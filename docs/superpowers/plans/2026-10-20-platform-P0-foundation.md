@@ -438,6 +438,18 @@ CREATE TABLE assignments (
 );
 CREATE INDEX idx_assignments_lookup ON assignments(user_id, capability);
 
+-- 用户与角色的多对多
+-- 一人可以同时是选手 + 队长 + 评委（借 hackerspace3 assignment 模型的做法）
+-- ⚠️ 本表并入 001_init.sql，不单独开 002 迁移：
+--    迁移版本号是全局唯一序位，002 必须留给 P1 的 002_registration.sql。
+--    两个迁移抢同一个版本号时，后执行的那张表永远建不出来（applyMigrations 按 version 去重）。
+CREATE TABLE user_roles (
+  user_id  TEXT NOT NULL REFERENCES users(id),
+  role_key TEXT NOT NULL REFERENCES roles(key),
+  PRIMARY KEY (user_id, role_key)
+);
+CREATE INDEX idx_user_roles_role ON user_roles(role_key);
+
 CREATE TABLE audit_log (
   id          TEXT PRIMARY KEY,
   actor_id    TEXT REFERENCES users(id),
@@ -1604,20 +1616,21 @@ export function scopeClause(userId, capability, { scopeType, scopeId, alias = nu
 }
 ```
 
-- [ ] **Step 4: 补 user_roles 表（迁移 002）**
+- [ ] **Step 4: 确认 user_roles 表已在 001_init.sql 中**
 
-`platform/db/migrations/002_user_roles.sql`：
+`user_roles` 表**已在 Task 2 的 `001_init.sql` 里建好**（迁移版本号是全局唯一序位，002 留给 P1 的 `002_registration.sql`）。
+本步只需确认它存在：
 
-```sql
--- 002_user_roles.sql — 用户与角色的多对多
--- 一人可以同时是选手 + 队长 + 评委（借 hackerspace3 assignment 模型的做法）
-CREATE TABLE user_roles (
-  user_id  TEXT NOT NULL REFERENCES users(id),
-  role_key TEXT NOT NULL REFERENCES roles(key),
-  PRIMARY KEY (user_id, role_key)
-);
-CREATE INDEX idx_user_roles_role ON user_roles(role_key);
+```bash
+cd platform && node scripts/migrate.js && node -e "
+const {DatabaseSync}=require('node:sqlite');
+const db=new DatabaseSync('./data/app.db');
+const r=db.prepare(\"SELECT name FROM sqlite_master WHERE type='table' AND name='user_roles'\").get();
+console.log(r ? 'user_roles 存在' : '缺失');
+db.close();
+"
 ```
+Expected: `user_roles 存在`
 
 - [ ] **Step 5: 修正测试中的角色用例**
 
@@ -1642,7 +1655,7 @@ Expected: PASS（6 个测试全过）
 - [ ] **Step 7: 提交**
 
 ```bash
-cd platform && git add src/auth/permissions.js src/db/repo/assignments.js db/migrations/002_user_roles.sql test/permissions.test.js
+cd platform && git add src/auth/permissions.js src/db/repo test/permissions.test.js
 git commit -m "feat(P0): capability + assignment 权限模型与 SQL 层行级过滤"
 ```
 

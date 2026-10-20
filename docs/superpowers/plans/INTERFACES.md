@@ -80,7 +80,11 @@ createApp({ db, rules, webDir })         // → { router, handle(req, res) }
 serveStatic(webDir, req, res)            // → boolean（已处理则 true）
 ```
 
-**P0 已建表**（`001_init.sql`）：`users` / `sessions` / `capabilities` / `roles` / `role_capabilities` / `assignments` / `audit_log`
+**P0 已建表**（`001_init.sql`，**只有这一个迁移文件**）：`users` / `sessions` / `capabilities` / `roles` / `role_capabilities` / `assignments` / `user_roles` / `audit_log`
+
+> **⚠️ 迁移版本号是全局唯一序位，002 起依次是 P1→P5**。
+> 曾出现过 P0 建 `002_user_roles.sql` 与 P1 建 `002_registration.sql` 抢同一个版本号的问题——`applyMigrations` 按 version 去重，**后执行的那张表永远建不出来**。已修法：`user_roles` 并入 P0 的 `001_init.sql`，P0 不再单独开迁移。
+> **执行任何阶段前先确认 `platform/db/migrations/` 里的版本号无重复。**
 
 **P0 已有规则文件**（9 份，内容见 P0 计划 Task 3）：`scoring-initial` / `scoring-final` / `tiebreak` / `ranks` / `behavior-points` / `visibility` / `registration-scoring` / `solvability` / `milestones.default`
 
@@ -545,3 +549,37 @@ docs/deployment.md           部署与运维手册
 | P4 | P0 + P2 + P3 | 复算 diff、限频、复核状态机 |
 | P5 | P0 + P1 + P3 | 三池派生数据、公开 API、iCal |
 | P6 | 全部 | 部署资产、演示版 |
+
+---
+
+## 9. 文件归属裁决表（**跨计划唯一写入权**）
+
+> **为什么需要这张表**：六份计划并行写完后，检测出 **5 个文件被两个阶段同时声明 "Create"**，
+> 另有 **1 张表被两个迁移同时 CREATE**、**1 个模块两套参数顺序相反**。
+> 这三类冲突的共同后果都是同一个：**同一件事有两个实现，两处算出不同结果**——正是本项目复盘里反复出现的那类失败。
+> 裁决原则：**最早建立它的阶段拥有它；后续阶段一律 Modify（追加），不得重建。**
+
+| 文件 | 拥有者 | 后续阶段怎么用 | 为什么这么定 |
+|---|---|---|---|
+| `src/errors.js` | **P1** | P4 **追加**快捷函数；P3 **直接复用** | P3 原打算新建 `src/errors/app-error.js` 且签名是 `appError(code, message, status)`，与 P1/P4 的 `appError(status, code, message, detail)` **参数顺序相反**。两套并存 → `err.status` 与 `err.code` 互换 → HTTP 层返回错误状态码。**统一为 status-first** |
+| `src/audit/log.js` | **P2** | P4 **改造**（把内联 SQL 下沉到仓储层）+ **追加**查询 | P2 先写审计日志。P4 改造时**函数签名一个字不改**，P2 已有的调用点不必跟着改 |
+| `src/db/repo/computations.js` | **P2** | P4 **追加** `nextRevision` / `listComputationRows` | 计算快照表由 P2 的 `003_review.sql` 建，写入方是 P2 的 `computeStage`。P4 只做读与复算 |
+| `src/db/repo/tiers.js` | **P3** | P4 **追加**只读的 `getTeamTierRow(db, teamId)` | P3 已建 `insertTierRecord(db, { …, reasonsJson, … })`。P4 原打算重复定义且参数名写作 `reasons`——参数名不同会让 `reasons` 静默变 `undefined` → 段位降级原因丢失 → R-PTS-04「降级须公示」破 |
+| `src/domain/evidence.js` | **P4** | P5 **另建** `src/domain/task-evidence.js` | 同名不同义：P4 的是 R-AUD-04「证据三列 + 按发行方去重」（审计概念），P5 的是 R-STG-04「任务完成证据」。**不改名则后写的阶段覆盖先写的模块** |
+| `tiebreak_round` / `tiebreak_votes` 表 | **P2**（`003_review.sql`） | P3 **只消费**，不建表 | ⚠️ **最高危的一处**：P2 与 P3 的迁移原本都 `CREATE TABLE`，第二个迁移报 `table tiebreak_round already exists` → **整条迁移链（004/005/006）全部不执行**。归属理由：投票入口在 P2（"互评、加时陈述与一票破同分"是 P2 的 Task 7） |
+| `scripts/audit-scan.js` | **P4** | P6 **不重建**，只在 P4 版本上追加参数 | P4 已建并写进验收标准。P6 重建会得到两个扫描器，其中一个可能没人跑 |
+
+### 9.1 执行前自检（每个阶段开工前跑一遍）
+
+```bash
+cd platform/db/migrations && ls -1 *.sql | cut -d_ -f1 | sort | uniq -d
+# 期望输出为空。非空 = 有两个迁移抢同一个版本号 → 后执行的那张表永远建不出来。
+```
+
+```bash
+cd /Users/mac/soft/AI/orca/heikesong/docs/superpowers/plans
+for f in 2026-10-20-platform-P*.md; do
+  grep -oE '^- Create: `platform/[^`]+`' "$f" | sed -E 's/^- Create: `platform\///; s/`$//'
+done | sort | uniq -c | awk '$1>1'
+# 期望输出为空。⛔ 非空 = 同一文件被两个阶段声明 Create → 后面那个会覆盖前面那个。
+```
