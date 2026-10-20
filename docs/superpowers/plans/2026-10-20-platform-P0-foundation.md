@@ -227,7 +227,16 @@ git commit -m "feat(P0): 零依赖骨架与零依赖守卫测试"
 
 ### Task 2: SQLite 封装与迁移机制
 
-> **【2026-10-20 评审后修正】** 本 Task 的代码块已按实现回写（评审判定 Needs fixes，3 条 Important）。
+> **【2026-10-20 评审后修正 · 第 2 轮】** 复评 Approved 后又发现 2 处**同源**缺陷，已一并修正：
+> **④** 版本号解析过宽 —— `Number(name.split('_')[0])` 会把 `_init.sql` 当成版本 0、
+>      把 `1e3_x.sql` 静默解析成版本 1000，在「全局唯一序位」（001=P0 … 006=P5）上
+>      开出静默缺口。改为严格正则 `/^(\d+)_/`，错误文案也改准（"必须形如 NNN_name.sql"）。
+> **⑤** 同版本号冲突时，错误信息里两个文件名的先后取决于 `readdirSync` 的返回顺序 ——
+>      POSIX 未定义该顺序（ext4/xfs 是 hash 序），本机 APFS 实测稳定但换平台可能翻转，
+>      会让测试正则偶发失配 → CI 偶发红，违反 R-OPS-02 跨平台稳定。
+>      改为同版本号按文件名**字节序**二次排序。
+>
+> **【2026-10-20 评审后修正 · 第 1 轮】** 本 Task 的代码块已按实现回写（评审判定 Needs fixes，3 条 Important）。
 > 修正三处：**①** `engines.node` 由 `>=22.5.0` 改为 `>=22.16.0`（22.5.0 只是 `node:sqlite` 的引入版本，
 > 22.5.0–22.12.x 免不了 `--experimental-sqlite` 标志会直接抛错；`sqlite.backup()` 又需 ≥22.16.0，取并集）；
 > **②** `readMigrationFiles` 增加**重复版本号 fail-fast**（原实现按 version 静默去重 → 第二次运行
@@ -357,6 +366,43 @@ test('已应用的迁移文件被改名：响亮报错，而不是静默跳过',
   db.close();
   rmSync(dir, { recursive: true, force: true });
   rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('退化迁移文件名会被拒绝（不静默开版本缺口）', () => {
+  // "_init.sql" —— Number('') === 0，会被当成版本 0
+  const dirA = tempDir();
+  writeFileSync(join(dirA, '_init.sql'), 'CREATE TABLE a (x INTEGER);');
+  assert.throws(() => readMigrationFiles(dirA), /迁移文件名必须形如 NNN_name\.sql/);
+  rmSync(dirA, { recursive: true, force: true });
+
+  // "1e3_x.sql" —— Number('1e3') === 1000，会静默跳到版本 1000，
+  // 在「全局唯一序位」（001=P0 … 006=P5）上开出一个静默缺口
+  const dirB = tempDir();
+  writeFileSync(join(dirB, '1e3_x.sql'), 'CREATE TABLE a (x INTEGER);');
+  assert.throws(() => readMigrationFiles(dirB), /迁移文件名必须形如 NNN_name\.sql/);
+  rmSync(dirB, { recursive: true, force: true });
+
+  // "001.sql" —— 缺下划线
+  const dirC = tempDir();
+  writeFileSync(join(dirC, '001.sql'), 'CREATE TABLE a (x INTEGER);');
+  assert.throws(() => readMigrationFiles(dirC), /迁移文件名必须形如 NNN_name\.sql/);
+  rmSync(dirC, { recursive: true, force: true });
+});
+
+test('同版本号冲突时错误信息里的文件名顺序是确定的（跨平台稳定）', () => {
+  // readdirSync 的返回顺序在 POSIX 里未定义（ext4/xfs 是 hash 序）。
+  // 同版本号必须按文件名二次排序，否则错误信息里的先后会随机 → CI 偶发红。
+  for (const [first, second] of [['a', 'b'], ['b', 'a']]) {
+    const dir = tempDir();
+    writeFileSync(join(dir, `001_${first}.sql`), 'CREATE TABLE a (x INTEGER);');
+    writeFileSync(join(dir, `001_${second}.sql`), 'CREATE TABLE b (x INTEGER);');
+    assert.throws(
+      () => readMigrationFiles(dir),
+      /迁移版本号重复: 001 \(001_a\.sql, 001_b\.sql\)/,
+      '同版本号冲突的错误信息必须始终按文件名排序',
+    );
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // ⚠️ 下面两条断言的是「当前迁移集」的快照：P1 加入 002_registration.sql 之后，
@@ -517,13 +563,23 @@ export function readMigrationFiles(dir) {
   const files = readdirSync(dir)
     .filter((f) => f.endsWith('.sql'))
     .map((name) => {
-      const version = Number(name.split('_')[0]);
-      if (!Number.isInteger(version)) {
-        throw new Error(`迁移文件名必须以数字版本开头: ${name}`);
+      // 版本号必须形如 NNN_name.sql —— 严格正则，不接受退化写法。
+      // ⛔ 不能用 Number(name.split('_')[0])：
+      //    Number('') === 0 会把 "_init.sql" 当成版本 0；
+      //    Number('1e3') === 1000 会把 "1e3_x.sql" 静默解析成版本 1000，
+      //    在「迁移版本号是全局唯一序位」（001=P0 … 006=P5）上开出一个静默缺口。
+      const m = /^(\d+)_/.exec(name);
+      if (!m) {
+        throw new Error(`迁移文件名必须形如 NNN_name.sql: ${name}`);
       }
+      const version = Number(m[1]);
       return { version, name, sql: readFileSync(join(dir, name), 'utf8') };
     })
-    .sort((a, b) => a.version - b.version);
+    // 先按版本号升序；**同版本号再按文件名按字节序排序** ——
+    // readdirSync 的返回顺序在 POSIX 里未定义（ext4/xfs 是 hash 序），
+    // 不二次排序的话，同版本号冲突的错误信息里两个文件名的先后会随机，
+    // 跨平台 CI 会出现偶发红（违反 R-OPS-02 跨平台稳定）。
+    .sort((a, b) => (a.version - b.version) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 
   // 重复版本号 → 抛错。必须在任何迁移 SQL 落地**之前**发现，
   // 否则先落地的那张表会把后一个永久遮蔽（静默跳过 = schema 缺口被固化）。
@@ -702,7 +758,7 @@ try {
 - [ ] **Step 7: 运行测试确认通过**
 
 Run: `cd platform && node --test test/migrate.test.js`
-Expected: PASS（7 个测试全过）
+Expected: PASS（9 个测试全过）
 
 - [ ] **Step 8: 实跑迁移脚本**
 
@@ -730,6 +786,23 @@ git commit -m "feat(P0): SQLite 封装、迁移机制与初始表结构"
 > ③ milestones 的 `confirmedBy` 枚举 / key 唯一 / 至少一项 `countsTowardTier`；
 > ④ 缺失 `dimensions` 等子结构时报**友好校验错误**而不是抛 `TypeError`；
 > ⑤ 各处 key 唯一性检查。对应测试从 7 条增至 13 条。
+>
+> **【2026-10-20 派单后第 2 轮补强】** 实现者按简报**逐字**实现后，用探针实测出 3 条漏检并交回裁决，
+> 父代理复核后**全部采纳**（实测证据见 `task-3-report.md`）：
+> **⑥** **9 份配置的 `version` 必须全等** —— 实现者实测把 `tiebreak.json` 的 version 改成
+> `2099-01-01` 后 `loadRules` **静默接受**并对外报 `version=2099-01-01`。version 会写进计算 trace
+> （设计原则「每次计算留 trace」）—— 版本号漂移 = 审计链在说谎，事后复算无法自证。
+> **⑦** **数组元素为 null 时报友好错误而非裸 `TypeError`** —— 第 ④ 条只护住了 `scoring.*.dimensions`，
+> 同类的 `behavior.events` / `milestones.items` / `ranks.tiers` 等无防护，
+> 实测 `TypeError: Cannot read properties of null (reading 'points')`。
+> **⑧** **`solvability.grades` 的评分区间不得重叠** —— A/B/C/D 是**互斥**区间（A 10-12 / B 7-9 / C 4-6 / D 0-3），
+> 实测改成重叠后**不报错**；重叠会让同一分数落进两个等级，评级结果取决于查表顺序 → 不可复算。
+> 对应测试从 13 条增至 **16 条**。
+>
+> ⚠️ 本轮父代理自己写的校验代码里也踩了一个坑（已修正）：`[...new Set(arr)]` 得到的是**数组**，
+> 判重数要用 `.length`；写成 `.size` 会拿到 `undefined`，`undefined > 1` 恒为 false，
+> **这条校验会静默失效**。派单前用"抽取代码块 → 临时目录实跑"校验规格，抓到了它。
+> 补强后的规格实跑：**16/16 通过**。
 > 另修正一处测试标题与实现不符（"覆盖 0-100" → "单调不增"，本就不校验 0-100 覆盖）。
 
 **Files:**
@@ -862,6 +935,33 @@ test('维度 key 重复会被拒绝', () => {
   const broken = structuredClone(rules);
   broken.scoring.final.dimensions[1].key = broken.scoring.final.dimensions[0].key;
   assert.ok(validateRules(broken).some((e) => e.includes('重复 key')));
+});
+
+// ── 以下 3 条来自实现者实测反馈的 3 条漏检（父代理裁决后采纳）──────────
+
+test('9 份配置的 version 必须一致（漂移会让计算 trace 说谎）', () => {
+  const { rules } = loadRules(rulesDir);
+  const broken = structuredClone(rules);
+  broken.tiebreak.version = '2099-01-01';
+  assert.ok(validateRules(broken).some((e) => e.includes('version')));
+});
+
+test('数组里混入 null 元素时报友好错误，而不是抛 TypeError', () => {
+  const { rules } = loadRules(rulesDir);
+  const broken = structuredClone(rules);
+  broken.behavior.events[0] = null;
+  const errors = validateRules(broken);
+  assert.ok(
+    errors.some((e) => e.includes('behavior.events')),
+    'null 元素应被当作校验错误报告，而不是抛 TypeError',
+  );
+});
+
+test('solvability.grades 的评分区间不得重叠', () => {
+  const { rules } = loadRules(rulesDir);
+  const broken = structuredClone(rules);
+  broken.solvability.grades[1].minScore = broken.solvability.grades[0].minScore; // B 覆盖到 A
+  assert.ok(validateRules(broken).some((e) => e.includes('区间重叠')));
 });
 ```
 
@@ -1134,9 +1234,39 @@ function hasDuplicateKeys(items) {
   return new Set(keys).size !== keys.length;
 }
 
+// 数组元素必须是非 null 对象 —— 否则下面访问 item.key / item.points 会抛 TypeError。
+// 校验器的第一职责是**自己不崩**、给出可读错误，而不是把裸 TypeError 抛给调用方。
+function hasBadItem(items) {
+  return items.some((i) => i === null || typeof i !== 'object');
+}
+
 export function validateRules(rules) {
   const errors = [];
   const push = (msg) => errors.push(msg);
+
+  // ── 版本号一致性 ─────────────────────────────────────────
+  // 9 份配置的 version 必须全等。version 会写进计算 trace（设计原则
+  // 「每次计算留 trace」）—— 版本号漂移 = 审计链在说谎：trace 上标注的版本
+  // 与实际生效的规则对不上，事后复算无法自证。
+  const versionValues = [
+    rules?.scoring?.initial?.version,
+    rules?.scoring?.final?.version,
+    rules?.tiebreak?.version,
+    rules?.ranks?.version,
+    rules?.behavior?.version,
+    rules?.visibility?.version,
+    rules?.registration?.version,
+    rules?.solvability?.version,
+    rules?.milestones?.version,
+  ].filter((v) => v !== undefined && v !== null && v !== '');
+  if (versionValues.length > 1) {
+    const distinct = [...new Set(versionValues)];
+    // ⚠️ distinct 是**数组**（Set 被展开），判重数用 .length —— 用 .size 会拿到
+    //    undefined，比较恒为 false，这条校验会静默失效。
+    if (distinct.length > 1) {
+      push(`规则配置 version 不一致：${distinct.join(' / ')} —— 9 份配置必须同版本`);
+    }
+  }
 
   // ── 评分配置 ──────────────────────────────────────────────
   for (const key of ['initial', 'final']) {
@@ -1147,6 +1277,10 @@ export function validateRules(rules) {
     }
     if (!Array.isArray(cfg.dimensions) || cfg.dimensions.length === 0) {
       push(`scoring.${key}.dimensions 缺失或为空`);
+      continue;
+    }
+    if (hasBadItem(cfg.dimensions)) {
+      push(`scoring.${key}.dimensions 含非对象元素`);
       continue;
     }
     const sum = weightSum(cfg.dimensions);
@@ -1176,6 +1310,8 @@ export function validateRules(rules) {
   const chain = rules?.tiebreak?.chain;
   if (!Array.isArray(chain) || chain.length === 0) {
     push('tiebreak.chain 缺失或为空');
+  } else if (hasBadItem(chain)) {
+    push('tiebreak.chain 含非对象元素');
   } else {
     const last = chain[chain.length - 1];
     if (!last.deterministic) {
@@ -1194,6 +1330,8 @@ export function validateRules(rules) {
   const tierKeys = new Set();
   if (!Array.isArray(tiers) || tiers.length === 0) {
     push('ranks.tiers 缺失或为空');
+  } else if (hasBadItem(tiers)) {
+    push('ranks.tiers 含非对象元素');
   } else {
     for (const t of tiers) tierKeys.add(t.key);
     for (let i = 1; i < tiers.length; i += 1) {
@@ -1210,6 +1348,8 @@ export function validateRules(rules) {
   const levels = rules?.registration?.levels;
   if (!Array.isArray(levels) || levels.length === 0) {
     push('registration.levels 缺失或为空');
+  } else if (hasBadItem(levels)) {
+    push('registration.levels 含非对象元素');
   } else {
     for (let i = 1; i < levels.length; i += 1) {
       if (levels[i].minScore > levels[i - 1].minScore) {
@@ -1223,6 +1363,8 @@ export function validateRules(rules) {
   const regDims = rules?.registration?.dimensions;
   if (!Array.isArray(regDims) || regDims.length === 0) {
     push('registration.dimensions 缺失或为空');
+  } else if (hasBadItem(regDims)) {
+    push('registration.dimensions 含非对象元素');
   } else {
     const sum = weightSum(regDims);
     if (Math.abs(sum - 1) > 1e-9) {
@@ -1234,6 +1376,8 @@ export function validateRules(rules) {
   const sol = rules?.solvability;
   if (!Array.isArray(sol?.dimensions) || sol.dimensions.length === 0) {
     push('solvability.dimensions 缺失或为空');
+  } else if (hasBadItem(sol.dimensions)) {
+    push('solvability.dimensions 含非对象元素');
   } else {
     const sum = weightSum(sol.dimensions);
     if (Math.abs(sum - 1) > 1e-9) {
@@ -1242,8 +1386,23 @@ export function validateRules(rules) {
   }
   if (!Array.isArray(sol?.grades) || sol.grades.length === 0) {
     push('solvability.grades 缺失或为空');
+  } else if (hasBadItem(sol.grades)) {
+    push('solvability.grades 含非对象元素');
   } else if (hasDuplicateKeys(sol.grades)) {
     push('solvability.grades 存在重复 key');
+  } else {
+    // A/B/C/D 是**互斥**的评分区间：重叠会让同一个分数落进两个等级，
+    // 评级结果取决于查表顺序 —— 不可复算。
+    const sorted = [...sol.grades].sort((a, b) => a.minScore - b.minScore);
+    for (let i = 1; i < sorted.length; i += 1) {
+      if (sorted[i].minScore <= sorted[i - 1].maxScore) {
+        push(
+          `solvability.grades 分值区间重叠：${sorted[i - 1].key}`
+          + `(${sorted[i - 1].minScore}-${sorted[i - 1].maxScore}) 与 `
+          + `${sorted[i].key}(${sorted[i].minScore}-${sorted[i].maxScore})`,
+        );
+      }
+    }
   }
 
   // ── 行为分 ───────────────────────────────────────────────
@@ -1262,6 +1421,8 @@ export function validateRules(rules) {
     }
     if (!Array.isArray(behavior.events) || behavior.events.length === 0) {
       push('behavior.events 缺失或为空');
+    } else if (hasBadItem(behavior.events)) {
+      push('behavior.events 含非对象元素');
     } else {
       if (hasDuplicateKeys(behavior.events)) {
         push('behavior.events 存在重复 key');
@@ -1298,6 +1459,8 @@ export function validateRules(rules) {
   } else {
     if (!Array.isArray(ms.items) || ms.items.length === 0) {
       push('milestones.items 缺失或为空');
+    } else if (hasBadItem(ms.items)) {
+      push('milestones.items 含非对象元素');
     } else {
       if (hasDuplicateKeys(ms.items)) {
         push('milestones.items 存在重复 key');
@@ -1352,7 +1515,7 @@ export function loadRules(rulesDir) {
 - [ ] **Step 5: 运行测试确认通过**
 
 Run: `cd platform && node --test test/config.test.js`
-Expected: PASS（13 个测试全过）
+Expected: PASS（16 个测试全过）
 
 - [ ] **Step 6: 提交**
 
