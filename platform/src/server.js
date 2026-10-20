@@ -15,6 +15,7 @@ import { createSession, resolveSession, revokeSession } from './auth/session.js'
 import { can } from './auth/permissions.js';
 import { verifyPassword, hashPassword } from './auth/password.js';
 import { getUserById, getCredentialsByPhone, toPublicUser } from './db/repo/users.js';
+import { appError } from './errors.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -98,10 +99,12 @@ export function createApp({ db, rules, webDir }) {
 
   router.add('GET', '/api/me', async ({ user }) => {
     if (!user) {
-      const e = new Error('未登录');
-      e.status = 401;
-      e.code = 'UNAUTHENTICATED';
-      throw e;
+      // ⛔ 终审修正（Important，I-5）：领域错误必须走 AppError。
+      //    原来手搓 `new Error()` 再挂 .status/.code —— 运行时行为对，
+      //    但 INTERFACES.md:21 定义了 AppError 是**唯一**的错误类型，
+      //    P1–P6 的 handler 会照抄本文件 → 树起第二套错误类型，
+      //    下游 `e instanceof AppError` 分支就再也进不去了。
+      throw appError(401, 'UNAUTHENTICATED', '未登录');
     }
     return { user: toPublicUser(user) };
   });
@@ -118,10 +121,8 @@ export function createApp({ db, rules, webDir }) {
     const passwordOk = verifyPassword(password, cred ? cred.password_hash : dummyHash());
     const ok = !!cred && cred.active === 1 && passwordOk;
     if (!ok) {
-      const e = new Error('手机号或密码不正确');
-      e.status = 401;
-      e.code = 'INVALID_CREDENTIALS';
-      throw e;
+      // ⛔ 终审修正（Important，I-5）：同上，必须走 AppError。
+      throw appError(401, 'INVALID_CREDENTIALS', '手机号或密码不正确');
     }
     const { token, expiresAt } = createSession(db, cred.id);
     const maxAge = Math.max(0, Math.floor((new Date(expiresAt).getTime() - Date.now()) / 1000));

@@ -153,8 +153,86 @@ test('scopeClause 单资源模式：scopeId 命中才放行', () => {
   rmSync(dataDir, { recursive: true, force: true });
 });
 
-test('scopeClause 的占位符个数恒等于 params 个数', () => {
-  // ⛔ 预审修正（C6-2）：原实现 SQL 3 个占位符却推 4 个值 → column index out of range。
+test('scopeId 为**数字**时，can() 与 scopeClause() 必须给出相同结论', () => {
+  // ⛔ 终审修正（Important，I-4）：assignments.scope_id 是 TEXT 列，取回是字符串；
+  //    而 ctx.scopeId 若来自 parseInt() 就是数字。
+  //    原来 can() 用严格相等 `row.scope_id === ctx.scopeId` → '42' ≠ 42 → false；
+  //    但 scopeClause 走 SQL 的**类型亲和** → `a.scope_id = 42` 能匹配上 TEXT '42'。
+  //    于是同一个用户：can() 说「没权限」、scopeClause 把行放出来 —— **相反结论**。
+  //    这直接违反 INTERFACES.md:22「两者必须给出相同结论」。
+  const { db, close, dataDir, user } = setup();
+  seedResources(db);
+  // 造一行 id 是**数字形态**的资源（存成 TEXT '42'），用来对照数字 scopeId
+  db.exec("INSERT INTO fake_resources (id, title) VALUES ('42', '数字 id 资源')");
+  grantAssignment(db, {
+    userId: user.id, capability: 'score:write',
+    scopeType: 'task_package', scopeId: '42', grantedBy: user.id,
+  });
+
+  // 数字形式：can() 必须判有权
+  assert.equal(
+    can(user, 'score:write', { scopeType: 'task_package', scopeId: 42 }, db),
+    true,
+    '数字 scopeId 时 can() 必须判有权（scope_id 存的是 TEXT "42"）',
+  );
+
+  // 字符串形式：结论必须相同（两条路径不能分裂）
+  assert.equal(
+    can(user, 'score:write', { scopeType: 'task_package', scopeId: '42' }, db),
+    true,
+    '字符串 scopeId 时 can() 必须判有权',
+  );
+
+  // 契约要求：can() 与 scopeClause() 的结论一致 —— 数字形式下 scopeClause 放行的行，
+  // can() 也必须放行（否则「能看见行但没权限」/「有权却看不见行」）
+  for (const scopeId of ['42', 42]) {
+    // 模式二（单资源）：scopeId 直接进 SQL 的 WHERE
+    const single = scopeClause(user.id, 'score:write', { scopeType: 'task_package', scopeId });
+    const singleRows = db
+      .prepare('SELECT t.id FROM fake_resources t WHERE t.id = ? AND ' + single.sql)
+      .all('42', ...single.params)
+      .map((r) => r.id);
+    assert.deepEqual(
+      singleRows,
+      ['42'],
+      `scopeId=${JSON.stringify(scopeId)} 时 scopeClause（单资源模式）应放行该行`,
+    );
+    assert.equal(
+      can(user, 'score:write', { scopeType: 'task_package', scopeId }, db),
+      true,
+      `scopeId=${JSON.stringify(scopeId)} 时 can() 与 scopeClause 结论必须一致`,
+    );
+
+    // 模式一（行级）：scopeId 不进 SQL，改用 alias 比 resource.id
+    const rowLevel = scopeClause(user.id, 'score:write', { scopeType: 'task_package', alias: 't' });
+    const rowRows = db
+      .prepare('SELECT t.id FROM fake_resources t WHERE ' + rowLevel.sql)
+      .all(...rowLevel.params)
+      .map((r) => r.id);
+    assert.deepEqual(
+      rowRows,
+      ['42'],
+      `scopeId=${JSON.stringify(scopeId)} 时 scopeClause（行级模式）应放行该行`,
+    );
+    assert.equal(
+      can(user, 'score:write', { scopeType: 'task_package', scopeId }, db),
+      true,
+      `scopeId=${JSON.stringify(scopeId)} 时 can() 与 scopeClause（行级模式）结论必须一致`,
+    );
+  }
+
+  // 反例对照：无关的 scopeId 两边都必须拒绝（防止「一律放行」的恒绿断言）
+  assert.equal(
+    can(user, 'score:write', { scopeType: 'task_package', scopeId: 43 }, db),
+    false,
+    '数字 scopeId 不得放宽匹配：43 与 42 不是同一个资源',
+  );
+
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('scopeClause 的占位符个数恒等于 params 个数', () => {  // ⛔ 预审修正（C6-2）：原实现 SQL 3 个占位符却推 4 个值 → column index out of range。
   const { db, close, dataDir, user } = setup();
   const modes = [
     scopeClause(user.id, 'score:write'),

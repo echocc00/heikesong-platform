@@ -151,3 +151,59 @@ test('会话 token 是 32 字节随机（base64url 43 字符）', () => {
   close();
   rmSync(dataDir, { recursive: true, force: true });
 });
+
+// ⛔ 复核发现（Important）：绝对过期的**默认值**与**环境变量覆盖**此前零断言 ——
+//    把默认值改成 9999 天、或把 SESSION_ABSOLUTE_TTL_DAYS 覆盖逻辑改坏，
+//    全量测试照样全绿。而这条是「令牌泄露后最坏能用到什么时候」的硬边界。
+test('绝对过期默认是 30 天，且可由 SESSION_ABSOLUTE_TTL_DAYS 覆盖', async () => {
+  const { sessionAbsoluteTtlDays } = await import('../src/auth/session.js');
+  const original = process.env.SESSION_ABSOLUTE_TTL_DAYS;
+  try {
+    delete process.env.SESSION_ABSOLUTE_TTL_DAYS;
+    assert.equal(sessionAbsoluteTtlDays(), 30, '绝对过期默认必须是 30 天（设计文档 §7.5）');
+
+    process.env.SESSION_ABSOLUTE_TTL_DAYS = '7';
+    assert.equal(sessionAbsoluteTtlDays(), 7, '必须能被 SESSION_ABSOLUTE_TTL_DAYS 覆盖');
+
+    // 非法值必须回落到默认值，而不是变成 NaN / 0 / 负数
+    process.env.SESSION_ABSOLUTE_TTL_DAYS = 'abc';
+    assert.equal(sessionAbsoluteTtlDays(), 30, '非法值必须回落到默认值');
+    process.env.SESSION_ABSOLUTE_TTL_DAYS = '-1';
+    assert.equal(sessionAbsoluteTtlDays(), 30, '负数必须回落到默认值');
+    process.env.SESSION_ABSOLUTE_TTL_DAYS = '0';
+    assert.equal(sessionAbsoluteTtlDays(), 30, '0 必须回落到默认值');
+  } finally {
+    if (original === undefined) delete process.env.SESSION_ABSOLUTE_TTL_DAYS;
+    else process.env.SESSION_ABSOLUTE_TTL_DAYS = original;
+  }
+});
+
+test('滑动续期不得突破绝对过期上限（设计文档 §7.5）', async () => {
+  const { db, close, dataDir, user } = setup();
+  const { createSession, resolveSession } = await import('../src/auth/session.js');
+  const issuedAt = new Date('2026-10-01T00:00:00.000Z');
+  // 签发时给了 100 天，但绝对上限只有 30 天 → 不得超过 30 天
+  const { token, expiresAt } = createSession(db, user.id, {
+    ttlDays: 100, absoluteTtlDays: 30, now: issuedAt,
+  });
+  const issuedPlus30 = new Date(issuedAt.getTime() + 30 * 86400_000).toISOString();
+  assert.equal(expiresAt, issuedPlus30, '会话有效期不得越过绝对上限');
+
+  // 第 20 天使用 → 滑动续期到「第 20 天 + 100 天」，但仍不得超过签发 + 30 天
+  const day20 = new Date(issuedAt.getTime() + 20 * 86400_000);
+  const renewed = resolveSession(db, token, {
+    ttlDays: 100, absoluteTtlDays: 30, now: day20,
+  });
+  assert.ok(renewed, '第 20 天会话仍应有效');
+  assert.equal(renewed.expiresAt, issuedPlus30, '滑动续期不得突破绝对上限');
+
+  // 第 31 天 → 一律作废（即使刚用过）
+  const day31 = new Date(issuedAt.getTime() + 31 * 86400_000);
+  assert.equal(
+    resolveSession(db, token, { ttlDays: 100, absoluteTtlDays: 30, now: day31 }),
+    null,
+    '超过绝对上限后必须作废',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});

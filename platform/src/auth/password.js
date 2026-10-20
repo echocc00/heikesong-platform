@@ -24,8 +24,22 @@ export function verifyPassword(plain, stored) {
   if (parts.length !== 6 || parts[0] !== 'scrypt') return false;
 
   const [, nStr, rStr, pStr, saltB64, hashB64] = parts;
-  const salt = Buffer.from(saltB64, 'base64');
-  const expected = Buffer.from(hashB64, 'base64');
+
+  // ⛔ 终审修正（Important，I-6-1）：Buffer.from 必须在 try **里面**。
+  //    6 段守卫挡住的是「段数不对」，但段数对了不代表内容对：
+  //    段数守卫一旦被改坏（终审变异 `!== 6` → `< 5`），5 段串会让
+  //    hashB64 变成 undefined → Buffer.from(undefined) 抛 TypeError
+  //    → 而它在 try 外面 → **未捕获异常** → 登录热路径上整个进程退出。
+  //    现状（守卫正确）不抛，但这条不变量没有任何断言钉住 —— 放进 try 是
+  //    第二道防线，与守卫互不依赖。
+  let salt;
+  let expected;
+  try {
+    salt = Buffer.from(saltB64, 'base64');
+    expected = Buffer.from(hashB64, 'base64');
+  } catch {
+    return false;
+  }
   if (salt.length === 0 || expected.length === 0) return false;
 
   let actual;

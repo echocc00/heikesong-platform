@@ -61,6 +61,24 @@ function roleGrants(db, userId, capability) {
   return hasRoleCapability(db, userId, capability);
 }
 
+/**
+ * 比较 scope_id：统一按**字符串**比较。
+ *
+ * ⛔ 终审修正（Important，I-4）：assignments.scope_id 是 TEXT 列，取回是字符串；
+ *    而 ctx.scopeId 若来自 parseInt() / 数字字面量就是 number。
+ *    原来用严格相等 `row.scope_id === ctx.scopeId` → 字符串 '42' ≠ 数字 42 → false；
+ *    但 scopeClause 走 SQL 的**类型亲和** → `a.scope_id = 42` 能匹配上 TEXT '42'。
+ *    于是同一个用户：can() 说「没权限」、scopeClause 把行放出来 —— **相反结论**。
+ *    这直接违反 INTERFACES.md:22「两者必须给出相同结论」。
+ *    （P0 枚举的一致性场景没覆盖数字 id，所以 P0-4 当时判「达标」——
+ *      但契约说的是**一般情形**。）
+ */
+function scopeIdEquals(stored, given) {
+  if (stored === null || stored === undefined) return false;
+  if (given === null || given === undefined) return false;
+  return String(stored) === String(given);
+}
+
 export function can(user, capability, ctx = null, db = null) {
   if (!user) return false;
   // ⛔ 预审修正（m6-1）：原来写 user.active === 0 —— 传入没有 active 字段的
@@ -88,7 +106,7 @@ export function can(user, capability, ctx = null, db = null) {
   for (const row of rows) {
     if (row.scope_type === 'global') return true;
     if (!ctx) continue;
-    if (row.scope_type === ctx.scopeType && row.scope_id === ctx.scopeId) return true;
+    if (row.scope_type === ctx.scopeType && scopeIdEquals(row.scope_id, ctx.scopeId)) return true;
   }
   return false;
 }
@@ -142,7 +160,16 @@ export function scopeClause(userId, capability, { scopeType, scopeId, alias = nu
       scopeParams.push(scopeType);
     } else {
       scopeCond.push(`(a.scope_type = ? AND a.scope_id = ?)`);
-      scopeParams.push(scopeType, scopeId);
+      // ⛔ 终审修正（Important，I-4）：scopeId 统一按**字符串**绑定。
+      //    assignments.scope_id 声明为 TEXT。实测（node:sqlite）：
+      //    `WHERE scope_id = ?` 绑**整数** 42 匹配不上 TEXT '42'；
+      //    绑**字符串** '42' 或写 SQL 字面量 42 才能匹配上。
+      //    原因：绑定参数**没有类型亲和**，SQLite 不会把列的 TEXT 亲和
+      //    应用到它身上（列↔列比较则会应用）。
+      //    不归一的后果：scopeId 来自 parseInt() 时，
+      //    scopeClause 说「这行不可见」、can() 说「有权」—— 契约要求的
+      //    「两者必须给出相同结论」被打破（INTERFACES.md:22）。
+      scopeParams.push(scopeType, String(scopeId));
     }
   }
   const scopeSql = scopeCond.length ? ` OR ${scopeCond.join(' OR ')}` : '';

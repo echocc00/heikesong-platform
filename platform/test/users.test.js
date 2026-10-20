@@ -12,6 +12,7 @@ import {
   getCredentialsByPhone,
   listUsers,
   toPublicUser,
+  deactivateUser,
 } from '../src/db/repo/users.js';
 import { verifyPassword } from '../src/auth/password.js';
 import { AppError } from '../src/errors.js';
@@ -88,6 +89,27 @@ test('toPublicUser 对带哈希的行也不漏 password_hash（对外键集合�
     Object.keys(pub).sort(),
     ['active', 'createdAt', 'id', 'isSuperadmin', 'mbaStatus', 'name', 'org', 'phone'],
     '对外形状的键集合必须精确等于约定的 8 个字段（多一个也算泄露）',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('停用用户的手机号不能被再次注册（查重不看 active）（终审 I-6-7）', () => {
+  // ⛔ 终审发现（Important）：查重函数刻意**不看 active**（源码注释明写）——
+  //    否则停用用户可以被**冒名重新注册**（别人拿他的手机号注册新账号）。
+  //    这条不变量此前没有任何断言钉住：给查重加上 `AND active = 1` 全量测试照样全绿。
+  const { db, close, dataDir } = setup();
+  const user = createUser(db, { name: '甲', phone: '13900000007', password: 'pw' });
+  deactivateUser(db, user.id);
+  assert.throws(
+    () => createUser(db, { name: '乙冒名', phone: '13900000007', password: 'pw' }),
+    (err) => {
+      assert.ok(err instanceof AppError, '领域错误必须是 AppError');
+      assert.equal(err.status, 409);
+      assert.equal(err.code, 'PHONE_TAKEN');
+      return true;
+    },
+    '停用用户的手机号不得被再次注册',
   );
   close();
   rmSync(dataDir, { recursive: true, force: true });

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, chmodSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, chmodSync, symlinkSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -439,4 +439,324 @@ test('读流的 error 监听：流出错时断开响应，而不是变成未捕�
   pipeFd(res, 999999); // 不存在的 fd → 流会发 EBADF error
   await new Promise((r) => setTimeout(r, 50));
   assert.equal(destroyed, 1, '流出错时应断开响应（而不是让异常冒泡）');
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 终审修复轮 3 的回归用例（评审 whole-branch-review.md §7）
+// 下面每一条都对应一条「改坏了但全量测试照样全绿」的生产护栏。
+// ══════════════════════════════════════════════════════════════════
+
+test('软链指向 web 根外的文件时返回 404，不得读出文件内容（终审 I-1）', async () => {
+  // ⛔ 终审发现（Important）：静态服务只对**路径字符串**做边界比较，
+  //    而 resolve() **不解析符号链接** → web/ 下指向根外的软链会被读出来。
+  //    终审实测：ln -s /etc web/etclink → GET /etclink/passwd → 200 + /etc/passwd 全文。
+  //    真实风险是**部署期误配置**：把 platform/data 软链进 web/ → 全部 password_hash
+  //    与 token_hash 暴露到公网，正好抵消「库里只存哈希」这条安全设计。
+  // ⚠️ 必须用**真实 http server + 裸 socket**：fake res 走不到流式响应，会假绿。
+  const dataDir = mkdtempSync(join(tmpdir(), 'hks-sym-'));
+  const { db, close } = openDatabase({ dataDir });
+  applyMigrations(db, migrationsDir);
+  const { rules } = loadRules(rulesDir);
+  const webRoot = mkdtempSync(join(tmpdir(), 'hks-symweb-'));
+  const webDir = join(webRoot, 'web');
+  mkdirSync(webDir, { recursive: true });
+  writeFileSync(join(webDir, 'index.html'), '<h1>home</h1>');
+  // 根外文件 + 两个软链：直接指向文件的、指向整个目录的
+  writeFileSync(join(webRoot, 'leak.txt'), 'SECRET-OUTSIDE-WEB\n');
+  symlinkSync(join(webRoot, 'leak.txt'), join(webDir, 'leak.txt'));
+  symlinkSync(webRoot, join(webDir, 'rootlink'));
+  const app = createApp({ db, rules, webDir });
+  const server = http.createServer(app.handle);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address();
+  try {
+    for (const p of ['/leak.txt', '/rootlink/leak.txt']) {
+      const raw = await rawRequest(port, p);
+      assert.equal(raw.includes('SECRET-OUTSIDE-WEB'), false, `${p} 泄露了 web 根外的内容`);
+      assert.ok(!/^HTTP\/1\.1 200/.test(raw), `${p} 不得返回 200：${raw.slice(0, 80)}`);
+    }
+    // 正常静态资源必须仍然可用（防止把防线修过头）
+    const alive = await rawRequest(port, '/index.html');
+    assert.ok(alive.includes('200 OK'), '正常静态资源必须仍可访问');
+    assert.ok(alive.includes('<h1>home</h1>'), '正常静态资源内容必须完整');
+  } finally {
+    server.close();
+    close();
+    rmSync(dataDir, { recursive: true, force: true });
+    rmSync(webRoot, { recursive: true, force: true });
+  }
+});
+
+test('服务器抛出的领域错误必须是 AppError 实例（终审 I-5）', async () => {
+  // ⛔ 终审发现（Important）：src/server.js 手搓 `new Error()` 再挂 .status/.code，
+  //    而 INTERFACES.md:21 定义 AppError 是**唯一**的错误类型、P1–P6 全部复用。
+  //    服务器自己示范另一套写法 → P1–P6 照抄 → 下游 `e instanceof AppError` 分支失效。
+  const { db, close, dataDir, app } = setup();
+  const { AppError } = await import('../src/errors.js');
+  const hit = app.router.match('GET', '/api/me');
+  assert.ok(hit, '必须能取到 /api/me 的 handler');
+  await assert.rejects(
+    () => hit.handler({ user: null }),
+    (err) => {
+      assert.ok(err instanceof AppError, `领域错误必须是 AppError，实际是 ${err?.constructor?.name}`);
+      assert.equal(err.status, 401);
+      assert.equal(err.code, 'UNAUTHENTICATED');
+      return true;
+    },
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('登录失败也必须抛 AppError（终审 I-5）', async () => {
+  const { db, close, dataDir, app } = setup();
+  const { AppError } = await import('../src/errors.js');
+  createUser(db, { name: '甲', phone: '13800000009', password: 'pw123' });
+  const hit = app.router.match('POST', '/api/auth/login');
+  await assert.rejects(
+    () => hit.handler({ body: { phone: '13800000009', password: 'wrong' } }),
+    (err) => {
+      assert.ok(err instanceof AppError, `领域错误必须是 AppError，实际是 ${err?.constructor?.name}`);
+      assert.equal(err.status, 401);
+      assert.equal(err.code, 'INVALID_CREDENTIALS');
+      return true;
+    },
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('请求体是数组时返回 400（不是 401）（终审 I-6-2）', async () => {
+  // ⛔ 终审发现（Important）：去掉 readJsonBody 的 Array.isArray 守卫后，
+  //    数组 body 会一路走到 `body?.phone` → undefined → 401。
+  //    错误从「清晰的 400」退化成「静默的 undefined」，P1–P6 的 handler 会拿到数组当对象用。
+  const { db, close, dataDir, app } = setup();
+  for (const body of [[], ['a'], 'str', 42]) {
+    const res = await call(app, 'POST', '/api/auth/login', { body });
+    assert.equal(res.status, 400, `body=${JSON.stringify(body)} 必须回 400，实际 ${res.status}`);
+  }
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('JSON 响应的 Content-Type 必须是 application/json（终审 I-6-3）', async () => {
+  // ⛔ 终审发现（Important）：把 json() 的 Content-Type 改成 text/plain，
+  //    全量测试照样全绿 —— 因为 web/api.js 用 res.text() + JSON.parse()，
+  //    前端恰好不受影响，bug 会一路带到 P6 才在真浏览器里炸。
+  const { db, close, dataDir, app } = setup();
+  const res = await call(app, 'GET', '/api/health');
+  assert.equal(res.status, 200);
+  assert.match(
+    res.headers['Content-Type'],
+    /application\/json/,
+    `JSON 响应必须是 application/json，实际 ${res.headers['Content-Type']}`,
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('已停用的用户不能登录（终审 I-6-4）', async () => {
+  // ⛔ 终审发现（Important）：`cred.active === 1` 是**登录路径上唯一**的停用检查。
+  //    P1 接上「停用成员」之后，这个未钉住的检查就是**认证绕过**。
+  const { db, close, dataDir, app } = setup();
+  const { deactivateUser } = await import('../src/db/repo/users.js');
+  const user = createUser(db, { name: '甲', phone: '13800000010', password: 'pw123' });
+  deactivateUser(db, user.id);
+  const res = await call(app, 'POST', '/api/auth/login', {
+    body: { phone: '13800000010', password: 'pw123' },
+  });
+  assert.equal(res.status, 401, '停用用户不得登录成功');
+  assert.equal(res.headers['Set-Cookie'], undefined, '停用用户登录不得下发 Cookie');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('4xx 响应不得外泄 err.stack（终审 I-6-5）', async () => {
+  // ⛔ 终审发现（Important）：500 分支有逐字节断言，4xx 分支没有。
+  //    一旦把 4xx 分支的 err.message 改成 err.stack → 文件路径 + 调用栈直接进 HTTP 响应。
+  const { db, close, dataDir, app } = setup();
+  const res = await call(app, 'GET', '/api/me');
+  assert.equal(res.status, 401);
+  assert.ok(!res.body.includes('at '), `响应体不得包含调用栈：${res.body}`);
+  assert.ok(!res.body.includes('src/server.js'), `响应体不得包含源码路径：${res.body}`);
+  assert.ok(!res.body.includes('node:internal'), `响应体不得包含 Node 内部路径：${res.body}`);
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('带 if-none-match 的静态请求返回 304 且不重复打开文件（终审 M-2）', async () => {
+  const { db, close, dataDir, webRoot, app } = setup();
+  const server = http.createServer(app.handle);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address();
+  try {
+    const first = await rawRequest(port, '/index.html');
+    const m = first.match(/ETag:\s*(\S+)/i);
+    assert.ok(m, '静态响应必须带 ETag');
+    const etag = m[1];
+    const second = await rawRequest(port, '/index.html', 5000);
+    assert.ok(second.includes('200 OK'), '首次请求必须是 200');
+    // 用裸 socket 发带 if-none-match 的请求
+    const notModified = await new Promise((resolve, reject) => {
+      const socket = net.connect(port, '127.0.0.1');
+      const chunks = [];
+      socket.setTimeout(5000, () => { socket.destroy(); reject(new Error('超时')); });
+      socket.on('connect', () => {
+        socket.write(
+          `GET /index.html HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nIf-None-Match: ${etag}\r\nConnection: close\r\n\r\n`,
+        );
+      });
+      socket.on('data', (d) => chunks.push(d));
+      socket.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+      socket.on('close', () => resolve(Buffer.concat(chunks).toString('utf8')));
+      socket.on('error', reject);
+    });
+    assert.ok(notModified.includes('304'), `命中 ETag 必须回 304：${notModified.slice(0, 120)}`);
+    const alive = await rawRequest(port, '/index.html');
+    assert.ok(alive.includes('200 OK'), '服务器必须存活（304 分支不得泄漏 fd 把进程拖死）');
+  } finally {
+    server.close();
+    close();
+    rmSync(dataDir, { recursive: true, force: true });
+    rmSync(webRoot, { recursive: true, force: true });
+  }
+});
+
+test('登出响应必须下发清空 Cookie 的 Set-Cookie（终审 M-3）', async () => {
+  const { db, close, dataDir, app } = setup();
+  createUser(db, { name: '甲', phone: '13800000011', password: 'pw123' });
+  const login = await call(app, 'POST', '/api/auth/login', {
+    body: { phone: '13800000011', password: 'pw123' },
+  });
+  const cookie = login.headers['Set-Cookie'];
+  assert.ok(cookie, '登录必须下发 Cookie');
+  const res = await call(app, 'POST', '/api/auth/logout', { headers: { cookie: cookie.split(';')[0] } });
+  assert.equal(res.status, 200);
+  const cleared = res.headers['Set-Cookie'];
+  assert.ok(cleared, '登出必须下发 Set-Cookie 以清掉浏览器端会话');
+  assert.match(cleared, /^hk_session=;/, `登出必须清空 hk_session：${cleared}`);
+  assert.match(cleared, /Max-Age=0/i, `登出的 Cookie 必须立即过期：${cleared}`);
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('404 响应体不得包含 web 目录的绝对路径（终审 M-4）', async () => {
+  const { db, close, dataDir, webRoot, app } = setup();
+  const res = await call(app, 'GET', '/api/nope');
+  assert.equal(res.status, 404);
+  assert.ok(!res.body.includes(webRoot), `404 不得回显内部路径：${res.body}`);
+  assert.ok(!res.body.includes('hks-web-'), `404 不得回显临时目录名：${res.body}`);
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+  rmSync(webRoot, { recursive: true, force: true });
+});
+
+test('dev/ino 对账：两个不同的文件不得被判为同一个（终审 I-1 的 TOCTOU 防线）', async () => {
+  // ⚠️ realpath 与 open 之间的竞态无法稳定复现，但「两个不同文件必须被判为不同」
+  //    可以直接钉死 —— 否则这条防线就是纯注释。
+  const { isSameFile } = await import('../src/http/static.js');
+  const a = { dev: 16777224, ino: 12345 };
+  assert.equal(isSameFile(a, { dev: a.dev, ino: a.ino }), true, '同一文件必须判为相同');
+  assert.equal(isSameFile(a, { dev: a.dev, ino: 99999 }), false, 'ino 不同必须判为不同');
+  assert.equal(isSameFile(a, { dev: 99999, ino: a.ino }), false, 'dev 不同必须判为不同');
+  assert.equal(isSameFile(a, null), false, '缺 stat 不得判为相同');
+  assert.equal(isSameFile(null, a), false, '缺 stat 不得判为相同');
+  assert.equal(isSameFile(null, null), false, '两个缺 stat 不得判为相同');
+});
+
+test('登录响应体必须带回当前用户，且不得含 password_hash（复核 I1）', async () => {
+  // ⛔ 复核发现（Important）：登录响应体此前**零断言** ——
+  //    把它改成 `{"user":null}` 或 `toPublicUser(cred)`（把口令哈希带出去），
+  //    全量测试照样全绿。主功能的输出没有任何保证。
+  const { db, close, dataDir, app } = setup();
+  createUser(db, { name: '甲', phone: '13800000012', password: 'pw123' });
+  const res = await call(app, 'POST', '/api/auth/login', {
+    body: { phone: '13800000012', password: 'pw123' },
+  });
+  assert.equal(res.status, 200);
+  const body = JSON.parse(res.body);
+  assert.ok(body.user, '登录响应必须带回 user');
+  assert.equal(body.user.name, '甲', '必须带回用户姓名');
+  assert.equal(body.user.phone, '13800000012', '必须带回手机号');
+  assert.ok(body.user.id, '必须带回用户 id');
+  assert.ok(!('password_hash' in body.user), '不得把 password_hash 带出去');
+  assert.ok(!('passwordHash' in body.user), '不得把 passwordHash 带出去');
+  assert.ok(!res.body.includes('scrypt$'), '响应体不得出现口令哈希');
+  // ⚠️ 键集合必须**精确**：对外形状是 toPublicUser 的驼峰版
+  //    （mbaStatus / isSuperadmin / createdAt，active 与 isSuperadmin 是**布尔**）。
+  //    只断言 name/phone 时，把响应换成仓储原始行（snake_case）照样全绿 ——
+  //    而那会让前端拿到 `active: 1`（数字）、`is_superadmin: 0`（数字），
+  //    真假判断在 JS 里是**真的**（`1` 与 `0` 都是 truthy）→ 停用用户会被当成超管。
+  assert.deepEqual(
+    Object.keys(body.user).sort(),
+    ['active', 'createdAt', 'id', 'isSuperadmin', 'mbaStatus', 'name', 'org', 'phone'],
+    `登录响应的 user 键集合必须精确等于 toPublicUser 的对外形状，实际 ${JSON.stringify(Object.keys(body.user))}`,
+  );
+  assert.equal(typeof body.user.active, 'boolean', 'active 必须是布尔（数字 0/1 都是 truthy）');
+  assert.equal(typeof body.user.isSuperadmin, 'boolean', 'isSuperadmin 必须是布尔');
+  assert.equal(body.user.active, true);
+  assert.equal(body.user.isSuperadmin, false);
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('停用用户的登录失败耗时也必须跑 scrypt（复核 I2）', async () => {
+  // ⛔ 复核发现（Important）：计时对齐此前只钉住「用户不存在」与「密码错误」两条路径，
+  //    **停用用户**这条路径没钉。若实现改成「停用用户直接短路、不跑 scrypt」，
+  //    攻击者就能用「停用账号的响应时间」区分「手机号存在但已停用」→ 依然可枚举。
+  const { db, close, dataDir, app } = setup();
+  const { deactivateUser } = await import('../src/db/repo/users.js');
+  const user = createUser(db, { name: '甲', phone: '13800000013', password: 'pw123' });
+  deactivateUser(db, user.id);
+  const t0 = process.hrtime.bigint();
+  const res = await call(app, 'POST', '/api/auth/login', {
+    body: { phone: '13800000013', password: 'pw123' },
+  });
+  const t1 = process.hrtime.bigint();
+  assert.equal(res.status, 401);
+  const ms = Number(t1 - t0) / 1e6;
+  assert.ok(
+    ms >= 5,
+    `停用用户的登录耗时 ${ms.toFixed(2)}ms —— 必须跑完 scrypt（否则仍可枚举手机号）`,
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('静态请求命中目录时返回干净的 404，而不是掐断连接（复核 I5）', async () => {
+  // ⛔ 复核发现（Important）：serveStatic 的 isFile() 守卫此前零覆盖 ——
+  //    去掉它之后，目录请求不再走「干净 404」，而是**连接被掐断**（实测 fetch failed）。
+  //    这会让前端把「404」与「服务器崩了」混为一谈。
+  const { db, close, dataDir, webRoot, app } = setup();
+  mkdirSync(join(webRoot, 'web', 'subdir'), { recursive: true });
+  const server = http.createServer(app.handle);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address();
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/subdir`);
+    assert.ok(res.status >= 400 && res.status < 500, `目录请求必须回 4xx，实际 ${res.status}`);
+    const alive = await fetch(`http://127.0.0.1:${port}/index.html`);
+    assert.equal(alive.status, 200, '服务器必须存活');
+  } finally {
+    server.close();
+    close();
+    rmSync(dataDir, { recursive: true, force: true });
+    rmSync(webRoot, { recursive: true, force: true });
+  }
+});
+
+test('serveStatic 必须真的调用 isSameFile 做 dev/ino 对账（接线断言）', async () => {
+  // ⚠️ 竞态本身无法稳定复现，但「serveStatic 真的调用了这条防线」可以钉死 ——
+  //    否则把**调用点**删掉（isSameFile 函数还在、它自己的单元测试照样绿）
+  //    就等于这条 TOCTOU 防线悄悄消失了。
+  //    这与「零依赖守卫」用的是同一类手段：**扫描源码**。
+  const src = readFileSync(join(here, '..', 'src', 'http', 'static.js'), 'utf8');
+  const fnStart = src.indexOf('export function serveStatic');
+  assert.ok(fnStart > 0, '必须能找到 serveStatic');
+  const fnBody = src.slice(fnStart, src.indexOf('\nexport ', fnStart + 10) > 0 ? src.indexOf('\nexport ', fnStart + 10) : src.length);
+  assert.match(
+    fnBody,
+    /isSameFile\s*\(/,
+    'serveStatic 必须调用 isSameFile —— 删掉调用点等于删掉这条 TOCTOU 防线',
+  );
 });

@@ -2,6 +2,7 @@
 import { route, match, navigate, currentPath } from './router.js';
 import { getState, setState, subscribe } from './store.js';
 import { renderLogin } from './views/login.js';
+import { escapeHtml } from './escape.js';
 
 // 演示版：?demo=1 时用 localStorage 适配器；正式版走真实 API。
 const isDemo = new URLSearchParams(window.location.search).get('demo') === '1';
@@ -17,7 +18,7 @@ function renderHome() {
   const { user } = getState();
   el.innerHTML = `
     <h1>赛事平台</h1>
-    ${user ? `<p>已登录：${user.name}</p>` : '<p class="muted">未登录</p>'}
+    ${user ? `<p>已登录：${escapeHtml(user.name)}</p>` : '<p class="muted">未登录</p>'}
     <nav>
       <a href="#/login">登录</a>
       <a href="#/leaderboard">榜单</a>
@@ -63,7 +64,7 @@ async function render() {
     const el = await found.view(ctx);
     app.replaceChildren(el);
   } catch (e) {
-    app.innerHTML = `<div class="card err">${e.message}</div>`;
+    app.innerHTML = `<div class="card err">${escapeHtml(e.message)}</div>`;
   }
 }
 

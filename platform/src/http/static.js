@@ -1,6 +1,6 @@
 // src/http/static.js — 静态文件服务
 // 依据：设计文档 §14.2。生产环境静态资源由 nginx 直出，这里是内网/本地兜底。
-import { createReadStream, openSync, fstatSync, closeSync } from 'node:fs';
+import { createReadStream, openSync, fstatSync, closeSync, realpathSync, statSync } from 'node:fs';
 import { resolve, sep, extname } from 'node:path';
 
 const MIME = {
@@ -35,6 +35,25 @@ export function serveStatic(webDir, req, res) {
   const target = resolve(root, `.${relPath}`);
   if (target !== root && !target.startsWith(root + sep)) return false;
 
+  // ⛔ 终审修正（Important，I-1）：**符号链接逃逸**。
+  //    上面的边界比较只作用于**路径字符串** —— resolve() 规范化路径但
+  //    **不解析符号链接**。web/ 下一个指向根外的软链（部署脚本把 data/ 软链进
+  //    web/、静态资源目录指向共享卷）会让 web 根之外的文件被 HTTP 读走。
+  //    终审实测：ln -s /etc web/etclink → GET /etclink/passwd → 200 + /etc/passwd 全文。
+  //    这里把**根**与**目标**都解析成真实路径再比一次边界。
+  let realRoot;
+  let realTarget;
+  let linkStat;
+  try {
+    realRoot = realpathSync(root);
+    realTarget = realpathSync(target);
+    linkStat = statSync(realTarget);
+  } catch {
+    // 目标不存在（404）或根不存在 → 不当静态资源处理
+    return false;
+  }
+  if (realTarget !== realRoot && !realTarget.startsWith(realRoot + sep)) return false;
+
   // ⚠️ **先打开再取元数据**，而不是 statSync 之后再 open：
   //    stat 与 open 之间存在 TOCTOU 窗口 —— 「热部署时先删掉整个 web 目录、
   //    再拷入新版本」正好落在这个窗口里，open 失败 → 读流抛出一个**无人监听的
@@ -50,6 +69,12 @@ export function serveStatic(webDir, req, res) {
     return false;
   }
   if (!stat.isFile()) {
+    closeSync(fd);
+    return false;
+  }
+  // ⚠️ realpath → open 之间仍有一个窗口：软链可能被换成别的文件。
+  //    用 dev/ino 对账堵住 —— 打开后的 inode 必须与 realpath 看到的一致。
+  if (!isSameFile(stat, linkStat)) {
     closeSync(fd);
     return false;
   }
@@ -72,6 +97,22 @@ export function serveStatic(webDir, req, res) {
   });
   pipeFd(res, fd);
   return true;
+}
+
+/**
+ * 判断两个 stat 是否指向**同一个文件**（dev + ino 对账）。
+ *
+ * ⛔ 终审修正（Important，I-1）：realpath 与 open 之间存在 TOCTOU 窗口 ——
+ *    软链可能在两步之间被换成别的文件。用 dev/ino 对账把窗口堵上。
+ *
+ * 单独导出是为了能**直接测这条防线**：竞态本身无法稳定复现，
+ *    但「两个不同的文件不得被判为同一个」可以钉死。
+ *    （dev+ino 是 POSIX 的文件身份；跨平台稳定 —— Windows 下同样有 ino，
+ *      拿不到时 dev/ino 相同仍会走同一条拒绝路径，不影响正确性。）
+ */
+export function isSameFile(statA, statB) {
+  if (!statA || !statB) return false;
+  return statA.dev === statB.dev && statA.ino === statB.ino;
 }
 
 /**

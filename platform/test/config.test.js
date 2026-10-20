@@ -186,3 +186,19 @@ test('破同分链每一项都必须标注来源文档（C-03 落地要求）', 
   delete broken.tiebreak.chain[1].source;
   assert.ok(validateRules(broken).some((e) => e.includes('source')));
 });
+
+test('权重合计的容差必须严格：合计 101% 也要被拒绝（终审 I-6-6）', () => {
+  // ⛔ 终审发现（Important）：权重合计的容差是 1e-9。把容差放宽到 0.02 后，
+  //    **权重合计 101% 的配置能启动** —— 榜单整体错位 1% 而系统不报错。
+  //    rule-decisions.md:158 明写「C-01 如果被硬编码，初赛榜单**整体错位**且不报错」
+  //    —— 这正是这类 bug 的形状。
+  const { rules } = loadRules(rulesDir);
+  const broken = structuredClone(rules);
+  // 把初赛第一个维度的权重 +0.01 → 合计 101%
+  broken.scoring.initial.dimensions[0].weight += 0.01;
+  const errors = validateRules(broken);
+  assert.ok(
+    errors.some((e) => e.includes('scoring.initial') && e.includes('权重合计')),
+    `合计 101% 必须被拒绝，实际校验结果：${JSON.stringify(errors)}`,
+  );
+});
