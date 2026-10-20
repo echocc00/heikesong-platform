@@ -563,11 +563,13 @@ export function readMigrationFiles(dir) {
   const files = readdirSync(dir)
     .filter((f) => f.endsWith('.sql'))
     .map((name) => {
-      // 版本号必须形如 NNN_name.sql —— 严格正则，不接受退化写法。
-      // ⛔ 不能用 Number(name.split('_')[0])：
-      //    Number('') === 0 会把 "_init.sql" 当成版本 0；
-      //    Number('1e3') === 1000 会把 "1e3_x.sql" 静默解析成版本 1000，
-      //    在「迁移版本号是全局唯一序位」（001=P0 … 006=P5）上开出一个静默缺口。
+      // 严格解析：文件名必须形如 NNN_name.sql。
+      // ⛔ 不能用 Number(name.split('_')[0])：那样 '_init.sql'（Number('')===0）、
+      //    '1e3_x.sql'（Number('1e3')===1000）会被静默当成合法版本号 ——
+      //    在「全局唯一序位」（001=P0、002=P1 … 006=P5）上开出一个静默缺口。
+      //    依据：docs/superpowers/plans/INTERFACES.md「迁移版本号是全局唯一序位，
+      //    002 起依次是 P1→P5」；同文档的重复版本号检查也以 '_' 为分隔符
+      //    （ls -1 *.sql | cut -d_ -f1 | sort | uniq -d）。
       const m = /^(\d+)_/.exec(name);
       if (!m) {
         throw new Error(`迁移文件名必须形如 NNN_name.sql: ${name}`);
@@ -575,10 +577,12 @@ export function readMigrationFiles(dir) {
       const version = Number(m[1]);
       return { version, name, sql: readFileSync(join(dir, name), 'utf8') };
     })
-    // 先按版本号升序；**同版本号再按文件名按字节序排序** ——
-    // readdirSync 的返回顺序在 POSIX 里未定义（ext4/xfs 是 hash 序），
-    // 不二次排序的话，同版本号冲突的错误信息里两个文件名的先后会随机，
-    // 跨平台 CI 会出现偶发红（违反 R-OPS-02 跨平台稳定）。
+    // 排序：版本号升序 + 同版本号按文件名字节序。
+    // ⚠️ readdirSync 的返回顺序在 POSIX 里未定义（ext4/xfs 是 hash 序），
+    //    只按 version 排序会让同版本号的两个文件谁在前取决于 readdir 顺序 →
+    //    错误信息里的文件名先后随机 → CI 偶发红。
+    //    比较用字节序（< / >），**不用 localeCompare**：后者依赖 locale，跨平台不一致。
+    //    依据：R-OPS-02「跨平台稳定」。
     .sort((a, b) => (a.version - b.version) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 
   // 重复版本号 → 抛错。必须在任何迁移 SQL 落地**之前**发现，
