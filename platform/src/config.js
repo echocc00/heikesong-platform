@@ -30,6 +30,10 @@ function readJson(path) {
 
 // 归一化策略四选一（设计文档 §6.2 裁决：可切换）
 const VALID_NORMALIZATIONS = ['zscore', 'median', 'trimmed', 'bayes'];
+// 归一化的兜底策略二选一（rule-decisions.md C-05 裁决）：
+//   global —— 退回全局均值方差（S7 §3.1 原文）；raw —— 直接用原始分。
+//   缺这个键 = 样本不足时的归一化行为无定义，必须当场拒绝。
+const VALID_FALLBACKS = ['global', 'raw'];
 // 里程碑确认方只有两种：企业侧确认 / 评委确认
 const VALID_CONFIRMERS = ['enterprise', 'judge'];
 
@@ -46,6 +50,11 @@ function hasDuplicateKeys(items) {
 // 校验器的第一职责是**自己不崩**、给出可读错误，而不是把裸 TypeError 抛给调用方。
 function hasBadItem(items) {
   return items.some((i) => i === null || typeof i !== 'object');
+}
+
+// 维度必须都有 key —— 否则算分时无法把分数映射回维度。
+function hasMissingKey(items) {
+  return items.some((i) => typeof i.key !== 'string' || !i.key);
 }
 
 export function validateRules(rules) {
@@ -67,6 +76,11 @@ export function validateRules(rules) {
     rules?.solvability?.version,
     rules?.milestones?.version,
   ].filter((v) => v !== undefined && v !== null && v !== '');
+  // 9 份必须**都有** version —— 只校验「存在的那几份全等」是不够的：
+  // 缺一份时 loadRules 对外报的 version 会取到别人的值，等于说谎。
+  if (versionValues.length < 9) {
+    push(`规则配置有 ${9 - versionValues.length} 份缺少 version 字段`);
+  }
   if (versionValues.length > 1) {
     const distinct = [...new Set(versionValues)];
     // ⚠️ distinct 是**数组**（Set 被展开），判重数用 .length —— 用 .size 会拿到
@@ -109,6 +123,20 @@ export function validateRules(rules) {
     if (!VALID_NORMALIZATIONS.includes(cfg.normalizationStrategy)) {
       push(`scoring.${key} normalizationStrategy 非法`);
     }
+    // C-05 裁决：兜底策略可配 —— "global" 退回全局均值方差（S7 §3.1 原文），
+    // "raw" 直接用原始分。缺这个键 = 样本不足时归一化怎么走没有定义。
+    if (!VALID_FALLBACKS.includes(cfg.fallback)) {
+      push(`scoring.${key}.fallback 必须是 ${VALID_FALLBACKS.join(' / ')}（C-05 裁决）`);
+    }
+    // C-01 裁决：初赛企业确认权重锁定 10%（由 S7 §2.1 权重表合计正好 100% 反推）。
+    // 只靠测试锁不住 —— 同时改 wEnterprise 与企业维度权重（保持合计 100%）能绕过测试，
+    // 所以校验器也要锁。改动此项须同步改 rule-decisions.md 的 C-01。
+    if (cfg.conflictRef === 'C-01' && Math.abs(cfg.wEnterprise - 0.10) > 1e-9) {
+      push(`scoring.${key}.wEnterprise 必须为 0.10（C-01 裁决）`);
+    }
+    if (hasMissingKey(cfg.dimensions)) {
+      push(`scoring.${key}.dimensions 存在缺少 key 的维度`);
+    }
     if (hasDuplicateKeys(cfg.dimensions)) {
       push(`scoring.${key}.dimensions 存在重复 key`);
     }
@@ -130,6 +158,11 @@ export function validateRules(rules) {
     }
     if (hasDuplicateKeys(chain)) {
       push('tiebreak.chain 存在重复 key');
+    }
+    // C-03 落地要求：有序链的**每一项**都要标注来源文档与生效条件
+    // （生效条件 = scope，已有；来源文档 = source，必须有）。
+    if (chain.some((c) => typeof c.source !== 'string' || !c.source)) {
+      push('tiebreak.chain 存在缺少 source 的项（C-03 要求逐项标注来源文档）');
     }
   }
 
@@ -174,6 +207,9 @@ export function validateRules(rules) {
   } else if (hasBadItem(regDims)) {
     push('registration.dimensions 含非对象元素');
   } else {
+    if (hasMissingKey(regDims)) {
+      push('registration.dimensions 存在缺少 key 的维度');
+    }
     const sum = weightSum(regDims);
     if (Math.abs(sum - 1) > 1e-9) {
       push(`registration.dimensions 权重合计 = ${sum.toFixed(4)}，必须等于 1`);
@@ -187,6 +223,9 @@ export function validateRules(rules) {
   } else if (hasBadItem(sol.dimensions)) {
     push('solvability.dimensions 含非对象元素');
   } else {
+    if (hasMissingKey(sol.dimensions)) {
+      push('solvability.dimensions 存在缺少 key 的维度');
+    }
     const sum = weightSum(sol.dimensions);
     if (Math.abs(sum - 1) > 1e-9) {
       push(`solvability.dimensions 权重合计 = ${sum.toFixed(4)}，必须等于 1`);
@@ -199,6 +238,16 @@ export function validateRules(rules) {
   } else if (hasDuplicateKeys(sol.grades)) {
     push('solvability.grades 存在重复 key');
   } else {
+    // 反向区间（minScore > maxScore）永远匹配不到任何分数 —— 当场拒绝。
+    for (const g of sol.grades) {
+      if (typeof g.minScore !== 'number' || typeof g.maxScore !== 'number'
+        || g.minScore > g.maxScore) {
+        push(
+          `solvability.grades 等级 ${g.key} 的区间非法`
+          + `（minScore=${g.minScore}, maxScore=${g.maxScore}）`,
+        );
+      }
+    }
     // A/B/C/D 是**互斥**的评分区间：重叠会让同一个分数落进两个等级，
     // 评级结果取决于查表顺序 —— 不可复算。
     const sorted = [...sol.grades].sort((a, b) => a.minScore - b.minScore);

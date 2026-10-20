@@ -3,10 +3,11 @@
   "version": "2026-10-20",
   "conflictRef": "C-01",
   "source": "S7 §2.1 初赛权重表 + §3.1 评分公式",
-  "note": "初赛 wEnterprise=0.10 —— 依据权重表合计正好 100% 反推，见 rule-decisions.md C-01",
+  "note": "初赛 wEnterprise=0.10 —— 依据权重表合计正好 100% 反推，见 rule-decisions.md C-01；fallback=global 依据 C-05 裁决（S7 §3.1 原文：样本数<5 退回全局均值方差）",
   "wEnterprise": 0.10,
   "normalizationStrategy": "zscore",
   "minSamplesForJudgeNormalization": 5,
+  "fallback": "global",
   "trimOutliers": true,
   "minJudgesForTrim": 5,
   "dimensions": [

@@ -131,3 +131,58 @@ test('solvability.grades 的评分区间不得重叠', () => {
   broken.solvability.grades[1].minScore = broken.solvability.grades[0].minScore; // B 覆盖到 A
   assert.ok(validateRules(broken).some((e) => e.includes('区间重叠')));
 });
+
+// ── 以下 6 条来自 Task 3 评审（rule-decisions 裁决的落地方式未落实）──────────
+
+test('归一化的兜底策略 fallback 必须是 global 或 raw（C-05 裁决）', () => {
+  const { rules } = loadRules(rulesDir);
+  assert.equal(rules.scoring.initial.fallback, 'global');
+  assert.equal(rules.scoring.final.fallback, 'global');
+  const broken = structuredClone(rules);
+  delete broken.scoring.final.fallback;
+  assert.ok(validateRules(broken).some((e) => e.includes('fallback')));
+});
+
+test('C-01 裁决由运行时校验器锁住（不只靠测试）', () => {
+  const { rules } = loadRules(rulesDir);
+  const broken = structuredClone(rules);
+  // 同时改 wEnterprise 与企业维度权重，并把完成度调低 —— 合计仍是 100%。
+  // 这正是「只靠测试锁不住」的绕过路径。
+  broken.scoring.initial.wEnterprise = 0.20;
+  const ent = broken.scoring.initial.dimensions.find((d) => d.seat === 'enterprise');
+  ent.weight = 0.20;
+  broken.scoring.initial.dimensions.find((d) => d.key === 'completeness').weight = 0.15;
+  const errors = validateRules(broken);
+  assert.ok(
+    errors.some((e) => e.includes('C-01')),
+    'C-01 裁决的初赛企业确认权重 10% 必须由校验器锁住',
+  );
+});
+
+test('solvability.grades 的反向区间（min > max）会被拒绝', () => {
+  const { rules } = loadRules(rulesDir);
+  const broken = structuredClone(rules);
+  broken.solvability.grades[0].maxScore = 6; // A 变成 10-6，永远匹配不到
+  assert.ok(validateRules(broken).some((e) => e.includes('区间非法')));
+});
+
+test('维度缺少 key 会被拒绝（否则算分无法映射回维度）', () => {
+  const { rules } = loadRules(rulesDir);
+  const broken = structuredClone(rules);
+  delete broken.scoring.final.dimensions[0].key;
+  assert.ok(validateRules(broken).some((e) => e.includes('缺少 key')));
+});
+
+test('某份配置缺少 version 会被拒绝（不能只校验存在的那几份）', () => {
+  const { rules } = loadRules(rulesDir);
+  const broken = structuredClone(rules);
+  delete broken.tiebreak.version;
+  assert.ok(validateRules(broken).some((e) => e.includes('缺少 version')));
+});
+
+test('破同分链每一项都必须标注来源文档（C-03 落地要求）', () => {
+  const { rules } = loadRules(rulesDir);
+  const broken = structuredClone(rules);
+  delete broken.tiebreak.chain[1].source;
+  assert.ok(validateRules(broken).some((e) => e.includes('source')));
+});
