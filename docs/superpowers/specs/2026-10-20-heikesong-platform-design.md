@@ -7,7 +7,7 @@
 | **作者** | 零号备战组（T1 第 2 组）· MCode 协作产出 |
 | **仓库** | `/Users/mac/soft/AI/orca/heikesong` |
 | **代码目录** | `platform/` |
-| **配套文档** | [`docs/requirements-traceability.md`](../../requirements-traceability.md)（需求溯源表，99 条）<br>[`docs/rule-decisions.md`](../../rule-decisions.md)（规则冲突登记表，6 条） |
+| **配套文档** | [`docs/requirements-traceability.md`](../../requirements-traceability.md)（需求溯源表，96 条）<br>[`docs/rule-decisions.md`](../../rule-decisions.md)（规则冲突登记表，6 条） |
 
 ---
 
@@ -76,18 +76,18 @@
 
 完整溯源表见 [`docs/requirements-traceability.md`](../../requirements-traceability.md)。此处只给结论：
 
-**分母声明**：需求全集 = **99 条**｜来源 = 任务书 2.0 + S7 + S10 + SABC + 顶层文档 + 项目自身复盘（6 类一手文档）｜独立源数 = 6（**同一作者体系，非独立互证**）
+**分母声明**：需求全集 = **96 条**｜来源 = 任务书 2.0 + S7 + S10 + SABC + 顶层文档 + 项目自身复盘（6 类一手文档）｜独立源数 = 6（**同一作者体系，非独立互证**）
 
 | 状态 | 条数 | 对实现的含义 |
 |---|---|---|
-| 已定 | 24 | 硬编码行为不可改 |
-| **机制件（待组委会确认）** | **56** | **必须配置化** |
-| 我方假设 / 待验证 | 19 | 必须留可调参数与回测接口 |
+| 已定 | 19 | 硬编码行为不可改 |
+| **机制件（待组委会确认）** | **60** | **必须配置化** |
+| 我方假设 / 待验证 | 8 | 必须留可调参数与回测接口 |
 | 规则空白 | 2 | 需组委会拍板 |
 | 非功能（推导） | 8 | 由用户决策直接推导 |
 
 > **⭐ 贯穿全表的第一条设计结论**
-> **56 条机制件级需求全部来自我们自己尚未被组委会确认的设计。硬编码 = 委员会改一次数值就要改代码、重新部署、重新验证。**
+> **60 条机制件级需求全部来自我们自己尚未被组委会确认的设计。硬编码 = 委员会改一次数值就要改代码、重新部署、重新验证。**
 > → 核心规则全部走**声明式配置 + 纯函数引擎 + 计算留痕**。**换一次规则 = 改一份 JSON。**
 
 > **⭐ 第二条设计结论**
@@ -98,7 +98,110 @@
 
 ## 3. 开源调研与借鉴结论
 
-> ⏳ *本节待调研子任务回填（4 条轴并行调研中）。*
+### 3.1 调研方法与分母
+
+**分母声明**：本次分母 = **11 个黑客松/竞赛管理平台 + 9 个 headless 后端 + 8 个评分/表单/权限类项目**，共 28 个候选仓库｜来源 = GitHub API 元数据 + 各仓库源码 tarball 逐文件精读 + 官方许可证原文 + 官方文档站｜独立源数 = 28（**均为独立仓库，非同一来源复制**）
+
+**检索方式**：`dribdat/awesome-hackathon`（311★，策展清单）作为入口 → GitHub API 检索（受限时改用 `raw.githubusercontent` 与 `codeload.github.com` tarball）→ 逐仓库读源码、读 LICENSE 原文、读官方部署文档。
+
+### 3.2 一句话结论
+
+> **没有任何一个开源项目能整体直接用；也没有必要整体 fork。**
+> 但它们把三件最难从零想清楚的事给出了**可直接照抄的 MIT 实现**；而我们的差异化（双签 / 归一化 / 段位 / 滚动榜 / 匿名 / 回避）**全行业都是空白，必须自建**。
+
+**决定性证据**：对 11 个黑客松平台全仓检索 `z_score / standardize / winsor / outlier / percentile` —— **零命中**。
+**S7 设计的评委宽严归一化，在全行业开源项目里没有先例。** 这既证明必须自建，也印证了 S7 §7 自陈的「无先例、须首届后回测」。
+
+### 3.3 零件级借鉴清单（这才是"不重复造轮子"的答案）
+
+> **【决策】不 fork 任何整仓，只移植以下零件级实现。**
+
+| # | 零件 | 来源 | 许可证 | 移植成本 | 照搬前必须改的 |
+|---|---|---|---|---|---|
+| 1 | **并列名次算法**（同分同名次，1224 式） | `HackSC/hibiscus` `libs/calculateRankings.ts` | MIT | 0.5d | ⚠️ 上游 `calculatePoints.ts` 的 `switch` **无 break 穿透**，实际是 18/8/3/1 而非 10/5/2/1，相对顺序不变但数值错——**抄时必须修** |
+| 2 | **赛事分 / 行为分双列 + 行为分发放日志** | `HackSC/hibiscus` `leaderboard` / `bonus_points` 表 | MIT | 0.5d | ⚠️ 其 `getRank` 排序时又 `bonus_points + event_points` **相加** → 与"行为分不进总分"直接冲突，**必须改成只按 event_points 排** |
+| 3 | **评审数据模型三件套**（多评委×多维度） | `deltahacks/portal` `prisma/schema.prisma` | MIT | 2–3d | 加 `Dimension{weight}`、匿名映射表、企业双签字段；其聚合层有 **bug**：按 trackId 过滤时 `generalScore` 因 `question.trackId === null` 恒假而恒为 0 |
+| 4 | **贝叶斯评委宽严模型**（140 行纯 Python 自实现 digamma/lgamma，零第三方依赖） | `hack-the-back` `app/services/crowd_bt.py` | MIT | 1–2d | 改为 JS/TS 实现；作为 **z-score 的并行备选策略**，用于评委少、样本少的场景（见 C-05） |
+| 5 | **幂等 + 行锁 + 只接受当前分配** | `hack-the-back` `app/services/judging.py` | MIT | 0.5d | 加"同一账号多设备协同投票"检测 |
+| 6 | **破同分双保险**（同分先到者胜 + **行 ID 兜底**） | `CTFd/CTFd` `utils/scores/__init__.py` | Apache-2.0 | 0.5d | 保留双保险：不同数据库时间精度不同，只用一个时间字段会不稳 |
+| 7 | **限频三层**（滑动窗口计数 + SETNX 提交锁 + INCR 每分钟配额） | `CTFd/CTFd` `api/v1/challenges.py` | Apache-2.0 | 0.5d | 键名换成维度 ID；再加**评委级配额**（每人每小时打分次数上限） |
+| 8 | **可见性分档 + 受众白名单** | `CTFd/CTFd` `utils/config/visibility.py` + `Audiences`/`AudienceMembers` | Apache-2.0 | 1d | CTFd 只有「整档位 + 受众白名单」，**没有按名次区间分层** → 我们要新增 `min_visible_rank` + `min_visible_tier` |
+| 9 | **规则引擎三态语义**（200+空集 / 404 / 403） | `pocketbase` Collection API Rules | MIT | 0.5d | 把 PocketBase 的过滤表达式 DSL 换成我们的 scope 谓词生成器 |
+| 10 | **Admin Dashboard 三段式 + API Preview** | `pocketbase` | MIT | 1d | 三段导航改成「项目池/人才池/资源池」；API Preview 改成"当前用户在这条记录上能看什么" |
+| 11 | **加权算分公式**（`percentile = (avg+shift)/(max+shift)`，`Σ percentile × weight` → 0–1） | `AmericanAirlines/Hangar` `api/criteriaJudgingSession/id/results/get.ts` | MIT | 0.5d | ⚠️ Hangar **只校验单个 weight∈[0.1,1]，没有校验权重和=1**（原作者留了 TODO）→ **我们必须自己加**（见 §6.7 fail-fast） |
+| 12 | **rubric 不可变快照 + hash 去重** | `edx/edx-ora2` `base.py` | AGPL-3.0 ⚠️ | 0.5d | ⛔ **只读思路，代码独立实现**。snapshot 表结构我们自建 |
+| 13 | **复核/申诉分阶段状态机**（含幂等守卫：只处理首次 edit） | `openreview/openreview-py` `*/process/*` | MIT | 1d | 状态改为我们的 `SUBMITTED → PENDING_REVIEW → CONFIRMED → FINALIZED`，加分叉 `FLAGGED`/`REJECTED` |
+| 14 | **冲突申报**（venue 级策略 + 自动/自报双路径） | `openreview/openreview-py` `compute_conflicts_process.py` | MIT | 0.5d | OpenReview 是**分配前剔除**，我们要的是**评审后作废 + 留档** → 另加 `recusal_records` 表 |
+| 15 | **赛段定义 + 阶段准入校验**（YAML 加载、字段级 min/max/test） | `dribdat/dribdat` `user/constants.py` `PR_STAGES` | MIT | 1d | 我们要把"阶段准入校验"改成"赛段窗口 + 结算条件" |
+| 16 | **公开榜单 API + 赛程 iCal 订阅** | `dribdat/dribdat` `public/api.py` | MIT | 0.5d | 加鉴权分级（公开只读 vs 机器人写） |
+| 17 | **赛制设计 SOP + 评委人数公式 + stack ranking** | `MLH/mlh-hackathon-organizer-guide` | CC-BY-4.0 | 0.5d | ⚠️ 复制文字**须署名**（MLH + 链接 + 改动说明）。stack ranking **只能作备选**——它丢失分差信息，与我们的「\|d\|>10 触发复核」冲突 |
+| 18 | **组队 MILP 撮合**（Pyomo/HiGHS） | `dribdat/dribdat` `matching.py` | MIT | 3–5d | ⚠️ **HiGHS 需独立安装，违反零依赖 → 二期再做**。一期用「选手自选 + 组队长确认 + 组委会兜底配对」 |
+
+**总计：18 个零件可移植，其中 14 个在一期落地（#4 与 #18 归入二期的算法备选与组队优化）。**
+
+### 3.4 全行业空白清单（必须自建的部分，也是我们的护城河）
+
+| # | 能力 | 全 11 个平台的现状 |
+|---|---|---|
+| 1 | **企业签字双签工作流**（双主体、各自签名、任一缺失即"部分生效"的状态机 + 审计） | ❌ 零实现。portal 的 `signature` 是参赛同意书与监护人签字，不是评审双签 |
+| 2 | **z-score 归一化 + 去极值 + 百分位** | ❌ 零实现（全仓关键词检索零命中）。实际聚合只有三种：贝叶斯 μ 排序 / 名次映射成分数再平均 / 评委间算术平均 |
+| 3 | **段位体系**（档位阈值 + 升降级 + 权益映射） | ❌ 零实现。hibiscus 的 battlepass 只有"积分 + 排行榜"，前三名是皇冠图标，**无档位阶梯** |
+| 4 | **滚动榜**（赛段时间序列快照） | ❌ 所有榜单都是终态快照，无按赛段存储的历史榜单模型 |
+| 5 | **匿名评审映射**（作品编号 ↔ 真实队伍） | ❌ 三个有评审的项目都实名存 `judgeId` 并直接展示作品名 |
+| 6 | **利益冲突矩阵 + 回避改派** | ⚠️ 只有 JunctionApp 的 `allowVoteOnOwnProject` 与 hackerspace3 的 `cannot_judge_your_own_team`（仅"自己队"），无同校/同公司/同赛道 |
+| 7 | **完整防刷分**（多账号协同投票检测） | ⚠️ Gavel 系做了配对/幂等/节流，但**无任何项目做多账号协同检测**；dribdat 的行为分榜是纯计数、零防刷 |
+| 8 | **可解释评分回执**（选手能看到"我为什么得这个分"） | ❌ 零实现 |
+
+> **⭐ 这 8 条就是本平台真正的护城河。** 它们不是"我们没找到"，是**全行业都没做**。
+
+### 3.5 明确不借鉴的清单及理由
+
+| 项目 | 不借鉴的理由 |
+|---|---|
+| **JunctionApp**（AGPL-3.0） | AGPL §13 网络服务即触发开源义务；根 `package.json` 固定 **Node 12.3.1（已 EOL）**；Auth0 需自建 Authorization Extension 并手工 PUBLISH RULES；210 open issues |
+| **Hackerspace3**（AGPL-3.0） | AGPL；Rails 栈与我们的移植目标不符；GraphQL API 只是骨架（`resolve_type` 直接 raise） |
+| **halo** | ⚠️ **仓库无 LICENSE 文件**（README 声称 MIT，API `license=None`）→ 法务不清不可抄码；且评审/榜单完全为零 |
+| **OpenHackathon-service** | ⚠️ **后端仓无任何许可证** → 后端代码不可复用，只能看设计 |
+| **Formbricks** | 主体 **AGPLv3** + `apps/web/modules/ee/` 为 **EE 商业许可**；⚠️ 根 LICENSE 声称 `packages/js`/`packages/api` 为 MIT，但**这两个目录在当前 main 分支已不存在**（404）；真正承载问卷运行时的 `packages/surveys` 不在 MIT 清单内 → 按根 LICENSE 措辞应视为 AGPLv3 |
+| **Directus / NocoDB** | **许可证已变**：Directus = 自定义 MSCL-1.0-GPL（source-available，禁商业竞品用途）；NocoDB **2026-01-09 起从 AGPL-3.0 切换为 Sustainable Use License**（限内部/非商业）。且都需联网装依赖、自带数据库 |
+| **Baserow / Strapi / Payload / Appwrite / Hasura** | 全部需联网安装或拉镜像；Baserow/Hasura **强制 Postgres**；Appwrite **需 Postgres + Redis + 多容器**；Strapi 的 EE 目录是商业许可 |
+| **deltahacks/portal 的聚合层** | ⚠️ 已知 bug：按 trackId 过滤时 `generalScore` 恒为 0（通用维度被静默丢弃）。**只抄 schema，不抄聚合** |
+| **hibiscus 的 `getRank`** | 排序时把 `bonus_points + event_points` **相加** → 与"行为分不进总分"直接冲突。**只抄名次算法与表结构，不抄排序** |
+| **dribdat 的 `calculate_score()`** | 是"资料完整度"启发式（progress + 字段填写加分），**不是评审分**，绝不能当评审用 |
+| **scipy / numpy** | 它们是 Python 生态，我们零依赖路线用不到。z-score 原语在 JS 里 20 行可写（且**我们的口径与 `scipy.stats.zscore` 不同**：我们对「评委×维度」归一化，不是对轴归一化） |
+
+### 3.6 诚实记录：一个值得正面回应的反论
+
+MLH 的组织者指南明确建议：**不要自建评审系统，用 Gavel 或 Google Sheet 更稳**。
+
+**这条建议在多数情况下是对的，我们为什么仍要自建**：
+
+| MLH 的前提 | 我们的情况 |
+|---|---|
+| 评审是多评委**排序**即可 | 我们要**加权维度分** + 企业签字双签 + 可签名的分数语义 |
+| 评委可以跨赛道打分 | 企业席受 R1 限制只能评本赛道，样本量天然小 |
+| 榜单 = 一次排序结果 | 我们要**双榜并列不合并** + **段位** + **分层公开** + **行为分隔离** |
+| 用 Sheet 意味着规则改动即时生效 | 我们的规则有 60 条待组委会确认 —— Sheet 无法承载配置化 + 可复算 + 审计留档 |
+
+**但这条建议提醒我们一件重要的事**：**不要低估"简单"的收益**。
+→ 因此本设计把规则引擎做成**可切换的归一化策略**（z-score / median / trimmed-mean / 贝叶斯），首届后按实际数据回测选型，而不是一上来就锁死一种。
+
+### 3.7 一个必须正面承认的取舍
+
+调研也带来一条**与我们原设想冲突**的信息：**MLH 的 stack ranking 是一种更稳健的评委宽严归一化方案**——它只关心评委给出的**相对顺序**，天然消除宽严差异，且实现极简。
+
+**但我们不能直接用它**，因为 S7 §4.3 的自评测差异检测依赖**绝对分差**（`d = 自评分 − 评委分`，\|d\| > 10 触发复核）。stack ranking 丢弃分差信息，会让这条复核机制失效。
+
+**【决策】归一化策略做成配置项，四选一，首届时按实际数据回测**：
+
+| 策略 | 出处 | 适合场景 |
+|---|---|---|
+| `zscore`（默认） | S7 §3.1 原文 | 评委数充足、样本量够 |
+| `median` | ORA 思路（只读，独立实现） | 评委少、极端评委多时更稳健 |
+| `trimmed` | Hangar 思路（20 次随机 + 截尾均值） | 顺序偏见明显时 |
+| `bayes` | hack-the-back `crowd_bt.py`（MIT） | 样本极少时的兜底 |
+
+**当前仍按 S7 原文实现 `zscore` 为默认**，但把策略切换的成本在 P2 阶段就做掉——避免首届结束后才发现要重写聚合层。
 
 ---
 
@@ -148,14 +251,32 @@
 | 实时推送 | SSE（`text/event-stream`） | 单向推送够用；已实测零依赖可用 |
 | 会话 | HttpOnly Cookie + 服务端 session 表 | 同上 |
 
-**已实测验证**（非推断）：
+**已实测验证**（本机 Node 22.23.2，非推断）：
 
 | 能力 | 结果 |
 |---|---|
 | `node:sqlite` 事务 / `user_version` 迁移 / JSON 函数 / 窗口函数 / CTE / WAL | ✅ 全可用 |
-| `VACUUM INTO` 一致性备份 | ✅ 可用 |
+| **`sqlite.backup()` 一致性备份 API** | ✅ 可用（Node ≥22.16.0 引入）——**优于 `VACUUM INTO`，官方推荐** |
 | `scrypt` 密码哈希 / `randomBytes` token / HMAC / `timingSafeEqual` | ✅ 可用 |
 | SSE 零依赖推送 | ✅ 可用 |
+
+**【决策】目标运行时 Node ≥ 22.5，开发与测试锚定本机 22.23.2**。
+**理由**：Node 22.18+ 起默认开启 TypeScript type stripping（`.ts` 可直接 `node server.ts`），所以**后端也能零构建**，不只前端。
+**Node 24 是推荐的生产运行时，但本设计不使用任何 Node-24-only API**：
+- Node 22 没有 `URLPattern`（Node 24 才有）→ **路由手写约 100 行**，不因此抬高运行时门槛
+- 生命周期：Node 22 EOL **2027-04-30**；Node 24 EOL **2028-04-30**（2026-10-20 进维护期）
+- **开赛前把版本写死，不用 `latest`**。生产建议 Node 24，但代码在 22 与 24 上都能跑——这正是可移植性的含义
+
+**【决策】三条来自 SQLite 官方文档的硬约束**（sqlite.org 原文，非印象）：
+
+| 约束 | 原文依据 | 对我们的含义 |
+|---|---|---|
+| **单写者** | 「There can only be a single writer at a time」 | ⛔ **禁止多 Node worker 进程同时写同一个 SQLite 文件**——这是 `SQLITE_BUSY` 的真正来源。扩容只能加读，不能加写进程 |
+| **WAL 同主机** | 「All processes using a database must be on the same host computer; WAL does not work over a network filesystem」 | 一旦要**多机部署**，必须换 Postgres，没有第三条路 |
+| **NFS 不可用** | fcntl 锁在 NFS 上不可靠 | 数据库文件不能放网络盘 |
+
+**【决策】`node:sqlite` 是同步 API，慢查询会阻塞 event loop**（官方：「All APIs exposed by this class execute synchronously」）。
+→ 全部 SQL **预编译 statement + 参数化**；**报表与大导出绝不放在请求路径**，放定时任务。
 
 **为什么不用 Express / Fastify / React**：每一个第三方依赖都在"移植性"这条约束上扣分。Express 简单，但要 `npm install`；React 要装依赖 + 构建。**对一个要交给组员、交给组委会、交给下一届城市联络员的系统，"别人跑不起来"是最大的实际风险**，而它恰恰是这类技术栈最常见的失败模式。
 
@@ -316,7 +437,43 @@ CREATE TABLE audit_log (
   id TEXT PRIMARY KEY, actor_id TEXT, action TEXT NOT NULL,
   entity TEXT, entity_id TEXT, detail_json TEXT, created_at TEXT NOT NULL
 );
+
+-- 增量统计（★ z-score 的输入，避免每次全量重算）
+CREATE TABLE score_stats (
+  judge_id TEXT NOT NULL, dimension TEXT NOT NULL,
+  n INTEGER NOT NULL, mean REAL NOT NULL, sum_sq REAL NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (judge_id, dimension)
+);
+
+-- 一票破同分（加时陈述）
+CREATE TABLE tiebreak_round (
+  id TEXT PRIMARY KEY, stage_id TEXT NOT NULL, tied_group_key TEXT NOT NULL,
+  statement_deadline TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE TABLE tiebreak_votes (
+  tiebreak_round_id TEXT NOT NULL REFERENCES tiebreak_round(id),
+  voter_id TEXT NOT NULL, team_id TEXT NOT NULL, score REAL NOT NULL,
+  submitted_at TEXT NOT NULL,
+  PRIMARY KEY (tiebreak_round_id, voter_id, team_id)   -- ★ 唯一约束保证一人一票
+);
+
+-- 人工复核与防作弊
+CREATE TABLE flagged_reviews (
+  id TEXT PRIMARY KEY, stage_id TEXT NOT NULL, submission_id TEXT,
+  kind TEXT NOT NULL,      -- self_vs_judge | burst_submit | identical_peer_pattern | low_variance
+  detail_json TEXT, status TEXT NOT NULL,   -- open | confirmed | rejected
+  reviewed_by TEXT, reviewed_at TEXT, created_at TEXT NOT NULL
+);
+CREATE TABLE recusal_records (       -- ★ 回避留档（S7 §4.2 赛后 6 个月可查）
+  id TEXT PRIMARY KEY, stage_id TEXT, judge_id TEXT NOT NULL, team_id TEXT,
+  reason TEXT NOT NULL, source TEXT NOT NULL,   -- self_declared | detected
+  declared_at TEXT NOT NULL, audit_by TEXT, action TEXT NOT NULL  -- drop_score | reassign
+);
 ```
+
+**【决策】评分记录只增不改（追加式日志），删除一律软删除**。
+理由：Gavel 的 admin 删除逻辑在有投票后改为提示用 "disable" 而非硬删；CTFd 也有 `Discards` 概念。这条直接服务 S7 §4.2「赛后 6 个月可查」——**要能查，就必须不能被悄悄改掉**。
 
 ### 5.3 【决策】两种"企业签字"必须分表
 
@@ -360,7 +517,7 @@ CREATE TABLE pool_resources (id TEXT PRIMARY KEY, enterprise_id TEXT, kind TEXT,
 
 | # | 原则 | 为什么 |
 |---|---|---|
-| 1 | **配置驱动** | 56 条机制件级需求待组委会确认。硬编码 = 改一次数值就要改代码 |
+| 1 | **配置驱动** | 60 条机制件级需求待组委会确认。硬编码 = 改一次数值就要改代码 |
 | 2 | **纯函数** | 规则逻辑可脱离系统完整阅读与单测；评审时能逐行核对 S7/S10 原文 |
 | 3 | **每次计算留 trace** | 榜单必须可复算（S-1）；且降级状态必须可见（S-5） |
 
@@ -381,6 +538,16 @@ z[i][d]    = (s[i][d] − mean(i,d)) / stdev(i,d)
 stdev = 0 → 该评委该维度无区分度 → z = 0，并在 warnings 中记录
 ```
 > ⚠️ **注意口径**：均值/标准差是「**该评委在该维度上的全部打分的**均值」——归一化的是**评委的宽严**，不是队伍的分数。这一条极易实现错，代码注释必须写明。
+>
+> ⛔ **不要用 `scipy.stats.zscore` 的语义**。那是「对给定轴做标准化」，我们的是「对评委的宽严做标准化」，两者数学形式相似、口径不同。
+
+**【决策】归一化策略可切换（4 选 1）**：`zscore`（默认，S7 原文）｜`median`（ORA 思路，只读独立实现）｜`trimmed`（Hangar 思路：多次随机 + 截尾均值）｜`bayes`（hack-the-back `crowd_bt.py`，MIT 可直接移植）。
+**为什么**：S7 §7 自陈「归一化算法……在本赛事场景下的效果未验证」。若把 z-score 写死，首届后发现不合适就要重写聚合层。**做成配置项后，换策略 = 改一份 JSON。**
+
+**【决策】`mean`/`stdev` 增量维护，不在计算时全量重算**：
+`score_stats(judge_id, dimension, n, mean, sum_sq)` 表在每次打分提交时更新，`stdev` 由 `sum_sq` 现算。
+**为什么**：CTFd 的做法是 60 秒 memoize + 事件驱动 `clear_standings()`；我们的 z-score 需要每个评委×每个维度的统计量，若每次发榜都全表重算，成本随评委数与队伍数**相乘**增长。数据量虽小，但**架构上留成增量的**，避免首届数据量上来后被迫重构。
+**但**：**每次发榜仍做一次全量重算并落快照**——因为"可复算"要求榜单能从原始数据重放，增量统计只用于加速与展示。
 
 **Step 3｜去极值**（S7 §3.2）：同维度内去掉一个最高 z、一个最低 z 后取均值；要求该维度有效评委数 ≥ 5，不足则不去极值。
 
@@ -440,6 +607,13 @@ d < −10  → 触发复核：评委向团队提问（只提问，不改分）
 
 **为什么这样排**：三条原规则各自说了一个不同层级的破同分手段，原文档没给它们排序，所以「互评是唯一破同分依据」与「行为分也可以用」才矛盾。排序依据**强度递降**：人工复议 > 评审互评 > 单一维度原始分 > 过程参与度。最后一条 `team_id` 是**新增的**——三份文档都没写，但没有它，同分且全部分数相同时排序不确定，榜单不可复算，违反 S-1。它不影响任何实质名次（走到这一步本身就是并列）。
 
+**【决策】第 6 条用「行 ID 兜底」而不是时间戳兜底**。
+借自 CTFd 的破同分写法：`ORDER BY score DESC, date ASC, id ASC` —— 同分先到者胜，**并用行 ID 兜底**。CTFd 的注释写明了原因：**不同数据库的时间精度不同**，只用一个时间字段会不稳。我们把 `date` 换成「该维度首次达到该分的时间戳」，`id` 换成打分记录的自增 ID，**双保险都保留**。
+
+**【决策】加时陈述用独立表 + 唯一约束**。
+`tiebreak_round`（同分组 + 陈述截止时间）+ `tiebreak_votes`（`PRIMARY KEY(tiebreak_round_id, voter_id, team_id)`）。
+**为什么用唯一约束而不是应用层判断**：一人一票必须由数据库保证。应用层的"先查再插"在并发下会插出两票——**这正是我们项目自己的教训 5「静默的空产出比报错更危险」的同构版本**。
+
 **状态**：⛔ 待组委会确认。若组委会坚持「互评是唯一」，则移除 `enterprise_raw` 与 `behavior` 两项。
 
 ### 6.5 段位与行为分
@@ -497,9 +671,58 @@ d < −10  → 触发复核：评委向团队提问（只提问，不改分）
 
 **角色**：`admin`（组委会）｜`captain`（队长）｜`member`（组员）｜`judge`（评委席）｜`enterprise`（企业席）｜`observer`（观察员，**无投票权**）｜`enterprise_admin`（企业管理员）
 
-**作用域**：`scope_type ∈ {edition, city, task_package, team, enterprise}` —— 角色与作用域绑定，而非全局。
+### 7.1 【决策】权限不靠角色枚举，靠「能力 + 授权记录」
 
-**关键行级规则**：
+```
+capability        能力点字符串：task_package:read / score:write / team:manage / signoff:create …
+role_capability   (role_id, capability)                       ← RBAC 部分（角色 → 能力）
+assignment        (user_id, capability, scope_type, scope_id) ← 资源级 / 行级部分
+scope_type ∈ {global, edition, city, task_package, team, enterprise}
+```
+
+**判定只有一个入口**：
+```
+can(user, capability, ctx) →
+  1. user.is_superadmin                             → true
+  2. role_capability 命中该能力                      → true
+  3. assignment 中存在该用户该能力且 scope 匹配 ctx    → true
+  4. 否则 → false
+```
+
+**为什么不用「角色 + 直接枚举」**：企业席评委"只能评自己出的题"这条规则，用 if 写会散落在每一个 handler 里；用 assignment 表写就是**一行数据**：
+`assignment(user_id='judge_u42', capability='score:write', scope_type='task_package', scope_id='tp_7')`。
+加一条授权 = INSERT，撤销 = DELETE，审计 = 查这张表。**规则变了不用改代码。**
+
+**落库形态**：⛔ 不要在 SQL 里存 scope_id 数组；用独立 `assignment` 表。
+
+### 7.2 【决策】四条工程硬约束（这才是省事的关键）
+
+| # | 约束 | 为什么 |
+|---|---|---|
+| 1 | **所有 SQL 收进 repository 层**，handler 里禁止裸 SQL | 否则换库和加权限都要翻遍代码 |
+| 2 | **权限过滤必须生成到 WHERE 子句**，不能"先查全量再在 JS 里 filter" | 否则 `GET /api/score/123` 会绕过列表过滤导致越权 |
+| 3 | **每个查询强制传 `scopeCtx`**，repository 方法内部自动拼 scope 谓词 | 写错一处就是越权 |
+| 4 | **行级权限模板统一为 EXISTS 子查询** | 跨表 join 授权（评委↔任务包↔战队）一次写对 |
+
+```sql
+WHERE EXISTS (SELECT 1 FROM assignment a
+  WHERE a.user_id = ? AND a.capability = 'task_package:read'
+    AND ( (a.scope_type = 'global')
+       OR (a.scope_type = 'task_package' AND a.scope_id = tp.id)
+       OR (a.scope_type = 'team'       AND a.scope_id = tp.team_id) ))
+```
+
+### 7.3 【决策】三态状态码，不泄露资源存在性
+
+| 情形 | 返回 | 理由 |
+|---|---|---|
+| 列表查询，权限不满足 | **200 + 空集** | 不暴露"有但不给看" |
+| 单条读取，权限不满足 | **404** | 不泄露该记录是否存在（比 403 更安全） |
+| 规则本身被禁用 | 403 | 这是"机制没开"，不是"你没权限" |
+
+> 借自 PocketBase 的 Collection API Rules 设计：**同一条规则同时承担授权与数据过滤**（它不是布尔开关，是过滤表达式），且三态语义被明确区分。这比"先查出来再过滤"的常见写法更安全，也更省心。
+
+### 7.4 关键行级规则
 
 | 规则 | 实现 |
 |---|---|
@@ -511,7 +734,20 @@ d < −10  → 触发复核：评委向团队提问（只提问，不改分）
 | 企业评委合计权重 ≤25%（R3） | 计算时封顶 |
 | 组委会可查全部审计 | `admin` 读 `computation_snapshots` 与 `audit_log` |
 
-**会话**：`HttpOnly` + `SameSite=Lax` Cookie；服务端 session 表；`scrypt` 存密码。
+### 7.5 认证
+
+| 项 | 做法 |
+|---|---|
+| 密码 | `node:crypto` `scrypt`（Node 默认 N=16384, r=8, p=1）；每用户独立 16 字节随机 salt；存储格式 `scrypt$N$r$p$<salt_b64>$<hash_b64>`；比对用 `timingSafeEqual` |
+| 会话 | 32 字节随机 token；**数据库只存 SHA-256 哈希，不存明文 token**；Cookie `HttpOnly` + `SameSite=Lax` + `Secure`(生产) + `Path=/`；绝对过期 + 滑动续期 |
+| 强制下线 | `POST /api/auth/logout-all` 吊销该用户全部 session |
+| ⛔ 不做无状态 JWT | 难撤销、难审计、难强制下线。服务端 session 表可撤销、可审计 |
+| 预留 | `identity_provider` 表 + OIDC client 模式（企业微信/钉钉/LDAP）。**现在只留接口不实现**——手写 OIDC authorization-code flow 约 150 行，仍可零 npm |
+
+### 7.6 【决策】后台要有「权限预览」
+
+借自 PocketBase Admin Dashboard 的 **API Preview**：编辑一条记录时，实时显示**当前这个用户在这条记录上能看到哪些字段、能不能写、能不能删**。
+**为什么必须有**：行级权限最大的调试成本在这里，缺了它，一次权限 bug 要靠翻代码定位。抄这个能省一两天。
 
 ---
 
@@ -649,6 +885,37 @@ d < −10  → 触发复核：评委向团队提问（只提问，不改分）
 | SSE 断连 | 客户端指数退避重连；服务端清理连接 |
 | 并发写同一队伍 | SQLite 事务 + `BEGIN IMMEDIATE`；同实体写串行化 |
 
+### 11.1 防刷分与防串通（调研带回来的可落地组合）
+
+| 目标 | 做法 | 出处 |
+|---|---|---|
+| 重复提交 / 并发灌分 | 幂等键（`request_id` 唯一）+ 行锁 + 只接受当前分配的那一份 | hack-the-back `judging.py`（MIT） |
+| 评委刷分（高频） | 三层限频：滑动窗口计数 + 提交锁 + 每分钟配额；再加**评委级配额**（每人每小时打分次数上限） | CTFd `api/v1/challenges.py`（Apache-2.0） |
+| 互评串通 | **同一企业同一时刻只分配一位评委**；评委互相不可见打分；分配记录写日志 | Gavel `preferred_items()` 的 busy 排除（AGPL，**只读思路独立实现**） |
+| 串通识别 | 检测"两位评委对全部重叠项目给出完全相同的相对顺序"→ 进人工复核队列 | Gavel 追加式决策日志思路 |
+| 评委宽严异常 | 某评委 stddev 异常小/大、与其他评委相关性为负 → **告警但不自动处罚** | 我们自己的 `score_stats` |
+| 结束前抢跑（先看榜再改分） | 评分入口在封榜时间后锁定提交；或记录"提交时可见的榜单版本号"用于回溯 | CTFd 的 freeze 时间戳思路 |
+| 事后篡改 | 评分**只增不改**；删除 = 软删除；重算走新 `revision`，不覆盖历史 | Gavel 软禁用 + 追加日志 |
+
+**⚠️ 全行业空白**：没有任何一个开源项目做**多账号协同投票检测**。我们至少要做到"同一手机号/同一企业注册的多个账号"可被识别。
+
+### 11.2 人工复核与申诉状态机
+
+```
+SUBMITTED ──→ PENDING_REVIEW ──→ CONFIRMED ──→ FINALIZED
+                  │                    ↑              ↑
+                  ├──→ REJECTED ─(选手申诉)───────────┘
+                  └──→ FLAGGED（疑似刷分/串通）→ REJECTED | CONFIRMED
+```
+
+| 规则 | 说明 |
+|---|---|
+| `PENDING_REVIEW` 的分数**对其他评委/企业不可见** | 借自 OpenReview 的 `nonreaders` 思路——防止未定稿的分数外泄影响后续打分 |
+| 每次状态迁移写 `audit_log(actor, from_state, to_state, reason, at)` | 状态机必须有完整迁移日志，否则申诉无法复盘 |
+| 幂等守卫 | 借自 OpenReview 的"只处理首次 edit"——重复触发不产生二次迁移 |
+| 申诉触发 `revision + 1` 重算 | **不覆盖历史**。旧 `revision` 保留，供复盘 |
+| 申诉范围 | 企业只能对"已 FINALIZED 且处于低可见档"的条目申诉 |
+
 ---
 
 ## 12. 审计与可复算
@@ -686,16 +953,21 @@ d < −10  → 触发复核：评委向团队提问（只提问，不改分）
 
 | 层 | 覆盖 |
 |---|---|
-| **配置校验** | 权重合计 ≠100% 必须抛错（防【冲突】C-01 类回归）；阈值单调；段位门槛递增 |
-| **评分引擎** | 已知评委矩阵 → z 值、去极值结果、P/E 加权；`stdev=0` 分支；样本不足 fallback |
+| **配置校验** | 权重合计 ≠100% 必须抛错（防【冲突】C-01 类回归）；阈值单调；段位门槛递增；**权重和校验是我们补上的**（Hangar 上游只校验单个 weight∈[0.1,1]，留了 TODO） |
+| **评分引擎** | 已知评委矩阵 → z 值、去极值结果、P/E 加权；`stdev=0` 分支；样本不足 fallback；**归一化策略四选一各自的结果一致性** |
 | **分轨断言** | ⭐ **行为分变化不影响总分**（S-3 的自动化保证）；`scoreStage` 入参含行为分时被丢弃 |
-| **破同分链** | 构造同分场景，验证链顺序生效；全同分时落到 `team_id` 兜底且结果稳定 |
+| **破同分链** | 构造同分场景，验证链顺序生效；全同分时落到 `team_id` 兜底且结果稳定；**同分先到者胜 + 行 ID 兜底**（CTFd 双保险） |
+| **并列名次** | 同分同名次（1224 式），奖金共享总额不变；**回归测试：修正后的 `calculatePoints` 必须是 10/8/5 而非上游的 18/8/3/1** |
 | **段位** | 边界：3 项含接入 → A；5 项含业务部门签字 → S；技术部门签字不计入 S |
-| **可见性** | D 段不出现在榜单；B 榜响应体不含签字人；观察员不能提交评分 |
+| **可见性** | D 段不出现在榜单；B 榜响应体不含签字人；观察员不能提交评分；**200+空集 / 404 / 403 三态** |
 | **企业约束** | R1 非本赛道权重置 0；R2 缺签计 0；R3 合计封顶 25% |
 | **报名分级** | SABC 3 维加权 → 阈值边界（79/80、59/60、39/40） |
-| **数据层** | 迁移幂等；事务回滚；并发写不产生脏读 |
+| **幂等与并发** | 同一 `request_id` 重复提交只生效一次；一人一票（`tiebreak_votes` 唯一约束）；并发提交不产生双票 |
+| **数据层** | 迁移幂等；事务回滚；并发写不产生脏读；**`sqlite.backup()` 产出的备份可独立打开且数据一致** |
 | **端到端** | 报名→组队→打分→计算→发榜→战绩卡 全链路（用种子数据） |
+
+**【决策】回归测试要专门盯住"抄来的代码"**。
+理由：调研发现上游有 **2 个可复算的 bug**（hibiscus switch 穿透、portal `generalScore` 恒为 0）。**移植的每一段外部代码都必须配一个"我们的预期值"测试**，否则 bug 会被一起搬进来，且没人发现。
 
 ---
 
@@ -715,7 +987,38 @@ node src/server.js          # 默认 http://127.0.0.1:8080
 - `deploy/nginx.conf`（反代 + TLS + 静态资源缓存）
 - `deploy/docker-compose.yml`
 - `deploy/install.sh`（一键：装 Node → 写 service → 配 nginx → 建库 → 初始化管理员账号）
-- `scripts/backup.js`（`VACUUM INTO` 一致性备份 + 保留策略 + 定时）
+- `scripts/backup.js`（一致性备份 + 保留策略 + 定时）
+
+**【决策】备份用 `sqlite.backup()` API，不用 `cp`**
+SQLite 官方 `backup.html` 列出 cp 方式的三个缺点：备份期间其他写者须等锁释放；不能用于内存库；**复制过程中掉电可能导致备份损坏**。`backup()` 是增量拷贝、源库只在真正读取的瞬间短暂加锁、结果是源库的 bit-wise identical snapshot。**已实测本机可用（Node ≥22.16.0）。**
+⚠️ **WAL 模式下只 cp `.db` 不 cp `-wal` 会丢数据**——已提交但未 checkpoint 的事务还在 WAL 文件里。
+
+**【决策】迁移用纯 `.sql` 文件 + `schema_migrations(version, applied_at)` 表，启动时单事务串行执行**
+⛔ 不赌原生 `ALTER TABLE` 的能力边界（`DROP COLUMN` 需 3.35+、`RENAME COLUMN` 需 3.25+，而 `node:sqlite` 捆绑的 SQLite 版本未核实）→ **一律"新表 + 迁移"，expand-contract 三步走**（先加新表/新列双写 → 切读 → 确认无流量再清理）。
+
+**【决策】单写者约束写进部署文档**
+⛔ **禁止多 Node worker 进程同时写同一个 SQLite 文件**（SQLite 官方：single writer at a time）。这是 `SQLITE_BUSY` 的真正来源。
+✅ 扩容只能加**读**（静态资源交给 nginx 直出，几百并发静态请求根本不进 Node 进程）。
+⚠️ WAL 要求所有进程**在同一台主机**；**一旦要多机部署，必须换 Postgres，没有第三条路**。
+
+**【决策】nginx 配置要点**
+```
+proxy_set_header Connection '';  proxy_http_version 1.1;
+proxy_set_header X-Real-IP $remote_addr;
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+# SSE 必须关闭缓冲：
+proxy_buffering off;  proxy_read_timeout 360s;  add_header X-Accel-Buffering no;
+```
+审计日志要读真实客户端 IP，所以这两个头必须透传。
+
+**【决策】实时推送用 SSE，不用 WebSocket**
+- 量级：几十个用户、每分钟几次更新。CTFd 自己的做法是 **5 分钟轮询**；我们用 SSE + 30–60 秒轮询兜底即可
+- SSE 走普通 HTTP，穿透代理/CDN 容易，浏览器 `EventSource` **自带断线重连**
+- WebSocket 是"单向推榜单"的过度设计；只有评委工作台需要亚秒级同步（新任务分配、加时倒计时）才值得上
+- ⚠️ **HTTP/1.1 同源连接数限制（约 6 条）本轮未从 MDN 原文核实** → 上线前实测
+
+**【决策】报表与大导出走定时任务，不进请求路径**
+`node:sqlite` 是**同步 API**，慢查询会阻塞 event loop（官方：All APIs execute synchronously）。全部 SQL 预编译 + 参数化；导出用 `node:zlib` + 系统 `tar`（Mac/Linux/Windows10+ 都有 bsdtar），零 npm。
 
 ### 14.3 公网演示版（现在就能拿到的 URL）
 前端代码 **100% 复用**，只换数据层：
@@ -731,17 +1034,28 @@ node src/server.js          # 默认 http://127.0.0.1:8080
 
 ## 15. 实施路线
 
-| 阶段 | 内容 | 产出 |
-|---|---|---|
-| **P0 地基** | 仓库骨架、SQLite 封装、迁移机制、配置加载 + 校验、HTTP 路由、认证会话 | 能登录的空系统 |
-| **P1 报名与组队** | SABC 算分分级、注册流程、战队与成员、任务卡与六维准入 | 报名到组队全链路 |
-| **P2 评审引擎** | 评分界面、z-score、去极值、双签、回避、自评检测、互评 | 能真实算分 |
-| **P3 榜单与积分** | 破同分链、A/B/个人榜、段位、行为分、战绩卡、可见性过滤 | 能真实发榜 |
-| **P4 审计与可复算** | 计算快照、trace 抽屉、审计日志、复算 diff、扫描闸 | 榜单可复算 |
-| **P5 工作流与三池** | 任务清单与领取、三池底座接口 | 数据沉淀 |
-| **P6 部署** | 部署资产、备份恢复、演示版适配器、静态站发布 | 公网 URL + 云主机就绪 |
+| 阶段 | 内容 | 借鉴的零件 | 产出 |
+|---|---|---|---|
+| **P0 地基** | 仓库骨架、SQLite 封装、迁移机制、配置加载 + 校验、HTTP 路由、认证会话、capability/assignment 权限骨架 | CTFd 破同分双保险；PocketBase 三态语义 | 能登录的空系统；配置改错会启动失败 |
+| **P1 报名与组队** | SABC 算分分级、注册流程、战队与成员、任务卡与六维准入、报名状态机 + 变更审计 | hack-the-back 报名状态机 + `ApplicationStatusHistory`；dribdat `PR_STAGES` | 报名到组队全链路 |
+| **P2 评审引擎** | 评分界面、z-score、去极值、双签、回避、自评检测、互评、**归一化策略可切换** | portal 评审 schema 三件套；Hangar 加权算分；hack-the-back `crowd_bt.py`（备选策略）；ORA rubric 快照思路 | 能真实算分，且换归一化策略不改代码 |
+| **P3 榜单与积分** | 破同分链、加时陈述、A/B/个人榜、段位、行为分、战绩卡、可见性过滤 | hibiscus 并列名次 + 双列（**修 bug**）；CTFd 可见性分档 | 能真实发榜；行为分在 schema 层隔离 |
+| **P4 审计与防作弊** | 计算快照、trace 抽屉、审计日志、复算 diff、限频三层、幂等、复核状态机、扫描闸 | CTFd 限频三层；OpenReview 复核状态机 + 冲突申报 | 榜单可复算；刷分可拦截 |
+| **P5 工作流与三池** | 任务清单与领取、三池底座接口、公开榜单 API + iCal | dribdat 开放 API / iCal | 数据沉淀 |
+| **P6 部署与演示版** | 部署资产、备份恢复、演示版适配器、静态站发布 | —— | 公网 URL + 云主机就绪 |
+| **二期** | 组队 MILP 撮合、贝叶斯归一化主用 | dribdat `matching.py`（HiGHS） | — |
 
-**排序理由**：P2/P3 是这个平台**不可替代的核心价值**（S7/S10 的算法只有我们实现了），必须最扎实。P5 的三池放到后面，因为它是派生数据。P6 的演示版在 P3 完成后即可发布，不必等全部完工。
+**排序理由**：
+- **P2/P3 是不可替代的核心价值**（S7/S10 的算法只有我们实现了），必须最扎实
+- **P3 的行为分分离要在 schema 层做**（hibiscus 的教训：字段分列了，但排序时又相加）——所以 P3 不能等到 P4
+- **P4 的限频与幂等不能推后**：刷分一旦发生，榜单的历史就要作废
+- **P5 的三池放到后面**，因为它是派生数据
+- **P6 的演示版在 P3 完成后即可发布**，不必等全部完工
+
+**【决策】第一天就把这两个零件做成可运行的单元**：
+① `crowd_bt.py`（MIT，140 行）——归一化策略的第二条路，早做早知道值不值得
+② `calculateRankings.ts`（MIT，修掉 switch 穿透 bug 后）——名次算法
+理由：这两个是"看起来最像锦上添花、实际最容易在后面拖住整体"的模块。
 
 ---
 
@@ -749,13 +1063,18 @@ node src/server.js          # 默认 http://127.0.0.1:8080
 
 | # | 风险 / 边界 | 说明 | 缓解 |
 |---|---|---|---|
-| 1 | **规则本身待组委会确认** | 56 条机制件级需求未确认 | 全部配置化；配置版本随快照留档 |
+| 1 | **规则本身待组委会确认** | 60 条机制件级需求未确认 | 全部配置化；配置版本随快照留档 |
 | 2 | **【冲突】C-01~C-06 未追认** | 我方文档内部矛盾 | 已在 `rule-decisions.md` 裁决并标注来源；配置可改 |
-| 3 | **z-score 可能长期不生效** | 任务包只有 2–3 队，样本 <5 → 走全局回退（C-05） | 显式暴露降级状态；建议专家席跨包评分 |
-| 4 | **企业愿不愿配合签里程碑** | S10 §10 自陈：「这是整个设计成立的前提，但没有证据」 | 平台侧做成"签字成本可配置 + TOP 回访任务" |
-| 5 | **公网正式版需云主机** | 当前无云账号/隧道/Docker | 部署资产一次交齐；演示版先上线 |
-| 6 | **规则引擎由 AI 实现** | 规则理解可能有偏差 | 每条规则在代码注释里**引用原文定位**；配置校验 + 单元测试双保险 |
-| 7 | 未做端到端压测 | 数据量小（~50 人） | 瓶颈在网络；预留 SSE 与静态缓存 |
+| 3 | **z-score 可能长期不生效** | 任务包只有 2–3 队，样本 <5 → 走全局回退（C-05） | ① 显式暴露降级状态 ② **归一化策略可切换**（zscore/median/trimmed/bayes）③ 建议专家席跨包评分、每队 ≥3 评委（借 MLH 赛制设计） |
+| 4 | **z-score 全行业无先例** | 11 个平台全仓检索零命中 | 这既说明必须自建，也说明必须首届后回测 → 策略可切换 + 记录实际样本量分布 |
+| 5 | **企业愿不愿配合签里程碑** | S10 §10 自陈：「这是整个设计成立的前提，但没有证据」 | 平台侧做成"签字成本可配置 + TOP 回访任务" |
+| 6 | **公网正式版需云主机** | 当前无云账号/隧道/Docker | 部署资产一次交齐；演示版先上线 |
+| 7 | **规则引擎由 AI 实现** | 规则理解可能有偏差 | 每条规则在代码注释里**引用原文定位**；配置校验 + 单元测试双保险；每条规则配一个可追溯的样例用例 |
+| 8 | **`node:sqlite` 尚未 2.0 Stable** | Node 22 = Stability 1.1，Node 24 = 1.2 (RC) | 用薄封装隔离 API 变动；已实测所需能力全部可用 |
+| 9 | **HTTP/1.1 同源连接限制未核实** | SSE 多连接可能受限 | 上线前实测；若受限改用单连接 + 版本号增量推送 |
+| 10 | **未做端到端压测** | 数据量小（~50 人） | 瓶颈在网络；预编译 statement + 静态资源 nginx 直出 |
+| 11 | **Windows 上没有零依赖守护方案** | Node 进程不是 Windows 服务 | 组员本地手动起进程；云主机一律 Linux + systemd |
+| 12 | **组队 MILP 撮合需 HiGHS** | 违反零依赖 | 移到二期；一期用"自选 + 组队长确认 + 组委会兜底配对" |
 
 ---
 
@@ -772,17 +1091,41 @@ node src/server.js          # 默认 http://127.0.0.1:8080
 | 六维可解性与一票否决 | 【机制件】顶层文档 §3.2 | 1 | Y（作为"我方规则"） |
 | `node:sqlite` / SSE / scrypt 可用 | 【实测】本机 Node 22.23 | 1 | Y |
 | AGPL-3.0 §13 网络服务义务 | 【官方】gnu.org 许可证原文 | 1 | Y |
-| 开源项目可借鉴清单 | 【多源】§3 待回填 | — | — |
+| **全行业无 z-score / 去极值 / 段位 / 双签 / 匿名 / 回避实现** | 【多源】11 仓源码级全仓关键词检索 + 逐文件精读 | 11（各自独立仓库） | Y（**缺失性结论**：检索面广，但只能证明"这 11 个仓没有"，不能证明"全世界没有"） |
+| CTFd 破同分 = 时间 + 行 ID 双保险 | 【官方】源码 + 官方文档站 | 2 | Y |
+| CTFd 冻结榜 = 时间戳过滤，管理员看实时榜 | 【官方】源码 + 官方文档站 | 2 | Y |
+| SQLite 单写者 / WAL 同主机 / NFS 不可用 / 备份用 backup API | 【官方】sqlite.org 原文 | 1 | Y |
+| `node:sqlite` 稳定性 1.1(22)/1.2 RC(24)；`backup()` 需 ≥22.16.0 | 【官方】Node 文档 | 1 | Y |
+| Node 22 EOL 2027-04-30；Node 24 EOL 2028-04-30 | 【官方】nodejs/Release schedule.json | 2 | Y |
+| **Directus 已改自定义 MSCL；NocoDB 2026-01-09 起改 Sustainable Use License** | 【官方】仓库 LICENSE 原文 | 各 1 | Y（各读原文） |
+| **Formbricks MIT 声明指向不存在的路径；`packages/surveys` 按根 LICENSE 应视为 AGPLv3** | 【官方】仓库 LICENSE + 目录清单 404 实测 | 1 | Y |
+| **halo 仓库无 LICENSE 文件；OpenHackathon-service 后端无许可证** | 【官方】tarball 清单 + API license=None | 各 2 | Y |
+| hibiscus `calculatePoints` switch 穿透 bug；portal `generalScore` 恒为 0 | 【一手源码推导】 | 各 1 | Y（逻辑必然，可复算） |
 
 > ⚠️ **诚实声明**：S7 / S10 / SABC / 顶层文档**全部出自同一团队**，**不构成多方独立互证**。它们是"我们自己的规则"，不是"行业已验证的规则"。凡标 `我方假设` 的条目，实现时必须留可调参数与回测接口。
-> ⚠️ **AGPL 提示**：JunctionApp、Hackerspace3 为 AGPL-3.0。AGPL §13 原文：「**if you modify the Program**, your modified version must prominently offer all users interacting with it remotely … an opportunity to receive the Corresponding Source」。**学习其设计并自写代码不受此限；复制其代码并部署为网络服务则触发开源义务。** 凡拟复用代码的候选，一律只选 MIT/Apache 系。
+> ⚠️ **AGPL 提示**：JunctionApp、Hackerspace3、ORA 为 AGPL-3.0。AGPL §13 原文：「**if you modify the Program**, your modified version must prominently offer all users interacting with it remotely … an opportunity to receive the Corresponding Source」。**学习其设计并自写代码不受此限；复制其代码并部署为网络服务则触发开源义务。** 凡拟复用代码的候选，一律只选 MIT/Apache 系。
 
 ### 17.2 待补内容
 
-- [ ] §3 开源调研回填（4 条轴）
-- [ ] 截图位（沿用一页纸的 4 张惯例）
+- [x] §3 开源调研回填（4 条轴，28 个候选仓库）
 - [ ] 组委会对本设计的确认（尤其 §6.4 破同分链、§6.2 初赛 `w_E`）
+- [ ] 截图位（沿用一页纸的 4 张惯例）
 - [ ] 脱敏核对：本文档涉及内部项目路径与合作方信息
+- [ ] `rules/*.json` 的初版配置（按 §6.7 清单落地，附 `conflictRef` 字段回指 `rule-decisions.md`）
+
+### 17.3 调研中未能验证的事项（不作为结论使用）
+
+| # | 事项 | 状态 |
+|---|---|---|
+| 1 | Gavel 原始上游 `anishathalye/gavel` 的许可证未核实 | ⚠️ 若要直接搬原始实现必须单独查证。**本设计改用 MIT 版 `hack-the-back/crowd_bt.py`，规避此风险** |
+| 2 | HTTP/1.1 同源连接数限制（约 6 条） | ⚠️ 本轮未从 MDN 原文核实 → 上线前实测 |
+| 3 | Hasura EE 的许可证条款 | ⚠️ 仓库内 EE LICENSE 路径全部 404，未能结案（不影响本设计，Hasura 已被排除） |
+| 4 | Baserow `premium/` 与 `enterprise/` 许可原文 | ⚠️ 仅从根 LICENSE 确认"有独立许可"，未读原文（不影响本设计，已排除） |
+| 5 | `node:sqlite` 捆绑的 SQLite 具体版本号 | ⚠️ 未核实 → 因此迁移一律"新表 + 迁移"，不赌 `ALTER TABLE` 能力边界 |
+| 6 | `PRAGMA user_version` 作为迁移载体 | ⚠️ 未读 sqlite.org pragma 原文 → 改用 `schema_migrations` 表，更稳妥 |
+| 7 | 各候选项目的真实生产使用规模 | ⚠️ 除 dribdat 官方自述外均无第二来源 → **不作为选型依据** |
+| 8 | 活跃度数字（stars / open issues） | ⚠️ GitHub API 单次快照，会漂移 → **不作为选型依据** |
+| 9 | hibiscus battlepass 是否有段位定义 | ⚠️ grep 只命中图标颜色，未见档位表 → **不能断言"它有段位"** |
 
 ---
 
