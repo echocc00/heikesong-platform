@@ -12,6 +12,7 @@ import { loadRules } from '../src/config.js';
 import { createApp } from '../src/server.js';
 import { createUser } from '../src/db/repo/users.js';
 import { createSession } from '../src/auth/session.js';
+import { stripComments } from '../test-helpers/strip-comments.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrationsDir = join(here, '..', 'db', 'migrations');
@@ -451,7 +452,7 @@ test('读流的 error 监听：流出错时断开响应，而不是变成未捕�
 // 下面每一条都对应一条「改坏了但全量测试照样全绿」的生产护栏。
 // ══════════════════════════════════════════════════════════════════
 
-test('软链指向 web 根外的文件时返回 404，不得读出文件内容（终审 I-1）', async () => {
+test('软链指向 web 根外的文件时返回 404，不得读出文件内容（终审 I-1）', { skip: process.platform === 'win32' ? 'Windows 创建符号链接需要开发者模式或管理员权限' : false }, async () => {
   // ⛔ 终审发现（Important）：静态服务只对**路径字符串**做边界比较，
   //    而 resolve() **不解析符号链接** → web/ 下指向根外的软链会被读出来。
   //    终审实测：ln -s /etc web/etclink → GET /etclink/passwd → 200 + /etc/passwd 全文。
@@ -758,7 +759,8 @@ test('serveStatic 必须真的调用 isSameFile 做 dev/ino 对账（接线断�
   const src = readFileSync(join(here, '..', 'src', 'http', 'static.js'), 'utf8');
   const fnStart = src.indexOf('export function serveStatic');
   assert.ok(fnStart > 0, '必须能找到 serveStatic');
-  const fnBody = src.slice(fnStart, src.indexOf('\nexport ', fnStart + 10) > 0 ? src.indexOf('\nexport ', fnStart + 10) : src.length);
+  const nextExport = src.indexOf('\nexport ', fnStart + 10);
+  const rawFnBody = src.slice(fnStart, nextExport > 0 ? nextExport : src.length);
   // ⚠️ 终审修正（Minor，M-1）：原来只断言「源码里出现过 isSameFile(」，
   //    于是 `isSameFile(stat, stat)`（**对账对象写错**，更像手滑）
   //    与 `!isSameFile(stat, linkStat) && false`（把防线短路掉）
@@ -767,6 +769,11 @@ test('serveStatic 必须真的调用 isSameFile 做 dev/ino 对账（接线断�
   //      ① 第一个实参是 stat（打开后 fstat 的结果）
   //      ② 第二个实参是 linkStat（realpath 解析出的目标的 stat）
   //      ③ 必须处在 `if (! ... )` 的否定守卫里，且紧跟 `)` —— 不能被 && 短路
+  // ⚠️ 终审复核修正（Minor，F-3）：**必须先剥掉注释再匹配** ——
+  //    否则「代码改成 isSameFile(stat, stat) + 注释里写上正确形态」就能骗过这条断言，
+  //    守卫永不触发却仍判绿（原正则匹配的是**未剥注释**的源码）。
+  //    剥注释用共享工具 test-helpers/strip-comments.js（零依赖守卫同款）。
+  const fnBody = stripComments(rawFnBody, { blankRegex: true });
   assert.match(
     fnBody,
     /if\s*\(\s*!isSameFile\(\s*stat\s*,\s*linkStat\s*\)\s*\)/,
@@ -831,6 +838,31 @@ test('HTTP 层不把 Node 的 ERR_* 错误码外泄给客户端（端到端）',
   rmSync(dataDir, { recursive: true, force: true });
 });
 
+test('4xx 响应的 message 必须是 AppError 自己的文案，而不是通用回落（终审复核 F-1）', async () => {
+  // ⛔ 终审复核发现（Important，F-1）：I-C 的修复只钉住了「裸 Error 的 message 一律回落」，
+  //    **没钉住「AppError 的 message 必须原样透传」这一半** ——
+  //    把 `const message = err instanceof AppError ? err.message : '请求无效';`
+  //    改成 `const message = '请求无效';` → 全量 150 条照样全绿。
+  //    实测响应里的 message 从「手机号或密码不正确」退化成「请求无效」，
+  //    而 web/api.js:15 正把它当界面文案直接显示 → 所有错误提示变成同一句废话，
+  //    用户既不知道是「没填手机号」还是「密码错了」。
+  const { db, close, dataDir, app } = setup();
+  const res = await call(app, 'POST', '/api/auth/login', {
+    body: { phone: '13800000000', password: 'wrong-password' },
+  });
+  assert.equal(res.status, 401);
+  const body = JSON.parse(res.body);
+  assert.equal(body.error.code, 'INVALID_CREDENTIALS');
+  assert.equal(
+    body.error.message,
+    '手机号或密码不正确',
+    'AppError 的 message 必须原样透传给客户端（它是我们自己写的中文文案）',
+  );
+  assert.notEqual(body.error.message, '请求无效', '不得退化成通用文案 —— 那等于把用户能懂的信息抹掉');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
 test('静态响应的 Content-Type 与 Cache-Control 必须符合 MIME 表（终审 M-6）', async () => {
   // ⚠️ 终审修正（Minor，M-6）：MIME 表与 Cache-Control 策略此前**零断言** ——
   //    把 MIME 表里的 '.js' 删掉（回落到 application/octet-stream）、
@@ -874,7 +906,7 @@ test('请求体超限返回 413 且必须带 Connection: close（终审 M-6）',
   rmSync(dataDir, { recursive: true, force: true });
 });
 
-test('软链的判定看真实路径：指向根外的被拒，指向根内的放行（终审 M-7）', async () => {
+test('软链的判定看真实路径：指向根外的被拒，指向根内的放行（终审 M-7）', { skip: process.platform === 'win32' ? 'Windows 创建符号链接需要开发者模式或管理员权限' : false }, async () => {
   // ⚠️ 终审修正（Minor，M-7）：static.js 的注释原先把「静态资源目录指向共享卷」
   //    写成了**正常部署形态**，但那条形态指向 web/ 根外 → 会被 realpath 防线挡下（404）。
   //    注释与实际行为相反 → 照着注释部署会踩坑。

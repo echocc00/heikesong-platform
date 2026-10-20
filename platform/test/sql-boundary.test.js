@@ -44,6 +44,7 @@ import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
 import { join, dirname, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { stripComments } from '../test-helpers/strip-comments.js';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -56,112 +57,6 @@ function collectJsFiles(dir) {
     else if (entry.isFile() && entry.name.endsWith('.js')) files.push(full);
   }
   return files;
-}
-
-/**
- * 把源码里的**注释**替换成等长空白（保留换行 → 行号不变），
- * 字符串 / 模板字面量 / 正则字面量原样保留。
- * （与 test/zero-deps.test.js 里的同名 helper 重复：本轮评审限定只能改那 6 个文件，
- *   不允许另建共享 helper 文件；两个文件各自独立可跑。）
- */
-function stripComments(src) {
-  const out = src.split('');
-  const blank = (from, to) => {
-    for (let k = from; k < to; k += 1) {
-      if (out[k] !== '\n' && out[k] !== '\r') out[k] = ' ';
-    }
-  };
-  const frames = [{ kind: 'code', depth: 0 }];
-  const top = () => frames[frames.length - 1];
-  const REGEX_PUNCT = new Set('(,=:[!&|?{}+-*%<>~^'.split(''));
-  const REGEX_KEYWORDS = new Set([
-    'return', 'typeof', 'case', 'in', 'of', 'new', 'do', 'else',
-    'yield', 'await', 'void', 'instanceof', 'delete',
-  ]);
-  let i = 0;
-  let lastCodeChar = '';
-
-  const trailingWord = () => {
-    let k = i - 1;
-    while (k >= 0 && /\s/.test(src[k])) k -= 1;
-    const end = k + 1;
-    while (k >= 0 && /[A-Za-z0-9_$]/.test(src[k])) k -= 1;
-    return src.slice(k + 1, end);
-  };
-
-  while (i < src.length) {
-    const f = top();
-    const c = src[i];
-    const c2 = src[i + 1];
-
-    if (f.kind === 'code') {
-      if (c === '/' && c2 === '/') {
-        let end = src.indexOf('\n', i);
-        if (end === -1) end = src.length;
-        blank(i, end);
-        i = end;
-        continue;
-      }
-      if (c === '/' && c2 === '*') {
-        let end = src.indexOf('*/', i + 2);
-        end = end === -1 ? src.length : end + 2;
-        blank(i, end);
-        i = end;
-        continue;
-      }
-      if (c === '/' && (REGEX_PUNCT.has(lastCodeChar) || REGEX_KEYWORDS.has(trailingWord()))) {
-        let j = i + 1;
-        let inClass = false;
-        while (j < src.length) {
-          const ch = src[j];
-          if (ch === '\\') { j += 2; continue; }
-          if (ch === '[') inClass = true;
-          else if (ch === ']') inClass = false;
-          else if (ch === '/' && !inClass) { j += 1; break; }
-          else if (ch === '\n') break;
-          j += 1;
-        }
-        lastCodeChar = '/';
-        i = j;
-        continue;
-      }
-      if (c === "'" || c === '"' || c === '`') {
-        frames.push({ kind: c === "'" ? 'sq' : c === '"' ? 'dq' : 'tpl', depth: 0 });
-        lastCodeChar = c;
-        i += 1;
-        continue;
-      }
-      if (c === '{') { f.depth += 1; lastCodeChar = '{'; i += 1; continue; }
-      if (c === '}') {
-        if (f.depth === 0 && frames.length > 1) { frames.pop(); lastCodeChar = '}'; i += 1; continue; }
-        if (f.depth > 0) f.depth -= 1;
-        lastCodeChar = '}';
-        i += 1;
-        continue;
-      }
-      if (!/\s/.test(c)) lastCodeChar = c;
-      i += 1;
-      continue;
-    }
-
-    if (f.kind === 'sq' || f.kind === 'dq') {
-      if (c === '\\') { i += 2; continue; }
-      if ((f.kind === 'sq' && c === "'") || (f.kind === 'dq' && c === '"')) {
-        frames.pop();
-        lastCodeChar = c;
-        i += 1;
-        continue;
-      }
-      i += 1;
-      continue;
-    }
-
-    if (c === '\\') { i += 2; continue; }
-    if (c === '`') { frames.pop(); lastCodeChar = '`'; i += 1; continue; }
-    if (c === '$' && c2 === '{') { frames.push({ kind: 'code', depth: 0 }); i += 2; continue; }
-    i += 1;
-  }
-  return out.join('');
 }
 
 /** 取出代码里所有字符串/模板字面量（含起始下标与内容）。 */

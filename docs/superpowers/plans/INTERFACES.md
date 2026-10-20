@@ -58,6 +58,11 @@ error(res, status, code, message, detail)
 // src/http/body.js
 readJsonBody(req, { limit })             // → 解析后的对象；超限抛错
 
+// src/http/static.js
+serveStatic(webDir, req, res)            // → boolean（已处理则 true）
+isSameFile(statA, statB)                 // → boolean（dev + ino 对账；单独导出是为了能直接测边界）
+pipeFd(res, fd)                          // → ReadStream（读流必须挂 error 监听）
+
 // src/auth/password.js
 hashPassword(plain)                      // → 'scrypt$N$r$p$saltB64$hashB64'
 verifyPassword(plain, stored)            // → boolean
@@ -83,10 +88,14 @@ listAssignments(db, { userId, capability })
 
 // src/server.js
 createApp({ db, rules, webDir })         // → { router, handle(req, res) }
-serveStatic(webDir, req, res)            // → boolean（已处理则 true）
 //   handler 返回约定（2026-10-20 补）：handler 返回 undefined → 视为 200；
 //   返回 { status, body }（可选 headers 附加响应头）→ 按返回的状态码/响应体/响应头应答。
 ```
+
+> **【订正 2026-10-21】** `serveStatic` 原先被列在 `// src/server.js` 段下 ——
+> 它实际住在 `platform/src/http/static.js`（终审复核 Minor F-6）。
+> P1–P6 若按旧表述去 `src/server.js` 里找它，会找不到。
+
 
 **P0 已建表**（`001_init.sql`，**只有这一个迁移文件**）：`users` / `sessions` / `capabilities` / `roles` / `role_capabilities` / `assignments` / `user_roles` / `audit_log`
 

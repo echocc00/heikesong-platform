@@ -60,16 +60,20 @@ test('请求体上限的**默认值**是 512KB（不传 limit 时也必须限）
   const KB = 1024;
   const MB = 1024 * KB;
 
-  // 刚好在上限内 → 通过（body 必须是**合法 JSON**，否则先被 JSON 解析拦下，
+  // 刚好**等于**上限 → 通过（body 必须是**合法 JSON**，否则先被 JSON 解析拦下，
   // 测的就不是「大小上限」这条护栏了）
+  // ⚠️ 终审复核修正（Minor，F-2）：这里原来用 `512 * KB - 1`（差一字节），
+  //    于是把实现的 `size > limit` 改成 `size >= limit` 仍然全绿（实测 SURVIVED）。
+  //    边界语义是「**超过**上限才拒绝」= 恰好等于上限必须放行 →
+  //    用例必须正好取 512KB 才能钉住这条。
   const mkJson = (totalBytes) => {
     const head = '{"a":"';
     const tail = '"}';
     const pad = 'x'.repeat(totalBytes - head.length - tail.length);
     return Buffer.from(head + pad + tail);
   };
-  const under = Readable.from([mkJson(512 * KB - 1)]);
-  await assert.doesNotReject(() => readJsonBody(under), '512KB 以内必须放行');
+  const under = Readable.from([mkJson(512 * KB)]);
+  await assert.doesNotReject(() => readJsonBody(under), '正好 512KB（等于上限）必须放行');
 
   // 超过上限 → 413（用默认 limit，不传参）
   const over = Readable.from([mkJson(512 * KB + 1)]);

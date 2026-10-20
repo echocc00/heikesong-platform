@@ -90,6 +90,8 @@ platform/
 │   ├── migrate.js
 │   ├── seed.js
 │   └── forbidden.txt
+├── test-helpers/
+│   └── strip-comments.js        共享的「剥掉注释」工具（三个测试文件共用）
 └── test/
     ├── zero-deps.test.js
     ├── migrate.test.js
@@ -112,6 +114,7 @@ platform/
 **Files:**
 - Create: `platform/package.json`
 - Create: `platform/test/zero-deps.test.js`
+- Create: `platform/test-helpers/strip-comments.js`
 - Create: `platform/README.md`
 
 **Interfaces:**
@@ -140,6 +143,7 @@ import assert from 'node:assert/strict';
 import { readFileSync, existsSync, readdirSync } from 'node:fs';
 import { join, dirname, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { stripComments } from '../test-helpers/strip-comments.js';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -198,120 +202,6 @@ function collectJsFiles(dir) {
     else if (entry.isFile() && entry.name.endsWith('.js')) files.push(full);
   }
   return files;
-}
-
-/**
- * 把源码里的**注释**替换成等长空白（保留换行 → 行号不变），
- * 字符串 / 模板字面量 / 正则字面量原样保留。
- *
- * 为什么必须先剥注释：注释里写的 `import x from 'lodash'` **不是依赖**，
- * 让它误报 = 守卫被人加白名单绕过（误伤比漏检更糟）。
- * 为什么不能粗暴地按行切：字符串字面量里的 `//` 不是注释（如 'https://…'）。
- * 实现：逐字符状态机（代码 / 单引号 / 双引号 / 模板），零依赖。
- */
-function stripComments(src) {
-  const out = src.split('');
-  const blank = (from, to) => {
-    for (let k = from; k < to; k += 1) {
-      if (out[k] !== '\n' && out[k] !== '\r') out[k] = ' ';
-    }
-  };
-  // 帧栈：code（代码 / 模板表达式）/ sq / dq / tpl
-  const frames = [{ kind: 'code', depth: 0 }];
-  const top = () => frames[frames.length - 1];
-  // 「/」是除号还是正则字面量的开头：用上一个有效字符 + 尾词判断
-  const REGEX_PUNCT = new Set('(,=:[!&|?{}+-*%<>~^'.split(''));
-  const REGEX_KEYWORDS = new Set([
-    'return', 'typeof', 'case', 'in', 'of', 'new', 'do', 'else',
-    'yield', 'await', 'void', 'instanceof', 'delete',
-  ]);
-  let i = 0;
-  let lastCodeChar = '';
-
-  const trailingWord = () => {
-    let k = i - 1;
-    while (k >= 0 && /\s/.test(src[k])) k -= 1;
-    const end = k + 1;
-    while (k >= 0 && /[A-Za-z0-9_$]/.test(src[k])) k -= 1;
-    return src.slice(k + 1, end);
-  };
-
-  while (i < src.length) {
-    const f = top();
-    const c = src[i];
-    const c2 = src[i + 1];
-
-    if (f.kind === 'code') {
-      if (c === '/' && c2 === '/') {
-        let end = src.indexOf('\n', i);
-        if (end === -1) end = src.length;
-        blank(i, end);
-        i = end;
-        continue;
-      }
-      if (c === '/' && c2 === '*') {
-        let end = src.indexOf('*/', i + 2);
-        end = end === -1 ? src.length : end + 2;
-        blank(i, end);
-        i = end;
-        continue;
-      }
-      if (c === '/' && (REGEX_PUNCT.has(lastCodeChar) || REGEX_KEYWORDS.has(trailingWord()))) {
-        // 正则字面量：整体跳过（内容是代码，不能当注释，也不能当字符串）
-        let j = i + 1;
-        let inClass = false;
-        while (j < src.length) {
-          const ch = src[j];
-          if (ch === '\\') { j += 2; continue; }
-          if (ch === '[') inClass = true;
-          else if (ch === ']') inClass = false;
-          else if (ch === '/' && !inClass) { j += 1; break; }
-          else if (ch === '\n') break;
-          j += 1;
-        }
-        lastCodeChar = '/';
-        i = j;
-        continue;
-      }
-      if (c === "'" || c === '"' || c === '`') {
-        frames.push({ kind: c === "'" ? 'sq' : c === '"' ? 'dq' : 'tpl', depth: 0 });
-        lastCodeChar = c;
-        i += 1;
-        continue;
-      }
-      if (c === '{') { f.depth += 1; lastCodeChar = '{'; i += 1; continue; }
-      if (c === '}') {
-        // depth === 0 且不是根帧 → 模板表达式的 ${ } 结束，回到模板态
-        if (f.depth === 0 && frames.length > 1) { frames.pop(); lastCodeChar = '}'; i += 1; continue; }
-        if (f.depth > 0) f.depth -= 1;
-        lastCodeChar = '}';
-        i += 1;
-        continue;
-      }
-      if (!/\s/.test(c)) lastCodeChar = c;
-      i += 1;
-      continue;
-    }
-
-    if (f.kind === 'sq' || f.kind === 'dq') {
-      if (c === '\\') { i += 2; continue; }
-      if ((f.kind === 'sq' && c === "'") || (f.kind === 'dq' && c === '"')) {
-        frames.pop();
-        lastCodeChar = c;
-        i += 1;
-        continue;
-      }
-      i += 1;
-      continue;
-    }
-
-    // 模板字符串
-    if (c === '\\') { i += 2; continue; }
-    if (c === '`') { frames.pop(); lastCodeChar = '`'; i += 1; continue; }
-    if (c === '$' && c2 === '{') { frames.push({ kind: 'code', depth: 0 }); i += 2; continue; }
-    i += 1;
-  }
-  return out.join('');
 }
 
 /** 取出源码里所有字符串/模板字面量（含起始下标与内容）。 */
@@ -377,8 +267,10 @@ function lineAt(src, index) {
  *    而 README 承诺「只用 Node 标准库」是**全项目级**的，测试代码也在内 ——
  *    测试代码同样要能在任何机器上裸跑。
  *    （终审实测：注入探针 XD-11 MISSED。）
+ * ⚠️ `test-helpers/` 是测试专用的共享工具目录（终审复核引入），
+ *    它同样是项目代码，也必须在零依赖承诺范围内。
  */
-const SCAN_DIRS = ['src', 'scripts', 'web', 'test'];
+const SCAN_DIRS = ['src', 'scripts', 'web', 'test', 'test-helpers'];
 
 /**
  * 判断一个 specifier 属于哪一类。
@@ -406,7 +298,9 @@ export function scanSource(code, rel = '<synthetic>') {
   const specifiers = [];
   const violations = [];
   const absolute = [];
-  const stripped = stripComments(code);
+  // ⚠️ blankRegex: true → 正则字面量也剥成空白。
+  //    终审复核（Minor F-5）：正则字面量里的 `from 'x'` 不是 import，保留正则会误报。
+  const stripped = stripComments(code, { blankRegex: true });
   for (const spec of findSpecifiers(stripped)) {
     const line = lineAt(code, spec.start);
     const hit = { file: rel, line, value: spec.value };
@@ -529,6 +423,10 @@ test('扫描器对**已知坏输入**确实判违规（防「一条都不判违�
     "const s = '这不是 import';",
     "// import lodash from 'lodash';  // 注释里的不算",
     "const url = 'https://example.com/from';",
+    // ⚠️ 终审复核（Minor F-5）：**正则字面量**里的 import 也不是 import。
+    //    保留正则 → 这一行会被误判成第三方依赖（假警报，守卫被人当噪声关掉）。
+    //    stripComments(code, { blankRegex: true }) 把正则也剥成空白 → 不误报。
+    "const re = /import x from 'lodash'/;",
   ];
   for (const code of GOOD) {
     const r = scanSource(code, '<synthetic>');
@@ -659,12 +557,168 @@ node --test               # 跑测试
 `../docs/superpowers/specs/2026-10-20-heikesong-platform-design.md`
 ```
 
-- [ ] **Step 5: 运行测试确认通过**
+- [ ] **Step 5: 创建共享的注释剥离工具 `platform/test-helpers/strip-comments.js`**
+
+> **【2026-10-21 终审复核引入】** 三个测试文件需要**同一个**「剥掉注释」的 helper：
+> `zero-deps.test.js`（扫 import）、`sql-boundary.test.js`（扫 SQL）、`server.test.js`（扫接线断言）。
+> 此前前两个文件**各抄了一份**（逐字相同，只差注释）→ 改一处要改两处，必然漂移；
+> 终审复核（Minor F-3）指出第三处也需要它，于是抽出成本文件。
+> ⚠️ **不能放在 `test/` 目录下**：Node 的测试运行器会把**任何名为 `test` 的目录**下的
+> 所有 `.js` / `.cjs` / `.mjs` 文件**都当成测试文件**（Node 文档：目录名为 `test` 时递归搜全部 JS），
+> 放在 `test/helpers/` 下会被算成一条「测试」→ 用例总数凭空 +1。
+> `test-helpers/` 不匹配任何发现规则（发现规则只看**文件名**：`^test$` / `^test-.+` / `^.+[.\-_]test$`，
+> 而 `strip-comments.js` 都不匹配）→ 不会被误认成测试文件。
+
+`platform/test-helpers/strip-comments.js`：
+
+```javascript
+// platform/test/helpers/strip-comments.js — 源码注释剥离器（测试专用共享工具）
+//
+// 依据：本文件是三个测试文件共同需要的**同一样东西**：
+//   - test/zero-deps.test.js  → 扫 import specifier（注释里的 import 不算依赖）
+//   - test/sql-boundary.test.js → 扫 SQL（注释里的 SQL 不算）
+//   - test/server.test.js     → 扫接线断言（**注释里的调用点不算接线**）
+//   此前前两个文件各抄了一份（逐字相同，只差注释）→ 改一处要改两处，必然漂移。
+//   终审复核（Minor F-3）指出第三处也需要它，于是抽出成本文件。
+//
+// ⚠️ 它是**测试辅助工具**，不是被测代码；放在 test/ 下由零依赖守卫一起扫
+//    （零依赖守卫扫描 src/ scripts/ web/ test/ 四个目录 —— 本文件不含任何 import，
+//      连 node: 都不需要，符合「只用 Node 标准库」的承诺）。
+//
+// ⛔ 纯函数、零依赖、零 IO。
+
+/**
+ * 把源码里的**注释**替换成等长空白（保留换行 → 行号不变），
+ * 字符串 / 模板字面量 / 正则字面量原样保留。
+ *
+ * 为什么必须先剥注释：注释里写的 `import x from 'lodash'` **不是依赖**，
+ * 让它误报 = 守卫被人加白名单绕过（误伤比漏检更糟）。
+ * 为什么不能粗暴地按行切：字符串字面量里的 `//` 不是注释（如 'https://…'）。
+ * 实现：逐字符状态机（代码 / 单引号 / 双引号 / 模板），零依赖。
+ *
+ * @param {string} src 源码
+ * @param {{ blankRegex?: boolean }} [options]
+ *   `blankRegex: true` → 连**正则字面量**也一起替换成空白。
+ *   用途：零依赖守卫的 specifier 扫描 —— 正则字面量里的 `from 'x'` 不是 import
+ *   （终审复核 Minor F-5：保留正则会误报）。
+ *   ⚠️ 默认**不**开：SQL 边界扫描器需要**字符串字面量**原样保留，
+ *   而且正则识别的启发式偶尔会误判除号 → 宁可少扫也不误伤。
+ * @returns {string} 与输入等长、行号一致的「剥掉注释」的源码
+ */
+export function stripComments(src, options = {}) {
+  const blankRegex = options.blankRegex === true;
+  const out = src.split('');
+  const blank = (from, to) => {
+    for (let k = from; k < to; k += 1) {
+      if (out[k] !== '\n' && out[k] !== '\r') out[k] = ' ';
+    }
+  };
+  // 帧栈：code（代码 / 模板表达式）/ sq / dq / tpl
+  const frames = [{ kind: 'code', depth: 0 }];
+  const top = () => frames[frames.length - 1];
+  // 「/」是除号还是正则字面量的开头：用上一个有效字符 + 尾词判断
+  const REGEX_PUNCT = new Set('(,=:[!&|?{}+-*%<>~^'.split(''));
+  const REGEX_KEYWORDS = new Set([
+    'return', 'typeof', 'case', 'in', 'of', 'new', 'do', 'else',
+    'yield', 'await', 'void', 'instanceof', 'delete',
+  ]);
+  let i = 0;
+  let lastCodeChar = '';
+
+  const trailingWord = () => {
+    let k = i - 1;
+    while (k >= 0 && /\s/.test(src[k])) k -= 1;
+    const end = k + 1;
+    while (k >= 0 && /[A-Za-z0-9_$]/.test(src[k])) k -= 1;
+    return src.slice(k + 1, end);
+  };
+
+  while (i < src.length) {
+    const f = top();
+    const c = src[i];
+    const c2 = src[i + 1];
+
+    if (f.kind === 'code') {
+      if (c === '/' && c2 === '/') {
+        let end = src.indexOf('\n', i);
+        if (end === -1) end = src.length;
+        blank(i, end);
+        i = end;
+        continue;
+      }
+      if (c === '/' && c2 === '*') {
+        let end = src.indexOf('*/', i + 2);
+        end = end === -1 ? src.length : end + 2;
+        blank(i, end);
+        i = end;
+        continue;
+      }
+      if (c === '/' && (REGEX_PUNCT.has(lastCodeChar) || REGEX_KEYWORDS.has(trailingWord()))) {
+        // 正则字面量：整体跳过（内容是代码，不能当注释，也不能当字符串）
+        let j = i + 1;
+        let inClass = false;
+        while (j < src.length) {
+          const ch = src[j];
+          if (ch === '\\') { j += 2; continue; }
+          if (ch === '[') inClass = true;
+          else if (ch === ']') inClass = false;
+          else if (ch === '/' && !inClass) { j += 1; break; }
+          else if (ch === '\n') break;
+          j += 1;
+        }
+        if (blankRegex) blank(i, j);
+        lastCodeChar = '/';
+        i = j;
+        continue;
+      }
+      if (c === "'" || c === '"' || c === '`') {
+        frames.push({ kind: c === "'" ? 'sq' : c === '"' ? 'dq' : 'tpl', depth: 0 });
+        lastCodeChar = c;
+        i += 1;
+        continue;
+      }
+      if (c === '{') { f.depth += 1; lastCodeChar = '{'; i += 1; continue; }
+      if (c === '}') {
+        // depth === 0 且不是根帧 → 模板表达式的 ${ } 结束，回到模板态
+        if (f.depth === 0 && frames.length > 1) { frames.pop(); lastCodeChar = '}'; i += 1; continue; }
+        if (f.depth > 0) f.depth -= 1;
+        lastCodeChar = '}';
+        i += 1;
+        continue;
+      }
+      if (!/\s/.test(c)) lastCodeChar = c;
+      i += 1;
+      continue;
+    }
+
+    if (f.kind === 'sq' || f.kind === 'dq') {
+      if (c === '\\') { i += 2; continue; }
+      if ((f.kind === 'sq' && c === "'") || (f.kind === 'dq' && c === '"')) {
+        frames.pop();
+        lastCodeChar = c;
+        i += 1;
+        continue;
+      }
+      i += 1;
+      continue;
+    }
+
+    // 模板字符串
+    if (c === '\\') { i += 2; continue; }
+    if (c === '`') { frames.pop(); lastCodeChar = '`'; i += 1; continue; }
+    if (c === '$' && c2 === '{') { frames.push({ kind: 'code', depth: 0 }); i += 2; continue; }
+    i += 1;
+  }
+  return out.join('');
+}
+```
+
+- [ ] **Step 6: 运行测试确认通过**
 
 Run: `cd platform && node --test test/zero-deps.test.js`
 Expected: PASS（9 个测试全过：zero-deps 9）
 
-- [ ] **Step 6: 提交**
+- [ ] **Step 7: 提交**
 
 ```bash
 cd platform && git add package.json README.md test/zero-deps.test.js
@@ -2351,16 +2405,20 @@ test('请求体上限的**默认值**是 512KB（不传 limit 时也必须限）
   const KB = 1024;
   const MB = 1024 * KB;
 
-  // 刚好在上限内 → 通过（body 必须是**合法 JSON**，否则先被 JSON 解析拦下，
+  // 刚好**等于**上限 → 通过（body 必须是**合法 JSON**，否则先被 JSON 解析拦下，
   // 测的就不是「大小上限」这条护栏了）
+  // ⚠️ 终审复核修正（Minor，F-2）：这里原来用 `512 * KB - 1`（差一字节），
+  //    于是把实现的 `size > limit` 改成 `size >= limit` 仍然全绿（实测 SURVIVED）。
+  //    边界语义是「**超过**上限才拒绝」= 恰好等于上限必须放行 →
+  //    用例必须正好取 512KB 才能钉住这条。
   const mkJson = (totalBytes) => {
     const head = '{"a":"';
     const tail = '"}';
     const pad = 'x'.repeat(totalBytes - head.length - tail.length);
     return Buffer.from(head + pad + tail);
   };
-  const under = Readable.from([mkJson(512 * KB - 1)]);
-  await assert.doesNotReject(() => readJsonBody(under), '512KB 以内必须放行');
+  const under = Readable.from([mkJson(512 * KB)]);
+  await assert.doesNotReject(() => readJsonBody(under), '正好 512KB（等于上限）必须放行');
 
   // 超过上限 → 413（用默认 limit，不传参）
   const over = Readable.from([mkJson(512 * KB + 1)]);
@@ -4844,6 +4902,29 @@ git commit -m "feat(P0): capability + assignment 权限模型与 SQL 层行级�
 
 ### Task 7: 静态文件服务、前端骨架与服务器入口
 
+> **【2026-10-21 终审复核结论 + F-1 ~ F-6 处置】** 修复轮 3 的**终审复核**（verifier，
+> 27 个独立变异）判定 **Needs fixes**：**0 Critical / 1 Important / 3 Minor**。
+> 评审原话：「**实现本身正确，无安全漏洞、无功能缺陷**」，且 11 项修复中 8 项被完全钉住。
+> 剩余问题的性质是「**断言没钉住 / 断言被注释劫持 / 边界差一格 / 文档归属写错**」，逐条处置如下：
+>
+> | # | 严重度 | 发现 | 处置 |
+> |---|---|---|---|
+> | **F-1** | **Important** | **I-C 修复只钉住了「裸 Error 的 message 一律回落」，没钉住「AppError 的 message 必须原样透传」这一半** —— 把 `const message = err instanceof AppError ? err.message : '请求无效';` 改成 `const message = '请求无效';` → 全量 150 条照样全绿。实测响应里的 message 从「手机号或密码不正确」退化成「请求无效」，而 `web/api.js:15` 正把它当界面文案直接显示 → **所有错误提示变成同一句废话** | 新增用例断言 401 登录失败的 `error.message` **逐字等于**「手机号或密码不正确」且 **不等于**「请求无效」 |
+> | **F-2** | Minor | I-B 的断言边界**差一格**：用例用 `512KB - 1` 字节，于是把实现的 `size > limit` 改成 `size >= limit` 仍全绿（`524288B` 恰好等于上限时会被错误拒绝）。**当前实现正确，是断言弱一格** | 用例改为**正好取 512KB**（等于上限必须放行），并把断言文案改成「正好 512KB（等于上限）必须放行」 |
+> | **F-3** | Minor | M-1 的接线断言**可被注释劫持**：代码改成 `isSameFile(stat, stat)` + 注释里写上正确形态 → 守卫永不触发却仍判绿。根因：该正则匹配的是**未剥注释**的源码 | ① 把「剥注释」抽成**共享工具** `platform/test-helpers/strip-comments.js`（此前 `zero-deps.test.js` 与 `sql-boundary.test.js` **各抄了一份逐字相同的实现**，改一处要改两处 → 必然漂移）；② 接线断言改为**先剥注释与正则字面量再匹配** |
+> | **F-4** | Minor | 两条软链用例**没有 Windows skip**，与同文件其他用例的 skip 口径不一致 | 两条软链用例都补 `{ skip: process.platform === 'win32' ? … : false }`（Windows 创建符号链接需要开发者模式或管理员权限） |
+> | **F-5** | Minor | 零依赖扫描器**保留正则字面量** → 正则里的 `from 'x'` 被误报成第三方依赖 | `stripComments(code, { blankRegex: true })` —— 正则字面量也剥成空白（默认**不开**：SQL 边界扫描器需要字符串字面量原样保留） |
+> | **F-6** | Minor | `INTERFACES.md` 把 `serveStatic` 列在 `// src/server.js` 段下，**它实际住在 `src/http/static.js`**（main 既有问题，非本轮引入）。P1–P6 若按旧表述去 `src/server.js` 找它会找不到 | 订正归属，并补上 `isSameFile` / `pipeFd` 两个同模块导出 |
+>
+> ⚠️ **共享 helper 为什么放在 `test-helpers/` 而不是 `test/helpers/`**：
+> Node 的测试运行器会把**任何名为 `test` 的目录**下的所有 `.js` / `.cjs` / `.mjs` 文件
+> **都当成测试文件**（Node 文档：目录名为 `test` 时递归搜全部 JS）→ 放在 `test/helpers/` 下
+> 会被算成一条「测试」，用例总数凭空 +1。
+> `test-helpers/` 不匹配任何发现规则（发现规则只看**文件名**：`^test$` / `^test-.+` / `^.+[.\-_]test$`，
+> 而 `strip-comments.js` 都不匹配）→ 不会被误认成测试文件。
+>
+> **验收**：用例 150 → **151**；本轮 4 个针对性变异全杀（F-1 / F-2 / F-3 / F-5）。
+
 > **【2026-10-21 终审复核 + 8 条 Minor 收尾】** 修复轮 3 的终审复核（verifier）判定 **Needs fixes**：
 > **0 Critical / 3 Important / 8 Minor**。3 条 Important 全部是**「断言缺失」型** ——
 > 也就是说实现本身是对的，但**没有任何测试钉住它**，把实现改坏全量照样全绿：
@@ -5061,6 +5142,7 @@ import { loadRules } from '../src/config.js';
 import { createApp } from '../src/server.js';
 import { createUser } from '../src/db/repo/users.js';
 import { createSession } from '../src/auth/session.js';
+import { stripComments } from '../test-helpers/strip-comments.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrationsDir = join(here, '..', 'db', 'migrations');
@@ -5500,7 +5582,7 @@ test('读流的 error 监听：流出错时断开响应，而不是变成未捕�
 // 下面每一条都对应一条「改坏了但全量测试照样全绿」的生产护栏。
 // ══════════════════════════════════════════════════════════════════
 
-test('软链指向 web 根外的文件时返回 404，不得读出文件内容（终审 I-1）', async () => {
+test('软链指向 web 根外的文件时返回 404，不得读出文件内容（终审 I-1）', { skip: process.platform === 'win32' ? 'Windows 创建符号链接需要开发者模式或管理员权限' : false }, async () => {
   // ⛔ 终审发现（Important）：静态服务只对**路径字符串**做边界比较，
   //    而 resolve() **不解析符号链接** → web/ 下指向根外的软链会被读出来。
   //    终审实测：ln -s /etc web/etclink → GET /etclink/passwd → 200 + /etc/passwd 全文。
@@ -5807,7 +5889,8 @@ test('serveStatic 必须真的调用 isSameFile 做 dev/ino 对账（接线断�
   const src = readFileSync(join(here, '..', 'src', 'http', 'static.js'), 'utf8');
   const fnStart = src.indexOf('export function serveStatic');
   assert.ok(fnStart > 0, '必须能找到 serveStatic');
-  const fnBody = src.slice(fnStart, src.indexOf('\nexport ', fnStart + 10) > 0 ? src.indexOf('\nexport ', fnStart + 10) : src.length);
+  const nextExport = src.indexOf('\nexport ', fnStart + 10);
+  const rawFnBody = src.slice(fnStart, nextExport > 0 ? nextExport : src.length);
   // ⚠️ 终审修正（Minor，M-1）：原来只断言「源码里出现过 isSameFile(」，
   //    于是 `isSameFile(stat, stat)`（**对账对象写错**，更像手滑）
   //    与 `!isSameFile(stat, linkStat) && false`（把防线短路掉）
@@ -5816,6 +5899,11 @@ test('serveStatic 必须真的调用 isSameFile 做 dev/ino 对账（接线断�
   //      ① 第一个实参是 stat（打开后 fstat 的结果）
   //      ② 第二个实参是 linkStat（realpath 解析出的目标的 stat）
   //      ③ 必须处在 `if (! ... )` 的否定守卫里，且紧跟 `)` —— 不能被 && 短路
+  // ⚠️ 终审复核修正（Minor，F-3）：**必须先剥掉注释再匹配** ——
+  //    否则「代码改成 isSameFile(stat, stat) + 注释里写上正确形态」就能骗过这条断言，
+  //    守卫永不触发却仍判绿（原正则匹配的是**未剥注释**的源码）。
+  //    剥注释用共享工具 test-helpers/strip-comments.js（零依赖守卫同款）。
+  const fnBody = stripComments(rawFnBody, { blankRegex: true });
   assert.match(
     fnBody,
     /if\s*\(\s*!isSameFile\(\s*stat\s*,\s*linkStat\s*\)\s*\)/,
@@ -5880,6 +5968,31 @@ test('HTTP 层不把 Node 的 ERR_* 错误码外泄给客户端（端到端）',
   rmSync(dataDir, { recursive: true, force: true });
 });
 
+test('4xx 响应的 message 必须是 AppError 自己的文案，而不是通用回落（终审复核 F-1）', async () => {
+  // ⛔ 终审复核发现（Important，F-1）：I-C 的修复只钉住了「裸 Error 的 message 一律回落」，
+  //    **没钉住「AppError 的 message 必须原样透传」这一半** ——
+  //    把 `const message = err instanceof AppError ? err.message : '请求无效';`
+  //    改成 `const message = '请求无效';` → 全量 150 条照样全绿。
+  //    实测响应里的 message 从「手机号或密码不正确」退化成「请求无效」，
+  //    而 web/api.js:15 正把它当界面文案直接显示 → 所有错误提示变成同一句废话，
+  //    用户既不知道是「没填手机号」还是「密码错了」。
+  const { db, close, dataDir, app } = setup();
+  const res = await call(app, 'POST', '/api/auth/login', {
+    body: { phone: '13800000000', password: 'wrong-password' },
+  });
+  assert.equal(res.status, 401);
+  const body = JSON.parse(res.body);
+  assert.equal(body.error.code, 'INVALID_CREDENTIALS');
+  assert.equal(
+    body.error.message,
+    '手机号或密码不正确',
+    'AppError 的 message 必须原样透传给客户端（它是我们自己写的中文文案）',
+  );
+  assert.notEqual(body.error.message, '请求无效', '不得退化成通用文案 —— 那等于把用户能懂的信息抹掉');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
 test('静态响应的 Content-Type 与 Cache-Control 必须符合 MIME 表（终审 M-6）', async () => {
   // ⚠️ 终审修正（Minor，M-6）：MIME 表与 Cache-Control 策略此前**零断言** ——
   //    把 MIME 表里的 '.js' 删掉（回落到 application/octet-stream）、
@@ -5923,7 +6036,7 @@ test('请求体超限返回 413 且必须带 Connection: close（终审 M-6）',
   rmSync(dataDir, { recursive: true, force: true });
 });
 
-test('软链的判定看真实路径：指向根外的被拒，指向根内的放行（终审 M-7）', async () => {
+test('软链的判定看真实路径：指向根外的被拒，指向根内的放行（终审 M-7）', { skip: process.platform === 'win32' ? 'Windows 创建符号链接需要开发者模式或管理员权限' : false }, async () => {
   // ⚠️ 终审修正（Minor，M-7）：static.js 的注释原先把「静态资源目录指向共享卷」
   //    写成了**正常部署形态**，但那条形态指向 web/ 根外 → 会被 realpath 防线挡下（404）。
   //    注释与实际行为相反 → 照着注释部署会踩坑。
@@ -7074,6 +7187,7 @@ import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
 import { join, dirname, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { stripComments } from '../test-helpers/strip-comments.js';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -7086,112 +7200,6 @@ function collectJsFiles(dir) {
     else if (entry.isFile() && entry.name.endsWith('.js')) files.push(full);
   }
   return files;
-}
-
-/**
- * 把源码里的**注释**替换成等长空白（保留换行 → 行号不变），
- * 字符串 / 模板字面量 / 正则字面量原样保留。
- * （与 test/zero-deps.test.js 里的同名 helper 重复：本轮评审限定只能改那 6 个文件，
- *   不允许另建共享 helper 文件；两个文件各自独立可跑。）
- */
-function stripComments(src) {
-  const out = src.split('');
-  const blank = (from, to) => {
-    for (let k = from; k < to; k += 1) {
-      if (out[k] !== '\n' && out[k] !== '\r') out[k] = ' ';
-    }
-  };
-  const frames = [{ kind: 'code', depth: 0 }];
-  const top = () => frames[frames.length - 1];
-  const REGEX_PUNCT = new Set('(,=:[!&|?{}+-*%<>~^'.split(''));
-  const REGEX_KEYWORDS = new Set([
-    'return', 'typeof', 'case', 'in', 'of', 'new', 'do', 'else',
-    'yield', 'await', 'void', 'instanceof', 'delete',
-  ]);
-  let i = 0;
-  let lastCodeChar = '';
-
-  const trailingWord = () => {
-    let k = i - 1;
-    while (k >= 0 && /\s/.test(src[k])) k -= 1;
-    const end = k + 1;
-    while (k >= 0 && /[A-Za-z0-9_$]/.test(src[k])) k -= 1;
-    return src.slice(k + 1, end);
-  };
-
-  while (i < src.length) {
-    const f = top();
-    const c = src[i];
-    const c2 = src[i + 1];
-
-    if (f.kind === 'code') {
-      if (c === '/' && c2 === '/') {
-        let end = src.indexOf('\n', i);
-        if (end === -1) end = src.length;
-        blank(i, end);
-        i = end;
-        continue;
-      }
-      if (c === '/' && c2 === '*') {
-        let end = src.indexOf('*/', i + 2);
-        end = end === -1 ? src.length : end + 2;
-        blank(i, end);
-        i = end;
-        continue;
-      }
-      if (c === '/' && (REGEX_PUNCT.has(lastCodeChar) || REGEX_KEYWORDS.has(trailingWord()))) {
-        let j = i + 1;
-        let inClass = false;
-        while (j < src.length) {
-          const ch = src[j];
-          if (ch === '\\') { j += 2; continue; }
-          if (ch === '[') inClass = true;
-          else if (ch === ']') inClass = false;
-          else if (ch === '/' && !inClass) { j += 1; break; }
-          else if (ch === '\n') break;
-          j += 1;
-        }
-        lastCodeChar = '/';
-        i = j;
-        continue;
-      }
-      if (c === "'" || c === '"' || c === '`') {
-        frames.push({ kind: c === "'" ? 'sq' : c === '"' ? 'dq' : 'tpl', depth: 0 });
-        lastCodeChar = c;
-        i += 1;
-        continue;
-      }
-      if (c === '{') { f.depth += 1; lastCodeChar = '{'; i += 1; continue; }
-      if (c === '}') {
-        if (f.depth === 0 && frames.length > 1) { frames.pop(); lastCodeChar = '}'; i += 1; continue; }
-        if (f.depth > 0) f.depth -= 1;
-        lastCodeChar = '}';
-        i += 1;
-        continue;
-      }
-      if (!/\s/.test(c)) lastCodeChar = c;
-      i += 1;
-      continue;
-    }
-
-    if (f.kind === 'sq' || f.kind === 'dq') {
-      if (c === '\\') { i += 2; continue; }
-      if ((f.kind === 'sq' && c === "'") || (f.kind === 'dq' && c === '"')) {
-        frames.pop();
-        lastCodeChar = c;
-        i += 1;
-        continue;
-      }
-      i += 1;
-      continue;
-    }
-
-    if (c === '\\') { i += 2; continue; }
-    if (c === '`') { frames.pop(); lastCodeChar = '`'; i += 1; continue; }
-    if (c === '$' && c2 === '{') { frames.push({ kind: 'code', depth: 0 }); i += 2; continue; }
-    i += 1;
-  }
-  return out.join('');
 }
 
 /** 取出代码里所有字符串/模板字面量（含起始下标与内容）。 */
@@ -7669,7 +7677,7 @@ test('登录按钮真的可点：点一下就发 /api/auth/login（终审 I-6-8�
 - [ ] **Step 8: 运行测试确认通过**
 
 Run: `cd platform && node --test test/server.test.js test/seed.test.js test/web.test.js test/sql-boundary.test.js`
-Expected: PASS（51 个测试全过：server 39 + seed 2 + web 6 + sql-boundary 4）
+Expected: PASS（52 个测试全过：server 40 + seed 2 + web 6 + sql-boundary 4）
 
 - [ ] **Step 9: 全量测试 + 实跑**
 
@@ -7706,13 +7714,15 @@ git commit -m "feat(P0): 静态服务、前端骨架、种子数据与服务器�
 | P0-3 | 迁移幂等 | 连续跑两次 `scripts/migrate.js`，第二次输出「本次无新迁移」 |
 | P0-4 | 权限判定唯一入口 | `permissions.test.js` **22** 个用例通过；`scopeClause` 生成的 SQL **能真跑**（有权那行在结果里、无权那行不在），且占位符个数 == `params.length`；超管标志的**两种形状**（仓储行 snake_case / `toPublicUser` 驼峰）都认；**`scopeClause` 与 `can()` 结论一致**（超管 / `role_capability` 授权 → 不做行级过滤、全部行可见；停用用户 → 一行都看不到）；`alias` 必须是合法 SQL 标识符（注入载荷全部拒绝）；`grantAssignment` 对未注册 capability / 不存在用户抛**领域错误**（不漏 SQLite 原文）；`can()` 对缺 id 的用户 **fail-closed 返回 false**（不抛错） |
 | P0-5 | 密码与会话 | `password.test.js` 8 + `session.test.js` 10 + `users.test.js` 5 个用例通过；**库中只存 `token_hash`**（`session.test.js` 断言：库里无明文 token，`token_hash` 是 64 位 sha256 十六进制）；**库里存的是 scrypt 哈希而不是明文口令**（`users.test.js` 直接读库断言 `startsWith('scrypt$')` 且验签通过）；**会话有绝对过期上限**（设计文档 §7.5：滑动续期不得突破从签发时刻算起的硬边界） |
-| P0-6 | 登录闭环 | `server.test.js` **39** 个用例通过：登录 200 + 下发 `hk_session` Cookie（HttpOnly/SameSite=Lax/Path=/）；带 Cookie 访问 `/api/me` 返回 200；密码错 401 且不下发 Cookie；**用户不存在时登录耗时也有 scrypt 量级**（防计时侧信道枚举） |
+| P0-6 | 登录闭环 | `server.test.js` **40** 个用例通过：登录 200 + 下发 `hk_session` Cookie（HttpOnly/SameSite=Lax/Path=/）；带 Cookie 访问 `/api/me` 返回 200；密码错 401 且不下发 Cookie；**用户不存在时登录耗时也有 scrypt 量级**（防计时侧信道枚举） |
 | P0-9 | 安全边界钉住 | `seed.test.js` **2** + `web.test.js` **6** 个用例通过；**目录穿越**（字面量 `/../` 与编码 `/%2e%2e`、`/%2e%2e%2f`、`/..%2f` 四种变体，**裸 socket 发原始请求行**）全部拿不到 `web/` 兄弟目录的内容；**500 响应逐字节等于通用文案**（内部细节只进 `console.error`）；**畸形 cookie** 返回 401 不抛异常；**登出后原 token 立即失效**；`createApp` 缺 `webDir` **构造期**就抛错；**静态文件读不了时返回错误且服务器存活**（不能被单个请求打死）；**前端启动时恢复会话**（`/api/me` 成功 → 首屏显示已登录） |
-| P0-10 | 修复轮 3 的安全边界 | `server.test.js` **39** + `web.test.js` **6** + `permissions.test.js` **22** + `password.test.js` **8** + `session.test.js` **10** + `users.test.js` **5** + `config.test.js` **23** + `zero-deps.test.js` **9** + `sql-boundary.test.js` **4** 个用例通过；**软链逃逸被拒**（`web/` 下指向根外的软链 → 404，真实 http server + 裸 socket）；**服务端数据里的 HTML 被转义**（存储型 XSS 封堵）；**零依赖守卫真的扫描源码 import**（不再只看 package.json）；**SQL 边界扫描**（裸 SQL 只允许出现在 `src/db/repo/`）；**数字 `scopeId` 时 `can()` 与 `scopeClause()` 结论一致**（两侧同时按字符串归一）；**`server.js` 的领域错误全部经 `AppError`**（构造期 fail-fast 除外）；**会话绝对过期默认 30 天**且 `SESSION_ABSOLUTE_TTL_DAYS` 可覆盖、非法值回落；**登录响应体键集合精确**（对外形状是驼峰版，布尔不是 0/1）；**停用用户登录耗时也有 scrypt 量级**（计时对齐覆盖第三条路径） |
+| P0-10 | 修复轮 3 的安全边界 | `server.test.js` **40** + `web.test.js` **6** + `permissions.test.js` **22** + `password.test.js` **8** + `session.test.js` **10** + `users.test.js` **5** + `config.test.js` **23** + `zero-deps.test.js` **9** + `sql-boundary.test.js` **4** 个用例通过；**软链逃逸被拒**（`web/` 下指向根外的软链 → 404，真实 http server + 裸 socket）；**服务端数据里的 HTML 被转义**（存储型 XSS 封堵）；**零依赖守卫真的扫描源码 import**（不再只看 package.json）；**SQL 边界扫描**（裸 SQL 只允许出现在 `src/db/repo/`）；**数字 `scopeId` 时 `can()` 与 `scopeClause()` 结论一致**（两侧同时按字符串归一）；**`server.js` 的领域错误全部经 `AppError`**（构造期 fail-fast 除外）；**会话绝对过期默认 30 天**且 `SESSION_ABSOLUTE_TTL_DAYS` 可覆盖、非法值回落；**登录响应体键集合精确**（对外形状是驼峰版，布尔不是 0/1）；**停用用户登录耗时也有 scrypt 量级**（计时对齐覆盖第三条路径） |
 | P0-7 | 跨平台 | 在 Mac 上 `node src/server.js` 成功；把 `platform/` 拷到另一台机器重复同样命令 |
 | P0-8 | 领域错误统一 | `src/errors.js` 导出 `AppError` / `appError(status, code, message, detail)`（**status-first**）；全部领域错误都经它抛出（`instanceof AppError` 有断言钉住）；HTTP 层只把 `.status` / `.code` 转出去，**不外泄** Node 的 `ERR_*` 与 SQLite 原文 |
-| P0-11 | 终审 Important 三项（I-A / I-B / I-C） | **`zero-deps.test.js` 9 + `body.test.js` 4 + `server.test.js` 39** 个用例通过；**I-A 零依赖守卫有自保护**：判定逻辑抽成纯函数 `classifySpecifier()` / `scanSource()`（从 `zero-deps.test.js` 导出），对**合成的坏源码**断言 6 种第三方写法（`import x from 'pkg'` / `import {x} from 'pkg'` / 副作用 import / `export … from 'pkg'` / 动态 `import()` / `require()`）**必须被判违规**，5 种合法写法（相对路径 / `node:` 内置 / 普通字符串 / 注释里的 import / URL 字面量）**不得被误判**；**I-B 请求体默认上限被钉住**：`readJsonBody(req)` 不传 `limit` 时上限为 **512KB**，512KB 以内放行、超出回 413 `PAYLOAD_TOO_LARGE`，且有反例对照（显式放宽 `limit` 后同一 body 放行）；**I-C `domainCode` 有断言且被导出**：领域码透传、Node 的 `ERR_*` 与非领域码（小写 / 数字开头 / 下划线开头 / 带连字符 / 非字符串 / 缺失）一律回落为通用码（回落值用**可区分哨兵**，避免被固定值变异掩盖）；**4xx 分支只透传 `AppError` 的 message**，裸 `Error`（含 SQLite 原文）的 message 一律回落为「请求无效」 |
-| P0-12 | 终审 8 条 Minor 逐条处置 | **`server.test.js` 39 + `sql-boundary.test.js` 4 + `zero-deps.test.js` 9 + `migrate.test.js` 10** 个用例通过；**M-1 dev/ino 接线断言收紧**：必须逐字匹配 `if (!isSameFile(stat, linkStat))`（对账对象写错或被 `&&` 短路都红）；**M-2 304 分支不泄漏 fd**：`/dev/fd` 计数探针（连打 50 次 304，fd 数不得增长；Windows 跳过该用例）；**M-3 SQL 边界扫描器有自检**：10 种形态（`exec`/`prepare` × `SELECT`/`INSERT`/`UPDATE`/`DELETE`/`DROP`/`ALTER`/`CREATE TABLE`）的阳性对照 + 3 种反例对照；**M-4 三种现实绕过（SQL 存进变量 / `db['prepare']()` / 连接变量不叫 `db`）已在文件头显式登记**（有意接受的取舍）；**M-5 零依赖守卫扫到 `test/`**：`SCAN_DIRS` 含 `test`，且断言「扫描结果里出现过 `test/` 下的文件」；**M-6 五条次要护栏有断言**：静态 `Content-Type`（MIME 表）/ `Cache-Control` / `PRAGMA busy_timeout = 5000` / 404 错误码字面量 `NOT_FOUND` / 413 的 `Connection: close`；**M-7 软链判定被钉死**：指向 web/ 根外的软链（文件与目录）→ 404，指向根内的 → 200；`static.js` 注释已订正为 fail-closed 的真实行为（共享卷部署须改用挂载或复制）；**M-8 溯源与错误风格已写明**：`router.js` 补设计文档 §8 + INTERFACES 契约溯源；`scopeClause`（程序员错误，普通 `Error`）与 `grantAssignment`（客户端输入错误，`AppError`）风格有意不同的理由写入注释；`AppError.detail` 的转发**按 P4 计划排期**（P0 无任何错误携带 detail → 无可观测差异） |
+| P0-11 | 终审 Important 三项（I-A / I-B / I-C） | **`zero-deps.test.js` 9 + `body.test.js` 4 + `server.test.js` 40** 个用例通过；**I-A 零依赖守卫有自保护**：判定逻辑抽成纯函数 `classifySpecifier()` / `scanSource()`（从 `zero-deps.test.js` 导出），对**合成的坏源码**断言 6 种第三方写法（`import x from 'pkg'` / `import {x} from 'pkg'` / 副作用 import / `export … from 'pkg'` / 动态 `import()` / `require()`）**必须被判违规**，5 种合法写法（相对路径 / `node:` 内置 / 普通字符串 / 注释里的 import / URL 字面量）**不得被误判**；**I-B 请求体默认上限被钉住**：`readJsonBody(req)` 不传 `limit` 时上限为 **512KB**，512KB 以内放行、超出回 413 `PAYLOAD_TOO_LARGE`，且有反例对照（显式放宽 `limit` 后同一 body 放行）；**I-C `domainCode` 有断言且被导出**：领域码透传、Node 的 `ERR_*` 与非领域码（小写 / 数字开头 / 下划线开头 / 带连字符 / 非字符串 / 缺失）一律回落为通用码（回落值用**可区分哨兵**，避免被固定值变异掩盖）；**4xx 分支只透传 `AppError` 的 message**，裸 `Error`（含 SQLite 原文）的 message 一律回落为「请求无效」 |
+| P0-12 | 终审 8 条 Minor 逐条处置 | **`server.test.js` 40 + `sql-boundary.test.js` 4 + `zero-deps.test.js` 9 + `migrate.test.js` 10** 个用例通过；**M-1 dev/ino 接线断言收紧**：必须逐字匹配 `if (!isSameFile(stat, linkStat))`（对账对象写错或被 `&&` 短路都红）；**M-2 304 分支不泄漏 fd**：`/dev/fd` 计数探针（连打 50 次 304，fd 数不得增长；Windows 跳过该用例）；**M-3 SQL 边界扫描器有自检**：10 种形态（`exec`/`prepare` × `SELECT`/`INSERT`/`UPDATE`/`DELETE`/`DROP`/`ALTER`/`CREATE TABLE`）的阳性对照 + 3 种反例对照；**M-4 三种现实绕过（SQL 存进变量 / `db['prepare']()` / 连接变量不叫 `db`）已在文件头显式登记**（有意接受的取舍）；**M-5 零依赖守卫扫到 `test/`**：`SCAN_DIRS` 含 `test`，且断言「扫描结果里出现过 `test/` 下的文件」；**M-6 五条次要护栏有断言**：静态 `Content-Type`（MIME 表）/ `Cache-Control` / `PRAGMA busy_timeout = 5000` / 404 错误码字面量 `NOT_FOUND` / 413 的 `Connection: close`；**M-7 软链判定被钉死**：指向 web/ 根外的软链（文件与目录）→ 404，指向根内的 → 200；`static.js` 注释已订正为 fail-closed 的真实行为（共享卷部署须改用挂载或复制）；**M-8 溯源与错误风格已写明**：`router.js` 补设计文档 §8 + INTERFACES 契约溯源；`scopeClause`（程序员错误，普通 `Error`）与 `grantAssignment`（客户端输入错误，`AppError`）风格有意不同的理由写入注释；`AppError.detail` 的转发**按 P4 计划排期**（P0 无任何错误携带 detail → 无可观测差异） |
+
+| P0-13 | 终审复核的 F-1 ~ F-6 | **`server.test.js` 40 + `body.test.js` 4 + `zero-deps.test.js` 9 + `sql-boundary.test.js` 4** 个用例通过；**F-1（Important）AppError 的 message 必须原样透传**：4xx 响应的 `error.message` 断言等于具体文案（「手机号或密码不正确」）且**不等于**通用回落「请求无效」（`web/api.js` 把它当界面文案直接显示，退化后所有错误提示变成同一句废话）；**F-2 请求体上限边界取「正好等于上限」**：512KB（524288 字节）必须放行、512KB+1 必须 413（`size > limit` 改成 `>=` 会被抓住）；**F-3 接线断言先剥注释再匹配**：`isSameFile` 接线断言改用共享工具 `test-helpers/strip-comments.js` 剥掉注释与正则字面量后再匹配，「代码写错 + 注释里写对形态」骗不过去；**共享 helper 消除 `zero-deps.test.js` 与 `sql-boundary.test.js` 的逐字重复**（且放在 `test-helpers/` 而非 `test/` 下 —— Node 会把名为 `test` 的目录下所有 JS 当测试文件）；**F-4 两条软链用例补 Windows skip**（与同文件其他 skip 口径一致）；**F-5 正则字面量不再误报**：`stripComments(code, { blankRegex: true })` 把正则字面量也剥成空白（正则里的 `from 'x'` 不是 import）；**F-6 `INTERFACES.md` 的 `serveStatic` 归属订正**：它住在 `src/http/static.js` 而非 `src/server.js` |
 
 ---
 
