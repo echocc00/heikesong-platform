@@ -6,7 +6,7 @@ import { dirname, join } from 'node:path';
 
 const rulesDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'rules');
 
-test('仓库自带的 9 份规则配置能通过校验', () => {
+test('仓库自带的全部规则配置能通过校验', () => {
   const { rules } = loadRules(rulesDir);
   assert.deepEqual(validateRules(rules), []);
 });
@@ -55,7 +55,7 @@ test('破同分链必须以确定性兜底项结尾', () => {
   assert.ok(validateRules(broken).some((e) => e.includes('tiebreak')));
 });
 
-// ── 以下 6 条覆盖「9 份配置全部有内容校验」这条要求 ──────────────
+// ── 以下 6 条覆盖「每份配置都有内容校验」这条要求 ──────────────
 // 行为分 / 可见性 / 里程碑这三份配置如果只被读出来、不被校验，
 // 写错了也要等到 P2/P3 算分算榜时才发现 —— 那时榜单可能已经发出去了。
 
@@ -107,7 +107,7 @@ test('维度 key 重复会被拒绝', () => {
 
 // ── 以下 3 条来自实现者实测反馈的 3 条漏检（父代理裁决后采纳）──────────
 
-test('9 份配置的 version 必须一致（漂移会让计算 trace 说谎）', () => {
+test('全部配置的 version 必须一致（漂移会让计算 trace 说谎）', () => {
   const { rules } = loadRules(rulesDir);
   const broken = structuredClone(rules);
   broken.tiebreak.version = '2099-01-01';

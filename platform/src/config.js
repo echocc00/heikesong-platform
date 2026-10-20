@@ -60,37 +60,68 @@ function hasMissingKey(items) {
   return items.some((i) => typeof i.key !== 'string' || !i.key);
 }
 
-export function validateRules(rules) {
+/**
+ * 把配置对象摊平收集到 out。
+ * 「有 id 的是一份配置，没 id 的是命名空间」（scoring = { initial, final }）。
+ */
+function collectConfigObjects(value, out) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return;
+  if (typeof value.id === 'string') {
+    out.push(value);
+    return;
+  }
+  for (const inner of Object.values(value)) {
+    collectConfigObjects(inner, out);
+  }
+}
+
+/**
+ * 校验全部规则配置。**任何一条不通过都必须 fail-fast**（loadRules 会抛错拒绝启动）。
+ * @param {object} rules 分组后的配置（loadRules 传入）
+ * @param {number|null} [expectedCount] 应当存在的配置份数（loadRules 传 FILES 的键数）。
+ *   传了才能发现「整份配置没被识别到」；不传时只做 version 相关的检查。
+ */
+export function validateRules(rules, expectedCount = null) {
   const errors = [];
   const push = (msg) => errors.push(msg);
 
   // ── 版本号一致性 ─────────────────────────────────────────
-  // 9 份配置的 version 必须全等。version 会写进计算 trace（设计原则
+  // 所有配置的 version 必须全等。version 会写进计算 trace（设计原则
   // 「每次计算留 trace」）—— 版本号漂移 = 审计链在说谎：trace 上标注的版本
   // 与实际生效的规则对不上，事后复算无法自证。
-  const versionValues = [
-    rules?.scoring?.initial?.version,
-    rules?.scoring?.final?.version,
-    rules?.tiebreak?.version,
-    rules?.ranks?.version,
-    rules?.behavior?.version,
-    rules?.visibility?.version,
-    rules?.registration?.version,
-    rules?.solvability?.version,
-    rules?.milestones?.version,
-  ].filter((v) => v !== undefined && v !== null && v !== '');
-  // 9 份必须**都有** version —— 只校验「存在的那几份全等」是不够的：
-  // 缺一份时 loadRules 对外报的 version 会取到别人的值，等于说谎。
-  if (versionValues.length < 9) {
-    push(`规则配置有 ${9 - versionValues.length} 份缺少 version 字段`);
+  //
+  // ⚠️ 2026-10-21 修正（P1 Task 3 验收发现，与 P2–P6 漂移审计的 I-2 同一条）：
+  //    原来这里是**硬编码的 9 项**列表 —— P1 新增 3 份配置（teamFormation /
+  //    schedule / compliance）之后，它们的 version 漂移**根本不会被发现**，
+  //    这条校验对新增配置形同虚设（实跑：把新配置改成一个异版本号，零报错）。
+  //    改成**自动派生**：按「有 id 的就是一份配置」把配置对象摊平，
+  //    加多少份配置都自动覆盖 —— 不再需要改这里。
+  //
+  //    「有 id 的是配置，没 id 的是命名空间」（如 scoring = { initial, final }）。
+  //    用 id 而不是 version 做识别：一份配置**缺了 version** 时仍能被认出来，
+  //    否则它会被当成命名空间 → 「缺少 version」这条检查反而失效。
+  const configObjects = [];
+  for (const value of Object.values(rules ?? {})) {
+    collectConfigObjects(value, configObjects);
   }
-  if (versionValues.length > 1) {
-    const distinct = [...new Set(versionValues)];
-    // ⚠️ distinct 是**数组**（Set 被展开），判重数用 .length —— 用 .size 会拿到
-    //    undefined，比较恒为 false，这条校验会静默失效。
-    if (distinct.length > 1) {
-      push(`规则配置 version 不一致：${distinct.join(' / ')} —— 9 份配置必须同版本`);
-    }
+  const configCount = configObjects.length;
+  // 每份都必须**有** version —— 只校验「存在的那几份全等」是不够的：
+  // 缺一份时 loadRules 对外报的 version 会取到别人的值，等于说谎。
+  const missingVersion = configObjects.filter(
+    (c) => c.version === undefined || c.version === null || c.version === '',
+  ).length;
+  if (missingVersion > 0) {
+    push(`规则配置有 ${missingVersion} 份缺少 version 字段`);
+  }
+  // 份数对不上 = 有配置**没被识别到**（如整份配置读成了空对象）→ 必须报错。
+  if (expectedCount !== null && configCount !== expectedCount) {
+    push(`规则配置应有 ${expectedCount} 份，实际只识别到 ${configCount} 份`);
+  }
+  const distinct = [...new Set(configObjects.map((c) => c.version).filter((v) => v !== undefined && v !== null && v !== ''))];
+  // ⚠️ distinct 是**数组**（Set 被展开），判重数用 .length —— 用 .size 会拿到
+  //    undefined，比较恒为 false，这条校验会静默失效。
+  if (distinct.length > 1) {
+    push(`规则配置 version 不一致：${distinct.join(' / ')} —— ${configCount} 份配置必须同版本`);
   }
 
   // ── 评分配置 ──────────────────────────────────────────────
@@ -464,7 +495,7 @@ export function loadRules(rulesDir) {
     compliance: rules.compliance,
   };
 
-  const errors = validateRules(grouped);
+  const errors = validateRules(grouped, Object.keys(FILES).length);
   if (errors.length) {
     const list = errors.map((e) => `  - ${e}`).join('\n');
     throw new Error(`规则配置校验失败，拒绝启动：\n${list}`);

@@ -870,12 +870,12 @@ export function lastLeaveAt(db, teamId) {
 > 而不是写死数字。**断言强度不减**：漏建表 / 迁移没被应用 / 历史对不上账仍会被抓住
 > （已用「把 cities 改名」变异实测）。
 
-- [ ] **Step 9: 运行测试确认通过**
+- [ ] **Step 10: 运行测试确认通过**
 
 Run: `cd platform && node --test test/migration-002.test.js`
 Expected: PASS（8 个测试全过：migration-002 8）
 
-- [ ] **Step 10: 提交**
+- [ ] **Step 11: 提交**
 
 ```bash
 cd platform && git add db/migrations/002_registration.sql src/db/repo test/migration-002.test.js test/migrate.test.js
@@ -1286,6 +1286,7 @@ git commit -m "feat(P1): 报名算分分级纯函数与 SABC 问卷配置
 - Modify: `platform/src/server.js`
 - Create: `platform/test/registration-service.test.js`
 - Create: `platform/test/registration-api.test.js`
+- Create: `platform/test/config-p1.test.js`
 
 **Interfaces:**
 - Consumes: Task 1 仓储、Task 2 `scoreRegistration` / `classifyLevel` / `validateRegistrationAnswers`、P0 `can()` 与 `createSession()`
@@ -1719,6 +1720,14 @@ export function registerRegistrationRoutes({ router, db, rules }) {
 
   router.add('POST', '/api/registrations', async ({ user, body }) => {
     if (!user) throw new AppError(401, 'UNAUTHENTICATED', '未登录');
+    // ⚠️ 2026-10-21 验收修正（规格缺陷）：`registration:write` 这个能力点被注册、
+    //    被授予（seed 里给了 captain / member，测试里也显式授予），
+    //    但**路由从不校验它** → 能力点形同虚设，违反全局约束
+    //    「权限模型 = capability + assignment，`can()` 是唯一判定入口」。
+    //    已登录但没有该能力 → 403（三态：禁用 → 403；不是 404，资源不存在才用 404）。
+    if (!can(user, 'registration:write', null, db)) {
+      throw new AppError(403, 'FORBIDDEN', '你没有提交报名的权限');
+    }
     const { editionId, answers } = body ?? {};
     if (!editionId) throw new AppError(400, 'MISSING_EDITION_ID', '缺少届期');
     return submitRegistration({ db, userId: user.id, editionId, answers, rules });
@@ -1822,6 +1831,25 @@ import { registerRegistrationRoutes } from './http/routes/registration.js';
         error(res, status, code, message, err instanceof AppError ? err.detail : undefined);
 ```
 
+> **【2026-10-21 父代理验收修正（规格缺陷）】** P0 的 `validateRules()` 里，version 全等校验是
+> **硬编码的 9 项列表**（`rules.scoring.initial.version` … `rules.milestones.version`）。
+> P1 加了 `teamFormation` / `schedule` / `compliance` 三份配置之后 ——
+> **这三份的 version 漂移根本不会被发现**，校验对新增配置形同虚设
+> （实跑：把 `teamFormation.version` 改成 `2099-01-01`，`validateRules` 零报错）。
+> 这与 P2–P6 漂移审计的 **I-2** 是同一条问题。
+> **修法**：`validateRules(rules, expectedCount = null)` —— 把配置对象**自动派生**出来
+> （「有 `id` 的是一份配置，没 `id` 的是命名空间」，如 `scoring = { initial, final }`），
+> 加多少份配置都自动覆盖；`expectedCount` 由 `loadRules()` 传 `Object.keys(FILES).length`，
+> 用于发现「整份配置没被识别到」。**用 `id` 而不是 `version` 做识别**：
+> 一份配置**缺了 version** 时仍要被认出来，否则它会被当成命名空间 → 「缺少 version」这条检查反而失效。
+>
+> **⚠️ 为什么新增配置不写进 P0 的 `test/config.test.js`**：那个文件是 **P0 建立**的，
+> 条数已在 P0 计划里声明（23 条）。往里加用例会让 P0 计划的条数声明当场过期
+> → 跨阶段的同一条纪律是「计划声明的条数 == 实跑条数」，改一处要改两处。
+> P1 自己新增配置的断言放在 **P1 自己的文件** `test/config-p1.test.js`（4 条）→
+> P0 的文件与计划**一字不动**。
+>
+
 - [ ] **Step 7: 创建 P1 新增的 3 份规则配置并扩展 src/config.js**
 
 > ⚠️ 放在本 Task 而不是 Task 5：`loadRules()` 会一次性加载 `rules/` 下全部文件。
@@ -1905,6 +1933,11 @@ import { registerRegistrationRoutes } from './http/routes/registration.js';
 `platform/src/config.js` 三处改动：
 
 ```javascript
+
+// ④ version 全等校验改为**自动派生**（2026-10-21 父代理验收修正：
+//    原实现把 version 校验硬编码成 9 项 → P1 新增的 3 份配置漂移不会被发现，
+//    与 P2–P6 漂移审计的 I-2 同一条）。改为按「有 id 的是一份配置」摊平收集，
+//    加多少份配置都自动覆盖；expectedCount 由 loadRules 传 Object.keys(FILES).length。
 // ① FILES 追加三项
   teamFormation: 'team-formation.json',
   schedule: 'schedule.json',
@@ -2037,7 +2070,7 @@ import { openDatabase } from '../src/db/sqlite.js';
 import { applyMigrations } from '../src/db/migrate.js';
 import { loadRules } from '../src/config.js';
 import { createApp } from '../src/server.js';
-import { createUser } from '../src/db/repo/users.js';
+import { createUser, setSuperadmin } from '../src/db/repo/users.js';
 import { createEdition } from '../src/db/repo/editions.js';
 import { createSession } from '../src/auth/session.js';
 import { grantAssignment } from '../src/auth/permissions.js';
@@ -2067,7 +2100,12 @@ function setup() {
   const user = createUser(db, { name: '选手甲', phone: '13900003001', password: 'pw', mbaStatus: 'mba' });
   const other = createUser(db, { name: '选手乙', phone: '13900003002', password: 'pw', mbaStatus: 'mba' });
   const admin = createUser(db, { name: '组委会', phone: '13900003003', password: 'pw', mbaStatus: 'mba' });
-  db.prepare('UPDATE users SET is_superadmin = 1 WHERE id = ?').run(admin.id);
+  // ⚠️ 用 P0 的仓储函数，不写裸 SQL（SQL 边界：SQL 只允许出现在 src/db/repo/）。
+  //    验收修正：原来这里写的是 db.prepare('UPDATE users SET is_superadmin = 1 ...')，
+  //    而本文件自己的注释又声称「不写裸 SQL」—— 自相矛盾。
+  setSuperadmin(db, admin.id);
+  // 「有账号但没有 registration:write 能力」的用户 —— 用来验证能力点真的被校验。
+  const outsider = createUser(db, { name: '无权限者', phone: '13900003004', password: 'pw', mbaStatus: 'mba' });
   // ⚠️ 父代理预审修正（规格缺口）：**能力点必须先注册**。
   //    `grantAssignment` 会先校验 capability 是否在 `capabilities` 表里注册过
   //    （P0 的评审修正 I5 同类：入参要先校验，不把 SQLite 原文漏到 HTTP 层），
@@ -2084,10 +2122,11 @@ function setup() {
   });
   const app = createApp({ db, rules, webDir });
   return {
-    db, close, dataDir, app, edition, user, other, admin,
+    db, close, dataDir, app, edition, user, other, admin, outsider,
     tokenUser: createSession(db, user.id).token,
     tokenOther: createSession(db, other.id).token,
     tokenAdmin: createSession(db, admin.id).token,
+    tokenOutsider: createSession(db, outsider.id).token,
   };
 }
 
@@ -2212,14 +2251,142 @@ test('POST /api/registrations/:id/level 组委会改级成功，选手改级 →
   s.close();
   rmSync(s.dataDir, { recursive: true, force: true });
 });
+
+test('问卷不完整 → 400 INVALID_ANSWERS，且响应体带 detail（前端要知道缺哪几题）', async () => {
+  // ⚠️ 2026-10-21 验收修正（worker 报为 M7，是真实覆盖缺口）：
+  //    HTTP 层的 `error.detail` 此前**零断言** —— 把 server.js 里的
+  //    `error(res, status, code, message, err instanceof AppError ? err.detail : undefined)`
+  //    改成不传 detail，18 条用例照样全绿。
+  //    而「缺哪几题」正是前端报名页要显示的东西（detail 被吞 → 页面只能报「填写不完整」）。
+  const s = setup();
+  const res = await call(s.app, 'POST', '/api/registrations', {
+    token: s.tokenUser,
+    body: { editionId: s.edition.id, answers: { ...GOOD, direction: [4, 4] } },
+  });
+  assert.equal(res.status, 400);
+  const body = JSON.parse(res.body);
+  assert.equal(body.error.code, 'INVALID_ANSWERS');
+  assert.ok(Array.isArray(body.error.detail), `error.detail 必须是数组，实际 ${JSON.stringify(body.error.detail)}`);
+  assert.ok(body.error.detail.length > 0, 'detail 必须指出缺哪几题');
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('已登录但没有 registration:write 能力 → 403（能力点必须真的被校验）', async () => {
+  // ⚠️ 2026-10-21 验收修正（规格缺陷）：`registration:write` 被注册、被授予，
+  //    但路由从不校验 → 能力点形同虚设，违反「can() 是唯一判定入口」。
+  const s = setup();
+  const res = await call(s.app, 'POST', '/api/registrations', {
+    token: s.tokenOutsider,
+    body: { editionId: s.edition.id, answers: GOOD },
+  });
+  assert.equal(res.status, 403, `没有能力点必须回 403，实际 ${res.status}`);
+  assert.equal(JSON.parse(res.body).error.code, 'FORBIDDEN');
+  // 拒绝之后不能留下任何报名记录
+  const list = await call(s.app, 'GET', '/api/registrations?editionId=' + s.edition.id, { token: s.tokenAdmin });
+  assert.equal(JSON.parse(list.body).items.length, 0, '被拒绝的提交不得留下记录');
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
 ```
 
-- [ ] **Step 9: 运行测试确认通过**
+- [ ] **Step 9: 创建 test/config-p1.test.js**
 
-Run: `cd platform && node --test test/registration-service.test.js test/registration-api.test.js`
-Expected: PASS（18 个测试全过：registration-service 10 + registration-api 8）
+`platform/test/config-p1.test.js`：
 
-- [ ] **Step 10: 提交**
+```javascript
+// platform/test/config-p1.test.js —— P1 阶段新增配置的配置校验守卫
+//
+// 为什么单独开一个文件（而不是往 P0 的 test/config.test.js 里加）：
+//   P0 的 config.test.js 是 **P0 建立**的文件，条数已在 P0 计划里声明（23 条）。
+//   往里加用例会让 P0 计划的条数声明当场过期 —— 跨阶段的同一条纪律是
+//   「计划声明的条数 == 实跑条数」，改一处要改两处。
+//   P1 自己新增的配置（P1 加了 teamFormation / schedule / compliance 三份）
+//   相关断言放在 P1 自己的文件里 → P0 的文件与计划**一字不动**。
+//
+// 依据：设计文档 §4.2「运行时与依赖」+ §6.1「三条设计原则」+ §6.7「配置清单」
+//   「version 会写进计算 trace」—— version 漂移 = 审计链在说谎。
+//   全局约束「配置校验 fail-fast」：配置改坏就拒绝启动，不静默降级。
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { loadRules, validateRules } from '../src/config.js';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+
+const rulesDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'rules');
+
+// P1 新增的三份配置
+const P1_KEYS = ['teamFormation', 'schedule', 'compliance'];
+
+test('P1 新增的 3 份配置都存在、都带 version、且与全体同版本', () => {
+  const { rules } = loadRules(rulesDir);
+  for (const key of P1_KEYS) {
+    assert.ok(rules[key], `${key} 必须存在`);
+    assert.equal(typeof rules[key].version, 'string', `${key} 必须带 version`);
+  }
+  const versions = new Set();
+  const collect = (value) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return;
+    if (typeof value.id === 'string') { versions.add(value.version); return; }
+    for (const inner of Object.values(value)) collect(inner);
+  };
+  collect(rules);
+  assert.equal(versions.size, 1, `全部配置的 version 必须同版本，实际 ${[...versions].join(' / ')}`);
+});
+
+test('新增配置的 version 漂移会被拒绝（不是只校验 P0 那 9 份）', () => {
+  // ⚠️ 2026-10-21 验收修正（与 P2–P6 漂移审计的 I-2 同一条）：
+  //    version 校验原先是**硬编码的 9 项列表** —— P1 新增的 3 份配置
+  //    的 version 漂移**根本不会被发现**（实跑：零报错）。
+  //    改成自动派生后，新增配置漂移立刻被抓。
+  const { rules } = loadRules(rulesDir);
+  const broken = structuredClone(rules);
+  broken.teamFormation.version = '2099-01-01';
+  const errors = validateRules(broken);
+  assert.ok(errors.some((e) => e.includes('version')), `必须报 version 不一致，实际 ${JSON.stringify(errors)}`);
+});
+
+test('新增的配置缺少 version 会被拒绝', () => {
+  const { rules } = loadRules(rulesDir);
+  const broken = structuredClone(rules);
+  delete broken.schedule.version;
+  const errors = validateRules(broken);
+  assert.ok(errors.some((e) => e.includes('缺少 version')), `必须报缺少 version，实际 ${JSON.stringify(errors)}`);
+});
+
+test('配置份数对不上会被拒绝（整份配置没被识别到）', () => {
+  // expectedCount 来自 FILES 的键数 —— 有配置**没被识别到**时必须报错，
+  // 否则「少一份配置」会静默通过（计算 trace 上的 version 就是错的）。
+  const { rules } = loadRules(rulesDir);
+  const errors = validateRules(rules, 99);
+  assert.ok(errors.some((e) => e.includes('份')), `必须报份数不符，实际 ${JSON.stringify(errors)}`);
+});
+```
+
+
+> **【2026-10-21 父代理验收修正（两条规格缺陷）】**
+> **①（能力点形同虚设）** `registration:write` 这个能力点被 `insertCapability` 注册、
+>    被 seed 授予（captain / member）、被测试显式授予 —— 但**路由从不校验它**：
+>    `POST /api/registrations` 只判了「有没有登录」。
+>    能力点形同虚设 = 违反全局约束「权限模型 = capability + assignment，`can()` 是唯一判定入口」。
+>    **修法**：已登录但 `can(user, 'registration:write', null, db)` 为假 → **403**
+>    （三态：禁用 → 403；404 是「资源不存在」，不能拿来表示「无权」）。
+> **②（HTTP 层 `error.detail` 零断言）** worker 交付时自报的 M7：
+>    把 server.js 的 `error(res, status, code, message, err instanceof AppError ? err.detail : undefined)`
+>    改成不传 detail，**18 条用例照样全绿** ——
+>    而「缺哪几题」正是前端报名页要显示的东西（detail 被吞 → 页面只能报「填写不完整」）。
+>    **修法**：补一条用例断言 400 `INVALID_ANSWERS` 的 `error.detail` 是**非空数组**。
+>
+> **③（测试里的裸 SQL）** 本文件原来用 `db.prepare('UPDATE users SET is_superadmin = 1 …')`，
+>    而文件自己的注释却写着「不写裸 SQL，守住 SQL 边界」—— 自相矛盾。
+>    P0 的 `src/db/repo/users.js` 已有 `setSuperadmin(db, userId)` → 直接调它。
+
+- [ ] **Step 10: 运行测试确认通过**
+
+Run: `cd platform && node --test test/registration-service.test.js test/registration-api.test.js test/config-p1.test.js`
+Expected: PASS（24 个测试全过：registration-service 10 + registration-api 10 + config-p1 4）
+
+- [ ] **Step 11: 提交**
 
 ```bash
 cd platform && git add src/services/registration.js src/http/routes/registration.js rules/team-formation.json rules/schedule.json rules/compliance.json src/config.js src/server.js test/registration-service.test.js test/registration-api.test.js
@@ -4605,6 +4772,8 @@ git commit -m "feat(P1): 端到端串联与种子扩充（报名→分级→建�
 | 六维的一票否决 ①② 由维度推导 | `data_access = 0` → 自动命中「无法提供数据授权说明」；`accountability = 0` → 自动命中「无企业侧唯一责任人」；③「涉及生产系统且未谈责任归属」只能由出题方自报 | 顶层文档 §3.2 的六维与三条否决是同一件事的两种说法（原文把「责任可归属」列为维度、把「唯一责任人」列为否决）。**属我方推断，需组委会追认** |
 | 分级落在档位间隙时向下取档 | 分值落在两档之间（例如 6.8）取更低一档 | 六维分值是 0–12 的连续量，档位是 10-12 / 7-9 / 4-6 / 0-3，间隙必然存在。**我方假设** |
 | R-REG-01「报名即认领任务包」的落点 | 认领动作落在**建队时刻**（`teams.task_package_id`），报名表不带任务包字段 | 设计文档 §10 流 1 写的是「队长建队 → 认领任务包 → 成员加入」，且契约的 `registrations` 表无任务包列。**若组委会要求「报名表里就选任务包」**，需在 `002_registration.sql` 给 `registrations` 加列 → 契约变更 |
+| `GET /api/registrations` 不带 `editionId` 的含义 | 返回**全部届期**的报名（组委会视角）；带 `editionId` 才按届期过滤 | 与「全局授权不做行级过滤」一致（`scopeClause` 对 `scope_type='global'` 的授权不设限）。**带版期授权的组委会成员**（`scope_type='edition'`）在不带 `editionId` 时看不到任何行 —— 因为 `scopeId` 为空、匹配不上任何一版。⚠️ 若组委会希望「不带 editionId 时只看自己有权限的届期」，需要把 `editionId` 变成**必填**（契约变更） |
+| `POST /api/registrations` 的能力点校验 | 已登录 + `can(user, 'registration:write', …)` 才放行，否则 **403** | **【2026-10-21 父代理验收修正】** 计划原文只判「有没有登录」→ `registration:write` 这个被注册、被 seed 授予的能力点**形同虚设**，违反全局约束「`can()` 是唯一判定入口」。⚠️ **副作用**：新注册的账号若没有任何角色 / 授权，将无法报名（seed 里 captain 与 member 都有 `registration:write`，所以正常路径不受影响）。若组委会要求「任何人注册后即可报名」，则应改为「报名成功时自动授予 member 角色」—— 那是契约变更 |
 
 ---
 

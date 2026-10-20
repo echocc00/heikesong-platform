@@ -15,6 +15,14 @@ export function registerRegistrationRoutes({ router, db, rules }) {
 
   router.add('POST', '/api/registrations', async ({ user, body }) => {
     if (!user) throw new AppError(401, 'UNAUTHENTICATED', '未登录');
+    // ⚠️ 2026-10-21 验收修正（规格缺陷）：`registration:write` 这个能力点被注册、
+    //    被授予（seed 里给了 captain / member，测试里也显式授予），
+    //    但**路由从不校验它** → 能力点形同虚设，违反全局约束
+    //    「权限模型 = capability + assignment，`can()` 是唯一判定入口」。
+    //    已登录但没有该能力 → 403（三态：禁用 → 403；不是 404，资源不存在才用 404）。
+    if (!can(user, 'registration:write', null, db)) {
+      throw new AppError(403, 'FORBIDDEN', '你没有提交报名的权限');
+    }
     const { editionId, answers } = body ?? {};
     if (!editionId) throw new AppError(400, 'MISSING_EDITION_ID', '缺少届期');
     return submitRegistration({ db, userId: user.id, editionId, answers, rules });
