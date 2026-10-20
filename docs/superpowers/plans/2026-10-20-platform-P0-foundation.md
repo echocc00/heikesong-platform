@@ -2702,6 +2702,23 @@ test('超级管理员拥有一切能力', () => {
   rmSync(dataDir, { recursive: true, force: true });
 });
 
+test('超管标志两种形状都认（仓储行 / toPublicUser 的驼峰形状）', () => {
+  // ⛔ 跨 Task 接口缝：can() 只认 snake_case 时，调用方传 toPublicUser() 的
+  //    驼峰形状会让**超管静默失去全部权限**（症状：管理员登进去什么都点不动）。
+  //    can() 是全项目唯一权限入口，必须两种形状都认。
+  const { db, close, dataDir, user } = setup();
+  user.is_superadmin = 1;
+  assert.equal(can(user, 'score:write', null, db), true);
+  assert.equal(can({ id: user.id, isSuperadmin: true, active: true }, 'score:write', null, db), true);
+  // 反向：非超管的驼峰形状不能被误判成超管
+  assert.equal(
+    can({ id: user.id, isSuperadmin: false, active: true }, 'score:write', null, db),
+    false,
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
 test('没有授权时能力为 false', () => {
   const { db, close, dataDir, user } = setup();
   assert.equal(can(user, 'score:write', { scopeType: 'task_package', scopeId: 'tp_1' }, db), false);
@@ -2914,7 +2931,13 @@ export function can(user, capability, ctx = null, db = null) {
   //    精简对象 { id, is_superadmin: 1 } 时，被停用的用户会被判为有权。
   //    只有**明确带 active 且为假**才拒绝。
   if (user.active !== undefined && !user.active) return false;
-  if (user.is_superadmin === 1) return true;
+  // ⚠️ 超管标志**同时认两种形状**：仓储层行是 `is_superadmin: 0|1`（snake_case），
+  //    toPublicUser() 的对外形状是 `isSuperadmin: boolean`（camelCase）。
+  //    can() 是全项目**唯一**权限入口（P1–P6 全部依赖）。若只认一种形状，
+  //    调用方传错形状会让**超管静默失去全部权限** —— 症状是"管理员登进去
+  //    什么都点不动"，极难定位。多认一种形状，把这类静默降级从根上消除。
+  //    （失败方向是 fail-closed：认不出超管只会少给权限，不会多给。）
+  if (user.is_superadmin === 1 || user.isSuperadmin === true) return true;
   if (!db) return false;
 
   // 角色能力
@@ -3069,7 +3092,7 @@ Expected: `role_capabilities role_id,capability` ｜ `user_roles user_id,role_ke
 - [ ] **Step 7: 运行测试确认通过**
 
 Run: `cd platform && node --test test/permissions.test.js`
-Expected: PASS（12 个测试全过）
+Expected: PASS（13 个测试全过）
 
 - [ ] **Step 8: 提交**
 
@@ -3147,6 +3170,7 @@ git commit -m "feat(P0): capability + assignment 权限模型与 SQL 层行级�
 - Create: `platform/src/http/static.js`
 - Create: `platform/src/server.js`
 - Create: `platform/scripts/seed.js`
+- Create: `platform/test/server.test.js`
 - Create: `platform/web/index.html`
 - Create: `platform/web/app.js`
 - Create: `platform/web/router.js`
@@ -4102,7 +4126,7 @@ git commit -m "feat(P0): 静态服务、前端骨架、种子数据与服务器�
 | P0-1 | 零依赖 | `node --test test/zero-deps.test.js` 通过；无 `node_modules`、无 `package-lock.json` |
 | P0-2 | 配置 fail-fast | 故意把 `scoring-final.json` 某权重改成 0.30 → 启动报错里出现「权重合计」，且进程以**非 0 退出码**退出（实际文案是「权重合计 = 1.1000，必须等于 1（100%）」，用 `toFixed(4)`） |
 | P0-3 | 迁移幂等 | 连续跑两次 `scripts/migrate.js`，第二次输出「本次无新迁移」 |
-| P0-4 | 权限判定唯一入口 | `permissions.test.js` **12** 个用例通过；`scopeClause` 生成的 SQL **能真跑**（有权那行在结果里、无权那行不在），且占位符个数 == `params.length` |
+| P0-4 | 权限判定唯一入口 | `permissions.test.js` **13** 个用例通过；`scopeClause` 生成的 SQL **能真跑**（有权那行在结果里、无权那行不在），且占位符个数 == `params.length`；超管标志的**两种形状**（仓储行 snake_case / `toPublicUser` 驼峰）都认 |
 | P0-5 | 密码与会话 | `password.test.js` 5 + `session.test.js` 4 + `users.test.js` 2 个用例通过；**库中只存 `token_hash`**（`session.test.js` 断言：库里无明文 token，`token_hash` 是 64 位 sha256 十六进制） |
 | P0-6 | 登录闭环 | `server.test.js` **9** 个用例通过：登录 200 + 下发 `hk_session` Cookie（HttpOnly/SameSite=Lax/Path=/）；带 Cookie 访问 `/api/me` 返回 200；密码错 401 且不下发 Cookie |
 | P0-7 | 跨平台 | 在 Mac 上 `node src/server.js` 成功；把 `platform/` 拷到另一台机器重复同样命令 |
