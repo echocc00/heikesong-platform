@@ -21,5 +21,11 @@
     { "key": "no_responsible_owner",  "label": "无企业侧唯一责任人" },
     { "key": "production_undisclosed","label": "涉及生产系统且未谈责任归属" }
   ],
-  "taskMix": { "enterprise": 0.70, "free": 0.30 }
+  "taskMix": {
+    "enterprise": 0.70,
+    "free": 0.30,
+    "enterpriseGradeSplit": { "A": 0.40, "B": 0.20, "C": 0.10 },
+    "tolerance": 0.10
+  },
+  "taskMixNote": "R-ENT-09（顶层文档 §3.1）：任务卡 70% B 端 + 30% 自由；任务池内 A 40% / B 20% / C 10% / 自由 30%（四档合计 100%，分母是**全体任务卡**，不是 B 端子集）。tolerance=0.10 为【我方假设】的配比浮动容忍度，首届后按实测调整。"
 }

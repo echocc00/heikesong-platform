@@ -299,6 +299,7 @@ test('一个用户只能同时属于一个战队（部分唯一索引）', () =>
 });
 ```
 
+
 - [ ] **Step 2: 运行测试确认失败**
 
 Run: `cd platform && node --test test/migration-002.test.js`
@@ -524,7 +525,20 @@ export function getTaskPackage(db, id) {
   return db.prepare('SELECT * FROM task_packages WHERE id = ? AND deleted_at IS NULL').get(id) ?? null;
 }
 
-export function listTaskPackagesByEdition(db, editionId) {
+/**
+ * 按届期列任务卡。
+ *
+ * ⚠️ 父代理预审修正（Important）：editionId 缺省时**不按届期过滤**（列全部届期），
+ *    而不是把 undefined 绑进 SQL。
+ *    原来写死 `WHERE edition_id = ?` → GET /api/task-packages 不带 editionId 时
+ *    node:sqlite 抛「Provided value cannot be bound to SQLite parameter 1.」
+ *    → 裸 TypeError 漏到 HTTP 层 → 只能回 500（父代理预审实跑复现）。
+ *    约定与报名的 listRegistrationRows 完全一致：过滤条件缺省即不生效。
+ */
+export function listTaskPackagesByEdition(db, editionId = null) {
+  const where = ['deleted_at IS NULL'];
+  const params = [];
+  if (editionId) { where.push('edition_id = ?'); params.push(editionId); }
   return db
     // ⚠️ 父代理预审修正（确定性排序）：原来的兜底排序键是 `id`，
     //    而 id 是 `crypto.randomUUID()` —— **随机 UUID**。
@@ -540,8 +554,10 @@ export function listTaskPackagesByEdition(db, editionId) {
     //    对「只增不改」的追加式表（注册事件 / 成员进出历史）正是审计轨迹该有的顺序。
     //    （本项目自己的设计决策「破同分兜底用行 ID 而非时间戳」也是同一个道理：
     //      兜底键必须是**确定性**的，不能是随机 UUID。）
-    .prepare('SELECT * FROM task_packages WHERE edition_id = ? AND deleted_at IS NULL ORDER BY submitted_at, rowid')
-    .all(editionId);
+    .prepare(
+      `SELECT * FROM task_packages WHERE ${where.join(' AND ')} ORDER BY submitted_at, rowid`,
+    )
+    .all(...params);
 }
 
 export function updateTaskPackage(db, id, patch) {
@@ -2404,9 +2420,11 @@ git commit -m "feat(P1): 报名服务与 API（幂等 409 / 改级留痕 / 可�
 - Create: `platform/src/services/taskPackage.js`
 - Create: `platform/src/http/routes/taskPackage.js`
 - Modify: `platform/rules/solvability.json`
+- Modify: `platform/src/db/repo/taskPackages.js`（**Task 1 建立、本 Task 追加**：`listTaskPackagesByEdition` 加 editionId 缺省守卫）
 - Modify: `platform/src/server.js`（追加任务卡路由注册）
 - Create: `platform/test/solvability-domain.test.js`
 - Create: `platform/test/task-package-service.test.js`
+- Create: `platform/test/task-package-api.test.js`
 
 **Interfaces:**
 - Consumes: Task 1 任务卡仓储、P0 `rules.solvability`、P0 `can()`
@@ -2415,11 +2433,18 @@ git commit -m "feat(P1): 报名服务与 API（幂等 409 / 改级留痕 / 可�
     - `answers`: `{ problem_clarity: 0..3, data_access: 0..3, validation: 0..2, decision_chain: 0..1, accountability: 0..1, precedent: 0..1, vetoes?: string[] }`
     - `score` ∈ [0, 12]；`grade` ∈ A/B/C/D；`vetoes` = 命中的否决项 key 列表
   - `checkTaskMix(packages, config)` → `{ ok, total, free, enterprise, actualFree, actualEnterprise, byGrade, errors }`（R-ENT-09 配比校验）
+    - ⚠️ **入参形状 = 服务层已呈现（present）的任务卡**（`isFreeBrief` 驼峰），**不是数据库行**（`is_free_brief`）
+    - ⚠️ **分母是全体任务卡（total）**，不是 B 端子集 —— 见 Step 4 的分母说明与需求原文 R-ENT-09
   - `submitTaskPackage({ db, userId, payload, now, rules })` → task package
+    - 错误码：`MISSING_EDITION_ID`(400) / `EDITION_NOT_FOUND`(404) / `INCOMPLETE_TASK_PACKAGE`(400) / `CONSENT_REQUIRED`(400) / `FREE_BRIEF_NO_ENTERPRISE`(400)
   - `assessSolvability({ db, taskPackageId, answers, actorId, now, rules })` → task package
+    - 错误码：`TASK_PACKAGE_NOT_FOUND`(404) / `TASK_PACKAGE_STATE_INVALID`(409) / `INVALID_SOLVABILITY_ANSWERS`(400) / `INVALID_VETO_KEY`(400)
   - `approveTaskPackage({ db, taskPackageId, grade, actorId, now, rules })` → task package
+    - 错误码：`TASK_PACKAGE_NOT_FOUND`(404) / `SOLVABILITY_NOT_ASSESSED`(400) / `TASK_PACKAGE_STATE_INVALID`(409) / `INVALID_GRADE`(400)
   - `listTaskPackages({ db, filter, viewer, rules })` → task package[]
   - API：`POST /api/task-packages`｜`GET /api/task-packages`｜`POST /api/task-packages/:id/solvability`｜`POST /api/task-packages/:id/approve`
+  - ⚠️ 与 `INTERFACES.md §2` 的偏差：这里的四个服务签名多了 `rules` 参数（规则配置按依赖注入传入，不用全局单例）。
+    与 Task 3 的报名服务同款偏差；契约文件里的签名仍成立（多一个可选依赖参数不算破坏契约）。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -2515,26 +2540,63 @@ test('explain 给出每维取值 / 权重 / 折算分', () => {
 });
 
 test('配比：自由题 30% / B 端 70%，A 40% B 20% C 10%（R-ENT-09）', () => {
+  // ⚠️ 父代理预审修正（Critical，规格缺陷）：夹具字段名从 `is_free_brief` 改成
+  //    `isFreeBrief`（驼峰 = 服务层 presentTaskPackage 的输出形状）。
+  //    checkTaskMix 消费的是**已呈现的任务卡**，不是数据库行。
+  //    原来夹具用下划线、实现也读下划线 → 形状错配在夹具与实现之间互相抵消，
+  //    测试全绿；但路由层喂的是**驼峰的 presented 对象** → 实现读不到 →
+  //    自由题恒算 0 → 配比体检恒报「自由命题占比 0%」。
+  //    父代理预审实跑复现（3 张自由卡被算成 0 张）。现在夹具与路由同形，回归可见。
   const packages = [
-    { is_free_brief: 0, grade: 'A' }, { is_free_brief: 0, grade: 'A' },
-    { is_free_brief: 0, grade: 'A' }, { is_free_brief: 0, grade: 'A' },
-    { is_free_brief: 0, grade: 'B' }, { is_free_brief: 0, grade: 'B' },
-    { is_free_brief: 0, grade: 'C' },
-    { is_free_brief: 1, grade: null }, { is_free_brief: 1, grade: null },
-    { is_free_brief: 1, grade: null },
+    { isFreeBrief: false, grade: 'A' }, { isFreeBrief: false, grade: 'A' },
+    { isFreeBrief: false, grade: 'A' }, { isFreeBrief: false, grade: 'A' },
+    { isFreeBrief: false, grade: 'B' }, { isFreeBrief: false, grade: 'B' },
+    { isFreeBrief: false, grade: 'C' },
+    { isFreeBrief: true, grade: null }, { isFreeBrief: true, grade: null },
+    { isFreeBrief: true, grade: null },
   ];
   const r = checkTaskMix(packages, config);
   assert.equal(r.ok, true, r.errors.join('；'));
   assert.equal(r.total, 10);
   assert.equal(r.free, 3);
   assert.equal(r.enterprise, 7);
+  // R-ENT-09 原文：「A 级 40% / B 级 20% / C 级 10% / 自由题 30%」——
+  // 四档瓜分**整个任务池**（合计 100%），不是 B 端子集。
+  assert.equal(r.byGrade.A, 4);
+  assert.equal(r.byGrade.B, 2);
+  assert.equal(r.byGrade.C, 1);
 });
 
 test('配比偏离 → 报错而不是静默通过', () => {
-  const packages = Array.from({ length: 9 }, () => ({ is_free_brief: 0, grade: 'A' }));
+  const packages = Array.from({ length: 9 }, () => ({ isFreeBrief: false, grade: 'A' }));
   const r = checkTaskMix(packages, config);
   assert.equal(r.ok, false);
   assert.ok(r.errors.some((e) => e.includes('TASK_MIX_FREE')), r.errors.join('；'));
+});
+
+test('配比分母是全体任务卡：7 张 B 端 + 3 张自由，误差在校准内才算达标', () => {
+  // ⚠️ 父代理预审修正（Critical）：分母必须是 **total**，不是 B 端子集。
+  //    需求原文（R-ENT-09）：「A 级 40% / B 级 20% / C 级 10% / 自由题 30%」。
+  //    原来实现用 enterprise * ratio → 10 张池子里 4 张 A 级被判成
+  //    「4/7 超出目标 40%」→ 明明合规却报错（父代理预审实跑复现）。
+  const packages = [
+    { isFreeBrief: false, grade: 'A' }, { isFreeBrief: false, grade: 'A' },
+    { isFreeBrief: false, grade: 'A' }, { isFreeBrief: false, grade: 'A' },
+    { isFreeBrief: false, grade: 'B' }, { isFreeBrief: false, grade: 'B' },
+    { isFreeBrief: false, grade: 'C' },
+    { isFreeBrief: true, grade: null }, { isFreeBrief: true, grade: null },
+    { isFreeBrief: true, grade: null },
+  ];
+  const r = checkTaskMix(packages, config);
+  assert.equal(r.ok, true, r.errors.join('；'));
+  assert.equal(r.actualFree, 0.3);
+});
+
+test('配比偏离 → 分母用 total 时仍能识别超标（防「改成永远通过」）', () => {
+  const packages = Array.from({ length: 10 }, () => ({ isFreeBrief: false, grade: 'A' }));
+  const r = checkTaskMix(packages, config);
+  assert.equal(r.ok, false);
+  assert.ok(r.errors.some((e) => e.includes('TASK_MIX_GRADE_A')), r.errors.join('；'));
 });
 ```
 
@@ -2552,6 +2614,8 @@ import { applyMigrations } from '../src/db/migrate.js';
 import { loadRules } from '../src/config.js';
 import { createUser } from '../src/db/repo/users.js';
 import { createEdition } from '../src/db/repo/editions.js';
+import { insertCapability } from '../src/db/repo/capabilities.js';
+import { grantAssignment } from '../src/auth/permissions.js';
 import {
   submitTaskPackage, assessSolvability, approveTaskPackage, listTaskPackages,
 } from '../src/services/taskPackage.js';
@@ -2716,11 +2780,459 @@ test('列表：无 task_package:read 权限 → 空数组', () => {
   close();
   rmSync(dataDir, { recursive: true, force: true });
 });
+
+test('未做六维评估就签级 → 400 SOLVABILITY_NOT_ASSESSED（评估闸门必须真的生效）', () => {
+  // ⚠️ 父代理预审修正（Important，规格缺陷）：原来 approveTaskPackage 只读
+  //    meta.solvability.vetoes —— 没评估过 → vetoes 为空 → 跳过否决降级 →
+  //    直接签 A 并发布（父代理预审实跑：grade=A / status=published /
+  //    solvabilityScore=null）。六维可解性评估闸门形同虚设。
+  const { db, close, dataDir, rules, edition, enterprise } = setup();
+  const pkg = submitTaskPackage({
+    db, userId: enterprise.id, payload: { ...PAYLOAD, editionId: edition.id }, now: NOW, rules,
+  });
+  assert.throws(
+    () => approveTaskPackage({ db, taskPackageId: pkg.id, grade: 'A', actorId: enterprise.id, now: NOW, rules }),
+    (err) => err.status === 400 && err.code === 'SOLVABILITY_NOT_ASSESSED',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('届期不存在 → 404 EDITION_NOT_FOUND（不得漏出 SQLite 外键原文）', () => {
+  // ⚠️ 父代理预审修正（Important）：原来只判 `!editionId` 就 INSERT →
+  //    edition_id 外键约束失败 → SQLite 原文漏到 HTTP 层（只能回 500）。
+  const { db, close, dataDir, rules, enterprise } = setup();
+  assert.throws(
+    () => submitTaskPackage({
+      db, userId: enterprise.id,
+      payload: { ...PAYLOAD, editionId: 'not-a-real-edition' }, now: NOW, rules,
+    }),
+    (err) => err.status === 404 && err.code === 'EDITION_NOT_FOUND',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('D 级诊断报告必须带上分数（不能恒为 null）', () => {
+  // ⚠️ 父代理预审修正（Important）：原来 meta.solvability 不存 score →
+  //    诊断报告里 `solvability.score ?? null` 恒为 null —— 报告是给企业看的
+  //    退回理由，分数却是空的（父代理预审实跑：diagnosticReport.score = null）。
+  const { db, close, dataDir, rules, edition, enterprise } = setup();
+  const pkg = submitTaskPackage({
+    db, userId: enterprise.id, payload: { ...PAYLOAD, editionId: edition.id }, now: NOW, rules,
+  });
+  assessSolvability({
+    db, taskPackageId: pkg.id,
+    answers: {
+      problem_clarity: 1, data_access: 0, validation: 0,
+      decision_chain: 0, accountability: 0, precedent: 0,
+    },
+    actorId: enterprise.id, now: NOW, rules,
+  });
+  const approved = approveTaskPackage({ db, taskPackageId: pkg.id, grade: 'D', actorId: enterprise.id, now: NOW, rules });
+  const report = approved.meta.solvability.diagnosticReport;
+  assert.equal(typeof report.score, 'number', '诊断报告必须带分数');
+  assert.equal(report.grade, 'D');
+  assert.ok(report.suggestions.length > 0);
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('已发布的卡不能重新评估 → 409（任务卡状态机）', () => {
+  const { db, close, dataDir, rules, edition, enterprise } = setup();
+  const pkg = submitTaskPackage({
+    db, userId: enterprise.id, payload: { ...PAYLOAD, editionId: edition.id }, now: NOW, rules,
+  });
+  assessSolvability({ db, taskPackageId: pkg.id, answers: FULL, actorId: enterprise.id, now: NOW, rules });
+  approveTaskPackage({ db, taskPackageId: pkg.id, grade: 'A', actorId: enterprise.id, now: NOW, rules });
+  assert.throws(
+    () => assessSolvability({ db, taskPackageId: pkg.id, answers: FULL, actorId: enterprise.id, now: NOW, rules }),
+    (err) => err.status === 409 && err.code === 'TASK_PACKAGE_STATE_INVALID',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('提交方在列表里能看到自己提交的卡', () => {
+  // ⚠️ 父代理预审修正（Minor）：原来非组委会视图只返回 status === 'published'
+  //    → 企业提交完任务卡，列表里一条都看不到。
+  const { db, close, dataDir, rules, edition, enterprise } = setup();
+  submitTaskPackage({ db, userId: enterprise.id, payload: { ...PAYLOAD, editionId: edition.id }, now: NOW, rules });
+  // 给该用户授予 task_package:read（走 P0 的授权函数，不写裸 SQL）
+  insertCapability(db, 'task_package:read', '读取任务卡');
+  grantAssignment(db, {
+    userId: enterprise.id, capability: 'task_package:read',
+    scopeType: 'global', scopeId: null, grantedBy: enterprise.id,
+  });
+  const viewer = { id: enterprise.id, active: 1, is_superadmin: 0 };
+  const items = listTaskPackages({ db, filter: { editionId: edition.id }, viewer, rules });
+  assert.equal(items.length, 1);
+  assert.equal(items[0].status, 'submitted');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+```
+
+`platform/test/task-package-api.test.js`：
+
+```javascript
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { openDatabase } from '../src/db/sqlite.js';
+import { applyMigrations } from '../src/db/migrate.js';
+import { loadRules } from '../src/config.js';
+import { createApp } from '../src/server.js';
+import { createUser, setSuperadmin } from '../src/db/repo/users.js';
+import { createEdition } from '../src/db/repo/editions.js';
+import { createSession } from '../src/auth/session.js';
+import { grantAssignment } from '../src/auth/permissions.js';
+import { insertCapability } from '../src/db/repo/capabilities.js';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const migrationsDir = join(here, '..', 'db', 'migrations');
+const rulesDir = join(here, '..', 'rules');
+const webDir = join(here, '..', 'web');
+
+const FULL = {
+  problem_clarity: 3, data_access: 3, validation: 2,
+  decision_chain: 1, accountability: 1, precedent: 1,
+};
+
+const PAYLOAD = {
+  title: '门店排班优化',
+  painPoint: '排班靠店长经验，旺季人不够、淡季人浪费',
+  expectedDelivery: '可运行的排班推荐原型',
+  acceptanceCriteria: '用真实门店历史数据跑出一版排班表，店长认可',
+  enterpriseName: '某零售',
+  consent: { accepted: true, items: ['no_data_export'] },
+};
+
+function setup() {
+  const dataDir = mkdtempSync(join(tmpdir(), 'hks-tpapi-'));
+  const { db, close } = openDatabase({ dataDir });
+  applyMigrations(db, migrationsDir);
+  const { rules } = loadRules(rulesDir);
+  const edition = createEdition(db, {
+    name: '首届', city: '上海', startsAt: '2026-10-01', endsAt: '2026-10-31',
+  });
+  const enterprise = createUser(db, { name: '企业甲', phone: '13900005001', password: 'pw', mbaStatus: 'other' });
+  const admin = createUser(db, { name: '组委会', phone: '13900005002', password: 'pw', mbaStatus: 'mba' });
+  const outsider = createUser(db, { name: '无权限者', phone: '13900005003', password: 'pw', mbaStatus: 'mba' });
+  setSuperadmin(db, admin.id);
+  // 能力点必须先注册（grantAssignment 会校验 capabilities 表）
+  insertCapability(db, 'task_package:read', '读取任务卡');
+  insertCapability(db, 'task_package:write', '提交/编辑任务卡');
+  insertCapability(db, 'task_package:approve', '任务卡分级签约');
+  grantAssignment(db, {
+    userId: enterprise.id, capability: 'task_package:write',
+    scopeType: 'global', scopeId: null, grantedBy: admin.id,
+  });
+  grantAssignment(db, {
+    userId: enterprise.id, capability: 'task_package:read',
+    scopeType: 'global', scopeId: null, grantedBy: admin.id,
+  });
+  const app = createApp({ db, rules, webDir });
+  return {
+    db, close, dataDir, app, edition, enterprise, admin, outsider,
+    tokenEnterprise: createSession(db, enterprise.id).token,
+    tokenAdmin: createSession(db, admin.id).token,
+    tokenOutsider: createSession(db, outsider.id).token,
+  };
+}
+
+function call(app, method, path, { token = null, body = null } = {}) {
+  return new Promise((resolve) => {
+    const chunks = body ? [Buffer.from(JSON.stringify(body))] : [];
+    const req = {
+      method,
+      url: path,
+      headers: token ? { cookie: `hk_session=${token}` } : {},
+      async *[Symbol.asyncIterator]() {
+        for (const c of chunks) yield c;
+      },
+      on() {},
+    };
+    const res = {
+      statusCode: 200,
+      headers: {},
+      body: '',
+      writeHead(status, h) { this.statusCode = status; this.headers = h || {}; },
+      end(payload) {
+        if (payload) this.body = payload.toString();
+        resolve({ status: this.statusCode, headers: this.headers, body: this.body });
+      },
+    };
+    app.handle(req, res);
+  });
+}
+
+test('POST /api/task-packages 未登录 → 401', async () => {
+  const s = setup();
+  const res = await call(s.app, 'POST', '/api/task-packages', {
+    body: { ...PAYLOAD, editionId: s.edition.id },
+  });
+  assert.equal(res.status, 401);
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('POST /api/task-packages 已登录但无 task_package:write → 403（能力点必须真的被校验）', async () => {
+  // ⚠️ 2026-10-21 父代理预审修正（覆盖缺口）：Task 4 原计划的 17 条用例
+  //    **一条都不碰路由**。而 P1 Task 3 验收发现的两个真实缺陷
+  //    （A1 能力点从未被校验 / A2 error.detail 零断言）正是在路由层。
+  const s = setup();
+  const res = await call(s.app, 'POST', '/api/task-packages', {
+    token: s.tokenOutsider, body: { ...PAYLOAD, editionId: s.edition.id },
+  });
+  assert.equal(res.status, 403, `没有能力点必须回 403，实际 ${res.status}`);
+  assert.equal(JSON.parse(res.body).error.code, 'FORBIDDEN');
+  // 拒绝之后不得留下任何任务卡
+  const list = await call(s.app, 'GET', `/api/task-packages?editionId=${s.edition.id}`, { token: s.tokenAdmin });
+  assert.equal(JSON.parse(list.body).items.length, 0, '被拒绝的提交不得留下记录');
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('POST /api/task-packages 缺 editionId → 400 MISSING_EDITION_ID', async () => {
+  const s = setup();
+  const res = await call(s.app, 'POST', '/api/task-packages', { token: s.tokenEnterprise, body: PAYLOAD });
+  assert.equal(res.status, 400);
+  assert.equal(JSON.parse(res.body).error.code, 'MISSING_EDITION_ID');
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('POST /api/task-packages 成功 → 200 + 状态 submitted', async () => {
+  const s = setup();
+  const res = await call(s.app, 'POST', '/api/task-packages', {
+    token: s.tokenEnterprise, body: { ...PAYLOAD, editionId: s.edition.id },
+  });
+  assert.equal(res.status, 200);
+  const body = JSON.parse(res.body);
+  assert.equal(body.status, 'submitted');
+  assert.equal(body.isFreeBrief, false);
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('GET /api/task-packages 不带 editionId → 200（不得因绑定 undefined 抛 500）', async () => {
+  // ⚠️ 2026-10-21 父代理预审修正（Important）：仓储层原来写死
+  //    `WHERE edition_id = ?` → editionId 缺省时 node:sqlite 抛
+  //    「Provided value cannot be bound to SQLite parameter 1.」→ 500。
+  const s = setup();
+  const res = await call(s.app, 'GET', '/api/task-packages', { token: s.tokenAdmin });
+  assert.equal(res.status, 200, `缺 editionId 不得 500，实际 ${res.status}`);
+  assert.ok(Array.isArray(JSON.parse(res.body).items));
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('GET /api/task-packages 无 task_package:read 权限 → 200 + 空集', async () => {
+  const s = setup();
+  const res = await call(s.app, 'GET', `/api/task-packages?editionId=${s.edition.id}`, { token: s.tokenOutsider });
+  assert.equal(res.status, 200);
+  assert.deepEqual(JSON.parse(res.body).items, []);
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('GET /api/task-packages 配比体检数得出自由题，且只算已进池的卡（分母 + 形状回归）', async () => {
+  // ⚠️ 2026-10-21 父代理预审修正（Critical ×2）：
+  //    ① **形状错配**：路由把 presentTaskPackage 的**驼峰**视图对象喂给
+  //       checkTaskMix，而实现读的是 `p.is_free_brief` → 自由题恒算 0 →
+  //       体检恒报「自由命题占比 0%」（父代理预审实跑复现）。
+  //    ② **分母用错**：R-ENT-09 原文「A 级 40% / B 级 20% / C 级 10% / 自由题 30%」
+  //       是四档瓜分**整个任务池**；原来实现用 `enterprise * ratio`（B 端子集为分母）
+  //       → 10 张池子里 4 张 A 级被判成「4/7 超出目标 40%」→ 明明合规却报错。
+  //    这条用例把 4A/2B/1C/3自由（= 40%/20%/10%/30%）全部发布进池后断言体检达标：
+  //    分母用错、形状错配、只看未分级卡 —— 三种错法都会让它变红。
+  const s = setup();
+  const enterprisePlan = [
+    { title: 'E0', grade: 'A' }, { title: 'E1', grade: 'A' },
+    { title: 'E2', grade: 'A' }, { title: 'E3', grade: 'A' },
+    { title: 'E4', grade: 'B' }, { title: 'E5', grade: 'B' },
+    { title: 'E6', grade: 'C' },
+  ];
+  async function submitAndPublish(body, grade) {
+    const created = await call(s.app, 'POST', '/api/task-packages', {
+      token: s.tokenEnterprise, body: { ...body, editionId: s.edition.id },
+    });
+    assert.equal(created.status, 200, created.body);
+    const id = JSON.parse(created.body).id;
+    const assessed = await call(s.app, 'POST', `/api/task-packages/${id}/solvability`, {
+      token: s.tokenEnterprise, body: { answers: FULL },
+    });
+    assert.equal(assessed.status, 200, assessed.body);
+    const approved = await call(s.app, 'POST', `/api/task-packages/${id}/approve`, {
+      token: s.tokenAdmin, body: { grade },
+    });
+    assert.equal(approved.status, 200, approved.body);
+  }
+  for (const p of enterprisePlan) {
+    await submitAndPublish({ ...PAYLOAD, title: p.title }, p.grade);
+  }
+  for (let i = 0; i < 3; i += 1) {
+    await submitAndPublish(
+      { ...PAYLOAD, title: `F${i}`, isFreeBrief: true, enterpriseName: null },
+      'A',
+    );
+  }
+  // 再交一张**未分级**的卡：它不进池，配比体检不该把它算进去
+  await call(s.app, 'POST', '/api/task-packages', {
+    token: s.tokenEnterprise, body: { ...PAYLOAD, title: 'PENDING', editionId: s.edition.id },
+  });
+
+  const res = await call(s.app, 'GET', `/api/task-packages?editionId=${s.edition.id}`, { token: s.tokenAdmin });
+  assert.equal(res.status, 200);
+  const body = JSON.parse(res.body);
+  assert.equal(body.items.length, 11, '组委会看到全部 11 张');
+  assert.ok(body.mix, '组委会必须拿到配比体检结果');
+  assert.equal(body.mix.total, 10, '配比只算已发布（进池）的卡');
+  assert.equal(body.mix.free, 3, `自由题应被算成 3，实际 ${body.mix.free}`);
+  assert.equal(body.mix.enterprise, 7);
+  assert.deepEqual(body.mix.byGrade, { A: 4, B: 2, C: 1 });
+  assert.equal(body.mix.ok, true, body.mix.errors.join('；'));
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('POST /api/task-packages/:id/solvability 无权限 → 403', async () => {
+  const s = setup();
+  const created = await call(s.app, 'POST', '/api/task-packages', {
+    token: s.tokenEnterprise, body: { ...PAYLOAD, editionId: s.edition.id },
+  });
+  const id = JSON.parse(created.body).id;
+  const res = await call(s.app, 'POST', `/api/task-packages/${id}/solvability`, {
+    token: s.tokenOutsider, body: { answers: FULL },
+  });
+  assert.equal(res.status, 403);
+  assert.equal(JSON.parse(res.body).error.code, 'FORBIDDEN');
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('POST /api/task-packages/:id/solvability 有权限 → 200 + 等级与承诺', async () => {
+  const s = setup();
+  const created = await call(s.app, 'POST', '/api/task-packages', {
+    token: s.tokenEnterprise, body: { ...PAYLOAD, editionId: s.edition.id },
+  });
+  const id = JSON.parse(created.body).id;
+  const res = await call(s.app, 'POST', `/api/task-packages/${id}/solvability`, {
+    token: s.tokenEnterprise, body: { answers: FULL },
+  });
+  assert.equal(res.status, 200);
+  const body = JSON.parse(res.body);
+  assert.equal(body.solvabilityScore, 12);
+  assert.equal(body.solvabilityGrade, 'A');
+  assert.equal(body.commitment, '试点承诺');
+  assert.equal(body.status, 'assessed');
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('POST /api/task-packages/:id/solvability 取值越界 → 400 INVALID_SOLVABILITY_ANSWERS', async () => {
+  const s = setup();
+  const created = await call(s.app, 'POST', '/api/task-packages', {
+    token: s.tokenEnterprise, body: { ...PAYLOAD, editionId: s.edition.id },
+  });
+  const id = JSON.parse(created.body).id;
+  const res = await call(s.app, 'POST', `/api/task-packages/${id}/solvability`, {
+    token: s.tokenEnterprise, body: { answers: { ...FULL, validation: 9 } },
+  });
+  assert.equal(res.status, 400);
+  assert.equal(JSON.parse(res.body).error.code, 'INVALID_SOLVABILITY_ANSWERS');
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('POST /api/task-packages/:id/approve 无权限 → 403', async () => {
+  const s = setup();
+  const created = await call(s.app, 'POST', '/api/task-packages', {
+    token: s.tokenEnterprise, body: { ...PAYLOAD, editionId: s.edition.id },
+  });
+  const id = JSON.parse(created.body).id;
+  const res = await call(s.app, 'POST', `/api/task-packages/${id}/approve`, {
+    token: s.tokenOutsider, body: { grade: 'A' },
+  });
+  assert.equal(res.status, 403);
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('POST /api/task-packages/:id/approve 未评估就签级 → 400 SOLVABILITY_NOT_ASSESSED', async () => {
+  // ⚠️ 2026-10-21 父代理预审修正（Important）：评估闸门必须在 HTTP 层也拦得住。
+  const s = setup();
+  const created = await call(s.app, 'POST', '/api/task-packages', {
+    token: s.tokenEnterprise, body: { ...PAYLOAD, editionId: s.edition.id },
+  });
+  const id = JSON.parse(created.body).id;
+  const res = await call(s.app, 'POST', `/api/task-packages/${id}/approve`, {
+    token: s.tokenAdmin, body: { grade: 'A' },
+  });
+  assert.equal(res.status, 400);
+  assert.equal(JSON.parse(res.body).error.code, 'SOLVABILITY_NOT_ASSESSED');
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('POST /api/task-packages/:id/approve 组委会签级 → 200 + published', async () => {
+  const s = setup();
+  const created = await call(s.app, 'POST', '/api/task-packages', {
+    token: s.tokenEnterprise, body: { ...PAYLOAD, editionId: s.edition.id },
+  });
+  const id = JSON.parse(created.body).id;
+  await call(s.app, 'POST', `/api/task-packages/${id}/solvability`, {
+    token: s.tokenEnterprise, body: { answers: FULL },
+  });
+  const res = await call(s.app, 'POST', `/api/task-packages/${id}/approve`, {
+    token: s.tokenAdmin, body: { grade: 'A' },
+  });
+  assert.equal(res.status, 200);
+  const body = JSON.parse(res.body);
+  assert.equal(body.grade, 'A');
+  assert.equal(body.status, 'published');
+  assert.equal(body.agreement, '试点承诺书 + 数据授权说明');
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('POST /api/task-packages/:id/approve 非法等级 → 400 INVALID_GRADE', async () => {
+  const s = setup();
+  const created = await call(s.app, 'POST', '/api/task-packages', {
+    token: s.tokenEnterprise, body: { ...PAYLOAD, editionId: s.edition.id },
+  });
+  const id = JSON.parse(created.body).id;
+  await call(s.app, 'POST', `/api/task-packages/${id}/solvability`, {
+    token: s.tokenEnterprise, body: { answers: FULL },
+  });
+  const res = await call(s.app, 'POST', `/api/task-packages/${id}/approve`, {
+    token: s.tokenAdmin, body: { grade: 'X' },
+  });
+  assert.equal(res.status, 400);
+  assert.equal(JSON.parse(res.body).error.code, 'INVALID_GRADE');
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('POST /api/task-packages/:id/solvability 任务卡不存在 → 404', async () => {
+  const s = setup();
+  const res = await call(s.app, 'POST', '/api/task-packages/not-a-real-id/solvability', {
+    token: s.tokenEnterprise, body: { answers: FULL },
+  });
+  assert.equal(res.status, 404);
+  assert.equal(JSON.parse(res.body).error.code, 'TASK_PACKAGE_NOT_FOUND');
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
 
-Run: `cd platform && node --test test/solvability-domain.test.js test/task-package-service.test.js`
+Run: `cd platform && node --test test/solvability-domain.test.js test/task-package-service.test.js test/task-package-api.test.js`
 Expected: FAIL —— `Cannot find module '../src/domain/solvability.js'`
 
 - [ ] **Step 3: 改写 rules/solvability.json 的 taskMix 段**
@@ -2734,8 +3246,18 @@ Expected: FAIL —— `Cannot find module '../src/domain/solvability.js'`
     "enterpriseGradeSplit": { "A": 0.40, "B": 0.20, "C": 0.10 },
     "tolerance": 0.10
   },
-  "taskMixNote": "R-ENT-09（顶层文档 §3.1）：任务卡 70% B 端 + 30% 自由；B 端内部 A 40% / B 20% / C 10%（40+20+10=70）。tolerance=0.10 为【我方假设】的配比浮动容忍度，首届后按实测调整。"
+  "taskMixNote": "R-ENT-09（顶层文档 §3.1）：任务卡 70% B 端 + 30% 自由；任务池内 A 40% / B 20% / C 10% / 自由 30%（四档合计 100%，分母是**全体任务卡**，不是 B 端子集）。tolerance=0.10 为【我方假设】的配比浮动容忍度，首届后按实测调整。"
 ```
+
+> ⚠️ 父代理预审修正（Important，**配置与实现必须同口径**）：
+> `enterpriseGradeSplit` 的三档比例合计 = 0.70 = `taskMix.enterprise`。
+> 这条等式只在「四档瓜分**整个任务池**」的口径下成立 ——
+> P0 已实现的 `validateRules`（`src/config.js`）正是按这条等式校验的：
+> `enterpriseGradeSplit` 合计 ≠ `taskMix.enterprise` → 直接拒绝启动。
+> 所以**实现侧的分母也必须是 total**，不能是 B 端子集（详见 Step 4）。
+> 本次把 `taskMixNote` 里的「B 端内部 …（40+20+10=70）」改成
+> 「任务池内 A 40% / B 20% / C 10% / 自由 30%（四档合计 100%，分母是全体任务卡）」，
+> 消除与实现不一致的旧表述。
 
 - [ ] **Step 4: 创建 src/domain/solvability.js**
 
@@ -2826,22 +3348,42 @@ export function scoreSolvability({ answers, config }) {
 }
 
 /**
- * 任务卡配比校验（R-ENT-09）：70% B 端 + 30% 自由；
- * B 端内部 A 40% / B 20% / C 10%。偏离只报错，不静默放行。
+ * 任务卡配比校验（R-ENT-09）：任务池 = A 级 40% / B 级 20% / C 级 10% / 自由题 30%。
+ *
+ * ⚠️ 父代理预审修正（Critical，规格缺陷）：**分母是全体任务卡（total），不是 B 端子集**。
+ *    需求原文（docs/requirements-traceability.md R-ENT-09）：
+ *      「A 级 40% / B 级 20% / C 级 10% / 自由题 30%」—— 四档相加正好 100%，
+ *      即**四类瓜分整个任务池**。
+ *    原来的实现用 `expected = enterprise * ratio`（分母 = B 端卡数），
+ *    与计划自带的测试用例直接冲突（父代理预审实跑复现）：
+ *      「[TASK_MIX_GRADE_A] B 端内部 A 级 4/7，目标占比 40%」→ 17 条用例挂 1 条。
+ *    三处独立佐证「分母 = total」：
+ *      ① P0 已实现的 validateRules（src/config.js）校验
+ *         `enterpriseGradeSplit` 合计 == `taskMix.enterprise`（0.40+0.20+0.10 = 0.70）；
+ *         只有「占总池比例」的口径才成立（若是 B 端子集占比，三者之和不必等于 0.70）。
+ *      ② 计划自己的注记「40+20+10=70」把三档比例锚在 70% 这个**总量占比**上。
+ *      ③ 测试夹具 4A/2B/1C/3自由（10 张）= 40%/20%/10%/30%，正是总量口径。
+ *
+ * ⚠️ 父代理预审修正（Critical，形状错配）：入参是**服务层已呈现（present）的任务卡**，
+ *    其自由题标记字段名是 `isFreeBrief`（驼峰）。原来的实现读 `p.is_free_brief`（下划线）
+ *    —— 对 presented 对象恒为 undefined → 自由题恒算 0 → 配比体检恒报
+ *    「自由命题占比 0%」（父代理预审实跑复现：3 张自由卡被算成 0 张）。
+ *    现在统一读 presented 形状（`Number(p.isFreeBrief) === 1` 对 boolean 与 0/1 都成立）。
+ *    领域层不认数据库行形状 —— 要传数据库行必须先经 presentTaskPackage 转换。
  */
 export function checkTaskMix(packages, config) {
   const mix = config.taskMix ?? {};
   const tolerance = mix.tolerance ?? 0.1;
   const list = Array.isArray(packages) ? packages : [];
   const total = list.length;
-  const free = list.filter((p) => Number(p.is_free_brief) === 1).length;
+  const free = list.filter((p) => Number(p.isFreeBrief) === 1).length;
   const enterprise = total - free;
   const actualFree = total ? round(free / total, 4) : 0;
   const actualEnterprise = total ? round(enterprise / total, 4) : 0;
 
   const byGrade = {};
   for (const p of list) {
-    if (Number(p.is_free_brief) === 1) continue;
+    if (Number(p.isFreeBrief) === 1) continue;
     const g = p.grade ?? 'ungraded';
     byGrade[g] = (byGrade[g] ?? 0) + 1;
   }
@@ -2854,10 +3396,10 @@ export function checkTaskMix(packages, config) {
   }
   for (const [g, ratio] of Object.entries(mix.enterpriseGradeSplit ?? {})) {
     const actual = byGrade[g] ?? 0;
-    const expected = enterprise * ratio;
-    if (enterprise > 0 && Math.abs(actual - expected) > enterprise * tolerance) {
+    const expected = total * ratio;
+    if (enterprise > 0 && Math.abs(actual - expected) > total * tolerance) {
       errors.push(
-        `[TASK_MIX_GRADE_${g}] B 端内部 ${g} 级 ${actual}/${enterprise}，目标占比 ${round(ratio * 100, 1)}%`,
+        `[TASK_MIX_GRADE_${g}] 任务池内 ${g} 级 ${actual}/${total}，目标占比 ${round(ratio * 100, 1)}%`,
       );
     }
   }
@@ -2877,7 +3419,14 @@ import { scoreSolvability } from '../domain/solvability.js';
 import {
   createTaskPackage, getTaskPackage, listTaskPackagesByEdition, updateTaskPackage,
 } from '../db/repo/taskPackages.js';
+import { getEdition } from '../db/repo/editions.js';
 import { can } from '../auth/permissions.js';
+
+// ⚠️ 父代理预审修正（Important，状态机）：任务卡的生命周期是
+//    submitted → assessed → published | returned →（补短板后）assessed → …
+//    没有状态机 = 任何状态都能被评估/签级，审计轨迹失真。
+const ASSESSABLE = new Set(['submitted', 'assessed', 'returned']);
+const APPROVABLE = new Set(['assessed', 'returned']);
 
 function parseJson(text, fallback = null) {
   if (text === null || text === undefined) return fallback;
@@ -2922,6 +3471,14 @@ export function submitTaskPackage({ db, userId, payload, now = new Date().toISOS
   } = payload ?? {};
 
   if (!editionId) throw new AppError(400, 'MISSING_EDITION_ID', '缺少届期');
+  // ⚠️ 父代理预审修正（Important）：届期必须真实存在。
+  //    原来只判 `!editionId` 就直接 INSERT → edition_id 外键约束失败，
+  //    SQLite 原文「FOREIGN KEY constraint failed」漏到 HTTP 层（只能回 500，
+  //    还把表结构暴露给客户端）。报名服务 submitRegistration 早就查过 getEdition，
+  //    任务卡这边漏了 —— 与 P0 评审修正 I5（重复手机号先查后写）同一类问题。
+  if (!getEdition(db, editionId)) {
+    throw new AppError(404, 'EDITION_NOT_FOUND', '届期不存在');
+  }
   // R-ENT-01：痛点、期望交付、验收标准三者缺一不可
   if (!title || !painPoint || !expectedDelivery || !acceptanceCriteria) {
     throw new AppError(400, 'INCOMPLETE_TASK_PACKAGE', '任务卡必须填写痛点、期望交付与验收标准');
@@ -2953,7 +3510,10 @@ export function assessSolvability({ db, taskPackageId, answers, actorId, now = n
   const config = rules.solvability;
   const row = getTaskPackage(db, taskPackageId);
   if (!row) throw new AppError(404, 'TASK_PACKAGE_NOT_FOUND', '任务包不存在');
-
+  // ⚠️ 父代理预审修正（Important，状态机）：已发布的卡不能再评估。
+  if (!ASSESSABLE.has(row.status)) {
+    throw new AppError(409, 'TASK_PACKAGE_STATE_INVALID', `当前状态（${row.status}）不允许重新评估`);
+  }
   // 六维取值范围校验（服务层做输入校验，领域层保持纯）
   for (const dim of config.dimensions) {
     const v = Number(answers?.[dim.key]);
@@ -2974,6 +3534,13 @@ export function assessSolvability({ db, taskPackageId, answers, actorId, now = n
   const result = scoreSolvability({ answers, config });
   const meta = parseJson(row.meta_json, {}) ?? {};
   meta.solvability = {
+    // ⚠️ 父代理预审修正（Important）：score / grade 必须一起存。
+    //    原来只存 vetoes/explain/computedGrade → buildDiagnosticReport 里
+    //    `solvability.score ?? null` 恒为 null —— 《问题可解性诊断报告》
+    //    （D 级退回时给企业的唯一凭据）里分数永远是空的。
+    //    父代理预审实跑复现：诊断报告 score = null。
+    score: result.score,
+    grade: result.grade,
     vetoes: result.vetoes,
     explain: result.explain,
     computedGrade: result.computedGrade,
@@ -3005,6 +3572,24 @@ export function approveTaskPackage({ db, taskPackageId, grade, actorId, now = ne
   const meta = parseJson(row.meta_json, {}) ?? {};
   const solvability = meta.solvability ?? {};
   const vetoes = solvability.vetoes ?? [];
+
+  // ⚠️ 父代理预审修正（Important，规格缺陷）：**必须先做六维评估才能签级**。
+  //    原来只读 meta.solvability.vetoes —— 没评估过的卡，meta.solvability 是空的，
+  //    vetoes 为空 → 跳过「一票否决强制降级」→ 直接签 A 并发布。
+  //    父代理预审实跑复现：grade = A、status = published、solvabilityScore = null。
+  //    这等于**六维可解性评估闸门形同虚设**，与 P1 Task 3 验收发现的 A1
+  //    （registration:write 能力点被注册但从不校验）同一类：
+  //    「机制被写下来了，但没接线」。
+  if (typeof solvability.score !== 'number') {
+    throw new AppError(
+      400, 'SOLVABILITY_NOT_ASSESSED',
+      '任务卡必须先完成六维可解性评估，才能分级签约',
+    );
+  }
+  // ⚠️ 父代理预审修正（Important，状态机）：只有已评估/已退回的卡才可签级。
+  if (!APPROVABLE.has(row.status)) {
+    throw new AppError(409, 'TASK_PACKAGE_STATE_INVALID', `当前状态（${row.status}）不允许分级签约`);
+  }
 
   // 存在未解除的一票否决 → 不得签成 A/B/C，强制退回
   if (vetoes.length && grade !== 'D') {
@@ -3070,12 +3655,43 @@ export function listTaskPackages({ db, filter = {}, viewer, rules }) {
   // 组委会看全部；选手与普通企业侧只看已分级发布的（未分级的不进任务包池）
   const isCommittee = viewer
     && can(viewer, 'task_package:approve', { scopeType: 'edition', scopeId: filter.editionId ?? null }, db);
-  const visible = isCommittee ? all : all.filter((p) => p.status === 'published');
+  // ⚠️ 父代理预审修正（Minor）：**提交方能看到自己提交的卡**。
+  //    原来非组委会一律只返回 status === 'published' —— 企业提交完任务卡，
+  //    在列表里却一条都看不到（提交方视角形同虚设）。
+  //    「未分级的不进任务池」针对的是**选题池**，不等于提交方看不到自己的卡。
+  const visible = isCommittee
+    ? all
+    : all.filter((p) => p.status === 'published' || p.submitted_by === viewer.id);
   return visible.map(presentTaskPackage);
 }
 ```
 
-- [ ] **Step 6: 创建 src/http/routes/taskPackage.js**
+- [ ] **Step 6: 修改 src/db/repo/taskPackages.js（Task 1 建立，本 Task 追加）**
+
+> ⚠️ 父代理预审修正（Important）：`listTaskPackagesByEdition` 原来写死 `WHERE edition_id = ?`。
+> `GET /api/task-packages` 不带 `editionId` 时，node:sqlite 抛
+> 「Provided value cannot be bound to SQLite parameter 1.」→ 裸 TypeError 漏到 HTTP 层 → 只能回 500。
+> 报名的 `listRegistrationRows` 早就加了「过滤条件缺省即不生效」的守卫，任务卡仓储漏了 —— 本步补齐，
+> 两者约定完全一致。
+
+`platform/src/db/repo/taskPackages.js`：
+
+```javascript
+export function listTaskPackagesByEdition(db, editionId = null) {
+  const where = ['deleted_at IS NULL'];
+  const params = [];
+  if (editionId) { where.push('edition_id = ?'); params.push(editionId); }
+  return db
+    // ⚠️ 父代理预审修正（确定性排序）：兜底排序键是 SQLite 隐式 `rowid`，
+    //    不用随机 UUID（`id` 是 crypto.randomUUID()）—— 排序键必须确定性。
+    .prepare(
+      `SELECT * FROM task_packages WHERE ${where.join(' AND ')} ORDER BY submitted_at, rowid`,
+    )
+    .all(...params);
+}
+```
+
+- [ ] **Step 7: 创建 src/http/routes/taskPackage.js**
 
 ```javascript
 // src/http/routes/taskPackage.js — 任务卡端点
@@ -3098,9 +3714,15 @@ export function registerTaskPackageRoutes({ router, db, rules }) {
 
   router.add('GET', '/api/task-packages', async ({ user, query }) => {
     const items = listTaskPackages({ db, filter: { editionId: query.editionId }, viewer: user, rules });
-    // R-ENT-09：配比体检只对组委会开放
+    // R-ENT-09：配比体检只对组委会开放。
+    // ⚠️ 父代理预审修正（Important）：配比体检的对象是**已发布（进池）的任务卡**。
+    //    原来直接用 items —— 组委会视图里 items 含未分级的卡（status = submitted /
+    //    assessed），它们的 grade 为 null → byGrade 全落在 'ungraded' 上 →
+    //    体检结果失真（父代理预审实跑：10 张未分级卡 → A/B/C 级计数全为 0）。
+    //    R-ENT-09 的四档（A 40% / B 20% / C 10% / 自由 30%）描述的是**任务池**构成，
+    //    未分级的卡还没进池。
     const mix = can(user, 'task_package:approve', { scopeType: 'edition', scopeId: query.editionId ?? null }, db)
-      ? checkTaskMix(items, rules.solvability)
+      ? checkTaskMix(items.filter((p) => p.status === 'published'), rules.solvability)
       : null;
     return { items, mix };
   });
@@ -3125,7 +3747,7 @@ export function registerTaskPackageRoutes({ router, db, rules }) {
 }
 ```
 
-- [ ] **Step 7: 修改 src/server.js**
+- [ ] **Step 8: 修改 src/server.js**
 
 ```javascript
 // ① 顶部 import 追加
@@ -3135,15 +3757,21 @@ import { registerTaskPackageRoutes } from './http/routes/taskPackage.js';
   registerTaskPackageRoutes({ router, db, rules });
 ```
 
-- [ ] **Step 8: 运行测试确认通过**
+- [ ] **Step 9: 运行测试确认通过**
 
-Run: `cd platform && node --test test/solvability-domain.test.js test/task-package-service.test.js`
-Expected: PASS（17 个测试全过：solvability-domain 8 + task-package-service 9）
+Run: `cd platform && node --test test/solvability-domain.test.js test/task-package-service.test.js test/task-package-api.test.js`
+Expected: PASS（39 个测试全过：solvability-domain 10 + task-package-service 14 + task-package-api 15）
 
-- [ ] **Step 9: 提交**
+> ⚠️ 父代理预审修正（Important，**路由层覆盖空洞**）：原计划的 17 条用例
+> **一条都不碰路由** —— 而 P1 Task 3 验收发现的两个真实缺陷
+> （A1 能力点从未被校验 / A2 `error.detail` 零断言）正是在路由层。
+> 本次补 `test/task-package-api.test.js`（15 条），覆盖三态状态码与权限：
+> 401 未登录 / 403 无能力点 / 400 参数与状态机 / 404 资源不存在 / 200+空集列表。
+
+- [ ] **Step 10: 提交**
 
 ```bash
-cd platform && git add src/domain/solvability.js src/services/taskPackage.js src/http/routes/taskPackage.js rules/solvability.json src/server.js test/solvability-domain.test.js test/task-package-service.test.js
+cd platform && git add src/domain/solvability.js src/services/taskPackage.js src/http/routes/taskPackage.js src/db/repo/taskPackages.js rules/solvability.json src/server.js test/solvability-domain.test.js test/task-package-service.test.js test/task-package-api.test.js
 git commit -m "feat(P1): 任务卡与六维可解性（分级签约 + 一票否决 + D 级诊断报告）
 
 对应需求：R-ENT-01 / R-ENT-06 / R-ENT-07 / R-ENT-08 / R-ENT-09 / R-ENT-10 / R-ENT-11 / R-ENT-12"
@@ -4745,6 +5373,29 @@ git commit -m "feat(P1): 端到端串联与种子扩充（报名→分级→建�
 
 > ⚠️ **跨阶段纪律**：P1 在实施时若发现上表某条锚点又变了，**先更新本计划再动手** ——
 > 「计划是规格」：计划里的代码块必须与最终实现逐字一致。
+
+---
+
+## Task 4 父代理预审修正台账（2026-10-21）
+
+> Task 4 的规格在**实施前**先被父代理逐条实跑预审，发现 **2 Critical + 5 Important + 2 Minor**，
+> 全部在本计划里改完后再实施（「先跑后派」纪律：规格改动必须抽取成独立工程实跑通过，再落盘）。
+> 全部缺陷均**实跑复现**，复现方式见「实跑证据」列。
+
+| # | 级别 | 缺陷 | 实跑证据 | 修法 |
+|---|---|---|---|---|
+| **T4-1** | **Critical** | `checkTaskMix` 的等级配比**分母用错**：实现用 `enterprise * ratio`（B 端子集为分母） | 计划自带的用例「配比：自由题 30% / B 端 70%，A 40% B 20% C 10%」**直接失败**：`[TASK_MIX_GRADE_A] B 端内部 A 级 4/7，目标占比 40%`（17 条挂 1 条） | 分母改为 `total`。三处独立佐证：① 需求原文 R-ENT-09「A 级 40% / B 级 20% / C 级 10% / 自由题 30%」四档合计 100%（瓜分整个池）；② P0 已实现的 `validateRules` 校验 `enterpriseGradeSplit` 合计 == `taskMix.enterprise`（0.70），只有总量口径成立；③ 测试夹具 4A/2B/1C/3自由（10 张）正是总量口径 |
+| **T4-2** | **Critical** | **形状错配**：路由把 `presentTaskPackage` 的**驼峰**视图对象喂给 `checkTaskMix`，实现却读 `p.is_free_brief` → 自由题恒算 0 | 3 张自由卡 + 7 张企业卡 → 体检结果「自由命题占比 0%，目标 30%」 | 领域层统一消费**已呈现**形状（`Number(p.isFreeBrief) === 1`）；测试夹具同步改成驼峰（原来夹具与实现同为下划线 → 错配互相抵消，测试全绿也测不出来）；路由层补回归用例 |
+| **T4-3** | Important | `GET /api/task-packages` 不带 `editionId` → **500** | `listTaskPackagesByEdition(db, undefined)` 抛 `TypeError: Provided value cannot be bound to SQLite parameter 1.` | 仓储层加「过滤条件缺省即不生效」守卫（与报名的 `listRegistrationRows` 约定一致）→ Step 6 |
+| **T4-4** | Important | `meta.solvability` 不存 `score`/`grade` → 《问题可解性诊断报告》的分数**恒为 null** | 诊断报告 `score = null` | 评估时把 `score`/`grade` 一并存进 `meta.solvability` |
+| **T4-5** | Important | **未做六维评估就能签 A 级** —— 评估闸门形同虚设 | `grade = A`、`status = published`、`solvabilityScore = null` | `approveTaskPackage` 要求 `meta.solvability.score` 是数字，否则 `400 SOLVABILITY_NOT_ASSESSED`。与 Task 3 验收发现的 A1（`registration:write` 被注册但从不校验）同类：**机制写下来了但没接线** |
+| **T4-6** | Important | 配比体检口径错：组委会视图的 `items` 含未分级卡 → `byGrade` 全落在 `ungraded` 上 | 10 张未分级卡 → A/B/C 计数全为 0 | 体检只算**已发布（进池）**的卡：`items.filter(p => p.status === 'published')`。R-ENT-09 的四档描述的是任务池构成，未分级的卡还没进池 |
+| **T4-7** | Important | **路由层零测试覆盖** —— 17 条用例全在 domain + service | 原计划无 `test/task-package-api.test.js` | 新增 15 条路由层用例：401 未登录 / 403 无能力点 / 400 参数与状态机 / 404 资源不存在 / 200+空集列表 / 配比口径回归。Task 3 的两个真实缺陷正是在路由层发现的 |
+| **T4-8** | Minor | 任务卡**没有状态机**：任何状态都能被评估/签级 | — | `ASSESSABLE = {submitted, assessed, returned}` / `APPROVABLE = {assessed, returned}`；违规 → `409 TASK_PACKAGE_STATE_INVALID` |
+| **T4-9** | Minor | 企业提交完任务卡，在列表里**一条都看不到**（非组委会视图只返回 `published`） | — | 非组委会视图加上「自己提交的」（`submitted_by === viewer.id`）。「未分级的不进**选题池**」≠ 提交方看不到自己的卡 |
+| **T4-10** | Minor | 届期不存在 → SQLite 外键原文漏到 HTTP 层（只能回 500，还暴露表结构） | 与 P0 评审修正 I5（重复手机号先查后写）同类 | 提交时先 `getEdition` 校验 → `404 EDITION_NOT_FOUND`（与报名服务一致） |
+
+**Task 4 的测试条数口径**：solvability-domain **10** + task-package-service **14** + task-package-api **15** = **39**。
 
 ---
 

@@ -17,6 +17,7 @@ import { verifyPassword, hashPassword } from './auth/password.js';
 import { getUserById, getCredentialsByPhone, toPublicUser } from './db/repo/users.js';
 import { appError, AppError } from './errors.js';
 import { registerRegistrationRoutes } from './http/routes/registration.js';
+import { registerTaskPackageRoutes } from './http/routes/taskPackage.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -101,6 +102,8 @@ export function createApp({ db, rules, webDir }) {
   const router = createRouter();
   // 注册 P1 报名端点（提交 / 查询 / 列表 / 改级 / 公开筛选标准）
   registerRegistrationRoutes({ router, db, rules });
+  // 注册 P1 任务卡端点（提交 / 列表 / 六维评估 / 分级签约）
+  registerTaskPackageRoutes({ router, db, rules });
   // 生产环境 Cookie 加 Secure；开发环境不加（http://127.0.0.1 会被浏览器拒收）
   const secureCookies = process.env.NODE_ENV === 'production';
 

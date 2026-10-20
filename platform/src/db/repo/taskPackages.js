@@ -45,7 +45,20 @@ export function getTaskPackage(db, id) {
   return db.prepare('SELECT * FROM task_packages WHERE id = ? AND deleted_at IS NULL').get(id) ?? null;
 }
 
-export function listTaskPackagesByEdition(db, editionId) {
+/**
+ * 按届期列任务卡。
+ *
+ * ⚠️ 父代理预审修正（Important）：editionId 缺省时**不按届期过滤**（列全部届期），
+ *    而不是把 undefined 绑进 SQL。
+ *    原来写死 `WHERE edition_id = ?` → GET /api/task-packages 不带 editionId 时
+ *    node:sqlite 抛「Provided value cannot be bound to SQLite parameter 1.」
+ *    → 裸 TypeError 漏到 HTTP 层 → 只能回 500（父代理预审实跑复现）。
+ *    约定与报名的 listRegistrationRows 完全一致：过滤条件缺省即不生效。
+ */
+export function listTaskPackagesByEdition(db, editionId = null) {
+  const where = ['deleted_at IS NULL'];
+  const params = [];
+  if (editionId) { where.push('edition_id = ?'); params.push(editionId); }
   return db
     // ⚠️ 父代理预审修正（确定性排序）：原来的兜底排序键是 `id`，
     //    而 id 是 `crypto.randomUUID()` —— **随机 UUID**。
@@ -61,8 +74,10 @@ export function listTaskPackagesByEdition(db, editionId) {
     //    对「只增不改」的追加式表（注册事件 / 成员进出历史）正是审计轨迹该有的顺序。
     //    （本项目自己的设计决策「破同分兜底用行 ID 而非时间戳」也是同一个道理：
     //      兜底键必须是**确定性**的，不能是随机 UUID。）
-    .prepare('SELECT * FROM task_packages WHERE edition_id = ? AND deleted_at IS NULL ORDER BY submitted_at, rowid')
-    .all(editionId);
+    .prepare(
+      `SELECT * FROM task_packages WHERE ${where.join(' AND ')} ORDER BY submitted_at, rowid`,
+    )
+    .all(...params);
 }
 
 export function updateTaskPackage(db, id, patch) {
