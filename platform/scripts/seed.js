@@ -3,7 +3,9 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { openDatabase } from '../src/db/sqlite.js';
 import { applyMigrations } from '../src/db/migrate.js';
-import { createUser, findUserByPhone } from '../src/db/repo/users.js';
+import { createUser, findUserByPhone, setSuperadmin } from '../src/db/repo/users.js';
+import { insertCapability, insertRoleCapability } from '../src/db/repo/capabilities.js';
+import { insertRole, insertUserRole } from '../src/db/repo/roles.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const dataDir = process.env.DATA_DIR || join(here, '..', 'data');
@@ -67,24 +69,25 @@ const { db, close } = openDatabase({ dataDir });
 try {
   applyMigrations(db, join(here, '..', 'db', 'migrations'));
 
-  const insCap = db.prepare('INSERT OR IGNORE INTO capabilities (key, description) VALUES (?, ?)');
-  for (const c of CAPABILITIES) insCap.run(...c);
+  // ⛔ 评审修正（I-7）：种子数据写入一律走仓储层 ——
+  //    本文件**不再出现任何 SQL 字符串**（全局约束「所有 SQL 收进 src/db/repo/」）。
+  for (const [key, description] of CAPABILITIES) insertCapability(db, key, description);
 
-  const insRole = db.prepare('INSERT OR IGNORE INTO roles (key, description) VALUES (?, ?)');
-  for (const r of ROLES) insRole.run(...r);
+  for (const [key, description] of ROLES) insertRole(db, key, description);
 
-  const insRc = db.prepare('INSERT OR IGNORE INTO role_capabilities (role_id, capability) VALUES (?, ?)');
-  for (const [role, cap] of ROLE_CAPABILITIES) insRc.run(role, cap);
+  for (const [role, cap] of ROLE_CAPABILITIES) insertRoleCapability(db, role, cap);
 
   const adminPhone = process.env.ADMIN_PHONE || '13800000000';
-  // 查重用仓储层（不写裸 SQL；行里不含 password_hash）
+  // 查重走仓储层（findUserByPhone 取的行里不含 password_hash）
+  // ⛔ 评审修正（I-7）：这条注释原来写「不写裸 SQL」，**却和同一文件里的裸 SQL 自相矛盾**
+  //    —— 现在本文件确实一条 SQL 字符串都没有了：种子写入全部下沉到 src/db/repo/。
   let admin = findUserByPhone(db, adminPhone);
   if (!admin) {
     admin = createUser(db, {
       name: '组委会管理员', phone: adminPhone, password: adminPassword, mbaStatus: 'mba',
     });
-    db.prepare('UPDATE users SET is_superadmin = 1 WHERE id = ?').run(admin.id);
-    db.prepare("INSERT OR IGNORE INTO user_roles (user_id, role_key) VALUES (?, 'admin')").run(admin.id);
+    setSuperadmin(db, admin.id);
+    insertUserRole(db, admin.id, 'admin');
     // 只打印账号，不回显口令
     console.log(`已创建管理员：${adminPhone}  ← 请立即修改密码`);
   } else {

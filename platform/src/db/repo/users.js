@@ -88,3 +88,15 @@ export function userExists(db, id) {
 export function deactivateUser(db, id) {
   db.prepare('UPDATE users SET active = 0 WHERE id = ?').run(id);
 }
+
+/**
+ * 把用户标记为超管（is_superadmin = 1）。
+ *
+ * ⛔ 评审修正（I-7）：scripts/seed.js 原来在这里写裸 SQL
+ *    db.prepare('UPDATE users SET is_superadmin = 1 WHERE id = ?')
+ *    —— 越过 SQL 边界（脚本里禁止裸 SQL）。这里下沉到仓储层。
+ *    ⚠️ 只置位、不复位：调用方负责「授权」的语义（种子脚本只在建号时调用一次）。
+ */
+export function setSuperadmin(db, userId) {
+  db.prepare('UPDATE users SET is_superadmin = 1 WHERE id = ?').run(userId);
+}
