@@ -1,7 +1,8 @@
 {
   "id": "registration",
   "version": "2026-10-20",
-  "source": "SABC v1 §二 3 维画像筛选",
+  "source": "SABC v1 §二 3 维画像筛选 + §六 待补 1 问卷字段设计",
+  "scale": { "min": 1, "max": 5, "scoreMax": 100 },
   "dimensions": [
     { "key": "direction",    "label": "方向维度", "weight": 0.25, "min": 1, "max": 5 },
     { "key": "capability",   "label": "能力维度", "weight": 0.35, "min": 1, "max": 5 },
@@ -13,5 +14,47 @@
     { "key": "B", "label": "潜力候选", "minScore": 40, "accept": true },
     { "key": "C", "label": "底线外",   "minScore": 0,  "accept": false }
   ],
-  "openQuestion": { "required": true, "maxLength": 500 }
+  "openQuestion": { "required": true, "maxLength": 500 },
+  "questions": {
+    "status": "open_question",
+    "source": "SABC v1 §六 待补 1 —— 3 维各 5 题的具体题目清单尚未确定",
+    "note": "⚠️ 以下题面为【占位题面】，首届启用。组委会提供正式清单后只改本文件，不改任何代码。",
+    "dimensionItems": {
+      "direction": [
+        { "id": "d1", "text": "我能清楚说出想解决的商业问题是什么" },
+        { "id": "d2", "text": "我了解目标行业真实的业务痛点" },
+        { "id": "d3", "text": "我能判断一项 AI 能力是否真的适合我的问题" },
+        { "id": "d4", "text": "我的方向与本届任务包的方向匹配" },
+        { "id": "d5", "text": "我能说清这个方向上可能的商业化路径" }
+      ],
+      "capability": [
+        { "id": "c1", "text": "我能独立做出可运行的原型" },
+        { "id": "c2", "text": "我能把 AI 能力接入真实业务流程" },
+        { "id": "c3", "text": "我能评估技术方案的可行性、成本与风险" },
+        { "id": "c4", "text": "我能处理数据准备、清洗与接口对接" },
+        { "id": "c5", "text": "我能在时间压力下按期交付" }
+      ],
+      "collaboration": [
+        { "id": "l1", "text": "我习惯与他人分工协作推进项目" },
+        { "id": "l2", "text": "我会主动补位队友的阻塞点" },
+        { "id": "l3", "text": "我能清晰汇报进展与阻塞" },
+        { "id": "l4", "text": "我接受队友的方案并能快速调整" },
+        { "id": "l5", "text": "我愿意按赛程节奏承诺交付物" }
+      ]
+    },
+    "openQuestionItem": {
+      "id": "q_open",
+      "text": "请用 100–500 字说明：你最想用 AI 解决的商业问题是什么，以及你打算怎么验证它是否真的有用。",
+      "required": true,
+      "maxLength": 500
+    }
+  },
+  "funnel": [
+    { "key": "registration", "label": "报名筛选", "rate": 0.30 },
+    { "key": "incubation",   "label": "孵化",     "rate": 0.30 },
+    { "key": "sprint",       "label": "冲刺",     "rate": 0.20 },
+    { "key": "demo_day",     "label": "Demo Day", "rate": 0.10 },
+    { "key": "coaching",     "label": "辅导期",   "rate": null }
+  ],
+  "funnelNote": "R-REG-10：5 阶段筛选漏斗。报名筛选 30% → 孵化 30% → 冲刺 20% → Demo Day 10% → 辅导期。P1 只落地第一段，后续阶段由 P2/P3 的实际数据填充。"
 }
