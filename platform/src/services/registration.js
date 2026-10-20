@@ -10,7 +10,7 @@ import {
   findActiveRegistration, listRegistrationRows, updateRegistrationRow,
 } from '../db/repo/registrations.js';
 import {
-  insertRegistrationEvent, listRegistrationEvents,
+  insertRegistrationEvent, listRegistrationEvents, listRegistrationEventsForRegistrations,
 } from '../db/repo/registrationEvents.js';
 import { getEdition } from '../db/repo/editions.js';
 import { can } from '../auth/permissions.js';
@@ -139,6 +139,22 @@ export function submitRegistration({
   return presentRegistration(row, config);
 }
 
+/**
+ * 报名状态事件 → 对外形状。
+ * 单条（getRegistration）与列表（listRegistrations）**共用**这一个映射：
+ * 两套口径迟早漂移（列表漏字段、字段名不一致），而筛选台读的是列表。
+ */
+export function presentRegistrationEvent(e) {
+  return {
+    id: e.id,
+    fromStatus: e.from_status,
+    toStatus: e.to_status,
+    actorId: e.actor_id,
+    reason: e.reason,
+    createdAt: e.created_at,
+  };
+}
+
 export function getRegistration({ db, id, viewer, rules }) {
   const row = findRegistrationRow(db, id);
   if (!row) return null;
@@ -149,14 +165,7 @@ export function getRegistration({ db, id, viewer, rules }) {
   if (!isOwner && !isCommittee) return null;
 
   const out = presentRegistration(row, rules.registration);
-  out.events = listRegistrationEvents(db, id).map((e) => ({
-    id: e.id,
-    fromStatus: e.from_status,
-    toStatus: e.to_status,
-    actorId: e.actor_id,
-    reason: e.reason,
-    createdAt: e.created_at,
-  }));
+  out.events = listRegistrationEvents(db, id).map(presentRegistrationEvent);
   return out;
 }
 
@@ -165,7 +174,18 @@ export function listRegistrations({ db, filter = {}, viewer, rules }) {
   const ok = viewer
     && can(viewer, 'registration:review', { scopeType: 'edition', scopeId: filter.editionId ?? null }, db);
   if (!ok) return [];
-  return listRegistrationRows(db, filter).map((row) => presentRegistration(row, rules.registration));
+  const rows = listRegistrationRows(db, filter);
+  const items = rows.map((row) => presentRegistration(row, rules.registration));
+  // ⚠️ P1 Task 6 修正（Important，列表端点的轨迹恒空）：
+  //    此前只有**单条** getRegistration 才挂 `events`，列表不带 →
+  //    组委会筛选台（读列表）的事件轨迹一栏恒空 —— 计划声称的功能实际没落地。
+  //    现在批量挂上：**一次 SQL**，不新增往返。
+  //    事件行的对外形状与单条口径**逐字一致**（同一个映射函数，避免两套口径）。
+  const grouped = listRegistrationEventsForRegistrations(db, rows.map((r) => r.id));
+  for (const item of items) {
+    item.events = (grouped.get(item.id) ?? []).map(presentRegistrationEvent);
+  }
+  return items;
 }
 
 /**

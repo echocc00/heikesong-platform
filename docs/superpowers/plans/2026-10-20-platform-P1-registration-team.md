@@ -695,6 +695,41 @@ export function insertRegistrationEvent(db, {
   return id;
 }
 
+/**
+ * 批量取多条报名的状态事件，按报名 id 分组返回。
+ *
+ * ⚠️ P1 Task 6 修正（Important，列表端点的轨迹恒空）：
+ *    组委会筛选台读的是 `GET /api/registrations`（**列表**），而事件轨迹此前只有
+ *    `getRegistration`（**单条**）才挂 `events` → 列表里的 `r.events` 恒为 undefined
+ *    → 筛选台「事件轨迹」一栏永远是空的（计划声称的功能实际没落地）。
+ *    修法有两种：① 前端逐行再拉一次详情（N+1 次 HTTP）；② 后端批量带上。
+ *    选 ②：**一次 SQL** 把这一页报名的事件全捞回来，不新增往返。
+ *
+ * 排序键与 `listRegistrationEvents` 一致：`created_at, rowid` —— 兜底键必须是
+ * **确定性**的（rowid 按插入顺序单调递增），不能用随机 UUID（见上面的说明）。
+ *
+ * @param {string[]} registrationIds 报名 id 列表
+ * @returns {Map<string, object[]>} 报名 id → 事件行数组（没有事件的报名不出现在 Map 里）
+ */
+export function listRegistrationEventsForRegistrations(db, registrationIds) {
+  const ids = [...new Set((registrationIds ?? []).filter((id) => typeof id === 'string' && id !== ''))];
+  if (!ids.length) return new Map();
+  const placeholders = ids.map(() => '?').join(', ');
+  const rows = db
+    .prepare(
+      `SELECT * FROM registration_events
+        WHERE registration_id IN (${placeholders})
+        ORDER BY created_at, rowid`,
+    )
+    .all(...ids);
+  const grouped = new Map();
+  for (const row of rows) {
+    if (!grouped.has(row.registration_id)) grouped.set(row.registration_id, []);
+    grouped.get(row.registration_id).push(row);
+  }
+  return grouped;
+}
+
 export function listRegistrationEvents(db, registrationId) {
   return db
     // ⚠️ 父代理预审修正（确定性排序）：原来的兜底排序键是 `id`，
@@ -1585,6 +1620,61 @@ test('非唯一约束的插入失败不得被报成 DUPLICATE_REGISTRATION', () 
   close();
   rmSync(dataDir, { recursive: true, force: true });
 });
+
+// ── 列表端点必须带上状态事件轨迹（父代理预审修正 Important）──────────────
+// ⚠️ 此前**只有单条** getRegistration 挂 `events`，列表 listRegistrations 不挂 →
+//    组委会筛选台读列表 → 事件轨迹一栏恒空（计划声称的功能实际没落地）。
+test('listRegistrations：每条报名都带上状态事件轨迹（与单条口径一致）', () => {
+  const { db, close, dataDir, rules, edition, user } = setup();
+  const reg = submitRegistration({
+    db, userId: user.id, editionId: edition.id, answers: GOOD, now: NOW, rules,
+  });
+  // 走一次改级 → 追加一条事件（提交事件 + 改级事件 = 2 条）
+  decideRegistration({
+    db, id: reg.id, level: 'B', decidedBy: user.id, note: '复核降级', now: NOW, rules,
+  });
+
+  const viewer = { id: user.id, is_superadmin: 1 };
+  const list = listRegistrations({ db, filter: { editionId: edition.id }, viewer, rules });
+  assert.equal(list.length, 1);
+  assert.ok(Array.isArray(list[0].events), '列表里的每条报名都必须有 events 数组');
+  assert.equal(list[0].events.length, 2, '提交 + 改级 = 2 条轨迹');
+
+  // 与单条口径逐字一致
+  const single = getRegistration({ db, id: reg.id, viewer, rules });
+  assert.deepEqual(list[0].events, single.events, '列表与单条的事件形状必须一致');
+  assert.equal(list[0].events[0].toStatus, 'submitted');
+  assert.equal(list[0].events[1].toStatus, 'accepted', 'B 级 accept=true → 终态 accepted');
+  assert.equal(list[0].events[1].fromStatus, 'submitted');
+  assert.equal(list[0].events[1].reason, '复核降级');
+});
+
+test('listRegistrations：批量取事件时不得把不同报名的轨迹串在一起', () => {
+  const { db, close, dataDir, rules, edition, user } = setup();
+  const other = createUser(db, { name: '乙', phone: '13900002002', password: 'pw', mbaStatus: 'mba' });
+  const r1 = submitRegistration({
+    db, userId: user.id, editionId: edition.id, answers: GOOD, now: NOW, rules,
+  });
+  const r2 = submitRegistration({
+    db, userId: other.id, editionId: edition.id, answers: GOOD, now: NOW, rules,
+  });
+  decideRegistration({ db, id: r1.id, level: 'A', decidedBy: user.id, now: NOW, rules });
+
+  const list = listRegistrations({
+    db, filter: { editionId: edition.id }, viewer: { id: user.id, is_superadmin: 1 }, rules,
+  });
+  assert.equal(list.length, 2);
+  const byId = new Map(list.map((r) => [r.id, r]));
+  assert.equal(byId.get(r1.id).events.length, 2, 'r1 有提交 + 改级两条');
+  assert.equal(byId.get(r2.id).events.length, 1, 'r2 只有提交一条');
+  // r2 的轨迹里不能混进 r1 的改级事件
+  assert.ok(
+    byId.get(r2.id).events.every((e) => e.id !== byId.get(r1.id).events[1].id),
+    '两条报名的轨迹不得串台',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -1625,7 +1715,7 @@ import {
   findActiveRegistration, listRegistrationRows, updateRegistrationRow,
 } from '../db/repo/registrations.js';
 import {
-  insertRegistrationEvent, listRegistrationEvents,
+  insertRegistrationEvent, listRegistrationEvents, listRegistrationEventsForRegistrations,
 } from '../db/repo/registrationEvents.js';
 import { getEdition } from '../db/repo/editions.js';
 import { can } from '../auth/permissions.js';
@@ -1754,6 +1844,22 @@ export function submitRegistration({
   return presentRegistration(row, config);
 }
 
+/**
+ * 报名状态事件 → 对外形状。
+ * 单条（getRegistration）与列表（listRegistrations）**共用**这一个映射：
+ * 两套口径迟早漂移（列表漏字段、字段名不一致），而筛选台读的是列表。
+ */
+export function presentRegistrationEvent(e) {
+  return {
+    id: e.id,
+    fromStatus: e.from_status,
+    toStatus: e.to_status,
+    actorId: e.actor_id,
+    reason: e.reason,
+    createdAt: e.created_at,
+  };
+}
+
 export function getRegistration({ db, id, viewer, rules }) {
   const row = findRegistrationRow(db, id);
   if (!row) return null;
@@ -1764,14 +1870,7 @@ export function getRegistration({ db, id, viewer, rules }) {
   if (!isOwner && !isCommittee) return null;
 
   const out = presentRegistration(row, rules.registration);
-  out.events = listRegistrationEvents(db, id).map((e) => ({
-    id: e.id,
-    fromStatus: e.from_status,
-    toStatus: e.to_status,
-    actorId: e.actor_id,
-    reason: e.reason,
-    createdAt: e.created_at,
-  }));
+  out.events = listRegistrationEvents(db, id).map(presentRegistrationEvent);
   return out;
 }
 
@@ -1780,7 +1879,18 @@ export function listRegistrations({ db, filter = {}, viewer, rules }) {
   const ok = viewer
     && can(viewer, 'registration:review', { scopeType: 'edition', scopeId: filter.editionId ?? null }, db);
   if (!ok) return [];
-  return listRegistrationRows(db, filter).map((row) => presentRegistration(row, rules.registration));
+  const rows = listRegistrationRows(db, filter);
+  const items = rows.map((row) => presentRegistration(row, rules.registration));
+  // ⚠️ P1 Task 6 修正（Important，列表端点的轨迹恒空）：
+  //    此前只有**单条** getRegistration 才挂 `events`，列表不带 →
+  //    组委会筛选台（读列表）的事件轨迹一栏恒空 —— 计划声称的功能实际没落地。
+  //    现在批量挂上：**一次 SQL**，不新增往返。
+  //    事件行的对外形状与单条口径**逐字一致**（同一个映射函数，避免两套口径）。
+  const grouped = listRegistrationEventsForRegistrations(db, rows.map((r) => r.id));
+  for (const item of items) {
+    item.events = (grouped.get(item.id) ?? []).map(presentRegistrationEvent);
+  }
+  return items;
 }
 
 /**
@@ -2737,7 +2847,7 @@ test('solvability 的否决项配置坏了会被拒绝（vetoes 非空 / key 唯
 - [ ] **Step 10: 运行测试确认通过**
 
 Run: `cd platform && node --test test/registration-service.test.js test/registration-api.test.js test/config-p1.test.js`
-Expected: PASS（33 个测试全过：registration-service 14 + registration-api 14 + config-p1 5）
+Expected: PASS（35 个测试全过：registration-service 16 + registration-api 14 + config-p1 5）
 
 - [ ] **Step 11: 提交**
 
@@ -5545,15 +5655,19 @@ git commit -m "feat(P1): 战队与成员管理（MBA 组长硬门槛 / 并队触
 - Create: `platform/web/views/admin-registration.js`
 - Modify: `platform/web/app.js`
 - Create: `platform/test/p1-frontend.test.js`
+- Modify: `platform/src/db/repo/registrationEvents.js`（Task 1 建立；Task 6 追加 `listRegistrationEventsForRegistrations`）
+- Modify: `platform/src/services/registration.js`（Task 3 建立；Task 6 让列表端点也带事件轨迹）
+- Modify: `platform/test/registration-service.test.js`（Task 3 建立；Task 6 追加 2 条事件轨迹用例）
 
 **Interfaces:**
 - Consumes: Task 3 `GET /api/registration-criteria`、`POST /api/registrations`；Task 4 `GET /api/task-packages`；Task 5 `GET /api/teams`、`GET /api/teams/:id`、`POST /api/teams`、`POST /api/teams/:id/members`、`PATCH /api/teams/:id`；Task 3 `GET /api/registrations`、`POST /api/registrations/:id/level`
 - Produces:
   - `web/views/registration.js` → `buildQuestionnaire(criteria)`、`formatExplain(explain, scale)`、`renderRegistration(ctx)`
-  - `web/views/team.js` → `summarizeTeam(team)`、`renderTeam(ctx)`
-  - `web/views/admin-registration.js` → `buildScreeningRows(registrations, criteria)`、`buildFunnelView(registrations, funnel)`、`renderAdminRegistration(ctx)`
+  - `web/views/team.js` → `summarizeTeam(team)`、`canLeaveTeam(team, viewerId)`、`buildTeamCards(teams, viewerId)`、`renderTeam(ctx)`
+  - `web/views/admin-registration.js` → `buildScreeningRows(registrations, criteria)`、`buildFunnelView(registrations, funnel)`、`formatEventTrail(events)`、`renderAdminRegistration(ctx)`
   - 路由：`#/apply`｜`#/team`｜`#/admin/registration`
   - ⛔ 每个视图模块的**纯逻辑导出**不得触碰 `document`（这样 `node:test` 能在无 DOM 环境直接测）
+  - ⚠️ **所有插进 `innerHTML` 的服务端数据必须走 P0 的 `escapeHtml`**（战队名称、任务包标题、userId、message、agreement 都是**用户自填**的 → 不转义即存储型 XSS）
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -5562,9 +5676,14 @@ git commit -m "feat(P1): 战队与成员管理（MBA 组长硬门槛 / 并队触
 ```javascript
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { buildQuestionnaire, formatExplain } from '../web/views/registration.js';
-import { summarizeTeam } from '../web/views/team.js';
-import { buildScreeningRows, buildFunnelView } from '../web/views/admin-registration.js';
+import { summarizeTeam, canLeaveTeam, buildTeamCards } from '../web/views/team.js';
+import {
+  buildScreeningRows, buildFunnelView, formatEventTrail,
+} from '../web/views/admin-registration.js';
 
 const CRITERIA = {
   scale: { min: 1, max: 5, scoreMax: 100 },
@@ -5668,6 +5787,155 @@ test('漏斗视图：5 阶段，第一段给实数，后续标注待填充', () 
   assert.equal(view[1].current, null);
   assert.equal(view[0].target, 1); // round(3 × 0.3)
 });
+
+// ── 退出战队的可用性判定（父代理预审修正 Important）─────────────────────
+// ⚠️ 原实现把条件**取反**了：按钮只在「当前用户是组长」时可点，
+//    而服务端 leaveTeam 对组长抛 409 CAPTAIN_MUST_REPLACE，
+//    组员又被禁用 → **两个角色都退不了队**。
+//    判定被抽成纯函数 canLeaveTeam（不碰 document），这里直接测边界。
+test('退出战队：组员可退、组长不可退（组长要移交）、非成员不可退、未登录不可退', () => {
+  const team = {
+    id: 't1', name: '甲队', status: 'active',
+    members: [
+      { userId: 'u1', role: 'captain' },
+      { userId: 'u2', role: 'member' },
+    ],
+  };
+  assert.equal(canLeaveTeam(team, 'u2'), true, '组员应当能退出');
+  assert.equal(canLeaveTeam(team, 'u1'), false, '组长不能直接退出（服务端 409）');
+  assert.equal(canLeaveTeam(team, 'u3'), false, '非成员不能退出别人的队');
+  assert.equal(canLeaveTeam(team, null), false, '未登录不能退出');
+  assert.equal(canLeaveTeam(null, 'u2'), false, '队不存在时不能退出');
+});
+
+test('退出战队：只有 role=captain 的成员才算组长（captainId 缺失时看 team.captainId）', () => {
+  const noRoleCaptain = {
+    id: 't2', captainId: 'u1', members: [{ userId: 'u1', role: 'member' }, { userId: 'u2', role: 'member' }],
+  };
+  assert.equal(canLeaveTeam(noRoleCaptain, 'u1'), false, 'team.captainId 是组长 → 不可退');
+  assert.equal(canLeaveTeam(noRoleCaptain, 'u2'), true, '其他成员可退');
+});
+
+// ── 渲染路径本身也要有覆盖（父代理变异检验发现调用点是盲区）───────────────
+// ⚠️ 变异检验实测：把 `canLeaveTeam(t, viewerId)` 换成老写法 `s.captainId === viewerId`，
+//    变异体**存活** —— 因为 canLeaveTeam 本身测对了，但**调用点**写错没人知道。
+//    修法：把卡片构建抽成纯函数 buildTeamCards，直接断言它产出的 HTML。
+test('我的战队页：组员的「退出」按钮可点，组长的不可点（渲染路径）', () => {
+  const teams = [{
+    id: 't1', name: '甲队', status: 'active',
+    members: [
+      { userId: 'u1', role: 'captain' },
+      { userId: 'u2', role: 'member' },
+    ],
+  }];
+  const asMember = buildTeamCards(teams, 'u2');
+  assert.equal(asMember.length, 1);
+  assert.ok(!asMember[0].includes(' disabled'), '组员的退出按钮必须可点');
+  assert.ok(asMember[0].includes('data-team="t1"'), '必须带上队 id');
+  assert.ok(!asMember[0].includes('data-user'), '客户端不再传 userId（服务端只认发起人自己）');
+
+  const asCaptain = buildTeamCards(teams, 'u1');
+  assert.ok(asCaptain[0].includes(' disabled'), '组长的退出按钮必须禁用（服务端会 409）');
+
+  const asOutsider = buildTeamCards(teams, 'u9');
+  assert.ok(asOutsider[0].includes(' disabled'), '非成员的退出按钮必须禁用');
+});
+
+test('我的战队页：队名与成员名仍然走 escapeHtml（渲染路径的转义不能因为抽函数而丢）', () => {
+  const cards = buildTeamCards([{
+    id: 't1', name: '<img src=x onerror=alert(1)>', status: 'active',
+    members: [{ userId: '<script>bad()</script>', role: 'member' }],
+  }], 'u2');
+  assert.ok(!cards[0].includes('<img src=x'), '队名必须被转义');
+  assert.ok(!cards[0].includes('<script>'), '成员 id 必须被转义');
+});
+
+// ── 存储型 XSS 防护（父代理预审修正 Critical）────────────────────────────
+// ⚠️ 2026-10-21 父代理预审修正（Critical，**存储型 XSS**）：
+//    三个新视图把**服务端返回的数据**直接插进 innerHTML，而 P0 的
+//    `web/escape.js` 注释早就写明了这个危险：
+//      「前端把服务端返回的数据插进 innerHTML……P1 的『报名』端点让用户自选
+//        name → 立刻变成可远程利用」。
+//    用户可控的插值点（实跑确认）：
+//      · 战队名称（POST /api/teams 的 name，选手自填）→ 我的战队页
+//      · 任务包标题（POST /api/task-packages 的 title，企业自填）→ 筛选台页
+//    两者都进了 innerHTML 且未转义 → 存储型 XSS。
+//
+// 这条用例做**结构性扫描**：凡是「用户可控字段的裸插值」都必须被 escapeHtml 包住。
+// 扫描规则（刻意保守，避免误报）：
+//   ① 只看**简单成员链**插值（`${a.b.c}`，不含函数调用）——
+//      复合插值（`${xs.map(...)}`）的转义在各自内部单独保证；
+//   ② 只盯**用户可控的字段名**：title / name / message / userId / agreement。
+
+const here = dirname(fileURLToPath(import.meta.url));
+const webDir = join(here, '..', 'web');
+
+// 用户可控的字段名：服务端数据里这些值由**用户自己填**
+const USER_CONTROLLED = ['title', 'name', 'message', 'userId', 'agreement'];
+
+function bareInterpolations(source) {
+  // 抓出模板字面量里的 ${a.b.c} 形式（不含括号 = 不是函数调用）
+  const out = [];
+  const re = /\$\{\s*([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*\}/g;
+  let m = re.exec(source);
+  while (m) {
+    out.push({ expr: m[1], raw: m[0] });
+    m = re.exec(source);
+  }
+  return out;
+}
+
+test('三个视图：用户可控的字段必须经过 escapeHtml 才能进 innerHTML（存储型 XSS 防护）', () => {
+  const views = ['views/registration.js', 'views/team.js', 'views/admin-registration.js'];
+  const offenders = [];
+  for (const v of views) {
+    const source = readFileSync(join(webDir, v), 'utf8');
+    assert.ok(
+      source.includes("from '../escape.js'"),
+      `${v} 必须 import escapeHtml`,
+    );
+    for (const { expr, raw } of bareInterpolations(source)) {
+      const last = expr.split('.').pop();
+      if (!USER_CONTROLLED.includes(last)) continue;
+      // 被 escapeHtml(...) 包住的（形如 escapeHtml(x)）不算裸插值
+      if (source.includes(`escapeHtml(${expr})`)) continue;
+      offenders.push(`${v}: ${raw}`);
+    }
+  }
+  assert.deepEqual(offenders, [], `以下插值未转义：\n${offenders.join('\n')}`);
+});
+
+// ── 筛选台的「事件轨迹」一栏必须真的渲染（父代理预审修正 Important）────────
+// ⚠️ 两处空转：
+//    ① 后端 `GET /api/registrations`（列表）此前**不挂 events**（只有单条挂）→
+//       `buildScreeningRows` 拿到的 `r.events` 恒为 undefined → 轨迹恒空；
+//    ② 前端表格里**根本没有「事件轨迹」这一列** → 就算数据有了也没地方显示。
+//    后端已在 src/services/registration.js 修好；这里钉住前端这一侧。
+test('筛选台：事件轨迹既要在表头出现，也要把每条事件渲染成行', () => {
+  const source = readFileSync(join(webDir, 'views', 'admin-registration.js'), 'utf8');
+  // ⚠️ 断言必须精确到表头单元格：`includes('事件轨迹')` 会被 formatEventTrail 的
+  //    文档注释里的同名串满足 → 删掉表头的变异体会**存活**（父代理变异检验实测）。
+  assert.ok(source.includes('<th>事件轨迹</th>'), '表头必须有「事件轨迹」一列');
+  // ⚠️ 断言必须精确到**调用点**：原来只查 `includes('r.events')`，
+  //    而 buildScreeningRows 里也有 `r.events` → 把渲染换成 `<td>${[].map(...)}</td>`
+  //    这个变异体照样存活（父代理变异检验实测）。这里钉住 `formatEventTrail(r.events)`。
+  assert.ok(
+    source.includes('formatEventTrail(r.events)'),
+    '表格里的轨迹单元格必须调用 formatEventTrail(r.events)',
+  );
+});
+
+test('筛选台：事件轨迹的纯文本格式（状态变迁 + 原因）', () => {
+  const lines = formatEventTrail([
+    { fromStatus: 'submitted', toStatus: 'screening', reason: '进入筛选' },
+    { fromStatus: 'screening', toStatus: 'accepted', reason: null },
+  ]);
+  assert.equal(lines.length, 2);
+  assert.ok(lines[0].includes('submitted') && lines[0].includes('screening'));
+  assert.ok(lines[0].includes('进入筛选'));
+  assert.ok(lines[1].includes('accepted'));
+  assert.deepEqual(formatEventTrail(null), [], '事件缺省时不得抛错');
+});
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -5682,6 +5950,7 @@ Expected: FAIL —— `Cannot find module '../web/views/registration.js'`
 // 依据：设计文档 §9「报名问卷：每题显示该题所属维度与分值；明示筛选标准（R-REG-09）；
 //       提交后展示『你被判为 X 级』及可解释明细」
 // ⛔ buildQuestionnaire / formatExplain 是纯函数，不得触碰 document（便于 node:test 直接测）
+import { escapeHtml } from '../escape.js';
 export function buildQuestionnaire(criteria) {
   const dims = (criteria?.dimensions ?? []).map((d) => ({
     key: d.key,
@@ -5740,23 +6009,23 @@ export function renderRegistration(ctx) {
       <h1>报名</h1>
       <section class="criteria">
         <h2>筛选标准（公开透明，报名之前就告诉你）</h2>
-        <ul>${q.criteriaLines.map((l) => `<li>${l}</li>`).join('')}</ul>
-        <p class="muted">${q.open.text}</p>
-        <p class="muted">${q.ipOwnership.team ?? ''} ${q.ipOwnership.committee ?? ''} ${q.ipOwnership.enterprise ?? ''}</p>
+        <ul>${q.criteriaLines.map((l) => `<li>${escapeHtml(l)}</li>`).join('')}</ul>
+        <p class="muted">${escapeHtml(q.open.text)}</p>
+        <p class="muted">${escapeHtml(q.ipOwnership.team ?? '')} ${escapeHtml(q.ipOwnership.committee ?? '')} ${escapeHtml(q.ipOwnership.enterprise ?? '')}</p>
       </section>
       ${q.dims.map((d) => `
         <section class="dim" data-dim="${d.key}">
-          <h2>${d.label}（权重 ${d.weightLabel}，每题 ${d.min}–${d.max} 分）</h2>
+          <h2>${escapeHtml(d.label)}（权重 ${escapeHtml(d.weightLabel)}，每题 ${d.min}–${d.max} 分）</h2>
           ${d.items.map((it, i) => `
-            <label>${it.text}
+            <label>${escapeHtml(it.text)}
               <select name="${d.key}-${i}">
                 ${Array.from({ length: d.max - d.min + 1 }, (_, k) => d.min + k)
                   .map((v) => `<option value="${v}">${v}</option>`).join('')}
               </select>
             </label>`).join('')}
         </section>`).join('')}
-      <label>${q.open.text}<textarea name="open" maxlength="${q.maxLength}"></textarea></label>
-      <label><input type="checkbox" name="consent" /> ${q.consentPrompt}</label>
+      <label>${escapeHtml(q.open.text)}<textarea name="open" maxlength="${q.maxLength}"></textarea></label>
+      <label><input type="checkbox" name="consent" /> ${escapeHtml(q.consentPrompt)}</label>
       <button type="submit">提交报名</button>
       <p id="reg-err" class="err"></p>
       <div id="reg-result"></div>
@@ -5780,9 +6049,9 @@ export function renderRegistration(ctx) {
         });
         const levelLabel = q.levels.find((l) => l.key === reg.level)?.label ?? reg.level;
         result.innerHTML = `
-          <h2>你被判为 ${reg.level} 级（${levelLabel}）</h2>
+          <h2>你被判为 ${escapeHtml(reg.level)} 级（${escapeHtml(levelLabel)}）</h2>
           <p>总分 ${reg.grading.score} 分</p>
-          <ul>${formatExplain(reg.grading.explain, criteria.scale).map((e) => `<li>${e.text}</li>`).join('')}</ul>
+          <ul>${formatExplain(reg.grading.explain, criteria.scale).map((e) => `<li>${escapeHtml(e.text)}</li>`).join('')}</ul>
           <p>${reg.grading.accepted ? '你已被接收，可以去组队。' : '本级不接收，可向组委会提交申诉。'}</p>
           <button id="go-team" type="button">去组队</button>`;
         result.querySelector('#go-team').addEventListener('click', () => navigate('/team'));
@@ -5793,7 +6062,7 @@ export function renderRegistration(ctx) {
 
     wrap.replaceChildren(form);
   })().catch((e) => {
-    wrap.innerHTML = `<div class="card err">${e.message}</div>`;
+    wrap.innerHTML = `<div class="card err">${escapeHtml(e.message)}</div>`;
   });
 
   return wrap;
@@ -5806,6 +6075,7 @@ export function renderRegistration(ctx) {
 // web/views/team.js — 我的战队（选手视角）
 // 依据：设计文档 §9「我的战队 + 组队/汰换」
 // 依据：R-REG-01（建队即认领任务包）、R-REG-03（持续招募汰换）、R-REG-04（仅剩 1 人须并队）
+import { escapeHtml } from '../escape.js';
 const STATUS_LABELS = {
   forming: '组建中（未满 2 人）',
   active: '已成立',
@@ -5813,22 +6083,73 @@ const STATUS_LABELS = {
   dissolved: '已解散',
 };
 
-export function summarizeTeam(team) {
+// 组长是谁：优先看成员表里的 role=captain，退回 team.captainId
+function resolveCaptainId(team) {
   const members = team?.members ?? [];
   const captain = members.find((m) => m.role === 'captain');
+  return captain?.userId ?? team?.captainId ?? '';
+}
+
+export function summarizeTeam(team) {
+  const members = team?.members ?? [];
   return {
     id: team?.id ?? null,
     title: team?.name ?? '',
     memberCount: members.length,
     status: team?.status ?? 'forming',
     statusLabel: STATUS_LABELS[team?.status] ?? team?.status ?? '',
-    captainId: captain?.userId ?? team?.captainId ?? '',
+    captainId: resolveCaptainId(team),
     needsMerge: team?.needsMerge === true,
     mergeDeadline: team?.mergeDeadline ?? null,
     formationOk: team?.formation?.ok === true,
     formationErrors: team?.formation?.errors ?? [],
     milestoneCount: team?.milestones?.items?.length ?? 0,
   };
+}
+
+/**
+ * 「退出」按钮能不能点：**本人是组员、且不是组长**。
+ *
+ * ⚠️ P1 Task 6 修正（Important，退出功能完全不可用）：
+ *    原来的判定是 `captainId === 当前用户 ? 可点 : 禁用` —— 条件**取反**了：
+ *      · 组长可点 → 但服务端 `leaveTeam` 对组长抛 409 `CAPTAIN_MUST_REPLACE`
+ *        （组长要移交职责，不能直接退）→ 点了必然报错；
+ *      · 组员被禁用 → 明明可以退，却点不动。
+ *    结果：**两个角色都退不了队**，整条「持续招募汰换（R-REG-03）」的退出路径在 UI 上是死的。
+ *    现在按服务端规则对齐：**组员可退，组长不可退**（移交走汰换接口）。
+ */
+export function canLeaveTeam(team, viewerId) {
+  if (!team || !viewerId) return false;
+  if (resolveCaptainId(team) === viewerId) return false;
+  return (team?.members ?? []).some((m) => m.userId === viewerId);
+}
+
+/**
+ * 战队卡片 HTML（纯函数，不碰 document）。
+ *
+ * ⚠️ 为什么抽出来：`renderTeam` 里内联模板时，「退出按钮能不能点」这条**渲染路径**
+ *    完全没有测试覆盖 —— canLeaveTeam 本身测对了，但调用点写错也没人知道
+ *    （父代理变异检验实测：把 `canLeaveTeam(t, viewerId)` 换成老写法
+ *     `s.captainId === viewerId`，变异体**存活** —— 说明调用点是盲区）。
+ *    抽成纯函数后，这条路径能被直接断言。
+ */
+export function buildTeamCards(teams, viewerId) {
+  return (teams ?? []).map((t) => {
+    const s = summarizeTeam(t);
+    const leaveable = canLeaveTeam(t, viewerId);
+    const leaveHint = leaveable
+      ? ''
+      : ' title="组长不能直接退出，请先汰换成员并移交组长职责"';
+    return `
+        <section class="team-card">
+          <h2>${escapeHtml(s.title)}</h2>
+          <p class="muted">状态：${escapeHtml(s.statusLabel)}｜成员 ${s.memberCount} 人｜固定里程碑 ${s.milestoneCount} 项</p>
+          ${s.needsMerge ? `<p class="err">⚠️ 仅剩 1 人，须在 ${s.mergeDeadline ?? '期限内'} 前并入其他战队</p>` : ''}
+          ${s.formationErrors.map((e) => `<p class="err">${escapeHtml(e)}</p>`).join('')}
+          <ul>${t.members.map((m) => `<li>${escapeHtml(m.userId)}（${m.role === 'captain' ? '组长' : '组员'}）</li>`).join('')}</ul>
+          <button data-action="leave" data-team="${escapeHtml(t.id)}"${leaveable ? '' : ' disabled'}${leaveHint}>退出</button>
+        </section>`;
+  });
 }
 
 export function renderTeam(ctx) {
@@ -5846,20 +6167,10 @@ export function renderTeam(ctx) {
     const teams = teamsRes.items ?? [];
     const packages = packagesRes.items ?? [];
 
-    const cards = teams.map((t) => {
-      const s = summarizeTeam(t);
-      return `
-        <section class="team-card">
-          <h2>${s.title}</h2>
-          <p class="muted">状态：${s.statusLabel}｜成员 ${s.memberCount} 人｜固定里程碑 ${s.milestoneCount} 项</p>
-          ${s.needsMerge ? `<p class="err">⚠️ 仅剩 1 人，须在 ${s.mergeDeadline ?? '期限内'} 前并入其他战队</p>` : ''}
-          ${s.formationErrors.map((e) => `<p class="err">${e}</p>`).join('')}
-          <ul>${t.members.map((m) => `<li>${m.userId}（${m.role === 'captain' ? '组长' : '组员'}）</li>`).join('')}</ul>
-          <button data-action="leave" data-team="${t.id}" data-user="${s.captainId}" ${s.captainId === ctx.getState().user?.id ? '' : 'disabled'}>退出</button>
-        </section>`;
-    });
+    const viewerId = ctx.getState().user?.id ?? null;
+    const cards = buildTeamCards(teams, viewerId);
 
-    const opts = packages.map((p) => `<option value="${p.id}">${p.title}</option>`).join('');
+    const opts = packages.map((p) => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.title)}</option>`).join('');
     wrap.innerHTML = `
       <h1>我的战队</h1>
       ${cards.join('') || '<p class="muted">你还没有战队</p>'}
@@ -5890,9 +6201,9 @@ export function renderTeam(ctx) {
     for (const btn of wrap.querySelectorAll('[data-action=leave]')) {
       btn.addEventListener('click', async () => {
         try {
-          await api.post(`/api/teams/${btn.dataset.team}/members`, {
-            action: 'leave', userId: btn.dataset.user,
-          });
+          // ⚠️ 父代理预审修正：退出**只作用于发起人自己** ——
+          //    服务端不再接受 body.userId（否则任何人都能把别人踢出战队）。
+          await api.post(`/api/teams/${btn.dataset.team}/members`, { action: 'leave' });
           location.reload();
         } catch (e) {
           wrap.querySelector('#team-err').textContent = e.message;
@@ -5900,7 +6211,7 @@ export function renderTeam(ctx) {
       });
     }
   })().catch((e) => {
-    wrap.innerHTML = `<div class="card err">${e.message}</div>`;
+    wrap.innerHTML = `<div class="card err">${escapeHtml(e.message)}</div>`;
   });
 
   return wrap;
@@ -5913,6 +6224,7 @@ export function renderTeam(ctx) {
 // web/views/admin-registration.js — 组委会筛选台
 // 依据：设计文档 §9「报名筛选台（含可解释明细）+ 复核/申诉/改级」「任务包与配比 70/30」
 // 溯源：R-REG-09 / R-REG-10 / R-ENT-09
+import { escapeHtml } from '../escape.js';
 import { formatExplain } from './registration.js';
 
 const STATUS_LABELS = {
@@ -5948,6 +6260,20 @@ export function buildScreeningRows(registrations, criteria) {
   return { rows, distribution, total: rows.length };
 }
 
+/**
+ * 事件轨迹 → 一行一条的纯文本（纯函数，不碰 document）。
+ *
+ * ⚠️ 为什么要抽出来：轨迹的**渲染路径**此前既没有单元测试，结构扫描也只查
+ *    `source.includes('r.events')` —— 而 `buildScreeningRows` 里也有 `r.events`，
+ *    于是「把渲染改成 `<td>${[].map(...)}</td>`」这个变异体**存活**
+ *    （父代理变异检验实测）。抽成纯函数后可以直接断言它的输出。
+ */
+export function formatEventTrail(events) {
+  return (events ?? []).map((ev) => (
+    `${ev.fromStatus ?? '—'} → ${ev.toStatus ?? '—'}${ev.reason ? `（${ev.reason}）` : ''}`
+  ));
+}
+
 export function buildFunnelView(registrations, funnel) {
   const total = (registrations ?? []).length;
   return (funnel ?? []).map((stage, i) => ({
@@ -5980,32 +6306,33 @@ export function renderAdminRegistration(ctx) {
       <h1>报名筛选台</h1>
       <section class="funnel">
         <h2>筛选漏斗（R-REG-10）</h2>
-        <ul>${funnel.map((f) => `<li>${f.label}：${f.rate === null ? '—' : `${Math.round(f.rate * 100)}%`}｜${f.current === null ? '待填充' : `当前 ${f.current} 人`}</li>`).join('')}</ul>
+        <ul>${funnel.map((f) => `<li>${escapeHtml(f.label)}：${f.rate === null ? '—' : `${Math.round(f.rate * 100)}%`}｜${f.current === null ? '待填充' : `当前 ${f.current} 人`}</li>`).join('')}</ul>
       </section>
       <section class="distribution">
         <h2>分级分布（共 ${total} 人）</h2>
-        <ul>${Object.entries(distribution).map(([k, v]) => `<li>${k} 级 ${v} 人</li>`).join('')}</ul>
+        <ul>${Object.entries(distribution).map(([k, v]) => `<li>${escapeHtml(k)} 级 ${v} 人</li>`).join('')}</ul>
       </section>
       <section class="mix">
         <h2>任务包配比（R-ENT-09：70% B 端 + 30% 自由）</h2>
         <p>${mix ? `自由题 ${mix.free}/${mix.total}（${Math.round(mix.actualFree * 100)}%）｜B 端 ${mix.enterprise}｜${mix.ok ? '配比达标' : '配比未达标'}` : '无数据'}</p>
-        ${mix && !mix.ok ? `<ul class="err">${mix.errors.map((e) => `<li>${e}</li>`).join('')}</ul>` : ''}
-        <ul>${packages.map((p) => `<li>${p.title}｜${p.isFreeBrief ? '自由命题' : `B 端 ${p.solvabilityGrade ?? '未分级'} 级`}｜${p.agreement ?? ''}</li>`).join('')}</ul>
+        ${mix && !mix.ok ? `<ul class="err">${mix.errors.map((e) => `<li>${escapeHtml(e)}</li>`).join('')}</ul>` : ''}
+        <ul>${packages.map((p) => `<li>${escapeHtml(p.title)}｜${p.isFreeBrief ? '自由命题' : `B 端 ${escapeHtml(p.solvabilityGrade ?? '未分级')} 级`}｜${escapeHtml(p.agreement ?? '')}</li>`).join('')}</ul>
       </section>
       <table class="screening">
-        <thead><tr><th>用户</th><th>系统分级</th><th>复核级别</th><th>分数</th><th>状态</th><th>可解释明细</th><th>操作</th></tr></thead>
+        <thead><tr><th>用户</th><th>系统分级</th><th>复核级别</th><th>分数</th><th>状态</th><th>可解释明细</th><th>事件轨迹</th><th>操作</th></tr></thead>
         <tbody>
           ${rows.map((r) => `
-            <tr data-id="${r.id}">
-              <td>${r.userId}</td>
-              <td>${r.autoLevel}</td>
-              <td>${r.level}</td>
+            <tr data-id="${escapeHtml(r.id)}">
+              <td>${escapeHtml(r.userId)}</td>
+              <td>${escapeHtml(r.autoLevel)}</td>
+              <td>${escapeHtml(r.level)}</td>
               <td>${r.score}</td>
-              <td>${r.statusLabel}</td>
-              <td>${r.explain.map((e) => e.text).join('<br />')}</td>
+              <td>${escapeHtml(r.statusLabel)}</td>
+              <td>${r.explain.map((e) => escapeHtml(e.text)).join('<br />')}</td>
+              <td>${formatEventTrail(r.events).map((line) => escapeHtml(line)).join('<br />')}</td>
               <td>
                 <select data-role="level">
-                  ${criteria.levels.map((l) => `<option value="${l.key}" ${l.key === r.level ? 'selected' : ''}>${l.key}</option>`).join('')}
+                  ${criteria.levels.map((l) => `<option value="${escapeHtml(l.key)}" ${l.key === r.level ? 'selected' : ''}>${escapeHtml(l.key)}</option>`).join('')}
                 </select>
                 <input data-role="note" placeholder="复核意见" />
                 <button data-role="save">改级</button>
@@ -6029,7 +6356,7 @@ export function renderAdminRegistration(ctx) {
       });
     }
   })().catch((e) => {
-    wrap.innerHTML = `<div class="card err">${e.message}</div>`;
+    wrap.innerHTML = `<div class="card err">${escapeHtml(e.message)}</div>`;
   });
 
   return wrap;
@@ -6045,6 +6372,7 @@ import { renderTeam } from './views/team.js';
 import { renderAdminRegistration } from './views/admin-registration.js';
 
 // ② route 追加三页
+// P1 三页：报名 / 我的战队 / 组委会筛选台
 route('/apply', () => renderRegistration(ctx));
 route('/team', () => renderTeam(ctx));
 route('/admin/registration', () => renderAdminRegistration(ctx));
@@ -6058,12 +6386,13 @@ route('/admin/registration', () => renderAdminRegistration(ctx));
 - [ ] **Step 7: 运行测试确认通过**
 
 Run: `cd platform && node --test test/p1-frontend.test.js`
-Expected: PASS（6 个测试全过：p1-frontend 6）
+Expected: PASS（13 个测试全过：p1-frontend 13）
 
 - [ ] **Step 8: 提交**
 
 ```bash
-cd platform && git add web/views web/app.js test/p1-frontend.test.js
+cd platform && git add web/views web/app.js test/p1-frontend.test.js \
+  src/db/repo/registrationEvents.js src/services/registration.js test/registration-service.test.js
 git commit -m "feat(P1): 前端三页（报名问卷明示筛选标准 / 我的战队 / 组委会筛选台）
 
 对应需求：R-REG-09 / R-REG-10 / R-REG-03 / R-REG-04 / R-ENT-09"
@@ -6426,7 +6755,8 @@ git commit -m "feat(P1): 端到端串联与种子扩充（报名→分级→建�
 | **T3-10** | Minor | P0 的 `test/config.test.js` 的措辞（「9 份」）在 P1 分支过期 → P1 计划却写「一字不动」，与实现自相矛盾 | 评审核对：P1 分支该文件已改成「全部规则配置」，P1 计划仍写「一字不动」 | ① P1 计划的「一字不动」改成**准确表述**（「不加用例」—— 条数 23 与断言一字未动，只订正了 3 处会随配置份数过期的措辞）；② **P0 计划保持历史原样**（它是 P0 阶段的历史规格，必须与 main / `feat/p0-foundation` 同一份；跨阶段的一致性靠变更登记兜住，不靠改历史规格）；③ 提交信息里的用例数订正为 193 → 199 | — |
 | **T3-11** | Minor | 列表端点未暴露分页参数，`limit` 硬编码 200 | — | **本期不提供分页**（口径已登记，见下方「口径」表）；报名量级在一届之内不会到 200+ | — |
 
-**Task 3 的测试条数口径**：registration-service **14** + registration-api **14** + config-p1 **4** = **32**。
+**Task 3 的测试条数口径**：registration-service **16** + registration-api **14** + config-p1 **5** = **35**。
+（registration-service 由 14 增至 16：Task 6 的「列表端点也带事件轨迹」修正在此文件追加了 2 条用例，见 Task 6 台账 T6-4。）
 
 ---
 
@@ -6505,6 +6835,27 @@ git commit -m "feat(P1): 端到端串联与种子扩充（报名→分级→建�
 
 ---
 
+## Task 6 父代理预审修正台账（2026-10-21）
+
+> Task 6 的规格在**实施前**被父代理逐条实跑预审（把计划里的代码块抽到独立工程里跑），
+> 发现 **1 Critical + 2 Important**；实施完成后又做了一轮**变异检验**，
+> 变异体一度出现 **2 条存活**（暴露了「渲染路径无覆盖」这一类盲区），补完测试后 **12/12 杀灭**。
+> 全部缺陷均**实跑复现**。
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| **T6-1** | **Critical** | 三个新视图把**服务端返回的数据**直接插进 `innerHTML`，**未走 P0 的 `escapeHtml`** | 用户可控字段有实测入口：战队名称（`POST /api/teams` 的 `name`，选手自填）、任务包标题（`POST /api/task-packages` 的 `title`，企业自填）。P0 的 `web/escape.js` 注释早就写明了这个危险（「P1 的『报名』端点让用户自选 name → 立刻变成可远程利用」），但 Task 6 的三个视图**没照做** → **存储型 XSS** | 三个视图统一 `import { escapeHtml } from '../escape.js'`，所有服务端数据插值点逐个转义；新增**结构性回归测试**（扫描用户可控字段的裸插值），修复前红、修复后绿 |
+| **T6-2** | Important | 「退出战队」按钮的禁用条件**取反**：只在「当前用户是组长」时可点 | 服务端 `leaveTeam` 对组长抛 **409 `CAPTAIN_MUST_REPLACE`**（组长要移交职责，不能直接退），组员又被禁用 → **两个角色都退不了队**，整条「持续招募汰换（R-REG-03）」的退出路径在 UI 上是死的 | 判定抽成纯函数 `canLeaveTeam(team, viewerId)`：**组员可退、组长不可退**（与服务端规则对齐）；渲染路径抽成纯函数 `buildTeamCards(teams, viewerId)` 便于直接断言 |
+| **T6-3** | Important | 筛选台的「事件轨迹」一栏**恒为空** | 两处空转：① 后端 `GET /api/registrations`（**列表**）此前**不挂 `events`**（只有单条 `getRegistration` 挂）→ `r.events` 恒为 `undefined`；② 前端表格里**根本没有这一列** → 数据有了也没地方显示 | 后端：仓储层追加 `listRegistrationEventsForRegistrations`（**一次 SQL** 批量取，`IN (...)` + `ORDER BY created_at, rowid`），服务层 `listRegistrations` 挂上事件；前端：表格加「事件轨迹」列，纯函数 `formatEventTrail(events)` 逐条渲染 |
+| **T6-4** | Minor | `data-user="${s.captainId}"` 是**死属性** | Task 5 的 T5-4 已把「退出只作用于发起人自己」落到服务端（不再接受 `body.userId`），前端却还留着一个指向组长的 `data-user` → 读代码的人会以为客户端仍在传别人的 id | 删除该属性 |
+| **T6-5** | Minor | **渲染路径无覆盖**（变异检验暴露的盲区） | 首轮变异检验 **10 条变异体存活 2 条**：把 `canLeaveTeam(t, viewerId)` 换成老写法 `s.captainId === viewerId` → **存活**（`canLeaveTeam` 本身测对了，但**调用点**写错没人知道）；把轨迹渲染换成 `<td>${[].map(...)}</td>` → **存活**（结构断言只查 `includes('r.events')`，而 `buildScreeningRows` 里也有 `r.events`） | 渲染路径抽成纯函数（`buildTeamCards` / `formatEventTrail`）并直接断言其输出；结构断言收紧到**调用点**（`formatEventTrail(r.events)`）与**表头单元格**（`<th>事件轨迹</th>`）—— 原来的 `includes('事件轨迹')` 会被文档注释里的同名串满足，删掉表头的变异体照样存活 |
+
+**Task 6 的测试条数口径**：p1-frontend **13**（原计划 6 + T6-2 追加 2 条 + T6-3 追加 1 条 + T6-5 追加 4 条）；registration-service 由 **14** 增至 **16**（T6-3 追加 2 条）。
+
+**Task 6 的变异检验口径**：12 个变异体，**12/12 杀灭**（`/tmp/p1t6/mutate.mjs`）。变异体覆盖：组长判定、成员判定、事件挂载、事件分组、事件累积、事件字段、轨迹表头、轨迹渲染、`formatEventTrail`、队名转义、退出按钮条件、`buildTeamCards` 调用点。
+
+---
+
 ## 与接口契约的偏差
 
 > 以下 7 条是本计划相对 `INTERFACES.md` §2「P1 产出」的实现偏差。**INTERFACES.md 未被本计划修改**。
@@ -6524,6 +6875,8 @@ git commit -m "feat(P1): 端到端串联与种子扩充（报名→分级→建�
 
 **另有 3 条「契约未禁止但本阶段自行决定」的口径，写明以免被当成原文**：
 
+> ⚠️ 标题里的「3 条」是 Task 3 成文时的数字，后续 Task 4/5/6 又追加了几条 —— 以**表里的实际行数**为准。
+
 | 口径 | 本阶段实现 | 出处与状态 |
 |---|---|---|
 | 六维的一票否决 ①② 由维度推导 | `data_access = 0` → 自动命中「无法提供数据授权说明」；`accountability = 0` → 自动命中「无企业侧唯一责任人」；③「涉及生产系统且未谈责任归属」只能由出题方自报 | 顶层文档 §3.2 的六维与三条否决是同一件事的两种说法（原文把「责任可归属」列为维度、把「唯一责任人」列为否决）。**属我方推断，需组委会追认** |
@@ -6533,6 +6886,9 @@ git commit -m "feat(P1): 端到端串联与种子扩充（报名→分级→建�
 | `POST /api/registrations` 的能力点校验 | 已登录 + `can(user, 'registration:write', { scopeType:'edition', scopeId: editionId })` 才放行，否则 **403** | **【2026-10-21 父代理验收修正】** 计划原文只判「有没有登录」→ `registration:write` 这个被注册、被 seed 授予的能力点**形同虚设**，违反全局约束「`can()` 是唯一判定入口」。⚠️ **副作用**：新注册的账号若没有任何角色 / 授权，将无法报名（seed 里 captain 与 member 都有 `registration:write`，所以正常路径不受影响）。若组委会要求「任何人注册后即可报名」，则应改为「报名成功时自动授予 member 角色」—— 那是契约变更。**【2026-10-21 独立评审修正 T3-7】** 作用域从 `null` 改成 edition —— 原来传 `ctx = null` 时 `can()` 会**跳过**资源级授权的 scope 匹配 → `scope_type='edition'` 的授权会被误拒（该用户无法报名） |
 | `GET /api/registrations` 列表**不提供分页** | `limit` 硬编码 200、offset 恒 0；query 里的 `limit` / `offset` 被忽略 | **【2026-10-21 独立评审 Minor T3-11】** 仓储层（`listRegistrationRows`）已经支持 `limit` / `offset`，但路由没有透传。一届的报名量级远不到 200 条，**本期不开放分页**；若报名量超 200 条，第 201 条起取不到 → 届期规模扩大前必须补路由透传 + 上界校验 |
 | `level` / `grading.level` / `levelFinal` 三者的口径 | `level` + `rawScore` = **提交那一刻**的快照（存库）；`grading` = **按当前配置重算**（不存库）；`levelFinal` = **组委会裁定**（只有组委会能改） | **【2026-10-21 独立评审 Minor T3-9】** 改 `rules/registration-scoring.json` 的权重或阈值后，重读同一条报名会看到 `level`（旧快照）与 `grading.level`（新口径）不一致 —— 这**不是 bug**，而是「评分可复算、裁定不可篡改」两条原则的必然结果。列表的 `level` 过滤走**库内快照**，客户端按等级筛选时以快照为准 |
+| `GET /api/registrations`（列表）**带 events** | 列表里的每条报名都带 `events` 数组（与单条 `GET /api/registrations/:id` 形状**逐字一致**） | **【2026-10-21 父代理预审 Important T6-3】** 契约没写列表带不带事件。此前只有单条挂 → 组委会筛选台读列表 → 轨迹一栏恒空。现在仓储层用**一次 SQL**（`IN (...)` + `ORDER BY created_at, rowid`）批量取，服务层挂上。⚠️ 代价：一届的报名量级下 N+1 与批量差别不大，但**报名量上万时列表会变重** —— 届期规模扩大前要改成分页 + 分批取 |
+| 「退出战队」按钮的可用性口径 | **组员可退、组长不可退**（组长移交走汰换 `action=replace`） | **【2026-10-21 父代理预审 Important T6-2】** 与服务端 `leaveTeam` 的 409 `CAPTAIN_MUST_REPLACE` 对齐。契约没规定前端按钮的禁用规则 |
+| 前端视图的**纯逻辑导出**范围 | `buildQuestionnaire` / `formatExplain` / `summarizeTeam` / `canLeaveTeam` / `buildTeamCards` / `buildScreeningRows` / `buildFunnelView` / `formatEventTrail` 全部**不碰 `document`**，可在 `node:test` 里直接测 | **【2026-10-21 父代理预审 Minor T6-5】** 变异检验暴露「渲染路径无覆盖」的盲区 —— 把渲染逻辑从 DOM 里剥出来，纯函数才能被直接断言 |
 
 ---
 

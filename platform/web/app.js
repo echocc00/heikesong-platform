@@ -2,6 +2,9 @@
 import { route, match, navigate, currentPath } from './router.js';
 import { getState, setState, subscribe } from './store.js';
 import { renderLogin } from './views/login.js';
+import { renderRegistration } from './views/registration.js';
+import { renderTeam } from './views/team.js';
+import { renderAdminRegistration } from './views/admin-registration.js';
 import { escapeHtml } from './escape.js';
 
 // 演示版：?demo=1 时用 localStorage 适配器；正式版走真实 API。
@@ -11,6 +14,10 @@ const { api } = isDemo ? await import('./api.demo.js') : await import('./api.js'
 route('/', () => renderHome());
 route('/login', () => renderLogin(ctx));
 route('/logout', () => renderLogout());
+// P1 三页：报名 / 我的战队 / 组委会筛选台
+route('/apply', () => renderRegistration(ctx));
+route('/team', () => renderTeam(ctx));
+route('/admin/registration', () => renderAdminRegistration(ctx));
 
 function renderHome() {
   const el = document.createElement('div');
@@ -22,6 +29,9 @@ function renderHome() {
     <nav>
       <a href="#/login">登录</a>
       <a href="#/leaderboard">榜单</a>
+      <a href="#/apply">报名</a>
+      <a href="#/team">我的战队</a>
+      <a href="#/admin/registration">筛选台</a>
     </nav>
   `;
   return el;

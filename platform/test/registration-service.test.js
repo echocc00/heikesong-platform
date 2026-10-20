@@ -259,3 +259,58 @@ test('非唯一约束的插入失败不得被报成 DUPLICATE_REGISTRATION', () 
   close();
   rmSync(dataDir, { recursive: true, force: true });
 });
+
+// ── 列表端点必须带上状态事件轨迹（父代理预审修正 Important）──────────────
+// ⚠️ 此前**只有单条** getRegistration 挂 `events`，列表 listRegistrations 不挂 →
+//    组委会筛选台读列表 → 事件轨迹一栏恒空（计划声称的功能实际没落地）。
+test('listRegistrations：每条报名都带上状态事件轨迹（与单条口径一致）', () => {
+  const { db, close, dataDir, rules, edition, user } = setup();
+  const reg = submitRegistration({
+    db, userId: user.id, editionId: edition.id, answers: GOOD, now: NOW, rules,
+  });
+  // 走一次改级 → 追加一条事件（提交事件 + 改级事件 = 2 条）
+  decideRegistration({
+    db, id: reg.id, level: 'B', decidedBy: user.id, note: '复核降级', now: NOW, rules,
+  });
+
+  const viewer = { id: user.id, is_superadmin: 1 };
+  const list = listRegistrations({ db, filter: { editionId: edition.id }, viewer, rules });
+  assert.equal(list.length, 1);
+  assert.ok(Array.isArray(list[0].events), '列表里的每条报名都必须有 events 数组');
+  assert.equal(list[0].events.length, 2, '提交 + 改级 = 2 条轨迹');
+
+  // 与单条口径逐字一致
+  const single = getRegistration({ db, id: reg.id, viewer, rules });
+  assert.deepEqual(list[0].events, single.events, '列表与单条的事件形状必须一致');
+  assert.equal(list[0].events[0].toStatus, 'submitted');
+  assert.equal(list[0].events[1].toStatus, 'accepted', 'B 级 accept=true → 终态 accepted');
+  assert.equal(list[0].events[1].fromStatus, 'submitted');
+  assert.equal(list[0].events[1].reason, '复核降级');
+});
+
+test('listRegistrations：批量取事件时不得把不同报名的轨迹串在一起', () => {
+  const { db, close, dataDir, rules, edition, user } = setup();
+  const other = createUser(db, { name: '乙', phone: '13900002002', password: 'pw', mbaStatus: 'mba' });
+  const r1 = submitRegistration({
+    db, userId: user.id, editionId: edition.id, answers: GOOD, now: NOW, rules,
+  });
+  const r2 = submitRegistration({
+    db, userId: other.id, editionId: edition.id, answers: GOOD, now: NOW, rules,
+  });
+  decideRegistration({ db, id: r1.id, level: 'A', decidedBy: user.id, now: NOW, rules });
+
+  const list = listRegistrations({
+    db, filter: { editionId: edition.id }, viewer: { id: user.id, is_superadmin: 1 }, rules,
+  });
+  assert.equal(list.length, 2);
+  const byId = new Map(list.map((r) => [r.id, r]));
+  assert.equal(byId.get(r1.id).events.length, 2, 'r1 有提交 + 改级两条');
+  assert.equal(byId.get(r2.id).events.length, 1, 'r2 只有提交一条');
+  // r2 的轨迹里不能混进 r1 的改级事件
+  assert.ok(
+    byId.get(r2.id).events.every((e) => e.id !== byId.get(r1.id).events[1].id),
+    '两条报名的轨迹不得串台',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
