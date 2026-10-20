@@ -1,0 +1,238 @@
+// src/server.js — 进程入口 + 可测的应用装配
+// 依据：设计文档 §4.1 / §14.1
+import http from 'node:http';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+import { openDatabase } from './db/sqlite.js';
+import { applyMigrations } from './db/migrate.js';
+import { loadRules, validateRules } from './config.js';
+import { createRouter } from './http/router.js';
+import { json, error } from './http/respond.js';
+import { readJsonBody } from './http/body.js';
+import { serveStatic } from './http/static.js';
+import { createSession, resolveSession, revokeSession } from './auth/session.js';
+import { can } from './auth/permissions.js';
+import { verifyPassword } from './auth/password.js';
+import { getUserById, getCredentialsByPhone, toPublicUser } from './db/repo/users.js';
+
+const here = dirname(fileURLToPath(import.meta.url));
+
+// 会话 Cookie（设计文档 §7.5）：HttpOnly + SameSite=Lax + Path=/ + Secure(生产)
+function sessionCookie(token, maxAge, secure) {
+  const parts = [
+    `hk_session=${token}`,
+    'HttpOnly',
+    'SameSite=Lax',
+    'Path=/',
+    `Max-Age=${maxAge}`,
+  ];
+  if (secure) parts.push('Secure');
+  return parts.join('; ');
+}
+
+/**
+ * 畸形百分号编码（如 '%E0%A4%A'）会让 decodeURIComponent 抛 URIError。
+ * router 内部已把这类段视为「不匹配」，这里再判一次是为了把
+ * 「请求本身非法（400）」与「没这个接口（404）」区分开。
+ */
+function hasMalformedEncoding(path) {
+  try {
+    decodeURIComponent(path);
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * 领域错误码：Node 内置错误的 .code（如 ERR_INVALID_ARG_TYPE）不是领域码，
+ * 不能原样回给客户端 —— 那会暴露内部实现细节。
+ */
+function domainCode(err, fallback) {
+  const code = err && err.code;
+  if (typeof code === 'string' && /^[A-Z][A-Z0-9_]*$/.test(code) && !code.startsWith('ERR_')) {
+    return code;
+  }
+  return fallback;
+}
+
+export function createApp({ db, rules, webDir }) {
+  // fail-fast：规则不合法直接拒绝启动
+  const errors = validateRules(rules);
+  if (errors.length) {
+    throw new Error(`规则配置校验失败，拒绝启动：\n${errors.map((e) => `  - ${e}`).join('\n')}`);
+  }
+
+  const router = createRouter();
+  // 生产环境 Cookie 加 Secure；开发环境不加（http://127.0.0.1 会被浏览器拒收）
+  const secureCookies = process.env.NODE_ENV === 'production';
+
+  router.add('GET', '/api/health', async () => ({ ok: true, at: new Date().toISOString() }));
+
+  router.add('GET', '/api/me', async ({ user }) => {
+    if (!user) {
+      const e = new Error('未登录');
+      e.status = 401;
+      e.code = 'UNAUTHENTICATED';
+      throw e;
+    }
+    return { user: toPublicUser(user) };
+  });
+
+  // ⛔ 预审修正（I7-1）：P0 原本**没有登录接口** → README 宣称的「能登录的空系统」不成立，
+  //    Task 5 产出的 createSession 也没有任何调用方。补上登录/登出。
+  router.add('POST', '/api/auth/login', async ({ body }) => {
+    const phone = String(body?.phone ?? '').trim();
+    const password = String(body?.password ?? '');
+    const cred = getCredentialsByPhone(db, phone);
+    // 用户不存在与密码错误返回**同一个**错误码 → 避免用户枚举
+    const ok = !!cred && cred.active === 1 && verifyPassword(password, cred.password_hash);
+    if (!ok) {
+      const e = new Error('手机号或密码不正确');
+      e.status = 401;
+      e.code = 'INVALID_CREDENTIALS';
+      throw e;
+    }
+    const { token, expiresAt } = createSession(db, cred.id);
+    const maxAge = Math.max(0, Math.floor((new Date(expiresAt).getTime() - Date.now()) / 1000));
+    return {
+      status: 200,
+      body: { user: toPublicUser(getUserById(db, cred.id)) },
+      headers: { 'Set-Cookie': sessionCookie(token, maxAge, secureCookies) },
+    };
+  });
+
+  router.add('POST', '/api/auth/logout', async ({ sessionToken }) => {
+    if (sessionToken) revokeSession(db, sessionToken);
+    return {
+      status: 200,
+      body: { ok: true },
+      headers: { 'Set-Cookie': sessionCookie('', 0, secureCookies) },
+    };
+  });
+
+  async function handle(req, res) {
+    const url = req.url || '/';
+    if (url.startsWith('/api/')) {
+      try {
+        // ⛔ 预审修正（C4-2）：router.match 必须**在 try 块内**。
+        //    原来它在 try 之外 → 畸形百分号编码抛出的 URIError 越过 catch
+        //    → Node 默认未捕获异常退出 → 整个服务器进程死亡。
+        const match = router.match(req.method, url);
+        if (!match) {
+          // 畸形 URL 编码 → 400（请求本身非法）；真没这个接口 → 404
+          if (hasMalformedEncoding(url)) {
+            error(res, 400, 'BAD_REQUEST', 'URL 编码非法');
+            return;
+          }
+          error(res, 404, 'NOT_FOUND', `无此接口: ${req.method} ${url}`);
+          return;
+        }
+        const sessionToken = parseCookie(req.headers?.cookie || '')['hk_session'];
+        const session = sessionToken ? resolveSession(db, sessionToken) : null;
+        // ⛔ 预审修正（C7-2）：resolveSession 返回 { userId, expiresAt }（契约 INTERFACES.md:67），
+        //    原来读 session.user_id（undefined）→ node:sqlite 绑定 undefined 抛错 → 500。
+        const user = session ? getUserById(db, session.userId) : null;
+        const body = ['POST', 'PATCH', 'PUT', 'DELETE'].includes(req.method)
+          ? await readJsonBody(req)
+          : null;
+        const ctx = {
+          user,
+          session,
+          sessionToken,
+          db,
+          rules,
+          params: match.params,
+          body,
+          query: Object.fromEntries(new URL(url, 'http://x').searchParams),
+          can: (capability, c) => can(user, capability, c, db),
+        };
+        const result = await match.handler(ctx);
+        // ⛔ 预审修正（I7-4）：handler 返回约定 ——
+        //   undefined → 200（保持原行为）；{ status, body }（可选 headers）→ 按返回值应答。
+        if (result && typeof result === 'object' && typeof result.status === 'number') {
+          const { status, body: payload } = result;
+          if (status === 204) {
+            res.writeHead(204);
+            res.end();
+            return;
+          }
+          json(res, status, payload ?? null, result.headers || {});
+          return;
+        }
+        json(res, 200, result ?? { ok: true });
+      } catch (err) {
+        const status = err.status || 500;
+        if (status >= 500) {
+          // ⛔ 预审修正（I7-3）：内部错误原文不外泄 ——
+          //    SQLite 错误带表名列名，Node 错误带内部实现细节。只进日志。
+          console.error('[server]', err);
+          json(res, 500, { error: { code: 'INTERNAL', message: '服务内部错误' } });
+          return;
+        }
+        const code = domainCode(err, 'BAD_REQUEST');
+        if (status === 413) {
+          // 请求体超限：连接已不可用 → 关掉，不复用
+          json(res, 413, { error: { code, message: err.message } }, { Connection: 'close' });
+          return;
+        }
+        error(res, status, code, err.message);
+      }
+      return;
+    }
+    if (req.method === 'GET' && serveStatic(webDir, req, res)) return;
+    error(res, 404, 'NOT_FOUND', '页面不存在');
+  }
+
+  return { router, handle };
+}
+
+function parseCookie(header) {
+  const out = {};
+  for (const part of String(header).split(';')) {
+    const idx = part.indexOf('=');
+    if (idx <= 0) continue;
+    const name = part.slice(0, idx).trim();
+    const raw = part.slice(idx + 1).trim();
+    let value = raw;
+    try {
+      value = decodeURIComponent(raw);
+    } catch {
+      // ⛔ 预审修正（m7-2）：畸形编码不能抛 URIError —— 原样透传该 cookie 值
+      value = raw;
+    }
+    out[name] = value;
+  }
+  return out;
+}
+
+// ── 进程启动 ────────────────────────────────────────────────
+const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+if (isMain) {
+  const dataDir = process.env.DATA_DIR || join(here, '..', 'data');
+  const port = Number(process.env.PORT || 8080);
+  const webDir = join(here, '..', 'web');
+  const migrationsDir = join(here, '..', 'db', 'migrations');
+  const rulesDir = join(here, '..', 'rules');
+
+  const { rules, version } = loadRules(rulesDir);
+  const { db, close } = openDatabase({ dataDir });
+  applyMigrations(db, migrationsDir);
+  const app = createApp({ db, rules, webDir });
+
+  const server = http.createServer(app.handle);
+  // ⛔ 预审修正（m7-1）：显式绑 127.0.0.1（默认是 0.0.0.0，会暴露到局域网/公网），
+  //    日志与实际绑定保持一致；云主机部署时再显式改成 '0.0.0.0'。
+  server.listen(port, '127.0.0.1', () => {
+    console.log(`heikesong-platform 启动于 http://127.0.0.1:${port}（规则版本 ${version}）`);
+  });
+
+  for (const sig of ['SIGINT', 'SIGTERM']) {
+    process.on(sig, () => {
+      server.close(() => {
+        close();
+        process.exit(0);
+      });
+    });
+  }
+}
