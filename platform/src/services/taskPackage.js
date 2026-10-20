@@ -198,9 +198,17 @@ export function approveTaskPackage({ db, taskPackageId, grade, actorId, now = ne
   if (finalGrade === 'D') {
     // R-ENT-08：D 级不是静默丢弃 —— 必须出《问题可解性诊断报告》
     solvability.diagnosticReport = buildDiagnosticReport({ row, solvability, config, now });
-    meta.solvability = solvability;
-    patch.meta_json = meta;
+  } else if (solvability.diagnosticReport) {
+    // ⚠️ 2026-10-21 独立评审修正（Minor M-6：**旧 D 级报告残留**）：
+    //    原来只在 finalGrade === 'D' 时写 meta_json。一张被退回过（D 级、带诊断报告）
+    //    的卡，重新评估后被签成 A 级时，**旧的诊断报告还挂在 meta 上** ——
+    //    已发布的卡上挂着一份「grade: D, score: 12」的过期报告，
+    //    前端会把退回结论和当前结论一起显示出来（独立评审实跑复现）。
+    //    现在签非 D 级时**清掉**旧报告：诊断报告只对 D 级成立。
+    delete solvability.diagnosticReport;
   }
+  meta.solvability = solvability;
+  patch.meta_json = meta;
 
   const updated = updateTaskPackage(db, taskPackageId, patch);
   return presentTaskPackage(updated);

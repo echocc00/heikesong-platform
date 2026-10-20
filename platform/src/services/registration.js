@@ -27,6 +27,18 @@ function parseJson(text, fallback = null) {
 /**
  * DB 行 → 前端视图。grading 由配置重算（纯函数，可复算），
  * 不额外存一份 explain —— 换配置后重算即得新口径，不留陈旧快照。
+ *
+ * ⚠️ 口径登记（2026-10-21 独立评审 Minor M-2：**同一响应里两个等级可能不同，这是有意的**）：
+ *   - `level` / `rawScore`：**报名提交那一刻**按当时配置算出的**快照**（存库，不可变）
+ *   - `grading.level` / `grading.score`：**按当前配置重算**的结果（不存库）
+ *   - `levelFinal`：**组委会的裁定**（改级后写 `level_final`，只有组委会能改）
+ *   改了 `rules/registration-scoring.json` 的权重或阈值后，重读同一条报名会看到
+ *   `level`（旧快照）与 `grading.level`（新口径）不一致 —— 这**不是 bug**，而是
+ *   「评分可复算、裁定不可篡改」两条原则的必然结果：
+ *   - 快照留痕：事后复算能对上当时的判分依据
+ *   - 重算可追：换配置后能立刻看到「按新口径这个人会是几级」
+ *   列表的 `level` 过滤走**库内快照**（`src/db/repo/registrations.js`），
+ *   与 `grading` 不同源 —— 客户端按等级筛选时以快照为准。
  */
 export function presentRegistration(row, config) {
   if (!row) return null;
@@ -101,7 +113,15 @@ export function submitRegistration({
     });
   } catch (err) {
     // 并发下由数据库唯一索引兜底 → 同样 409，绝不静默覆盖
-    if (/UNIQUE|constraint/i.test(String(err.message))) {
+    //
+    // ⚠️ 2026-10-21 独立评审修正（Minor M-3，错误码用错）：原来用 `/UNIQUE|constraint/i`
+    //    —— 这条正则**连外键失败也一起吞掉**（"FOREIGN KEY constraint failed" 里有
+    //    "constraint"）。后果：user_id 指向不存在的用户（外键失败）会被报成
+    //    409 DUPLICATE_REGISTRATION「你已提交过本届报名」—— 客户端被告知一个
+    //    完全错误的原因（独立评审探针实测复现）。
+    //    收紧为**只认 registrations 的唯一索引**：
+    //    实测原文 = "UNIQUE constraint failed: registrations.user_id, registrations.edition_id"
+    if (/UNIQUE constraint failed: registrations\./i.test(String(err.message))) {
       throw new AppError(409, 'DUPLICATE_REGISTRATION', '你已提交过本届报名，不能重复提交');
     }
     throw err;
@@ -170,7 +190,18 @@ export function decideRegistration({
       reason: note ?? '选手申诉',
       now,
     });
-    const updated = updateRegistrationRow(db, id, { status: 'appealed' });
+    // ⚠️ 2026-10-21 独立评审修正（Minor M-4，**申诉不得抹掉委员会的终态裁定**）：
+    //    原来无条件把 status 改成 'appealed' —— 委员会已裁定 'accepted' / 'rejected'
+    //    的行，被选手申诉一次就把 status 从终态翻走（裁定只留在 level_final 与事件流里，
+    //    按 status 统计/放行的下游会漏掉这个人）。
+    //    独立评审探针实测：
+    //      B1 委员会改 C 后: status=rejected  levelFinal=C
+    //      B2 选手申诉后  : status=appealed  levelFinal=C   ← 终态被抹
+    //    现在：**只有尚无终态的行**才把 status 标成 'appealed'（表示「有申诉待处理」）；
+    //    已有终态的行保持 status 不变，申诉只进事件流 —— 终态裁定不可被选手改写。
+    const patch = {};
+    if (!['accepted', 'rejected'].includes(row.status)) patch.status = 'appealed';
+    const updated = updateRegistrationRow(db, id, patch);
     return presentRegistration(updated, config);
   }
 

@@ -17,8 +17,10 @@
     { "key": "D", "minScore": 0,  "maxScore": 3,  "commitment": "无",         "agreement": "退回，但必出问题可解性诊断报告" }
   ],
   "vetoes": [
-    { "key": "no_data_authorization", "label": "无法提供《数据授权说明》" },
-    { "key": "no_responsible_owner",  "label": "无企业侧唯一责任人" },
+    { "key": "no_data_authorization", "label": "无法提供《数据授权说明》",
+      "auto": { "dimension": "data_access", "equals": 0 } },
+    { "key": "no_responsible_owner",  "label": "无企业侧唯一责任人",
+      "auto": { "dimension": "accountability", "equals": 0 } },
     { "key": "production_undisclosed","label": "涉及生产系统且未谈责任归属" }
   ],
   "taskMix": {

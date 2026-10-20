@@ -1,5 +1,7 @@
 // src/http/routes/taskPackage.js — 任务卡端点
 // 依据：INTERFACES.md §2「API（P1）」+ 设计文档 §8
+// 溯源需求：R-ENT-01 / R-ENT-06 / R-ENT-07 / R-ENT-08 / R-ENT-09 / R-ENT-10 / R-ENT-12
+// 三态状态码（设计文档 §7.3）：列表不满足 → 200+空集；单条不满足 → 404；禁用 → 403
 import { AppError } from '../../errors.js';
 import { can } from '../../auth/permissions.js';
 import { checkTaskMix } from '../../domain/solvability.js';

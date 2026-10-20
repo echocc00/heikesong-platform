@@ -145,3 +145,58 @@ test('配比偏离 → 分母用 total 时仍能识别超标（防「改成永�
   assert.equal(r.ok, false);
   assert.ok(r.errors.some((e) => e.includes('TASK_MIX_GRADE_A')), r.errors.join('；'));
 });
+
+test('分档边界值：10→A、9→B、7→B、6→C、4→C、3→D（边界不可判错）', () => {
+  // ⚠️ 2026-10-21 独立评审修正（Important I-1：**分档边界值零覆盖**）。
+  //    原来只测了 12 / 8.6 / 4.6 / 0 四个点 —— 把 `gradeOf` 里的 `>=` 改成 `>`，
+  //    全量用例照样全绿（独立评审变异 M14 SURVIVED）。
+  //    而这些边界分**业务上完全可达**（独立评审枚举 288 组组合：10 分 1 组、
+  //    9 分 9 组、7 分 8 组、6 分 16 组、4 分 8 组、3 分 9 组），
+  //    档位直接决定 R-ENT-08 的承诺与协议 → 判错一档 = 承诺错一级。
+  //    这里用 computedGrade（不含一票否决）单独钉住「分数 → 档位」这条映射。
+  const cases = [
+    { score: 10, grade: 'A', answers: { problem_clarity: 3, data_access: 1, validation: 2, decision_chain: 1, accountability: 1, precedent: 1 } },
+    { score: 9, grade: 'B', answers: { problem_clarity: 1, data_access: 3, validation: 2, decision_chain: 1, accountability: 1, precedent: 0 } },
+    { score: 7, grade: 'B', answers: { problem_clarity: 1, data_access: 1, validation: 2, decision_chain: 1, accountability: 1, precedent: 0 } },
+    { score: 6, grade: 'C', answers: { problem_clarity: 0, data_access: 3, validation: 0, decision_chain: 1, accountability: 1, precedent: 1 } },
+    { score: 4, grade: 'C', answers: { problem_clarity: 0, data_access: 1, validation: 0, decision_chain: 1, accountability: 1, precedent: 1 } },
+    { score: 3, grade: 'D', answers: { problem_clarity: 0, data_access: 0, validation: 0, decision_chain: 1, accountability: 1, precedent: 1 } },
+  ];
+  for (const c of cases) {
+    const r = scoreSolvability({ answers: c.answers, config });
+    assert.equal(r.score, c.score, `${c.score} 分的算分必须精确`);
+    assert.equal(r.computedGrade, c.grade, `${c.score} 分必须判为 ${c.grade} 级`);
+  }
+});
+
+test('explain.note 必须写清取值与折算（可解释明细是给企业看的）', () => {
+  // ⚠️ 2026-10-21 独立评审修正（Minor M-5：`explain.note` 零断言）。
+  const r = scoreSolvability({ answers: FULL, config });
+  const pc = r.explain.find((e) => e.dimension === 'problem_clarity');
+  assert.ok(pc.note.includes('问题确定性'), `note 必须含维度标签，实际 ${pc.note}`);
+  assert.ok(pc.note.includes('3/3'), `note 必须含取值/上限，实际 ${pc.note}`);
+  assert.ok(pc.note.includes('3.6'), `note 必须含折算分，实际 ${pc.note}`);
+});
+
+test('否决项的自动触发条件来自配置（改 key 不得让维度推导静默失效）', () => {
+  // ⚠️ 2026-10-21 独立评审修正（Minor M-1：**key 硬编码在领域层**）：
+  //    原来领域层写死 'no_data_authorization' / 'no_responsible_owner' 两个 key ——
+  //    把配置里的 key 改名 → 维度推导出的否决项**整个消失**，
+  //    实跑表现为「grade=B, vetoes=[]」，即「数据可得性 = 0 → 一票否决」
+  //    这条规则可以被一次配置改名**静默关掉**。
+  //    现在触发条件写在配置的 `auto` 里，key 只是标识 —— 改名不影响判定。
+  const renamed = {
+    ...config,
+    vetoes: config.vetoes.map((v) => (v.auto ? { ...v, key: `${v.key}_renamed` } : v)),
+  };
+  const r = scoreSolvability({
+    answers: {
+      problem_clarity: 3, data_access: 0, validation: 2,
+      decision_chain: 1, accountability: 1, precedent: 1,
+    },
+    config: renamed,
+  });
+  assert.equal(r.vetoes.length, 1, '数据可得性 = 0 仍必须命中一条否决项');
+  assert.equal(r.vetoes[0], 'no_data_authorization_renamed');
+  assert.equal(r.grade, 'D', '命中否决项必须强制降到 D');
+});

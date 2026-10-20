@@ -1336,8 +1336,9 @@ import { loadRules } from '../src/config.js';
 import { createUser } from '../src/db/repo/users.js';
 import { createEdition } from '../src/db/repo/editions.js';
 import { listRegistrationEvents } from '../src/db/repo/registrationEvents.js';
+import { getRegistration as findRegistrationRow } from '../src/db/repo/registrations.js';
 import {
-  submitRegistration, getRegistration, listRegistrations, decideRegistration,
+  submitRegistration, getRegistration, listRegistrations, decideRegistration, presentRegistration,
 } from '../src/services/registration.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -1485,6 +1486,105 @@ test('申诉：level 省略时只留痕不改级', () => {
   close();
   rmSync(dataDir, { recursive: true, force: true });
 });
+
+test('申诉不得抹掉委员会的终态裁定（status 保持终态，裁定留在 level_final）', () => {
+  // ⚠️ 2026-10-21 独立评审修正（Minor M-4）：原来申诉**无条件**把 status 改成
+  //    'appealed' —— 委员会已裁定 'rejected' 的行被选手申诉一次，终态就从
+  //    status 列上消失了（裁定只留在 level_final 与事件流里，按 status 统计的下游会漏人）。
+  //    独立评审探针实测：改 C 后 status=rejected → 申诉后 status=appealed。
+  const { db, close, dataDir, rules, edition, user } = setup();
+  const reg = submitRegistration({ db, userId: user.id, editionId: edition.id, answers: GOOD, now: NOW, rules });
+  decideRegistration({ db, id: reg.id, level: 'C', decidedBy: user.id, note: '复核不通过', now: NOW, rules });
+  const afterDecision = getRegistration({ db, id: reg.id, viewer: user, rules });
+  assert.equal(afterDecision.status, 'rejected', '前置：委员会裁定后应是终态');
+
+  const appealed = decideRegistration({
+    db, id: reg.id, level: null, decidedBy: user.id, note: '我补充了材料', now: NOW, rules,
+  });
+  assert.equal(appealed.status, 'rejected', '申诉不得把委员会的终态翻走');
+  assert.equal(appealed.levelFinal, 'C', '裁定必须仍在 level_final 上');
+  // 申诉本身仍然要留痕（追加式，不覆盖历史）
+  const events = listRegistrationEvents(db, reg.id);
+  assert.equal(events.length, 3);
+  assert.equal(events[2].to_status, 'appealed');
+  assert.equal(events[2].from_status, 'rejected');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('低分问卷 → C 级且 accepted=false（R-REG-08 C 级不接收）', () => {
+  // ⚠️ 2026-10-21 独立评审修正（Minor M-1：近似恒绿断言）。
+  //    原来唯一的 accepted 断言针对的是一份 **S 级** 报名（accepted 本就为 true），
+  //    把实现改成恒 true 照样通过（独立评审变异 V16 实测：199 条仍全绿）。
+  //    这条用例断言的是 C 级 —— 真值与硬编码在这里分得开。
+  const { db, close, dataDir, rules, edition, user } = setup();
+  const low = {
+    direction: [1, 1, 1, 1, 1],
+    capability: [1, 1, 1, 1, 1],
+    collaboration: [1, 1, 1, 1, 1],
+    open: '我的方向还在探索中',
+    consent: { accepted: true, items: [] },
+  };
+  const reg = submitRegistration({ db, userId: user.id, editionId: edition.id, answers: low, now: NOW, rules });
+  assert.equal(reg.rawScore, 0);
+  assert.equal(reg.level, 'C');
+  assert.equal(reg.grading.accepted, false, 'C 级必须不接收');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('grading 是按当前配置重算的；库内快照 level 不随后续改配置而变', () => {
+  // ⚠️ 2026-10-21 独立评审修正（Minor M-2：**口径无登记、断言缺失**）。
+  //    `level` / `rawScore` 是提交那一刻的快照（存库），`grading` 是按当前配置重算的结果。
+  //    改配置后两者不一致是**有意为之**（快照留痕 + 重算可追），但必须写明并钉住。
+  const { db, close, dataDir, rules, edition, user } = setup();
+  const skewed = {
+    ...GOOD,
+    direction: [5, 5, 5, 5, 5],
+    capability: [1, 1, 1, 1, 1],
+    collaboration: [1, 1, 1, 1, 1],
+  };
+  const reg = submitRegistration({ db, userId: user.id, editionId: edition.id, answers: skewed, now: NOW, rules });
+  assert.equal(reg.level, 'C', '提交时的快照等级');
+  assert.equal(reg.rawScore, 25);
+
+  // 换一份权重明显不同的配置重算
+  const shifted = {
+    ...rules.registration,
+    dimensions: rules.registration.dimensions.map((d) => (
+      d.key === 'direction' ? { ...d, weight: 0.9 } : { ...d, weight: 0.05 }
+    )),
+  };
+  const row = findRegistrationRow(db, reg.id);
+  const recomputed = presentRegistration(row, shifted);
+  assert.equal(recomputed.grading.level, 'S', '换配置后重算结果应当变化');
+  assert.equal(recomputed.grading.score, 90);
+  assert.equal(recomputed.level, 'C', '库内快照不随后配置变');
+  assert.equal(recomputed.rawScore, 25);
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('非唯一约束的插入失败不得被报成 DUPLICATE_REGISTRATION', () => {
+  // ⚠️ 2026-10-21 独立评审修正（Minor M-3：**错误码用错**）。
+  //    原来的兜底正则 `/UNIQUE|constraint/i` 连外键失败也一起吞掉
+  //    （"FOREIGN KEY constraint failed" 里含 "constraint"）
+  //    → 客户端被告知「你已提交过本届报名」，而真实原因是外键失败。
+  const { db, close, dataDir, rules, edition } = setup();
+  let caught = null;
+  try {
+    submitRegistration({
+      db, userId: 'no-such-user', editionId: edition.id, answers: GOOD, now: NOW, rules,
+    });
+  } catch (err) {
+    caught = err;
+  }
+  assert.ok(caught, '必须抛错');
+  assert.notEqual(caught.code, 'DUPLICATE_REGISTRATION', '外键失败不得报成重复报名');
+  assert.ok(!/DUPLICATE/.test(String(caught.message)), '错误信息不得提到重复报名');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -1542,6 +1642,18 @@ function parseJson(text, fallback = null) {
 /**
  * DB 行 → 前端视图。grading 由配置重算（纯函数，可复算），
  * 不额外存一份 explain —— 换配置后重算即得新口径，不留陈旧快照。
+ *
+ * ⚠️ 口径登记（2026-10-21 独立评审 Minor M-2：**同一响应里两个等级可能不同，这是有意的**）：
+ *   - `level` / `rawScore`：**报名提交那一刻**按当时配置算出的**快照**（存库，不可变）
+ *   - `grading.level` / `grading.score`：**按当前配置重算**的结果（不存库）
+ *   - `levelFinal`：**组委会的裁定**（改级后写 `level_final`，只有组委会能改）
+ *   改了 `rules/registration-scoring.json` 的权重或阈值后，重读同一条报名会看到
+ *   `level`（旧快照）与 `grading.level`（新口径）不一致 —— 这**不是 bug**，而是
+ *   「评分可复算、裁定不可篡改」两条原则的必然结果：
+ *   - 快照留痕：事后复算能对上当时的判分依据
+ *   - 重算可追：换配置后能立刻看到「按新口径这个人会是几级」
+ *   列表的 `level` 过滤走**库内快照**（`src/db/repo/registrations.js`），
+ *   与 `grading` 不同源 —— 客户端按等级筛选时以快照为准。
  */
 export function presentRegistration(row, config) {
   if (!row) return null;
@@ -1616,7 +1728,15 @@ export function submitRegistration({
     });
   } catch (err) {
     // 并发下由数据库唯一索引兜底 → 同样 409，绝不静默覆盖
-    if (/UNIQUE|constraint/i.test(String(err.message))) {
+    //
+    // ⚠️ 2026-10-21 独立评审修正（Minor M-3，错误码用错）：原来用 `/UNIQUE|constraint/i`
+    //    —— 这条正则**连外键失败也一起吞掉**（"FOREIGN KEY constraint failed" 里有
+    //    "constraint"）。后果：user_id 指向不存在的用户（外键失败）会被报成
+    //    409 DUPLICATE_REGISTRATION「你已提交过本届报名」—— 客户端被告知一个
+    //    完全错误的原因（独立评审探针实测复现）。
+    //    收紧为**只认 registrations 的唯一索引**：
+    //    实测原文 = "UNIQUE constraint failed: registrations.user_id, registrations.edition_id"
+    if (/UNIQUE constraint failed: registrations\./i.test(String(err.message))) {
       throw new AppError(409, 'DUPLICATE_REGISTRATION', '你已提交过本届报名，不能重复提交');
     }
     throw err;
@@ -1685,7 +1805,18 @@ export function decideRegistration({
       reason: note ?? '选手申诉',
       now,
     });
-    const updated = updateRegistrationRow(db, id, { status: 'appealed' });
+    // ⚠️ 2026-10-21 独立评审修正（Minor M-4，**申诉不得抹掉委员会的终态裁定**）：
+    //    原来无条件把 status 改成 'appealed' —— 委员会已裁定 'accepted' / 'rejected'
+    //    的行，被选手申诉一次就把 status 从终态翻走（裁定只留在 level_final 与事件流里，
+    //    按 status 统计/放行的下游会漏掉这个人）。
+    //    独立评审探针实测：
+    //      B1 委员会改 C 后: status=rejected  levelFinal=C
+    //      B2 选手申诉后  : status=appealed  levelFinal=C   ← 终态被抹
+    //    现在：**只有尚无终态的行**才把 status 标成 'appealed'（表示「有申诉待处理」）；
+    //    已有终态的行保持 status 不变，申诉只进事件流 —— 终态裁定不可被选手改写。
+    const patch = {};
+    if (!['accepted', 'rejected'].includes(row.status)) patch.status = 'appealed';
+    const updated = updateRegistrationRow(db, id, patch);
     return presentRegistration(updated, config);
   }
 
@@ -1736,16 +1867,24 @@ export function registerRegistrationRoutes({ router, db, rules }) {
 
   router.add('POST', '/api/registrations', async ({ user, body }) => {
     if (!user) throw new AppError(401, 'UNAUTHENTICATED', '未登录');
+    const { editionId, answers } = body ?? {};
+    if (!editionId) throw new AppError(400, 'MISSING_EDITION_ID', '缺少届期');
     // ⚠️ 2026-10-21 验收修正（规格缺陷）：`registration:write` 这个能力点被注册、
     //    被授予（seed 里给了 captain / member，测试里也显式授予），
     //    但**路由从不校验它** → 能力点形同虚设，违反全局约束
     //    「权限模型 = capability + assignment，`can()` 是唯一判定入口」。
     //    已登录但没有该能力 → 403（三态：禁用 → 403；不是 404，资源不存在才用 404）。
-    if (!can(user, 'registration:write', null, db)) {
+    //
+    // ⚠️ 2026-10-21 独立评审修正（Minor M-6）：能力点校验**要带 edition 作用域**。
+    //    原来传 `ctx = null` —— `can()` 遇到 `ctx === null` 时**跳过**资源级授权的
+    //    scope 匹配 → 只有 `scope_type='global'` 的授权能通过，
+    //    委员会若用 `scope_type='edition'` 授予 `registration:write`，该用户**无法报名**
+    //    （独立评审探针实测：global 授权 can(null ctx)=true / edition 授权 can(null ctx)=false /
+    //    edition 授权 can(edition ctx)=true）。
+    //    现在把已经解析出来的 editionId 传进去，作用域授权与全局授权都能认。
+    if (!can(user, 'registration:write', { scopeType: 'edition', scopeId: editionId }, db)) {
       throw new AppError(403, 'FORBIDDEN', '你没有提交报名的权限');
     }
-    const { editionId, answers } = body ?? {};
-    if (!editionId) throw new AppError(400, 'MISSING_EDITION_ID', '缺少届期');
     return submitRegistration({ db, userId: user.id, editionId, answers, rules });
   });
 
@@ -1793,7 +1932,12 @@ function buildCriteria(rules, db) {
   const reg = rules.registration;
   const comp = rules.compliance ?? {};
   // 当届届期一并返回：前端据此提交报名 / 建队，省掉一个契约外的端点
-  const edition = db ? (listEditions(db)[0] ?? null) : null;
+  // ⚠️ 2026-10-21 独立评审修正（Minor M-9）：取**当届**，不是「最早的一届」。
+  //    listEditions 按 starts_at 排序 → [0] 永远是历史最早的那届；
+  //    多届期场景下前端拿到的 editionId 不是当前届 → 报名页会引导用户报错届期
+  //    （独立评审探针实测：多届期时返回的是历史届期）。
+  //    判据：**尚未结束**（ends_at >= 今天）的最早一届；都没有就退回最后一届。
+  const edition = db ? pickCurrentEdition(listEditions(db)) : null;
   return {
     editionId: edition?.id ?? null,
     editionName: edition?.name ?? null,
@@ -1823,6 +1967,18 @@ function buildCriteria(rules, db) {
     // R-STG-01：赛段时间轴
     schedule: rules.schedule?.stages ?? [],
   };
+}
+
+/**
+ * 挑「当届」：尚未结束（ends_at >= 今天）的最早一届；都没有就退回最后一届。
+ * 单独导出便于直接测边界（与 domainCode / isSameFile 同款：纯函数一律导出）。
+ *
+ * ⚠️ `today` 可注入：默认取真实日期，但**测试必须能钉住「今天」**，
+ *    否则「哪一届是当届」这条断言会随日历漂移变成 flaky。
+ */
+export function pickCurrentEdition(editions, today = new Date().toISOString().slice(0, 10)) {
+  if (!Array.isArray(editions) || editions.length === 0) return null;
+  return editions.find((e) => String(e.ends_at) >= today) ?? editions[editions.length - 1];
 }
 ```
 
@@ -1863,7 +2019,23 @@ import { registerRegistrationRoutes } from './http/routes/registration.js';
 > 条数已在 P0 计划里声明（23 条）。往里加用例会让 P0 计划的条数声明当场过期
 > → 跨阶段的同一条纪律是「计划声明的条数 == 实跑条数」，改一处要改两处。
 > P1 自己新增配置的断言放在 **P1 自己的文件** `test/config-p1.test.js`（4 条）→
-> P0 的文件与计划**一字不动**。
+> **P0 的文件不加用例**。
+>
+> **⚠️ 2026-10-21 独立评审修正（M-7：原来说法「一字不动」与实现不符）**：
+> P1 分支里 `platform/test/config.test.js` 的**措辞**被订正过 3 处
+> （「9 份」→「全部规则配置」三处测试名与一条注释）——
+> P1 加了 3 份配置后，「9 份」这个数字已经过期，属于事实性错误。
+> **条数（23）与断言一字未动**，只是把随配置份数会过期的措辞改成版本无关的说法。
+>
+> **为什么 P0 计划的代码块不跟着改**：P0 计划是 **P0 阶段的历史规格**，
+> 必须与 main / `feat/p0-foundation` 保持**同一份**（P0 阶段确实是 9 份配置，那三条表述在当时准确无误）。
+> 本分支把 P0 计划改一份，等于让同一个历史文档在不同分支有两副面孔 ——
+> 合并 P1 回 main 时还要再解一次冲突。
+> 跨阶段的纪律靠**变更登记**兜住，不靠改历史规格：
+> 本计划已逐条登记 P1 对 P0 文件的修改（`test/migrate.test.js` 见 Task 1 Files 段；
+> `test/config.test.js` 的措辞订正见上）。
+> 用「P0 计划的代码块 ↔ 实现」这条一致性检查时，**基准只能是 P0 worktree** ——
+> 拿 P0 计划去比一棵更晚的树，天然会看到 P1 声明过的那些差异。
 >
 
 - [ ] **Step 7: 创建 P1 新增的 3 份规则配置并扩展 src/config.js**
@@ -2068,6 +2240,36 @@ import { registerRegistrationRoutes } from './http/routes/registration.js';
       errors.push(`solvability.taskMix.enterpriseGradeSplit 合计 = ${splitSum.toFixed(4)}，必须等于 enterprise = ${tm.enterprise}`);
     }
   }
+
+  // ④ validateRules 追加 solvability.vetoes 校验（Task 4 独立评审修正 M-2）
+  //    位置：solvability 段内、**紧跟 grades 校验之后**（复用已有的 `const sol` 变量，不要重复声明）
+    // ⚠️ 2026-10-21 独立评审修正（Minor M-2：**vetoes 完全没有校验**）：
+    //    原来这里只校验 dimensions 与 grades，`solvability.vetoes` 一个字都没查 ——
+    //    否决项写成空数组、或两条同名、或 `auto.dimension` 指向一个不存在的维度，
+    //    全都能通过校验、直到算分时才出问题（或者干脆**静默失效**）。
+    //    现在校验：非空、key 唯一、label 非空、`auto` 的形状与指向的维度存在。
+    if (!Array.isArray(sol?.vetoes) || sol.vetoes.length === 0) {
+      push('solvability.vetoes 缺失或为空（R-ENT-07 三条一票否决）');
+    } else if (hasBadItem(sol.vetoes)) {
+      push('solvability.vetoes 含非对象元素');
+    } else if (hasDuplicateKeys(sol.vetoes)) {
+      push('solvability.vetoes 存在重复 key');
+    } else {
+      const dimensionKeys = new Set((sol.dimensions ?? []).map((d) => d.key));
+      for (const v of sol.vetoes) {
+        if (typeof v.label !== 'string' || !v.label) {
+          push(`solvability.vetoes ${v.key} 缺少 label`);
+        }
+        if (v.auto === undefined || v.auto === null) continue;
+        if (typeof v.auto !== 'object' || typeof v.auto.dimension !== 'string'
+          || typeof v.auto.equals !== 'number') {
+          push(`solvability.vetoes ${v.key} 的 auto 必须是 { dimension: string, equals: number }`);
+        } else if (dimensionKeys.size && !dimensionKeys.has(v.auto.dimension)) {
+          push(`solvability.vetoes ${v.key} 的 auto.dimension 引用了不存在的维度 ${v.auto.dimension}`);
+        }
+      }
+    }
+  
 ```
 
 > ⚠️ P0 的 `validateRules` 里已有一处 `const sol = rules.solvability;` —— 追加本段时**复用同一个 `sol` 变量**，
@@ -2091,6 +2293,7 @@ import { createEdition } from '../src/db/repo/editions.js';
 import { createSession } from '../src/auth/session.js';
 import { grantAssignment } from '../src/auth/permissions.js';
 import { insertCapability } from '../src/db/repo/capabilities.js';
+import { pickCurrentEdition } from '../src/http/routes/registration.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrationsDir = join(here, '..', 'db', 'migrations');
@@ -2180,6 +2383,15 @@ test('GET /api/registration-criteria 无需登录即可读（筛选标准对外�
   assert.equal(body.dimensions.length, 3);
   assert.equal(body.levels.find((l) => l.key === 'S').minScore, 80);
   assert.equal(body.funnel.length, 5);
+  // ⚠️ 2026-10-21 独立评审修正（Important I-1：合规 / IP / 赛程披露**零断言**）。
+  //    这四项是 R-ENT-11 / R-ENT-12 / R-STG-01 的**唯一对外出口**
+  //    （前端读不到 rules/*.json 目录，见计划 D-3）。
+  //    原来把它们从 buildCriteria 里删掉，全量用例照样全绿 —— 需求在产品上静默失效。
+  //    独立评审变异 V14 实测：删掉这 4 个字段 → 199 条仍全绿。
+  assert.ok(body.ipOwnership && body.ipOwnership.team, 'R-ENT-11：IP 归属必须在报名页明示');
+  assert.ok(Array.isArray(body.redLines) && body.redLines.length >= 5, 'R-ENT-12：合规红线必须公开');
+  assert.equal(body.consent?.required, true, 'R-ENT-12：同意条款必须公开');
+  assert.equal(body.schedule?.length, 5, 'R-STG-01：5 个赛段时间轴必须公开');
   s.close();
   rmSync(s.dataDir, { recursive: true, force: true });
 });
@@ -2243,6 +2455,14 @@ test('GET /api/registrations/:id 本人可读、他人 → 404', async () => {
   const id = JSON.parse(created.body).id;
   const mine = await call(s.app, 'GET', `/api/registrations/${id}`, { token: s.tokenUser });
   assert.equal(mine.status, 200);
+  // ⚠️ 2026-10-21 独立评审修正（Important I-2：状态机**留痕零断言**）。
+  //    GET /api/registrations/:id 是 registration_events 唯一的对外出口，
+  //    也是 Task 3「改级留痕」承诺的落点。
+  //    原来把 events 拼装改成空数组，全量用例照样全绿（独立评审变异 V15 实测）。
+  const mineBody = JSON.parse(mine.body);
+  assert.equal(mineBody.events.length, 1, '刚提交完应当只有一条「提交」事件');
+  assert.equal(mineBody.events[0].toStatus, 'submitted');
+  assert.equal(mineBody.events[0].fromStatus, null);
   const theirs = await call(s.app, 'GET', `/api/registrations/${id}`, { token: s.tokenOther });
   assert.equal(theirs.status, 404);
   s.close();
@@ -2263,9 +2483,76 @@ test('POST /api/registrations/:id/level 组委会改级成功，选手改级 →
     token: s.tokenAdmin, body: { level: 'B', note: '复核：能力维需补材料' },
   });
   assert.equal(byAdmin.status, 200);
-  assert.equal(JSON.parse(byAdmin.body).levelFinal, 'B');
+  const adminBody = JSON.parse(byAdmin.body);
+  assert.equal(adminBody.levelFinal, 'B');
+  // ⚠️ 2026-10-21 独立评审修正（Important I-2：改级后**留痕零断言**）。
+  //    改级必须追加一条事件，且 from_status 是改级前的状态 —— 审计链的落点。
+  //    留痕的对外出口是 GET /api/registrations/:id（events 字段），
+  //    所以这里改级后回读一次，把「留痕」钉在 API 层而不是只钉在仓储层。
+  const after = await call(s.app, 'GET', `/api/registrations/${id}`, { token: s.tokenAdmin });
+  assert.equal(after.status, 200);
+  const afterBody = JSON.parse(after.body);
+  assert.equal(afterBody.events.length, 2, '提交 + 改级 = 两条事件');
+  assert.equal(afterBody.events[1].fromStatus, 'submitted');
+  assert.equal(afterBody.events[1].toStatus, 'accepted');
   s.close();
   rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('POST /api/registrations/:id/level 未登录 → 401', async () => {
+  // ⚠️ 2026-10-21 独立评审修正（Minor M-5：401 路径零断言）。
+  //    独立评审变异 V21：删掉路由里的 401 判断 → 全量用例照样全绿，
+  //    行为会退化成 404 / 500。
+  const s = setup();
+  const created = await call(s.app, 'POST', '/api/registrations', {
+    token: s.tokenUser, body: { editionId: s.edition.id, answers: GOOD },
+  });
+  const id = JSON.parse(created.body).id;
+  const res = await call(s.app, 'POST', `/api/registrations/${id}/level`, { body: { level: 'S' } });
+  assert.equal(res.status, 401);
+  assert.equal(JSON.parse(res.body).error.code, 'UNAUTHENTICATED');
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('GET /api/registration-criteria 返回当届，不是历史最早的一届', async () => {
+  // ⚠️ 2026-10-21 独立评审修正（Minor M-9：取「最早的一届」而不是「当届」）。
+  //    原来 listEditions(db)[0] 永远是 starts_at 最早的那届 → 多届期场景下
+  //    前端拿到的 editionId 不是当前届，报名页会引导用户报错届期。
+  //    这里只断言「**历史届期不得被当成当届**」—— 不绑定具体是哪一届，
+  //    避免把断言写成随日历漂移的 flaky 用例（当届是谁由真实日期决定）。
+  const s = setup();
+  createEdition(s.db, {
+    name: '往届', city: '上海', startsAt: '2020-01-01', endsAt: '2020-12-31',
+  });
+  createEdition(s.db, {
+    name: '在办', city: '上海', startsAt: '2099-01-01', endsAt: '2099-12-31',
+  });
+  const res = await call(s.app, 'GET', '/api/registration-criteria');
+  assert.equal(res.status, 200);
+  const body = JSON.parse(res.body);
+  assert.notEqual(body.editionName, '往届', '历史届期不得被当成当届');
+  assert.ok(body.editionId, '必须给出届期 id');
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('pickCurrentEdition：按「尚未结束」挑当届，且 today 可注入（不随日历漂移）', () => {
+  // ⚠️ 2026-10-21 独立评审修正（Minor M-9）：today 必须可注入 ——
+  //    否则「哪一届是当届」这条断言会随真实日历变成 flaky 用例。
+  const editions = [
+    { id: 'past', ends_at: '2020-12-31' },
+    { id: 'now', ends_at: '2026-10-31' },
+    { id: 'later', ends_at: '2099-12-31' },
+  ];
+  assert.equal(pickCurrentEdition(editions, '2026-10-21').id, 'now');
+  assert.equal(pickCurrentEdition(editions, '2026-10-31').id, 'now', '结束当天仍算当届');
+  assert.equal(pickCurrentEdition(editions, '2020-06-01').id, 'past');
+  // 全部已结束 → 退回最后一届
+  assert.equal(pickCurrentEdition([{ id: 'a', ends_at: '2019-01-01' }], '2026-10-21').id, 'a');
+  // 空集 → null
+  assert.equal(pickCurrentEdition([], '2026-10-21'), null);
+  assert.equal(pickCurrentEdition(null, '2026-10-21'), null);
 });
 
 test('问卷不完整 → 400 INVALID_ANSWERS，且响应体带 detail（前端要知道缺哪几题）', async () => {
@@ -2301,6 +2588,27 @@ test('已登录但没有 registration:write 能力 → 403（能力点必须真�
   // 拒绝之后不能留下任何报名记录
   const list = await call(s.app, 'GET', '/api/registrations?editionId=' + s.edition.id, { token: s.tokenAdmin });
   assert.equal(JSON.parse(list.body).items.length, 0, '被拒绝的提交不得留下记录');
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('edition 作用域的 registration:write 授权也能报名（能力点校验要带作用域）', async () => {
+  // ⚠️ 2026-10-21 独立评审修正（Minor M-6：作用域授权被误拒）。
+  //    原来路由传 `ctx = null` —— `can()` 在 ctx 为空时**跳过**资源级授权的 scope 匹配
+  //    → 只有 scope_type='global' 的授权能通过，
+  //    组委会若用 scope_type='edition' 授予 registration:write，该用户**无法报名**
+  //    （独立评审探针实测：global 授权 can(null ctx)=true / edition 授权 can(null ctx)=false）。
+  const s = setup();
+  const scoped = createUser(s.db, { name: '届期授权者', phone: '13900003005', password: 'pw', mbaStatus: 'mba' });
+  grantAssignment(s.db, {
+    userId: scoped.id, capability: 'registration:write',
+    scopeType: 'edition', scopeId: s.edition.id, grantedBy: s.admin.id,
+  });
+  const token = createSession(s.db, scoped.id).token;
+  const res = await call(s.app, 'POST', '/api/registrations', {
+    token, body: { editionId: s.edition.id, answers: GOOD },
+  });
+  assert.equal(res.status, 200, `edition 作用域授权必须放行，实际 ${res.status}`);
   s.close();
   rmSync(s.dataDir, { recursive: true, force: true });
 });
@@ -2377,6 +2685,35 @@ test('配置份数对不上会被拒绝（整份配置没被识别到）', () =>
   const errors = validateRules(rules, 99);
   assert.ok(errors.some((e) => e.includes('份')), `必须报份数不符，实际 ${JSON.stringify(errors)}`);
 });
+
+test('solvability 的否决项配置坏了会被拒绝（vetoes 非空 / key 唯一 / auto 指向真实维度）', () => {
+  // ⚠️ 2026-10-21 独立评审修正（Minor M-2：**vetoes 完全没有校验**）：
+  //    原来 validateRules 只查 dimensions 与 grades，`solvability.vetoes` 一个字都没查 ——
+  //    否决项写成空数组、或两条同名、或 auto 指向不存在的维度，都能通过校验、
+  //    直到算分时才出问题（或者干脆**静默失效**：维度推导出的否决项整个消失）。
+  const { rules } = loadRules(rulesDir);
+
+  const empty = structuredClone(rules);
+  empty.solvability.vetoes = [];
+  assert.ok(
+    validateRules(empty).some((e) => e.includes('vetoes')),
+    'vetoes 为空必须被拒绝',
+  );
+
+  const duplicated = structuredClone(rules);
+  duplicated.solvability.vetoes[1].key = duplicated.solvability.vetoes[0].key;
+  assert.ok(
+    validateRules(duplicated).some((e) => e.includes('重复 key')),
+    'vetoes 的 key 重复必须被拒绝',
+  );
+
+  const dangling = structuredClone(rules);
+  dangling.solvability.vetoes[0].auto.dimension = 'no_such_dimension';
+  assert.ok(
+    validateRules(dangling).some((e) => e.includes('auto.dimension')),
+    'auto 指向不存在的维度必须被拒绝',
+  );
+});
 ```
 
 
@@ -2400,7 +2737,7 @@ test('配置份数对不上会被拒绝（整份配置没被识别到）', () =>
 - [ ] **Step 10: 运行测试确认通过**
 
 Run: `cd platform && node --test test/registration-service.test.js test/registration-api.test.js test/config-p1.test.js`
-Expected: PASS（24 个测试全过：registration-service 10 + registration-api 10 + config-p1 4）
+Expected: PASS（33 个测试全过：registration-service 14 + registration-api 14 + config-p1 5）
 
 - [ ] **Step 11: 提交**
 
@@ -2597,6 +2934,61 @@ test('配比偏离 → 分母用 total 时仍能识别超标（防「改成永�
   const r = checkTaskMix(packages, config);
   assert.equal(r.ok, false);
   assert.ok(r.errors.some((e) => e.includes('TASK_MIX_GRADE_A')), r.errors.join('；'));
+});
+
+test('分档边界值：10→A、9→B、7→B、6→C、4→C、3→D（边界不可判错）', () => {
+  // ⚠️ 2026-10-21 独立评审修正（Important I-1：**分档边界值零覆盖**）。
+  //    原来只测了 12 / 8.6 / 4.6 / 0 四个点 —— 把 `gradeOf` 里的 `>=` 改成 `>`，
+  //    全量用例照样全绿（独立评审变异 M14 SURVIVED）。
+  //    而这些边界分**业务上完全可达**（独立评审枚举 288 组组合：10 分 1 组、
+  //    9 分 9 组、7 分 8 组、6 分 16 组、4 分 8 组、3 分 9 组），
+  //    档位直接决定 R-ENT-08 的承诺与协议 → 判错一档 = 承诺错一级。
+  //    这里用 computedGrade（不含一票否决）单独钉住「分数 → 档位」这条映射。
+  const cases = [
+    { score: 10, grade: 'A', answers: { problem_clarity: 3, data_access: 1, validation: 2, decision_chain: 1, accountability: 1, precedent: 1 } },
+    { score: 9, grade: 'B', answers: { problem_clarity: 1, data_access: 3, validation: 2, decision_chain: 1, accountability: 1, precedent: 0 } },
+    { score: 7, grade: 'B', answers: { problem_clarity: 1, data_access: 1, validation: 2, decision_chain: 1, accountability: 1, precedent: 0 } },
+    { score: 6, grade: 'C', answers: { problem_clarity: 0, data_access: 3, validation: 0, decision_chain: 1, accountability: 1, precedent: 1 } },
+    { score: 4, grade: 'C', answers: { problem_clarity: 0, data_access: 1, validation: 0, decision_chain: 1, accountability: 1, precedent: 1 } },
+    { score: 3, grade: 'D', answers: { problem_clarity: 0, data_access: 0, validation: 0, decision_chain: 1, accountability: 1, precedent: 1 } },
+  ];
+  for (const c of cases) {
+    const r = scoreSolvability({ answers: c.answers, config });
+    assert.equal(r.score, c.score, `${c.score} 分的算分必须精确`);
+    assert.equal(r.computedGrade, c.grade, `${c.score} 分必须判为 ${c.grade} 级`);
+  }
+});
+
+test('explain.note 必须写清取值与折算（可解释明细是给企业看的）', () => {
+  // ⚠️ 2026-10-21 独立评审修正（Minor M-5：`explain.note` 零断言）。
+  const r = scoreSolvability({ answers: FULL, config });
+  const pc = r.explain.find((e) => e.dimension === 'problem_clarity');
+  assert.ok(pc.note.includes('问题确定性'), `note 必须含维度标签，实际 ${pc.note}`);
+  assert.ok(pc.note.includes('3/3'), `note 必须含取值/上限，实际 ${pc.note}`);
+  assert.ok(pc.note.includes('3.6'), `note 必须含折算分，实际 ${pc.note}`);
+});
+
+test('否决项的自动触发条件来自配置（改 key 不得让维度推导静默失效）', () => {
+  // ⚠️ 2026-10-21 独立评审修正（Minor M-1：**key 硬编码在领域层**）：
+  //    原来领域层写死 'no_data_authorization' / 'no_responsible_owner' 两个 key ——
+  //    把配置里的 key 改名 → 维度推导出的否决项**整个消失**，
+  //    实跑表现为「grade=B, vetoes=[]」，即「数据可得性 = 0 → 一票否决」
+  //    这条规则可以被一次配置改名**静默关掉**。
+  //    现在触发条件写在配置的 `auto` 里，key 只是标识 —— 改名不影响判定。
+  const renamed = {
+    ...config,
+    vetoes: config.vetoes.map((v) => (v.auto ? { ...v, key: `${v.key}_renamed` } : v)),
+  };
+  const r = scoreSolvability({
+    answers: {
+      problem_clarity: 3, data_access: 0, validation: 2,
+      decision_chain: 1, accountability: 1, precedent: 1,
+    },
+    config: renamed,
+  });
+  assert.equal(r.vetoes.length, 1, '数据可得性 = 0 仍必须命中一条否决项');
+  assert.equal(r.vetoes[0], 'no_data_authorization_renamed');
+  assert.equal(r.grade, 'D', '命中否决项必须强制降到 D');
 });
 ```
 
@@ -2871,6 +3263,111 @@ test('提交方在列表里能看到自己提交的卡', () => {
   close();
   rmSync(dataDir, { recursive: true, force: true });
 });
+
+test('returned → 重新评估 → 复活为 published（D 级退回后可以补短板再来一次）', () => {
+  // ⚠️ 2026-10-21 独立评审修正（Important I-2：**状态机复活链零断言**）。
+  //    原来只测了「提交 → 评估 → 签级」这一条正向链；
+  //    把 ASSESSABLE 里的 'returned' 删掉、把 approve 的状态守卫放宽，
+  //    全量用例照样全绿（独立评审变异 M18/M19 SURVIVED）。
+  //    实跑确认实现本身正确（returned 的卡能重新评估并复活）—— 但**没有断言保护**。
+  const { db, close, dataDir, rules, edition, enterprise } = setup();
+  const pkg = submitTaskPackage({
+    db, userId: enterprise.id, payload: { ...PAYLOAD, editionId: edition.id }, now: NOW, rules,
+  });
+  assessSolvability({
+    db, taskPackageId: pkg.id,
+    answers: {
+      problem_clarity: 0, data_access: 0, validation: 0,
+      decision_chain: 0, accountability: 0, precedent: 0,
+    },
+    actorId: enterprise.id, now: NOW, rules,
+  });
+  const returned = approveTaskPackage({ db, taskPackageId: pkg.id, grade: 'D', actorId: enterprise.id, now: NOW, rules });
+  assert.equal(returned.status, 'returned');
+  assert.ok(returned.meta.solvability.diagnosticReport, 'D 级必须带诊断报告');
+
+  // 补齐短板后重新评估 → 再签级 → 复活
+  const reassessed = assessSolvability({
+    db, taskPackageId: pkg.id, answers: FULL, actorId: enterprise.id, now: NOW, rules,
+  });
+  assert.equal(reassessed.status, 'assessed');
+  assert.equal(reassessed.solvabilityGrade, 'A');
+  const revived = approveTaskPackage({ db, taskPackageId: pkg.id, grade: 'A', actorId: enterprise.id, now: NOW, rules });
+  assert.equal(revived.status, 'published');
+  assert.equal(revived.grade, 'A');
+  // ⚠️ Minor M-6：复活后**旧的 D 级诊断报告不得残留** ——
+  //    否则已发布的卡上挂着一份「grade: D, score: 0」的过期报告。
+  assert.equal(revived.meta.solvability.diagnosticReport, undefined, '复活后不得残留旧 D 级诊断报告');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('D 级诊断报告的内容必须能指导企业补短板（不是空壳）', () => {
+  // ⚠️ 2026-10-21 独立评审修正（Important I-5：**报告实质内容零断言**）：
+  //    原来只断言 `suggestions.length > 0` —— 但 `suggestions` 有两个独立生产者
+  //    （短板维度 + 否决项提示），只删掉其中一个断言照样通过
+  //    （独立评审变异 M50 / M16 / M17 各自 SURVIVED）。
+  const { db, close, dataDir, rules, edition, enterprise } = setup();
+  const pkg = submitTaskPackage({
+    db, userId: enterprise.id, payload: { ...PAYLOAD, editionId: edition.id }, now: NOW, rules,
+  });
+  assessSolvability({
+    db, taskPackageId: pkg.id,
+    answers: {
+      problem_clarity: 3, data_access: 0, validation: 0,
+      decision_chain: 1, accountability: 0, precedent: 1,
+    },
+    actorId: enterprise.id, now: NOW, rules,
+  });
+  const approved = approveTaskPackage({ db, taskPackageId: pkg.id, grade: 'D', actorId: enterprise.id, now: NOW, rules });
+  const report = approved.meta.solvability.diagnosticReport;
+  assert.equal(report.title, '问题可解性诊断报告');
+  assert.equal(report.grade, 'D');
+  assert.equal(typeof report.score, 'number');
+  assert.equal(report.dimensions.length, 6, '六个维度都要在报告里');
+  // 短板建议必须**点名具体维度**
+  assert.ok(
+    report.suggestions.some((s) => s.includes('数据可得性') || s.includes('责任可归属')),
+    `建议必须点名短板维度，实际 ${JSON.stringify(report.suggestions)}`,
+  );
+  // 否决项必须带**中文标签**（不是 key）
+  assert.ok(report.vetoLabels.length > 0, '否决项标签不得为空');
+  assert.ok(report.vetoLabels.every((l) => !/^[a-z_]+$/.test(l)), '标签必须是中文而不是 key');
+  assert.ok(report.vetoLabels.includes('无法提供《数据授权说明》'));
+  assert.ok(report.vetoLabels.includes('无企业侧唯一责任人'));
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('重签级后旧的 D 级诊断报告不得残留（published 卡上不能挂着退回结论）', () => {
+  // ⚠️ 2026-10-21 独立评审修正（Minor M-6：**旧 D 级报告残留**）。
+  //    独立评审实跑复现：一张被签成 D 级（带《问题可解性诊断报告》）的卡，
+  //    之后**重新签级为 A 并发布**时，旧的诊断报告还挂在 meta 上 ——
+  //    已发布的卡上挂着一份「grade: D, score: 12」的退回结论。
+  //    注意：走「重新评估 → 再签级」这条路时，`assessSolvability` 会整份替换
+  //    meta.solvability，旧报告自然消失 —— **那条路查不出这个缺陷**。
+  //    真正的暴露路径是「D 级 → 直接重签 A」（状态机允许 returned 再签）。
+  const { db, close, dataDir, rules, edition, enterprise } = setup();
+  const pkg = submitTaskPackage({
+    db, userId: enterprise.id, payload: { ...PAYLOAD, editionId: edition.id }, now: NOW, rules,
+  });
+  // 先评估（六维满分、无否决）→ 组委会直接签 D 级
+  assessSolvability({ db, taskPackageId: pkg.id, answers: FULL, actorId: enterprise.id, now: NOW, rules });
+  const downgraded = approveTaskPackage({ db, taskPackageId: pkg.id, grade: 'D', actorId: enterprise.id, now: NOW, rules });
+  assert.equal(downgraded.status, 'returned');
+  assert.ok(downgraded.meta.solvability.diagnosticReport, 'D 级必须带诊断报告');
+
+  // 组委会复核后改签 A 级 → published
+  const revived = approveTaskPackage({ db, taskPackageId: pkg.id, grade: 'A', actorId: enterprise.id, now: NOW, rules });
+  assert.equal(revived.status, 'published');
+  assert.equal(revived.grade, 'A');
+  assert.equal(
+    revived.meta.solvability.diagnosticReport, undefined,
+    '已发布的卡上不得残留旧的 D 级诊断报告',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
 ```
 
 `platform/test/task-package-api.test.js`：
@@ -2922,6 +3419,13 @@ function setup() {
   const enterprise = createUser(db, { name: '企业甲', phone: '13900005001', password: 'pw', mbaStatus: 'other' });
   const admin = createUser(db, { name: '组委会', phone: '13900005002', password: 'pw', mbaStatus: 'mba' });
   const outsider = createUser(db, { name: '无权限者', phone: '13900005003', password: 'pw', mbaStatus: 'mba' });
+  // ⚠️ 2026-10-21 独立评审修正（Important I-3：**三条路由的能力点常量不可区分**）：
+  //    独立评审变异 M37/M37b/M37c：`write`↔`read`、`approve`↔`read` 互换后
+  //    全量用例照样全绿 —— 因为测试里的企业账号同时有 write + read，
+  //    超管又绕过一切检查 → 换掉常量没有任何用例会红。
+  //    这里造两个**只有单一能力点**的账号，把「哪个端点要哪个能力点」钉死。
+  const reader = createUser(db, { name: '只读账号', phone: '13900005006', password: 'pw', mbaStatus: 'mba' });
+  const writer = createUser(db, { name: '可写不可签级账号', phone: '13900005007', password: 'pw', mbaStatus: 'mba' });
   setSuperadmin(db, admin.id);
   // 能力点必须先注册（grantAssignment 会校验 capabilities 表）
   insertCapability(db, 'task_package:read', '读取任务卡');
@@ -2935,12 +3439,28 @@ function setup() {
     userId: enterprise.id, capability: 'task_package:read',
     scopeType: 'global', scopeId: null, grantedBy: admin.id,
   });
+  grantAssignment(db, {
+    userId: reader.id, capability: 'task_package:read',
+    scopeType: 'global', scopeId: null, grantedBy: admin.id,
+  });
+  grantAssignment(db, {
+    userId: writer.id, capability: 'task_package:write',
+    scopeType: 'global', scopeId: null, grantedBy: admin.id,
+  });
+  // 「可写不可签级」账号**同时给 read** —— 这样把 approve 端点的能力点
+  // 换成 read 时它仍然能通过 → 用例必须变红（否则换掉常量无人察觉）。
+  grantAssignment(db, {
+    userId: writer.id, capability: 'task_package:read',
+    scopeType: 'global', scopeId: null, grantedBy: admin.id,
+  });
   const app = createApp({ db, rules, webDir });
   return {
-    db, close, dataDir, app, edition, enterprise, admin, outsider,
+    db, close, dataDir, app, edition, enterprise, admin, outsider, reader, writer,
     tokenEnterprise: createSession(db, enterprise.id).token,
     tokenAdmin: createSession(db, admin.id).token,
     tokenOutsider: createSession(db, outsider.id).token,
+    tokenReader: createSession(db, reader.id).token,
+    tokenWriter: createSession(db, writer.id).token,
   };
 }
 
@@ -3228,6 +3748,121 @@ test('POST /api/task-packages/:id/solvability 任务卡不存在 → 404', async
   s.close();
   rmSync(s.dataDir, { recursive: true, force: true });
 });
+
+test('能力点常量钉死：只有 task_package:read 不能评估，只有 task_package:write 不能签级', async () => {
+  // ⚠️ 2026-10-21 独立评审修正（Important I-3）。
+  //    「提交/评估」要 write，「分级签约」要 approve，「读列表」要 read ——
+  //    三个常量互换，任何一个用例都不会红（独立评审变异 M37/M37b/M37c SURVIVED）。
+  const s = setup();
+  const created = await call(s.app, 'POST', '/api/task-packages', {
+    token: s.tokenEnterprise, body: { ...PAYLOAD, editionId: s.edition.id },
+  });
+  assert.equal(created.status, 200, created.body);
+  const id = JSON.parse(created.body).id;
+
+  // 只读账号：有 read 没有 write → 评估必须 403
+  const byReader = await call(s.app, 'POST', `/api/task-packages/${id}/solvability`, {
+    token: s.tokenReader, body: { answers: FULL },
+  });
+  assert.equal(byReader.status, 403, '只有 read 的账号不得评估');
+
+  // 只写账号：有 write 没有 approve → 签级必须 403
+  const byWriter = await call(s.app, 'POST', `/api/task-packages/${id}/approve`, {
+    token: s.tokenWriter, body: { grade: 'A' },
+  });
+  assert.equal(byWriter.status, 403, '只有 write 的账号不得分级签约');
+  assert.equal(JSON.parse(byWriter.body).error.code, 'FORBIDDEN');
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('配比体检只对组委会开放（非组委会拿不到 mix）', async () => {
+  // ⚠️ 2026-10-21 独立评审修正（Important I-4）：
+  //    原来「mix 只对组委会开放」这条规则**没有任何断言** ——
+  //    把 mix 对所有人开放，全量用例照样全绿（独立评审变异 M46/M47 SURVIVED）。
+  //    mix 是任务池的经营数据（配比是否达标），不该流向普通选手/企业。
+  const s = setup();
+  await call(s.app, 'POST', '/api/task-packages', {
+    token: s.tokenEnterprise, body: { ...PAYLOAD, editionId: s.edition.id },
+  });
+  const byEnterprise = await call(s.app, 'GET', `/api/task-packages?editionId=${s.edition.id}`, { token: s.tokenEnterprise });
+  assert.equal(byEnterprise.status, 200);
+  assert.equal(JSON.parse(byEnterprise.body).mix, null, '非组委会不得拿到配比体检结果');
+  const byAdmin = await call(s.app, 'GET', `/api/task-packages?editionId=${s.edition.id}`, { token: s.tokenAdmin });
+  assert.ok(JSON.parse(byAdmin.body).mix, '组委会必须拿到配比体检结果');
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('六维取值越界（负数 / 非整数）→ 400 INVALID_SOLVABILITY_ANSWERS', async () => {
+  // ⚠️ 2026-10-21 独立评审修正（Minor M-4：负数取值分支零断言）。
+  const s = setup();
+  const created = await call(s.app, 'POST', '/api/task-packages', {
+    token: s.tokenEnterprise, body: { ...PAYLOAD, editionId: s.edition.id },
+  });
+  const id = JSON.parse(created.body).id;
+  const negative = await call(s.app, 'POST', `/api/task-packages/${id}/solvability`, {
+    token: s.tokenEnterprise, body: { answers: { ...FULL, problem_clarity: -1 } },
+  });
+  assert.equal(negative.status, 400);
+  assert.equal(JSON.parse(negative.body).error.code, 'INVALID_SOLVABILITY_ANSWERS');
+  const fractional = await call(s.app, 'POST', `/api/task-packages/${id}/solvability`, {
+    token: s.tokenEnterprise, body: { answers: { ...FULL, validation: 1.5 } },
+  });
+  assert.equal(fractional.status, 400);
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('自报未知否决项 → 400 INVALID_VETO_KEY', async () => {
+  // ⚠️ 2026-10-21 独立评审修正（Minor M-4：INVALID_VETO_KEY 分支零断言）。
+  const s = setup();
+  const created = await call(s.app, 'POST', '/api/task-packages', {
+    token: s.tokenEnterprise, body: { ...PAYLOAD, editionId: s.edition.id },
+  });
+  const id = JSON.parse(created.body).id;
+  const res = await call(s.app, 'POST', `/api/task-packages/${id}/solvability`, {
+    token: s.tokenEnterprise, body: { answers: { ...FULL, vetoes: ['not_a_real_veto'] } },
+  });
+  assert.equal(res.status, 400);
+  assert.equal(JSON.parse(res.body).error.code, 'INVALID_VETO_KEY');
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('approve 不存在的任务卡 → 404', async () => {
+  // ⚠️ 2026-10-21 独立评审修正（Minor M-4：approve 的 404 分支零断言）。
+  const s = setup();
+  const res = await call(s.app, 'POST', '/api/task-packages/not-a-real-id/approve', {
+    token: s.tokenAdmin, body: { grade: 'A' },
+  });
+  assert.equal(res.status, 404);
+  assert.equal(JSON.parse(res.body).error.code, 'TASK_PACKAGE_NOT_FOUND');
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('GET /api/task-packages 不带 editionId → 返回全部届期的卡', async () => {
+  // ⚠️ 2026-10-21 独立评审修正（Minor M-3：editionId 缺省语义未钉住）。
+  //    只断言「不 500」不够 —— 语义必须写死：缺省 = 不按届期过滤。
+  const s = setup();
+  const otherEdition = createEdition(s.db, {
+    name: '第二届', city: '北京', startsAt: '2027-10-01', endsAt: '2027-10-31',
+  });
+  await call(s.app, 'POST', '/api/task-packages', {
+    token: s.tokenEnterprise, body: { ...PAYLOAD, editionId: s.edition.id },
+  });
+  await call(s.app, 'POST', '/api/task-packages', {
+    token: s.tokenEnterprise, body: { ...PAYLOAD, title: '第二届的题', editionId: otherEdition.id },
+  });
+  const all = await call(s.app, 'GET', '/api/task-packages', { token: s.tokenAdmin });
+  assert.equal(all.status, 200);
+  assert.equal(JSON.parse(all.body).items.length, 2, '不带 editionId 必须返回全部届期');
+  const one = await call(s.app, 'GET', `/api/task-packages?editionId=${s.edition.id}`, { token: s.tokenAdmin });
+  assert.equal(JSON.parse(one.body).items.length, 1, '带 editionId 必须只返回本届');
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -3237,7 +3872,7 @@ Expected: FAIL —— `Cannot find module '../src/domain/solvability.js'`
 
 - [ ] **Step 3: 改写 rules/solvability.json 的 taskMix 段**
 
-`platform/rules/solvability.json` 里的 `taskMix` 换成（其余字段逐字保留）：
+`platform/rules/solvability.json` 里的 `taskMix` 换成：
 
 ```json
   "taskMix": {
@@ -3248,6 +3883,27 @@ Expected: FAIL —— `Cannot find module '../src/domain/solvability.js'`
   },
   "taskMixNote": "R-ENT-09（顶层文档 §3.1）：任务卡 70% B 端 + 30% 自由；任务池内 A 40% / B 20% / C 10% / 自由 30%（四档合计 100%，分母是**全体任务卡**，不是 B 端子集）。tolerance=0.10 为【我方假设】的配比浮动容忍度，首届后按实测调整。"
 ```
+
+`platform/rules/solvability.json` 里的 `vetoes` 换成（**其余字段逐字保留**）：
+
+```json
+  "vetoes": [
+    { "key": "no_data_authorization", "label": "无法提供《数据授权说明》",
+      "auto": { "dimension": "data_access", "equals": 0 } },
+    { "key": "no_responsible_owner",  "label": "无企业侧唯一责任人",
+      "auto": { "dimension": "accountability", "equals": 0 } },
+    { "key": "production_undisclosed","label": "涉及生产系统且未谈责任归属" }
+  ],
+```
+
+> ⚠️ 2026-10-21 独立评审修正（Minor M-1：**否决项 key 硬编码在领域层 → 配置改名即静默失效**）：
+> 领域层原来写死两个 key（`no_data_authorization` / `no_responsible_owner`）。
+> 把配置里的 key 改名 → 维度推导出的否决项**整个消失**，实跑表现为
+> 「grade=B, vetoes=[]」—— 也就是说「数据可得性 = 0 → 一票否决」这条规则
+> 可以被一次配置改名**静默关掉**，没有任何报错。
+> 现在**触发条件写在配置的 `auto` 里**（`auto.dimension` + `auto.equals`），
+> key 只当标识用 —— 改名不影响判定。
+> `auto` 的形状与「指向的维度必须真实存在」由 `validateRules` 校验（见 Task 3 Step 7 的 ④）。
 
 > ⚠️ 父代理预审修正（Important，**配置与实现必须同口径**）：
 > `enterpriseGradeSplit` 的三档比例合计 = 0.70 = `taskMix.enterprise`。
@@ -3288,13 +3944,28 @@ function gradeOf(score, config) {
 //   ② 无企业侧唯一责任人     ← 责任可归属 = 0
 //   ③ 涉及生产系统且未谈责任归属 ← 只能由出题方自报
 // ① ② 由六维推导（这两维本身就是同一件事的两种说法），③ 只能自报。
+//
+// ⚠️ 2026-10-21 独立评审修正（Minor M-1：**key 硬编码在领域层 → 配置改名即静默失效**）：
+//    原来这里写死两个 key（'no_data_authorization' / 'no_responsible_owner'）。
+//    后果：把配置里的 key 改名（或者新增一条同类否决项）→ 领域层仍然按老 key 判定
+//    → **维度推导出的否决项整个消失**，且实跑表现为「grade=B, vetoes=[]」
+//    （独立评审探针实测）—— 也就是说「数据可得性 = 0 → 一票否决」这条规则
+//    可以被一次配置改名**静默关掉**，没有任何报错。
+//    现在改成**从配置读触发条件**：带 `auto: { dimension, equals }` 的否决项
+//    由「该维度取值等于该值」自动触发。key 只是标识，判定逻辑不再依赖它。
 function detectVetoes({ answers, config }) {
   const hit = new Set();
   for (const key of Array.isArray(answers.vetoes) ? answers.vetoes : []) {
     if (config.vetoes.some((v) => v.key === key)) hit.add(key);
   }
-  if (Number(answers.data_access ?? 0) <= 0) hit.add('no_data_authorization');
-  if (Number(answers.accountability ?? 0) <= 0) hit.add('no_responsible_owner');
+  // 维度推导：配置里带 auto 的否决项，按「某维度取值等于某值」自动命中
+  for (const v of config.vetoes) {
+    const auto = v.auto;
+    if (!auto || typeof auto.dimension !== 'string') continue;
+    const value = Number(answers[auto.dimension] ?? 0);
+    const target = Number(auto.equals ?? 0);
+    if (value === target) hit.add(v.key);
+  }
   return config.vetoes.filter((v) => hit.has(v.key)).map((v) => v.key);
 }
 
@@ -3611,9 +4282,17 @@ export function approveTaskPackage({ db, taskPackageId, grade, actorId, now = ne
   if (finalGrade === 'D') {
     // R-ENT-08：D 级不是静默丢弃 —— 必须出《问题可解性诊断报告》
     solvability.diagnosticReport = buildDiagnosticReport({ row, solvability, config, now });
-    meta.solvability = solvability;
-    patch.meta_json = meta;
+  } else if (solvability.diagnosticReport) {
+    // ⚠️ 2026-10-21 独立评审修正（Minor M-6：**旧 D 级报告残留**）：
+    //    原来只在 finalGrade === 'D' 时写 meta_json。一张被退回过（D 级、带诊断报告）
+    //    的卡，重新评估后被签成 A 级时，**旧的诊断报告还挂在 meta 上** ——
+    //    已发布的卡上挂着一份「grade: D, score: 12」的过期报告，
+    //    前端会把退回结论和当前结论一起显示出来（独立评审实跑复现）。
+    //    现在签非 D 级时**清掉**旧报告：诊断报告只对 D 级成立。
+    delete solvability.diagnosticReport;
   }
+  meta.solvability = solvability;
+  patch.meta_json = meta;
 
   const updated = updateTaskPackage(db, taskPackageId, patch);
   return presentTaskPackage(updated);
@@ -3696,6 +4375,8 @@ export function listTaskPackagesByEdition(db, editionId = null) {
 ```javascript
 // src/http/routes/taskPackage.js — 任务卡端点
 // 依据：INTERFACES.md §2「API（P1）」+ 设计文档 §8
+// 溯源需求：R-ENT-01 / R-ENT-06 / R-ENT-07 / R-ENT-08 / R-ENT-09 / R-ENT-10 / R-ENT-12
+// 三态状态码（设计文档 §7.3）：列表不满足 → 200+空集；单条不满足 → 404；禁用 → 403
 import { AppError } from '../../errors.js';
 import { can } from '../../auth/permissions.js';
 import { checkTaskMix } from '../../domain/solvability.js';
@@ -3760,7 +4441,7 @@ import { registerTaskPackageRoutes } from './http/routes/taskPackage.js';
 - [ ] **Step 9: 运行测试确认通过**
 
 Run: `cd platform && node --test test/solvability-domain.test.js test/task-package-service.test.js test/task-package-api.test.js`
-Expected: PASS（39 个测试全过：solvability-domain 10 + task-package-service 14 + task-package-api 15）
+Expected: PASS（51 个测试全过：solvability-domain 13 + task-package-service 17 + task-package-api 21）
 
 > ⚠️ 父代理预审修正（Important，**路由层覆盖空洞**）：原计划的 17 条用例
 > **一条都不碰路由** —— 而 P1 Task 3 验收发现的两个真实缺陷
@@ -3786,6 +4467,7 @@ git commit -m "feat(P1): 任务卡与六维可解性（分级签约 + 一票否�
 - Create: `platform/src/http/routes/team.js`
 - Modify: `platform/src/server.js`（追加战队路由注册）
 - Create: `platform/test/team-service.test.js`
+- Create: `platform/test/team-api.test.js`
 
 **Interfaces:**
 - Consumes: Task 1 战队仓储、Task 3 报名仓储、P0 `can()` 与 `users` 表、Task 3 的 `rules.teamFormation`
@@ -3800,6 +4482,15 @@ git commit -m "feat(P1): 任务卡与六维可解性（分级签约 + 一票否�
   - `replaceMember({ db, teamId, outUserId, inUserId, actorId, now, rules })` → team
   - `updateTeam({ db, teamId, patch, actorId, now, rules })` → team
   - API：`POST /api/teams`｜`GET /api/teams`｜`GET /api/teams/:id`｜`POST /api/teams/:id/members`｜`PATCH /api/teams/:id`
+    - ⚠️ 父代理预审修正（Critical，能力点与越权）：
+      - `POST /api/teams` 必须 `can(user, 'team:create', { scopeType:'edition', scopeId: editionId })` → 否则 **403**
+      - `POST /api/teams/:id/members` 的 `add` / `leave` 分支**固定用发起人自己**（`user.id`），
+        **不接受** `body.userId` —— 否则任何登录用户都能替别人入队、**把别人踢出战队**；
+        换人走 `replace`（汰换移交，服务层校验队长或组委会 `team:manage`）
+      - `PATCH /api/teams/:id` 的权限在服务层判定（队长或组委会 `team:manage`）
+    - 错误码：`TEAM_NOT_FOUND`(404) / `CAPTAIN_MBA_REQUIRED`(409) / `TASK_PACKAGE_NOT_GRADED`(409) /
+      `ALREADY_IN_TEAM`(409) / `TEAM_FULL`(409) / `TEAM_DISSOLVED`(409) / `MEMBER_NOT_FOUND`(404) /
+      `CAPTAIN_MUST_REPLACE`(409) / `FORBIDDEN`(403) / `INVALID_ACTION`(400)
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -4048,6 +4739,12 @@ test('汰换：非队长发起 → 403；队长发起 → 成功且历史留痕'
   });
   addMember({ db: s.db, teamId: team.id, userId: s.member.id, actorId: s.captain.id, now: NOW, rules: s.rules });
   const outsider = createUser(s.db, { name: '路人', phone: '13900005201', password: 'pw', mbaStatus: 'mba' });
+  // ⚠️ 汰换进来的新人必须**已完成本届报名且被接收**（R-REG-08）——
+  // 原用例漏了这一步，服务层的 assertAcceptedRegistration 直接把用例挡在门外。
+  insertRegistration(s.db, {
+    editionId: s.edition.id, userId: outsider.id, answers: GOOD, rawScore: 80,
+    level: 'S', status: 'submitted', now: NOW,
+  });
   assert.throws(
     () => replaceMember({
       db: s.db, teamId: team.id, outUserId: s.member.id, inUserId: outsider.id,
@@ -4101,11 +4798,297 @@ test('可见性：非成员读不到战队（返回 null）', () => {
   s.close();
   rmSync(s.dataDir, { recursive: true, force: true });
 });
+
+test('singleMemberTriggersMerge=false → 退出后不触发并队标记（配置真的被读了）', () => {
+  // ⚠️ 2026-10-21 父代理预审修正（Important，配置没接线）：原来「仅剩 1 人触发并队」
+  //    是**硬编码**在实现里的，配置项 `singleMemberTriggersMerge` 一次都没被读过 ——
+  //    配置改成 false，行为照旧触发并队。这条用例把配置关掉，断言行为**跟着变**。
+  const s = setup();
+  const offRules = {
+    ...s.rules,
+    teamFormation: { ...s.rules.teamFormation, singleMemberTriggersMerge: false },
+  };
+  const team = createTeam({
+    db: s.db, userId: s.captain.id, editionId: s.edition.id,
+    taskPackageId: s.pkg.id, name: '甲队', now: NOW, rules: offRules,
+  });
+  addMember({ db: s.db, teamId: team.id, userId: s.member.id, actorId: s.captain.id, now: NOW, rules: offRules });
+  const after = leaveTeam({ db: s.db, teamId: team.id, userId: s.member.id, now: NOW, rules: offRules });
+  assert.equal(after.status, 'active', '配置关掉时不得触发并队标记');
+  assert.equal(after.needsMerge, false);
+});
+```
+
+`platform/test/team-api.test.js`：
+
+```javascript
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { openDatabase } from '../src/db/sqlite.js';
+import { applyMigrations } from '../src/db/migrate.js';
+import { loadRules } from '../src/config.js';
+import { createApp } from '../src/server.js';
+import { createUser, setSuperadmin } from '../src/db/repo/users.js';
+import { createEdition } from '../src/db/repo/editions.js';
+import { createSession } from '../src/auth/session.js';
+import { grantAssignment } from '../src/auth/permissions.js';
+import { insertCapability } from '../src/db/repo/capabilities.js';
+import { createTaskPackage, updateTaskPackage } from '../src/db/repo/taskPackages.js';
+import { insertRegistration } from '../src/db/repo/registrations.js';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const migrationsDir = join(here, '..', 'db', 'migrations');
+const rulesDir = join(here, '..', 'rules');
+const webDir = join(here, '..', 'web');
+const NOW = '2026-10-20T12:00:00.000Z';
+
+const GOOD = {
+  direction: [4, 4, 4, 4, 5], capability: [4, 4, 4, 4, 5], collaboration: [4, 4, 4, 4, 5],
+  open: '我想解决门店排班问题', consent: { accepted: true },
+};
+
+function setup() {
+  const dataDir = mkdtempSync(join(tmpdir(), 'hks-teamapi-'));
+  const { db, close } = openDatabase({ dataDir });
+  applyMigrations(db, migrationsDir);
+  const { rules } = loadRules(rulesDir);
+  const edition = createEdition(db, {
+    name: '首届', city: '上海', startsAt: '2026-10-01', endsAt: '2026-10-31',
+  });
+  const enterprise = createUser(db, { name: '某企业', phone: '13900006001', password: 'pw', mbaStatus: 'other' });
+  const pkg = createTaskPackage(db, {
+    editionId: edition.id, title: '门店排班优化', painPoint: 'p', expectedDelivery: 'd',
+    acceptanceCriteria: 'a', submittedBy: enterprise.id, now: NOW,
+  });
+  updateTaskPackage(db, pkg.id, { solvability_grade: 'A', solvability_score: 11, status: 'published' });
+
+  const captain = createUser(db, { name: '队长甲', phone: '13900006002', password: 'pw', mbaStatus: 'mba' });
+  const member = createUser(db, { name: '成员乙', phone: '13900006003', password: 'pw', mbaStatus: 'mba' });
+  const outsider = createUser(db, { name: '无权限者', phone: '13900006004', password: 'pw', mbaStatus: 'mba' });
+  const admin = createUser(db, { name: '组委会', phone: '13900006005', password: 'pw', mbaStatus: 'mba' });
+  setSuperadmin(db, admin.id);
+
+  for (const u of [captain, member, outsider]) {
+    insertRegistration(db, {
+      editionId: edition.id, userId: u.id, answers: GOOD, rawScore: 80,
+      level: 'S', status: 'submitted', now: NOW,
+    });
+  }
+
+  // 能力点必须先注册（grantAssignment 会校验 capabilities 表）
+  insertCapability(db, 'team:create', '创建战队');
+  insertCapability(db, 'team:read', '读取战队');
+  insertCapability(db, 'team:manage', '管理战队成员');
+  grantAssignment(db, {
+    userId: captain.id, capability: 'team:create', scopeType: 'global', scopeId: null, grantedBy: admin.id,
+  });
+  grantAssignment(db, {
+    userId: member.id, capability: 'team:create', scopeType: 'global', scopeId: null, grantedBy: admin.id,
+  });
+
+  const app = createApp({ db, rules, webDir });
+  return {
+    db, close, dataDir, app, edition, pkg, captain, member, outsider, admin,
+    tokenCaptain: createSession(db, captain.id).token,
+    tokenMember: createSession(db, member.id).token,
+    tokenOutsider: createSession(db, outsider.id).token,
+    tokenAdmin: createSession(db, admin.id).token,
+  };
+}
+
+function call(app, method, path, { token = null, body = null } = {}) {
+  return new Promise((resolve) => {
+    const chunks = body ? [Buffer.from(JSON.stringify(body))] : [];
+    const req = {
+      method,
+      url: path,
+      headers: token ? { cookie: `hk_session=${token}` } : {},
+      async *[Symbol.asyncIterator]() {
+        for (const c of chunks) yield c;
+      },
+      on() {},
+    };
+    const res = {
+      statusCode: 200,
+      headers: {},
+      body: '',
+      writeHead(status, h) { this.statusCode = status; this.headers = h || {}; },
+      end(payload) {
+        if (payload) this.body = payload.toString();
+        resolve({ status: this.statusCode, headers: this.headers, body: this.body });
+      },
+    };
+    app.handle(req, res);
+  });
+}
+
+async function createTeamViaApi(s, token, name = '甲队') {
+  const res = await call(s.app, 'POST', '/api/teams', {
+    token, body: { editionId: s.edition.id, taskPackageId: s.pkg.id, name },
+  });
+  assert.equal(res.status, 200, res.body);
+  return JSON.parse(res.body);
+}
+
+test('POST /api/teams 未登录 → 401', async () => {
+  const s = setup();
+  const res = await call(s.app, 'POST', '/api/teams', {
+    body: { editionId: s.edition.id, taskPackageId: s.pkg.id, name: '甲队' },
+  });
+  assert.equal(res.status, 401);
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('POST /api/teams 已登录但无 team:create 能力 → 403（能力点必须真的被校验）', async () => {
+  // ⚠️ 2026-10-21 父代理预审修正（Critical）：`team:create` 被注册、被 seed 授予，
+  //    但路由从不校验 → 能力点形同虚设（与 Task 3 的 A1、Task 4 的 T4-5 同类）。
+  const s = setup();
+  const res = await call(s.app, 'POST', '/api/teams', {
+    token: s.tokenOutsider,
+    body: { editionId: s.edition.id, taskPackageId: s.pkg.id, name: '甲队' },
+  });
+  assert.equal(res.status, 403, `没有能力点必须回 403，实际 ${res.status}`);
+  assert.equal(JSON.parse(res.body).error.code, 'FORBIDDEN');
+  // 拒绝之后不得留下任何战队
+  const list = await call(s.app, 'GET', '/api/teams', { token: s.tokenCaptain });
+  assert.equal(JSON.parse(list.body).items.length, 0);
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('POST /api/teams 有权限 → 200 + 战队视图', async () => {
+  const s = setup();
+  const team = await createTeamViaApi(s, s.tokenCaptain);
+  assert.equal(team.status, 'forming');
+  assert.equal(team.memberCount, 1);
+  assert.equal(team.members[0].role, 'captain');
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('GET /api/teams 未登录 → 401', async () => {
+  const s = setup();
+  const res = await call(s.app, 'GET', '/api/teams');
+  assert.equal(res.status, 401);
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('GET /api/teams/:id 非成员读不到 → 404；成员可读 → 200', async () => {
+  const s = setup();
+  const team = await createTeamViaApi(s, s.tokenCaptain);
+  const theirs = await call(s.app, 'GET', `/api/teams/${team.id}`, { token: s.tokenOutsider });
+  assert.equal(theirs.status, 404);
+  const mine = await call(s.app, 'GET', `/api/teams/${team.id}`, { token: s.tokenCaptain });
+  assert.equal(mine.status, 200);
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('POST /api/teams/:id/members 的 add 只能自己加入（不能替别人加）', async () => {
+  // ⚠️ 2026-10-21 父代理预审修正（Critical）：原来把 `body.userId` 直接交给服务层
+  //    → 任何登录用户都能替别人加入战队。
+  const s = setup();
+  const team = await createTeamViaApi(s, s.tokenCaptain);
+  const res = await call(s.app, 'POST', `/api/teams/${team.id}/members`, {
+    token: s.tokenMember, body: { action: 'add', userId: s.captain.id },
+  });
+  assert.equal(res.status, 200, res.body);
+  const body = JSON.parse(res.body);
+  assert.equal(body.memberCount, 2);
+  // 加进来的是**发起人自己**，不是 body 里指定的别人
+  assert.ok(body.members.some((m) => m.userId === s.member.id));
+  assert.equal(body.members.filter((m) => m.userId === s.captain.id).length, 1, '组长只能有一条成员记录');
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('POST /api/teams/:id/members 的 leave 不能踢别人（越权踢人防护）', async () => {
+  // ⚠️ 2026-10-21 父代理预审修正（Critical）：原来 `userId: body?.userId ?? user.id`
+  //    → 客户端传别人的 id 就能把别人踢出战队（服务层不校验 actor）。
+  const s = setup();
+  const team = await createTeamViaApi(s, s.tokenCaptain);
+  await call(s.app, 'POST', `/api/teams/${team.id}/members`, {
+    token: s.tokenMember, body: { action: 'add' },
+  });
+  // 成员乙试图「退出」组长（body.userId 指向组长）
+  const res = await call(s.app, 'POST', `/api/teams/${team.id}/members`, {
+    token: s.tokenMember, body: { action: 'leave', userId: s.captain.id },
+  });
+  assert.ok(res.status === 200 || res.status === 404, `实际 ${res.status}`);
+  // 关键断言：退出的是**发起人自己**，body.userId 指向的组长不得被踢
+  const after = await call(s.app, 'GET', `/api/teams/${team.id}`, { token: s.tokenCaptain });
+  const body = JSON.parse(after.body);
+  assert.ok(body.members.some((m) => m.userId === s.captain.id), '组长不得被踢出');
+  assert.ok(!body.members.some((m) => m.userId === s.member.id), '退出的必须是发起人自己');
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('POST /api/teams/:id/members 的 replace 非队长发起 → 403', async () => {
+  const s = setup();
+  const team = await createTeamViaApi(s, s.tokenCaptain);
+  await call(s.app, 'POST', `/api/teams/${team.id}/members`, {
+    token: s.tokenMember, body: { action: 'add' },
+  });
+  const res = await call(s.app, 'POST', `/api/teams/${team.id}/members`, {
+    token: s.tokenMember,
+    body: { action: 'replace', outUserId: s.member.id, inUserId: s.outsider.id },
+  });
+  assert.equal(res.status, 403);
+  assert.equal(JSON.parse(res.body).error.code, 'FORBIDDEN');
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('POST /api/teams/:id/members 的 action 非法 → 400 INVALID_ACTION', async () => {
+  const s = setup();
+  const team = await createTeamViaApi(s, s.tokenCaptain);
+  const res = await call(s.app, 'POST', `/api/teams/${team.id}/members`, {
+    token: s.tokenCaptain, body: { action: 'destroy' },
+  });
+  assert.equal(res.status, 400);
+  assert.equal(JSON.parse(res.body).error.code, 'INVALID_ACTION');
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('PATCH /api/teams/:id 非队长 → 403；队长 → 200', async () => {
+  const s = setup();
+  const team = await createTeamViaApi(s, s.tokenCaptain);
+  const byOther = await call(s.app, 'PATCH', `/api/teams/${team.id}`, {
+    token: s.tokenMember, body: { name: '被改的名字' },
+  });
+  assert.equal(byOther.status, 403);
+  const byCaptain = await call(s.app, 'PATCH', `/api/teams/${team.id}`, {
+    token: s.tokenCaptain, body: { name: '甲队新名字' },
+  });
+  assert.equal(byCaptain.status, 200);
+  assert.equal(JSON.parse(byCaptain.body).name, '甲队新名字');
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('GET /api/teams 只返回自己参与的战队', async () => {
+  const s = setup();
+  await createTeamViaApi(s, s.tokenCaptain);
+  const mine = await call(s.app, 'GET', '/api/teams', { token: s.tokenCaptain });
+  assert.equal(JSON.parse(mine.body).items.length, 1);
+  const others = await call(s.app, 'GET', '/api/teams', { token: s.tokenMember });
+  assert.equal(JSON.parse(others.body).items.length, 0);
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
 
-Run: `cd platform && node --test test/team-service.test.js`
+Run: `cd platform && node --test test/team-service.test.js test/team-api.test.js`
 Expected: FAIL —— `Cannot find module '../src/services/team.js'`
 
 - [ ] **Step 3: 确认组队规则已就位**
@@ -4126,7 +5109,12 @@ import { getEdition } from '../db/repo/editions.js';
 import { getTaskPackage } from '../db/repo/taskPackages.js';
 import { findActiveRegistration } from '../db/repo/registrations.js';
 import {
-  insertTeam, getTeam, listTeamRows, updateTeamRow, countActiveTeamsByPackage,
+  // ⚠️ 父代理预审修正（Critical，规格缺陷）：仓储的 getTeam 必须**改别名**导入。
+  //    原来直接 `import { getTeam }`，而本文件下面又 `export function getTeam(...)`
+  //    → **同名重复声明** → `SyntaxError: Identifier 'getTeam' has already been declared`
+  //    → 整个模块根本无法导入 → 计划自带的 13 条用例**一条都跑不起来**。
+  //    父代理预审实跑复现。服务层对外仍是 `getTeam({db,id,viewer,rules})`（契约不变）。
+  insertTeam, getTeam as findTeamRow, listTeamRows, updateTeamRow, countActiveTeamsByPackage,
 } from '../db/repo/teams.js';
 import {
   insertTeamMember, listActiveMembers, listMemberHistory, markMemberLeft,
@@ -4175,7 +5163,7 @@ function assertAcceptedRegistration(db, userId, editionId, rules) {
 
 // 战队视图：成员、组队校验、并队信息、固定里程碑
 function teamView(db, teamId, rules) {
-  const team = getTeam(db, teamId);
+  const team = findTeamRow(db, teamId);
   if (!team) return null;
   const members = listActiveMembers(db, teamId);
   const captain = getUserById(db, team.captain_id);
@@ -4238,6 +5226,16 @@ export function createTeam({
     throw new AppError(409, 'TASK_PACKAGE_NOT_GRADED', '认领的任务包尚未完成六维可解性分级');
   }
   // R-REG-01 + 顶层文档 §3.1：每个任务包 2–3 支战队
+  //
+  // ⚠️ 父代理预审修正（Important，两处口径登记）：
+  //  ① `teamsPerPackage.min`（每包**至少** 2 支）**不在建队时强制**：
+  //     建队是选手行为，某个包的第一支队在建队那一刻还不存在 ——
+  //     强制 min 会让这个包**永远建不出第一支队**（死锁）。min 是组委会的运营目标，不是创建闸门。
+  //  ② `packageQuotaMix`（企业包 70% / 自由包 30% 的战队配额）**本期不强制**：
+  //     需求溯源表里没有对应条目（只有 R-ENT-09 的**任务卡池**配比，
+  //     那条由 Task 4 的 checkTaskMix 体检）；且建队时无法预知最终配比，
+  //     强制会让某个类型的包建不出队。该键保留在配置里（INTERFACES.md §2 的契约形状），
+  //     由组委会在配比体检里人工看。
   const teamCount = countActiveTeamsByPackage(db, taskPackageId);
   if (teamCount >= config.teamsPerPackage.max) {
     throw new AppError(
@@ -4273,7 +5271,7 @@ export function createTeam({
 }
 
 export function getTeam({ db, id, viewer, rules }) {
-  const row = getTeam(db, id);
+  const row = findTeamRow(db, id);
   if (!row) return null;
   // 可见性：战队成员 / 组长 / 有 team:read 授权的人
   const isMember = listActiveMembers(db, id).some((m) => m.user_id === viewer?.id);
@@ -4285,7 +5283,7 @@ export function getTeam({ db, id, viewer, rules }) {
 
 export function addMember({ db, teamId, userId, actorId, now = new Date().toISOString(), rules }) {
   const config = rules.teamFormation;
-  const team = getTeam(db, teamId);
+  const team = findTeamRow(db, teamId);
   if (!team) throw new AppError(404, 'TEAM_NOT_FOUND', '战队不存在');
   if (team.status === 'dissolved') throw new AppError(409, 'TEAM_DISSOLVED', '战队已解散');
   if (findActiveMembershipByUser(db, userId)) {
@@ -4307,7 +5305,7 @@ export function addMember({ db, teamId, userId, actorId, now = new Date().toISOS
 
 export function leaveTeam({ db, teamId, userId, now = new Date().toISOString(), rules }) {
   const config = rules.teamFormation;
-  const team = getTeam(db, teamId);
+  const team = findTeamRow(db, teamId);
   if (!team) throw new AppError(404, 'TEAM_NOT_FOUND', '战队不存在');
   const member = listActiveMembers(db, teamId).find((m) => m.user_id === userId);
   if (!member) throw new AppError(404, 'MEMBER_NOT_FOUND', '该同学不在此战队');
@@ -4316,7 +5314,11 @@ export function leaveTeam({ db, teamId, userId, now = new Date().toISOString(), 
   }
   markMemberLeft(db, member.id, now);
   // R-REG-04：仅剩 1 人 → 触发并队
-  if (countActiveMembers(db, teamId) <= 1) {
+  // ⚠️ 父代理预审修正（Important，配置没接线）：原来把「仅剩 1 人」硬编码在实现里，
+  //    配置项 `singleMemberTriggersMerge` 一次都没被读过 ——
+  //    配置与实现可以各说各话（把配置改成 false，行为照旧触发并队）。
+  //    现在**从配置读**：`singleMemberTriggersMerge === false` 时不触发并队标记。
+  if (config.singleMemberTriggersMerge !== false && countActiveMembers(db, teamId) <= 1) {
     updateTeamRow(db, teamId, { status: 'needs_merge' });
   }
   return teamView(db, teamId, rules);
@@ -4326,7 +5328,7 @@ export function replaceMember({
   db, teamId, outUserId, inUserId, actorId, now = new Date().toISOString(), rules,
 }) {
   const config = rules.teamFormation;
-  const team = getTeam(db, teamId);
+  const team = findTeamRow(db, teamId);
   if (!team) throw new AppError(404, 'TEAM_NOT_FOUND', '战队不存在');
 
   // R-REG-03：换人要队长或组委会同意（memberChange.requireCaptainOrAdmin）
@@ -4361,7 +5363,8 @@ export function replaceMember({
   if (replacingCaptain) updateTeamRow(db, teamId, { captain_id: inUserId });
 
   const remaining = countActiveMembers(db, teamId);
-  if (remaining <= 1) {
+  // ⚠️ 父代理预审修正（Important，配置没接线）：同上，改读 `singleMemberTriggersMerge`
+  if (config.singleMemberTriggersMerge !== false && remaining <= 1) {
     updateTeamRow(db, teamId, { status: 'needs_merge' });
   } else if (team.status === 'forming') {
     updateTeamRow(db, teamId, { status: 'active' });
@@ -4371,7 +5374,7 @@ export function replaceMember({
 
 export function updateTeam({ db, teamId, patch, actorId, now = new Date().toISOString(), rules }) {
   const config = rules.teamFormation;
-  const team = getTeam(db, teamId);
+  const team = findTeamRow(db, teamId);
   if (!team) throw new AppError(404, 'TEAM_NOT_FOUND', '战队不存在');
 
   const actor = getUserById(db, actorId);
@@ -4423,6 +5426,7 @@ export function listMyTeams({ db, userId, rules }) {
 // src/http/routes/team.js — 战队端点
 // 依据：INTERFACES.md §2「API（P1）」+ 设计文档 §8
 import { AppError } from '../../errors.js';
+import { can } from '../../auth/permissions.js';
 import {
   createTeam, getTeam, addMember, leaveTeam, replaceMember, updateTeam, listMyTeams,
 } from '../../services/team.js';
@@ -4430,6 +5434,16 @@ import {
 export function registerTeamRoutes({ router, db, rules }) {
   router.add('POST', '/api/teams', async ({ user, body }) => {
     if (!user) throw new AppError(401, 'UNAUTHENTICATED', '未登录');
+    // ⚠️ 父代理预审修正（Critical，规格缺陷）：`team:create` 这个能力点被注册、
+    //    被 seed 授予（captain 角色），但**路由从不校验它** → 能力点形同虚设，
+    //    违反全局约束「权限模型 = capability + assignment，`can()` 是唯一判定入口」。
+    //    与 P1 Task 3 的 A1（registration:write）、Task 4 的 T4-5（task_package:write）
+    //    同一类病根：**机制写下来了，但没接线**。
+    //    作用域带上 edition —— `can()` 传 ctx=null 会跳过资源级授权的 scope 匹配
+    //    （Task 3 评审 T3-7 的同一条教训）。
+    if (!can(user, 'team:create', { scopeType: 'edition', scopeId: body?.editionId ?? null }, db)) {
+      throw new AppError(403, 'FORBIDDEN', '你没有建队的权限');
+    }
     return createTeam({
       db,
       userId: user.id,
@@ -4441,6 +5455,7 @@ export function registerTeamRoutes({ router, db, rules }) {
   });
 
   // 我参与的战队（⚠️ 契约外新增端点，见文末偏差 D-2）
+  // 可见性天然收敛：只返回自己参与或自己组长的战队，不需要额外能力点。
   router.add('GET', '/api/teams', async ({ user }) => {
     if (!user) throw new AppError(401, 'UNAUTHENTICATED', '未登录');
     return { items: listMyTeams({ db, userId: user.id, rules }) };
@@ -4457,14 +5472,23 @@ export function registerTeamRoutes({ router, db, rules }) {
     if (!user) throw new AppError(401, 'UNAUTHENTICATED', '未登录');
     const action = body?.action ?? 'add';
     if (action === 'add') {
+      // ⚠️ 父代理预审修正（Critical）：**加入只能是自己加入**。
+      //    原来把 `body.userId` 直接交给服务层 → 任何登录用户都能**替别人**加入战队
+      //    （服务层只校验「该同学已通过报名且被接收」，不校验 actor 与 userId 的关系）。
+      //    「拉人入队」是组委会/队长的事，走 `action=replace`（汰换）或 P2 的邀请流程。
       return addMember({
-        db, teamId: params.id, userId: body?.userId ?? user.id, actorId: user.id, rules,
+        db, teamId: params.id, userId: user.id, actorId: user.id, rules,
       });
     }
     if (action === 'leave') {
-      return leaveTeam({ db, teamId: params.id, userId: body?.userId ?? user.id, rules });
+      // ⚠️ 父代理预审修正（Critical）：**退出只能是自己退出**。
+      //    原来 `userId: body?.userId ?? user.id` → 客户端传别人的 id 就能
+      //    **把别人踢出战队**（服务层只查「该同学在此战队」，不校验 actor）—— 越权踢人。
+      //    组长要换人走 `action=replace`（汰换移交），不是 leave。
+      return leaveTeam({ db, teamId: params.id, userId: user.id, rules });
     }
     if (action === 'replace') {
+      // 汰换的权限在服务层判定：队长或组委会（team:manage）—— 见 services/team.js
       return replaceMember({
         db, teamId: params.id, outUserId: body?.outUserId, inUserId: body?.inUserId,
         actorId: user.id, rules,
@@ -4475,6 +5499,7 @@ export function registerTeamRoutes({ router, db, rules }) {
 
   router.add('PATCH', '/api/teams/:id', async ({ user, params, body }) => {
     if (!user) throw new AppError(401, 'UNAUTHENTICATED', '未登录');
+    // 权限在服务层判定：队长或组委会（team:manage）—— 见 services/team.js 的 updateTeam
     return updateTeam({ db, teamId: params.id, patch: body ?? {}, actorId: user.id, rules });
   });
 }
@@ -4492,15 +5517,19 @@ import { registerTeamRoutes } from './http/routes/team.js';
 
 - [ ] **Step 7: 运行测试确认通过**
 
-Run: `cd platform && node --test test/team-service.test.js test/config.test.js`
-Expected: PASS（12 个测试全过：team-service 12）
-> `test/config.test.js` 是 **P0 已有文件**，本 Task 追加的配置校验用例会让它的条数增长 ——
-> 实施后必须同步更新 **P0 计划**里 `config.test.js` 的条数声明（跨计划的同一条纪律）。
+Run: `cd platform && node --test test/team-service.test.js test/team-api.test.js`
+Expected: PASS（25 个测试全过：team-service 14 + team-api 11）
+
+> ⚠️ 2026-10-21 父代理预审修正（Important，**路由层覆盖空洞**）：原计划只有
+> `test/team-service.test.js`（12 条），**一条都不碰路由**。
+> 而 Task 3 / Task 4 的真实缺陷（A1 能力点未校验、越权踢人）都出在路由层 ——
+> 本次补 `test/team-api.test.js`（11 条），覆盖 401 / 403 / 404 / 200+空集、
+> 「加入只能自己加」「退出不能踢别人」「非队长不能汰换」「非组长不能改战队」。
 
 - [ ] **Step 8: 提交**
 
 ```bash
-cd platform && git add src/services/team.js src/http/routes/team.js src/server.js test/team-service.test.js
+cd platform && git add src/services/team.js src/http/routes/team.js src/server.js test/team-service.test.js test/team-api.test.js
 git commit -m "feat(P1): 战队与成员管理（MBA 组长硬门槛 / 并队触发 / 里程碑报名固定）
 
 对应需求：R-REG-01 / R-REG-02 / R-REG-03 / R-REG-04 / R-REG-05 / R-STG-03"
@@ -5376,11 +6405,39 @@ git commit -m "feat(P1): 端到端串联与种子扩充（报名→分级→建�
 
 ---
 
+## Task 3 独立评审处置台账（2026-10-21）
+
+> Task 3 完工后由**独立 verifier** 评审（报告：`.superpowers/sdd/2026-10-20-platform-P1-registration/task-3-review.md`），
+> 结论 **Needs fixes：0 Critical / 2 Important / 10 Minor**。基线 199/199 连跑 3 次一致，
+> 9 个文件级代码块与计划逐字一致，P0 的 3 Important + 8 Minor + 复核 F-1~F-6 **全部未回退**。
+> 下表是逐条处置结果；**9 条修复全部做了变异检验（9/9 杀灭，见「变异验证」列）**。
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 | 变异验证 |
+|---|---|---|---|---|---|
+| **T3-1** | **Important** | `buildCriteria` 的合规 / IP / 赛程披露（`ipOwnership` / `redLines` / `consent` / `schedule`）**零断言** —— 这四项是 R-ENT-11 / R-ENT-12 / R-STG-01 的**唯一对外出口**，删掉后需求在产品上静默失效而 CI 全绿 | 评审变异 V14：删掉这 4 个字段 → **全量 199 条仍全绿** | `test/registration-api.test.js` 的 criteria 用例补 4 条断言 | ✅ 杀灭 |
+| **T3-2** | **Important** | `getRegistration` 的 `events` 状态机留痕**零断言** —— `registration_events` 唯一的对外出口，审计链在 API 层消失无人察觉 | 评审变异 V15：`out.events` 置空 → **全量 199 条仍全绿** | 补 `mine.events.length === 1` / `toStatus === 'submitted'` / `fromStatus === null`；改级用例改后回读一次，断言 `events.length === 2` / `fromStatus === 'submitted'` / `toStatus === 'accepted'` | ✅ 杀灭 |
+| **T3-3** | Minor | `grading.accepted` 断言**无区分能力**（唯一一条断言针对 S 级报名，把实现改成恒 `true` 照样通过） | 评审变异 V16：`accepted: graded.accepted` → `accepted: true` → **全量仍全绿** | 新增低分问卷用例 → `level === 'C'` 且 `grading.accepted === false`（C 级不接收） | ✅ 杀灭 |
+| **T3-4** | Minor | 幂等兜底正则 `/UNIQUE\|constraint/i` **过宽** → `FOREIGN KEY constraint failed` 也被吞成 409 `DUPLICATE_REGISTRATION`（客户端被告知「你已重复报名」） | 评审探针：传不存在的 `userId` → 实测 `409 / DUPLICATE_REGISTRATION` | 正则收紧为 `/UNIQUE constraint failed: registrations\./i`（实测原文 `UNIQUE constraint failed: registrations.user_id, registrations.edition_id`）；新增用例断言外键失败**不得**报成重复报名 | ✅ 杀灭 |
+| **T3-5** | Minor | 选手申诉**无条件**把 `status` 改成 `'appealed'` → 委员会已裁定 `'accepted'` / `'rejected'` 的行，终态从 `status` 列上消失（按 status 统计的下游会漏人） | 评审探针：改 C 后 `status=rejected` → 申诉后 `status=appealed` | 只有**尚无终态**的行才标 `'appealed'`；已有终态的行保持 status 不变，申诉只进事件流 | ✅ 杀灭 |
+| **T3-6** | Minor | `POST /api/registrations/:id/level` 的 **401 未登录路径零断言** | 评审变异 V21：删掉 401 判断 → **全量仍全绿** | 补用例：匿名 → 401 + `error.code === 'UNAUTHENTICATED'` | ✅ 杀灭 |
+| **T3-7** | Minor | 能力点校验传 `ctx = null` → `scope_type='edition'` 的 `registration:write` 授权**被误拒**（该用户无法报名） | 评审探针：global 授权 `can(null ctx)=true` / edition 授权 `can(null ctx)=false` | 校验移到解析 `editionId` 之后并带 `{ scopeType:'edition', scopeId: editionId }`；新增用例断言 edition 作用域授权能报名 | ✅ 杀灭 |
+| **T3-8** | Minor | `GET /api/registration-criteria` 返回的是**最早开始**的一届，不是**当届** | 评审探针：多届期时返回历史届期 | 新增 `pickCurrentEdition(editions, today?)`：取尚未结束的最早一届；`today` **可注入**（否则断言会随日历漂移变成 flaky）；配套单测 | ✅ 杀灭 |
+| **T3-9** | Minor | `level`（库内快照）与 `grading.level`（当前配置重算）**口径无登记、断言缺失** → 换配置后同一响应里两个等级矛盾 | 评审探针：换配置后 `level='B'` 与 `grading.level='A'` 并存；变异 V17（grading 改读库值）→ 全量仍全绿 | 在 `presentRegistration` 上方**登记口径**（快照留痕 + 重算可追 + 裁定不可篡改）；新增用例断言「换配置后 `grading` 变、快照不变」 | ✅ 杀灭 |
+| **T3-10** | Minor | P0 的 `test/config.test.js` 的措辞（「9 份」）在 P1 分支过期 → P1 计划却写「一字不动」，与实现自相矛盾 | 评审核对：P1 分支该文件已改成「全部规则配置」，P1 计划仍写「一字不动」 | ① P1 计划的「一字不动」改成**准确表述**（「不加用例」—— 条数 23 与断言一字未动，只订正了 3 处会随配置份数过期的措辞）；② **P0 计划保持历史原样**（它是 P0 阶段的历史规格，必须与 main / `feat/p0-foundation` 同一份；跨阶段的一致性靠变更登记兜住，不靠改历史规格）；③ 提交信息里的用例数订正为 193 → 199 | — |
+| **T3-11** | Minor | 列表端点未暴露分页参数，`limit` 硬编码 200 | — | **本期不提供分页**（口径已登记，见下方「口径」表）；报名量级在一届之内不会到 200+ | — |
+
+**Task 3 的测试条数口径**：registration-service **14** + registration-api **14** + config-p1 **4** = **32**。
+
+---
+
 ## Task 4 父代理预审修正台账（2026-10-21）
 
-> Task 4 的规格在**实施前**先被父代理逐条实跑预审，发现 **2 Critical + 5 Important + 2 Minor**，
+> Task 4 的规格在**实施前**先被父代理逐条实跑预审，发现 **2 Critical + 5 Important + 3 Minor**，
 > 全部在本计划里改完后再实施（「先跑后派」纪律：规格改动必须抽取成独立工程实跑通过，再落盘）。
 > 全部缺陷均**实跑复现**，复现方式见「实跑证据」列。
+> 实施后又经**独立 verifier** 评审（报告：`.superpowers/sdd/2026-10-20-platform-P1-registration/task-4-review.md`，
+> 结论 Needs fixes：0 Critical / 5 Important / 7 Minor，62 个变异 44 杀 18 活）——
+> 处置见下方「Task 4 独立评审处置台账」。
 
 | # | 级别 | 缺陷 | 实跑证据 | 修法 |
 |---|---|---|---|---|
@@ -5396,6 +6453,55 @@ git commit -m "feat(P1): 端到端串联与种子扩充（报名→分级→建�
 | **T4-10** | Minor | 届期不存在 → SQLite 外键原文漏到 HTTP 层（只能回 500，还暴露表结构） | 与 P0 评审修正 I5（重复手机号先查后写）同类 | 提交时先 `getEdition` 校验 → `404 EDITION_NOT_FOUND`（与报名服务一致） |
 
 **Task 4 的测试条数口径**：solvability-domain **10** + task-package-service **14** + task-package-api **15** = **39**。
+
+---
+
+## Task 4 独立评审处置台账（2026-10-21）
+
+> 独立 verifier 结论 **Needs fixes：0 Critical / 5 Important / 7 Minor**。
+> 评审的判断是「**实现本身无功能性缺陷**，问题集中在测试强度（恒绿断言）与 2 处加固」。
+> 62 个变异 → 44 KILLED / 18 SURVIVED（其中 2 个是等价变异体 → 有效缺口 16 条）。
+> 下表逐条处置；**13 条修复全部做了变异检验（13/13 杀灭）**。
+
+| # | 级别 | 缺陷 | 证据 | 处置 | 变异 |
+|---|---|---|---|---|---|
+| **T4R-1** | **Important** | 六维**分档边界值零覆盖** —— 把 `gradeOf` 的 `>=` 改成 `>`，全量照样全绿 | 评审变异 M14 SURVIVED；而这些边界分**业务上完全可达**（独立评审枚举 288 组：10 分 1 组、9 分 9 组、7 分 8 组、6 分 16 组、4 分 8 组、3 分 9 组），档位直接决定 R-ENT-08 的承诺与协议 | 新增边界用例：10→A、9→B、7→B、6→C、4→C、3→D，用 `computedGrade`（不含一票否决）单独钉住「分数 → 档位」 | ✅ |
+| **T4R-2** | **Important** | 状态机「`returned` → 再评估 → 复活 `published`」整条链**零断言** | 评审变异 M18/M19 SURVIVED；实跑确认实现本身正确（复活成功） | 新增用例走完整条复活链 | ✅ |
+| **T4R-3** | **Important** | 三条路由的**能力点常量不可区分**（`write`↔`read`、`approve`↔`read` 互换后无人察觉） | 评审变异 M37/M37b/M37c SURVIVED；seed 角色矩阵下 admin 有 read+approve 无 write | 测试里造两个**单一能力点**账号：「只读账号」（read）与「可写不可签级账号」（read+write）；前者评估必须 403、后者签级必须 403 | ✅ |
+| **T4R-4** | **Important** | 「配比体检只对组委会开放」没被钉住 —— mix 对所有人开放也无人察觉 | 评审变异 M46/M47 SURVIVED；mix 是任务池经营数据 | 新增用例：企业侧 `mix === null`，组委会侧 `mix` 非空 | ✅ |
+| **T4R-5** | **Important** | D 级诊断报告的**实质内容没被钉住** —— `suggestions` 有两个独立生产者，只删一个断言照样通过 | 评审变异 M50 / M16 / M17 各自 SURVIVED | 新增用例：报告必须点名短板维度、必须带**中文**否决标签（不是 key）、六个维度齐全 | ✅ |
+| **T4R-6** | Minor | 领域层**硬编码两个否决项 key** → 配置改名即让「数据可得性 = 0 → 一票否决」**静默失效** | 评审探针实测：改名后 `grade=B, vetoes=[]` | 触发条件写进配置的 `auto: { dimension, equals }`，领域层按配置判定，key 只当标识 | ✅ |
+| **T4R-7** | Minor | `validateRules` **不校验 `solvability.vetoes`**（空数组 / key 重复 / auto 指向不存在的维度都能通过） | 评审实测 | 补校验：`vetoes` 非空、key 唯一、label 非空、`auto` 形状与指向的维度存在（Task 3 Step 7 的 ④ 段） | ✅ |
+| **T4R-8** | Minor | 重签级后**旧 D 级诊断报告残留**（已发布的卡上挂着「grade: D, score: 12」的退回结论） | 评审实跑复现 | 签非 D 级时清掉旧报告。⚠️ 注意暴露路径是「D 级 → **直接**重签 A」；走「重新评估 → 再签级」时 `assessSolvability` 会整份替换 `meta.solvability`，旧报告自然消失 —— **那条路查不出这个缺陷** | ✅ |
+| **T4R-9** | Minor | `editionId` 缺省语义未钉住（只断言「不 500」不够） | 评审实测 | 新增用例：不带 `editionId` 返回**全部届期**的卡，带上则只返回本届 | ✅ |
+| **T4R-10** | Minor | 负数取值 / `INVALID_VETO_KEY` / approve 404 三个分支零断言 | 评审实测 | 三条各补一条用例 | ✅ |
+| **T4R-11** | Minor | `explain.note` 零断言（可解释明细是给企业看的） | 评审实测 | 断言 note 必须含维度标签、取值/上限、折算分 | ✅ |
+| **T4R-12** | Minor | 路由文件缺「溯源需求编号」行 | 评审核对 | 补 `// 溯源需求：R-ENT-01 / R-ENT-06 / …` | — |
+| **T4R-13** | Minor | 预审台账的表头计数写成 2C+5I+2M，实为 2C+5I+3M | 评审核对 | 订正表头 | — |
+
+**Task 4 的测试条数口径**：solvability-domain **13** + task-package-service **17** + task-package-api **21** = **51**。
+
+---
+
+## Task 5 父代理预审修正台账（2026-10-21）
+
+> Task 5 的规格在**实施前**被父代理逐条实跑预审（把计划里的代码块抽到独立工程里跑），
+> 发现 **4 Critical + 4 Important**，全部在本计划里改完后再实施。
+> 全部缺陷均**实跑复现**；**6 条修复做了变异检验（6/6 杀灭）**。
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| **T5-1** | **Critical** | `src/services/team.js` 里 `getTeam` **重复声明**（仓储导入 + 服务层导出同名） | `SyntaxError: Identifier 'getTeam' has already been declared` → 整个模块**根本无法导入** → 计划自带的 13 条用例**一条都跑不起来** | 仓储导入改别名 `getTeam as findTeamRow`；服务层对外签名不变 |
+| **T5-2** | **Critical** | 汰换用例漏了「新成员必须已完成本届报名且被接收」 | 实跑 `REGISTRATION_REQUIRED`（服务层行为**正确**，R-ENT-08；是用例夹具错了） | 夹具给汰换对象补一条已接收的报名 |
+| **T5-3** | **Critical** | 路由层**零能力点校验**：`POST /api/teams` 不校验 `team:create` | 与 Task 3 的 A1、Task 4 的 T4-5 同类：能力点被注册、被 seed 授予，却从不校验 | 路由补 `can(user, 'team:create', { scopeType:'edition', scopeId: editionId }, db)` → 403 |
+| **T5-4** | **Critical** | **越权踢人**：`POST /api/teams/:id/members` 的 `leave` 分支把 `body.userId` 直接交给服务层 | 服务层只查「该同学在此战队」，不校验 actor → 任何登录用户能把**别人**踢出战队 | `leave` 分支**固定用 `user.id`**，不接受 `body.userId`；换人走 `replace`（汰换移交） |
+| **T5-5** | Important | `add` 分支同样可**替别人**加入战队 | `body.userId` 直通服务层 | `add` 分支固定 `userId: user.id`（自助加入） |
+| **T5-6** | Important | `packageQuotaMix`（企业包 70% / 自由包 30% 的战队配额）在配置里但**从未被使用** | 服务层 0 次引用 | **登记口径**：需求溯源表里没有对应条目（只有 R-ENT-09 的**任务卡池**配比，那条由 Task 4 的 `checkTaskMix` 体检）；且建队时无法预知最终配比，强制会让某个类型的包建不出队。该键保留（INTERFACES.md §2 的契约形状） |
+| **T5-7** | Important | `teamsPerPackage.min`（每包**至少** 2 支）从未校验 | — | **登记口径**：min 是组委会的运营目标，不是创建闸门 —— 建队是选手行为，某个包的第一支队在建队那一刻还不存在，强制 min 会让它**永远建不出第一支队** |
+| **T5-8** | Important | `singleMemberTriggersMerge` 配置项从未被读取（行为硬编码 `count <= 1`） | 配置与实现可以各说各话（把配置改成 false，行为照旧触发并队） | 改读配置；新增用例把配置关掉并断言行为**跟着变** |
+| **T5-9** | Minor | 路由层**零测试覆盖**（只有 `test/team-service.test.js`） | Task 3 / Task 4 的真实缺陷都出在路由层 | 新增 `test/team-api.test.js`（11 条） |
+
+**Task 5 的测试条数口径**：team-service **14** + team-api **11** = **25**。
 
 ---
 
@@ -5424,7 +6530,9 @@ git commit -m "feat(P1): 端到端串联与种子扩充（报名→分级→建�
 | 分级落在档位间隙时向下取档 | 分值落在两档之间（例如 6.8）取更低一档 | 六维分值是 0–12 的连续量，档位是 10-12 / 7-9 / 4-6 / 0-3，间隙必然存在。**我方假设** |
 | R-REG-01「报名即认领任务包」的落点 | 认领动作落在**建队时刻**（`teams.task_package_id`），报名表不带任务包字段 | 设计文档 §10 流 1 写的是「队长建队 → 认领任务包 → 成员加入」，且契约的 `registrations` 表无任务包列。**若组委会要求「报名表里就选任务包」**，需在 `002_registration.sql` 给 `registrations` 加列 → 契约变更 |
 | `GET /api/registrations` 不带 `editionId` 的含义 | 返回**全部届期**的报名（组委会视角）；带 `editionId` 才按届期过滤 | 与「全局授权不做行级过滤」一致（`scopeClause` 对 `scope_type='global'` 的授权不设限）。**带版期授权的组委会成员**（`scope_type='edition'`）在不带 `editionId` 时看不到任何行 —— 因为 `scopeId` 为空、匹配不上任何一版。⚠️ 若组委会希望「不带 editionId 时只看自己有权限的届期」，需要把 `editionId` 变成**必填**（契约变更） |
-| `POST /api/registrations` 的能力点校验 | 已登录 + `can(user, 'registration:write', …)` 才放行，否则 **403** | **【2026-10-21 父代理验收修正】** 计划原文只判「有没有登录」→ `registration:write` 这个被注册、被 seed 授予的能力点**形同虚设**，违反全局约束「`can()` 是唯一判定入口」。⚠️ **副作用**：新注册的账号若没有任何角色 / 授权，将无法报名（seed 里 captain 与 member 都有 `registration:write`，所以正常路径不受影响）。若组委会要求「任何人注册后即可报名」，则应改为「报名成功时自动授予 member 角色」—— 那是契约变更 |
+| `POST /api/registrations` 的能力点校验 | 已登录 + `can(user, 'registration:write', { scopeType:'edition', scopeId: editionId })` 才放行，否则 **403** | **【2026-10-21 父代理验收修正】** 计划原文只判「有没有登录」→ `registration:write` 这个被注册、被 seed 授予的能力点**形同虚设**，违反全局约束「`can()` 是唯一判定入口」。⚠️ **副作用**：新注册的账号若没有任何角色 / 授权，将无法报名（seed 里 captain 与 member 都有 `registration:write`，所以正常路径不受影响）。若组委会要求「任何人注册后即可报名」，则应改为「报名成功时自动授予 member 角色」—— 那是契约变更。**【2026-10-21 独立评审修正 T3-7】** 作用域从 `null` 改成 edition —— 原来传 `ctx = null` 时 `can()` 会**跳过**资源级授权的 scope 匹配 → `scope_type='edition'` 的授权会被误拒（该用户无法报名） |
+| `GET /api/registrations` 列表**不提供分页** | `limit` 硬编码 200、offset 恒 0；query 里的 `limit` / `offset` 被忽略 | **【2026-10-21 独立评审 Minor T3-11】** 仓储层（`listRegistrationRows`）已经支持 `limit` / `offset`，但路由没有透传。一届的报名量级远不到 200 条，**本期不开放分页**；若报名量超 200 条，第 201 条起取不到 → 届期规模扩大前必须补路由透传 + 上界校验 |
+| `level` / `grading.level` / `levelFinal` 三者的口径 | `level` + `rawScore` = **提交那一刻**的快照（存库）；`grading` = **按当前配置重算**（不存库）；`levelFinal` = **组委会裁定**（只有组委会能改） | **【2026-10-21 独立评审 Minor T3-9】** 改 `rules/registration-scoring.json` 的权重或阈值后，重读同一条报名会看到 `level`（旧快照）与 `grading.level`（新口径）不一致 —— 这**不是 bug**，而是「评分可复算、裁定不可篡改」两条原则的必然结果。列表的 `level` 过滤走**库内快照**，客户端按等级筛选时以快照为准 |
 
 ---
 

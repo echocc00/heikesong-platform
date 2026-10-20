@@ -266,3 +266,108 @@ test('提交方在列表里能看到自己提交的卡', () => {
   close();
   rmSync(dataDir, { recursive: true, force: true });
 });
+
+test('returned → 重新评估 → 复活为 published（D 级退回后可以补短板再来一次）', () => {
+  // ⚠️ 2026-10-21 独立评审修正（Important I-2：**状态机复活链零断言**）。
+  //    原来只测了「提交 → 评估 → 签级」这一条正向链；
+  //    把 ASSESSABLE 里的 'returned' 删掉、把 approve 的状态守卫放宽，
+  //    全量用例照样全绿（独立评审变异 M18/M19 SURVIVED）。
+  //    实跑确认实现本身正确（returned 的卡能重新评估并复活）—— 但**没有断言保护**。
+  const { db, close, dataDir, rules, edition, enterprise } = setup();
+  const pkg = submitTaskPackage({
+    db, userId: enterprise.id, payload: { ...PAYLOAD, editionId: edition.id }, now: NOW, rules,
+  });
+  assessSolvability({
+    db, taskPackageId: pkg.id,
+    answers: {
+      problem_clarity: 0, data_access: 0, validation: 0,
+      decision_chain: 0, accountability: 0, precedent: 0,
+    },
+    actorId: enterprise.id, now: NOW, rules,
+  });
+  const returned = approveTaskPackage({ db, taskPackageId: pkg.id, grade: 'D', actorId: enterprise.id, now: NOW, rules });
+  assert.equal(returned.status, 'returned');
+  assert.ok(returned.meta.solvability.diagnosticReport, 'D 级必须带诊断报告');
+
+  // 补齐短板后重新评估 → 再签级 → 复活
+  const reassessed = assessSolvability({
+    db, taskPackageId: pkg.id, answers: FULL, actorId: enterprise.id, now: NOW, rules,
+  });
+  assert.equal(reassessed.status, 'assessed');
+  assert.equal(reassessed.solvabilityGrade, 'A');
+  const revived = approveTaskPackage({ db, taskPackageId: pkg.id, grade: 'A', actorId: enterprise.id, now: NOW, rules });
+  assert.equal(revived.status, 'published');
+  assert.equal(revived.grade, 'A');
+  // ⚠️ Minor M-6：复活后**旧的 D 级诊断报告不得残留** ——
+  //    否则已发布的卡上挂着一份「grade: D, score: 0」的过期报告。
+  assert.equal(revived.meta.solvability.diagnosticReport, undefined, '复活后不得残留旧 D 级诊断报告');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('D 级诊断报告的内容必须能指导企业补短板（不是空壳）', () => {
+  // ⚠️ 2026-10-21 独立评审修正（Important I-5：**报告实质内容零断言**）：
+  //    原来只断言 `suggestions.length > 0` —— 但 `suggestions` 有两个独立生产者
+  //    （短板维度 + 否决项提示），只删掉其中一个断言照样通过
+  //    （独立评审变异 M50 / M16 / M17 各自 SURVIVED）。
+  const { db, close, dataDir, rules, edition, enterprise } = setup();
+  const pkg = submitTaskPackage({
+    db, userId: enterprise.id, payload: { ...PAYLOAD, editionId: edition.id }, now: NOW, rules,
+  });
+  assessSolvability({
+    db, taskPackageId: pkg.id,
+    answers: {
+      problem_clarity: 3, data_access: 0, validation: 0,
+      decision_chain: 1, accountability: 0, precedent: 1,
+    },
+    actorId: enterprise.id, now: NOW, rules,
+  });
+  const approved = approveTaskPackage({ db, taskPackageId: pkg.id, grade: 'D', actorId: enterprise.id, now: NOW, rules });
+  const report = approved.meta.solvability.diagnosticReport;
+  assert.equal(report.title, '问题可解性诊断报告');
+  assert.equal(report.grade, 'D');
+  assert.equal(typeof report.score, 'number');
+  assert.equal(report.dimensions.length, 6, '六个维度都要在报告里');
+  // 短板建议必须**点名具体维度**
+  assert.ok(
+    report.suggestions.some((s) => s.includes('数据可得性') || s.includes('责任可归属')),
+    `建议必须点名短板维度，实际 ${JSON.stringify(report.suggestions)}`,
+  );
+  // 否决项必须带**中文标签**（不是 key）
+  assert.ok(report.vetoLabels.length > 0, '否决项标签不得为空');
+  assert.ok(report.vetoLabels.every((l) => !/^[a-z_]+$/.test(l)), '标签必须是中文而不是 key');
+  assert.ok(report.vetoLabels.includes('无法提供《数据授权说明》'));
+  assert.ok(report.vetoLabels.includes('无企业侧唯一责任人'));
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('重签级后旧的 D 级诊断报告不得残留（published 卡上不能挂着退回结论）', () => {
+  // ⚠️ 2026-10-21 独立评审修正（Minor M-6：**旧 D 级报告残留**）。
+  //    独立评审实跑复现：一张被签成 D 级（带《问题可解性诊断报告》）的卡，
+  //    之后**重新签级为 A 并发布**时，旧的诊断报告还挂在 meta 上 ——
+  //    已发布的卡上挂着一份「grade: D, score: 12」的退回结论。
+  //    注意：走「重新评估 → 再签级」这条路时，`assessSolvability` 会整份替换
+  //    meta.solvability，旧报告自然消失 —— **那条路查不出这个缺陷**。
+  //    真正的暴露路径是「D 级 → 直接重签 A」（状态机允许 returned 再签）。
+  const { db, close, dataDir, rules, edition, enterprise } = setup();
+  const pkg = submitTaskPackage({
+    db, userId: enterprise.id, payload: { ...PAYLOAD, editionId: edition.id }, now: NOW, rules,
+  });
+  // 先评估（六维满分、无否决）→ 组委会直接签 D 级
+  assessSolvability({ db, taskPackageId: pkg.id, answers: FULL, actorId: enterprise.id, now: NOW, rules });
+  const downgraded = approveTaskPackage({ db, taskPackageId: pkg.id, grade: 'D', actorId: enterprise.id, now: NOW, rules });
+  assert.equal(downgraded.status, 'returned');
+  assert.ok(downgraded.meta.solvability.diagnosticReport, 'D 级必须带诊断报告');
+
+  // 组委会复核后改签 A 级 → published
+  const revived = approveTaskPackage({ db, taskPackageId: pkg.id, grade: 'A', actorId: enterprise.id, now: NOW, rules });
+  assert.equal(revived.status, 'published');
+  assert.equal(revived.grade, 'A');
+  assert.equal(
+    revived.meta.solvability.diagnosticReport, undefined,
+    '已发布的卡上不得残留旧的 D 级诊断报告',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
