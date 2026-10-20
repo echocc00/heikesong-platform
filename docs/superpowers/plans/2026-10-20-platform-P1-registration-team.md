@@ -1336,8 +1336,9 @@ import { loadRules } from '../src/config.js';
 import { createUser } from '../src/db/repo/users.js';
 import { createEdition } from '../src/db/repo/editions.js';
 import { listRegistrationEvents } from '../src/db/repo/registrationEvents.js';
+import { getRegistration as findRegistrationRow } from '../src/db/repo/registrations.js';
 import {
-  submitRegistration, getRegistration, listRegistrations, decideRegistration,
+  submitRegistration, getRegistration, listRegistrations, decideRegistration, presentRegistration,
 } from '../src/services/registration.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -1485,6 +1486,105 @@ test('申诉：level 省略时只留痕不改级', () => {
   close();
   rmSync(dataDir, { recursive: true, force: true });
 });
+
+test('申诉不得抹掉委员会的终态裁定（status 保持终态，裁定留在 level_final）', () => {
+  // ⚠️ 2026-10-21 独立评审修正（Minor M-4）：原来申诉**无条件**把 status 改成
+  //    'appealed' —— 委员会已裁定 'rejected' 的行被选手申诉一次，终态就从
+  //    status 列上消失了（裁定只留在 level_final 与事件流里，按 status 统计的下游会漏人）。
+  //    独立评审探针实测：改 C 后 status=rejected → 申诉后 status=appealed。
+  const { db, close, dataDir, rules, edition, user } = setup();
+  const reg = submitRegistration({ db, userId: user.id, editionId: edition.id, answers: GOOD, now: NOW, rules });
+  decideRegistration({ db, id: reg.id, level: 'C', decidedBy: user.id, note: '复核不通过', now: NOW, rules });
+  const afterDecision = getRegistration({ db, id: reg.id, viewer: user, rules });
+  assert.equal(afterDecision.status, 'rejected', '前置：委员会裁定后应是终态');
+
+  const appealed = decideRegistration({
+    db, id: reg.id, level: null, decidedBy: user.id, note: '我补充了材料', now: NOW, rules,
+  });
+  assert.equal(appealed.status, 'rejected', '申诉不得把委员会的终态翻走');
+  assert.equal(appealed.levelFinal, 'C', '裁定必须仍在 level_final 上');
+  // 申诉本身仍然要留痕（追加式，不覆盖历史）
+  const events = listRegistrationEvents(db, reg.id);
+  assert.equal(events.length, 3);
+  assert.equal(events[2].to_status, 'appealed');
+  assert.equal(events[2].from_status, 'rejected');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('低分问卷 → C 级且 accepted=false（R-REG-08 C 级不接收）', () => {
+  // ⚠️ 2026-10-21 独立评审修正（Minor M-1：近似恒绿断言）。
+  //    原来唯一的 accepted 断言针对的是一份 **S 级** 报名（accepted 本就为 true），
+  //    把实现改成恒 true 照样通过（独立评审变异 V16 实测：199 条仍全绿）。
+  //    这条用例断言的是 C 级 —— 真值与硬编码在这里分得开。
+  const { db, close, dataDir, rules, edition, user } = setup();
+  const low = {
+    direction: [1, 1, 1, 1, 1],
+    capability: [1, 1, 1, 1, 1],
+    collaboration: [1, 1, 1, 1, 1],
+    open: '我的方向还在探索中',
+    consent: { accepted: true, items: [] },
+  };
+  const reg = submitRegistration({ db, userId: user.id, editionId: edition.id, answers: low, now: NOW, rules });
+  assert.equal(reg.rawScore, 0);
+  assert.equal(reg.level, 'C');
+  assert.equal(reg.grading.accepted, false, 'C 级必须不接收');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('grading 是按当前配置重算的；库内快照 level 不随后续改配置而变', () => {
+  // ⚠️ 2026-10-21 独立评审修正（Minor M-2：**口径无登记、断言缺失**）。
+  //    `level` / `rawScore` 是提交那一刻的快照（存库），`grading` 是按当前配置重算的结果。
+  //    改配置后两者不一致是**有意为之**（快照留痕 + 重算可追），但必须写明并钉住。
+  const { db, close, dataDir, rules, edition, user } = setup();
+  const skewed = {
+    ...GOOD,
+    direction: [5, 5, 5, 5, 5],
+    capability: [1, 1, 1, 1, 1],
+    collaboration: [1, 1, 1, 1, 1],
+  };
+  const reg = submitRegistration({ db, userId: user.id, editionId: edition.id, answers: skewed, now: NOW, rules });
+  assert.equal(reg.level, 'C', '提交时的快照等级');
+  assert.equal(reg.rawScore, 25);
+
+  // 换一份权重明显不同的配置重算
+  const shifted = {
+    ...rules.registration,
+    dimensions: rules.registration.dimensions.map((d) => (
+      d.key === 'direction' ? { ...d, weight: 0.9 } : { ...d, weight: 0.05 }
+    )),
+  };
+  const row = findRegistrationRow(db, reg.id);
+  const recomputed = presentRegistration(row, shifted);
+  assert.equal(recomputed.grading.level, 'S', '换配置后重算结果应当变化');
+  assert.equal(recomputed.grading.score, 90);
+  assert.equal(recomputed.level, 'C', '库内快照不随后配置变');
+  assert.equal(recomputed.rawScore, 25);
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('非唯一约束的插入失败不得被报成 DUPLICATE_REGISTRATION', () => {
+  // ⚠️ 2026-10-21 独立评审修正（Minor M-3：**错误码用错**）。
+  //    原来的兜底正则 `/UNIQUE|constraint/i` 连外键失败也一起吞掉
+  //    （"FOREIGN KEY constraint failed" 里含 "constraint"）
+  //    → 客户端被告知「你已提交过本届报名」，而真实原因是外键失败。
+  const { db, close, dataDir, rules, edition } = setup();
+  let caught = null;
+  try {
+    submitRegistration({
+      db, userId: 'no-such-user', editionId: edition.id, answers: GOOD, now: NOW, rules,
+    });
+  } catch (err) {
+    caught = err;
+  }
+  assert.ok(caught, '必须抛错');
+  assert.notEqual(caught.code, 'DUPLICATE_REGISTRATION', '外键失败不得报成重复报名');
+  assert.ok(!/DUPLICATE/.test(String(caught.message)), '错误信息不得提到重复报名');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -1542,6 +1642,18 @@ function parseJson(text, fallback = null) {
 /**
  * DB 行 → 前端视图。grading 由配置重算（纯函数，可复算），
  * 不额外存一份 explain —— 换配置后重算即得新口径，不留陈旧快照。
+ *
+ * ⚠️ 口径登记（2026-10-21 独立评审 Minor M-2：**同一响应里两个等级可能不同，这是有意的**）：
+ *   - `level` / `rawScore`：**报名提交那一刻**按当时配置算出的**快照**（存库，不可变）
+ *   - `grading.level` / `grading.score`：**按当前配置重算**的结果（不存库）
+ *   - `levelFinal`：**组委会的裁定**（改级后写 `level_final`，只有组委会能改）
+ *   改了 `rules/registration-scoring.json` 的权重或阈值后，重读同一条报名会看到
+ *   `level`（旧快照）与 `grading.level`（新口径）不一致 —— 这**不是 bug**，而是
+ *   「评分可复算、裁定不可篡改」两条原则的必然结果：
+ *   - 快照留痕：事后复算能对上当时的判分依据
+ *   - 重算可追：换配置后能立刻看到「按新口径这个人会是几级」
+ *   列表的 `level` 过滤走**库内快照**（`src/db/repo/registrations.js`），
+ *   与 `grading` 不同源 —— 客户端按等级筛选时以快照为准。
  */
 export function presentRegistration(row, config) {
   if (!row) return null;
@@ -1616,7 +1728,15 @@ export function submitRegistration({
     });
   } catch (err) {
     // 并发下由数据库唯一索引兜底 → 同样 409，绝不静默覆盖
-    if (/UNIQUE|constraint/i.test(String(err.message))) {
+    //
+    // ⚠️ 2026-10-21 独立评审修正（Minor M-3，错误码用错）：原来用 `/UNIQUE|constraint/i`
+    //    —— 这条正则**连外键失败也一起吞掉**（"FOREIGN KEY constraint failed" 里有
+    //    "constraint"）。后果：user_id 指向不存在的用户（外键失败）会被报成
+    //    409 DUPLICATE_REGISTRATION「你已提交过本届报名」—— 客户端被告知一个
+    //    完全错误的原因（独立评审探针实测复现）。
+    //    收紧为**只认 registrations 的唯一索引**：
+    //    实测原文 = "UNIQUE constraint failed: registrations.user_id, registrations.edition_id"
+    if (/UNIQUE constraint failed: registrations\./i.test(String(err.message))) {
       throw new AppError(409, 'DUPLICATE_REGISTRATION', '你已提交过本届报名，不能重复提交');
     }
     throw err;
@@ -1685,7 +1805,18 @@ export function decideRegistration({
       reason: note ?? '选手申诉',
       now,
     });
-    const updated = updateRegistrationRow(db, id, { status: 'appealed' });
+    // ⚠️ 2026-10-21 独立评审修正（Minor M-4，**申诉不得抹掉委员会的终态裁定**）：
+    //    原来无条件把 status 改成 'appealed' —— 委员会已裁定 'accepted' / 'rejected'
+    //    的行，被选手申诉一次就把 status 从终态翻走（裁定只留在 level_final 与事件流里，
+    //    按 status 统计/放行的下游会漏掉这个人）。
+    //    独立评审探针实测：
+    //      B1 委员会改 C 后: status=rejected  levelFinal=C
+    //      B2 选手申诉后  : status=appealed  levelFinal=C   ← 终态被抹
+    //    现在：**只有尚无终态的行**才把 status 标成 'appealed'（表示「有申诉待处理」）；
+    //    已有终态的行保持 status 不变，申诉只进事件流 —— 终态裁定不可被选手改写。
+    const patch = {};
+    if (!['accepted', 'rejected'].includes(row.status)) patch.status = 'appealed';
+    const updated = updateRegistrationRow(db, id, patch);
     return presentRegistration(updated, config);
   }
 
@@ -1736,16 +1867,24 @@ export function registerRegistrationRoutes({ router, db, rules }) {
 
   router.add('POST', '/api/registrations', async ({ user, body }) => {
     if (!user) throw new AppError(401, 'UNAUTHENTICATED', '未登录');
+    const { editionId, answers } = body ?? {};
+    if (!editionId) throw new AppError(400, 'MISSING_EDITION_ID', '缺少届期');
     // ⚠️ 2026-10-21 验收修正（规格缺陷）：`registration:write` 这个能力点被注册、
     //    被授予（seed 里给了 captain / member，测试里也显式授予），
     //    但**路由从不校验它** → 能力点形同虚设，违反全局约束
     //    「权限模型 = capability + assignment，`can()` 是唯一判定入口」。
     //    已登录但没有该能力 → 403（三态：禁用 → 403；不是 404，资源不存在才用 404）。
-    if (!can(user, 'registration:write', null, db)) {
+    //
+    // ⚠️ 2026-10-21 独立评审修正（Minor M-6）：能力点校验**要带 edition 作用域**。
+    //    原来传 `ctx = null` —— `can()` 遇到 `ctx === null` 时**跳过**资源级授权的
+    //    scope 匹配 → 只有 `scope_type='global'` 的授权能通过，
+    //    委员会若用 `scope_type='edition'` 授予 `registration:write`，该用户**无法报名**
+    //    （独立评审探针实测：global 授权 can(null ctx)=true / edition 授权 can(null ctx)=false /
+    //    edition 授权 can(edition ctx)=true）。
+    //    现在把已经解析出来的 editionId 传进去，作用域授权与全局授权都能认。
+    if (!can(user, 'registration:write', { scopeType: 'edition', scopeId: editionId }, db)) {
       throw new AppError(403, 'FORBIDDEN', '你没有提交报名的权限');
     }
-    const { editionId, answers } = body ?? {};
-    if (!editionId) throw new AppError(400, 'MISSING_EDITION_ID', '缺少届期');
     return submitRegistration({ db, userId: user.id, editionId, answers, rules });
   });
 
@@ -1793,7 +1932,12 @@ function buildCriteria(rules, db) {
   const reg = rules.registration;
   const comp = rules.compliance ?? {};
   // 当届届期一并返回：前端据此提交报名 / 建队，省掉一个契约外的端点
-  const edition = db ? (listEditions(db)[0] ?? null) : null;
+  // ⚠️ 2026-10-21 独立评审修正（Minor M-9）：取**当届**，不是「最早的一届」。
+  //    listEditions 按 starts_at 排序 → [0] 永远是历史最早的那届；
+  //    多届期场景下前端拿到的 editionId 不是当前届 → 报名页会引导用户报错届期
+  //    （独立评审探针实测：多届期时返回的是历史届期）。
+  //    判据：**尚未结束**（ends_at >= 今天）的最早一届；都没有就退回最后一届。
+  const edition = db ? pickCurrentEdition(listEditions(db)) : null;
   return {
     editionId: edition?.id ?? null,
     editionName: edition?.name ?? null,
@@ -1823,6 +1967,18 @@ function buildCriteria(rules, db) {
     // R-STG-01：赛段时间轴
     schedule: rules.schedule?.stages ?? [],
   };
+}
+
+/**
+ * 挑「当届」：尚未结束（ends_at >= 今天）的最早一届；都没有就退回最后一届。
+ * 单独导出便于直接测边界（与 domainCode / isSameFile 同款：纯函数一律导出）。
+ *
+ * ⚠️ `today` 可注入：默认取真实日期，但**测试必须能钉住「今天」**，
+ *    否则「哪一届是当届」这条断言会随日历漂移变成 flaky。
+ */
+export function pickCurrentEdition(editions, today = new Date().toISOString().slice(0, 10)) {
+  if (!Array.isArray(editions) || editions.length === 0) return null;
+  return editions.find((e) => String(e.ends_at) >= today) ?? editions[editions.length - 1];
 }
 ```
 
@@ -1863,7 +2019,23 @@ import { registerRegistrationRoutes } from './http/routes/registration.js';
 > 条数已在 P0 计划里声明（23 条）。往里加用例会让 P0 计划的条数声明当场过期
 > → 跨阶段的同一条纪律是「计划声明的条数 == 实跑条数」，改一处要改两处。
 > P1 自己新增配置的断言放在 **P1 自己的文件** `test/config-p1.test.js`（4 条）→
-> P0 的文件与计划**一字不动**。
+> **P0 的文件不加用例**。
+>
+> **⚠️ 2026-10-21 独立评审修正（M-7：原来说法「一字不动」与实现不符）**：
+> P1 分支里 `platform/test/config.test.js` 的**措辞**被订正过 3 处
+> （「9 份」→「全部规则配置」三处测试名与一条注释）——
+> P1 加了 3 份配置后，「9 份」这个数字已经过期，属于事实性错误。
+> **条数（23）与断言一字未动**，只是把随配置份数会过期的措辞改成版本无关的说法。
+>
+> **为什么 P0 计划的代码块不跟着改**：P0 计划是 **P0 阶段的历史规格**，
+> 必须与 main / `feat/p0-foundation` 保持**同一份**（P0 阶段确实是 9 份配置，那三条表述在当时准确无误）。
+> 本分支把 P0 计划改一份，等于让同一个历史文档在不同分支有两副面孔 ——
+> 合并 P1 回 main 时还要再解一次冲突。
+> 跨阶段的纪律靠**变更登记**兜住，不靠改历史规格：
+> 本计划已逐条登记 P1 对 P0 文件的修改（`test/migrate.test.js` 见 Task 1 Files 段；
+> `test/config.test.js` 的措辞订正见上）。
+> 用「P0 计划的代码块 ↔ 实现」这条一致性检查时，**基准只能是 P0 worktree** ——
+> 拿 P0 计划去比一棵更晚的树，天然会看到 P1 声明过的那些差异。
 >
 
 - [ ] **Step 7: 创建 P1 新增的 3 份规则配置并扩展 src/config.js**
@@ -2091,6 +2263,7 @@ import { createEdition } from '../src/db/repo/editions.js';
 import { createSession } from '../src/auth/session.js';
 import { grantAssignment } from '../src/auth/permissions.js';
 import { insertCapability } from '../src/db/repo/capabilities.js';
+import { pickCurrentEdition } from '../src/http/routes/registration.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrationsDir = join(here, '..', 'db', 'migrations');
@@ -2180,6 +2353,15 @@ test('GET /api/registration-criteria 无需登录即可读（筛选标准对外�
   assert.equal(body.dimensions.length, 3);
   assert.equal(body.levels.find((l) => l.key === 'S').minScore, 80);
   assert.equal(body.funnel.length, 5);
+  // ⚠️ 2026-10-21 独立评审修正（Important I-1：合规 / IP / 赛程披露**零断言**）。
+  //    这四项是 R-ENT-11 / R-ENT-12 / R-STG-01 的**唯一对外出口**
+  //    （前端读不到 rules/*.json 目录，见计划 D-3）。
+  //    原来把它们从 buildCriteria 里删掉，全量用例照样全绿 —— 需求在产品上静默失效。
+  //    独立评审变异 V14 实测：删掉这 4 个字段 → 199 条仍全绿。
+  assert.ok(body.ipOwnership && body.ipOwnership.team, 'R-ENT-11：IP 归属必须在报名页明示');
+  assert.ok(Array.isArray(body.redLines) && body.redLines.length >= 5, 'R-ENT-12：合规红线必须公开');
+  assert.equal(body.consent?.required, true, 'R-ENT-12：同意条款必须公开');
+  assert.equal(body.schedule?.length, 5, 'R-STG-01：5 个赛段时间轴必须公开');
   s.close();
   rmSync(s.dataDir, { recursive: true, force: true });
 });
@@ -2243,6 +2425,14 @@ test('GET /api/registrations/:id 本人可读、他人 → 404', async () => {
   const id = JSON.parse(created.body).id;
   const mine = await call(s.app, 'GET', `/api/registrations/${id}`, { token: s.tokenUser });
   assert.equal(mine.status, 200);
+  // ⚠️ 2026-10-21 独立评审修正（Important I-2：状态机**留痕零断言**）。
+  //    GET /api/registrations/:id 是 registration_events 唯一的对外出口，
+  //    也是 Task 3「改级留痕」承诺的落点。
+  //    原来把 events 拼装改成空数组，全量用例照样全绿（独立评审变异 V15 实测）。
+  const mineBody = JSON.parse(mine.body);
+  assert.equal(mineBody.events.length, 1, '刚提交完应当只有一条「提交」事件');
+  assert.equal(mineBody.events[0].toStatus, 'submitted');
+  assert.equal(mineBody.events[0].fromStatus, null);
   const theirs = await call(s.app, 'GET', `/api/registrations/${id}`, { token: s.tokenOther });
   assert.equal(theirs.status, 404);
   s.close();
@@ -2263,9 +2453,76 @@ test('POST /api/registrations/:id/level 组委会改级成功，选手改级 →
     token: s.tokenAdmin, body: { level: 'B', note: '复核：能力维需补材料' },
   });
   assert.equal(byAdmin.status, 200);
-  assert.equal(JSON.parse(byAdmin.body).levelFinal, 'B');
+  const adminBody = JSON.parse(byAdmin.body);
+  assert.equal(adminBody.levelFinal, 'B');
+  // ⚠️ 2026-10-21 独立评审修正（Important I-2：改级后**留痕零断言**）。
+  //    改级必须追加一条事件，且 from_status 是改级前的状态 —— 审计链的落点。
+  //    留痕的对外出口是 GET /api/registrations/:id（events 字段），
+  //    所以这里改级后回读一次，把「留痕」钉在 API 层而不是只钉在仓储层。
+  const after = await call(s.app, 'GET', `/api/registrations/${id}`, { token: s.tokenAdmin });
+  assert.equal(after.status, 200);
+  const afterBody = JSON.parse(after.body);
+  assert.equal(afterBody.events.length, 2, '提交 + 改级 = 两条事件');
+  assert.equal(afterBody.events[1].fromStatus, 'submitted');
+  assert.equal(afterBody.events[1].toStatus, 'accepted');
   s.close();
   rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('POST /api/registrations/:id/level 未登录 → 401', async () => {
+  // ⚠️ 2026-10-21 独立评审修正（Minor M-5：401 路径零断言）。
+  //    独立评审变异 V21：删掉路由里的 401 判断 → 全量用例照样全绿，
+  //    行为会退化成 404 / 500。
+  const s = setup();
+  const created = await call(s.app, 'POST', '/api/registrations', {
+    token: s.tokenUser, body: { editionId: s.edition.id, answers: GOOD },
+  });
+  const id = JSON.parse(created.body).id;
+  const res = await call(s.app, 'POST', `/api/registrations/${id}/level`, { body: { level: 'S' } });
+  assert.equal(res.status, 401);
+  assert.equal(JSON.parse(res.body).error.code, 'UNAUTHENTICATED');
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('GET /api/registration-criteria 返回当届，不是历史最早的一届', async () => {
+  // ⚠️ 2026-10-21 独立评审修正（Minor M-9：取「最早的一届」而不是「当届」）。
+  //    原来 listEditions(db)[0] 永远是 starts_at 最早的那届 → 多届期场景下
+  //    前端拿到的 editionId 不是当前届，报名页会引导用户报错届期。
+  //    这里只断言「**历史届期不得被当成当届**」—— 不绑定具体是哪一届，
+  //    避免把断言写成随日历漂移的 flaky 用例（当届是谁由真实日期决定）。
+  const s = setup();
+  createEdition(s.db, {
+    name: '往届', city: '上海', startsAt: '2020-01-01', endsAt: '2020-12-31',
+  });
+  createEdition(s.db, {
+    name: '在办', city: '上海', startsAt: '2099-01-01', endsAt: '2099-12-31',
+  });
+  const res = await call(s.app, 'GET', '/api/registration-criteria');
+  assert.equal(res.status, 200);
+  const body = JSON.parse(res.body);
+  assert.notEqual(body.editionName, '往届', '历史届期不得被当成当届');
+  assert.ok(body.editionId, '必须给出届期 id');
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('pickCurrentEdition：按「尚未结束」挑当届，且 today 可注入（不随日历漂移）', () => {
+  // ⚠️ 2026-10-21 独立评审修正（Minor M-9）：today 必须可注入 ——
+  //    否则「哪一届是当届」这条断言会随真实日历变成 flaky 用例。
+  const editions = [
+    { id: 'past', ends_at: '2020-12-31' },
+    { id: 'now', ends_at: '2026-10-31' },
+    { id: 'later', ends_at: '2099-12-31' },
+  ];
+  assert.equal(pickCurrentEdition(editions, '2026-10-21').id, 'now');
+  assert.equal(pickCurrentEdition(editions, '2026-10-31').id, 'now', '结束当天仍算当届');
+  assert.equal(pickCurrentEdition(editions, '2020-06-01').id, 'past');
+  // 全部已结束 → 退回最后一届
+  assert.equal(pickCurrentEdition([{ id: 'a', ends_at: '2019-01-01' }], '2026-10-21').id, 'a');
+  // 空集 → null
+  assert.equal(pickCurrentEdition([], '2026-10-21'), null);
+  assert.equal(pickCurrentEdition(null, '2026-10-21'), null);
 });
 
 test('问卷不完整 → 400 INVALID_ANSWERS，且响应体带 detail（前端要知道缺哪几题）', async () => {
@@ -2304,6 +2561,27 @@ test('已登录但没有 registration:write 能力 → 403（能力点必须真�
   s.close();
   rmSync(s.dataDir, { recursive: true, force: true });
 });
+
+test('edition 作用域的 registration:write 授权也能报名（能力点校验要带作用域）', async () => {
+  // ⚠️ 2026-10-21 独立评审修正（Minor M-6：作用域授权被误拒）。
+  //    原来路由传 `ctx = null` —— `can()` 在 ctx 为空时**跳过**资源级授权的 scope 匹配
+  //    → 只有 scope_type='global' 的授权能通过，
+  //    组委会若用 scope_type='edition' 授予 registration:write，该用户**无法报名**
+  //    （独立评审探针实测：global 授权 can(null ctx)=true / edition 授权 can(null ctx)=false）。
+  const s = setup();
+  const scoped = createUser(s.db, { name: '届期授权者', phone: '13900003005', password: 'pw', mbaStatus: 'mba' });
+  grantAssignment(s.db, {
+    userId: scoped.id, capability: 'registration:write',
+    scopeType: 'edition', scopeId: s.edition.id, grantedBy: s.admin.id,
+  });
+  const token = createSession(s.db, scoped.id).token;
+  const res = await call(s.app, 'POST', '/api/registrations', {
+    token, body: { editionId: s.edition.id, answers: GOOD },
+  });
+  assert.equal(res.status, 200, `edition 作用域授权必须放行，实际 ${res.status}`);
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
 ```
 
 - [ ] **Step 9: 创建 test/config-p1.test.js**
@@ -2318,7 +2596,9 @@ test('已登录但没有 registration:write 能力 → 403（能力点必须真�
 //   往里加用例会让 P0 计划的条数声明当场过期 —— 跨阶段的同一条纪律是
 //   「计划声明的条数 == 实跑条数」，改一处要改两处。
 //   P1 自己新增的配置（P1 加了 teamFormation / schedule / compliance 三份）
-//   相关断言放在 P1 自己的文件里 → P0 的文件与计划**一字不动**。
+//   相关断言放在 P1 自己的文件里 → P0 的文件**不加用例**（条数 23 不变）。
+//   ⚠️ 2026-10-21 独立评审修正（M-7）：措辞（「9 份」→「全部规则配置」）在 P1 分支
+//      被订正过 —— 那是**版本无关化**，不是加用例；断言与条数一字未动。
 //
 // 依据：设计文档 §4.2「运行时与依赖」+ §6.1「三条设计原则」+ §6.7「配置清单」
 //   「version 会写进计算 trace」—— version 漂移 = 审计链在说谎。
@@ -2400,7 +2680,7 @@ test('配置份数对不上会被拒绝（整份配置没被识别到）', () =>
 - [ ] **Step 10: 运行测试确认通过**
 
 Run: `cd platform && node --test test/registration-service.test.js test/registration-api.test.js test/config-p1.test.js`
-Expected: PASS（24 个测试全过：registration-service 10 + registration-api 10 + config-p1 4）
+Expected: PASS（32 个测试全过：registration-service 14 + registration-api 14 + config-p1 4）
 
 - [ ] **Step 11: 提交**
 
@@ -5376,6 +5656,31 @@ git commit -m "feat(P1): 端到端串联与种子扩充（报名→分级→建�
 
 ---
 
+## Task 3 独立评审处置台账（2026-10-21）
+
+> Task 3 完工后由**独立 verifier** 评审（报告：`.superpowers/sdd/2026-10-20-platform-P1-registration/task-3-review.md`），
+> 结论 **Needs fixes：0 Critical / 2 Important / 10 Minor**。基线 199/199 连跑 3 次一致，
+> 9 个文件级代码块与计划逐字一致，P0 的 3 Important + 8 Minor + 复核 F-1~F-6 **全部未回退**。
+> 下表是逐条处置结果；**9 条修复全部做了变异检验（9/9 杀灭，见「变异验证」列）**。
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 | 变异验证 |
+|---|---|---|---|---|---|
+| **T3-1** | **Important** | `buildCriteria` 的合规 / IP / 赛程披露（`ipOwnership` / `redLines` / `consent` / `schedule`）**零断言** —— 这四项是 R-ENT-11 / R-ENT-12 / R-STG-01 的**唯一对外出口**，删掉后需求在产品上静默失效而 CI 全绿 | 评审变异 V14：删掉这 4 个字段 → **全量 199 条仍全绿** | `test/registration-api.test.js` 的 criteria 用例补 4 条断言 | ✅ 杀灭 |
+| **T3-2** | **Important** | `getRegistration` 的 `events` 状态机留痕**零断言** —— `registration_events` 唯一的对外出口，审计链在 API 层消失无人察觉 | 评审变异 V15：`out.events` 置空 → **全量 199 条仍全绿** | 补 `mine.events.length === 1` / `toStatus === 'submitted'` / `fromStatus === null`；改级用例改后回读一次，断言 `events.length === 2` / `fromStatus === 'submitted'` / `toStatus === 'accepted'` | ✅ 杀灭 |
+| **T3-3** | Minor | `grading.accepted` 断言**无区分能力**（唯一一条断言针对 S 级报名，把实现改成恒 `true` 照样通过） | 评审变异 V16：`accepted: graded.accepted` → `accepted: true` → **全量仍全绿** | 新增低分问卷用例 → `level === 'C'` 且 `grading.accepted === false`（C 级不接收） | ✅ 杀灭 |
+| **T3-4** | Minor | 幂等兜底正则 `/UNIQUE\|constraint/i` **过宽** → `FOREIGN KEY constraint failed` 也被吞成 409 `DUPLICATE_REGISTRATION`（客户端被告知「你已重复报名」） | 评审探针：传不存在的 `userId` → 实测 `409 / DUPLICATE_REGISTRATION` | 正则收紧为 `/UNIQUE constraint failed: registrations\./i`（实测原文 `UNIQUE constraint failed: registrations.user_id, registrations.edition_id`）；新增用例断言外键失败**不得**报成重复报名 | ✅ 杀灭 |
+| **T3-5** | Minor | 选手申诉**无条件**把 `status` 改成 `'appealed'` → 委员会已裁定 `'accepted'` / `'rejected'` 的行，终态从 `status` 列上消失（按 status 统计的下游会漏人） | 评审探针：改 C 后 `status=rejected` → 申诉后 `status=appealed` | 只有**尚无终态**的行才标 `'appealed'`；已有终态的行保持 status 不变，申诉只进事件流 | ✅ 杀灭 |
+| **T3-6** | Minor | `POST /api/registrations/:id/level` 的 **401 未登录路径零断言** | 评审变异 V21：删掉 401 判断 → **全量仍全绿** | 补用例：匿名 → 401 + `error.code === 'UNAUTHENTICATED'` | ✅ 杀灭 |
+| **T3-7** | Minor | 能力点校验传 `ctx = null` → `scope_type='edition'` 的 `registration:write` 授权**被误拒**（该用户无法报名） | 评审探针：global 授权 `can(null ctx)=true` / edition 授权 `can(null ctx)=false` | 校验移到解析 `editionId` 之后并带 `{ scopeType:'edition', scopeId: editionId }`；新增用例断言 edition 作用域授权能报名 | ✅ 杀灭 |
+| **T3-8** | Minor | `GET /api/registration-criteria` 返回的是**最早开始**的一届，不是**当届** | 评审探针：多届期时返回历史届期 | 新增 `pickCurrentEdition(editions, today?)`：取尚未结束的最早一届；`today` **可注入**（否则断言会随日历漂移变成 flaky）；配套单测 | ✅ 杀灭 |
+| **T3-9** | Minor | `level`（库内快照）与 `grading.level`（当前配置重算）**口径无登记、断言缺失** → 换配置后同一响应里两个等级矛盾 | 评审探针：换配置后 `level='B'` 与 `grading.level='A'` 并存；变异 V17（grading 改读库值）→ 全量仍全绿 | 在 `presentRegistration` 上方**登记口径**（快照留痕 + 重算可追 + 裁定不可篡改）；新增用例断言「换配置后 `grading` 变、快照不变」 | ✅ 杀灭 |
+| **T3-10** | Minor | P0 的 `test/config.test.js` 的措辞（「9 份」）在 P1 分支过期 → P1 计划却写「一字不动」，与实现自相矛盾 | 评审核对：P1 分支该文件已改成「全部规则配置」，P1 计划仍写「一字不动」 | ① P1 计划的「一字不动」改成**准确表述**（「不加用例」—— 条数 23 与断言一字未动，只订正了 3 处会随配置份数过期的措辞）；② **P0 计划保持历史原样**（它是 P0 阶段的历史规格，必须与 main / `feat/p0-foundation` 同一份；跨阶段的一致性靠变更登记兜住，不靠改历史规格）；③ 提交信息里的用例数订正为 193 → 199 | — |
+| **T3-11** | Minor | 列表端点未暴露分页参数，`limit` 硬编码 200 | — | **本期不提供分页**（口径已登记，见下方「口径」表）；报名量级在一届之内不会到 200+ | — |
+
+**Task 3 的测试条数口径**：registration-service **14** + registration-api **14** + config-p1 **4** = **32**。
+
+---
+
 ## Task 4 父代理预审修正台账（2026-10-21）
 
 > Task 4 的规格在**实施前**先被父代理逐条实跑预审，发现 **2 Critical + 5 Important + 2 Minor**，
@@ -5424,7 +5729,9 @@ git commit -m "feat(P1): 端到端串联与种子扩充（报名→分级→建�
 | 分级落在档位间隙时向下取档 | 分值落在两档之间（例如 6.8）取更低一档 | 六维分值是 0–12 的连续量，档位是 10-12 / 7-9 / 4-6 / 0-3，间隙必然存在。**我方假设** |
 | R-REG-01「报名即认领任务包」的落点 | 认领动作落在**建队时刻**（`teams.task_package_id`），报名表不带任务包字段 | 设计文档 §10 流 1 写的是「队长建队 → 认领任务包 → 成员加入」，且契约的 `registrations` 表无任务包列。**若组委会要求「报名表里就选任务包」**，需在 `002_registration.sql` 给 `registrations` 加列 → 契约变更 |
 | `GET /api/registrations` 不带 `editionId` 的含义 | 返回**全部届期**的报名（组委会视角）；带 `editionId` 才按届期过滤 | 与「全局授权不做行级过滤」一致（`scopeClause` 对 `scope_type='global'` 的授权不设限）。**带版期授权的组委会成员**（`scope_type='edition'`）在不带 `editionId` 时看不到任何行 —— 因为 `scopeId` 为空、匹配不上任何一版。⚠️ 若组委会希望「不带 editionId 时只看自己有权限的届期」，需要把 `editionId` 变成**必填**（契约变更） |
-| `POST /api/registrations` 的能力点校验 | 已登录 + `can(user, 'registration:write', …)` 才放行，否则 **403** | **【2026-10-21 父代理验收修正】** 计划原文只判「有没有登录」→ `registration:write` 这个被注册、被 seed 授予的能力点**形同虚设**，违反全局约束「`can()` 是唯一判定入口」。⚠️ **副作用**：新注册的账号若没有任何角色 / 授权，将无法报名（seed 里 captain 与 member 都有 `registration:write`，所以正常路径不受影响）。若组委会要求「任何人注册后即可报名」，则应改为「报名成功时自动授予 member 角色」—— 那是契约变更 |
+| `POST /api/registrations` 的能力点校验 | 已登录 + `can(user, 'registration:write', { scopeType:'edition', scopeId: editionId })` 才放行，否则 **403** | **【2026-10-21 父代理验收修正】** 计划原文只判「有没有登录」→ `registration:write` 这个被注册、被 seed 授予的能力点**形同虚设**，违反全局约束「`can()` 是唯一判定入口」。⚠️ **副作用**：新注册的账号若没有任何角色 / 授权，将无法报名（seed 里 captain 与 member 都有 `registration:write`，所以正常路径不受影响）。若组委会要求「任何人注册后即可报名」，则应改为「报名成功时自动授予 member 角色」—— 那是契约变更。**【2026-10-21 独立评审修正 T3-7】** 作用域从 `null` 改成 edition —— 原来传 `ctx = null` 时 `can()` 会**跳过**资源级授权的 scope 匹配 → `scope_type='edition'` 的授权会被误拒（该用户无法报名） |
+| `GET /api/registrations` 列表**不提供分页** | `limit` 硬编码 200、offset 恒 0；query 里的 `limit` / `offset` 被忽略 | **【2026-10-21 独立评审 Minor T3-11】** 仓储层（`listRegistrationRows`）已经支持 `limit` / `offset`，但路由没有透传。一届的报名量级远不到 200 条，**本期不开放分页**；若报名量超 200 条，第 201 条起取不到 → 届期规模扩大前必须补路由透传 + 上界校验 |
+| `level` / `grading.level` / `levelFinal` 三者的口径 | `level` + `rawScore` = **提交那一刻**的快照（存库）；`grading` = **按当前配置重算**（不存库）；`levelFinal` = **组委会裁定**（只有组委会能改） | **【2026-10-21 独立评审 Minor T3-9】** 改 `rules/registration-scoring.json` 的权重或阈值后，重读同一条报名会看到 `level`（旧快照）与 `grading.level`（新口径）不一致 —— 这**不是 bug**，而是「评分可复算、裁定不可篡改」两条原则的必然结果。列表的 `level` 过滤走**库内快照**，客户端按等级筛选时以快照为准 |
 
 ---
 
