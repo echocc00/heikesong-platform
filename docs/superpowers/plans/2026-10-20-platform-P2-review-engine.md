@@ -14,7 +14,7 @@
 运行时      Node ≥ 22.5（不使用任何 Node-24-only API；URLPattern 不可用，路由手写）
 npm 依赖    0 个。package.json 只有 {"type":"module"}，不得新增 dependencies
 数据库      node:sqlite。data/app.db，WAL 模式。单写者：禁止多 worker 写同一文件
-测试        node:test。命令：node --test test/
+测试        node:test。命令：node --test
 密码        node:crypto scrypt，存储格式 scrypt$N$r$p$<salt_b64>$<hash_b64>，比对用 timingSafeEqual
 会话        服务端 session 表，token 只存 SHA-256 哈希；Cookie HttpOnly + SameSite=Lax + Path=/
 代码目录    platform/
@@ -4150,7 +4150,7 @@ Expected: PASS（10 + 3 = 13 个测试全过）
 
 - [ ] **Step 11: 全量测试**
 
-Run: `cd platform && node --test test/`
+Run: `cd platform && node --test`
 Expected: 全部通过
 
 - [ ] **Step 12: 提交**
@@ -4199,7 +4199,7 @@ git commit -m "feat(P2): scoreStage 总装、compute 快照服务与 9 条评审
 | P2-9 | 关键唯一约束 | `node --test test/migration-review.test.js` 通过：重复 `stage_reviews` / `peer_reviews` 插入被数据库拒绝；`score_stats` 主键为 (judge_id, dimension) |
 | P2-10 | 可复算 | `node --test test/compute.test.js` 通过：快照含 `input_json` / `output_json` / `trace_json`；重复 compute 的 revision 为 1、2 |
 | P2-11 | 零依赖 | `node --test test/zero-deps.test.js` 通过；`platform/` 下无 `node_modules`、无 `package-lock.json` |
-| P2-12 | 全量回归 | `cd platform && node --test test/` 全部通过（含 P0 原有用例） |
+| P2-12 | 全量回归 | `cd platform && node --test` 全部通过（含 P0 原有用例） |
 
 ---
 

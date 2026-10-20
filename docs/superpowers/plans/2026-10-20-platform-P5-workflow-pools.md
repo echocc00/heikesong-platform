@@ -20,7 +20,7 @@
 运行时      Node ≥ 22.5（不使用任何 Node-24-only API；URLPattern 不可用，路由手写）
 npm 依赖    0 个。package.json 只有 {"type":"module"}，不得新增 dependencies
 数据库      node:sqlite。data/app.db，WAL 模式。单写者：禁止多 worker 写同一文件
-测试        node:test。命令：node --test test/
+测试        node:test。命令：node --test
 密码        node:crypto scrypt，存储格式 scrypt$N$r$p$<salt_b64>$<hash_b64>，比对用 timingSafeEqual
 会话        服务端 session 表，token 只存 SHA-256 哈希；Cookie HttpOnly + SameSite=Lax + Path=/
 代码目录    platform/
@@ -2924,7 +2924,7 @@ import { registerPublicRoutes } from './routes/public.js';
 Run: `cd platform && node --test test/public-api.test.js`
 Expected: PASS（10 个测试全过）
 
-Run: `cd platform && node --test test/`
+Run: `cd platform && node --test`
 Expected: 全部通过（P0–P5 累计）
 
 - [ ] **Step 9: 提交**
@@ -3686,7 +3686,7 @@ route('/tasks/:workflowId', (ctx) => renderTasks(ctx));
 Run: `cd platform && node --test test/workflow-e2e.test.js`
 Expected: PASS（1 个端到端用例通过）
 
-Run: `cd platform && node --test test/`
+Run: `cd platform && node --test`
 Expected: 全部通过
 
 - [ ] **Step 6: 人工验收任务清单页**

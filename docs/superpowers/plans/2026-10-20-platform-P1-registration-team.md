@@ -14,7 +14,7 @@
 运行时      Node ≥ 22.5（不使用任何 Node-24-only API；URLPattern 不可用，路由手写）
 npm 依赖    0 个。package.json 只有 {"type":"module"}，不得新增 dependencies
 数据库      node:sqlite。data/app.db，WAL 模式。单写者：禁止多 worker 写同一文件
-测试        node:test。命令：node --test test/
+测试        node:test。命令：node --test
 密码        node:crypto scrypt，存储格式 scrypt$N$r$p$<salt_b64>$<hash_b64>，比对用 timingSafeEqual
 会话        服务端 session 表，token 只存 SHA-256 哈希；Cookie HttpOnly + SameSite=Lax + Path=/
 代码目录    platform/
@@ -4391,7 +4391,7 @@ function seedP1({ db, rules, adminId }) {
 
 - [ ] **Step 4: 运行全量测试**
 
-Run: `cd platform && node --test test/`
+Run: `cd platform && node --test`
 Expected: 全部通过（P0 的用例 + P1 的 9 个测试文件）
 
 - [ ] **Step 5: 实跑种子与迁移**
@@ -4429,7 +4429,7 @@ git commit -m "feat(P1): 端到端串联与种子扩充（报名→分级→建�
 | P1-7 | D 级必须出诊断报告 | 六维 0 分任务卡 `approveTaskPackage(grade='D')` 后 `meta_json.solvability.diagnosticReport.title === '问题可解性诊断报告'`；一票否决命中时不得签成 A 级 |
 | P1-8 | 任务卡配比 | `checkTaskMix` 在自由题 30%、B 端 A40/B20/C10 时 `ok === true`；偏离时返回带 `[TASK_MIX_*]` 错误码的数组 |
 | P1-9 | 可见性 | 选手 `GET /api/registrations` → 200 + `items: []`；读他人报名 → 404；`GET /api/registration-criteria` → 200 公开；`GET /api/task-packages` 选手只看到 `published` |
-| P1-10 | 全链路 + 零依赖 | `node --test test/` 全过；`node --test test/e2e-p1.test.js` 跑通「报名→分级→建队→认领→加人」；`node --test test/zero-deps.test.js` 仍过且无 `node_modules` |
+| P1-10 | 全链路 + 零依赖 | `node --test` 全过；`node --test test/e2e-p1.test.js` 跑通「报名→分级→建队→认领→加人」；`node --test test/zero-deps.test.js` 仍过且无 `node_modules` |
 
 ---
 

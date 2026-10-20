@@ -48,7 +48,12 @@ P0 ──→ P1 ──→ P2 ──→ P3 ──→ P4 ──→ P5 ──→ P6
 运行时      Node ≥ 22.5（生产建议 24；不使用任何 Node-24-only API）
 npm 依赖    0 个。package.json 只有 {"type":"module"}，不得新增 dependencies
 数据库      node:sqlite（内置，无原生编译）。单文件 data/app.db，WAL 模式
-测试        node:test（内置）。命令：node --test test/
+测试        node:test（内置）。命令：node --test
+            ⚠️ 不要写成 `node --test test/`：Node 22 的位置参数按 glob/模块路径处理，
+               目录【不会】被展开 → MODULE_NOT_FOUND，pass 0 / fail 1。
+               实测（Node v22.23.2）：`node --test` ✅ ｜ `node --test test/` ❌ ｜
+               `node --test test/xxx.test.js` ✅（单文件形式合法）
+               依据：设计文档 §4.3 的 package.json 片段本身就是 `"test":"node --test"`。
 密码        node:crypto scrypt，格式 scrypt$N$r$p$salt$hash
 会话        服务端 session 表，token 只存 SHA-256 哈希；Cookie HttpOnly+SameSite=Lax
 实时        SSE（text/event-stream），不用 WebSocket

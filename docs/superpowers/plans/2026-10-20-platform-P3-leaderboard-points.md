@@ -14,7 +14,7 @@
 运行时      Node ≥ 22.5（不使用任何 Node-24-only API；URLPattern 不可用，路由手写）
 npm 依赖    0 个。package.json 只有 {"type":"module"}，不得新增 dependencies
 数据库      node:sqlite。data/app.db，WAL 模式。单写者：禁止多 worker 写同一文件
-测试        node:test。命令：node --test test/
+测试        node:test。命令：node --test
 密码        node:crypto scrypt，存储格式 scrypt$N$r$p$<salt_b64>$<hash_b64>，比对用 timingSafeEqual
 会话        服务端 session 表，token 只存 SHA-256 哈希；Cookie HttpOnly + SameSite=Lax + Path=/
 代码目录    platform/
@@ -476,7 +476,7 @@ export function getDefaultRules() {
 - [ ] **Step 6: 运行测试确认通过**
 
 Run: `cd platform && node --test test/leaderboard-migration.test.js` → Expected: PASS（8 个测试全过）
-Run: `cd platform && node --test test/` → Expected: 全部通过（P0 的 `config.test.js` 仍通过——新增规则文件不影响既有断言）
+Run: `cd platform && node --test` → Expected: 全部通过（P0 的 `config.test.js` 仍通过——新增规则文件不影响既有断言）
 
 - [ ] **Step 7: 提交**
 
@@ -3103,7 +3103,7 @@ Run: `cd platform && node --test test/leaderboard-web.test.js` → Expected: PAS
 
 - [ ] **Step 7: 全量回归**
 
-Run: `cd platform && node --test test/` → Expected: 全部通过（P0–P3 的全部用例）
+Run: `cd platform && node --test` → Expected: 全部通过（P0–P3 的全部用例）
 Run: `cd platform && node scripts/migrate.js` → Expected: 输出 `迁移完成，当前版本 4`
 
 - [ ] **Step 8: 提交**

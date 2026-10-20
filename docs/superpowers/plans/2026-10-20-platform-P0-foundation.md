@@ -14,7 +14,12 @@
 运行时      Node ≥ 22.5（不使用任何 Node-24-only API；URLPattern 不可用，路由手写）
 npm 依赖    0 个。package.json 只有 {"type":"module"}，不得新增 dependencies
 数据库      node:sqlite。data/app.db，WAL 模式。单写者：禁止多 worker 写同一文件
-测试        node:test。命令：node --test test/
+测试        node:test。命令：node --test
+            ⚠️ 不要写成 `node --test test/`：Node 22 的位置参数按 glob/模块路径处理，
+               目录【不会】被展开 → MODULE_NOT_FOUND，pass 0 / fail 1。
+               实测（Node v22.23.2）：`node --test` ✅ ｜ `node --test test/` ❌ ｜
+               `node --test test/xxx.test.js` ✅（单文件形式合法）
+               依据：设计文档 §4.3 的 package.json 片段本身就是 `"test":"node --test"`。
 密码        node:crypto scrypt，存储格式 scrypt$N$r$p$<salt_b64>$<hash_b64>，比对用 timingSafeEqual
 会话        服务端 session 表，token 只存 SHA-256 哈希；Cookie HttpOnly + SameSite=Lax + Path=/
 代码目录    platform/
@@ -98,7 +103,7 @@ platform/
 
 **Interfaces:**
 - Consumes: 无
-- Produces: `npm test` 可用（`node --test test/`）；`npm start` 指向 `src/server.js`（本阶段先占位，后续 Task 替换）
+- Produces: `npm test` 可用（`node --test`）；`npm start` 指向 `src/server.js`（本阶段先占位，后续 Task 替换）
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -155,7 +160,7 @@ Expected: FAIL —— `ENOENT: no such file or directory, open 'platform/package
   "engines": { "node": ">=22.5.0" },
   "scripts": {
     "start": "node src/server.js",
-    "test": "node --test test/",
+    "test": "node --test",
     "migrate": "node scripts/migrate.js",
     "seed": "node scripts/seed.js"
   }
@@ -175,7 +180,7 @@ Expected: FAIL —— `ENOENT: no such file or directory, open 'platform/package
 node scripts/migrate.js   # 建库 + 迁移
 node scripts/seed.js      # 种子数据（可选）
 node src/server.js        # http://127.0.0.1:8080
-node --test test/         # 跑测试
+node --test         # 跑测试
 ```
 
 ## 硬约束
@@ -2354,7 +2359,7 @@ Expected: PASS（4 个测试全过）
 
 - [ ] **Step 8: 全量测试 + 实跑**
 
-Run: `cd platform && node --test test/`
+Run: `cd platform && node --test`
 Expected: 全部通过
 
 Run: `cd platform && node scripts/migrate.js && node scripts/seed.js && node src/server.js &`

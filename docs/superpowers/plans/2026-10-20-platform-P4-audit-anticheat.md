@@ -18,7 +18,7 @@
 运行时      Node ≥ 22.5（不使用任何 Node-24-only API；URLPattern 不可用，路由手写）
 npm 依赖    0 个。package.json 只有 {"type":"module"}，不得新增 dependencies
 数据库      node:sqlite。data/app.db，WAL 模式。单写者：禁止多 worker 写同一文件
-测试        node:test。命令：node --test test/
+测试        node:test。命令：node --test
 密码        node:crypto scrypt，存储格式 scrypt$N$r$p$<salt_b64>$<hash_b64>，比对用 timingSafeEqual
 会话        服务端 session 表，token 只存 SHA-256 哈希；Cookie HttpOnly + SameSite=Lax + Path=/
 代码目录    platform/
@@ -4717,7 +4717,7 @@ Expected: PASS（1 个测试全过）
 
 - [ ] **Step 3: 全量测试**
 
-Run: `cd platform && node --test test/`
+Run: `cd platform && node --test`
 Expected: 全部通过（含 P0 的既有测试）
 
 - [ ] **Step 4: 实跑扫描闸 + 提交**

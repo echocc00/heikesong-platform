@@ -27,7 +27,7 @@
 运行时      Node ≥ 22.5（不使用任何 Node-24-only API；URLPattern 不可用，路由手写）
 npm 依赖    0 个。package.json 只有 {"type":"module"}，不得新增 dependencies
 数据库      node:sqlite。data/app.db，WAL 模式。单写者：禁止多 worker 写同一文件
-测试        node:test。命令：node --test test/
+测试        node:test。命令：node --test
 密码        node:crypto scrypt，存储格式 scrypt$N$r$p$<salt_b64>$<hash_b64>，比对用 timingSafeEqual
 会话        服务端 session 表，token 只存 SHA-256 哈希；Cookie HttpOnly + SameSite=Lax + Path=/
 代码目录    platform/
@@ -3342,7 +3342,7 @@ function serveMounted(req, res) {
 {
   "scripts": {
     "start": "node src/server.js",
-    "test": "node --test test/",
+    "test": "node --test",
     "migrate": "node scripts/migrate.js",
     "seed": "node scripts/seed.js",
     "backup": "node scripts/backup.js",
@@ -3618,7 +3618,7 @@ node scripts/serve-demo.js     # 本地预览 http://127.0.0.1:8090/
 
 ```bash
 cd platform
-node --test test/            # 全绿
+node --test            # 全绿
 node scripts/audit-scan.js   # 扫描闸：禁用表述 0 命中
 node scripts/build-demo.js   # 演示站构建：领域层浏览器安全检查通过
 ```
@@ -3874,7 +3874,7 @@ Expected: FAIL —— 缺 `test/p6-e2e.test.js` / `test/portability.test.js`（�
 
 - [ ] **Step 3: 全量测试**
 
-Run: `cd platform && node --test test/`
+Run: `cd platform && node --test`
 Expected: 全部通过（0 fail）
 
 - [ ] **Step 4: 跨平台复现（在另一台机器上）**
@@ -3887,7 +3887,7 @@ scp -r platform/ other-machine:/tmp/platform
 # 在另一台机器上，只跑这三条命令（不联网、不 npm install）
 cd /tmp/platform
 node scripts/migrate.js
-node --test test/
+node --test
 node scripts/build-demo.js
 ```
 
@@ -3921,7 +3921,7 @@ git commit -m "test(P6): 全链路验收 + 跨平台可移植性验收"
 | P6-10 | 领域层不得依赖 Node 内置模块 | `node --test test/demo-static.test.js` 通过：`assertDomainIsBrowserSafe()` 返回空数组；守卫用例证明它能拦下 `node:fs` |
 | P6-11 | 静态站产物自包含且路径相对 | 同上：`web/dist/index.html` 存在，HTML 里没有 `src="/…"`；产物含 `src/domain/`、`rules/`、`seed/` |
 | P6-12 | 公网演示 URL 可访问 | 发布 `platform/web/dist/` 后打开公网 URL：页面能加载、能登录、能点「计算」并看到 trace 与破同分链 |
-| P6-13 | 全链路 + 跨平台 | `node --test test/` 全绿；把 `platform/` 拷到另一台机器，只跑 `migrate` / `test` / `build-demo` 三条命令即通过 |
+| P6-13 | 全链路 + 跨平台 | `node --test` 全绿；把 `platform/` 拷到另一台机器，只跑 `migrate` / `test` / `build-demo` 三条命令即通过 |
 | P6-14 | 文档写清边界与升级条件 | `docs/deployment.md` 含「single writer at a time」「proxy_buffering off」「backup()」「多机必须换 Postgres」四处 |
 
 ---
