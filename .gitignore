@@ -6,3 +6,9 @@ platform/data/
 *.db
 *.db-wal
 *.db-shm
+
+# 隔离工作区（git worktree）—— 实现代码在分支上开发，不直接落 main
+.worktrees/
+
+# SDD 执行期工作区（ledger / task brief / 评审包 / 报告）
+.superpowers/
