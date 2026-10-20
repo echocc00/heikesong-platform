@@ -36,6 +36,22 @@ function renderLogout() {
 
 const ctx = { api, navigate, setState, getState };
 
+/**
+ * ⛔ 评审修正（Important）：启动时**先恢复会话**。
+ * 原来前端从不调 `/api/me` → 登录之后刷新页面（F5）显示「未登录」，
+ * 而 Cookie 其实还有效、接口也还能用 —— 用户被无端踢回登录页。
+ * 会话在服务端，状态在前端：两边必须有一次对齐。
+ */
+async function restoreSession() {
+  try {
+    const { user } = await api.get('/api/me');
+    setState({ user });
+  } catch {
+    // 401（未登录 / 会话过期）是正常情况，不是错误
+    setState({ user: null });
+  }
+}
+
 async function render() {
   const app = document.getElementById('app');
   const found = match(currentPath());
@@ -53,4 +69,6 @@ async function render() {
 
 window.addEventListener('hashchange', render);
 subscribe(() => render());
+// ⛔ 先恢复会话再首屏渲染 —— 否则首屏永远显示「未登录」
+await restoreSession();
 render();

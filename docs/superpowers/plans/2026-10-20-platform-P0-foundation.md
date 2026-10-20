@@ -97,7 +97,9 @@ platform/
     ├── session.test.js
     ├── users.test.js
     ├── permissions.test.js
-    └── server.test.js
+    ├── server.test.js
+    ├── seed.test.js
+    └── web.test.js
 ```
 
 ---
@@ -3637,6 +3639,41 @@ git commit -m "feat(P0): capability + assignment 权限模型与 SQL 层行级�
 
 ### Task 7: 静态文件服务、前端骨架与服务器入口
 
+> **【2026-10-20 修复轮 2】** Task 7 的评审（verifier，17 个变异体）判定 **Needs fixes**：
+> **无 Critical**（19 个裸 socket 穿越变体 + 对照实验证明当前实现不可利用），
+> 但有 **5 项 Important**，核心是「规格 + 测试没把安全边界钉住」：
+> **①（F-1 Important）登录失败路径有 115 倍计时侧信道** ——
+>      `!!cred &&` 短路 ⇒ 用户不存在时**根本不跑 scrypt**（评审实测
+>      「存在 20.18ms / 不存在 0.18ms」）→ 可枚举手机号。
+>      规格的「避免用户枚举」只做完了响应层那一半。修法：用户不存在时也拿一个
+>      **同参数**的哑元哈希跑一次 scrypt，让两条路径耗时对齐。
+> **②（F-2 Important）静态读流没有 `error` 监听 → 单个请求能杀死整个进程** ——
+>      `createReadStream(...).pipe(res)` 没有 error 监听时，流出错（mode 000 的文件 /
+>      TOCTOU：statSync 之后、异步 open 之前文件被删 / NFS 瞬时 I/O 错误）会变成
+>      **未捕获异常** → 进程退出码 1、客户端零响应。
+>      修法：①**先 open 再取元数据**（用已打开的 fd，彻底消除 stat→open 的 TOCTOU 窗口，
+>      打不开就直接回 404）；②读流挂 `error` 监听，错误时断开响应，**绝不让它冒泡**。
+> **③（F-3 Important）`serveStatic` 在 try/catch 之外 → 配置错误即进程死亡** ——
+>      `webDir` 缺失是在第一个静态请求上才炸（`resolve(undefined)` 抛错），
+>      而 `handle` 是 async、`http.createServer` **不接管 rejected promise**
+>      → 未捕获异常 → 进程退出。
+>      修法：①`createApp` **构造期**就 fail-fast 拒绝缺 `webDir`；
+>      ②静态分支进自己的 try；③`handle` 最外层再兜一层，任何异常都变成 500。
+> **④（F-4 Important）4 个安全行为 + 1 类穿越变体零覆盖** ——
+>      变异测试证明「seed 恢复默认口令兜底 / 500 分支回显 err.message /
+>      parseCookie 去掉 try-catch / 登出不调 revokeSession / `%2e%2e` 编码穿越」
+>      这 5 个变异**全量 79/79 仍绿**。其中编码穿越那条最硬：
+>      裸 socket 实测 `/%2e%2e/web-secret/passwd` → **200 OK 读出 TOP-SECRET**。
+>      修法：补 5 类用例（seed 2 条 + server 5 条），穿越用例改用
+>      **真实 http server + 裸 socket**（fake res 走不到流式响应，穿越用例会假绿）。
+> **⑤（F-5b Important）前端无会话恢复** ——
+>      `web/app.js` 从不调 `/api/me` → 登录后刷新页面（F5）显示「未登录」，
+>      而 Cookie 其实还有效、接口也还能用。修法：启动时先 `await restoreSession()` 再首屏渲染。
+> **另修 2 个 Minor**：`isMain` 用 realpath 比较（符号链接入口曾静默 exit 0 不启动）；
+> `static.js` 的 `createHash` 是死导入（删）。
+> **变异验收**：修复后 11 个变异体**全部变红**（含评审 M17 的组合变异），
+> 而「只去掉一道防线」的两条**预期保持绿** —— 那是纵深防御的正常表现。
+
 > **【2026-10-20 预审修正】** 只读预审代理把本 Task 的简报**逐字落到临时目录实跑**，
 > 查出 **2 Critical + 4 Important + 4 Minor**。
 > 注意：简报自带的 4 条测试**全绿** —— 因为**一条都没碰登录态与静态文件**，
@@ -3703,6 +3740,8 @@ git commit -m "feat(P0): capability + assignment 权限模型与 SQL 层行级�
 - Create: `platform/src/server.js`
 - Create: `platform/scripts/seed.js`
 - Create: `platform/test/server.test.js`
+- Create: `platform/test/seed.test.js`
+- Create: `platform/test/web.test.js`
 - Create: `platform/web/index.html`
 - Create: `platform/web/app.js`
 - Create: `platform/web/router.js`
@@ -3713,6 +3752,8 @@ git commit -m "feat(P0): capability + assignment 权限模型与 SQL 层行级�
 - Create: `platform/web/views/login.js`
 - Modify: `platform/package.json`（`start` 脚本已在 Task 1 建好，本步不改）
 - Test: `platform/test/server.test.js`
+- Test: `platform/test/seed.test.js`
+- Test: `platform/test/web.test.js`
 
 **Interfaces:**
 - Consumes: Task 2 `openDatabase`、Task 3 `loadRules`、Task 4 `createRouter/json/error`、Task 5 `createSession/resolveSession/revokeSession/verifyPassword`、Task 6 `can`、Task 5 `toPublicUser`
@@ -3731,10 +3772,12 @@ git commit -m "feat(P0): capability + assignment 权限模型与 SQL 层行级�
 ```javascript
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import http from 'node:http';
+import net from 'node:net';
 import { openDatabase } from '../src/db/sqlite.js';
 import { applyMigrations } from '../src/db/migrate.js';
 import { loadRules } from '../src/config.js';
@@ -3762,7 +3805,7 @@ function setup() {
   return { db, close, dataDir, webRoot, app };
 }
 
-function call(app, method, path, { headers = {}, body = null } = {}) {
+function call(app, method, path, { headers = {}, body = null, bodyThrows = null } = {}) {
   return new Promise((resolve) => {
     const chunks = body ? [Buffer.from(JSON.stringify(body))] : [];
     const req = {
@@ -3771,6 +3814,7 @@ function call(app, method, path, { headers = {}, body = null } = {}) {
       headers,
       async *[Symbol.asyncIterator]() {
         for (const c of chunks) yield c;
+        if (bodyThrows) throw bodyThrows;
       },
       on() {},
     };
@@ -3785,6 +3829,34 @@ function call(app, method, path, { headers = {}, body = null } = {}) {
       },
     };
     app.handle(req, res);
+  });
+}
+
+/**
+ * 用**裸 socket** 发原始请求行。
+ * ⚠️ 为什么不能用 fetch / http.request：它们会按 WHATWG URL 规范把
+ *    `%2e%2e` 规范化成 `..` 并消掉路径里的点段 —— 请求根本发不出原样，
+ *    穿越测试就成了空转（评审已对照实验证明 Node 的 HTTP **解析器**不规范化，
+ *    所以原样发出去，服务端收到的就是原样的路径）。
+ */
+function rawRequest(port, rawPath, timeoutMs = 5000) {
+  return new Promise((resolve, reject) => {
+    const socket = net.connect(port, '127.0.0.1');
+    const chunks = [];
+    const done = (value) => resolve(value);
+    socket.setTimeout(timeoutMs, () => {
+      socket.destroy();
+      reject(new Error(`请求超时：${rawPath}`));
+    });
+    socket.on('connect', () => {
+      socket.write(
+        `GET ${rawPath} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nConnection: close\r\n\r\n`,
+      );
+    });
+    socket.on('data', (d) => chunks.push(d));
+    socket.on('end', () => done(Buffer.concat(chunks).toString('utf8')));
+    socket.on('close', () => done(Buffer.concat(chunks).toString('utf8')));
+    socket.on('error', reject);
   });
 }
 
@@ -3893,13 +3965,252 @@ test('畸形百分号编码的 URL 返回 400，不抛异常', async () => {
 
 test('目录穿越拿不到 web 兄弟目录的内容', async () => {
   // ⛔ 预审修正（C7-1）：'/…/web-secret/passwd'.startsWith('/…/web') 为真 → 兄弟目录可被读出。
+  // ⚠️ 必须在**真实 http server + 裸 socket** 上验：
+  //    用 fake res 时，静态内容一旦真的被读出就会因为 fake res 没有 on()
+  //    （stream.pipe 需要）而抛错，被静态分支的 try/catch 吞成 404 ——
+  //    穿越测试就成了一条**恒绿**用例（评审 M17 的组合变异在 fake res 下测不出来）。
   const { db, close, dataDir, webRoot, app } = setup();
-  const res = await call(app, 'GET', '/../web-secret/passwd');
-  assert.notEqual(res.status, 200);
-  assert.equal(res.body.includes('TOP-SECRET'), false);
+  const server = http.createServer(app.handle);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address();
+  try {
+    const raw = await rawRequest(port, '/../web-secret/passwd');
+    assert.equal(raw.includes('TOP-SECRET'), false, '字面量穿越泄露了兄弟目录内容');
+    assert.ok(!/^HTTP\/1\.1 200/.test(raw), `字面量穿越不得返回 200：${raw.slice(0, 80)}`);
+    // 服务器必须存活
+    const alive = await rawRequest(port, '/index.html');
+    assert.ok(alive.includes('200 OK'), '服务器必须存活');
+  } finally {
+    server.close();
+    close();
+    rmSync(dataDir, { recursive: true, force: true });
+    rmSync(webRoot, { recursive: true, force: true });
+  }
+});
+
+test('编码形式的目录穿越（%2e%2e）拿不到 web 兄弟目录的内容', async () => {
+  // ⚠️ 评审修正（Important）：原来只测了**字面量** `/../`。
+  //    变异测试证明：把 `..` 检查挪到 decode 之前 **且** 去掉分隔符边界，
+  //    **79 条测试全绿**，而裸 socket 实测 `/%2e%2e/web-secret/passwd` → **200 OK 读出 TOP-SECRET**。
+  //    这里用**裸 socket** 发原始请求行（客户端会规范化路径，必须绕过客户端）。
+  const { db, close, dataDir, webRoot, app } = setup();
+  const server = http.createServer(app.handle);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address();
+  try {
+    const paths = [
+      '/%2e%2e/web-secret/passwd',
+      '/%2e%2e%2fweb-secret/passwd',
+      '/..%2fweb-secret/passwd',
+      '/%2e%2e/web-secret/passwd',
+    ];
+    for (const p of paths) {
+      const raw = await rawRequest(port, p);
+      assert.equal(raw.includes('TOP-SECRET'), false, `${p} 泄露了兄弟目录内容`);
+      assert.ok(!/^HTTP\/1\.1 200/.test(raw), `${p} 不得返回 200：${raw.slice(0, 80)}`);
+    }
+    const alive = await rawRequest(port, '/index.html');
+    assert.ok(alive.includes('200 OK'), '服务器必须存活');
+  } finally {
+    server.close();
+    close();
+    rmSync(dataDir, { recursive: true, force: true });
+    rmSync(webRoot, { recursive: true, force: true });
+  }
+});
+
+test('500 响应只回通用文案，内部细节只进 console.error', async () => {
+  // ⚠️ 评审修正（Important）：原来**没有任何 500 用例** ——
+  //    变异「500 分支回显 err.message」时全量 79/79 仍绿。
+  //    构造一个会抛普通 Error 的请求体读取 → 落到 500 分支。
+  const { db, close, dataDir, app } = setup();
+  const original = console.error;
+  const logged = [];
+  console.error = (...args) => { logged.push(args.map(String).join(' ')); };
+  try {
+    const res = await call(app, 'POST', '/api/auth/login', {
+      bodyThrows: new Error('INTERNAL-DETAIL-must-not-leak'),
+    });
+    assert.equal(res.status, 500);
+    assert.equal(
+      res.body,
+      JSON.stringify({ error: { code: 'INTERNAL', message: '服务内部错误' } }),
+      '500 响应体必须逐字节等于通用文案',
+    );
+    assert.equal(res.body.includes('INTERNAL-DETAIL-must-not-leak'), false);
+    assert.ok(
+      logged.some((l) => l.includes('INTERNAL-DETAIL-must-not-leak')),
+      '内部细节必须进 console.error',
+    );
+  } finally {
+    console.error = original;
+  }
   close();
   rmSync(dataDir, { recursive: true, force: true });
-  rmSync(webRoot, { recursive: true, force: true });
+});
+
+test('畸形 cookie 不会抛异常（返回 401，服务器存活）', async () => {
+  // ⚠️ 评审修正（Important）：原来**没有畸形 cookie 用例** ——
+  //    变异「parseCookie 去掉 try/catch」时全量 79/79 仍绿。
+  const { db, close, dataDir, app } = setup();
+  for (const cookie of ['hk_session=%E0%A4%A', 'hk_session=%', 'hk_session=%zz', '=abc', 'hk_session']) {
+    const res = await call(app, 'GET', '/api/me', { headers: { cookie } });
+    assert.equal(res.status, 401, `cookie=${cookie} 应返回 401`);
+  }
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('登出后原会话立即失效', async () => {
+  // ⚠️ 评审修正（Important）：原来**没有登出用例** ——
+  //    变异「登出不调 revokeSession」时全量 79/79 仍绿。
+  const { db, close, dataDir, app } = setup();
+  const user = createUser(db, { name: '甲', phone: '13800000004', password: 'pw123' });
+  const { token } = createSession(db, user.id);
+  const before = await call(app, 'GET', '/api/me', { headers: { cookie: `hk_session=${token}` } });
+  assert.equal(before.status, 200);
+  const out = await call(app, 'POST', '/api/auth/logout', { headers: { cookie: `hk_session=${token}` } });
+  assert.equal(out.status, 200);
+  const after = await call(app, 'GET', '/api/me', { headers: { cookie: `hk_session=${token}` } });
+  assert.equal(after.status, 401, '登出后原 token 必须失效');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('createApp 缺少 webDir 时在构造期就抛错（fail-fast，不留到运行时）', async () => {
+  // ⚠️ 评审修正（Important）：原来 webDir 缺失是在**第一个静态请求**上炸 ——
+  //    serveStatic 在 try/catch 之外 → 未捕获异常 → **整个进程退出**（退出码 1）。
+  const dataDir = mkdtempSync(join(tmpdir(), 'hks-noweb-'));
+  const { db, close } = openDatabase({ dataDir });
+  const { rules } = loadRules(rulesDir);
+  assert.throws(
+    () => createApp({ db, rules }),
+    /webDir/,
+    '构造期就必须拒绝，不能拖到请求期',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('登录失败路径的耗时要对齐（用户不存在时也必须跑 scrypt）', async () => {
+  // ⚠️ 评审修正（Important）：原来 `!!cred &&` 短路 → 用户不存在时**根本不跑 scrypt**
+  //    → 评审实测「存在 20.18ms / 不存在 0.18ms」，**115 倍**差距 → 可枚举手机号。
+  //    这里断言「用户不存在」的登录耗时也有 scrypt 的量级下限（~20ms，取 5ms 保守阈值）。
+  const { db, close, dataDir, app } = setup();
+  createUser(db, { name: '甲', phone: '13800000005', password: 'pw123' });
+  const t0 = process.hrtime.bigint();
+  const missing = await call(app, 'POST', '/api/auth/login', {
+    body: { phone: '13900000000', password: 'pw123' },
+  });
+  const t1 = process.hrtime.bigint();
+  const wrong = await call(app, 'POST', '/api/auth/login', {
+    body: { phone: '13800000005', password: 'wrong' },
+  });
+  const t2 = process.hrtime.bigint();
+  assert.equal(missing.status, 401);
+  assert.equal(wrong.status, 401);
+  const missingMs = Number(t1 - t0) / 1e6;
+  const wrongMs = Number(t2 - t1) / 1e6;
+  assert.ok(
+    missingMs >= 5,
+    `用户不存在的登录耗时 ${missingMs.toFixed(2)}ms —— 必须跑完 scrypt（否则可枚举手机号）`,
+  );
+  assert.ok(wrongMs >= 5, `密码错误的登录耗时 ${wrongMs.toFixed(2)}ms —— 异常偏低`);
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('静态文件读不了时返回错误且服务器存活（不能被单个请求打死）', {
+  // root 能读 mode 000 的文件 → 这条测试在 root 下没有意义
+  skip: typeof process.getuid === 'function' && process.getuid() === 0
+    ? 'root 可以读 mode 000 的文件，跳过'
+    : false,
+}, async () => {
+  // ⚠️ 评审修正（Important）：原来读流**没有 error 监听** ——
+  //    web/ 下 mode 000 的文件 → EACCES → 无人监听的 error 事件 → 未捕获异常
+  //    → **整个服务器进程退出**（评审实测退出码 1、客户端完全无响应）。
+  //    这条必须在**真实 http server** 上验：fake res 走不到流式响应。
+  const { db, close, dataDir, webRoot, app } = setup();
+  const locked = join(webRoot, 'web', 'locked.js');
+  writeFileSync(locked, 'module.exports = 1;');
+  chmodSync(locked, 0o000);
+  const server = http.createServer(app.handle);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address();
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/locked.js`);
+    assert.ok(res.status >= 400, `应返回 4xx/5xx，实际 ${res.status}`);
+    // 关键断言：服务器**还活着**
+    const alive = await fetch(`http://127.0.0.1:${port}/index.html`);
+    assert.equal(alive.status, 200, '服务器必须存活（不能被单个请求打死）');
+    assert.equal((await alive.text()).includes('home'), true);
+  } finally {
+    server.close();
+    chmodSync(locked, 0o600);
+    close();
+    rmSync(dataDir, { recursive: true, force: true });
+    rmSync(webRoot, { recursive: true, force: true });
+  }
+});
+
+test('读流出错时变成 500 响应，不会变成未捕获异常（外层兜底生效）', async () => {
+  // ⛔ 评审修正（Important）：`handle` 是 async，而 http.createServer **不接管
+  //    rejected promise** → 任何逸出 handle 的异常都会变成未捕获异常 → 进程死亡。
+  //    用一个会抛异常的 req.url 把异常打到**内层 try 之外**（外层兜底那一层）。
+  const { db, close, dataDir, app } = setup();
+  const original = console.error;
+  const logged = [];
+  console.error = (...args) => { logged.push(args.map(String).join(' ')); };
+  try {
+    const req = {
+      method: 'GET',
+      get url() { throw new Error('OUTER-DETAIL-must-not-leak'); },
+      headers: {},
+      async *[Symbol.asyncIterator]() {},
+      on() {},
+    };
+    const chunks = [];
+    const res = {
+      statusCode: 200,
+      headers: {},
+      body: '',
+      writeHead(status, h) { this.statusCode = status; this.headers = h || {}; },
+      end(payload) { if (payload) this.body = payload.toString(); },
+      destroy() {},
+    };
+    await app.handle(req, res);
+    assert.equal(res.statusCode, 500, '逸出的异常必须变成 500');
+    assert.equal(
+      res.body,
+      JSON.stringify({ error: { code: 'INTERNAL', message: '服务内部错误' } }),
+      '500 响应体必须逐字节等于通用文案',
+    );
+    assert.equal(res.body.includes('OUTER-DETAIL'), false, '内部细节不能外泄');
+    assert.ok(
+      logged.some((l) => l.includes('OUTER-DETAIL')),
+      '内部细节必须进 console.error',
+    );
+  } finally {
+    console.error = original;
+  }
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('读流的 error 监听：流出错时断开响应，而不是变成未捕获异常', async () => {
+  // ⛔ 评审修正（Important）：读流没有 error 监听时，任何读错误都会变成
+  //    **未捕获异常** → 整个服务器进程退出（评审实测：mode 000 文件 → EACCES
+  //    → 进程退出码 1、客户端零响应）。
+  //    这里用**无效 fd** 触发 EBADF，把这条路径单独钉住。
+  const { pipeFd } = await import('../src/http/static.js');
+  let destroyed = 0;
+  const res = {
+    destroy() { destroyed += 1; },
+    on() {}, once() {}, emit() {}, write() {}, end() {},
+  };
+  pipeFd(res, 999999); // 不存在的 fd → 流会发 EBADF error
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(destroyed, 1, '流出错时应断开响应（而不是让异常冒泡）');
 });
 ```
 
@@ -3913,9 +4224,8 @@ Expected: FAIL —— `Cannot find module '../src/server.js'`
 ```javascript
 // src/http/static.js — 静态文件服务
 // 依据：设计文档 §14.2。生产环境静态资源由 nginx 直出，这里是内网/本地兜底。
-import { createReadStream, statSync } from 'node:fs';
+import { createReadStream, openSync, fstatSync, closeSync } from 'node:fs';
 import { resolve, sep, extname } from 'node:path';
-import { createHash } from 'node:crypto';
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -3949,17 +4259,30 @@ export function serveStatic(webDir, req, res) {
   const target = resolve(root, `.${relPath}`);
   if (target !== root && !target.startsWith(root + sep)) return false;
 
+  // ⚠️ **先打开再取元数据**，而不是 statSync 之后再 open：
+  //    stat 与 open 之间存在 TOCTOU 窗口 —— 「热部署时先删掉整个 web 目录、
+  //    再拷入新版本」正好落在这个窗口里，open 失败 → 读流抛出一个**无人监听的
+  //    error 事件** → Node 视为未捕获异常 → **整个服务器进程退出**（评审实测
+  //    退出码 1、客户端零响应）。
+  //    用已经打开的 fd 就没有这个窗口了；打不开（权限不足 / 已删除）直接交给上层回 404。
+  let fd;
   let stat;
   try {
-    stat = statSync(target);
+    fd = openSync(target, 'r');
+    stat = fstatSync(fd);
   } catch {
     return false;
   }
-  if (!stat.isFile()) return false;
+  if (!stat.isFile()) {
+    closeSync(fd);
+    return false;
+  }
 
   const ext = extname(target).toLowerCase();
   const etag = `W/"${stat.size}-${stat.mtimeMs.toString(36)}"`;
   if (req.headers && req.headers['if-none-match'] === etag) {
+    // ⚠️ fd 已经在上面打开了 → 这里必须关掉，否则每次 304 都漏一个 fd
+    closeSync(fd);
     res.writeHead(304, { ETag: etag });
     res.end();
     return true;
@@ -3971,8 +4294,30 @@ export function serveStatic(webDir, req, res) {
     ETag: etag,
     'Cache-Control': ext === '.html' ? 'no-cache' : 'public, max-age=300',
   });
-  createReadStream(target).pipe(res);
+  pipeFd(res, fd);
   return true;
+}
+
+/**
+ * 用已打开的 fd 建流并写回响应。
+ *
+ * ⚠️ autoClose 让 Node 自己关 fd（手动再关会撞 EBADF，
+ *    而 EBADF 恰好就是「未监听的 error 事件」→ 进程死亡的一种形态）。
+ *
+ * ⛔ 评审修正（Important）：读流**必须挂 error 监听**。
+ *    没有监听时，任何读错误（权限、瞬时 I/O 错误、fd 被外部关闭）都会变成
+ *    **未捕获异常** → 整个服务器进程退出。此时响应头已经发出去了，
+ *    只能断开连接 —— 但**绝不能**让它冒泡成进程级异常。
+ *
+ * 导出是为了能单独测这条 error 路径（用无效 fd 触发 EBADF）。
+ */
+export function pipeFd(res, fd) {
+  const stream = createReadStream(null, { fd, autoClose: true });
+  stream.on('error', () => {
+    res.destroy();
+  });
+  stream.pipe(res);
+  return stream;
 }
 ```
 
@@ -3984,6 +4329,7 @@ export function serveStatic(webDir, req, res) {
 import http from 'node:http';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { realpathSync } from 'node:fs';
 import { openDatabase } from './db/sqlite.js';
 import { applyMigrations } from './db/migrate.js';
 import { loadRules, validateRules } from './config.js';
@@ -3993,10 +4339,29 @@ import { readJsonBody } from './http/body.js';
 import { serveStatic } from './http/static.js';
 import { createSession, resolveSession, revokeSession } from './auth/session.js';
 import { can } from './auth/permissions.js';
-import { verifyPassword } from './auth/password.js';
+import { verifyPassword, hashPassword } from './auth/password.js';
 import { getUserById, getCredentialsByPhone, toPublicUser } from './db/repo/users.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
+
+/**
+ * ⛔ 评审修正（Important）：登录失败路径的**计时侧信道**。
+ *
+ * 原来写成 `!!cred && verifyPassword(...)` —— `!!cred` 短路 ⇒ **用户不存在时
+ * 根本不跑 scrypt**。scrypt（N=16384）约需 20ms，评审实测
+ * 「用户存在 20.18ms / 用户不存在 0.18ms」，**115 倍**差距 ——
+ * 攻击者据此枚举手机号是否注册。
+ * 规格 I7-1 要求「密码错 / 用户不存在一律 401、不区分二者、避免用户枚举」，
+ * 响应层做到了，**时间层没做到** —— 安全目标只完成了一半。
+ *
+ * 做法：用户不存在时也拿一个**同参数**的哑元哈希跑一次 scrypt，
+ * 让两条路径的耗时对齐。哑元哈希延迟生成（不必在模块加载时付这 20ms）。
+ */
+let dummyPasswordHash = null;
+function dummyHash() {
+  if (!dummyPasswordHash) dummyPasswordHash = hashPassword('dummy-password-for-constant-time-login');
+  return dummyPasswordHash;
+}
 
 // 会话 Cookie（设计文档 §7.5）：HttpOnly + SameSite=Lax + Path=/ + Secure(生产)
 function sessionCookie(token, maxAge, secure) {
@@ -4038,6 +4403,13 @@ function domainCode(err, fallback) {
 }
 
 export function createApp({ db, rules, webDir }) {
+  // ⛔ 评审修正（Important）：webDir 缺失必须在**构造期**就拒绝。
+  //    原来它在第一个静态请求上才炸（serveStatic 在 try/catch 之外）→
+  //    未捕获异常 → **整个进程退出**（评审实测退出码 1、客户端零响应）。
+  //    这与项目原则「校验不过就拒绝启动，绝不降级为默认值」冲突。
+  if (typeof webDir !== 'string' || webDir === '') {
+    throw new Error('createApp 缺少 webDir（静态资源目录）');
+  }
   // fail-fast：规则不合法直接拒绝启动
   const errors = validateRules(rules);
   if (errors.length) {
@@ -4066,8 +4438,11 @@ export function createApp({ db, rules, webDir }) {
     const phone = String(body?.phone ?? '').trim();
     const password = String(body?.password ?? '');
     const cred = getCredentialsByPhone(db, phone);
-    // 用户不存在与密码错误返回**同一个**错误码 → 避免用户枚举
-    const ok = !!cred && cred.active === 1 && verifyPassword(password, cred.password_hash);
+    // 用户不存在与密码错误返回**同一个**错误码 → 避免用户枚举（响应层）
+    // ⛔ 而且**耗时也必须一致**（时间层）：用户不存在时照样跑一次 scrypt，
+    //    否则两条路径差 100 倍 → 枚举手机号。见 dummyHash() 的注释。
+    const passwordOk = verifyPassword(password, cred ? cred.password_hash : dummyHash());
+    const ok = !!cred && cred.active === 1 && passwordOk;
     if (!ok) {
       const e = new Error('手机号或密码不正确');
       e.status = 401;
@@ -4093,6 +4468,27 @@ export function createApp({ db, rules, webDir }) {
   });
 
   async function handle(req, res) {
+    // ⛔ 评审修正（Important）：`handle` 是 async，而 `http.createServer(app.handle)`
+    //    **不会接管 rejected promise** → handler 里任何逸出的异常都变成未捕获异常
+    //    → 整个服务器进程退出（客户端零响应）。
+    //    最外层兜一层：任何异常都变成 500，绝不把进程带走。
+    try {
+      await handleRequest(req, res);
+    } catch (err) {
+      console.error('[server]', err);
+      try {
+        if (!res.headersSent) {
+          json(res, 500, { error: { code: 'INTERNAL', message: '服务内部错误' } });
+        } else {
+          res.destroy();
+        }
+      } catch {
+        // 连 500 都写不出去（连接已断）—— 只能放弃，不能再抛
+      }
+    }
+  }
+
+  async function handleRequest(req, res) {
     const url = req.url || '/';
     if (url.startsWith('/api/')) {
       try {
@@ -4161,7 +4557,16 @@ export function createApp({ db, rules, webDir }) {
       }
       return;
     }
-    if (req.method === 'GET' && serveStatic(webDir, req, res)) return;
+    // ⛔ 评审修正（Important）：静态分支原来在 try/catch **之外** ——
+    //    serveStatic 抛出的任何异常都会逸出 handle → 进程死亡。
+    //    现在它在自己的 try 里；异常一律回 404，不影响进程。
+    if (req.method === 'GET') {
+      try {
+        if (serveStatic(webDir, req, res)) return;
+      } catch (err) {
+        console.error('[server] 静态服务异常', err);
+      }
+    }
     error(res, 404, 'NOT_FOUND', '页面不存在');
   }
 
@@ -4188,7 +4593,17 @@ function parseCookie(header) {
 }
 
 // ── 进程启动 ────────────────────────────────────────────────
-const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+// ⚠️ 符号链接入口：Node 会把主入口 **realpath 化**，import.meta.url 是**真实路径**，
+//    而 process.argv[1] 是**链接路径** → 字符串全等为假 → 服务器静默不启动、退出码 0
+//    （评审实测：stdout 为空、exit 0、从未监听）。两边都 realpath 再比。
+const isMain = (() => {
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+})();
 if (isMain) {
   const dataDir = process.env.DATA_DIR || join(here, '..', 'data');
   const port = Number(process.env.PORT || 8080);
@@ -4559,6 +4974,22 @@ function renderLogout() {
 
 const ctx = { api, navigate, setState, getState };
 
+/**
+ * ⛔ 评审修正（Important）：启动时**先恢复会话**。
+ * 原来前端从不调 `/api/me` → 登录之后刷新页面（F5）显示「未登录」，
+ * 而 Cookie 其实还有效、接口也还能用 —— 用户被无端踢回登录页。
+ * 会话在服务端，状态在前端：两边必须有一次对齐。
+ */
+async function restoreSession() {
+  try {
+    const { user } = await api.get('/api/me');
+    setState({ user });
+  } catch {
+    // 401（未登录 / 会话过期）是正常情况，不是错误
+    setState({ user: null });
+  }
+}
+
 async function render() {
   const app = document.getElementById('app');
   const found = match(currentPath());
@@ -4576,6 +5007,8 @@ async function render() {
 
 window.addEventListener('hashchange', render);
 subscribe(() => render());
+// ⛔ 先恢复会话再首屏渲染 —— 否则首屏永远显示「未登录」
+await restoreSession();
 render();
 ```
 
@@ -4620,12 +5053,181 @@ nav a { color: var(--accent); margin-right: 16px; }
 .boot { color: var(--muted); padding: 40px; text-align: center; }
 ```
 
-- [ ] **Step 7: 运行测试确认通过**
+- [ ] **Step 7: 补两个测试文件（种子脚本 + 前端骨架）**
 
-Run: `cd platform && node --test test/server.test.js`
-Expected: PASS（9 个测试全过）
+`platform/test/seed.test.js`：
 
-- [ ] **Step 8: 全量测试 + 实跑**
+```javascript
+// platform/test/seed.test.js —— 种子脚本的安全行为
+//
+// 规则溯源：
+//   - 「不兜底默认口令，校验不过就拒绝启动」→ 设计文档 §2「校验不过就拒绝启动」
+//     与 Task 7 预审修正 I7-2（种子脚本用硬编码默认口令创建超管 → 公网机器上
+//     等于把组委会超管口令写在代码里）。
+//   - 凭据类信息不入库 → 全局约束「证据链 / 凭据」。
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync, existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
+import { openDatabase } from '../src/db/sqlite.js';
+import { verifyPassword } from '../src/auth/password.js';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const platformDir = join(here, '..');
+const seedPath = join(platformDir, 'scripts', 'seed.js');
+
+function runSeed(env) {
+  const res = spawnSync(
+    process.execPath,
+    ['--disable-warning=ExperimentalWarning', seedPath],
+    { cwd: platformDir, encoding: 'utf8', env: { ...process.env, ...env }, timeout: 60000 },
+  );
+  return { status: res.status, out: `${res.stdout ?? ''}${res.stderr ?? ''}` };
+}
+
+test('没有 ADMIN_PASSWORD 时种子脚本拒绝运行：不建库、不建账号、不回显任何口令', () => {
+  // ⚠️ 评审修正（Important）：原来**根本没有 seed 的测试文件** ——
+  //    变异「恢复 `|| 'change-me-now'` 默认口令兜底」时全量 79/79 仍绿。
+  const dataDir = mkdtempSync(join(tmpdir(), 'hks-seed-'));
+  const res = runSeed({ DATA_DIR: dataDir, ADMIN_PASSWORD: '' });
+  assert.notEqual(res.status, 0, '必须以非 0 退出码退出');
+  assert.match(res.out, /ADMIN_PASSWORD/, '报错必须点名缺少的环境变量');
+  assert.equal(existsSync(join(dataDir, 'app.db')), false, '连数据库文件都不该创建');
+  assert.equal(/change-me-now/.test(res.out), false, '输出里不能出现任何默认口令');
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('给了 ADMIN_PASSWORD 时种子能建成超管，且口令哈希只能由这个口令验开', () => {
+  // 这条同时钉住两件事：① 种子确实建成账号；② 账号口令**就是**环境变量里给的那个，
+  //    不是代码里写死的另一个（默认口令兜底的回归会在这里露出来）。
+  const dataDir = mkdtempSync(join(tmpdir(), 'hks-seed-ok-'));
+  const password = 'Str0ng-Pass!2026';
+  const res = runSeed({ DATA_DIR: dataDir, ADMIN_PASSWORD: password });
+  assert.equal(res.status, 0, `种子应成功，输出：${res.out.slice(0, 200)}`);
+  assert.equal(existsSync(join(dataDir, 'app.db')), true, '数据库应被创建');
+  assert.equal(res.out.includes(password), false, '输出里不能回显口令本身');
+
+  const { db, close } = openDatabase({ dataDir });
+  try {
+    const row = db.prepare('SELECT password_hash, is_superadmin FROM users LIMIT 1').get();
+    assert.ok(row, '应建出超管账号');
+    assert.equal(row.is_superadmin, 1, '建出来的应是超管');
+    assert.equal(verifyPassword(password, row.password_hash), true, '口令必须来自 ADMIN_PASSWORD');
+    assert.equal(verifyPassword('change-me-now', row.password_hash), false, '不能是写死的默认口令');
+  } finally {
+    close();
+  }
+  rmSync(dataDir, { recursive: true, force: true });
+});
+```
+
+`platform/test/web.test.js`：
+
+```javascript
+// platform/test/web.test.js —— 前端骨架的行为
+//
+// 规则溯源：
+//   - 「登录后刷新页面仍应是登录态」→ 设计文档 §8（会话在服务端，Cookie 承载）；
+//     Task 7 评审修正 F-5b：前端从不调 /api/me → 登录后 F5 显示「未登录」，
+//     而 Cookie 其实还有效、接口也还能用。
+//   - 原生 ESM、无构建 → 前端模块可以被 Node 直接 import（配合最小 DOM 桩）。
+//
+// ⚠️ 用 `?v=N` 制造不同的模块实例 —— ESM 模块默认只求值一次，
+//    而这里需要用不同的 fetch 行为各跑一次「启动」。
+import test from 'node:test';
+import assert from 'node:assert/strict';
+
+function installDom() {
+  const state = { rendered: null, calls: [] };
+  const fakeEl = () => ({
+    className: '',
+    innerHTML: '',
+    textContent: '',
+    value: '',
+    querySelector: () => ({ addEventListener: () => {}, textContent: '', value: '' }),
+    addEventListener: () => {},
+    replaceChildren: (el) => { state.rendered = el; },
+  });
+  globalThis.window = {
+    location: { search: '', hash: '' },
+    addEventListener: () => {},
+  };
+  globalThis.document = {
+    getElementById: () => fakeEl(),
+    createElement: () => fakeEl(),
+  };
+  return state;
+}
+
+async function bootApp({ meStatus, meBody, tag }) {
+  const state = installDom();
+  state.calls = [];
+  globalThis.fetch = async (url) => {
+    state.calls.push(url);
+    if (url === '/api/me') {
+      return {
+        ok: meStatus < 400,
+        status: meStatus,
+        text: async () => JSON.stringify(meBody),
+      };
+    }
+    return { ok: true, status: 200, text: async () => '{}' };
+  };
+  // ?v=tag → 每个用例一个独立的模块实例（否则 ESM 只求值一次）
+  await import(`../web/app.js?v=${tag}`);
+  // 让顶层的 await 与首屏渲染落地
+  await new Promise((r) => setTimeout(r, 20));
+  return state;
+}
+
+test('启动时先恢复会话：/api/me 成功 → 首屏显示已登录', async () => {
+  const state = await bootApp({
+    meStatus: 200,
+    meBody: { user: { id: 'u_1', name: '甲', phone: '13800000000' } },
+    tag: 'ok',
+  });
+  assert.ok(
+    state.calls.includes('/api/me'),
+    `启动时必须调 /api/me 恢复会话，实际请求：${JSON.stringify(state.calls)}`,
+  );
+  assert.ok(state.rendered, '首屏应被渲染');
+  assert.match(state.rendered.innerHTML, /已登录/, '首屏应显示已登录');
+  assert.match(state.rendered.innerHTML, /甲/, '首屏应显示当前用户');
+});
+
+test('启动时 /api/me 返回 401 → 首屏显示未登录，且不抛异常', async () => {
+  const state = await bootApp({
+    meStatus: 401,
+    meBody: { error: { code: 'UNAUTHENTICATED', message: '未登录' } },
+    tag: '401',
+  });
+  assert.ok(state.calls.includes('/api/me'), '启动时必须尝试恢复会话');
+  assert.ok(state.rendered, '首屏应被渲染');
+  assert.match(state.rendered.innerHTML, /未登录/, '首屏应显示未登录');
+});
+
+test('恢复会话失败（网络异常）也不能让首屏崩掉', async () => {
+  const state = installDom();
+  globalThis.fetch = async (url) => {
+    if (url === '/api/me') throw new Error('network down');
+    return { ok: true, status: 200, text: async () => '{}' };
+  };
+  await import('../web/app.js?v=neterr');
+  await new Promise((r) => setTimeout(r, 20));
+  assert.ok(state.rendered, '首屏应被渲染');
+  assert.match(state.rendered.innerHTML, /未登录/, '恢复失败时应回落到未登录');
+});
+```
+
+- [ ] **Step 8: 运行测试确认通过**
+
+Run: `cd platform && node --test test/server.test.js test/seed.test.js test/web.test.js`
+Expected: PASS（23 个测试全过：server 18 + seed 2 + web 3）
+
+- [ ] **Step 9: 全量测试 + 实跑**
 
 Run: `cd platform && node --test`
 Expected: 全部通过
@@ -4642,10 +5244,10 @@ Expected: `{"ok":true,"at":"..."}`
 Run: `curl -s -i -X POST http://127.0.0.1:8080/api/auth/login -H 'Content-Type: application/json' -d '{"phone":"13800000000","password":"change-me-now-temporary"}'`
 Expected: `HTTP/1.1 200 OK` + `Set-Cookie: hk_session=...; HttpOnly; SameSite=Lax; Path=/; Max-Age=...`
 
-- [ ] **Step 9: 提交**
+- [ ] **Step 10: 提交**
 
 ```bash
-cd platform && git add src web scripts/seed.js test/server.test.js
+cd platform && git add src web scripts/seed.js test/server.test.js test/seed.test.js test/web.test.js
 git commit -m "feat(P0): 静态服务、前端骨架、种子数据与服务器入口"
 ```
 
@@ -4660,7 +5262,8 @@ git commit -m "feat(P0): 静态服务、前端骨架、种子数据与服务器�
 | P0-3 | 迁移幂等 | 连续跑两次 `scripts/migrate.js`，第二次输出「本次无新迁移」 |
 | P0-4 | 权限判定唯一入口 | `permissions.test.js` **21** 个用例通过；`scopeClause` 生成的 SQL **能真跑**（有权那行在结果里、无权那行不在），且占位符个数 == `params.length`；超管标志的**两种形状**（仓储行 snake_case / `toPublicUser` 驼峰）都认；**`scopeClause` 与 `can()` 结论一致**（超管 / `role_capability` 授权 → 不做行级过滤、全部行可见；停用用户 → 一行都看不到）；`alias` 必须是合法 SQL 标识符（注入载荷全部拒绝）；`grantAssignment` 对未注册 capability / 不存在用户抛**领域错误**（不漏 SQLite 原文）；`can()` 对缺 id 的用户 **fail-closed 返回 false**（不抛错） |
 | P0-5 | 密码与会话 | `password.test.js` 6 + `session.test.js` 8 + `users.test.js` 4 个用例通过；**库中只存 `token_hash`**（`session.test.js` 断言：库里无明文 token，`token_hash` 是 64 位 sha256 十六进制）；**库里存的是 scrypt 哈希而不是明文口令**（`users.test.js` 直接读库断言 `startsWith('scrypt$')` 且验签通过）；**会话有绝对过期上限**（设计文档 §7.5：滑动续期不得突破从签发时刻算起的硬边界） |
-| P0-6 | 登录闭环 | `server.test.js` **9** 个用例通过：登录 200 + 下发 `hk_session` Cookie（HttpOnly/SameSite=Lax/Path=/）；带 Cookie 访问 `/api/me` 返回 200；密码错 401 且不下发 Cookie |
+| P0-6 | 登录闭环 | `server.test.js` **18** 个用例通过：登录 200 + 下发 `hk_session` Cookie（HttpOnly/SameSite=Lax/Path=/）；带 Cookie 访问 `/api/me` 返回 200；密码错 401 且不下发 Cookie；**用户不存在时登录耗时也有 scrypt 量级**（防计时侧信道枚举） |
+| P0-9 | 安全边界钉住 | `seed.test.js` **2** + `web.test.js` **3** 个用例通过；**目录穿越**（字面量 `/../` 与编码 `/%2e%2e`、`/%2e%2e%2f`、`/..%2f` 四种变体，**裸 socket 发原始请求行**）全部拿不到 `web/` 兄弟目录的内容；**500 响应逐字节等于通用文案**（内部细节只进 `console.error`）；**畸形 cookie** 返回 401 不抛异常；**登出后原 token 立即失效**；`createApp` 缺 `webDir` **构造期**就抛错；**静态文件读不了时返回错误且服务器存活**（不能被单个请求打死）；**前端启动时恢复会话**（`/api/me` 成功 → 首屏显示已登录） |
 | P0-7 | 跨平台 | 在 Mac 上 `node src/server.js` 成功；把 `platform/` 拷到另一台机器重复同样命令 |
 | P0-8 | 领域错误统一 | `src/errors.js` 导出 `AppError` / `appError(status, code, message, detail)`（**status-first**）；全部领域错误都经它抛出（`instanceof AppError` 有断言钉住）；HTTP 层只把 `.status` / `.code` 转出去，**不外泄** Node 的 `ERR_*` 与 SQLite 原文 |
 

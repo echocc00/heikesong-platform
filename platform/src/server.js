@@ -3,6 +3,7 @@
 import http from 'node:http';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { realpathSync } from 'node:fs';
 import { openDatabase } from './db/sqlite.js';
 import { applyMigrations } from './db/migrate.js';
 import { loadRules, validateRules } from './config.js';
@@ -12,10 +13,29 @@ import { readJsonBody } from './http/body.js';
 import { serveStatic } from './http/static.js';
 import { createSession, resolveSession, revokeSession } from './auth/session.js';
 import { can } from './auth/permissions.js';
-import { verifyPassword } from './auth/password.js';
+import { verifyPassword, hashPassword } from './auth/password.js';
 import { getUserById, getCredentialsByPhone, toPublicUser } from './db/repo/users.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
+
+/**
+ * ⛔ 评审修正（Important）：登录失败路径的**计时侧信道**。
+ *
+ * 原来写成 `!!cred && verifyPassword(...)` —— `!!cred` 短路 ⇒ **用户不存在时
+ * 根本不跑 scrypt**。scrypt（N=16384）约需 20ms，评审实测
+ * 「用户存在 20.18ms / 用户不存在 0.18ms」，**115 倍**差距 ——
+ * 攻击者据此枚举手机号是否注册。
+ * 规格 I7-1 要求「密码错 / 用户不存在一律 401、不区分二者、避免用户枚举」，
+ * 响应层做到了，**时间层没做到** —— 安全目标只完成了一半。
+ *
+ * 做法：用户不存在时也拿一个**同参数**的哑元哈希跑一次 scrypt，
+ * 让两条路径的耗时对齐。哑元哈希延迟生成（不必在模块加载时付这 20ms）。
+ */
+let dummyPasswordHash = null;
+function dummyHash() {
+  if (!dummyPasswordHash) dummyPasswordHash = hashPassword('dummy-password-for-constant-time-login');
+  return dummyPasswordHash;
+}
 
 // 会话 Cookie（设计文档 §7.5）：HttpOnly + SameSite=Lax + Path=/ + Secure(生产)
 function sessionCookie(token, maxAge, secure) {
@@ -57,6 +77,13 @@ function domainCode(err, fallback) {
 }
 
 export function createApp({ db, rules, webDir }) {
+  // ⛔ 评审修正（Important）：webDir 缺失必须在**构造期**就拒绝。
+  //    原来它在第一个静态请求上才炸（serveStatic 在 try/catch 之外）→
+  //    未捕获异常 → **整个进程退出**（评审实测退出码 1、客户端零响应）。
+  //    这与项目原则「校验不过就拒绝启动，绝不降级为默认值」冲突。
+  if (typeof webDir !== 'string' || webDir === '') {
+    throw new Error('createApp 缺少 webDir（静态资源目录）');
+  }
   // fail-fast：规则不合法直接拒绝启动
   const errors = validateRules(rules);
   if (errors.length) {
@@ -85,8 +112,11 @@ export function createApp({ db, rules, webDir }) {
     const phone = String(body?.phone ?? '').trim();
     const password = String(body?.password ?? '');
     const cred = getCredentialsByPhone(db, phone);
-    // 用户不存在与密码错误返回**同一个**错误码 → 避免用户枚举
-    const ok = !!cred && cred.active === 1 && verifyPassword(password, cred.password_hash);
+    // 用户不存在与密码错误返回**同一个**错误码 → 避免用户枚举（响应层）
+    // ⛔ 而且**耗时也必须一致**（时间层）：用户不存在时照样跑一次 scrypt，
+    //    否则两条路径差 100 倍 → 枚举手机号。见 dummyHash() 的注释。
+    const passwordOk = verifyPassword(password, cred ? cred.password_hash : dummyHash());
+    const ok = !!cred && cred.active === 1 && passwordOk;
     if (!ok) {
       const e = new Error('手机号或密码不正确');
       e.status = 401;
@@ -112,6 +142,27 @@ export function createApp({ db, rules, webDir }) {
   });
 
   async function handle(req, res) {
+    // ⛔ 评审修正（Important）：`handle` 是 async，而 `http.createServer(app.handle)`
+    //    **不会接管 rejected promise** → handler 里任何逸出的异常都变成未捕获异常
+    //    → 整个服务器进程退出（客户端零响应）。
+    //    最外层兜一层：任何异常都变成 500，绝不把进程带走。
+    try {
+      await handleRequest(req, res);
+    } catch (err) {
+      console.error('[server]', err);
+      try {
+        if (!res.headersSent) {
+          json(res, 500, { error: { code: 'INTERNAL', message: '服务内部错误' } });
+        } else {
+          res.destroy();
+        }
+      } catch {
+        // 连 500 都写不出去（连接已断）—— 只能放弃，不能再抛
+      }
+    }
+  }
+
+  async function handleRequest(req, res) {
     const url = req.url || '/';
     if (url.startsWith('/api/')) {
       try {
@@ -180,7 +231,16 @@ export function createApp({ db, rules, webDir }) {
       }
       return;
     }
-    if (req.method === 'GET' && serveStatic(webDir, req, res)) return;
+    // ⛔ 评审修正（Important）：静态分支原来在 try/catch **之外** ——
+    //    serveStatic 抛出的任何异常都会逸出 handle → 进程死亡。
+    //    现在它在自己的 try 里；异常一律回 404，不影响进程。
+    if (req.method === 'GET') {
+      try {
+        if (serveStatic(webDir, req, res)) return;
+      } catch (err) {
+        console.error('[server] 静态服务异常', err);
+      }
+    }
     error(res, 404, 'NOT_FOUND', '页面不存在');
   }
 
@@ -207,7 +267,17 @@ function parseCookie(header) {
 }
 
 // ── 进程启动 ────────────────────────────────────────────────
-const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+// ⚠️ 符号链接入口：Node 会把主入口 **realpath 化**，import.meta.url 是**真实路径**，
+//    而 process.argv[1] 是**链接路径** → 字符串全等为假 → 服务器静默不启动、退出码 0
+//    （评审实测：stdout 为空、exit 0、从未监听）。两边都 realpath 再比。
+const isMain = (() => {
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+})();
 if (isMain) {
   const dataDir = process.env.DATA_DIR || join(here, '..', 'data');
   const port = Number(process.env.PORT || 8080);
