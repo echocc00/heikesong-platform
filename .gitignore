@@ -1,0 +1,8 @@
+# 飞书授权二维码 —— 凭证类，不入库
+*.png
+node_modules/
+.DS_Store
+platform/data/
+*.db
+*.db-wal
+*.db-shm

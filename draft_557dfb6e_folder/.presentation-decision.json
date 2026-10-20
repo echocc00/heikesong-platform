@@ -1,0 +1,11 @@
+{
+  "audience": "2026 AI 大航海同期同学与助教/评委",
+  "reader_task": "判断这套证据约束是否值得用，并能在下一次调研任务里立刻套用",
+  "genre_contract": "router.knowledge",
+  "adapter": null,
+  "presentation_mode": "normal",
+  "visual_plan": {
+    "reason": "核心信息关系是「证据强度 → 允许的结论强度」的精确映射，以及闸与闸之间的顺序约束，用表格承载最省理解成本；其余为步骤与判断，用列表即可。不使用装饰性组件，截图位留空由作者本人补。",
+    "blocks": []
+  }
+}
