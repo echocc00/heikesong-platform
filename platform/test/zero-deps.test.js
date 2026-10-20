@@ -13,7 +13,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, existsSync, readdirSync } from 'node:fs';
-import { join, dirname, relative } from 'node:path';
+import { join, dirname, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -243,7 +243,17 @@ function lineAt(src, index) {
   return line;
 }
 
-const SCAN_DIRS = ['src', 'scripts', 'web'];
+/**
+ * 受扫描的目录。
+ *
+ * ⚠️ 终审修正（Minor，M-5）：原来只有 src / scripts / web ——
+ *    **test/ 没被扫**，往 `test/router.test.js` 里塞一行 `import lodash from 'lodash'`
+ *    全量测试照样全绿。
+ *    而 README 承诺「只用 Node 标准库」是**全项目级**的，测试代码也在内 ——
+ *    测试代码同样要能在任何机器上裸跑。
+ *    （终审实测：注入探针 XD-11 MISSED。）
+ */
+const SCAN_DIRS = ['src', 'scripts', 'web', 'test'];
 
 /**
  * 判断一个 specifier 属于哪一类。
@@ -305,12 +315,28 @@ function scanImports() {
   return { specifiers, violations, absolute };
 }
 
-test('src/ scripts/ web/ 的源码里没有任何第三方 import', () => {
+test('src/ scripts/ web/ test/ 的源码里没有任何第三方 import', () => {
   const { violations } = scanImports();
   assert.deepEqual(
     violations.map((v) => `${v.file}:${v.line} 导入「${v.value}」`),
     [],
     '只允许 node: 内置模块或相对路径（. 开头）—— 发现第三方依赖',
+  );
+});
+
+test('零依赖守卫必须扫到 test/ 目录（测试代码同样要零依赖）', () => {
+  // ⚠️ 终审修正（Minor，M-5）：原来 SCAN_DIRS 只有 src / scripts / web ——
+  //    **test/ 没被扫**。往 test/router.test.js 里塞一行 `import lodash from 'lodash'`
+  //    全量测试照样全绿（终审实测：注入探针 XD-11 MISSED）。
+  //    而 README 承诺「只用 Node 标准库」是**全项目级**的，测试代码也在内 ——
+  //    测试代码同样要能在任何机器上裸跑。
+  // ⚠️ 这里**不去断言 SCAN_DIRS 常量**（那只是把实现抄一遍），而是断言
+  //    **扫描结果里真的出现过 test/ 下的文件** —— 守卫漏扫 test/ → 这条立刻红。
+  const { specifiers } = scanImports();
+  const fromTest = specifiers.filter((s) => s.file.split(sep).join('/').startsWith('test/'));
+  assert.ok(
+    fromTest.length > 0,
+    '零依赖守卫必须扫到 test/ 目录下的文件（测试代码也在零依赖承诺范围内）',
   );
 });
 

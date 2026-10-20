@@ -22,6 +22,22 @@
 //     迁移 SQL 也不能塞进业务仓储层。
 //   注意 src/db/sqlite.js **不豁免**：它只跑 PRAGMA（WAL / foreign_keys / busy_timeout），
 //   PRAGMA 不在上面的关键字表里 → 天然不触发判定；一旦它长出业务 SQL 就会被抓住。
+//
+// ⚠️ **已知绕过形态（终审 Minor M-4 显式登记 —— 宁可漏报也不要误报的代价）**：
+//   本守卫是**基于正则的形态匹配**，下面三种现实写法**抓不到**（实测探针全 MISSED）：
+//     ① SQL 存进变量再传进去：
+//          const sql = 'SELECT * FROM users'; db.prepare(sql);
+//        （参数是标识符不是字符串字面量 → 扫不到）
+//     ② 下标式调用：
+//          db['prepare']('SELECT * FROM users');
+//        （正则只认 `db.prepare(` / `db.exec(` 点号形态）
+//     ③ 连接变量不叫 `db`：
+//          conn.prepare('SELECT * FROM users');
+//        （正则锚定的是标识符 `db`）
+//   这三条是**有意接受**的：把判定放宽到「任意 .prepare( 调用」会误报一大片
+//   （仓储层之外的代码里 db.prepare 大量用于非 SQL 的语句）。
+//   代码评审时人工盯这三种写法；本守卫负责的是「裸 SQL 回到 handler 里」这个
+//   **主流回归**（终审实测：seed.js 的 5 处裸 SQL 被它抓到）。
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -213,6 +229,33 @@ function findDbCalls(code) {
 }
 
 /**
+ * 扫描**一段源码**，返回违规列表（相对路径 + 行号 + 命中的 SQL 文本）。
+ *
+ * ⚠️ 终审修正（Minor，M-3）：这段逻辑原先内联在 scanForSql 里，
+ *    只能扫**目录** —— 想断言「扫描器自己能不能抓」就只能往真实源码树里
+ *    塞一个带 SQL 的假文件（污染工作树）。抽成纯函数后可以对**合成源码**直接断言。
+ */
+function scanCode(raw, rel) {
+  const violations = [];
+  const code = stripComments(raw);
+  for (const call of findDbCalls(code)) {
+    for (const lit of stringLiterals(call.args)) {
+      if (!SQL_KEYWORD.test(lit.value)) continue;
+      let line = 1;
+      for (let i = 0; i < call.start && i < raw.length; i += 1) {
+        if (raw[i] === '\n') line += 1;
+      }
+      violations.push({
+        file: rel,
+        line,
+        sql: lit.value.replace(/\s+/g, ' ').trim().slice(0, 120),
+      });
+    }
+  }
+  return violations;
+}
+
+/**
  * 扫描一个目录，返回违规列表（相对路径 + 行号 + 命中的 SQL 文本）。
  * exempt(relPath) 返回 true 表示该文件豁免。
  */
@@ -221,22 +264,7 @@ function scanForSql(dir, exempt) {
   for (const file of collectJsFiles(dir)) {
     const rel = relative(root, file);
     if (exempt(rel)) continue;
-    const raw = readFileSync(file, 'utf8');
-    const code = stripComments(raw);
-    for (const call of findDbCalls(code)) {
-      for (const lit of stringLiterals(call.args)) {
-        if (!SQL_KEYWORD.test(lit.value)) continue;
-        let line = 1;
-        for (let i = 0; i < call.start && i < raw.length; i += 1) {
-          if (raw[i] === '\n') line += 1;
-        }
-        violations.push({
-          file: rel,
-          line,
-          sql: lit.value.replace(/\s+/g, ' ').trim().slice(0, 120),
-        });
-      }
-    }
+    violations.push(...scanCode(readFileSync(file, 'utf8'), rel));
   }
   return violations;
 }
@@ -278,4 +306,42 @@ test('迁移执行器确实执行 SQL（豁免有据，不是漏判）', () => {
     stringLiterals(call.args).some((lit) => SQL_KEYWORD.test(lit.value)),
   );
   assert.ok(withSql.length > 0, 'migrate.js 里应存在带 SQL 关键字的 db.prepare/db.exec 调用');
+});
+
+test('SQL 边界守卫自己有效：exec / DELETE / CREATE TABLE 每种形态都能被抓（终审 M-3）', () => {
+  // ⛔ 终审修正（Minor，M-3）：原来的阳性对照只有一条「仓储层里能抓到 SQL」，
+  //    它**不区分抓到的是哪种形态** —— 把 findDbCalls 的正则去掉 `exec`、
+  //    或把 SQL_KEYWORD 表里的 `DELETE` 删掉，这条对照照样绿（实测 I7-b / I7-c 均 SURVIVED）。
+  //    这里对**合成源码**逐个断言：每种形态都必须被抓到一次。
+  const CASES = [
+    { label: 'db.exec + SELECT', code: "db.exec('SELECT * FROM users');" },
+    { label: 'db.prepare + SELECT', code: "db.prepare('SELECT * FROM users WHERE id = ?');" },
+    { label: 'db.exec + DELETE', code: "db.exec('DELETE FROM users');" },
+    { label: 'db.prepare + DELETE', code: "db.prepare('DELETE FROM users WHERE id = ?');" },
+    { label: 'db.exec + CREATE TABLE', code: "db.exec('CREATE TABLE t (id INTEGER)');" },
+    { label: 'db.prepare + CREATE TABLE', code: "db.prepare('CREATE TABLE t (id INTEGER)');" },
+    { label: 'db.prepare + INSERT', code: "db.prepare('INSERT INTO t VALUES (?)');" },
+    { label: 'db.prepare + UPDATE', code: "db.prepare('UPDATE t SET a = ?');" },
+    { label: 'db.prepare + DROP', code: "db.prepare('DROP TABLE t');" },
+    { label: 'db.prepare + ALTER', code: "db.prepare('ALTER TABLE t ADD COLUMN b INTEGER');" },
+  ];
+  for (const c of CASES) {
+    const v = scanCode(c.code, '<synthetic>');
+    assert.equal(
+      v.length,
+      1,
+      `${c.label} 必须被判违规（实际 ${JSON.stringify(v)}）`,
+    );
+  }
+
+  // 反例对照：不含 SQL 关键字的调用不得误报（否则这条用例会退化成「一律违规」的恒绿）
+  const NEG = [
+    "db.exec('PRAGMA journal_mode = WAL');",
+    "db.prepare('?');",
+    "const x = db.getUserById(1);",
+  ];
+  for (const code of NEG) {
+    const v = scanCode(code, '<synthetic>');
+    assert.deepEqual(v, [], `不得误报：${code}（实际 ${JSON.stringify(v)}）`);
+  }
 });

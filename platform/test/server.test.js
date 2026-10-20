@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, chmodSync, symlinkSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, chmodSync, symlinkSync, readFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -105,10 +105,15 @@ test('未登录访问 /api/me 返回 401', async () => {
   rmSync(dataDir, { recursive: true, force: true });
 });
 
-test('未知路径返回 404', async () => {
+test('未知路径返回 404（错误码字面量必须是 NOT_FOUND）', async () => {
+  // ⚠️ 终审修正（Minor，M-6）：原来只断言了状态码 404 ——
+  //    把错误码字面量改成 NOT_FOUND_X，全量照样全绿（实测 V2 SURVIVED）。
+  //    而错误码是**契约的一部分**：客户端 web/api.js 消费 data.error.code 来分流。
   const { db, close, dataDir, app } = setup();
   const res = await call(app, 'GET', '/api/nope');
   assert.equal(res.status, 404);
+  const body = JSON.parse(res.body);
+  assert.equal(body.error.code, 'NOT_FOUND', `404 的错误码必须是 NOT_FOUND，实际 ${body.error.code}`);
   close();
   rmSync(dataDir, { recursive: true, force: true });
 });
@@ -584,7 +589,7 @@ test('4xx 响应不得外泄 err.stack（终审 I-6-5）', async () => {
   rmSync(dataDir, { recursive: true, force: true });
 });
 
-test('带 if-none-match 的静态请求返回 304 且不重复打开文件（终审 M-2）', async () => {
+test('带 if-none-match 的静态请求返回 304 且服务器存活（终审 M-2）', async () => {
   const { db, close, dataDir, webRoot, app } = setup();
   const server = http.createServer(app.handle);
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -754,10 +759,19 @@ test('serveStatic 必须真的调用 isSameFile 做 dev/ino 对账（接线断�
   const fnStart = src.indexOf('export function serveStatic');
   assert.ok(fnStart > 0, '必须能找到 serveStatic');
   const fnBody = src.slice(fnStart, src.indexOf('\nexport ', fnStart + 10) > 0 ? src.indexOf('\nexport ', fnStart + 10) : src.length);
+  // ⚠️ 终审修正（Minor，M-1）：原来只断言「源码里出现过 isSameFile(」，
+  //    于是 `isSameFile(stat, stat)`（**对账对象写错**，更像手滑）
+  //    与 `!isSameFile(stat, linkStat) && false`（把防线短路掉）
+  //    两种写法都能让这条防线**彻底失效**而全量照样全绿（实测 I1-g / I1-c 均 SURVIVED）。
+  //    现在把断言收紧到**调用点必须长这样**：
+  //      ① 第一个实参是 stat（打开后 fstat 的结果）
+  //      ② 第二个实参是 linkStat（realpath 解析出的目标的 stat）
+  //      ③ 必须处在 `if (! ... )` 的否定守卫里，且紧跟 `)` —— 不能被 && 短路
   assert.match(
     fnBody,
-    /isSameFile\s*\(/,
-    'serveStatic 必须调用 isSameFile —— 删掉调用点等于删掉这条 TOCTOU 防线',
+    /if\s*\(\s*!isSameFile\(\s*stat\s*,\s*linkStat\s*\)\s*\)/,
+    'serveStatic 必须在 if (!isSameFile(stat, linkStat)) 里做 dev/ino 对账 —— '
+      + '对账对象写错（stat, stat）或被 && 短路，都等于这条 TOCTOU 防线失效',
   );
 });
 
@@ -815,4 +829,137 @@ test('HTTP 层不把 Node 的 ERR_* 错误码外泄给客户端（端到端）',
   assert.ok(!res.body.includes('UNIQUE constraint'), `响应体不得出现 SQLite 原文：${res.body}`);
   close();
   rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('静态响应的 Content-Type 与 Cache-Control 必须符合 MIME 表（终审 M-6）', async () => {
+  // ⚠️ 终审修正（Minor，M-6）：MIME 表与 Cache-Control 策略此前**零断言** ——
+  //    把 MIME 表里的 '.js' 删掉（回落到 application/octet-stream）、
+  //    或把 Cache-Control 恒写成 no-cache，全量照样全绿（实测 T3 / T4 均 SURVIVED）。
+  //    而浏览器靠 Content-Type 决定要不要当脚本执行 —— 错了既是功能问题也是安全问题。
+  const { db, close, dataDir, webRoot, app } = setup();
+  writeFileSync(join(webRoot, 'web', 'app.js'), 'export const x = 1;\n');
+  const server = http.createServer(app.handle);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address();
+  try {
+    const html = await rawRequest(port, '/index.html');
+    assert.match(html, /Content-Type:\s*text\/html; charset=utf-8/i, '.html 的 Content-Type 必须是 text/html');
+    assert.match(html, /Cache-Control:\s*no-cache/i, '.html 必须 no-cache（入口页不能被缓存）');
+
+    const js = await rawRequest(port, '/app.js');
+    assert.match(js, /Content-Type:\s*text\/javascript; charset=utf-8/i, '.js 的 Content-Type 必须是 text/javascript');
+    assert.match(js, /Cache-Control:\s*public, max-age=300/i, '.js 必须是 public, max-age=300');
+  } finally {
+    server.close();
+    close();
+    rmSync(dataDir, { recursive: true, force: true });
+    rmSync(webRoot, { recursive: true, force: true });
+  }
+});
+
+test('请求体超限返回 413 且必须带 Connection: close（终审 M-6）', async () => {
+  // ⚠️ 终审修正（Minor，M-6）：413 的 Connection: close 此前零断言 ——
+  //    把它去掉，全量照样全绿（实测 V6 SURVIVED）。
+  //    这条头是**连接卫生**：body 没读完时连接必须断开、不许复用
+  //    （否则下一个请求可能读到上一个请求的残 body）。
+  const { db, close, dataDir, app } = setup();
+  const res = await call(app, 'POST', '/api/auth/login', {
+    body: { phone: '13800000000', password: 'x'.repeat(600 * 1024) },
+  });
+  assert.equal(res.status, 413);
+  assert.equal(res.headers.Connection, 'close', '413 必须带 Connection: close（连接不复用）');
+  const body = JSON.parse(res.body);
+  assert.equal(body.error.code, 'PAYLOAD_TOO_LARGE', `413 的错误码必须是 PAYLOAD_TOO_LARGE，实际 ${body.error.code}`);
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('软链的判定看真实路径：指向根外的被拒，指向根内的放行（终审 M-7）', async () => {
+  // ⚠️ 终审修正（Minor，M-7）：static.js 的注释原先把「静态资源目录指向共享卷」
+  //    写成了**正常部署形态**，但那条形态指向 web/ 根外 → 会被 realpath 防线挡下（404）。
+  //    注释与实际行为相反 → 照着注释部署会踩坑。
+  //    这里把**实际行为**钉死，注释才有依据：
+  //      · 指向根外的软链（文件 / 目录）→ 404（fail-closed）
+  //      · 指向根内的软链（文件 / 目录）→ 200
+  //    并明确：共享卷部署要改用挂载（bind mount）或复制。
+  const { db, close, dataDir, webRoot, app } = setup();
+  const webDir = join(webRoot, 'web');
+  mkdirSync(join(webDir, 'assets'), { recursive: true });
+  writeFileSync(join(webDir, 'assets', 'asset.js'), 'export const a = 1;\n');
+  writeFileSync(join(webRoot, 'leak.txt'), 'SECRET-OUTSIDE-WEB\n');
+  // 指向根内的软链（文件 / 目录）
+  symlinkSync(join(webDir, 'index.html'), join(webDir, 'innerlink.html'));
+  symlinkSync(join(webDir, 'assets'), join(webDir, 'assetslink'));
+  // 指向根外的软链（文件 / 目录）
+  symlinkSync(join(webRoot, 'leak.txt'), join(webDir, 'filelink.txt'));
+  symlinkSync(webRoot, join(webDir, 'rootlink'));
+  const server = http.createServer(app.handle);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address();
+  try {
+    // 指向根内 → 放行
+    const inner = await rawRequest(port, '/innerlink.html');
+    assert.ok(inner.includes('200 OK'), `指向根内的软链文件应放行：${inner.slice(0, 80)}`);
+    const innerDir = await rawRequest(port, '/assetslink/asset.js');
+    assert.ok(innerDir.includes('200 OK'), `指向根内的软链目录应放行：${innerDir.slice(0, 80)}`);
+    // 指向根外 → 拒绝
+    for (const p of ['/filelink.txt', '/rootlink/leak.txt']) {
+      const raw = await rawRequest(port, p);
+      assert.ok(!/^HTTP\/1\.1 200/.test(raw), `${p} 指向根外，必须被拒：${raw.slice(0, 80)}`);
+      assert.ok(!raw.includes('SECRET-OUTSIDE-WEB'), `${p} 泄露了 web 根外的内容`);
+    }
+  } finally {
+    server.close();
+    close();
+    rmSync(dataDir, { recursive: true, force: true });
+    rmSync(webRoot, { recursive: true, force: true });
+  }
+});
+
+test('304 分支必须关闭 fd，不能泄漏文件描述符（终审 M-2）', { skip: process.platform === 'win32' ? 'Windows 没有 /dev/fd，无法枚举进程打开的 fd' : false }, async () => {
+  // ⛔ 终审修正（Minor，M-2）：原来那条用例的名字声称「不重复打开文件」，
+  //    但**没有任何打开次数 / fd 断言** —— 把 304 分支的 closeSync(fd) 删掉，
+  //    全量 144 条照样全绿（实测 I1-f SURVIVED）。
+  //    这里用 /dev/fd 的条目数做**真实计数**：连打 N 次 304，fd 数不得增长。
+  // ⚠️ 断言用「增长即失败」而不是「必须相等」：socket 关闭是异步的，
+  //    偶发地多算一两个 fd 属于时序噪声；泄漏则是**线性增长**，两者不会混淆。
+  const { db, close, dataDir, webRoot, app } = setup();
+  const server = http.createServer(app.handle);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address();
+  const fdCount = () => readdirSync('/dev/fd').length;
+  try {
+    const first = await rawRequest(port, '/index.html');
+    const m = first.match(/ETag:\s*(\S+)/i);
+    assert.ok(m, '静态响应必须带 ETag');
+    const etag = m[1];
+    // 等第一次请求的读流彻底结束（autoClose 关 fd）+ socket 关掉
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const before = fdCount();
+    for (let i = 0; i < 50; i += 1) {
+      const raw = await new Promise((resolve, reject) => {
+        const socket = net.connect(port, '127.0.0.1');
+        const chunks = [];
+        socket.setTimeout(5000, () => { socket.destroy(); reject(new Error('超时')); });
+        socket.on('connect', () => {
+          socket.write(
+            `GET /index.html HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nIf-None-Match: ${etag}\r\nConnection: close\r\n\r\n`,
+          );
+        });
+        socket.on('data', (d) => chunks.push(d));
+        socket.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+        socket.on('close', () => resolve(Buffer.concat(chunks).toString('utf8')));
+        socket.on('error', reject);
+      });
+      assert.ok(raw.includes('304'), `第 ${i + 1} 次必须回 304：${raw.slice(0, 80)}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const after = fdCount();
+    assert.ok(after <= before, `304 分支泄漏了 fd：${before} → ${after}`);
+  } finally {
+    server.close();
+    close();
+    rmSync(dataDir, { recursive: true, force: true });
+    rmSync(webRoot, { recursive: true, force: true });
+  }
 });

@@ -43,11 +43,16 @@ test('迁移是幂等的：重复执行不重复应用', () => {
   rmSync(dataDir, { recursive: true, force: true });
 });
 
-test('WAL 与 foreign_keys 已开启', () => {
+test('WAL 与 foreign_keys 已开启，busy_timeout 为 5000ms', () => {
+  // ⚠️ 终审修正（Minor，M-6）：busy_timeout 此前**零断言** ——
+  //    把 `PRAGMA busy_timeout = 5000` 删掉，全量照样全绿（实测 D2 SURVIVED）。
+  //    它是 SQLite 的**写锁等待**上限：写并发时拿不到锁就等 5 秒再报 SQLITE_BUSY。
+  //    去掉它 → busy_timeout 变 0 → 并发写直接抛 BUSY，报名/评审的并发提交会随机失败。
   const dataDir = tempDir();
   const { db } = openDatabase({ dataDir });
   assert.equal(db.prepare('PRAGMA journal_mode').get().journal_mode, 'wal');
   assert.equal(db.prepare('PRAGMA foreign_keys').get().foreign_keys, 1);
+  assert.equal(db.prepare('PRAGMA busy_timeout').get().timeout, 5000, 'busy_timeout 必须是 5000ms');
   db.close();
   rmSync(dataDir, { recursive: true, force: true });
 });

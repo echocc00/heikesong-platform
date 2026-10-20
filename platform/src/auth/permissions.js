@@ -137,6 +137,14 @@ export function can(user, capability, ctx = null, db = null) {
  *    原实现 SQL 3 个占位符却推了 4 个值 → `column index out of range`。
  * ⚠️ 上级作用域**不隐式下推**：edition 授权不自动覆盖其下的 task_package
  *    （要覆盖必须显式再授权一条 task_package 的记录）。
+ *
+ * ⚠️ 这三个校验抛的是**普通 Error**，不是 AppError —— 终审 Minor M-8 澄清：
+ *    它们表达的是**程序员错误**（调用方把参数组合写错了），
+ *    而 AppError 表达的是**客户端输入错误**（「客户端提交的东西不合法」这一类要回给用户的领域失败）。
+ *    grantAssignment() 同样校验入参却用 AppError，因为它校验的是
+ *    **客户端传来的** capability / userId（客户端能触发）；
+ *    这里校验的是**调用方在代码里写死的组合**（客户端触发不了）。
+ *    两种错误风格是**有意不同**的，不是漏改。
  */
 export function scopeClause(userId, capability, { scopeType, scopeId, alias = null } = {}) {
   const hasScopeId = scopeId !== undefined && scopeId !== null;

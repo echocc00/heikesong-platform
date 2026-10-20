@@ -1,4 +1,9 @@
 // src/http/router.js — 极简路由
+// 依据：设计文档 §8「API 设计」+ INTERFACES.md「src/http/router.js」契约
+//   （createRouter() → { add(method, pattern, handler), match(method, path), list() }；
+//     pattern 形如 '/api/teams/:teamId/members'，:param 占位）。
+//   路由优先级 = **逐段比较**：第一处不同的段上，静态段胜参数段。
+//   （例：'/api/teams/me' 优先于 '/api/teams/:teamId'。）
 // ⛔ Node 22 没有 URLPattern（Node 24 才有），所以手写。
 //   不抬高运行时门槛 = 22 与 24 都能跑 = 可移植。
 export function createRouter() {

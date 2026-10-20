@@ -138,7 +138,7 @@ platform/
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, existsSync, readdirSync } from 'node:fs';
-import { join, dirname, relative } from 'node:path';
+import { join, dirname, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -368,7 +368,17 @@ function lineAt(src, index) {
   return line;
 }
 
-const SCAN_DIRS = ['src', 'scripts', 'web'];
+/**
+ * 受扫描的目录。
+ *
+ * ⚠️ 终审修正（Minor，M-5）：原来只有 src / scripts / web ——
+ *    **test/ 没被扫**，往 `test/router.test.js` 里塞一行 `import lodash from 'lodash'`
+ *    全量测试照样全绿。
+ *    而 README 承诺「只用 Node 标准库」是**全项目级**的，测试代码也在内 ——
+ *    测试代码同样要能在任何机器上裸跑。
+ *    （终审实测：注入探针 XD-11 MISSED。）
+ */
+const SCAN_DIRS = ['src', 'scripts', 'web', 'test'];
 
 /**
  * 判断一个 specifier 属于哪一类。
@@ -430,12 +440,28 @@ function scanImports() {
   return { specifiers, violations, absolute };
 }
 
-test('src/ scripts/ web/ 的源码里没有任何第三方 import', () => {
+test('src/ scripts/ web/ test/ 的源码里没有任何第三方 import', () => {
   const { violations } = scanImports();
   assert.deepEqual(
     violations.map((v) => `${v.file}:${v.line} 导入「${v.value}」`),
     [],
     '只允许 node: 内置模块或相对路径（. 开头）—— 发现第三方依赖',
+  );
+});
+
+test('零依赖守卫必须扫到 test/ 目录（测试代码同样要零依赖）', () => {
+  // ⚠️ 终审修正（Minor，M-5）：原来 SCAN_DIRS 只有 src / scripts / web ——
+  //    **test/ 没被扫**。往 test/router.test.js 里塞一行 `import lodash from 'lodash'`
+  //    全量测试照样全绿（终审实测：注入探针 XD-11 MISSED）。
+  //    而 README 承诺「只用 Node 标准库」是**全项目级**的，测试代码也在内 ——
+  //    测试代码同样要能在任何机器上裸跑。
+  // ⚠️ 这里**不去断言 SCAN_DIRS 常量**（那只是把实现抄一遍），而是断言
+  //    **扫描结果里真的出现过 test/ 下的文件** —— 守卫漏扫 test/ → 这条立刻红。
+  const { specifiers } = scanImports();
+  const fromTest = specifiers.filter((s) => s.file.split(sep).join('/').startsWith('test/'));
+  assert.ok(
+    fromTest.length > 0,
+    '零依赖守卫必须扫到 test/ 目录下的文件（测试代码也在零依赖承诺范围内）',
   );
 });
 
@@ -636,7 +662,7 @@ node --test               # 跑测试
 - [ ] **Step 5: 运行测试确认通过**
 
 Run: `cd platform && node --test test/zero-deps.test.js`
-Expected: PASS（8 个测试全过：zero-deps 8）
+Expected: PASS（9 个测试全过：zero-deps 9）
 
 - [ ] **Step 6: 提交**
 
@@ -731,11 +757,16 @@ test('迁移是幂等的：重复执行不重复应用', () => {
   rmSync(dataDir, { recursive: true, force: true });
 });
 
-test('WAL 与 foreign_keys 已开启', () => {
+test('WAL 与 foreign_keys 已开启，busy_timeout 为 5000ms', () => {
+  // ⚠️ 终审修正（Minor，M-6）：busy_timeout 此前**零断言** ——
+  //    把 `PRAGMA busy_timeout = 5000` 删掉，全量照样全绿（实测 D2 SURVIVED）。
+  //    它是 SQLite 的**写锁等待**上限：写并发时拿不到锁就等 5 秒再报 SQLITE_BUSY。
+  //    去掉它 → busy_timeout 变 0 → 并发写直接抛 BUSY，报名/评审的并发提交会随机失败。
   const dataDir = tempDir();
   const { db } = openDatabase({ dataDir });
   assert.equal(db.prepare('PRAGMA journal_mode').get().journal_mode, 'wal');
   assert.equal(db.prepare('PRAGMA foreign_keys').get().foreign_keys, 1);
+  assert.equal(db.prepare('PRAGMA busy_timeout').get().timeout, 5000, 'busy_timeout 必须是 5000ms');
   db.close();
   rmSync(dataDir, { recursive: true, force: true });
 });
@@ -2362,6 +2393,11 @@ Expected: FAIL —— `Cannot find module '../src/http/router.js'`
 
 ```javascript
 // src/http/router.js — 极简路由
+// 依据：设计文档 §8「API 设计」+ INTERFACES.md「src/http/router.js」契约
+//   （createRouter() → { add(method, pattern, handler), match(method, path), list() }；
+//     pattern 形如 '/api/teams/:teamId/members'，:param 占位）。
+//   路由优先级 = **逐段比较**：第一处不同的段上，静态段胜参数段。
+//   （例：'/api/teams/me' 优先于 '/api/teams/:teamId'。）
 // ⛔ Node 22 没有 URLPattern（Node 24 才有），所以手写。
 //   不抬高运行时门槛 = 22 与 24 都能跑 = 可移植。
 export function createRouter() {
@@ -4160,6 +4196,14 @@ export function can(user, capability, ctx = null, db = null) {
  *    原实现 SQL 3 个占位符却推了 4 个值 → `column index out of range`。
  * ⚠️ 上级作用域**不隐式下推**：edition 授权不自动覆盖其下的 task_package
  *    （要覆盖必须显式再授权一条 task_package 的记录）。
+ *
+ * ⚠️ 这三个校验抛的是**普通 Error**，不是 AppError —— 终审 Minor M-8 澄清：
+ *    它们表达的是**程序员错误**（调用方把参数组合写错了），
+ *    而 AppError 表达的是**客户端输入错误**（「客户端提交的东西不合法」这一类要回给用户的领域失败）。
+ *    grantAssignment() 同样校验入参却用 AppError，因为它校验的是
+ *    **客户端传来的** capability / userId（客户端能触发）；
+ *    这里校验的是**调用方在代码里写死的组合**（客户端触发不了）。
+ *    两种错误风格是**有意不同**的，不是漏改。
  */
 export function scopeClause(userId, capability, { scopeType, scopeId, alias = null } = {}) {
   const hasScopeId = scopeId !== undefined && scopeId !== null;
@@ -4800,6 +4844,41 @@ git commit -m "feat(P0): capability + assignment 权限模型与 SQL 层行级�
 
 ### Task 7: 静态文件服务、前端骨架与服务器入口
 
+> **【2026-10-21 终审复核 + 8 条 Minor 收尾】** 修复轮 3 的终审复核（verifier）判定 **Needs fixes**：
+> **0 Critical / 3 Important / 8 Minor**。3 条 Important 全部是**「断言缺失」型** ——
+> 也就是说实现本身是对的，但**没有任何测试钉住它**，把实现改坏全量照样全绿：
+> **①（I-A）零依赖守卫没有自保护**：`scanImports()` 的判定内联在扫描循环里，
+>    改成「无条件 `continue`（一条都不判违规）」→ 全量 140 条照样全绿。
+>    修法：抽出纯函数 `classifySpecifier()` / `scanSource()`（导出，可直接测），
+>    并对**合成的坏源码**断言 6 种第三方写法必须判违规、5 种合法写法不得误判。
+> **②（I-B）请求体默认上限零断言**：现有用例都传显式 `{ limit: 10 }`，
+>    把默认值改成 100MB → 全量照样全绿。而默认值才是**生产实际生效**的那个
+>    （HTTP 层调用 `readJsonBody(req)` 不传 limit）—— 没有上限 = 任何人可灌爆内存。
+>    修法：补默认上限用例（512KB 内放行 / 超出 413），并带反例对照（显式放宽 limit 后同一 body 放行）。
+> **③（I-C）`domainCode` 零断言，且 4xx 分支泄漏 SQLite 原文**：
+>    `domainCode` 是私有函数、零断言（改成恒返回 'BAD_REQUEST' 全量照样全绿）；
+>    而 4xx 分支把 `err.message` 原样回给客户端 —— 裸 Error 的 message 里含
+>    「users.phone UNIQUE constraint failed」这类内部原文。
+>    修法：`domainCode` 改为导出（可直接测边界）；4xx/413 分支**只透传 `AppError` 的 message**，
+>    裸 Error 一律回落为通用文案「请求无效」。
+>
+> **8 条 Minor 逐条处置**（全部是「加断言 / 改注释」，**不涉及任何生产行为变更**）：
+>
+> | # | Minor | 处置 |
+> |---|---|---|
+> | M-1 | `isSameFile` 接线断言过松（`isSameFile(stat, stat)` 与 `&& false` 两种写法都能让防线彻底失效） | 断言收紧到 `if (!isSameFile(stat, linkStat))` **逐字匹配**（含「不能被 `&&` 短路」） |
+> | M-2 | 304 分支那条用例的名字声称「不重复打开文件」，但**没有任何 fd 断言** | 新增 `/dev/fd` 计数探针（连打 50 次 304，fd 数不得增长；Windows 跳过）+ 原用例名改准 |
+> | M-3 | SQL 边界扫描器**自身**的检测面无断言（去掉 `exec` 或去掉 `DELETE` 都全绿） | 抽出 `scanCode()` + 10 种形态的阳性对照 + 3 种反例对照 |
+> | M-4 | 扫描器有 3 种现实绕过（SQL 存进变量 / `db['prepare']()` / 连接变量不叫 `db`） | **有意接受**（宁可漏报也不误报），在文件头把这三种写法**显式列出** |
+> | M-5 | 零依赖扫描器**不扫 `test/`**（README 的「只用 Node 标准库」是全项目级承诺） | `SCAN_DIRS` 加 `test` + 断言「扫描结果里出现过 `test/` 下的文件」（不抄常量，钉行为） |
+> | M-6 | 5 条次要护栏无断言（静态 Content-Type / Cache-Control / `PRAGMA busy_timeout` / 404 错误码字面量 / 413 的 `Connection: close`） | 逐条补断言（404 与 busy_timeout 并入既有用例，不新增条数） |
+> | M-7 | `static.js` 注释把「静态资源目录指向共享卷」写成正常部署形态，与实际行为**相反** | 注释订正为 fail-closed 的真实判定（指向根外 → 404；指向根内 → 200）+ 新增软链行为矩阵用例 |
+> | M-8 | ① `router.js` 无「依据/规则来源」溯源标记；② `scopeClause` 用普通 `Error`、`grantAssignment` 用 `AppError`，语义有别但未写明；③ `error()` 不转发 `AppError.detail` | ①② 补注释（路由契约溯源 + 两种错误风格有意不同的理由）；③ **留到 P4**（P4 计划已显式排期「错误响应带上 detail 与 Retry-After」，P0 当前无任何错误携带 detail → 无可观测差异） |
+>
+> **验收**：本轮 12 个针对性变异体**全杀**
+> （M1-a / M1-b / M2-a / M3-a / M3-b / M3-c / M5-a / M6-a / M6-b / M6-c / M6-d / M6-e）。
+> 用例总数 144 → **150**。
+
 > **【2026-10-20 修复轮 3】** 整分支终审（verifier）判定 **Needs fixes**：
 > **0 Critical / 7 Important / 11 Minor**。其中 4 项落在本 Task，且**都是可远程利用的**：
 > **①（I-1 Important）静态服务跟随符号链接跳出 `web/` 根 → 任意文件读。**
@@ -4970,7 +5049,7 @@ git commit -m "feat(P0): capability + assignment 权限模型与 SQL 层行级�
 ```javascript
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, chmodSync, symlinkSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, chmodSync, symlinkSync, readFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -5075,10 +5154,15 @@ test('未登录访问 /api/me 返回 401', async () => {
   rmSync(dataDir, { recursive: true, force: true });
 });
 
-test('未知路径返回 404', async () => {
+test('未知路径返回 404（错误码字面量必须是 NOT_FOUND）', async () => {
+  // ⚠️ 终审修正（Minor，M-6）：原来只断言了状态码 404 ——
+  //    把错误码字面量改成 NOT_FOUND_X，全量照样全绿（实测 V2 SURVIVED）。
+  //    而错误码是**契约的一部分**：客户端 web/api.js 消费 data.error.code 来分流。
   const { db, close, dataDir, app } = setup();
   const res = await call(app, 'GET', '/api/nope');
   assert.equal(res.status, 404);
+  const body = JSON.parse(res.body);
+  assert.equal(body.error.code, 'NOT_FOUND', `404 的错误码必须是 NOT_FOUND，实际 ${body.error.code}`);
   close();
   rmSync(dataDir, { recursive: true, force: true });
 });
@@ -5554,7 +5638,7 @@ test('4xx 响应不得外泄 err.stack（终审 I-6-5）', async () => {
   rmSync(dataDir, { recursive: true, force: true });
 });
 
-test('带 if-none-match 的静态请求返回 304 且不重复打开文件（终审 M-2）', async () => {
+test('带 if-none-match 的静态请求返回 304 且服务器存活（终审 M-2）', async () => {
   const { db, close, dataDir, webRoot, app } = setup();
   const server = http.createServer(app.handle);
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -5724,10 +5808,19 @@ test('serveStatic 必须真的调用 isSameFile 做 dev/ino 对账（接线断�
   const fnStart = src.indexOf('export function serveStatic');
   assert.ok(fnStart > 0, '必须能找到 serveStatic');
   const fnBody = src.slice(fnStart, src.indexOf('\nexport ', fnStart + 10) > 0 ? src.indexOf('\nexport ', fnStart + 10) : src.length);
+  // ⚠️ 终审修正（Minor，M-1）：原来只断言「源码里出现过 isSameFile(」，
+  //    于是 `isSameFile(stat, stat)`（**对账对象写错**，更像手滑）
+  //    与 `!isSameFile(stat, linkStat) && false`（把防线短路掉）
+  //    两种写法都能让这条防线**彻底失效**而全量照样全绿（实测 I1-g / I1-c 均 SURVIVED）。
+  //    现在把断言收紧到**调用点必须长这样**：
+  //      ① 第一个实参是 stat（打开后 fstat 的结果）
+  //      ② 第二个实参是 linkStat（realpath 解析出的目标的 stat）
+  //      ③ 必须处在 `if (! ... )` 的否定守卫里，且紧跟 `)` —— 不能被 && 短路
   assert.match(
     fnBody,
-    /isSameFile\s*\(/,
-    'serveStatic 必须调用 isSameFile —— 删掉调用点等于删掉这条 TOCTOU 防线',
+    /if\s*\(\s*!isSameFile\(\s*stat\s*,\s*linkStat\s*\)\s*\)/,
+    'serveStatic 必须在 if (!isSameFile(stat, linkStat)) 里做 dev/ino 对账 —— '
+      + '对账对象写错（stat, stat）或被 && 短路，都等于这条 TOCTOU 防线失效',
   );
 });
 
@@ -5786,6 +5879,139 @@ test('HTTP 层不把 Node 的 ERR_* 错误码外泄给客户端（端到端）',
   close();
   rmSync(dataDir, { recursive: true, force: true });
 });
+
+test('静态响应的 Content-Type 与 Cache-Control 必须符合 MIME 表（终审 M-6）', async () => {
+  // ⚠️ 终审修正（Minor，M-6）：MIME 表与 Cache-Control 策略此前**零断言** ——
+  //    把 MIME 表里的 '.js' 删掉（回落到 application/octet-stream）、
+  //    或把 Cache-Control 恒写成 no-cache，全量照样全绿（实测 T3 / T4 均 SURVIVED）。
+  //    而浏览器靠 Content-Type 决定要不要当脚本执行 —— 错了既是功能问题也是安全问题。
+  const { db, close, dataDir, webRoot, app } = setup();
+  writeFileSync(join(webRoot, 'web', 'app.js'), 'export const x = 1;\n');
+  const server = http.createServer(app.handle);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address();
+  try {
+    const html = await rawRequest(port, '/index.html');
+    assert.match(html, /Content-Type:\s*text\/html; charset=utf-8/i, '.html 的 Content-Type 必须是 text/html');
+    assert.match(html, /Cache-Control:\s*no-cache/i, '.html 必须 no-cache（入口页不能被缓存）');
+
+    const js = await rawRequest(port, '/app.js');
+    assert.match(js, /Content-Type:\s*text\/javascript; charset=utf-8/i, '.js 的 Content-Type 必须是 text/javascript');
+    assert.match(js, /Cache-Control:\s*public, max-age=300/i, '.js 必须是 public, max-age=300');
+  } finally {
+    server.close();
+    close();
+    rmSync(dataDir, { recursive: true, force: true });
+    rmSync(webRoot, { recursive: true, force: true });
+  }
+});
+
+test('请求体超限返回 413 且必须带 Connection: close（终审 M-6）', async () => {
+  // ⚠️ 终审修正（Minor，M-6）：413 的 Connection: close 此前零断言 ——
+  //    把它去掉，全量照样全绿（实测 V6 SURVIVED）。
+  //    这条头是**连接卫生**：body 没读完时连接必须断开、不许复用
+  //    （否则下一个请求可能读到上一个请求的残 body）。
+  const { db, close, dataDir, app } = setup();
+  const res = await call(app, 'POST', '/api/auth/login', {
+    body: { phone: '13800000000', password: 'x'.repeat(600 * 1024) },
+  });
+  assert.equal(res.status, 413);
+  assert.equal(res.headers.Connection, 'close', '413 必须带 Connection: close（连接不复用）');
+  const body = JSON.parse(res.body);
+  assert.equal(body.error.code, 'PAYLOAD_TOO_LARGE', `413 的错误码必须是 PAYLOAD_TOO_LARGE，实际 ${body.error.code}`);
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('软链的判定看真实路径：指向根外的被拒，指向根内的放行（终审 M-7）', async () => {
+  // ⚠️ 终审修正（Minor，M-7）：static.js 的注释原先把「静态资源目录指向共享卷」
+  //    写成了**正常部署形态**，但那条形态指向 web/ 根外 → 会被 realpath 防线挡下（404）。
+  //    注释与实际行为相反 → 照着注释部署会踩坑。
+  //    这里把**实际行为**钉死，注释才有依据：
+  //      · 指向根外的软链（文件 / 目录）→ 404（fail-closed）
+  //      · 指向根内的软链（文件 / 目录）→ 200
+  //    并明确：共享卷部署要改用挂载（bind mount）或复制。
+  const { db, close, dataDir, webRoot, app } = setup();
+  const webDir = join(webRoot, 'web');
+  mkdirSync(join(webDir, 'assets'), { recursive: true });
+  writeFileSync(join(webDir, 'assets', 'asset.js'), 'export const a = 1;\n');
+  writeFileSync(join(webRoot, 'leak.txt'), 'SECRET-OUTSIDE-WEB\n');
+  // 指向根内的软链（文件 / 目录）
+  symlinkSync(join(webDir, 'index.html'), join(webDir, 'innerlink.html'));
+  symlinkSync(join(webDir, 'assets'), join(webDir, 'assetslink'));
+  // 指向根外的软链（文件 / 目录）
+  symlinkSync(join(webRoot, 'leak.txt'), join(webDir, 'filelink.txt'));
+  symlinkSync(webRoot, join(webDir, 'rootlink'));
+  const server = http.createServer(app.handle);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address();
+  try {
+    // 指向根内 → 放行
+    const inner = await rawRequest(port, '/innerlink.html');
+    assert.ok(inner.includes('200 OK'), `指向根内的软链文件应放行：${inner.slice(0, 80)}`);
+    const innerDir = await rawRequest(port, '/assetslink/asset.js');
+    assert.ok(innerDir.includes('200 OK'), `指向根内的软链目录应放行：${innerDir.slice(0, 80)}`);
+    // 指向根外 → 拒绝
+    for (const p of ['/filelink.txt', '/rootlink/leak.txt']) {
+      const raw = await rawRequest(port, p);
+      assert.ok(!/^HTTP\/1\.1 200/.test(raw), `${p} 指向根外，必须被拒：${raw.slice(0, 80)}`);
+      assert.ok(!raw.includes('SECRET-OUTSIDE-WEB'), `${p} 泄露了 web 根外的内容`);
+    }
+  } finally {
+    server.close();
+    close();
+    rmSync(dataDir, { recursive: true, force: true });
+    rmSync(webRoot, { recursive: true, force: true });
+  }
+});
+
+test('304 分支必须关闭 fd，不能泄漏文件描述符（终审 M-2）', { skip: process.platform === 'win32' ? 'Windows 没有 /dev/fd，无法枚举进程打开的 fd' : false }, async () => {
+  // ⛔ 终审修正（Minor，M-2）：原来那条用例的名字声称「不重复打开文件」，
+  //    但**没有任何打开次数 / fd 断言** —— 把 304 分支的 closeSync(fd) 删掉，
+  //    全量 144 条照样全绿（实测 I1-f SURVIVED）。
+  //    这里用 /dev/fd 的条目数做**真实计数**：连打 N 次 304，fd 数不得增长。
+  // ⚠️ 断言用「增长即失败」而不是「必须相等」：socket 关闭是异步的，
+  //    偶发地多算一两个 fd 属于时序噪声；泄漏则是**线性增长**，两者不会混淆。
+  const { db, close, dataDir, webRoot, app } = setup();
+  const server = http.createServer(app.handle);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address();
+  const fdCount = () => readdirSync('/dev/fd').length;
+  try {
+    const first = await rawRequest(port, '/index.html');
+    const m = first.match(/ETag:\s*(\S+)/i);
+    assert.ok(m, '静态响应必须带 ETag');
+    const etag = m[1];
+    // 等第一次请求的读流彻底结束（autoClose 关 fd）+ socket 关掉
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const before = fdCount();
+    for (let i = 0; i < 50; i += 1) {
+      const raw = await new Promise((resolve, reject) => {
+        const socket = net.connect(port, '127.0.0.1');
+        const chunks = [];
+        socket.setTimeout(5000, () => { socket.destroy(); reject(new Error('超时')); });
+        socket.on('connect', () => {
+          socket.write(
+            `GET /index.html HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nIf-None-Match: ${etag}\r\nConnection: close\r\n\r\n`,
+          );
+        });
+        socket.on('data', (d) => chunks.push(d));
+        socket.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+        socket.on('close', () => resolve(Buffer.concat(chunks).toString('utf8')));
+        socket.on('error', reject);
+      });
+      assert.ok(raw.includes('304'), `第 ${i + 1} 次必须回 304：${raw.slice(0, 80)}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const after = fdCount();
+    assert.ok(after <= before, `304 分支泄漏了 fd：${before} → ${after}`);
+  } finally {
+    server.close();
+    close();
+    rmSync(dataDir, { recursive: true, force: true });
+    rmSync(webRoot, { recursive: true, force: true });
+  }
+});
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -5835,10 +6061,21 @@ export function serveStatic(webDir, req, res) {
 
   // ⛔ 终审修正（Important，I-1）：**符号链接逃逸**。
   //    上面的边界比较只作用于**路径字符串** —— resolve() 规范化路径但
-  //    **不解析符号链接**。web/ 下一个指向根外的软链（部署脚本把 data/ 软链进
-  //    web/、静态资源目录指向共享卷）会让 web 根之外的文件被 HTTP 读走。
+  //    **不解析符号链接**。web/ 下一个指向根外的软链会让 web 根之外的文件被 HTTP 读走。
   //    终审实测：ln -s /etc web/etclink → GET /etclink/passwd → 200 + /etc/passwd 全文。
   //    这里把**根**与**目标**都解析成真实路径再比一次边界。
+  //
+  // ⚠️ 部署形态说明（终审 Minor M-7 订正 —— 原文写反了）：
+  //    本防线是 **fail-closed** 的，判定看的是**软链解析后的真实路径**：
+  //      · 指向 web/ **根外**的软链（文件或目录）→ 一律 404；
+  //      · 指向 web/ **根内**的软链（文件或目录）→ 照常 200。
+  //    「把 web/ 下的子目录软链到共享卷 / 外部资产目录」这种部署形态**不再可用**
+  //    （它指向根外 → 被这条防线挡下），必须改用**挂载（bind mount）或复制**。
+  //    原文把「静态资源目录指向共享卷」写成了正常部署形态，与实际行为相反。
+  //
+  // ⚠️ 穿越防线共三层（'..' 段拒绝 / 分隔符边界 / realpath 边界）：
+  //    **目前只有 realpath 这一层被断言钉住** —— 另两层单独拆掉不会被测出来
+  //    （三层同拆才会红）。三层都要留着：realpath 之前的路径规范化仍需自保。
   let realRoot;
   let realTarget;
   let linkStat;
@@ -6815,6 +7052,22 @@ nav a { color: var(--accent); margin-right: 16px; }
 //     迁移 SQL 也不能塞进业务仓储层。
 //   注意 src/db/sqlite.js **不豁免**：它只跑 PRAGMA（WAL / foreign_keys / busy_timeout），
 //   PRAGMA 不在上面的关键字表里 → 天然不触发判定；一旦它长出业务 SQL 就会被抓住。
+//
+// ⚠️ **已知绕过形态（终审 Minor M-4 显式登记 —— 宁可漏报也不要误报的代价）**：
+//   本守卫是**基于正则的形态匹配**，下面三种现实写法**抓不到**（实测探针全 MISSED）：
+//     ① SQL 存进变量再传进去：
+//          const sql = 'SELECT * FROM users'; db.prepare(sql);
+//        （参数是标识符不是字符串字面量 → 扫不到）
+//     ② 下标式调用：
+//          db['prepare']('SELECT * FROM users');
+//        （正则只认 `db.prepare(` / `db.exec(` 点号形态）
+//     ③ 连接变量不叫 `db`：
+//          conn.prepare('SELECT * FROM users');
+//        （正则锚定的是标识符 `db`）
+//   这三条是**有意接受**的：把判定放宽到「任意 .prepare( 调用」会误报一大片
+//   （仓储层之外的代码里 db.prepare 大量用于非 SQL 的语句）。
+//   代码评审时人工盯这三种写法；本守卫负责的是「裸 SQL 回到 handler 里」这个
+//   **主流回归**（终审实测：seed.js 的 5 处裸 SQL 被它抓到）。
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -7006,6 +7259,33 @@ function findDbCalls(code) {
 }
 
 /**
+ * 扫描**一段源码**，返回违规列表（相对路径 + 行号 + 命中的 SQL 文本）。
+ *
+ * ⚠️ 终审修正（Minor，M-3）：这段逻辑原先内联在 scanForSql 里，
+ *    只能扫**目录** —— 想断言「扫描器自己能不能抓」就只能往真实源码树里
+ *    塞一个带 SQL 的假文件（污染工作树）。抽成纯函数后可以对**合成源码**直接断言。
+ */
+function scanCode(raw, rel) {
+  const violations = [];
+  const code = stripComments(raw);
+  for (const call of findDbCalls(code)) {
+    for (const lit of stringLiterals(call.args)) {
+      if (!SQL_KEYWORD.test(lit.value)) continue;
+      let line = 1;
+      for (let i = 0; i < call.start && i < raw.length; i += 1) {
+        if (raw[i] === '\n') line += 1;
+      }
+      violations.push({
+        file: rel,
+        line,
+        sql: lit.value.replace(/\s+/g, ' ').trim().slice(0, 120),
+      });
+    }
+  }
+  return violations;
+}
+
+/**
  * 扫描一个目录，返回违规列表（相对路径 + 行号 + 命中的 SQL 文本）。
  * exempt(relPath) 返回 true 表示该文件豁免。
  */
@@ -7014,22 +7294,7 @@ function scanForSql(dir, exempt) {
   for (const file of collectJsFiles(dir)) {
     const rel = relative(root, file);
     if (exempt(rel)) continue;
-    const raw = readFileSync(file, 'utf8');
-    const code = stripComments(raw);
-    for (const call of findDbCalls(code)) {
-      for (const lit of stringLiterals(call.args)) {
-        if (!SQL_KEYWORD.test(lit.value)) continue;
-        let line = 1;
-        for (let i = 0; i < call.start && i < raw.length; i += 1) {
-          if (raw[i] === '\n') line += 1;
-        }
-        violations.push({
-          file: rel,
-          line,
-          sql: lit.value.replace(/\s+/g, ' ').trim().slice(0, 120),
-        });
-      }
-    }
+    violations.push(...scanCode(readFileSync(file, 'utf8'), rel));
   }
   return violations;
 }
@@ -7071,6 +7336,44 @@ test('迁移执行器确实执行 SQL（豁免有据，不是漏判）', () => {
     stringLiterals(call.args).some((lit) => SQL_KEYWORD.test(lit.value)),
   );
   assert.ok(withSql.length > 0, 'migrate.js 里应存在带 SQL 关键字的 db.prepare/db.exec 调用');
+});
+
+test('SQL 边界守卫自己有效：exec / DELETE / CREATE TABLE 每种形态都能被抓（终审 M-3）', () => {
+  // ⛔ 终审修正（Minor，M-3）：原来的阳性对照只有一条「仓储层里能抓到 SQL」，
+  //    它**不区分抓到的是哪种形态** —— 把 findDbCalls 的正则去掉 `exec`、
+  //    或把 SQL_KEYWORD 表里的 `DELETE` 删掉，这条对照照样绿（实测 I7-b / I7-c 均 SURVIVED）。
+  //    这里对**合成源码**逐个断言：每种形态都必须被抓到一次。
+  const CASES = [
+    { label: 'db.exec + SELECT', code: "db.exec('SELECT * FROM users');" },
+    { label: 'db.prepare + SELECT', code: "db.prepare('SELECT * FROM users WHERE id = ?');" },
+    { label: 'db.exec + DELETE', code: "db.exec('DELETE FROM users');" },
+    { label: 'db.prepare + DELETE', code: "db.prepare('DELETE FROM users WHERE id = ?');" },
+    { label: 'db.exec + CREATE TABLE', code: "db.exec('CREATE TABLE t (id INTEGER)');" },
+    { label: 'db.prepare + CREATE TABLE', code: "db.prepare('CREATE TABLE t (id INTEGER)');" },
+    { label: 'db.prepare + INSERT', code: "db.prepare('INSERT INTO t VALUES (?)');" },
+    { label: 'db.prepare + UPDATE', code: "db.prepare('UPDATE t SET a = ?');" },
+    { label: 'db.prepare + DROP', code: "db.prepare('DROP TABLE t');" },
+    { label: 'db.prepare + ALTER', code: "db.prepare('ALTER TABLE t ADD COLUMN b INTEGER');" },
+  ];
+  for (const c of CASES) {
+    const v = scanCode(c.code, '<synthetic>');
+    assert.equal(
+      v.length,
+      1,
+      `${c.label} 必须被判违规（实际 ${JSON.stringify(v)}）`,
+    );
+  }
+
+  // 反例对照：不含 SQL 关键字的调用不得误报（否则这条用例会退化成「一律违规」的恒绿）
+  const NEG = [
+    "db.exec('PRAGMA journal_mode = WAL');",
+    "db.prepare('?');",
+    "const x = db.getUserById(1);",
+  ];
+  for (const code of NEG) {
+    const v = scanCode(code, '<synthetic>');
+    assert.deepEqual(v, [], `不得误报：${code}（实际 ${JSON.stringify(v)}）`);
+  }
 });
 ```
 
@@ -7366,7 +7669,7 @@ test('登录按钮真的可点：点一下就发 /api/auth/login（终审 I-6-8�
 - [ ] **Step 8: 运行测试确认通过**
 
 Run: `cd platform && node --test test/server.test.js test/seed.test.js test/web.test.js test/sql-boundary.test.js`
-Expected: PASS（46 个测试全过：server 35 + seed 2 + web 6 + sql-boundary 3）
+Expected: PASS（51 个测试全过：server 39 + seed 2 + web 6 + sql-boundary 4）
 
 - [ ] **Step 9: 全量测试 + 实跑**
 
@@ -7403,12 +7706,13 @@ git commit -m "feat(P0): 静态服务、前端骨架、种子数据与服务器�
 | P0-3 | 迁移幂等 | 连续跑两次 `scripts/migrate.js`，第二次输出「本次无新迁移」 |
 | P0-4 | 权限判定唯一入口 | `permissions.test.js` **22** 个用例通过；`scopeClause` 生成的 SQL **能真跑**（有权那行在结果里、无权那行不在），且占位符个数 == `params.length`；超管标志的**两种形状**（仓储行 snake_case / `toPublicUser` 驼峰）都认；**`scopeClause` 与 `can()` 结论一致**（超管 / `role_capability` 授权 → 不做行级过滤、全部行可见；停用用户 → 一行都看不到）；`alias` 必须是合法 SQL 标识符（注入载荷全部拒绝）；`grantAssignment` 对未注册 capability / 不存在用户抛**领域错误**（不漏 SQLite 原文）；`can()` 对缺 id 的用户 **fail-closed 返回 false**（不抛错） |
 | P0-5 | 密码与会话 | `password.test.js` 8 + `session.test.js` 10 + `users.test.js` 5 个用例通过；**库中只存 `token_hash`**（`session.test.js` 断言：库里无明文 token，`token_hash` 是 64 位 sha256 十六进制）；**库里存的是 scrypt 哈希而不是明文口令**（`users.test.js` 直接读库断言 `startsWith('scrypt$')` 且验签通过）；**会话有绝对过期上限**（设计文档 §7.5：滑动续期不得突破从签发时刻算起的硬边界） |
-| P0-6 | 登录闭环 | `server.test.js` **35** 个用例通过：登录 200 + 下发 `hk_session` Cookie（HttpOnly/SameSite=Lax/Path=/）；带 Cookie 访问 `/api/me` 返回 200；密码错 401 且不下发 Cookie；**用户不存在时登录耗时也有 scrypt 量级**（防计时侧信道枚举） |
+| P0-6 | 登录闭环 | `server.test.js` **39** 个用例通过：登录 200 + 下发 `hk_session` Cookie（HttpOnly/SameSite=Lax/Path=/）；带 Cookie 访问 `/api/me` 返回 200；密码错 401 且不下发 Cookie；**用户不存在时登录耗时也有 scrypt 量级**（防计时侧信道枚举） |
 | P0-9 | 安全边界钉住 | `seed.test.js` **2** + `web.test.js` **6** 个用例通过；**目录穿越**（字面量 `/../` 与编码 `/%2e%2e`、`/%2e%2e%2f`、`/..%2f` 四种变体，**裸 socket 发原始请求行**）全部拿不到 `web/` 兄弟目录的内容；**500 响应逐字节等于通用文案**（内部细节只进 `console.error`）；**畸形 cookie** 返回 401 不抛异常；**登出后原 token 立即失效**；`createApp` 缺 `webDir` **构造期**就抛错；**静态文件读不了时返回错误且服务器存活**（不能被单个请求打死）；**前端启动时恢复会话**（`/api/me` 成功 → 首屏显示已登录） |
-| P0-10 | 修复轮 3 的安全边界 | `server.test.js` **35** + `web.test.js` **6** + `permissions.test.js` **22** + `password.test.js` **8** + `session.test.js` **10** + `users.test.js` **5** + `config.test.js` **23** + `zero-deps.test.js` **8** + `sql-boundary.test.js` **3** 个用例通过；**软链逃逸被拒**（`web/` 下指向根外的软链 → 404，真实 http server + 裸 socket）；**服务端数据里的 HTML 被转义**（存储型 XSS 封堵）；**零依赖守卫真的扫描源码 import**（不再只看 package.json）；**SQL 边界扫描**（裸 SQL 只允许出现在 `src/db/repo/`）；**数字 `scopeId` 时 `can()` 与 `scopeClause()` 结论一致**（两侧同时按字符串归一）；**`server.js` 的领域错误全部经 `AppError`**（构造期 fail-fast 除外）；**会话绝对过期默认 30 天**且 `SESSION_ABSOLUTE_TTL_DAYS` 可覆盖、非法值回落；**登录响应体键集合精确**（对外形状是驼峰版，布尔不是 0/1）；**停用用户登录耗时也有 scrypt 量级**（计时对齐覆盖第三条路径） |
+| P0-10 | 修复轮 3 的安全边界 | `server.test.js` **39** + `web.test.js` **6** + `permissions.test.js` **22** + `password.test.js` **8** + `session.test.js` **10** + `users.test.js` **5** + `config.test.js` **23** + `zero-deps.test.js` **9** + `sql-boundary.test.js` **4** 个用例通过；**软链逃逸被拒**（`web/` 下指向根外的软链 → 404，真实 http server + 裸 socket）；**服务端数据里的 HTML 被转义**（存储型 XSS 封堵）；**零依赖守卫真的扫描源码 import**（不再只看 package.json）；**SQL 边界扫描**（裸 SQL 只允许出现在 `src/db/repo/`）；**数字 `scopeId` 时 `can()` 与 `scopeClause()` 结论一致**（两侧同时按字符串归一）；**`server.js` 的领域错误全部经 `AppError`**（构造期 fail-fast 除外）；**会话绝对过期默认 30 天**且 `SESSION_ABSOLUTE_TTL_DAYS` 可覆盖、非法值回落；**登录响应体键集合精确**（对外形状是驼峰版，布尔不是 0/1）；**停用用户登录耗时也有 scrypt 量级**（计时对齐覆盖第三条路径） |
 | P0-7 | 跨平台 | 在 Mac 上 `node src/server.js` 成功；把 `platform/` 拷到另一台机器重复同样命令 |
 | P0-8 | 领域错误统一 | `src/errors.js` 导出 `AppError` / `appError(status, code, message, detail)`（**status-first**）；全部领域错误都经它抛出（`instanceof AppError` 有断言钉住）；HTTP 层只把 `.status` / `.code` 转出去，**不外泄** Node 的 `ERR_*` 与 SQLite 原文 |
-| P0-11 | 终审 Important 三项（I-A / I-B / I-C） | **`zero-deps.test.js` 8 + `body.test.js` 4 + `server.test.js` 35** 个用例通过；**I-A 零依赖守卫有自保护**：判定逻辑抽成纯函数 `classifySpecifier()` / `scanSource()`（从 `zero-deps.test.js` 导出），对**合成的坏源码**断言 6 种第三方写法（`import x from 'pkg'` / `import {x} from 'pkg'` / 副作用 import / `export … from 'pkg'` / 动态 `import()` / `require()`）**必须被判违规**，5 种合法写法（相对路径 / `node:` 内置 / 普通字符串 / 注释里的 import / URL 字面量）**不得被误判**；**I-B 请求体默认上限被钉住**：`readJsonBody(req)` 不传 `limit` 时上限为 **512KB**，512KB 以内放行、超出回 413 `PAYLOAD_TOO_LARGE`，且有反例对照（显式放宽 `limit` 后同一 body 放行）；**I-C `domainCode` 有断言且被导出**：领域码透传、Node 的 `ERR_*` 与非领域码（小写 / 数字开头 / 下划线开头 / 带连字符 / 非字符串 / 缺失）一律回落为通用码（回落值用**可区分哨兵**，避免被固定值变异掩盖）；**4xx 分支只透传 `AppError` 的 message**，裸 `Error`（含 SQLite 原文）的 message 一律回落为「请求无效」 |
+| P0-11 | 终审 Important 三项（I-A / I-B / I-C） | **`zero-deps.test.js` 9 + `body.test.js` 4 + `server.test.js` 39** 个用例通过；**I-A 零依赖守卫有自保护**：判定逻辑抽成纯函数 `classifySpecifier()` / `scanSource()`（从 `zero-deps.test.js` 导出），对**合成的坏源码**断言 6 种第三方写法（`import x from 'pkg'` / `import {x} from 'pkg'` / 副作用 import / `export … from 'pkg'` / 动态 `import()` / `require()`）**必须被判违规**，5 种合法写法（相对路径 / `node:` 内置 / 普通字符串 / 注释里的 import / URL 字面量）**不得被误判**；**I-B 请求体默认上限被钉住**：`readJsonBody(req)` 不传 `limit` 时上限为 **512KB**，512KB 以内放行、超出回 413 `PAYLOAD_TOO_LARGE`，且有反例对照（显式放宽 `limit` 后同一 body 放行）；**I-C `domainCode` 有断言且被导出**：领域码透传、Node 的 `ERR_*` 与非领域码（小写 / 数字开头 / 下划线开头 / 带连字符 / 非字符串 / 缺失）一律回落为通用码（回落值用**可区分哨兵**，避免被固定值变异掩盖）；**4xx 分支只透传 `AppError` 的 message**，裸 `Error`（含 SQLite 原文）的 message 一律回落为「请求无效」 |
+| P0-12 | 终审 8 条 Minor 逐条处置 | **`server.test.js` 39 + `sql-boundary.test.js` 4 + `zero-deps.test.js` 9 + `migrate.test.js` 10** 个用例通过；**M-1 dev/ino 接线断言收紧**：必须逐字匹配 `if (!isSameFile(stat, linkStat))`（对账对象写错或被 `&&` 短路都红）；**M-2 304 分支不泄漏 fd**：`/dev/fd` 计数探针（连打 50 次 304，fd 数不得增长；Windows 跳过该用例）；**M-3 SQL 边界扫描器有自检**：10 种形态（`exec`/`prepare` × `SELECT`/`INSERT`/`UPDATE`/`DELETE`/`DROP`/`ALTER`/`CREATE TABLE`）的阳性对照 + 3 种反例对照；**M-4 三种现实绕过（SQL 存进变量 / `db['prepare']()` / 连接变量不叫 `db`）已在文件头显式登记**（有意接受的取舍）；**M-5 零依赖守卫扫到 `test/`**：`SCAN_DIRS` 含 `test`，且断言「扫描结果里出现过 `test/` 下的文件」；**M-6 五条次要护栏有断言**：静态 `Content-Type`（MIME 表）/ `Cache-Control` / `PRAGMA busy_timeout = 5000` / 404 错误码字面量 `NOT_FOUND` / 413 的 `Connection: close`；**M-7 软链判定被钉死**：指向 web/ 根外的软链（文件与目录）→ 404，指向根内的 → 200；`static.js` 注释已订正为 fail-closed 的真实行为（共享卷部署须改用挂载或复制）；**M-8 溯源与错误风格已写明**：`router.js` 补设计文档 §8 + INTERFACES 契约溯源；`scopeClause`（程序员错误，普通 `Error`）与 `grantAssignment`（客户端输入错误，`AppError`）风格有意不同的理由写入注释；`AppError.detail` 的转发**按 P4 计划排期**（P0 无任何错误携带 detail → 无可观测差异） |
 
 ---
 
