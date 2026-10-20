@@ -8,7 +8,7 @@
 
 **Tech Stack:** Node ≥22.16.0（生产建议 24）｜`node:sqlite`｜`node:crypto`（scrypt）｜`node:test`｜原生 ESM 前端，无构建｜**npm 依赖 0 个**
 
-> **上游依赖（执行前确认）**：本阶段消费 P0（基础设施 / `users` / `can()` / `audit_log`）、**P1**（`teams` / `team_members` / `task_packages` / `registrations`）、**P2**（`stage_results` / `stages`，**只读**）、**P3**（`points_ledger` / `tier_records` / `applyVisibility`）、**P4**（`src/errors.js` 的 `appError` / `src/db/tx.js` 的 `withTransaction`）。
+> **上游依赖（执行前确认）**：本阶段消费 P0（基础设施 / `users` / `can()` / `audit_log`）、**P1**（`teams` / `team_members` / `task_packages` / `registrations`）、**P2**（`stage_results` / `stages`，**只读**）、**P3**（`points_ledger` / `tier_records` / `applyVisibility`）、**P4**（`src/db/tx.js` 的 `withTransaction`）与 **P0**（`src/errors.js` 的 `appError`，**status-first**）。
 > ⚠️ `INTERFACES.md` §8 的依赖表写的是「P5 ← P0 + P1 + P3」，但 §6 的 `syncPoolProjects` 明确要求从 `stage_results` 派生，而 `stage_results` 是 **P2** 建的表 → **P5 额外只读 P2 的两张表**（见文末偏差章节 D-4）。
 > 若 P1–P4 尚未落地，P5 的测试会以「找不到模块 / 缺表」失败——**这是依赖缺失，不是本阶段的 bug**。
 
@@ -864,7 +864,7 @@ git commit -m "feat(P5): 工作流与三池数据模型（006_pools.sql）+ 领�
 - Test: `platform/test/workflow-service.test.js`
 
 **Interfaces:**
-- Consumes: Task 1 的 `workflows` / `workflow_tasks` / `task_claims` 与仓储；P0 的 `getUserById`（`src/db/repo/users.js`）；P4 的 `appError`（`src/errors.js`）
+- Consumes: Task 1 的 `workflows` / `workflow_tasks` / `task_claims` 与仓储；P0 的 `getUserById`（`src/db/repo/users.js`）与 `appError`（`src/errors.js`，**status-first**）
 - Produces（与 `INTERFACES.md` §6 逐字一致，另**追加**两个建对象，见偏差章节 D-3）：
   - `listWorkflowTasks({ db, workflowId, viewer })` → `task[]`
   - `claimTask({ db, taskId, userId, teamId, now })` → `{ task, claim }`
@@ -3786,12 +3786,12 @@ git commit -m "feat(P5): 任务清单前端页 + 端到端验收（工作流→�
 | `team_members` 的「一人一队」约束 | P1 建了部分唯一索引 `idx_team_members_active(user_id) WHERE left_at IS NULL` → **同一人同时只能在一支队**。影响两处：① `resolveTeam` 未显式指定队时最多命中 1 支（防御分支保留）；② P5 的测试种子不能把同一人同时塞进两支队（跨届期要写 `left_at`） | P1 |
 | `teams.milestones_json` / `task_packages.meta_json` | P1 的契约外新增列（报名时固定的里程碑快照 / 合规与六维评估明细）。P5 的 INSERT **全部显式列名**，不受影响；P5 的 SELECT 只取自己用到的列 | P1 |
 | `stages` 的 `key` 列 | P2 的 DDL 里是带引号的 `"key"`。P5 的 SQL 一律写 `s.key`（不带表别名前缀时按 SQLite 规则解析），必要时写 `s."key"` | P2 |
-| 错误模块的位置与签名 | P1/P4 建 `src/errors.js`（`appError(status, code, message, detail)`），P3 建 `src/errors/app-error.js`（`appError(code, message, status, detail)`）——**两处并存、参数顺序相反**。P5 只用 `src/errors.js`（执行顺序上 P4 在 P5 之后，其版本为准）。**建议 P6 统一**，本阶段不擅自改动他人文件 | P3 / P4 |
+| 错误模块的位置与签名 | **P0 的 Task 4 建 `src/errors.js`**（`AppError` / `appError(status, code, message, detail)`，**status-first**）；P3 已改为**复用**它、**不再建** `src/errors/app-error.js`；P4 只**追加**快捷函数、**不重建**。P5 只用 `src/errors.js` | P0 |
 
 ### F. 与契约 §8「阶段间依赖一览」的两处出入
 
 1. **§8 写「P5 ← P0 + P1 + P3」，但 §6 要求 `pool_projects` 从 `stage_results` 派生**——而 `stage_results` 是 **P2** 建的表（契约 §3）。→ **P5 额外只读 P2 的 `stages` 与 `stage_results`**（只读，不写）。
-2. **§8 未列 P4，但 P5 消费 P4 的 `src/errors.js`（`appError`）**。执行顺序上 P4 在 P5 之前，可用。若 P1/P4 的 `src/errors.js` 最终导出名不是 `appError`，P5 只需改一行 import。
+2. **§8 未列 P4，但 P5 消费 P4 的 `src/db/tx.js`（`withTransaction`）**。执行顺序上 P4 在 P5 之前，可用。`src/errors.js` 的 `appError` 由 **P0** 提供（**status-first**），P5 只需 `import { appError } from '../errors.js'`。
 
 ### G. 一处口径调和（不是冲突，是把两句话的适用边界写清楚）
 

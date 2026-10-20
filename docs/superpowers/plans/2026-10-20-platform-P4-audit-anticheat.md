@@ -128,7 +128,7 @@ platform/web/app.js                 注册 /audit 与 /flags 路由 + 导航入�
 - Create: `platform/src/db/repo/idempotency.js`
 - Create: `platform/src/db/repo/rate-limit.js`
 - Create: `platform/src/db/repo/appeals.js`
-- Modify: `platform/src/errors.js`（**P1 Task 3 已建**；本阶段只**追加**快捷函数，不改 `appError(status, code, message, detail?)` 的签名）
+- Modify: `platform/src/errors.js`（**P0 Task 4 已建**（归属从 P1 提前到 P0）；本阶段只**追加**快捷函数，**不重建** `AppError` 类、不改 `appError(status, code, message, detail?)` 的签名）
 - Modify: `platform/src/audit/log.js`（**P2 Task 4 已建**；本阶段只**追加** `writeAuditLog` 的领域字段，不重建文件）
 - Modify: `platform/src/db/repo/computations.js`（**P2 Task 6 已建**；本阶段只**追加** `nextRevision` / `listComputationRows`，不重建文件）
 - Test: `platform/test/audit-repo.test.js`
@@ -438,28 +438,24 @@ CREATE INDEX idx_appeals_subject ON appeals(subject_type, subject_id);
 CREATE INDEX idx_appeals_status ON appeals(status);
 ```
 
-- [ ] **Step 4: 创建 `src/errors.js` 与 `src/db/tx.js`**
+- [ ] **Step 4: 追加 `src/errors.js` 的快捷函数，与创建 `src/db/tx.js`**
 
 `platform/src/errors.js`：
 
 ```javascript
-// src/errors.js — 统一错误类型
-// 依据：跨阶段接口契约 §0「错误：抛 AppError（code + message + status）」
-//   P0 的 server.js 约定读 err.status / err.code，本模块只是把它们规范化。
+// src/errors.js — 统一错误类型（**P0 已建，本阶段只追加快捷函数**）
+// 依据：跨阶段接口契约 §0「错误：抛 AppError（status + code + message + detail，**status-first**）」
 //
-// ⚠️ 本文件由 **P1 的 Task 3 建立**（`export class AppError extends Error`，
+// ⚠️ 本文件由 **P0 的 Task 4 建立**（`export class AppError extends Error`，
 //    构造签名 `AppError(status, code, message, detail)`），本阶段【只追加快捷函数】。
-//    ⛔ 不要在这里重写 AppError 类：P3 的 12 处 `new AppError(...)` 调用按
-//       **status-first** 顺序写死，重写成别的签名会让 err.status / err.code 互换。
-//    ✅ 下面这段直接【追加到 P1 已建的 src/errors.js 末尾】。
-
-export function appError(status, code, message, detail = undefined) {
-  const err = new Error(message);
-  err.status = status;
-  err.code = code;
-  if (detail !== undefined) err.detail = detail;
-  return err;
-}
+//    ⛔ 不要在这里重写 AppError 类，也不要**重新定义 appError**：
+//       P3 的 12 处 `new AppError(...)` 调用按 **status-first** 顺序写死，
+//       重写成别的签名会让 err.status / err.code 互换；
+//       而 `appError` 若被重新定义成「返回普通 Error 而非 AppError 实例」，
+//       就破坏了 P0-8「全部领域错误都经 AppError 抛出」这条验收标准
+//       （下游 `e instanceof AppError` 分支会失效）。
+//    ✅ 下面这段直接【追加到 P0 已建的 src/errors.js 末尾】，
+//       **沿用已有的 appError**，不重复定义。
 
 export function badRequest(message, detail) {
   return appError(400, 'INVALID_REQUEST', message, detail);
@@ -4754,7 +4750,7 @@ git commit -m "test(P4): 端到端复算验收（改一个原始分 → diff 非
 
 | 文件 | 为什么需要它 |
 |---|---|
-| `src/errors.js` | 契约 §0 要求「抛 `AppError`（code + message + status）」，但 P0 没有这个模块。统一构造 `status` / `code` / `detail`，供 429 带 `retryAfterSeconds` 用 |
+| `src/errors.js` | 契约 §0 要求「抛 `AppError`（**status + code + message + detail，status-first**）」，**P0 的 Task 4 已建**（归属从 P1 提前到 P0）。本阶段只**追加** `badRequest` / `unauthenticated` / `forbidden` / `notFound` / `conflict` / `rateLimited` 六个快捷函数，**不重建 AppError、不重新定义 appError**；429 额外带 `retryAfterSeconds` |
 | `src/db/tx.js` | 「事务回滚，无部分写入」（设计文档 §11）需要事务助手；用 SAVEPOINT 实现，可嵌套，调用方自己开了事务也不会炸 |
 | `src/domain/diff.js` | 复算 diff 的比对逻辑是纯函数，必须留在 `domain/`（无 IO）；契约未列 |
 | `src/domain/evidence.js` | R-AUD-04「证据三列 + 按发行方去重」需要一个纯函数模块 |
