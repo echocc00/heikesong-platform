@@ -2404,6 +2404,7 @@ import { createSession } from '../src/auth/session.js';
 import { grantAssignment } from '../src/auth/permissions.js';
 import { insertCapability } from '../src/db/repo/capabilities.js';
 import { pickCurrentEdition } from '../src/http/routes/registration.js';
+import { call } from '../test-helpers/http-call.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrationsDir = join(here, '..', 'db', 'migrations');
@@ -2457,32 +2458,6 @@ function setup() {
     tokenAdmin: createSession(db, admin.id).token,
     tokenOutsider: createSession(db, outsider.id).token,
   };
-}
-
-function call(app, method, path, { token = null, body = null } = {}) {
-  return new Promise((resolve) => {
-    const chunks = body ? [Buffer.from(JSON.stringify(body))] : [];
-    const req = {
-      method,
-      url: path,
-      headers: token ? { cookie: `hk_session=${token}` } : {},
-      async *[Symbol.asyncIterator]() {
-        for (const c of chunks) yield c;
-      },
-      on() {},
-    };
-    const res = {
-      statusCode: 200,
-      headers: {},
-      body: '',
-      writeHead(status, h) { this.statusCode = status; this.headers = h || {}; },
-      end(payload) {
-        if (payload) this.body = payload.toString();
-        resolve({ status: this.statusCode, headers: this.headers, body: this.body });
-      },
-    };
-    app.handle(req, res);
-  });
 }
 
 test('GET /api/registration-criteria 无需登录即可读（筛选标准对外透明）', async () => {
@@ -3498,6 +3473,7 @@ import { createEdition } from '../src/db/repo/editions.js';
 import { createSession } from '../src/auth/session.js';
 import { grantAssignment } from '../src/auth/permissions.js';
 import { insertCapability } from '../src/db/repo/capabilities.js';
+import { call } from '../test-helpers/http-call.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrationsDir = join(here, '..', 'db', 'migrations');
@@ -3572,32 +3548,6 @@ function setup() {
     tokenReader: createSession(db, reader.id).token,
     tokenWriter: createSession(db, writer.id).token,
   };
-}
-
-function call(app, method, path, { token = null, body = null } = {}) {
-  return new Promise((resolve) => {
-    const chunks = body ? [Buffer.from(JSON.stringify(body))] : [];
-    const req = {
-      method,
-      url: path,
-      headers: token ? { cookie: `hk_session=${token}` } : {},
-      async *[Symbol.asyncIterator]() {
-        for (const c of chunks) yield c;
-      },
-      on() {},
-    };
-    const res = {
-      statusCode: 200,
-      headers: {},
-      body: '',
-      writeHead(status, h) { this.statusCode = status; this.headers = h || {}; },
-      end(payload) {
-        if (payload) this.body = payload.toString();
-        resolve({ status: this.statusCode, headers: this.headers, body: this.body });
-      },
-    };
-    app.handle(req, res);
-  });
 }
 
 test('POST /api/task-packages 未登录 → 401', async () => {
@@ -4949,6 +4899,7 @@ import { grantAssignment } from '../src/auth/permissions.js';
 import { insertCapability } from '../src/db/repo/capabilities.js';
 import { createTaskPackage, updateTaskPackage } from '../src/db/repo/taskPackages.js';
 import { insertRegistration } from '../src/db/repo/registrations.js';
+import { call } from '../test-helpers/http-call.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrationsDir = join(here, '..', 'db', 'migrations');
@@ -5008,32 +4959,6 @@ function setup() {
     tokenOutsider: createSession(db, outsider.id).token,
     tokenAdmin: createSession(db, admin.id).token,
   };
-}
-
-function call(app, method, path, { token = null, body = null } = {}) {
-  return new Promise((resolve) => {
-    const chunks = body ? [Buffer.from(JSON.stringify(body))] : [];
-    const req = {
-      method,
-      url: path,
-      headers: token ? { cookie: `hk_session=${token}` } : {},
-      async *[Symbol.asyncIterator]() {
-        for (const c of chunks) yield c;
-      },
-      on() {},
-    };
-    const res = {
-      statusCode: 200,
-      headers: {},
-      body: '',
-      writeHead(status, h) { this.statusCode = status; this.headers = h || {}; },
-      end(payload) {
-        if (payload) this.body = payload.toString();
-        resolve({ status: this.statusCode, headers: this.headers, body: this.body });
-      },
-    };
-    app.handle(req, res);
-  });
 }
 
 async function createTeamViaApi(s, token, name = '甲队') {
@@ -6404,39 +6329,65 @@ git commit -m "feat(P1): 前端三页（报名问卷明示筛选标准 / 我的�
 
 **Files:**
 - Create: `platform/test/e2e-p1.test.js`
-- Modify: `platform/scripts/seed.js`（P1 种子 + 角色能力补 `task_package:read`）
+- Create: `platform/test-helpers/http-call.js`（三个 API 测试文件里逐字相同的 HTTP 调用器抽成共享工具）
+- Modify: `platform/scripts/seed.js`（P0 建立；P1 追加 P1 种子 + 角色能力补 `task_package:read`）
+- Modify: `platform/test/registration-api.test.js`（Task 3 建立；改用共享调用器）
+- Modify: `platform/test/task-package-api.test.js`（Task 4 建立；改用共享调用器）
+- Modify: `platform/test/team-api.test.js`（Task 5 建立；改用共享调用器）
 
 **Interfaces:**
 - Consumes: Task 1–6 全部产物
 - Produces:
-  - `test/e2e-p1.test.js` —— 「报名 → 分级 → 建队 → 认领任务包 → 加人」全链路
-  - `scripts/seed.js` 扩充：1 届期 + 1 城市 + 6 张任务卡（A/A/B/C/D/自由）+ 若干用户与报名 + 1 支已成立的战队
+  - `test/e2e-p1.test.js` —— 三层：① **服务层**全链路（「报名 → 分级 → 建队 → 认领任务包 → 加人」）；② **HTTP 层**全链路（出题 → 评估 → 签级 → 报名 → 建队 → 加人 → 成立）+ 能力点拦截与可见性；③ **种子产物**的三条断言（角色已授予且能力点真的生效 / 配比达标且自由题进池 / 幂等重入）
+  - `test-helpers/http-call.js` —— `call(app, method, path, {token, body})`、`callJson(...)`（进程内 HTTP 调用器）
+  - `scripts/seed.js` 的 P1 种子：1 届期 + 1 城市 + **11 张任务卡**（进池 10 = 4A + 2B + 1C + 3 自由；另 1 张 D 级退回）+ 4 名选手报名（S/A/B/C 四档）+ 1 支已成立的战队
   - 角色能力映射补 `captain`/`member` 的 `task_package:read`（选手要能看见已发布的任务包才能认领）
+  - ⚠️ **每个种子用户都必须显式授角色** —— `createUser` 不分配角色，不授则演示版是死的
 
 - [ ] **Step 1: 写失败的测试**
 
 `platform/test/e2e-p1.test.js`：
 
 ```javascript
+// platform/test/e2e-p1.test.js —— P1 端到端串联
+//
+// 依据：P1 计划 Task 7「端到端串联 + 种子扩充 + 验收」
+// 溯源需求：R-REG-01 / R-REG-02 / R-REG-05 / R-REG-08 / R-STG-03 / R-ENT-08 / R-ENT-09
+//
+// ⚠️ 本文件刻意分两层：
+//   ① **服务层**全链路（计划原规格的两条）：验证业务规则串起来是对的；
+//   ② **HTTP 层**全链路（Task 7 预审新增）：验证**路由层**也串得起来。
+//      为什么必须补这一层：Task 3 / Task 4 / Task 5 的真实缺陷**全部出在路由层**
+//      （能力点校验没接线、列表端点缺字段、越权踢人），服务层测不出来。
+//   ③ **种子产物**的三条：种子是演示版唯一的数据来源，它的正确性不能靠肉眼看控制台。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { execFileSync } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openDatabase } from '../src/db/sqlite.js';
 import { applyMigrations } from '../src/db/migrate.js';
 import { loadRules } from '../src/config.js';
-import { createUser } from '../src/db/repo/users.js';
+import { createUser, setSuperadmin } from '../src/db/repo/users.js';
 import { createEdition } from '../src/db/repo/editions.js';
 import { createTaskPackage } from '../src/db/repo/taskPackages.js';
 import { submitRegistration } from '../src/services/registration.js';
-import { assessSolvability, approveTaskPackage } from '../src/services/taskPackage.js';
+import { assessSolvability, approveTaskPackage, listTaskPackages } from '../src/services/taskPackage.js';
 import { createTeam, addMember } from '../src/services/team.js';
+import { checkTaskMix } from '../src/domain/solvability.js';
+import { can, grantAssignment } from '../src/auth/permissions.js';
+import { insertCapability } from '../src/db/repo/capabilities.js';
+import { createSession } from '../src/auth/session.js';
+import { createApp } from '../src/server.js';
+import { call } from '../test-helpers/http-call.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const migrationsDir = join(here, '..', 'db', 'migrations');
-const rulesDir = join(here, '..', 'rules');
+const platformDir = join(here, '..');
+const migrationsDir = join(platformDir, 'db', 'migrations');
+const rulesDir = join(platformDir, 'rules');
+const webDir = join(platformDir, 'web');
 const NOW = '2026-10-20T12:00:00.000Z';
 
 const ANSWERS = {
@@ -6461,6 +6412,8 @@ function setup() {
   });
   return { db, close, dataDir, rules, edition };
 }
+
+// ── ① 服务层全链路 ────────────────────────────────────────────────────────
 
 test('全链路：报名 → 分级 → 建队（认领任务包）→ 加人 → 战队成立', () => {
   const s = setup();
@@ -6555,6 +6508,264 @@ test('全链路：C 级报名被拒 → 不能入队（R-REG-08）', () => {
   s.close();
   rmSync(s.dataDir, { recursive: true, force: true });
 });
+
+// ── ② HTTP 层全链路（Task 7 预审新增）────────────────────────────────────
+
+function setupHttp() {
+  const s = setup();
+  const { db, rules, edition } = s;
+  const captain = createUser(db, { name: '队长', phone: '13900006201', password: 'pw', mbaStatus: 'mba' });
+  const member = createUser(db, { name: '组员', phone: '13900006202', password: 'pw', mbaStatus: 'mba' });
+  const enterprise = createUser(db, { name: '企业', phone: '13900006203', password: 'pw', mbaStatus: 'other' });
+  const admin = createUser(db, { name: '组委会', phone: '13900006204', password: 'pw', mbaStatus: 'mba' });
+  const outsider = createUser(db, { name: '路人', phone: '13900006205', password: 'pw', mbaStatus: 'mba' });
+  setSuperadmin(db, admin.id);
+
+  // 能力点必须先注册（grantAssignment 会校验）—— 不注册会抛 CAPABILITY_UNKNOWN
+  for (const [key, desc] of [
+    ['registration:write', '提交报名'], ['registration:review', '审核报名分级'],
+    ['team:create', '创建战队'], ['team:read', '读取战队'], ['team:manage', '管理战队成员'],
+    ['task_package:read', '读取任务卡'], ['task_package:write', '提交/编辑任务卡'],
+    ['task_package:approve', '任务卡分级签约'],
+  ]) insertCapability(db, key, desc);
+
+  const grant = (userId, capability) => grantAssignment(db, {
+    userId, capability, scopeType: 'global', scopeId: null, grantedBy: admin.id,
+  });
+  for (const cap of ['registration:write', 'team:create', 'team:read', 'task_package:read']) grant(captain.id, cap);
+  for (const cap of ['registration:write', 'team:read', 'task_package:read']) grant(member.id, cap);
+  for (const cap of ['task_package:write', 'task_package:read']) grant(enterprise.id, cap);
+
+  const app = createApp({ db, rules, webDir });
+  return {
+    ...s,
+    app,
+    captain, member, enterprise, admin, outsider,
+    tokenCaptain: createSession(db, captain.id).token,
+    tokenMember: createSession(db, member.id).token,
+    tokenEnterprise: createSession(db, enterprise.id).token,
+    tokenAdmin: createSession(db, admin.id).token,
+    tokenOutsider: createSession(db, outsider.id).token,
+  };
+}
+
+test('HTTP 全链路：出题 → 评估 → 签级 → 报名 → 建队 → 加人 → 成立', async () => {
+  const s = setupHttp();
+  const json = (res) => JSON.parse(res.body);
+
+  // 1) 企业提交任务卡（HTTP 层走能力点校验）
+  const created = await call(s.app, 'POST', '/api/task-packages', {
+    token: s.tokenEnterprise,
+    body: {
+      editionId: s.edition.id, title: '门店排班优化', painPoint: 'p',
+      expectedDelivery: 'd', acceptanceCriteria: 'a', consent: { accepted: true },
+    },
+  });
+  assert.equal(created.status, 200, `企业出题应成功：${created.body}`);
+  const pkgId = json(created).id;
+
+  // 2) 六维评估 → 3) 组委会签级（超管）
+  const assessed = await call(s.app, 'POST', `/api/task-packages/${pkgId}/solvability`, {
+    token: s.tokenEnterprise, body: { answers: FULL_SOLVABILITY },
+  });
+  assert.equal(assessed.status, 200, `六维评估应成功：${assessed.body}`);
+  const approved = await call(s.app, 'POST', `/api/task-packages/${pkgId}/approve`, {
+    token: s.tokenAdmin, body: { grade: 'A' },
+  });
+  assert.equal(approved.status, 200, `签级应成功：${approved.body}`);
+  assert.equal(json(approved).grade, 'A');
+
+  // 4) 队长报名 → 5) 建队（认领任务包）
+  const reg = await call(s.app, 'POST', '/api/registrations', {
+    token: s.tokenCaptain, body: { editionId: s.edition.id, answers: ANSWERS },
+  });
+  assert.equal(reg.status, 200, `报名应成功：${reg.body}`);
+  assert.equal(json(reg).level, 'S');
+  const regId = json(reg).id;
+
+  const team = await call(s.app, 'POST', '/api/teams', {
+    token: s.tokenCaptain,
+    body: { editionId: s.edition.id, taskPackageId: pkgId, name: '甲队' },
+  });
+  assert.equal(team.status, 200, `建队应成功：${team.body}`);
+  const teamId = json(team).id;
+  assert.equal(json(team).status, 'forming');
+  assert.equal(json(team).taskPackageId, pkgId, '建队即认领任务包（R-REG-01）');
+
+  // 6) 组员自助加入 → 满 2 人即成立
+  const memberReg = await call(s.app, 'POST', '/api/registrations', {
+    token: s.tokenMember, body: { editionId: s.edition.id, answers: ANSWERS },
+  });
+  assert.equal(memberReg.status, 200);
+  const joined = await call(s.app, 'POST', `/api/teams/${teamId}/members`, {
+    token: s.tokenMember, body: { action: 'add' },
+  });
+  assert.equal(joined.status, 200, `组员加入应成功：${joined.body}`);
+  assert.equal(json(joined).memberCount, 2);
+  assert.equal(json(joined).status, 'active');
+
+  // 7) 「我的战队」可见
+  const mine = await call(s.app, 'GET', '/api/teams', { token: s.tokenCaptain });
+  assert.equal(mine.status, 200);
+  assert.equal(json(mine).items.length, 1);
+  assert.equal(json(mine).items[0].id, teamId);
+
+  // 8) 组委会看得到报名 + 事件轨迹（Task 6 的列表端点修复在 HTTP 层生效）
+  const all = await call(s.app, 'GET', `/api/registrations?editionId=${s.edition.id}`, { token: s.tokenAdmin });
+  assert.equal(all.status, 200);
+  assert.equal(json(all).items.length, 2);
+  assert.ok(Array.isArray(json(all).items[0].events), '列表必须带事件轨迹');
+  assert.ok(json(all).items[0].events.length >= 1, '提交报名本身就是一条轨迹');
+
+  // 9) 委员会改级 → 选手读到的终态
+  const decided = await call(s.app, 'POST', `/api/registrations/${regId}/level`, {
+    token: s.tokenAdmin, body: { level: 'B', note: '复核降级' },
+  });
+  assert.equal(decided.status, 200, `改级应成功：${decided.body}`);
+  assert.equal(json(decided).levelFinal, 'B');
+
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('HTTP 层：能力点拦截 + 可见性过滤（三态状态码）', async () => {
+  const s = setupHttp();
+  const json = (res) => JSON.parse(res.body);
+
+  // 无 team:create 的路人 → 403（禁用），不是 404
+  const denied = await call(s.app, 'POST', '/api/teams', {
+    token: s.tokenOutsider,
+    body: { editionId: s.edition.id, taskPackageId: 'nope', name: '野队' },
+  });
+  assert.equal(denied.status, 403, `无建队权限应 403：${denied.body}`);
+
+  // 未登录 → 401
+  const anon = await call(s.app, 'POST', '/api/teams', {
+    body: { editionId: s.edition.id, taskPackageId: 'nope', name: '野队' },
+  });
+  assert.equal(anon.status, 401);
+
+  // 选手读报名列表 → 200 + 空集（可见性在 API 层过滤）
+  const list = await call(s.app, 'GET', `/api/registrations?editionId=${s.edition.id}`, { token: s.tokenCaptain });
+  assert.equal(list.status, 200);
+  assert.deepEqual(json(list).items, [], '无 registration:review 的选手看不到任何报名');
+
+  // 读他人报名 → 404
+  const reg = await call(s.app, 'POST', '/api/registrations', {
+    token: s.tokenCaptain, body: { editionId: s.edition.id, answers: ANSWERS },
+  });
+  const other = await call(s.app, 'GET', `/api/registrations/${json(reg).id}`, { token: s.tokenMember });
+  assert.equal(other.status, 404, `读他人报名应 404：${other.body}`);
+
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+// ── ③ 种子产物（Task 7 预审新增）──────────────────────────────────────────
+
+/**
+ * 跑真实种子脚本（子进程）。
+ * ⛔ 用**子进程**而不是 import：种子脚本有顶层副作用（建管理员、退出码 1 等），
+ *    部署手册里执行的就是这个脚本 —— 测它就该测它本身。
+ */
+function runSeed(dataDir) {
+  return execFileSync(process.execPath, [join(platformDir, 'scripts', 'seed.js')], {
+    cwd: platformDir,
+    env: { ...process.env, ADMIN_PASSWORD: 'e2e-test-admin-pw', DATA_DIR: dataDir },
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+}
+
+function openSeeded(dataDir) {
+  const { db, close } = openDatabase({ dataDir });
+  applyMigrations(db, migrationsDir);
+  const { rules } = loadRules(rulesDir);
+  return { db, close, rules };
+}
+
+test('种子产物：每个用户都被授予角色，能力点真的生效（演示版不能是死的）', () => {
+  // ⚠️ Task 7 预审修正（Critical）：原规格建了 4 个选手 + 1 个企业代表却**没授角色**
+  //    → 演示版里他们登录后报名 403、建队 403、看不到任务包，整个演示是死的。
+  //    这里断言的是**能力点的实际效果**（can() 是唯一判定入口），不是数据表内容。
+  const dataDir = mkdtempSync(join(tmpdir(), 'hks-seed-'));
+  runSeed(dataDir);
+  const { db, close, rules } = openSeeded(dataDir);
+
+  const byName = (name) => db.prepare(
+    "SELECT id, name FROM users WHERE name = ? AND active = 1",
+  ).get(name);
+
+  const captain = byName('队长甲');
+  const member = byName('组员乙');
+  const enterprise = byName('某零售·企业代表');
+  assert.ok(captain && member && enterprise, '种子必须建出这三个用户');
+
+  assert.equal(can(captain, 'registration:write', null, db), true, '队长必须能报名');
+  assert.equal(can(captain, 'team:create', null, db), true, '队长必须能建队');
+  assert.equal(can(captain, 'task_package:read', null, db), true, '队长必须能看见已发布的任务包');
+  assert.equal(can(member, 'registration:write', null, db), true, '组员必须能报名');
+  assert.equal(can(member, 'task_package:read', null, db), true, '组员必须能看见已发布的任务包');
+  assert.equal(can(member, 'team:create', null, db), false, '组员不该有建队权限');
+  assert.equal(can(enterprise, 'task_package:write', null, db), true, '企业必须能出题');
+
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('种子产物：进池 10 张卡，配比精确命中 R-ENT-09（40/20/10/30），D 级已出诊断报告', () => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'hks-seed-'));
+  runSeed(dataDir);
+  const { db, close, rules } = openSeeded(dataDir);
+
+  // ⚠️ 只能用**服务层呈现的驼峰形状**喂 checkTaskMix ——
+  //    它读 `p.isFreeBrief`，喂数据库行（`is_free_brief`）会把自由题算成 0
+  //    （Task 4 的 T4-2 形状错配，预审时本任务自己又踩了一次）。
+  const items = listTaskPackages({ db, filter: {}, viewer: { id: 'seed', is_superadmin: 1 }, rules });
+  const published = items.filter((p) => p.status === 'published');
+  const mix = checkTaskMix(published, rules.solvability);
+  assert.equal(mix.ok, true, `配比必须达标：${JSON.stringify(mix.errors)}`);
+  assert.equal(mix.total, 10);
+  assert.equal(mix.free, 3);
+  assert.equal(mix.byGrade.A, 4);
+  assert.equal(mix.byGrade.B, 2);
+  assert.equal(mix.byGrade.C, 1);
+
+  // 自由题必须**已签级并进池**（原规格 grade: null → 永远不进池 → 自由占比恒 0）
+  const free = published.filter((p) => p.isFreeBrief);
+  assert.equal(free.length, 3, '三张自由题必须进池');
+  assert.ok(free.every((p) => p.grade), '自由题也必须签级');
+  assert.ok(free.every((p) => p.commitment === '无'), 'R-ENT-10：自由命题无企业签字');
+
+  // D 级卡：退回 + 出《问题可解性诊断报告》（R-ENT-08）
+  const d = items.find((p) => p.grade === 'D');
+  assert.ok(d, '必须有一张 D 级卡用于演示');
+  assert.equal(d.status, 'returned');
+  assert.equal(d.meta?.solvability?.diagnosticReport?.title, '问题可解性诊断报告');
+
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('种子产物：跑第二遍不崩、数据不翻倍（部署时会重跑种子）', () => {
+  // ⚠️ Task 7 预审修正（Important）：原规格直接 createUser → 第二次跑
+  //    PHONE_TAKEN（409）直接崩 —— 部署手册里的「跑一次种子」会变成地雷。
+  const dataDir = mkdtempSync(join(tmpdir(), 'hks-seed-'));
+  runSeed(dataDir);
+  const out = runSeed(dataDir);
+  assert.ok(out.includes('P1 种子'), `第二遍种子仍应跑通：${out}`);
+
+  const { db, close, rules } = openSeeded(dataDir);
+  const count = (sql) => db.prepare(sql).get().n;
+  assert.equal(count('SELECT COUNT(*) n FROM task_packages'), 11, '任务卡不得翻倍');
+  assert.equal(count('SELECT COUNT(*) n FROM registrations'), 4, '报名不得翻倍');
+  assert.equal(count('SELECT COUNT(*) n FROM teams'), 1, '战队不得翻倍');
+  assert.equal(count('SELECT COUNT(*) n FROM editions'), 1, '届期不得翻倍');
+  assert.equal(count('SELECT COUNT(*) n FROM cities'), 1, '城市不得翻倍');
+
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -6562,120 +6773,406 @@ test('全链路：C 级报名被拒 → 不能入队（R-REG-08）', () => {
 Run: `cd platform && node --test test/e2e-p1.test.js`
 Expected: FAIL —— 断言不成立（Task 1–6 尚未全部落地时跑）
 
-- [ ] **Step 3: 修改 scripts/seed.js**
+- [ ] **Step 3: 创建共享 HTTP 调用器 + 修改 scripts/seed.js**
 
-`platform/scripts/seed.js` 追加 import 与 P1 种子块：
+**先抽共享调用器**：三个 API 测试文件（registration-api / task-package-api / team-api）里
+**各抄了一份逐字相同**的进程内 HTTP 调用器（md5 一致）—— 改一处要改三处，必然漂移。
+按全局约束「共享测试 helper 必须放 `platform/test-helpers/`」抽出去，三个文件改为 import。
+
+`platform/test-helpers/http-call.js`：
 
 ```javascript
-// ① 顶部 import 追加
-import { createEdition } from '../src/db/repo/editions.js';
-import { createCity } from '../src/db/repo/cities.js';
-import { createTaskPackage } from '../src/db/repo/taskPackages.js';
+// platform/test-helpers/http-call.js — 进程内 HTTP 调用器（测试专用共享工具）
+//
+// 依据：P1 Task 7 预审（重复代码清理）。
+//   `call(app, method, path, {token, body})` 此前在**三个** API 测试文件里
+//   各抄了一份（**逐字相同**，md5 一致）—— 改一处要改三处，必然漂移。
+//   三个文件分别是：registration-api / task-package-api / team-api。
+//
+// ⛔ 它是**测试辅助工具**，不是被测代码：放在 test-helpers/ 下，
+//    零依赖守卫（test/zero-deps.test.js 的 SCAN_DIRS 含 'test-helpers'）会一起扫，
+//    本文件只用 Node 标准库（Buffer / Promise），符合「零 npm 依赖」承诺。
+//
+// ⚠️ 为什么是「进程内」而不是真起一个服务器：
+//    它走的是 **app.handle → 路由 → 中间件 → 会话解析 → 错误映射** 的完整链路，
+//    只是省掉了 socket 与 HTTP 报文编解码 —— 路由层的缺陷（能力点校验、
+//    三态状态码、可见性过滤）一样能被测到。真正的 socket 级用例在
+//    test/server.test.js（路径穿越 / 静态文件）。
+//
+// ⚠️ 返回值是 `{ status, headers, body }`（body 是**字符串**，要自己 JSON.parse）。
+//
+// ⛔ 纯函数、零依赖、零 IO。
+
+/**
+ * 在进程内发一次请求。
+ *
+ * @param {object} app `createApp({ db, rules, webDir })` 的返回值
+ * @param {string} method HTTP 方法（GET / POST / PATCH / DELETE）
+ * @param {string} path 请求路径（含 query）
+ * @param {{ token?: string|null, body?: any }} [options]
+ *   `token` → 带上 `Cookie: hk_session=<token>`（P0 的会话 cookie 名）
+ *   `body`  → 会被 JSON 序列化并声明 `Content-Type: application/json`
+ * @returns {Promise<{ status: number, headers: object, body: string }>}
+ */
+export function call(app, method, path, { token = null, body = null } = {}) {
+  return new Promise((resolve) => {
+    const chunks = body ? [Buffer.from(JSON.stringify(body))] : [];
+    const req = {
+      method,
+      url: path,
+      headers: token ? { cookie: `hk_session=${token}` } : {},
+      async *[Symbol.asyncIterator]() {
+        for (const c of chunks) yield c;
+      },
+      on() {},
+    };
+    const res = {
+      statusCode: 200,
+      headers: {},
+      body: '',
+      writeHead(status, h) { this.statusCode = status; this.headers = h || {}; },
+      end(payload) {
+        if (payload) this.body = payload.toString();
+        resolve({ status: this.statusCode, headers: this.headers, body: this.body });
+      },
+    };
+    app.handle(req, res);
+  });
+}
+
+/**
+ * `call` + JSON 解析的便捷封装。
+ * 响应体不是合法 JSON 时把原文挂在 `res.text` 上（便于断言错误文本）。
+ */
+export async function callJson(app, method, path, options = {}) {
+  const res = await call(app, method, path, options);
+  let json = null;
+  try {
+    json = res.body ? JSON.parse(res.body) : null;
+  } catch {
+    json = null;
+  }
+  return { ...res, json, text: res.body };
+}
+```
+
+**再改种子**（`scripts/seed.js` 是 **P0 建立**的文件，本阶段是 **Modify**）：
+
+`platform/scripts/seed.js`：
+
+> ⚠️ **2026-10-21 父代理预审后改为「整文件」呈现**（原规格是「追加 import 与 P1 种子块」的
+> 操作指令型片段）。原因：本任务对种子的改动覆盖了 import、角色能力映射、种子主流程调用、
+> 以及新增的 `seedP1` 函数**四处**，片段式呈现无法逐字校验；
+> 改成整文件后，一致性检查器能对 `scripts/seed.js` 做**逐字比对**（计划是规格）。
+> `scripts/seed.js` 是 **P0 建立**的文件，本阶段是 **Modify（追加语义）**，不是重建。
+
+`platform/scripts/seed.js`：
+
+```javascript
+// scripts/seed.js — 种子数据：能力点、角色、角色能力映射、初始管理员
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+import { openDatabase } from '../src/db/sqlite.js';
+import { applyMigrations } from '../src/db/migrate.js';
+import { createUser, findUserByPhone, setSuperadmin } from '../src/db/repo/users.js';
+import { insertCapability, insertRoleCapability } from '../src/db/repo/capabilities.js';
+import { insertRole, insertUserRole } from '../src/db/repo/roles.js';
+import { createEdition, listEditions } from '../src/db/repo/editions.js';
+import { createCity, listCitiesByEdition } from '../src/db/repo/cities.js';
+import { listTaskPackagesByEdition } from '../src/db/repo/taskPackages.js';
+import { findActiveRegistration } from '../src/db/repo/registrations.js';
+import { listTeamRows } from '../src/db/repo/teams.js';
 import { submitRegistration } from '../src/services/registration.js';
-import { assessSolvability, approveTaskPackage } from '../src/services/taskPackage.js';
+import { submitTaskPackage, assessSolvability, approveTaskPackage } from '../src/services/taskPackage.js';
 import { createTeam, addMember } from '../src/services/team.js';
 import { loadRules } from '../src/config.js';
 
-// ② ROLE_CAPABILITIES 补两行（选手要能读已发布的任务包才能认领）
-//    ['captain', 'task_package:read'], ['member', 'task_package:read'],
+const here = dirname(fileURLToPath(import.meta.url));
+const dataDir = process.env.DATA_DIR || join(here, '..', 'data');
 
-// ③ 在种子主流程末尾追加调用
-//    seedP1({ db, rules, adminId: admin.id });
+// ⛔ 预审修正（I7-2）：管理员口令**不兜底**。
+//    原来写 `process.env.ADMIN_PASSWORD || 'change-me-now'` —— 一个写死在代码里的
+//    公开口令当组委会超管口令（预审实测已打印出来）。P6 之后这套脚本要跑在公网机器上，
+//    与项目原则「校验不过就拒绝启动，绝不降级为默认值」直接冲突。
+//    没有 ADMIN_PASSWORD → 明确报错 + 退出码 1，**不创建任何账号**。
+const adminPassword = process.env.ADMIN_PASSWORD;
+if (!adminPassword) {
+  console.error('缺少环境变量 ADMIN_PASSWORD，拒绝创建管理员账号（不提供默认口令）。');
+  console.error("用法：ADMIN_PASSWORD='你的密码' node scripts/seed.js");
+  process.exit(1);
+}
 
-// ④ 新增函数
-function seedP1({ db, rules, adminId }) {
-  const NOW = '2026-10-20T00:00:00.000Z';
-  const edition = createEdition(db, {
-    name: '首届 · 上海', city: '上海', startsAt: '2026-10-01', endsAt: '2026-10-31', now: NOW,
-  });
-  createCity(db, { name: '上海', editionId: edition.id });
+const CAPABILITIES = [
+  ['registration:write', '提交报名'],
+  ['registration:review', '审核报名分级'],
+  ['team:create', '创建战队'],
+  ['team:read', '读取战队'],
+  ['team:manage', '管理战队成员'],
+  ['task_package:read', '读取任务卡'],
+  ['task_package:write', '提交/编辑任务卡'],
+  ['task_package:approve', '任务卡分级签约'],
+  ['score:write', '写入评分'],
+  ['score:read', '读取评分'],
+  ['peer_review:write', '互评'],
+  ['signoff:create', '企业里程碑签字'],
+  ['stage:compute', '触发计算发榜'],
+  ['audit:read', '读取审计与计算快照'],
+  ['pool:read', '读取三池'],
+  ['pool:write', '维护三池'],
+];
 
-  const enterprise = createUser(db, {
-    name: '某零售·企业代表', phone: '13800000001', password: 'demo-pw', mbaStatus: 'other', org: '某零售',
-  });
+const ROLES = [
+  ['admin', '组委会'],
+  ['captain', '队长'],
+  ['member', '组员'],
+  ['judge', '评委席'],
+  ['enterprise', '企业席'],
+  ['observer', '观察员（无投票权）'],
+  ['enterprise_admin', '企业管理员'],
+];
 
-  const FULL = {
-    problem_clarity: 3, data_access: 3, validation: 2,
-    decision_chain: 1, accountability: 1, precedent: 1,
+/** P1 演示届期名（种子幂等的锚点：按名字认领已存在的届期，不重复建）。 */
+const EDITION_NAME = '首届 · 上海';
+
+const ROLE_CAPABILITIES = [
+  ['admin', 'registration:review'], ['admin', 'team:read'], ['admin', 'team:manage'],
+  ['admin', 'task_package:read'], ['admin', 'task_package:approve'], ['admin', 'score:read'],
+  ['admin', 'stage:compute'], ['admin', 'audit:read'], ['admin', 'pool:read'], ['admin', 'pool:write'],
+  ['captain', 'registration:write'], ['captain', 'team:create'], ['captain', 'team:read'],
+  ['captain', 'team:manage'], ['captain', 'pool:read'], ['captain', 'task_package:read'],
+  ['member', 'registration:write'], ['member', 'team:read'], ['member', 'pool:read'],
+  ['member', 'task_package:read'],
+  ['judge', 'score:write'], ['judge', 'score:read'], ['judge', 'peer_review:write'], ['judge', 'task_package:read'],
+  ['enterprise', 'score:write'], ['enterprise', 'score:read'], ['enterprise', 'signoff:create'],
+  ['enterprise', 'task_package:read'], ['enterprise', 'task_package:write'], ['enterprise', 'pool:read'],
+  ['observer', 'score:read'], ['observer', 'team:read'], ['observer', 'task_package:read'],
+  ['enterprise_admin', 'task_package:write'], ['enterprise_admin', 'signoff:create'], ['enterprise_admin', 'pool:read'],
+];
+
+const { db, close } = openDatabase({ dataDir });
+try {
+  applyMigrations(db, join(here, '..', 'db', 'migrations'));
+
+  // ⛔ 评审修正（I-7）：种子数据写入一律走仓储层 ——
+  //    本文件**不再出现任何 SQL 字符串**（全局约束「所有 SQL 收进 src/db/repo/」）。
+  for (const [key, description] of CAPABILITIES) insertCapability(db, key, description);
+
+  for (const [key, description] of ROLES) insertRole(db, key, description);
+
+  for (const [role, cap] of ROLE_CAPABILITIES) insertRoleCapability(db, role, cap);
+
+  const adminPhone = process.env.ADMIN_PHONE || '13800000000';
+  // 查重走仓储层（findUserByPhone 取的行里不含 password_hash）
+  // ⛔ 评审修正（I-7）：这条注释原来写「不写裸 SQL」，**却和同一文件里的裸 SQL 自相矛盾**
+  //    —— 现在本文件确实一条 SQL 字符串都没有了：种子写入全部下沉到 src/db/repo/。
+  let admin = findUserByPhone(db, adminPhone);
+  if (!admin) {
+    admin = createUser(db, {
+      name: '组委会管理员', phone: adminPhone, password: adminPassword, mbaStatus: 'mba',
+    });
+    setSuperadmin(db, admin.id);
+    insertUserRole(db, admin.id, 'admin');
+    // 只打印账号，不回显口令
+    console.log(`已创建管理员：${adminPhone}  ← 请立即修改密码`);
+  } else {
+    console.log(`管理员已存在：${adminPhone}`);
+  }
+  // P1 演示数据（届期 / 任务卡 / 选手报名 / 战队）
+  const { rules } = loadRules(join(here, '..', 'rules'));
+  seedP1({ db, rules, adminId: admin.id });
+  console.log(`种子完成：${CAPABILITIES.length} 个能力点，${ROLES.length} 个角色，${ROLE_CAPABILITIES.length} 条角色能力映射`);
+} finally {
+  close();
+}
+
+// ── P1 演示数据 ─────────────────────────────────────────────────────────
+/**
+ * P1 种子：1 届期 + 1 城市 + 11 张任务卡 + 4 名选手报名 + 1 支已成立的战队。
+ *
+ * ⚠️ **角色必须显式授予**（P1 Task 7 预审修正 Critical）：
+ *    `createUser` **不分配任何角色**（角色在 `user_roles` 表）。
+ *    原规格建了 4 个选手 + 1 个企业代表却没授角色 →
+ *    演示版里这些人登录后报名 403、建队 403、看不到任务包，
+ *    整个演示是死的（预审探针：`user_roles` 里他们的 `role_key` 全是 `null`；
+ *    只有管理员有 `admin` 角色）。原规格自己加的
+ *    「captain/member 补 `task_package:read`」也因此**完全落空** ——
+ *    根本没人持有 captain / member 这两个角色。
+ *
+ * ⚠️ **配比必须达标**（P1 Task 7 预审修正 Important）：
+ *    R-ENT-09 要求任务池构成 A 40% / B 20% / C 10% / 自由 30%（容差 ±10%）。
+ *    原规格 6 张卡凑不出这个比例，而且自由题 `grade: null` → 永远签不了级 →
+ *    不进池 → 自由占比恒为 0%。预审实跑 `checkTaskMix`：
+ *    `[TASK_MIX_FREE] 自由命题占比 0%，目标 30%`。
+ *    现在进池 **10 张**：4 张 A + 2 张 B + 1 张 C + 3 张自由 = 精确命中 40/20/10/30；
+ *    另加 1 张 **D 级**卡（六维 0 分 → 退回 + 出《问题可解性诊断报告》）演示 D 档。
+ *
+ * ⚠️ **幂等**（P1 Task 7 预审修正 Important）：
+ *    种子会被重复执行（部署时重跑、崩溃后重跑）。原规格直接 `createUser` →
+ *    第二次跑 `PHONE_TAKEN`（409）直接崩掉 —— 部署手册里的「跑一次种子」会变成地雷。
+ *    现在每个实体都「先查后建」，与 P0 种子自己的 `findUserByPhone` 同一约定。
+ *
+ * ⚠️ **走服务层而不是仓储层**（P1 Task 7 预审修正 Important）：
+ *    原规格直接调 `createTaskPackage` 仓储并手搓 `meta`，
+ *    于是 R-ENT-01（字段完整）/ R-ENT-12（同意记录）/ R-ENT-10（自由题不挂企业）
+ *    这些**服务层才有的校验**在种子路径上全部绕开 —— 种子与生产两套口径。
+ *    现在改调 `submitTaskPackage` 服务层，`meta` 由服务层生成。
+ */
+function seedP1({ db, rules, adminId, now = '2026-10-20T00:00:00.000Z' }) {
+  // 先查后建（幂等）
+  const ensureUser = (spec) => {
+    const found = findUserByPhone(db, spec.phone);
+    return found ?? createUser(db, spec);
   };
-  const ZERO = {
-    problem_clarity: 0, data_access: 0, validation: 0,
-    decision_chain: 0, accountability: 0, precedent: 0,
+
+  const edition = listEditions(db).find((e) => e.name === EDITION_NAME)
+    ?? createEdition(db, {
+      name: EDITION_NAME, city: '上海', startsAt: '2026-10-01', endsAt: '2026-10-31', now,
+    });
+  if (!listCitiesByEdition(db, edition.id).some((c) => c.name === '上海')) {
+    createCity(db, { name: '上海', editionId: edition.id });
+  }
+
+  const enterprise = ensureUser({
+    name: '某零售·企业代表', phone: '13800000001', password: 'demo-pw',
+    mbaStatus: 'other', org: '某零售',
+  });
+  insertUserRole(db, enterprise.id, 'enterprise');
+
+  // 六维作答模板：每一档都按「该档位的分值区间」构造，
+  // 让卡片的评估分与组委会签的级**自洽**（否则演示里会出现「评估 11 分却签 C」的怪事）。
+  // ⚠️ data_access 与 accountability 都不能取 0 —— 取 0 会命中一票否决
+  //    （无法提供数据授权说明 / 无企业侧唯一责任人），被强制退回 D。
+  const ANSWERS = {
+    A: { problem_clarity: 3, data_access: 3, validation: 2, decision_chain: 1, accountability: 1, precedent: 1 },
+    B: { problem_clarity: 2, data_access: 2, validation: 2, decision_chain: 1, accountability: 1, precedent: 1 },
+    C: { problem_clarity: 1, data_access: 1, validation: 1, decision_chain: 0, accountability: 1, precedent: 1 },
+    D: { problem_clarity: 2, data_access: 0, validation: 1, decision_chain: 0, accountability: 0, precedent: 0 },
   };
+
+  // 进池 10 张：4×A + 2×B + 1×C + 3×自由（R-ENT-09 精确命中 40/20/10/30）
+  // ＋ 1 张 D 级卡（退回 + 诊断报告，演示 D 档）
   const specs = [
-    { title: '门店排班优化', grade: 'A', free: false, answers: FULL },
-    { title: '供应链需求预测', grade: 'A', free: false, answers: FULL },
-    { title: '客服知识库问答', grade: 'B', free: false, answers: FULL },
-    { title: '门店陈列合规巡检', grade: 'C', free: false, answers: FULL },
-    { title: '社区养老排班助手', grade: 'D', free: false, answers: ZERO },
-    { title: '开源模型微调实验', grade: null, free: true, answers: FULL },
+    { title: '门店排班优化', grade: 'A', free: false },
+    { title: '供应链需求预测', grade: 'A', free: false },
+    { title: '会员复购预测', grade: 'A', free: false },
+    { title: '门店能耗优化', grade: 'A', free: false },
+    { title: '客服知识库问答', grade: 'B', free: false },
+    { title: '选品需求预测', grade: 'B', free: false },
+    { title: '门店陈列合规巡检', grade: 'C', free: false },
+    { title: '开源模型微调实验', grade: 'A', free: true },
+    { title: '公共数据问诊助手', grade: 'B', free: true },
+    { title: '公益法律问答助手', grade: 'A', free: true },
+    { title: '社区养老排班助手', grade: 'D', free: false },
   ];
 
+  const existing = new Map(listTaskPackagesByEdition(db, edition.id).map((p) => [p.title, p]));
   const packages = [];
   for (const spec of specs) {
-    const pkg = createTaskPackage(db, {
-      editionId: edition.id,
-      enterpriseId: spec.free ? null : 'ent_retail',
-      enterpriseName: spec.free ? null : '某零售',
-      title: spec.title,
-      painPoint: `${spec.title}：目前靠人工，效率低且不可复制`,
-      expectedDelivery: '可运行原型 + 一次真实数据验证',
-      acceptanceCriteria: '门店负责人认可并愿意试点',
-      isFreeBrief: spec.free,
-      submittedBy: enterprise.id,
-      meta: { consent: { accepted: true, acceptedAt: NOW }, ipOwnership: rules.compliance.ipOwnership },
-      now: NOW,
-    });
-    assessSolvability({ db, taskPackageId: pkg.id, answers: spec.answers, actorId: enterprise.id, now: NOW, rules });
-    if (spec.grade) {
-      approveTaskPackage({ db, taskPackageId: pkg.id, grade: spec.grade, actorId: adminId, now: NOW, rules });
+    let pkg = existing.get(spec.title) ?? null;
+    if (!pkg) {
+      const submitted = submitTaskPackage({
+        db,
+        userId: spec.free ? adminId : enterprise.id,
+        payload: {
+          editionId: edition.id,
+          title: spec.title,
+          painPoint: `${spec.title}：目前靠人工，效率低且不可复制`,
+          expectedDelivery: '可运行原型 + 一次真实数据验证',
+          acceptanceCriteria: '门店负责人认可并愿意试点',
+          // R-ENT-10：自由命题**不挂企业主体**（企业签字对自由题不成立）
+          enterpriseId: spec.free ? null : enterprise.id,
+          enterpriseName: spec.free ? null : '某零售',
+          isFreeBrief: spec.free,
+          consent: { accepted: true },
+        },
+        now,
+        rules,
+      });
+      pkg = { id: submitted.id, status: 'submitted' };
+    }
+    // 幂等续跑：卡在哪个阶段就从哪个阶段往下走
+    if (pkg.status === 'submitted') {
+      assessSolvability({
+        db, taskPackageId: pkg.id, answers: ANSWERS[spec.grade], actorId: enterprise.id, now, rules,
+      });
+      pkg = { ...pkg, status: 'assessed' };
+    }
+    if (pkg.status === 'assessed') {
+      approveTaskPackage({ db, taskPackageId: pkg.id, grade: spec.grade, actorId: adminId, now, rules });
+      pkg = { ...pkg, status: spec.grade === 'D' ? 'returned' : 'published' };
     }
     packages.push(pkg);
   }
 
-  // 选手：一组画像强度不同的报名，覆盖 S/A/B/C 四档
+  // 选手：四档画像（S / A / B / C），覆盖「被接收 / 不接收」两条分支
   const profiles = [
-    { name: '队长甲', phone: '13800000011', mbaStatus: 'mba', answers: [5, 5, 5, 5, 5] },
-    { name: '组员乙', phone: '13800000012', mbaStatus: 'mba', answers: [4, 4, 4, 4, 4] },
-    { name: '组员丙', phone: '13800000013', mbaStatus: 'mba', answers: [3, 3, 3, 3, 3] },
-    { name: '落选丁', phone: '13800000014', mbaStatus: 'mba', answers: [1, 1, 1, 1, 1] },
+    { name: '队长甲', phone: '13800000011', mbaStatus: 'mba', role: 'captain', answers: [5, 5, 5, 5, 5] },
+    { name: '组员乙', phone: '13800000012', mbaStatus: 'mba', role: 'member', answers: [4, 4, 4, 4, 4] },
+    { name: '组员丙', phone: '13800000013', mbaStatus: 'mba', role: 'member', answers: [3, 3, 3, 3, 3] },
+    { name: '落选丁', phone: '13800000014', mbaStatus: 'mba', role: 'member', answers: [1, 1, 1, 1, 1] },
   ];
   const users = [];
   for (const p of profiles) {
-    const u = createUser(db, { name: p.name, phone: p.phone, password: 'demo-pw', mbaStatus: p.mbaStatus });
-    const answers = {
-      direction: p.answers, capability: p.answers, collaboration: p.answers,
-      open: '我想用 AI 解决真实门店的排班与库存协同问题',
-      consent: { accepted: true },
-    };
-    const reg = submitRegistration({ db, userId: u.id, editionId: edition.id, answers, now: NOW, rules });
-    users.push({ user: u, level: reg.level });
+    const u = ensureUser({
+      name: p.name, phone: p.phone, password: 'demo-pw', mbaStatus: p.mbaStatus,
+    });
+    insertUserRole(db, u.id, p.role);
+    let level = null;
+    if (!findActiveRegistration(db, u.id, edition.id)) {
+      const reg = submitRegistration({
+        db,
+        userId: u.id,
+        editionId: edition.id,
+        answers: {
+          direction: p.answers, capability: p.answers, collaboration: p.answers,
+          open: '我想用 AI 解决真实门店的排班与库存协同问题',
+          consent: { accepted: true },
+        },
+        now,
+        rules,
+      });
+      level = reg.level;
+    } else {
+      const found = findActiveRegistration(db, u.id, edition.id);
+      level = found.level;
+    }
+    users.push({ user: u, level });
   }
 
   // 一支已成立的战队（认领第一张 A 级任务卡）
   const captain = users[0].user;
   const member = users[1].user;
-  const team = createTeam({
-    db, userId: captain.id, editionId: edition.id,
-    taskPackageId: packages[0].id, name: '甲队', now: NOW, rules,
-  });
-  addMember({ db, teamId: team.id, userId: member.id, actorId: captain.id, now: NOW, rules });
+  const existingTeam = listTeamRows(db, { editionId: edition.id }).find((t) => t.name === '甲队');
+  if (!existingTeam) {
+    const team = createTeam({
+      db, userId: captain.id, editionId: edition.id,
+      taskPackageId: packages[0].id, name: '甲队', now, rules,
+    });
+    addMember({ db, teamId: team.id, userId: member.id, actorId: captain.id, now, rules });
+  }
 
   console.log(
-    `P1 种子：届期 ${edition.name}｜任务卡 ${packages.length} 张｜选手 ${users.length} 人（等级 ${users.map((u) => u.level).join('/')}）｜战队 甲队`,
+    `P1 种子：届期 ${edition.name}｜任务卡 ${packages.length} 张（进池 10 + D 级退回 1）｜`
+    + `选手 ${users.length} 人（等级 ${users.map((u) => u.level).join('/')}）｜战队 甲队`,
   );
+  return { edition, packages, users };
 }
 ```
 
 - [ ] **Step 4: 运行全量测试**
 
 Run: `cd platform && node --test`
-Expected: 全部通过（P0 的用例 + P1 的 9 个测试文件）
+Expected: PASS（7 个测试全过：e2e-p1 7）
+（`node --test` 无参、cwd 发现；全量应为 P0 的 151 条 + P1 的 155 条 = **306 条**）
 
 - [ ] **Step 5: 实跑种子与迁移**
 
 Run: `cd platform && rm -rf data && node scripts/migrate.js && node scripts/seed.js`
-Expected: 输出 `迁移完成，当前版本 2`；种子输出 `P1 种子：届期 首届 · 上海｜任务卡 6 张｜选手 4 人（等级 S/A/B/C）｜战队 甲队`
+Expected: 输出 `迁移完成，当前版本 2`；种子输出
+`P1 种子：届期 首届 · 上海｜任务卡 11 张（进池 10 + D 级退回 1）｜选手 4 人（等级 S/A/B/C）｜战队 甲队`
+
+⚠️ 种子必须**可重复执行**：再跑一遍不应报错，也不应把数据翻倍
+（Task 7 预审修正 Important —— 原规格第二次跑直接 `PHONE_TAKEN` 崩掉）。
 
 Run: `cd platform && node src/server.js &`
 Expected: 输出 `heikesong-platform 启动于 http://127.0.0.1:8080（规则版本 2026-10-20）`
@@ -6686,10 +7183,11 @@ Expected: JSON 含 `"dimensions"`、`"levels"`、`"funnel"`
 - [ ] **Step 6: 提交**
 
 ```bash
-cd platform && git add scripts/seed.js test/e2e-p1.test.js
+cd platform && git add scripts/seed.js test/e2e-p1.test.js test-helpers/http-call.js \
+  test/registration-api.test.js test/task-package-api.test.js test/team-api.test.js
 git commit -m "feat(P1): 端到端串联与种子扩充（报名→分级→建队→认领→加人）
 
-对应需求：R-REG-01 / R-REG-02 / R-REG-05 / R-REG-08 / R-STG-03 / R-ENT-08"
+对应需求：R-REG-01 / R-REG-02 / R-REG-05 / R-REG-08 / R-STG-03 / R-ENT-08 / R-ENT-09"
 ```
 
 ---
@@ -6856,6 +7354,34 @@ git commit -m "feat(P1): 端到端串联与种子扩充（报名→分级→建�
 
 ---
 
+## Task 7 父代理预审修正台账（2026-10-21）
+
+> Task 7 的规格在**实施前**被父代理逐条实跑预审（把计划里的代码块抽到独立工程里跑，
+> 并把种子脚本**真的执行了一遍**、再探针查库），发现 **1 Critical + 4 Important + 2 Minor**。
+> 全部缺陷均**实跑复现**；实施后做了变异检验，**9/9 杀灭**。
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| **T7-1** | **Critical** | 种子创建的**所有用户都没被授予任何角色** —— `createUser` **不分配角色**（角色在 `user_roles` 表），原规格建了 4 个选手 + 1 个企业代表却没授角色 | 探针查种子库：`user_roles` 里 4 个选手与企业代表的 `role_key` 全是 `null`，只有管理员有 `admin`。后果：演示版里这些人登录后**报名 403、建队 403、看不到任务包**，整个演示是死的；原规格自己加的「captain/member 补 `task_package:read`」也因此**完全落空**（没人持有这两个角色） | 逐个 `insertUserRole`：队长甲→`captain`、组员乙/丙/落选丁→`member`、企业代表→`enterprise`；e2e 用 `can()` 断言**能力点的实际效果**（不是查表），确保接线真的通了 |
+| **T7-2** | Important | 种子**不可重入**：直接 `createUser` → 第二次跑 `PHONE_TAKEN`（409）直接崩 | 实跑：同一 `DATA_DIR` 跑第二遍 → 409 `PHONE_TAKEN` 栈。部署手册里的「跑一次种子」会变成地雷 | 每个实体「先查后建」（用户按手机号、届期按名字、卡按标题、报名按 `findActiveRegistration`、战队按名字），与 P0 种子自己的 `findUserByPhone` 同一约定；e2e 跑两遍并断言数据不翻倍 |
+| **T7-3** | Important | 种子**绕过服务层**直连 `createTaskPackage` 仓储并手搓 `meta` | 服务层才有 R-ENT-01（字段完整）/ R-ENT-12（同意记录）/ R-ENT-10（自由题不挂企业主体）的校验 —— 种子路径把这些**全部绕开**，与生产两套口径 | 改调 `submitTaskPackage` 服务层，`meta` 由服务层生成 |
+| **T7-4** | Important | 自由命题卡 `grade: null` → **永远签不了级、不进选题池** → 演示数据里没有自由题，R-ENT-09 的 30% 自由**必然不达标** | 探针：自由卡 `grade=null`、`status=assessed`；`checkTaskMix` 实跑 → `[TASK_MIX_FREE] 自由命题占比 0%，目标 30%` | 自由题也走六维评估 + 分级签约 → 进池 |
+| **T7-5** | Important | 种子数据的**配比必然不达标**（6 张卡凑不出 40/20/10/30） | `checkTaskMix` 容差 ±10%：6 张卡凑不出 30% 自由（1/6 = 16.7%，差 13.3 个百分点 > 10） | 种子扩到 **10 张进池卡**（4×A + 2×B + 1×C + 3×自由）—— **精确命中** 40%/20%/10%/30%；另加 1 张 **D 级**卡（六维 0 分 → 退回 + 出《问题可解性诊断报告》）演示 D 档 |
+| **T7-6** | Minor | 三个 API 测试文件里各抄了一份**逐字相同**的 HTTP 调用器（md5 一致） | `md5` 比对：三个 `call` 函数哈希完全相同 —— 改一处要改三处 | 抽成 `platform/test-helpers/http-call.js`（全局约束：共享 helper 必须放 `test-helpers/`），三个文件改为 import；**变异复测确认覆盖率未丢**（撤掉 `team:create` 校验 → 三个 API 测试仍能抓住） |
+| **T7-7** | Minor | e2e 只走**服务层**，不覆盖路由层 | Task 3 / Task 4 / Task 5 的真实缺陷**全部出在路由层**（能力点校验没接线、列表端点缺字段、越权踢人），服务层测不出来 | 补 **HTTP 层**全链路（出题 → 评估 → 签级 → 报名 → 建队 → 加人 → 成立）+ 能力点拦截（403）+ 可见性（200+空集 / 404）+ 事件轨迹 |
+| **T7-8** | Minor | `enterpriseId: 'ent_retail'` 是**魔法字符串**，不对应任何用户 | 探针：`users` 表里没有该 id（`enterprise_id` 无外键所以不报错，但值是假的） | 改用真实的 `enterprise.id` |
+
+**Task 7 的测试条数口径**：e2e-p1 **7**（服务层 2 + HTTP 层 2 + 种子产物 3）。
+
+**Task 7 的变异检验口径**：9 个变异体，**9/9 杀灭**（`/tmp/p1t7/mutate.mjs`）。变异体覆盖：不给选手授角色、不给企业授角色、种子不幂等、自由题不签级、配比不达标、D 级不出诊断报告、列表不带事件轨迹、路由不校验 `team:create`、建队不认领任务包。
+
+**⚠️ 预审时自己踩到的坑（登记）**：`checkTaskMix` 消费的是**服务层呈现的驼峰形状**（`p.isFreeBrief`），
+喂**数据库行**（`p.is_free_brief`）会把自由题算成 0 —— 预审探针第一次就是这么写的，
+结果「自由占比 0%」的假象差点被当成真缺陷。这与 Task 4 的 T4-2（形状错配）是**同一个坑**：
+领域层统一消费**已呈现对象**，任何直接拿仓储行喂领域层的调用都会算错。
+
+---
+
 ## 与接口契约的偏差
 
 > 以下 7 条是本计划相对 `INTERFACES.md` §2「P1 产出」的实现偏差。**INTERFACES.md 未被本计划修改**。
@@ -6889,6 +7415,10 @@ git commit -m "feat(P1): 端到端串联与种子扩充（报名→分级→建�
 | `GET /api/registrations`（列表）**带 events** | 列表里的每条报名都带 `events` 数组（与单条 `GET /api/registrations/:id` 形状**逐字一致**） | **【2026-10-21 父代理预审 Important T6-3】** 契约没写列表带不带事件。此前只有单条挂 → 组委会筛选台读列表 → 轨迹一栏恒空。现在仓储层用**一次 SQL**（`IN (...)` + `ORDER BY created_at, rowid`）批量取，服务层挂上。⚠️ 代价：一届的报名量级下 N+1 与批量差别不大，但**报名量上万时列表会变重** —— 届期规模扩大前要改成分页 + 分批取 |
 | 「退出战队」按钮的可用性口径 | **组员可退、组长不可退**（组长移交走汰换 `action=replace`） | **【2026-10-21 父代理预审 Important T6-2】** 与服务端 `leaveTeam` 的 409 `CAPTAIN_MUST_REPLACE` 对齐。契约没规定前端按钮的禁用规则 |
 | 前端视图的**纯逻辑导出**范围 | `buildQuestionnaire` / `formatExplain` / `summarizeTeam` / `canLeaveTeam` / `buildTeamCards` / `buildScreeningRows` / `buildFunnelView` / `formatEventTrail` 全部**不碰 `document`**，可在 `node:test` 里直接测 | **【2026-10-21 父代理预审 Minor T6-5】** 变异检验暴露「渲染路径无覆盖」的盲区 —— 把渲染逻辑从 DOM 里剥出来，纯函数才能被直接断言 |
+| 种子**必须显式授角色** | 种子里的每个用户都 `insertUserRole`（队长→`captain`、组员→`member`、企业代表→`enterprise`） | **【2026-10-21 父代理预审 Critical T7-1】** `createUser` 不分配角色（角色在 `user_roles` 表）。契约 §2 规定了角色模型，但没说「谁负责授」—— 种子是**唯一的**账号来源，不授则演示版全死。⚠️ P2–P6 的种子扩充同样必须显式授角色 |
+| 种子数据的**配比构成** | 进池 10 张 = 4×A + 2×B + 1×C + 3×自由（精确命中 R-ENT-09 的 40/20/10/30，容差 ±10%）；另 1 张 D 级卡用于演示退回 + 诊断报告 | **【2026-10-21 父代理预审 Important T7-5】** 契约只给了 R-ENT-09 的比例，没给演示数据的张数。选 10 张是因为 10 的整数分之一能精确落档（4/2/1/3），不触发容差边界 |
+| 种子**幂等**约定 | 每个实体「先查后建」：用户按手机号、届期按名字、任务卡按标题、报名按 `findActiveRegistration`、战队按名字 | **【2026-10-21 父代理预审 Important T7-2】** 契约没规定。P6 的部署手册会写「跑一次种子」—— 不可重入的种子是地雷。与 P0 种子自己的 `findUserByPhone` 同一约定 |
+| 领域层**只消费已呈现对象** | `checkTaskMix` 吃服务层的驼峰形状（`p.isFreeBrief`），**不吃数据库行**（`p.is_free_brief`） | **【2026-10-21 父代理预审 Task 7 预审踩坑登记】** 预审探针自己写错了一次，得出「自由占比 0%」的假象。与 Task 4 的 T4-2 是同一个坑 |
 
 ---
 

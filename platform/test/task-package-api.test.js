@@ -13,6 +13,7 @@ import { createEdition } from '../src/db/repo/editions.js';
 import { createSession } from '../src/auth/session.js';
 import { grantAssignment } from '../src/auth/permissions.js';
 import { insertCapability } from '../src/db/repo/capabilities.js';
+import { call } from '../test-helpers/http-call.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrationsDir = join(here, '..', 'db', 'migrations');
@@ -87,32 +88,6 @@ function setup() {
     tokenReader: createSession(db, reader.id).token,
     tokenWriter: createSession(db, writer.id).token,
   };
-}
-
-function call(app, method, path, { token = null, body = null } = {}) {
-  return new Promise((resolve) => {
-    const chunks = body ? [Buffer.from(JSON.stringify(body))] : [];
-    const req = {
-      method,
-      url: path,
-      headers: token ? { cookie: `hk_session=${token}` } : {},
-      async *[Symbol.asyncIterator]() {
-        for (const c of chunks) yield c;
-      },
-      on() {},
-    };
-    const res = {
-      statusCode: 200,
-      headers: {},
-      body: '',
-      writeHead(status, h) { this.statusCode = status; this.headers = h || {}; },
-      end(payload) {
-        if (payload) this.body = payload.toString();
-        resolve({ status: this.statusCode, headers: this.headers, body: this.body });
-      },
-    };
-    app.handle(req, res);
-  });
 }
 
 test('POST /api/task-packages 未登录 → 401', async () => {
