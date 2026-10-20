@@ -162,13 +162,25 @@ test('版本号必须从 001 起，且描述符不能为空', () => {
 // ⚠️ 下面两条断言的是「当前迁移集」的快照：P1 加入 002_registration.sql 之后，
 //    「恰好 9 张表 / schema_migrations 恰好 1 行 / version 仍为 1」需要放宽为
 //    「包含 001_init.sql 的那几项」。到 P1 时按此提示修改。
+//
+// ✅ P1 已按此提示放宽（不再对「张数 / 行数 / 版本号」取快照）：
+//    取快照的断言每加一个迁移就必红一次，而它真正要抓的缺陷
+//    （漏建表 / 迁移没被应用 / 迁移历史对不上账）由下面这三条照样抓住：
+//      ① 每个迁移文件都被应用（applied 逐字等于目录里的文件清单）；
+//      ② 期望的表逐个点名，漏建任一张表即红；
+//      ③ schema_migrations 的版本号与文件名逐行对账。
+//    期望值**从迁移目录本身推导**，因此 P2 加 003 时本用例不需要再改。
 test('真实迁移目录：建出全部表并记录版本', () => {
   const dataDir = tempDir();
   const { db } = openDatabase({ dataDir });
 
+  // 期望的迁移文件名与版本号：从真实迁移目录推导（readMigrationFiles 已按版本升序排）
+  const expectedFiles = readMigrationFiles(REAL_MIGRATIONS).map((f) => f.name);
+  const expectedVersions = readMigrationFiles(REAL_MIGRATIONS).map((f) => f.version);
+
   const first = applyMigrations(db, REAL_MIGRATIONS);
-  assert.deepEqual(first.applied, ['001_init.sql']);
-  assert.equal(first.version, 1);
+  assert.deepEqual(first.applied, expectedFiles, '迁移目录里的每个文件都应被应用');
+  assert.equal(first.version, Math.max(...expectedVersions), '版本号应为已应用迁移的最大版本');
 
   const tables = db
     .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
@@ -184,20 +196,35 @@ test('真实迁移目录：建出全部表并记录版本', () => {
     'user_roles',
     'audit_log',
     'schema_migrations',
+    // P1（002_registration.sql）的 7 张表
+    'editions',
+    'cities',
+    'task_packages',
+    'registrations',
+    'registration_events',
+    'teams',
+    'team_members',
   ]) {
     assert.ok(tables.includes(t), `真实迁移应建出表 ${t}`);
   }
-  assert.equal(tables.length, 9, '真实迁移应恰好建出 9 张表');
 
-  const rows = db.prepare('SELECT version, name FROM schema_migrations').all();
-  assert.equal(rows.length, 1, 'schema_migrations 应恰好 1 行');
-  assert.equal(rows[0].version, 1);
-  assert.equal(rows[0].name, '001_init.sql');
+  const rows = db.prepare('SELECT version, name FROM schema_migrations ORDER BY version').all();
+  assert.equal(rows.length, expectedFiles.length, 'schema_migrations 行数应等于迁移文件数');
+  assert.deepEqual(
+    rows.map((r) => r.version),
+    expectedVersions,
+    'schema_migrations 的版本号应与迁移文件一致',
+  );
+  assert.deepEqual(
+    rows.map((r) => r.name),
+    expectedFiles,
+    'schema_migrations 的文件名应与迁移文件一致',
+  );
 
   // 幂等：再跑一次不应再应用
   const second = applyMigrations(db, REAL_MIGRATIONS);
   assert.deepEqual(second.applied, [], '真实迁移重复执行不应再应用');
-  assert.equal(second.version, 1);
+  assert.equal(second.version, first.version, '重复执行后版本号不应变化');
 
   db.close();
   rmSync(dataDir, { recursive: true, force: true });
