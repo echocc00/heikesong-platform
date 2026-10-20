@@ -27,6 +27,8 @@ node --test               # 跑测试
 
 - 生产仍推荐 **Node 24**；本项目**不使用任何 Node-24-only API**（Node 22 没有 `URLPattern` → 路由手写，不因此抬高运行时门槛）。
 
+- **`engines` 在 npm 里默认只是建议性的** —— 版本不满足时只会打印 `EBADENGINE` 警告，除非 `.npmrc` 里设了 `engine-strict=true` 才会阻断安装。本项目零依赖、不走 `npm install`，因此这个下限是**自检性质**的：跑不动时会在 import `node:sqlite` 处直接报错，而不是装的时候被拦住。
+
 ## 硬约束
 
 - **npm 依赖 0 个**。只用 Node 标准库。`test/zero-deps.test.js` 会守住这条。
