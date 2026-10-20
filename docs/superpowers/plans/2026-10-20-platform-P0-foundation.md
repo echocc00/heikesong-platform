@@ -720,6 +720,18 @@ git commit -m "feat(P0): SQLite 封装、迁移机制与初始表结构"
 
 ### Task 3: 规则配置与 fail-fast 校验
 
+> **【2026-10-20 派单前补强】** 原计划的 `validateRules` 只校验了 9 份配置里的 5 份
+> （scoring / tiebreak / ranks / registration / solvability），**behavior、visibility、milestones
+> 这 3 份只被读出来、零内容校验** —— 与本 Task 自己的目标「9 份规则配置与 fail-fast 校验」矛盾，
+> 也与全局约束「配置校验 fail-fast：权重合计≠100% / 阈值不单调 → 拒绝启动并报错」矛盾：
+> 这三份一旦写错，症状要到 P2/P3 算分、算榜单时才爆出来，而那时榜单可能已经发出去了。
+> 补强内容：① behavior 的 `maxWeightShare` / `completionThreshold` / 事件 `points` / key 唯一；
+> ② visibility 的段位引用必须真实存在于 `ranks.tiers`（悬空引用会让公示门槛静默失效）；
+> ③ milestones 的 `confirmedBy` 枚举 / key 唯一 / 至少一项 `countsTowardTier`；
+> ④ 缺失 `dimensions` 等子结构时报**友好校验错误**而不是抛 `TypeError`；
+> ⑤ 各处 key 唯一性检查。对应测试从 7 条增至 13 条。
+> 另修正一处测试标题与实现不符（"覆盖 0-100" → "单调不增"，本就不校验 0-100 覆盖）。
+
 **Files:**
 - Create: `platform/src/config.js`
 - Create: `platform/rules/scoring-initial.json`
@@ -788,7 +800,7 @@ test('段位门槛必须严格递增', () => {
   assert.ok(validateRules(broken).some((e) => e.includes('ranks')));
 });
 
-test('报名等级阈值必须单调且覆盖 0-100', () => {
+test('报名等级阈值必须单调不增', () => {
   const { rules } = loadRules(rulesDir);
   const broken = structuredClone(rules);
   broken.registration.levels[1].minScore = 90; // A 级阈值高于 S 级
@@ -800,6 +812,56 @@ test('破同分链必须以确定性兜底项结尾', () => {
   const broken = structuredClone(rules);
   broken.tiebreak.chain.pop();
   assert.ok(validateRules(broken).some((e) => e.includes('tiebreak')));
+});
+
+// ── 以下 6 条覆盖「9 份配置全部有内容校验」这条要求 ──────────────
+// 行为分 / 可见性 / 里程碑这三份配置如果只被读出来、不被校验，
+// 写错了也要等到 P2/P3 算分算榜时才发现 —— 那时榜单可能已经发出去了。
+
+test('behavior 的行为分占比上限必须在 0..1', () => {
+  const { rules } = loadRules(rulesDir);
+  const broken = structuredClone(rules);
+  broken.behavior.maxWeightShare = 1.5;
+  assert.ok(validateRules(broken).some((e) => e.includes('behavior')));
+});
+
+test('behavior 事件的 points 必须为正数', () => {
+  const { rules } = loadRules(rulesDir);
+  const broken = structuredClone(rules);
+  broken.behavior.events[0].points = 0;
+  assert.ok(validateRules(broken).some((e) => e.includes('behavior')));
+});
+
+test('visibility 引用的段位必须真实存在', () => {
+  const { rules } = loadRules(rulesDir);
+  const broken = structuredClone(rules);
+  broken.visibility.rank.publicFromTier = 'Z';
+  assert.ok(validateRules(broken).some((e) => e.includes('visibility')));
+});
+
+test('milestones 的确认方枚举必须合法', () => {
+  const { rules } = loadRules(rulesDir);
+  const broken = structuredClone(rules);
+  broken.milestones.items[0].confirmedBy = 'nobody';
+  assert.ok(validateRules(broken).some((e) => e.includes('milestones')));
+});
+
+test('缺失 dimensions 时报友好错误，而不是抛 TypeError', () => {
+  const { rules } = loadRules(rulesDir);
+  const broken = structuredClone(rules);
+  delete broken.scoring.final.dimensions;
+  const errors = validateRules(broken);
+  assert.ok(
+    errors.some((e) => e.includes('scoring.final') && e.includes('dimensions')),
+    '缺失 dimensions 应被当作校验错误报告，而不是抛 TypeError',
+  );
+});
+
+test('维度 key 重复会被拒绝', () => {
+  const { rules } = loadRules(rulesDir);
+  const broken = structuredClone(rules);
+  broken.scoring.final.dimensions[1].key = broken.scoring.final.dimensions[0].key;
+  assert.ok(validateRules(broken).some((e) => e.includes('重复 key')));
 });
 ```
 
@@ -1032,7 +1094,10 @@ Expected: FAIL —— `Cannot find module '../src/config.js'`
 // 依据：设计文档 §6.7 + §2 第二条结论。
 //   60 条机制件级需求全部来自尚未被组委会确认的设计 → 全部走配置。
 //   校验不过就拒绝启动，绝不降级为默认值 —— 否则会安静地算出一个错位的榜单。
-import { readFileSync, readdirSync } from 'node:fs';
+//   ⚠️ 9 份配置**全部**都要有内容校验（不只是能被 JSON.parse 出来）：
+//      "能读出 JSON" 不等于 "配置是对的"。漏检的那几份一旦写错，症状要到
+//      P2/P3 算分、算榜单时才爆出来 —— 而那时榜单可能已经发出去了。
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const FILES = {
@@ -1055,90 +1120,197 @@ function readJson(path) {
   }
 }
 
+// 归一化策略四选一（设计文档 §6.2 裁决：可切换）
+const VALID_NORMALIZATIONS = ['zscore', 'median', 'trimmed', 'bayes'];
+// 里程碑确认方只有两种：企业侧确认 / 评委确认
+const VALID_CONFIRMERS = ['enterprise', 'judge'];
+
+function weightSum(dimensions) {
+  return dimensions.reduce((a, d) => a + (typeof d.weight === 'number' ? d.weight : 0), 0);
+}
+
+function hasDuplicateKeys(items) {
+  const keys = items.map((i) => i?.key).filter((k) => k !== undefined);
+  return new Set(keys).size !== keys.length;
+}
+
 export function validateRules(rules) {
   const errors = [];
+  const push = (msg) => errors.push(msg);
 
   // ── 评分配置 ──────────────────────────────────────────────
   for (const key of ['initial', 'final']) {
-    const cfg = rules.scoring?.[key];
+    const cfg = rules?.scoring?.[key];
     if (!cfg) {
-      errors.push(`scoring.${key} 缺失`);
+      push(`scoring.${key} 缺失`);
       continue;
     }
-    const sum = cfg.dimensions.reduce((a, d) => a + d.weight, 0);
+    if (!Array.isArray(cfg.dimensions) || cfg.dimensions.length === 0) {
+      push(`scoring.${key}.dimensions 缺失或为空`);
+      continue;
+    }
+    const sum = weightSum(cfg.dimensions);
     if (Math.abs(sum - 1) > 1e-9) {
-      errors.push(`scoring.${key} 权重合计 = ${sum.toFixed(4)}，必须等于 1（100%）`);
+      push(`scoring.${key} 权重合计 = ${sum.toFixed(4)}，必须等于 1（100%）`);
     }
     const ent = cfg.dimensions.find((d) => d.seat === 'enterprise');
     if (!ent) {
-      errors.push(`scoring.${key} 缺少 seat=enterprise 的维度`);
+      push(`scoring.${key} 缺少 seat=enterprise 的维度`);
     } else if (Math.abs(ent.weight - cfg.wEnterprise) > 1e-9) {
-      errors.push(
+      push(
         `scoring.${key} wEnterprise=${cfg.wEnterprise} 与企业确认维度权重 ${ent.weight} 不一致`,
       );
     }
-    if (cfg.wEnterprise < 0 || cfg.wEnterprise > 1) {
-      errors.push(`scoring.${key} wEnterprise 必须在 0..1`);
+    if (typeof cfg.wEnterprise !== 'number' || cfg.wEnterprise < 0 || cfg.wEnterprise > 1) {
+      push(`scoring.${key} wEnterprise 必须在 0..1`);
     }
-    if (!['zscore', 'median', 'trimmed', 'bayes'].includes(cfg.normalizationStrategy)) {
-      errors.push(`scoring.${key} normalizationStrategy 非法`);
+    if (!VALID_NORMALIZATIONS.includes(cfg.normalizationStrategy)) {
+      push(`scoring.${key} normalizationStrategy 非法`);
+    }
+    if (hasDuplicateKeys(cfg.dimensions)) {
+      push(`scoring.${key}.dimensions 存在重复 key`);
     }
   }
 
   // ── 破同分链 ──────────────────────────────────────────────
-  const chain = rules.tiebreak?.chain;
+  const chain = rules?.tiebreak?.chain;
   if (!Array.isArray(chain) || chain.length === 0) {
-    errors.push('tiebreak.chain 缺失或为空');
+    push('tiebreak.chain 缺失或为空');
   } else {
     const last = chain[chain.length - 1];
     if (!last.deterministic) {
-      errors.push('tiebreak.chain 必须以确定性兜底项结尾（deterministic: true），否则榜单不可复算');
+      push('tiebreak.chain 必须以确定性兜底项结尾（deterministic: true），否则榜单不可复算');
     }
     if (!chain.some((c) => c.key === 'total')) {
-      errors.push('tiebreak.chain 缺少总分项');
+      push('tiebreak.chain 缺少总分项');
+    }
+    if (hasDuplicateKeys(chain)) {
+      push('tiebreak.chain 存在重复 key');
     }
   }
 
   // ── 段位 ─────────────────────────────────────────────────
-  const tiers = rules.ranks?.tiers;
+  const tiers = rules?.ranks?.tiers;
+  const tierKeys = new Set();
   if (!Array.isArray(tiers) || tiers.length === 0) {
-    errors.push('ranks.tiers 缺失或为空');
+    push('ranks.tiers 缺失或为空');
   } else {
+    for (const t of tiers) tierKeys.add(t.key);
     for (let i = 1; i < tiers.length; i += 1) {
       if (tiers[i].minMilestones <= tiers[i - 1].minMilestones) {
-        errors.push(`ranks.tiers 门槛必须严格递增（第 ${i + 1} 档）`);
+        push(`ranks.tiers 门槛必须严格递增（第 ${i + 1} 档）`);
       }
+    }
+    if (hasDuplicateKeys(tiers)) {
+      push('ranks.tiers 存在重复 key');
     }
   }
 
   // ── 报名等级 ─────────────────────────────────────────────
-  const levels = rules.registration?.levels;
+  const levels = rules?.registration?.levels;
   if (!Array.isArray(levels) || levels.length === 0) {
-    errors.push('registration.levels 缺失或为空');
+    push('registration.levels 缺失或为空');
   } else {
     for (let i = 1; i < levels.length; i += 1) {
       if (levels[i].minScore > levels[i - 1].minScore) {
-        errors.push(`registration.levels 阈值必须单调不增（第 ${i + 1} 级）`);
+        push(`registration.levels 阈值必须单调不增（第 ${i + 1} 级）`);
       }
     }
-    const sum = rules.registration.dimensions.reduce((a, d) => a + d.weight, 0);
+    if (hasDuplicateKeys(levels)) {
+      push('registration.levels 存在重复 key');
+    }
+  }
+  const regDims = rules?.registration?.dimensions;
+  if (!Array.isArray(regDims) || regDims.length === 0) {
+    push('registration.dimensions 缺失或为空');
+  } else {
+    const sum = weightSum(regDims);
     if (Math.abs(sum - 1) > 1e-9) {
-      errors.push(`registration.dimensions 权重合计 = ${sum.toFixed(4)}，必须等于 1`);
+      push(`registration.dimensions 权重合计 = ${sum.toFixed(4)}，必须等于 1`);
     }
   }
 
   // ── 可解性 ───────────────────────────────────────────────
-  const sol = rules.solvability;
-  if (!sol?.dimensions?.length) {
-    errors.push('solvability.dimensions 缺失');
+  const sol = rules?.solvability;
+  if (!Array.isArray(sol?.dimensions) || sol.dimensions.length === 0) {
+    push('solvability.dimensions 缺失或为空');
   } else {
-    const sum = sol.dimensions.reduce((a, d) => a + d.weight, 0);
+    const sum = weightSum(sol.dimensions);
     if (Math.abs(sum - 1) > 1e-9) {
-      errors.push(`solvability.dimensions 权重合计 = ${sum.toFixed(4)}，必须等于 1`);
+      push(`solvability.dimensions 权重合计 = ${sum.toFixed(4)}，必须等于 1`);
     }
   }
-  if (!Array.isArray(sol?.grades) || !sol.grades.length) {
-    errors.push('solvability.grades 缺失');
+  if (!Array.isArray(sol?.grades) || sol.grades.length === 0) {
+    push('solvability.grades 缺失或为空');
+  } else if (hasDuplicateKeys(sol.grades)) {
+    push('solvability.grades 存在重复 key');
+  }
+
+  // ── 行为分 ───────────────────────────────────────────────
+  // 行为分只用于破同分、不进总分（分轨强制）；但它仍有自己的阈值与上限，必须校验。
+  const behavior = rules?.behavior;
+  if (!behavior) {
+    push('behavior 缺失');
+  } else {
+    if (typeof behavior.maxWeightShare !== 'number'
+      || behavior.maxWeightShare < 0 || behavior.maxWeightShare > 1) {
+      push('behavior.maxWeightShare 必须在 0..1');
+    }
+    if (typeof behavior.completionThreshold !== 'number'
+      || behavior.completionThreshold < 0 || behavior.completionThreshold > 100) {
+      push('behavior.completionThreshold 必须在 0..100');
+    }
+    if (!Array.isArray(behavior.events) || behavior.events.length === 0) {
+      push('behavior.events 缺失或为空');
+    } else {
+      if (hasDuplicateKeys(behavior.events)) {
+        push('behavior.events 存在重复 key');
+      }
+      for (const e of behavior.events) {
+        if (typeof e.points !== 'number' || e.points <= 0) {
+          push(`behavior.events 事件 ${e.key} 的 points 必须为正数`);
+        }
+      }
+    }
+  }
+
+  // ── 可见性 ───────────────────────────────────────────────
+  // 段位引用必须真实存在 —— 悬空引用会让"公示门槛"静默失效，
+  // 而症状要到 P3 算榜单、对可见性过滤时才出现。
+  const vis = rules?.visibility;
+  if (!vis) {
+    push('visibility 缺失');
+  } else {
+    for (const field of ['publicFromTier', 'privateBelowTier']) {
+      const ref = vis.rank?.[field];
+      if (typeof ref !== 'string' || !ref) {
+        push(`visibility.rank.${field} 缺失`);
+      } else if (tierKeys.size > 0 && !tierKeys.has(ref)) {
+        push(`visibility.rank.${field} 引用了不存在的段位 ${ref}`);
+      }
+    }
+  }
+
+  // ── 里程碑 ───────────────────────────────────────────────
+  const ms = rules?.milestones;
+  if (!ms) {
+    push('milestones 缺失');
+  } else {
+    if (!Array.isArray(ms.items) || ms.items.length === 0) {
+      push('milestones.items 缺失或为空');
+    } else {
+      if (hasDuplicateKeys(ms.items)) {
+        push('milestones.items 存在重复 key');
+      }
+      for (const it of ms.items) {
+        if (!VALID_CONFIRMERS.includes(it.confirmedBy)) {
+          push(`milestones.items 里程碑 ${it.key} 的 confirmedBy=${it.confirmedBy} 非法`);
+        }
+      }
+      if (!ms.items.some((it) => it.countsTowardTier)) {
+        push('milestones.items 没有任何 countsTowardTier=true 的里程碑，段位将永远无法晋升');
+      }
+    }
   }
 
   return errors;
@@ -1180,7 +1352,7 @@ export function loadRules(rulesDir) {
 - [ ] **Step 5: 运行测试确认通过**
 
 Run: `cd platform && node --test test/config.test.js`
-Expected: PASS（6 个测试全过）
+Expected: PASS（13 个测试全过）
 
 - [ ] **Step 6: 提交**
 
