@@ -873,7 +873,7 @@ export function lastLeaveAt(db, teamId) {
 - [ ] **Step 9: 运行测试确认通过**
 
 Run: `cd platform && node --test test/migration-002.test.js`
-Expected: PASS（7 个测试全过）
+Expected: PASS（8 个测试全过：migration-002 8）
 
 - [ ] **Step 10: 提交**
 
@@ -1257,7 +1257,10 @@ export function scoreRegistration({ answers, config }) {
 - [ ] **Step 5: 运行测试确认通过**
 
 Run: `cd platform && node --test test/registration-domain.test.js`
-Expected: PASS（13 个测试全过，含 79/80、59/60、39/40 三个边界）
+Expected: PASS（16 个测试全过：registration-domain 16）
+> **条数订正（2026-10-21 父代理验收）**：本行原文写「13 个测试全过」，与代码块里的
+> **16 条**不符（多出的 3 条是加强后的 `explain[].note` 断言 + 两条配置自检）。
+> 「计划是规格」→ 计划里的条数必须与实现一致，故按实跑改为 16。
 
 - [ ] **Step 6: 提交**
 
@@ -1810,7 +1813,13 @@ import { registerRegistrationRoutes } from './http/routes/registration.js';
   registerRegistrationRoutes({ router, db, rules });
 
 // ③ 错误响应把 detail 一起带出去（否则前端看不到问卷缺哪几题）
-        error(res, status, code, err.message, err.detail);
+//    ⚠️ **必须沿用 P0 终审（Important I-C）的 AppError-only 规则**：
+//    P0 现在的错误分支是 `const message = err instanceof AppError ? err.message : '请求无效';`
+//    然后 `error(res, status, code, message)` —— 裸 Error / Node 内置错误 / SQLite 错误的
+//    message 里含内部原文（表名列名、SQL 参数位置、文件路径），一律回落为通用文案。
+//    本片段**不得**改回 `err.message`（那会把 I-C 的修复回退掉，等于重新引入 SQLite 原文泄漏）。
+//    detail 同理：detail 可能含表名 → **只透传 AppError 的 detail**。
+        error(res, status, code, message, err instanceof AppError ? err.detail : undefined);
 ```
 
 - [ ] **Step 7: 创建 P1 新增的 3 份规则配置并扩展 src/config.js**
@@ -2208,7 +2217,7 @@ test('POST /api/registrations/:id/level 组委会改级成功，选手改级 →
 - [ ] **Step 9: 运行测试确认通过**
 
 Run: `cd platform && node --test test/registration-service.test.js test/registration-api.test.js`
-Expected: PASS（服务 10 个 + API 8 个用例全过）
+Expected: PASS（18 个测试全过：registration-service 10 + registration-api 8）
 
 - [ ] **Step 10: 提交**
 
@@ -2962,7 +2971,7 @@ import { registerTaskPackageRoutes } from './http/routes/taskPackage.js';
 - [ ] **Step 8: 运行测试确认通过**
 
 Run: `cd platform && node --test test/solvability-domain.test.js test/task-package-service.test.js`
-Expected: PASS（领域 8 个 + 服务 9 个用例全过）
+Expected: PASS（17 个测试全过：solvability-domain 8 + task-package-service 9）
 
 - [ ] **Step 9: 提交**
 
@@ -3689,7 +3698,9 @@ import { registerTeamRoutes } from './http/routes/team.js';
 - [ ] **Step 7: 运行测试确认通过**
 
 Run: `cd platform && node --test test/team-service.test.js test/config.test.js`
-Expected: PASS（战队 12 个 + 配置校验全过）
+Expected: PASS（12 个测试全过：team-service 12）
+> `test/config.test.js` 是 **P0 已有文件**，本 Task 追加的配置校验用例会让它的条数增长 ——
+> 实施后必须同步更新 **P0 计划**里 `config.test.js` 的条数声明（跨计划的同一条纪律）。
 
 - [ ] **Step 8: 提交**
 
@@ -4223,7 +4234,7 @@ route('/admin/registration', () => renderAdminRegistration(ctx));
 - [ ] **Step 7: 运行测试确认通过**
 
 Run: `cd platform && node --test test/p1-frontend.test.js`
-Expected: PASS（6 个测试全过）
+Expected: PASS（6 个测试全过：p1-frontend 6）
 
 - [ ] **Step 8: 提交**
 
@@ -4544,6 +4555,29 @@ git commit -m "feat(P1): 端到端串联与种子扩充（报名→分级→建�
 | P1-8 | 任务卡配比 | `checkTaskMix` 在自由题 30%、B 端 A40/B20/C10 时 `ok === true`；偏离时返回带 `[TASK_MIX_*]` 错误码的数组 |
 | P1-9 | 可见性 | 选手 `GET /api/registrations` → 200 + `items: []`；读他人报名 → 404；`GET /api/registration-criteria` → 200 公开；`GET /api/task-packages` 选手只看到 `published` |
 | P1-10 | 全链路 + 零依赖 | `node --test` 全过；`node --test test/e2e-p1.test.js` 跑通「报名→分级→建队→认领→加人」；`node --test test/zero-deps.test.js` 仍过且无 `node_modules` |
+
+---
+
+## 与 P0 终态的对齐（2026-10-21 父代理复核）
+
+> P0 在本计划成文之后又经过**三轮评审修复**（`feat/p0-foundation` 的 HEAD `38c6713`），
+> 期间 `src/server.js` / `src/http/static.js` / `src/http/router.js` / `src/auth/permissions.js`
+> 与全部测试文件都变了。本计划 Task 3–7 的「修改 P0 文件」片段**逐条复核过落点锚点**，
+> 结果如下（**只有一条真冲突**，已修）：
+
+| 片段 | 落点锚点（P0 终态） | 结论 |
+|---|---|---|
+| Task 3 ① ② `src/server.js` import + 注册路由 | `createApp` 内 `router` 创建之后 | ✅ 锚点成立，直接追加 |
+| Task 3 ③ `src/server.js` 错误分支带 `detail` | P0 终审 **Important I-C** 已把该分支改成 `const message = err instanceof AppError ? err.message : '请求无效'` + `error(res, status, code, message)` | ❌ **冲突，已修**：原片段写的是 `error(res, status, code, err.message, err.detail)` —— 直接改回 `err.message` 会**回退 I-C 的修复**（4xx 重新泄漏 SQLite 原文）。已改为 `error(res, status, code, message, err instanceof AppError ? err.detail : undefined)`：**沿用 P0 的 AppError-only 规则**，只额外透传 AppError 的 detail |
+| Task 3 ④ `src/config.js`（FILES / grouped / validateRules 三处追加） | `FILES`（9 项，`registration` / `solvability` 在列）、`grouped`（同名 9 项）、`validateRules(grouped)` | ✅ 纯**追加**，锚点成立 |
+| Task 4 `rules/solvability.json` 的 `taskMix` | P0 的 `taskMix` = `{enterprise: 0.7, free: 0.3}`（**无** `taskMixNote`） | ✅ 计划原文即「把 `taskMix` 换成（其余字段逐字保留）」，是**替换**不是冲突；`taskMixNote` 是新增键 |
+| Task 4 ⑤ `src/server.js` import + 注册路由 | 同 Task 3 ①② | ✅ 锚点成立 |
+| Task 5 ⑥ `src/server.js` import + 注册路由 | 同 Task 3 ①② | ✅ 锚点成立 |
+| Task 6 ⑦ `web/app.js` import + route + nav | `route('/', () => renderHome())` + `renderHome()` 内 `<nav>`（两处 `<a>`） | ✅ 锚点成立，**追加** 3 个 `<a>`；注意 P0 的 `renderHome` 已改用 `escapeHtml(user.name)`（I-2 修复），**不得回退** |
+| Task 7 ⑧ `scripts/seed.js` import + ROLE_CAPABILITIES + `seedP1` | `ROLE_CAPABILITIES`（`['captain', …]` / `['member', …]` 各在列）+ 种子主流程 | ✅ 锚点成立。注意 P0 已把 seed 的裸 SQL **下沉到 `src/db/repo/`**（I-7 修复），P1 的 `seedP1` **必须同样只调仓储层**，不得出现裸 SQL |
+
+> ⚠️ **跨阶段纪律**：P1 在实施时若发现上表某条锚点又变了，**先更新本计划再动手** ——
+> 「计划是规格」：计划里的代码块必须与最终实现逐字一致。
 
 ---
 
