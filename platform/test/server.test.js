@@ -760,3 +760,59 @@ test('serveStatic 必须真的调用 isSameFile 做 dev/ino 对账（接线断�
     'serveStatic 必须调用 isSameFile —— 删掉调用点等于删掉这条 TOCTOU 防线',
   );
 });
+
+test('domainCode：领域码透传，Node 的 ERR_* 与非领域码一律回落（终审 I-C）', async () => {
+  // ⛔ 终审修正（Important，I-C）：domainCode 此前是私有函数且**零断言** ——
+  //    改成恒返回 'BAD_REQUEST' 全量测试照样全绿。
+  //    而客户端 web/api.js 确实消费 data.error.code（用来分流错误），
+  //    契约 INTERFACES.md「错误」纪律也明写「不外泄 Node 的 ERR_* 与 SQLite 原文」。
+  const { domainCode } = await import('../src/server.js');
+  // ⚠️ 回落值必须用**可区分**的字符串：用 'BAD_REQUEST' 的话，
+  //    把「回落分支恒返回 'BAD_REQUEST'」这个变异完全掩盖掉
+  //    （终审复核时踩过：第一次就用了 BAD_REQUEST → 变异存活）。
+  const FALLBACK = 'FALLBACK_SENTINEL';
+
+  // 领域码：原样透传
+  assert.equal(domainCode({ code: 'CAPABILITY_UNKNOWN' }, FALLBACK), 'CAPABILITY_UNKNOWN');
+  assert.equal(domainCode({ code: 'PHONE_TAKEN' }, FALLBACK), 'PHONE_TAKEN');
+  assert.equal(domainCode({ code: 'PAYLOAD_TOO_LARGE' }, FALLBACK), 'PAYLOAD_TOO_LARGE');
+
+  // Node 内置错误码：不得外泄
+  assert.equal(domainCode({ code: 'ERR_INVALID_ARG_TYPE' }, FALLBACK), FALLBACK);
+  assert.equal(domainCode({ code: 'ERR_SQLITE_ERROR' }, FALLBACK), FALLBACK);
+  assert.equal(domainCode({ code: 'ERR_OUT_OF_RANGE' }, FALLBACK), FALLBACK);
+
+  // 非领域码：不得外泄
+  assert.equal(domainCode({ code: 'sqlite_error' }, FALLBACK), FALLBACK, '小写码不得外泄');
+  assert.equal(domainCode({ code: '_PRIVATE' }, FALLBACK), FALLBACK, '下划线开头不得外泄');
+  assert.equal(domainCode({ code: '9LIVES' }, FALLBACK), FALLBACK, '数字开头不得外泄');
+  assert.equal(domainCode({ code: 'HAS-DASH' }, FALLBACK), FALLBACK, '带连字符不得外泄');
+  assert.equal(domainCode({ code: 42 }, FALLBACK), FALLBACK, '非字符串不得外泄');
+  assert.equal(domainCode({}, FALLBACK), FALLBACK, '缺 code 不得外泄');
+  assert.equal(domainCode(null, FALLBACK), FALLBACK, 'null 不得外泄');
+  assert.equal(domainCode(undefined, FALLBACK), FALLBACK, 'undefined 不得外泄');
+  // 回落值本身必须被原样返回（变异「回落分支恒返回某个固定值」会被这条抓住）
+  assert.equal(domainCode({ code: 'ERR_X' }, 'ANY_FALLBACK'), 'ANY_FALLBACK');
+});
+
+test('HTTP 层不把 Node 的 ERR_* 错误码外泄给客户端（端到端）', async () => {
+  // ⚠️ 评审修正（Important）：500 分支已有逐字节断言，但 **4xx 分支**的 code 没有。
+  //    这里注册一个**测试专用路由**，让它抛出「带 ERR_ 前缀 code 的 4xx 错误」
+  //    （Node 内置错误被某个 handler 挂了 .status 的典型形态），
+  //    断言响应体的 code 是通用回落码而不是 ERR_*。
+  const { db, close, dataDir, app } = setup();
+  app.router.add('GET', '/api/__test_throw_node_error', async () => {
+    const e = new Error('内部细节：users.phone UNIQUE constraint failed');
+    e.status = 400;
+    e.code = 'ERR_SQLITE_ERROR';
+    throw e;
+  });
+  const res = await call(app, 'GET', '/api/__test_throw_node_error');
+  assert.equal(res.status, 400);
+  const body = JSON.parse(res.body);
+  assert.equal(body.error.code, 'BAD_REQUEST', `不得外泄 ERR_* 码，实际 ${body.error.code}`);
+  assert.ok(!res.body.includes('ERR_'), `响应体不得出现 ERR_：${res.body}`);
+  assert.ok(!res.body.includes('UNIQUE constraint'), `响应体不得出现 SQLite 原文：${res.body}`);
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});

@@ -15,7 +15,7 @@ import { createSession, resolveSession, revokeSession } from './auth/session.js'
 import { can } from './auth/permissions.js';
 import { verifyPassword, hashPassword } from './auth/password.js';
 import { getUserById, getCredentialsByPhone, toPublicUser } from './db/repo/users.js';
-import { appError } from './errors.js';
+import { appError, AppError } from './errors.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -68,8 +68,14 @@ function hasMalformedEncoding(path) {
 /**
  * 领域错误码：Node 内置错误的 .code（如 ERR_INVALID_ARG_TYPE）不是领域码，
  * 不能原样回给客户端 —— 那会暴露内部实现细节。
+ *
+ * ⚠️ 终审修正（Important，I-C）：本函数此前**零断言** ——
+ *    改成恒返回 'BAD_REQUEST' 全量测试照样全绿。而客户端 `web/api.js`
+ *    确实消费 `data.error.code`（用来分流错误），契约 INTERFACES.md「错误」纪律
+ *    也明写「HTTP 层只把 .status / .code 转出去，**不外泄** Node 的 ERR_* 与 SQLite 原文」。
+ *    导出是为了能直接测这条边界（与 static.js 的 isSameFile 同一手法）。
  */
-function domainCode(err, fallback) {
+export function domainCode(err, fallback) {
   const code = err && err.code;
   if (typeof code === 'string' && /^[A-Z][A-Z0-9_]*$/.test(code) && !code.startsWith('ERR_')) {
     return code;
@@ -223,12 +229,21 @@ export function createApp({ db, rules, webDir }) {
           return;
         }
         const code = domainCode(err, 'BAD_REQUEST');
+        // ⛔ 终审修正（Important，I-C 延伸）：**只透传领域错误（AppError）的 message**。
+        //    AppError 的 message 是我们自己写的中文文案（"该手机号已注册"…），可以给用户看；
+        //    而裸 Error / Node 内置错误 / SQLite 错误的 message 里含**内部原文**
+        //    （表名列名、SQL 参数位置、文件路径）——
+        //    契约 INTERFACES.md「错误」纪律明写「不外泄 Node 的 ERR_* 与 SQLite 原文」。
+        //    实测（修复前）：handler 抛 `e.status=400; e.code='ERR_SQLITE_ERROR'` 时，
+        //    响应体是 {"code":"BAD_REQUEST","message":"users.phone UNIQUE constraint failed"}
+        //    —— code 挡住了，message 没挡住。
+        const message = err instanceof AppError ? err.message : '请求无效';
         if (status === 413) {
           // 请求体超限：连接已不可用 → 关掉，不复用
-          json(res, 413, { error: { code, message: err.message } }, { Connection: 'close' });
+          json(res, 413, { error: { code, message } }, { Connection: 'close' });
           return;
         }
-        error(res, status, code, err.message);
+        error(res, status, code, message);
       }
       return;
     }

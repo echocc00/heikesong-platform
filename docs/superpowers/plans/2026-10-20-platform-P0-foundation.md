@@ -370,6 +370,48 @@ function lineAt(src, index) {
 
 const SCAN_DIRS = ['src', 'scripts', 'web'];
 
+/**
+ * 判断一个 specifier 属于哪一类。
+ *
+ * ⚠️ 终审修正（Important，I-A）：这段判断原先**内联**在扫描循环里，
+ *    把 `if (spec.value.startsWith('node:') || spec.value.startsWith('.')) continue;`
+ *    改成**无条件 continue**（即「一条都不判违规」）→ 全量 140 条照样全绿。
+ *    原因：原来的阳性对照只防「扫描器一条都抓不到」，**不防「扫描器一条都不判违规」**。
+ *    抽出成纯函数后可以直接对已知输入断言判定结果。
+ */
+export function classifySpecifier(value) {
+  if (value.startsWith('node:')) return 'builtin';
+  if (value.startsWith('.')) return 'relative';
+  if (value.startsWith('/')) return 'absolute';
+  return 'violation';
+}
+
+/**
+ * 扫描**一段源码**，返回该源码里的 { specifiers, violations, absolute }。
+ *
+ * ⚠️ 终审修正（Important，I-A）：抽出来是为了能对**已知的坏输入**直接断言
+ *    「它确实被判成违规」—— 不必往真实源码树里塞一个假依赖文件。
+ */
+export function scanSource(code, rel = '<synthetic>') {
+  const specifiers = [];
+  const violations = [];
+  const absolute = [];
+  const stripped = stripComments(code);
+  for (const spec of findSpecifiers(stripped)) {
+    const line = lineAt(code, spec.start);
+    const hit = { file: rel, line, value: spec.value };
+    specifiers.push(hit);
+    const kind = classifySpecifier(spec.value);
+    if (kind === 'builtin' || kind === 'relative') continue;
+    if (kind === 'absolute') {
+      absolute.push(hit);
+      continue;
+    }
+    violations.push(hit);
+  }
+  return { specifiers, violations, absolute };
+}
+
 /** 扫描全部受管目录，返回 { specifiers, violations, absolute }。 */
 function scanImports() {
   const specifiers = [];
@@ -378,19 +420,11 @@ function scanImports() {
   for (const dir of SCAN_DIRS) {
     for (const file of collectJsFiles(join(root, dir))) {
       const raw = readFileSync(file, 'utf8');
-      const code = stripComments(raw);
       const rel = relative(root, file);
-      for (const spec of findSpecifiers(code)) {
-        const line = lineAt(raw, spec.start);
-        const hit = { file: rel, line, value: spec.value };
-        specifiers.push(hit);
-        if (spec.value.startsWith('node:') || spec.value.startsWith('.')) continue;
-        if (spec.value.startsWith('/')) {
-          absolute.push(hit);
-          continue;
-        }
-        violations.push(hit);
-      }
+      const r = scanSource(raw, rel);
+      specifiers.push(...r.specifiers);
+      violations.push(...r.violations);
+      absolute.push(...r.absolute);
     }
   }
   return { specifiers, violations, absolute };
@@ -426,6 +460,58 @@ test('没有任何绝对路径 import（绝对路径说明模块解析被绕过�
     [],
     '不允许绝对路径 import',
   );
+});
+
+test('扫描器对**已知坏输入**确实判违规（防「一条都不判违规」的假绿）', async () => {
+  // ⛔ 终审修正（Important，I-A）：原来的阳性对照只防「扫描器一条都抓不到」，
+  //    **不防「扫描器一条都不判违规」** —— 把扫描循环里的判定改成无条件 `continue`
+  //    （跳过全部 specifier）→ 全量 140 条照样全绿。
+  //    这里直接对**合成的坏源码**断言它被判成违规，不必往真实源码树里塞假依赖。
+  const { scanSource, classifySpecifier } = await import('./zero-deps.test.js');
+
+  // 判定函数本身
+  assert.equal(classifySpecifier('node:sqlite'), 'builtin');
+  assert.equal(classifySpecifier('./x.js'), 'relative');
+  assert.equal(classifySpecifier('../src/x.js'), 'relative');
+  assert.equal(classifySpecifier('/abs/x.js'), 'absolute');
+  assert.equal(classifySpecifier('lodash'), 'violation');
+  assert.equal(classifySpecifier('express'), 'violation');
+  assert.equal(classifySpecifier('@scope/pkg'), 'violation');
+
+  // 真实扫描路径：五种第三方写法都必须被抓
+  const BAD = [
+    "import lodash from 'lodash';",
+    "import { x } from 'express';",
+    "import 'chalk';",
+    "export { x } from 'redux';",
+    "const m = await import('moment');",
+    "const m = require('underscore');",
+  ];
+  for (const code of BAD) {
+    const r = scanSource(code, '<synthetic>');
+    assert.equal(
+      r.violations.length,
+      1,
+      `这段源码里的第三方依赖必须被判违规：${code}（实际 violations=${JSON.stringify(r.violations)}）`,
+    );
+  }
+
+  // 反例对照：合法的写法不得被误判（否则这条用例就变成了「一律违规」的恒绿）
+  const GOOD = [
+    "import { openDatabase } from '../src/db/sqlite.js';",
+    "import { DatabaseSync } from 'node:sqlite';",
+    "const s = '这不是 import';",
+    "// import lodash from 'lodash';  // 注释里的不算",
+    "const url = 'https://example.com/from';",
+  ];
+  for (const code of GOOD) {
+    const r = scanSource(code, '<synthetic>');
+    assert.deepEqual(
+      r.violations,
+      [],
+      `合法写法不得被误判为违规：${code}`,
+    );
+  }
 });
 ```
 
@@ -550,7 +636,7 @@ node --test               # 跑测试
 - [ ] **Step 5: 运行测试确认通过**
 
 Run: `cd platform && node --test test/zero-deps.test.js`
-Expected: PASS（7 个测试全过：zero-deps 7）
+Expected: PASS（8 个测试全过：zero-deps 8）
 
 - [ ] **Step 6: 提交**
 
@@ -2225,6 +2311,46 @@ test('body 超限时先销毁请求流再抛 413（用探针钉住调用与顺�
   assert.equal(destroyCallsAtThrow, 1, '抛 413 之前必须已经销毁请求流');
   assert.equal(resumeCalls, 0, '有 destroy() 就不该再走 resume 兜底');
 });
+
+test('请求体上限的**默认值**是 512KB（不传 limit 时也必须限）', async () => {
+  // ⛔ 终审修正（Important，I-B）：上限的**默认值**此前零断言 ——
+  //    现有用例都传了显式 `{ limit: 10 }`，把默认值改成 100MB 全量测试照样全绿。
+  //    而默认值才是**生产实际生效**的那个（HTTP 层调用 readJsonBody 时不传 limit）。
+  //    没有上限 = 任何人都能往内存里灌任意大的 body → OOM。
+  const KB = 1024;
+  const MB = 1024 * KB;
+
+  // 刚好在上限内 → 通过（body 必须是**合法 JSON**，否则先被 JSON 解析拦下，
+  // 测的就不是「大小上限」这条护栏了）
+  const mkJson = (totalBytes) => {
+    const head = '{"a":"';
+    const tail = '"}';
+    const pad = 'x'.repeat(totalBytes - head.length - tail.length);
+    return Buffer.from(head + pad + tail);
+  };
+  const under = Readable.from([mkJson(512 * KB - 1)]);
+  await assert.doesNotReject(() => readJsonBody(under), '512KB 以内必须放行');
+
+  // 超过上限 → 413（用默认 limit，不传参）
+  const over = Readable.from([mkJson(512 * KB + 1)]);
+  await assert.rejects(
+    () => readJsonBody(over),
+    (err) => {
+      assert.equal(err.status, 413);
+      assert.equal(err.code, 'PAYLOAD_TOO_LARGE');
+      return true;
+    },
+    '超过默认上限必须回 413',
+  );
+
+  // 反例对照：显式传更大的 limit 时，同一个 body 必须放行
+  //（证明上一条确实是「默认上限」在起作用，而不是 body 本身有问题）
+  const same = Readable.from([mkJson(512 * KB + 1)]);
+  await assert.doesNotReject(
+    () => readJsonBody(same, { limit: 2 * MB }),
+    '显式放宽 limit 后同一 body 必须放行',
+  );
+});
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -2439,7 +2565,7 @@ export async function readJsonBody(req, { limit = 1024 * 512 } = {}) {
 - [ ] **Step 7: 运行测试确认通过**
 
 Run: `cd platform && node --test test/router.test.js test/body.test.js`
-Expected: PASS（11 个测试全过：router 8 + body 3）
+Expected: PASS（12 个测试全过：router 8 + body 4）
 
 - [ ] **Step 8: 提交**
 
@@ -5604,6 +5730,62 @@ test('serveStatic 必须真的调用 isSameFile 做 dev/ino 对账（接线断�
     'serveStatic 必须调用 isSameFile —— 删掉调用点等于删掉这条 TOCTOU 防线',
   );
 });
+
+test('domainCode：领域码透传，Node 的 ERR_* 与非领域码一律回落（终审 I-C）', async () => {
+  // ⛔ 终审修正（Important，I-C）：domainCode 此前是私有函数且**零断言** ——
+  //    改成恒返回 'BAD_REQUEST' 全量测试照样全绿。
+  //    而客户端 web/api.js 确实消费 data.error.code（用来分流错误），
+  //    契约 INTERFACES.md「错误」纪律也明写「不外泄 Node 的 ERR_* 与 SQLite 原文」。
+  const { domainCode } = await import('../src/server.js');
+  // ⚠️ 回落值必须用**可区分**的字符串：用 'BAD_REQUEST' 的话，
+  //    把「回落分支恒返回 'BAD_REQUEST'」这个变异完全掩盖掉
+  //    （终审复核时踩过：第一次就用了 BAD_REQUEST → 变异存活）。
+  const FALLBACK = 'FALLBACK_SENTINEL';
+
+  // 领域码：原样透传
+  assert.equal(domainCode({ code: 'CAPABILITY_UNKNOWN' }, FALLBACK), 'CAPABILITY_UNKNOWN');
+  assert.equal(domainCode({ code: 'PHONE_TAKEN' }, FALLBACK), 'PHONE_TAKEN');
+  assert.equal(domainCode({ code: 'PAYLOAD_TOO_LARGE' }, FALLBACK), 'PAYLOAD_TOO_LARGE');
+
+  // Node 内置错误码：不得外泄
+  assert.equal(domainCode({ code: 'ERR_INVALID_ARG_TYPE' }, FALLBACK), FALLBACK);
+  assert.equal(domainCode({ code: 'ERR_SQLITE_ERROR' }, FALLBACK), FALLBACK);
+  assert.equal(domainCode({ code: 'ERR_OUT_OF_RANGE' }, FALLBACK), FALLBACK);
+
+  // 非领域码：不得外泄
+  assert.equal(domainCode({ code: 'sqlite_error' }, FALLBACK), FALLBACK, '小写码不得外泄');
+  assert.equal(domainCode({ code: '_PRIVATE' }, FALLBACK), FALLBACK, '下划线开头不得外泄');
+  assert.equal(domainCode({ code: '9LIVES' }, FALLBACK), FALLBACK, '数字开头不得外泄');
+  assert.equal(domainCode({ code: 'HAS-DASH' }, FALLBACK), FALLBACK, '带连字符不得外泄');
+  assert.equal(domainCode({ code: 42 }, FALLBACK), FALLBACK, '非字符串不得外泄');
+  assert.equal(domainCode({}, FALLBACK), FALLBACK, '缺 code 不得外泄');
+  assert.equal(domainCode(null, FALLBACK), FALLBACK, 'null 不得外泄');
+  assert.equal(domainCode(undefined, FALLBACK), FALLBACK, 'undefined 不得外泄');
+  // 回落值本身必须被原样返回（变异「回落分支恒返回某个固定值」会被这条抓住）
+  assert.equal(domainCode({ code: 'ERR_X' }, 'ANY_FALLBACK'), 'ANY_FALLBACK');
+});
+
+test('HTTP 层不把 Node 的 ERR_* 错误码外泄给客户端（端到端）', async () => {
+  // ⚠️ 评审修正（Important）：500 分支已有逐字节断言，但 **4xx 分支**的 code 没有。
+  //    这里注册一个**测试专用路由**，让它抛出「带 ERR_ 前缀 code 的 4xx 错误」
+  //    （Node 内置错误被某个 handler 挂了 .status 的典型形态），
+  //    断言响应体的 code 是通用回落码而不是 ERR_*。
+  const { db, close, dataDir, app } = setup();
+  app.router.add('GET', '/api/__test_throw_node_error', async () => {
+    const e = new Error('内部细节：users.phone UNIQUE constraint failed');
+    e.status = 400;
+    e.code = 'ERR_SQLITE_ERROR';
+    throw e;
+  });
+  const res = await call(app, 'GET', '/api/__test_throw_node_error');
+  assert.equal(res.status, 400);
+  const body = JSON.parse(res.body);
+  assert.equal(body.error.code, 'BAD_REQUEST', `不得外泄 ERR_* 码，实际 ${body.error.code}`);
+  assert.ok(!res.body.includes('ERR_'), `响应体不得出现 ERR_：${res.body}`);
+  assert.ok(!res.body.includes('UNIQUE constraint'), `响应体不得出现 SQLite 原文：${res.body}`);
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -5774,7 +5956,7 @@ import { createSession, resolveSession, revokeSession } from './auth/session.js'
 import { can } from './auth/permissions.js';
 import { verifyPassword, hashPassword } from './auth/password.js';
 import { getUserById, getCredentialsByPhone, toPublicUser } from './db/repo/users.js';
-import { appError } from './errors.js';
+import { appError, AppError } from './errors.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -5827,8 +6009,14 @@ function hasMalformedEncoding(path) {
 /**
  * 领域错误码：Node 内置错误的 .code（如 ERR_INVALID_ARG_TYPE）不是领域码，
  * 不能原样回给客户端 —— 那会暴露内部实现细节。
+ *
+ * ⚠️ 终审修正（Important，I-C）：本函数此前**零断言** ——
+ *    改成恒返回 'BAD_REQUEST' 全量测试照样全绿。而客户端 `web/api.js`
+ *    确实消费 `data.error.code`（用来分流错误），契约 INTERFACES.md「错误」纪律
+ *    也明写「HTTP 层只把 .status / .code 转出去，**不外泄** Node 的 ERR_* 与 SQLite 原文」。
+ *    导出是为了能直接测这条边界（与 static.js 的 isSameFile 同一手法）。
  */
-function domainCode(err, fallback) {
+export function domainCode(err, fallback) {
   const code = err && err.code;
   if (typeof code === 'string' && /^[A-Z][A-Z0-9_]*$/.test(code) && !code.startsWith('ERR_')) {
     return code;
@@ -5982,12 +6170,21 @@ export function createApp({ db, rules, webDir }) {
           return;
         }
         const code = domainCode(err, 'BAD_REQUEST');
+        // ⛔ 终审修正（Important，I-C 延伸）：**只透传领域错误（AppError）的 message**。
+        //    AppError 的 message 是我们自己写的中文文案（"该手机号已注册"…），可以给用户看；
+        //    而裸 Error / Node 内置错误 / SQLite 错误的 message 里含**内部原文**
+        //    （表名列名、SQL 参数位置、文件路径）——
+        //    契约 INTERFACES.md「错误」纪律明写「不外泄 Node 的 ERR_* 与 SQLite 原文」。
+        //    实测（修复前）：handler 抛 `e.status=400; e.code='ERR_SQLITE_ERROR'` 时，
+        //    响应体是 {"code":"BAD_REQUEST","message":"users.phone UNIQUE constraint failed"}
+        //    —— code 挡住了，message 没挡住。
+        const message = err instanceof AppError ? err.message : '请求无效';
         if (status === 413) {
           // 请求体超限：连接已不可用 → 关掉，不复用
-          json(res, 413, { error: { code, message: err.message } }, { Connection: 'close' });
+          json(res, 413, { error: { code, message } }, { Connection: 'close' });
           return;
         }
-        error(res, status, code, err.message);
+        error(res, status, code, message);
       }
       return;
     }
@@ -7169,7 +7366,7 @@ test('登录按钮真的可点：点一下就发 /api/auth/login（终审 I-6-8�
 - [ ] **Step 8: 运行测试确认通过**
 
 Run: `cd platform && node --test test/server.test.js test/seed.test.js test/web.test.js test/sql-boundary.test.js`
-Expected: PASS（44 个测试全过：server 33 + seed 2 + web 6 + sql-boundary 3）
+Expected: PASS（46 个测试全过：server 35 + seed 2 + web 6 + sql-boundary 3）
 
 - [ ] **Step 9: 全量测试 + 实跑**
 
@@ -7206,11 +7403,12 @@ git commit -m "feat(P0): 静态服务、前端骨架、种子数据与服务器�
 | P0-3 | 迁移幂等 | 连续跑两次 `scripts/migrate.js`，第二次输出「本次无新迁移」 |
 | P0-4 | 权限判定唯一入口 | `permissions.test.js` **22** 个用例通过；`scopeClause` 生成的 SQL **能真跑**（有权那行在结果里、无权那行不在），且占位符个数 == `params.length`；超管标志的**两种形状**（仓储行 snake_case / `toPublicUser` 驼峰）都认；**`scopeClause` 与 `can()` 结论一致**（超管 / `role_capability` 授权 → 不做行级过滤、全部行可见；停用用户 → 一行都看不到）；`alias` 必须是合法 SQL 标识符（注入载荷全部拒绝）；`grantAssignment` 对未注册 capability / 不存在用户抛**领域错误**（不漏 SQLite 原文）；`can()` 对缺 id 的用户 **fail-closed 返回 false**（不抛错） |
 | P0-5 | 密码与会话 | `password.test.js` 8 + `session.test.js` 10 + `users.test.js` 5 个用例通过；**库中只存 `token_hash`**（`session.test.js` 断言：库里无明文 token，`token_hash` 是 64 位 sha256 十六进制）；**库里存的是 scrypt 哈希而不是明文口令**（`users.test.js` 直接读库断言 `startsWith('scrypt$')` 且验签通过）；**会话有绝对过期上限**（设计文档 §7.5：滑动续期不得突破从签发时刻算起的硬边界） |
-| P0-6 | 登录闭环 | `server.test.js` **33** 个用例通过：登录 200 + 下发 `hk_session` Cookie（HttpOnly/SameSite=Lax/Path=/）；带 Cookie 访问 `/api/me` 返回 200；密码错 401 且不下发 Cookie；**用户不存在时登录耗时也有 scrypt 量级**（防计时侧信道枚举） |
+| P0-6 | 登录闭环 | `server.test.js` **35** 个用例通过：登录 200 + 下发 `hk_session` Cookie（HttpOnly/SameSite=Lax/Path=/）；带 Cookie 访问 `/api/me` 返回 200；密码错 401 且不下发 Cookie；**用户不存在时登录耗时也有 scrypt 量级**（防计时侧信道枚举） |
 | P0-9 | 安全边界钉住 | `seed.test.js` **2** + `web.test.js` **6** 个用例通过；**目录穿越**（字面量 `/../` 与编码 `/%2e%2e`、`/%2e%2e%2f`、`/..%2f` 四种变体，**裸 socket 发原始请求行**）全部拿不到 `web/` 兄弟目录的内容；**500 响应逐字节等于通用文案**（内部细节只进 `console.error`）；**畸形 cookie** 返回 401 不抛异常；**登出后原 token 立即失效**；`createApp` 缺 `webDir` **构造期**就抛错；**静态文件读不了时返回错误且服务器存活**（不能被单个请求打死）；**前端启动时恢复会话**（`/api/me` 成功 → 首屏显示已登录） |
-| P0-10 | 修复轮 3 的安全边界 | `server.test.js` **33** + `web.test.js` **6** + `permissions.test.js` **22** + `password.test.js` **8** + `session.test.js` **10** + `users.test.js` **5** + `config.test.js` **23** + `zero-deps.test.js` **7** + `sql-boundary.test.js` **3** 个用例通过；**软链逃逸被拒**（`web/` 下指向根外的软链 → 404，真实 http server + 裸 socket）；**服务端数据里的 HTML 被转义**（存储型 XSS 封堵）；**零依赖守卫真的扫描源码 import**（不再只看 package.json）；**SQL 边界扫描**（裸 SQL 只允许出现在 `src/db/repo/`）；**数字 `scopeId` 时 `can()` 与 `scopeClause()` 结论一致**（两侧同时按字符串归一）；**`server.js` 的领域错误全部经 `AppError`**（构造期 fail-fast 除外）；**会话绝对过期默认 30 天**且 `SESSION_ABSOLUTE_TTL_DAYS` 可覆盖、非法值回落；**登录响应体键集合精确**（对外形状是驼峰版，布尔不是 0/1）；**停用用户登录耗时也有 scrypt 量级**（计时对齐覆盖第三条路径） |
+| P0-10 | 修复轮 3 的安全边界 | `server.test.js` **35** + `web.test.js` **6** + `permissions.test.js` **22** + `password.test.js` **8** + `session.test.js` **10** + `users.test.js` **5** + `config.test.js` **23** + `zero-deps.test.js` **8** + `sql-boundary.test.js` **3** 个用例通过；**软链逃逸被拒**（`web/` 下指向根外的软链 → 404，真实 http server + 裸 socket）；**服务端数据里的 HTML 被转义**（存储型 XSS 封堵）；**零依赖守卫真的扫描源码 import**（不再只看 package.json）；**SQL 边界扫描**（裸 SQL 只允许出现在 `src/db/repo/`）；**数字 `scopeId` 时 `can()` 与 `scopeClause()` 结论一致**（两侧同时按字符串归一）；**`server.js` 的领域错误全部经 `AppError`**（构造期 fail-fast 除外）；**会话绝对过期默认 30 天**且 `SESSION_ABSOLUTE_TTL_DAYS` 可覆盖、非法值回落；**登录响应体键集合精确**（对外形状是驼峰版，布尔不是 0/1）；**停用用户登录耗时也有 scrypt 量级**（计时对齐覆盖第三条路径） |
 | P0-7 | 跨平台 | 在 Mac 上 `node src/server.js` 成功；把 `platform/` 拷到另一台机器重复同样命令 |
 | P0-8 | 领域错误统一 | `src/errors.js` 导出 `AppError` / `appError(status, code, message, detail)`（**status-first**）；全部领域错误都经它抛出（`instanceof AppError` 有断言钉住）；HTTP 层只把 `.status` / `.code` 转出去，**不外泄** Node 的 `ERR_*` 与 SQLite 原文 |
+| P0-11 | 终审 Important 三项（I-A / I-B / I-C） | **`zero-deps.test.js` 8 + `body.test.js` 4 + `server.test.js` 35** 个用例通过；**I-A 零依赖守卫有自保护**：判定逻辑抽成纯函数 `classifySpecifier()` / `scanSource()`（从 `zero-deps.test.js` 导出），对**合成的坏源码**断言 6 种第三方写法（`import x from 'pkg'` / `import {x} from 'pkg'` / 副作用 import / `export … from 'pkg'` / 动态 `import()` / `require()`）**必须被判违规**，5 种合法写法（相对路径 / `node:` 内置 / 普通字符串 / 注释里的 import / URL 字面量）**不得被误判**；**I-B 请求体默认上限被钉住**：`readJsonBody(req)` 不传 `limit` 时上限为 **512KB**，512KB 以内放行、超出回 413 `PAYLOAD_TOO_LARGE`，且有反例对照（显式放宽 `limit` 后同一 body 放行）；**I-C `domainCode` 有断言且被导出**：领域码透传、Node 的 `ERR_*` 与非领域码（小写 / 数字开头 / 下划线开头 / 带连字符 / 非字符串 / 缺失）一律回落为通用码（回落值用**可区分哨兵**，避免被固定值变异掩盖）；**4xx 分支只透传 `AppError` 的 message**，裸 `Error`（含 SQLite 原文）的 message 一律回落为「请求无效」 |
 
 ---
 

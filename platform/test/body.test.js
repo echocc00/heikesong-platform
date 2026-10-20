@@ -51,3 +51,43 @@ test('body 超限时先销毁请求流再抛 413（用探针钉住调用与顺�
   assert.equal(destroyCallsAtThrow, 1, '抛 413 之前必须已经销毁请求流');
   assert.equal(resumeCalls, 0, '有 destroy() 就不该再走 resume 兜底');
 });
+
+test('请求体上限的**默认值**是 512KB（不传 limit 时也必须限）', async () => {
+  // ⛔ 终审修正（Important，I-B）：上限的**默认值**此前零断言 ——
+  //    现有用例都传了显式 `{ limit: 10 }`，把默认值改成 100MB 全量测试照样全绿。
+  //    而默认值才是**生产实际生效**的那个（HTTP 层调用 readJsonBody 时不传 limit）。
+  //    没有上限 = 任何人都能往内存里灌任意大的 body → OOM。
+  const KB = 1024;
+  const MB = 1024 * KB;
+
+  // 刚好在上限内 → 通过（body 必须是**合法 JSON**，否则先被 JSON 解析拦下，
+  // 测的就不是「大小上限」这条护栏了）
+  const mkJson = (totalBytes) => {
+    const head = '{"a":"';
+    const tail = '"}';
+    const pad = 'x'.repeat(totalBytes - head.length - tail.length);
+    return Buffer.from(head + pad + tail);
+  };
+  const under = Readable.from([mkJson(512 * KB - 1)]);
+  await assert.doesNotReject(() => readJsonBody(under), '512KB 以内必须放行');
+
+  // 超过上限 → 413（用默认 limit，不传参）
+  const over = Readable.from([mkJson(512 * KB + 1)]);
+  await assert.rejects(
+    () => readJsonBody(over),
+    (err) => {
+      assert.equal(err.status, 413);
+      assert.equal(err.code, 'PAYLOAD_TOO_LARGE');
+      return true;
+    },
+    '超过默认上限必须回 413',
+  );
+
+  // 反例对照：显式传更大的 limit 时，同一个 body 必须放行
+  //（证明上一条确实是「默认上限」在起作用，而不是 body 本身有问题）
+  const same = Readable.from([mkJson(512 * KB + 1)]);
+  await assert.doesNotReject(
+    () => readJsonBody(same, { limit: 2 * MB }),
+    '显式放宽 limit 后同一 body 必须放行',
+  );
+});

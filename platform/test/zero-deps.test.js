@@ -245,6 +245,48 @@ function lineAt(src, index) {
 
 const SCAN_DIRS = ['src', 'scripts', 'web'];
 
+/**
+ * 判断一个 specifier 属于哪一类。
+ *
+ * ⚠️ 终审修正（Important，I-A）：这段判断原先**内联**在扫描循环里，
+ *    把 `if (spec.value.startsWith('node:') || spec.value.startsWith('.')) continue;`
+ *    改成**无条件 continue**（即「一条都不判违规」）→ 全量 140 条照样全绿。
+ *    原因：原来的阳性对照只防「扫描器一条都抓不到」，**不防「扫描器一条都不判违规」**。
+ *    抽出成纯函数后可以直接对已知输入断言判定结果。
+ */
+export function classifySpecifier(value) {
+  if (value.startsWith('node:')) return 'builtin';
+  if (value.startsWith('.')) return 'relative';
+  if (value.startsWith('/')) return 'absolute';
+  return 'violation';
+}
+
+/**
+ * 扫描**一段源码**，返回该源码里的 { specifiers, violations, absolute }。
+ *
+ * ⚠️ 终审修正（Important，I-A）：抽出来是为了能对**已知的坏输入**直接断言
+ *    「它确实被判成违规」—— 不必往真实源码树里塞一个假依赖文件。
+ */
+export function scanSource(code, rel = '<synthetic>') {
+  const specifiers = [];
+  const violations = [];
+  const absolute = [];
+  const stripped = stripComments(code);
+  for (const spec of findSpecifiers(stripped)) {
+    const line = lineAt(code, spec.start);
+    const hit = { file: rel, line, value: spec.value };
+    specifiers.push(hit);
+    const kind = classifySpecifier(spec.value);
+    if (kind === 'builtin' || kind === 'relative') continue;
+    if (kind === 'absolute') {
+      absolute.push(hit);
+      continue;
+    }
+    violations.push(hit);
+  }
+  return { specifiers, violations, absolute };
+}
+
 /** 扫描全部受管目录，返回 { specifiers, violations, absolute }。 */
 function scanImports() {
   const specifiers = [];
@@ -253,19 +295,11 @@ function scanImports() {
   for (const dir of SCAN_DIRS) {
     for (const file of collectJsFiles(join(root, dir))) {
       const raw = readFileSync(file, 'utf8');
-      const code = stripComments(raw);
       const rel = relative(root, file);
-      for (const spec of findSpecifiers(code)) {
-        const line = lineAt(raw, spec.start);
-        const hit = { file: rel, line, value: spec.value };
-        specifiers.push(hit);
-        if (spec.value.startsWith('node:') || spec.value.startsWith('.')) continue;
-        if (spec.value.startsWith('/')) {
-          absolute.push(hit);
-          continue;
-        }
-        violations.push(hit);
-      }
+      const r = scanSource(raw, rel);
+      specifiers.push(...r.specifiers);
+      violations.push(...r.violations);
+      absolute.push(...r.absolute);
     }
   }
   return { specifiers, violations, absolute };
@@ -301,4 +335,56 @@ test('没有任何绝对路径 import（绝对路径说明模块解析被绕过�
     [],
     '不允许绝对路径 import',
   );
+});
+
+test('扫描器对**已知坏输入**确实判违规（防「一条都不判违规」的假绿）', async () => {
+  // ⛔ 终审修正（Important，I-A）：原来的阳性对照只防「扫描器一条都抓不到」，
+  //    **不防「扫描器一条都不判违规」** —— 把扫描循环里的判定改成无条件 `continue`
+  //    （跳过全部 specifier）→ 全量 140 条照样全绿。
+  //    这里直接对**合成的坏源码**断言它被判成违规，不必往真实源码树里塞假依赖。
+  const { scanSource, classifySpecifier } = await import('./zero-deps.test.js');
+
+  // 判定函数本身
+  assert.equal(classifySpecifier('node:sqlite'), 'builtin');
+  assert.equal(classifySpecifier('./x.js'), 'relative');
+  assert.equal(classifySpecifier('../src/x.js'), 'relative');
+  assert.equal(classifySpecifier('/abs/x.js'), 'absolute');
+  assert.equal(classifySpecifier('lodash'), 'violation');
+  assert.equal(classifySpecifier('express'), 'violation');
+  assert.equal(classifySpecifier('@scope/pkg'), 'violation');
+
+  // 真实扫描路径：五种第三方写法都必须被抓
+  const BAD = [
+    "import lodash from 'lodash';",
+    "import { x } from 'express';",
+    "import 'chalk';",
+    "export { x } from 'redux';",
+    "const m = await import('moment');",
+    "const m = require('underscore');",
+  ];
+  for (const code of BAD) {
+    const r = scanSource(code, '<synthetic>');
+    assert.equal(
+      r.violations.length,
+      1,
+      `这段源码里的第三方依赖必须被判违规：${code}（实际 violations=${JSON.stringify(r.violations)}）`,
+    );
+  }
+
+  // 反例对照：合法的写法不得被误判（否则这条用例就变成了「一律违规」的恒绿）
+  const GOOD = [
+    "import { openDatabase } from '../src/db/sqlite.js';",
+    "import { DatabaseSync } from 'node:sqlite';",
+    "const s = '这不是 import';",
+    "// import lodash from 'lodash';  // 注释里的不算",
+    "const url = 'https://example.com/from';",
+  ];
+  for (const code of GOOD) {
+    const r = scanSource(code, '<synthetic>');
+    assert.deepEqual(
+      r.violations,
+      [],
+      `合法写法不得被误判为违规：${code}`,
+    );
+  }
 });
