@@ -44,7 +44,16 @@ node --test               # 跑测试
 |---|---|---|
 | `PORT` | 8080 | 监听端口 |
 | `DATA_DIR` | `./data` | 数据库与上传目录 |
-| `SESSION_TTL_DAYS` | 7 | 会话有效期 |
+| `SESSION_TTL_DAYS` | 7 | 会话滑动有效期（天） |
+| `SESSION_ABSOLUTE_TTL_DAYS` | 30 | 会话**绝对过期上限**（天，从签发时刻算起）。滑动续期不得突破它 —— 否则令牌一旦泄露就能一直刷新自己 |
+| `ADMIN_PASSWORD` | 无 | **`scripts/seed.js` 必填**。不设就报错退出（退出码非 0）、**不建库不建账号**。没有任何默认口令兜底 —— 写死的默认口令等于把超管口令公开 |
+| `NODE_ENV` | — | 设为 `production` 时 Cookie 加 `Secure`（开发环境不加，`http://127.0.0.1` 会被浏览器拒收） |
+
+> 种子脚本的用法：
+> ```bash
+> ADMIN_PASSWORD='你的强口令' node scripts/seed.js
+> ```
+> 口令本身不会被打印到 stdout。
 
 ## 设计文档
 
