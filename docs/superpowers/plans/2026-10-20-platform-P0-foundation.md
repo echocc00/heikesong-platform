@@ -26,6 +26,7 @@ npm 依赖    0 个。package.json 只有 {"type":"module"}，不得新增 depen
 规则配置    platform/rules/*.json，一切可变规则只改 JSON
 配置校验    fail-fast：权重合计≠100% / 阈值不单调 / 段位门槛不递增 → 拒绝启动并报错
 权限模型    capability + assignment；判定只有一个入口 can(user, capability, ctx)
+作用域      上级作用域**不隐式下推**：edition 授权不自动覆盖其下的 task_package
 三态状态码  列表不满足 → 200+空集；单条不满足 → 404；规则被禁用 → 403
 SQL 边界    所有 SQL 收进 src/db/repo/；handler 内禁止裸 SQL
 规则溯源    每条规则在代码注释里写明来源文档与章节
@@ -57,20 +58,20 @@ platform/
 │   │   ├── respond.js            JSON / 文本 / 错误响应
 │   │   ├── body.js               JSON body 解析（带大小上限）
 │   │   ├── static.js             静态文件服务（ETag）
-│   │   └── sse.js                SSE 事件总线
+│   │   └── sse.js                SSE 事件总线（**P2 才建**；P0/P1 没有这个端点）
 │   ├── auth/
 │   │   ├── password.js           scrypt 哈希与校验
-│   │   ├── session.js            会话签发/校验/吊销
-│   │   └── permissions.js        capability + assignment 判定
+│   │   ├── session.js            会话签发/校验/吊销（不含 SQL）
+│   │   └── permissions.js        capability + assignment 判定（不含 SQL）
 │   ├── db/
 │   │   ├── sqlite.js             连接封装 + 迁移执行
 │   │   ├── migrate.js            迁移文件读取与应用
 │   │   └── repo/
-│   │       ├── users.js
-│   │       ├── sessions.js
-│   │       └── assignments.js
+│   │       ├── users.js           用户仓储 + toPublicUser（唯一对外形状）
+│   │       ├── sessions.js        会话仓储（SQL 全在这）
+│   │       └── assignments.js     授权仓储（SQL 全在这）
 │   └── audit/
-│       └── log.js                审计日志写入
+│       └── log.js                审计日志写入（**P2 才建**；P0 不创建）
 ├── db/migrations/001_init.sql    初始表结构
 ├── web/
 │   ├── index.html
@@ -86,10 +87,16 @@ platform/
 │   ├── seed.js
 │   └── forbidden.txt
 └── test/
+    ├── zero-deps.test.js
+    ├── migrate.test.js
     ├── config.test.js
+    ├── router.test.js
+    ├── body.test.js
     ├── password.test.js
+    ├── session.test.js
+    ├── users.test.js
     ├── permissions.test.js
-    └── router.test.js
+    └── server.test.js
 ```
 
 ---
@@ -1532,20 +1539,48 @@ git commit -m "feat(P0): 9 份声明式规则配置与 fail-fast 校验"
 
 ### Task 4: HTTP 路由、响应与 body 解析
 
+> **【2026-10-20 预审修正】** 只读预审代理把本 Task 的简报**逐字落到临时目录实跑**，
+> 查出 **2 Critical + 1 Important**（Task 4 自带的 6 条测试里 **5 条会红**，主功能不可用）。
+> 修正三处：
+> **①（C4-1 Critical）路由优先级比较器写反 → 静态路径被参数路由劫持。**
+>      原比较器 `b.names.length - a.names.length` 的效果是**参数段多的排前面**，与注释相反；
+>      第二排序键 `a.pattern.length - b.pattern.length` 是字符串长度，与静态优先无关。
+>      后果：`GET /api/leaderboard/rolling` 命中 `GET /api/leaderboard/:stageId` → **发榜数据取错**
+>      （P1–P6 有 20+ 条带参路由全落在这个匹配器上）。
+>      改为**逐段比较**（不是比数量，也不是比字符串长度）：第一处不同的段上**静态段胜参数段**；
+>      两段都是静态但字面量不同（不可能同时匹配同一路径）→ 按字节序，保证确定性；
+>      两段都是参数 → 继续比下一段；一个 pattern 先结束（另一个是它的前缀）→ **短的在前**；
+>      完全相同 → 保持注册顺序。**匹配结果与注册顺序无关**（同形状两条路由谁先注册都一样）。
+>      测试从 6 条增至 8 条（新增「rolling 不被 :stageId 劫持」+「正序/反序注册结果一致」）。
+> **②（C4-2 Critical）畸形 URL 打死整个服务器进程。**
+>      `params[name] = decodeURIComponent(hit[i + 1])` 遇到 `'%E0%A4%A'` 抛 `URIError`，
+>      而 `server.js` 里 `router.match(...)` 在 `try {` **之外** → 异常越过 handle 的 try/catch →
+>      Node 默认未捕获异常退出（退出码 1），**整个服务器进程死亡**。
+>      P0 只有无参路由所以打不到，**P1 起（`/api/teams/:id`）即刻可远程触发**。
+>      两处都改：router 内对每个捕获段做 `try { decodeURIComponent(v) } catch { 该路由不匹配 }`
+>      （畸形百分号编码**不允许抛出到路由匹配之外**），`server.js` 里把 `router.match(...)`
+>      **移进 `try` 块内**，并把「URL 编码非法」与「没这个接口」区分开：前者 **400**、后者 404。
+> **③（I4-1 Important）body 超限时请求流未消费 → 连接悬挂。**
+>      `readJsonBody` 超限直接 `throw`，客户端还在发剩余 body → 连接占住不放（慢速上传可占连接）。
+>      改为超限时先 `req.destroy()`（销毁请求流）再抛 413；上层 413 响应带 `Connection: close`。
+> 另：`text(res, status, body, contentType?)` 的第 4 个可选参数与契约 `text(res, status, body)`
+> 不一致，但**向后兼容**，保留不动（m4-1）。
+
 **Files:**
 - Create: `platform/src/http/router.js`
 - Create: `platform/src/http/respond.js`
 - Create: `platform/src/http/body.js`
 - Create: `platform/test/router.test.js`
+- Create: `platform/test/body.test.js`
 
 **Interfaces:**
 - Consumes: 无
 - Produces:
   - `createRouter()` → `{ add(method, pattern, handler), match(method, path) }`
   - `pattern` 形如 `/api/teams/:teamId/members`，`:name` 捕获一个路径段
-  - `match()` 返回 `{ handler, params }` 或 `null`
+  - `match()` 返回 `{ handler, params }` 或 `null`（**畸形百分号编码 → 视为不匹配，返回 null**，由上层回 400）
   - `json(res, status, body)`、`text(res, status, body)`、`error(res, status, code, message)`
-  - `readJsonBody(req, { limit })` → 解析后的对象；超限抛错
+  - `readJsonBody(req, { limit })` → 解析后的对象；超限抛错（`status=413`，且请求流已被销毁）
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -1581,12 +1616,19 @@ test('路径不匹配返回 null', () => {
   assert.equal(r.match('GET', '/api/team'), null);
 });
 
-test('注册顺序不影响匹配（静态段优先于参数段）', () => {
-  const r = createRouter();
-  r.add('GET', '/api/teams/me', () => 'static');
-  r.add('GET', '/api/teams/:id', () => 'param');
-  assert.equal(r.match('GET', '/api/teams/me').handler(), 'static');
-  assert.equal(r.match('GET', '/api/teams/other').handler(), 'param');
+test('注册顺序不影响匹配（静态段优先于参数段）：正序与反序注册结果一致', () => {
+  // ⛔ 预审修正（C4-1）：原用例只测了一种注册顺序，而用例名承诺的是"注册顺序不影响"。
+  //    现在两种注册顺序都断言同样的结果。
+  const forward = createRouter();
+  forward.add('GET', '/api/teams/me', () => 'static');
+  forward.add('GET', '/api/teams/:id', () => 'param');
+  const backward = createRouter();
+  backward.add('GET', '/api/teams/:id', () => 'param');
+  backward.add('GET', '/api/teams/me', () => 'static');
+  for (const r of [forward, backward]) {
+    assert.equal(r.match('GET', '/api/teams/me').handler(), 'static');
+    assert.equal(r.match('GET', '/api/teams/other').handler(), 'param');
+  }
 });
 
 test('URL 里的 query 不影响路径匹配', () => {
@@ -1594,11 +1636,67 @@ test('URL 里的 query 不影响路径匹配', () => {
   r.add('GET', '/api/leaderboard', () => 'lb');
   assert.ok(r.match('GET', '/api/leaderboard?scope=rank'));
 });
+
+test('静态路由 /api/leaderboard/rolling 不会被参数路由 /api/leaderboard/:stageId 劫持', () => {
+  // ⛔ 预审修正（C4-1）：原比较器把参数段多的排前面 → rolling 会被 :stageId 劫持 → 发榜取错数据。
+  for (const build of [
+    (r) => {
+      r.add('GET', '/api/leaderboard/rolling', () => 'rolling');
+      r.add('GET', '/api/leaderboard/:stageId', () => 'stage');
+    },
+    (r) => {
+      r.add('GET', '/api/leaderboard/:stageId', () => 'stage');
+      r.add('GET', '/api/leaderboard/rolling', () => 'rolling');
+    },
+  ]) {
+    const r = createRouter();
+    build(r);
+    assert.equal(r.match('GET', '/api/leaderboard/rolling').handler(), 'rolling');
+    assert.equal(r.match('GET', '/api/leaderboard/st1').handler(), 'stage');
+  }
+});
+
+test('畸形百分号编码不抛异常，且不匹配该路由', () => {
+  // ⛔ 预审修正（C4-2）：decodeURIComponent('%E0%A4%A') 抛 URIError，
+  //    抛出到路由匹配之外会打死整个服务器进程（server.js 里 router.match 在 try 之外）。
+  const r = createRouter();
+  r.add('GET', '/api/teams/:teamId', () => 'team');
+  assert.equal(r.match('GET', '/api/teams/%E0%A4%A'), null);
+});
+```
+
+`platform/test/body.test.js`：
+
+```javascript
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { Readable } from 'node:stream';
+import { readJsonBody } from '../src/http/body.js';
+
+test('正常 JSON body 解析成对象', async () => {
+  const req = Readable.from([Buffer.from('{"a":1}')]);
+  assert.deepEqual(await readJsonBody(req), { a: 1 });
+});
+
+test('body 超限抛 413，并销毁请求流（不留下悬挂连接）', async () => {
+  // ⛔ 预审修正（I4-1）：超限时先销毁请求流再抛错，
+  //    否则客户端继续发剩余 body → 连接悬挂（慢速上传可占住连接）。
+  const req = Readable.from([Buffer.alloc(1024, 0x61)]);
+  await assert.rejects(
+    () => readJsonBody(req, { limit: 10 }),
+    (err) => {
+      assert.equal(err.status, 413);
+      assert.equal(err.code, 'PAYLOAD_TOO_LARGE');
+      return true;
+    },
+  );
+  assert.equal(req.destroyed, true);
+});
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
 
-Run: `cd platform && node --test test/router.test.js`
+Run: `cd platform && node --test test/router.test.js test/body.test.js`
 Expected: FAIL —— `Cannot find module '../src/http/router.js'`
 
 - [ ] **Step 3: 创建 src/http/router.js**
@@ -1625,27 +1723,77 @@ export function createRouter() {
     return { regex: new RegExp(`^${source}/?$`), names };
   }
 
+  /**
+   * 路由优先级比较器：**逐段比较**（2026-10-20 预审修正 C4-1）。
+   *
+   * ⛔ 不能比"参数段个数"，也不能比"pattern 字符串长度"：
+   *    前者把参数路由排到静态路由前面（与静态优先相反），
+   *    后者与静态优先无关 —— 两者都会让 `/api/leaderboard/rolling` 被
+   *    `/api/leaderboard/:stageId` 劫持（发榜数据取错）。
+   *
+   * 规则（从左往右逐段比，第一处不同的段决定胜负）：
+   *   ① 静态段胜参数段
+   *   ② 两段都是静态但字面量不同（不可能同时匹配同一路径）→ 按字节序，保证确定性
+   *   ③ 两段都是参数 → 继续比下一段
+   *   ④ 一个 pattern 先结束（另一个是它的前缀）→ 短的在前（更具体）
+   *   ⑤ 完全相同 → 保持注册顺序（Array.sort 稳定）
+   *
+   * 效果：同形状（同参数段数、同静态段数）的两条路由，先注册哪条都不影响匹配结果。
+   */
+  function compareRoutes(a, b) {
+    const as = a.segments;
+    const bs = b.segments;
+    const len = Math.min(as.length, bs.length);
+    for (let i = 0; i < len; i++) {
+      const x = as[i];
+      const y = bs[i];
+      if (x === y) continue;
+      const xIsParam = x.startsWith(':');
+      const yIsParam = y.startsWith(':');
+      if (xIsParam !== yIsParam) return xIsParam ? 1 : -1; // ① 静态段优先
+      if (xIsParam && yIsParam) continue; // ③ 都是参数 → 看下一段
+      return x < y ? -1 : 1; // ② 都是静态 → 字节序
+    }
+    return as.length - bs.length; // ④ 前缀 → 短的在前
+  }
+
   return {
     add(method, pattern, handler) {
       const { regex, names } = compile(pattern);
-      routes.push({ method: method.toUpperCase(), pattern, regex, names, handler });
+      routes.push({
+        method: method.toUpperCase(),
+        pattern,
+        segments: pattern.split('/'),
+        regex,
+        names,
+        handler,
+      });
       return this;
     },
     match(method, path) {
       const clean = path.split('?')[0];
       const m = method.toUpperCase();
-      // 先匹配静态段更多的路由 → 静态优先于参数
-      const ordered = [...routes].sort(
-        (a, b) => b.names.length - a.names.length || a.pattern.length - b.pattern.length,
-      );
+      // 静态优先于参数：逐段比较（见 compareRoutes）
+      const ordered = [...routes].sort(compareRoutes);
       for (const route of ordered) {
         if (route.method !== m) continue;
         const hit = route.regex.exec(clean);
         if (!hit) continue;
         const params = {};
+        let malformed = false;
         route.names.forEach((name, i) => {
-          params[name] = decodeURIComponent(hit[i + 1]);
+          if (malformed) return;
+          try {
+            params[name] = decodeURIComponent(hit[i + 1]);
+          } catch {
+            // ⛔ 畸形百分号编码（如 '%E0%A4%A'）会让 decodeURIComponent 抛 URIError。
+            //    绝不能让它抛出到路由匹配之外：server.js 里 router.match 一旦在 try 块外，
+            //    一个畸形 URL 就能让 Node 以未捕获异常退出（退出码 1）→ 整个服务器进程死亡。
+            //    视为非法 URL → 该路由不匹配（match 返回 null），由上层回 400。
+            malformed = true;
+          }
         });
+        if (malformed) return null;
         return { handler: route.handler, params, pattern: route.pattern };
       }
       return null;
@@ -1696,15 +1844,25 @@ export function error(res, status, code, message, detail) {
 export async function readJsonBody(req, { limit = 1024 * 512 } = {}) {
   const chunks = [];
   let size = 0;
+  let tooLarge = false;
   for await (const chunk of req) {
     size += chunk.length;
     if (size > limit) {
-      const err = new Error('请求体过大');
-      err.status = 413;
-      err.code = 'PAYLOAD_TOO_LARGE';
-      throw err;
+      tooLarge = true;
+      break;
     }
     chunks.push(chunk);
+  }
+  if (tooLarge) {
+    // ⛔ 预审修正（I4-1）：必须先把请求流消费/销毁掉再抛错。
+    //    客户端可能还在发剩余 body，不消费就抛 → 连接悬挂（慢速上传能占住连接不放）。
+    //    销毁请求流后，上层回 413 并带 Connection: close（连接不再复用）。
+    if (typeof req.destroy === 'function') req.destroy();
+    else if (typeof req.resume === 'function') req.resume();
+    const err = new Error('请求体过大');
+    err.status = 413;
+    err.code = 'PAYLOAD_TOO_LARGE';
+    throw err;
   }
   if (size === 0) return {};
   const raw = Buffer.concat(chunks).toString('utf8');
@@ -1729,13 +1887,13 @@ export async function readJsonBody(req, { limit = 1024 * 512 } = {}) {
 
 - [ ] **Step 6: 运行测试确认通过**
 
-Run: `cd platform && node --test test/router.test.js`
-Expected: PASS（6 个测试全过）
+Run: `cd platform && node --test test/router.test.js test/body.test.js`
+Expected: PASS（10 个测试全过：router 8 + body 2）
 
 - [ ] **Step 7: 提交**
 
 ```bash
-cd platform && git add src/http test/router.test.js
+cd platform && git add src/http test/router.test.js test/body.test.js
 git commit -m "feat(P0): HTTP 路由、响应与 body 解析"
 ```
 
@@ -1743,22 +1901,72 @@ git commit -m "feat(P0): HTTP 路由、响应与 body 解析"
 
 ### Task 5: 认证（scrypt + 服务端会话）
 
+> **【2026-10-20 预审修正】** 只读预审代理把本 Task 的简报**逐字落到临时目录实跑**，
+> 查出 **1 Critical + 4 Important + 2 Minor**（简报自带的 5 条测试里 **3 条会红**，
+> 且「正确密码校验通过」直接红 → **没有人能登录**）。
+> 修正六处：
+> **①（C5-1 Critical）密码格式字段数自相矛盾 → 没有任何人能登录。**
+>      `hashPassword` 产出 **6 段**（`scrypt$N$r$p$salt$hash`），
+>      `verifyPassword` 的守卫却要求 **5 段**（`parts.length !== 5`），
+>      守卫之后的解构又按 **6 段**写，测试也断言 `parts.length === 5` ——
+>      实测 `verifyPassword` 对**所有合法哈希一律返回 false**。
+>      连带 `createUser` 把这个哈希写进 `users.password_hash` → 全库口令都无法验证。
+>      **规范侧是对的（6 段）**：INTERFACES.md:62 写 `scrypt$N$r$p$saltB64$hashB64`，
+>      README 全局约束与设计文档 §7.5 同款 → 改守卫为 `parts.length !== 6`，测试断言改 6。
+> **②（I5-1 Important）违反「SQL 边界」全局约束。**
+>      会话的 4 处 `db.prepare` 写在 `src/auth/session.js`，而同时建的
+>      `src/db/repo/sessions.js` 只剩两个辅助函数。全部 SQL 移入仓储层；
+>      `src/auth/session.js` 只保留**与 SQL 无关**的逻辑（token 生成 + SHA-256 哈希 + 过期计算）。
+> **③（I5-2 Important）`SELECT *` 把 password_hash 交给调用方。**
+>      `listUsers` 一次性返回全体用户 + 全部 scrypt 哈希；P0 的 `/api/me` 手工挑字段所以当下安全，
+>      但任何后续 handler 只要 `json(res, 200, user)` 就会把口令哈希发给浏览器。
+>      仓储层 SELECT 改成**显式列白名单（不含 password_hash）**，
+>      并提供 `toPublicUser(row)` 作为**唯一的对外形状**；所有返回用户的地方强制走它。
+>      带哈希的行只允许 `getCredentialsByPhone` 取，且只用于服务端口令校验、绝不进响应。
+> **④（I5-3 Important）重复手机号抛原始 SQLite 错误。**
+>      `users.phone` 是 UNIQUE，重复注册会抛 `UNIQUE constraint failed: users.phone`
+>      → 上层只能回 500，且错误原文带表名列名。P1 契约要求「重复提交 → 409，不静默覆盖」。
+>      改为**先查后写**：已存在则抛**领域错误**（`status=409` / `code='PHONE_TAKEN'`）。
+> **⑤（I5-4 Important）会话代码零覆盖（「只存 token_hash」无任何断言）。**
+>      `password.test.js` 全程不碰数据库，`createSession`/`resolveSession`/`revoke*` **零覆盖**，
+>      而 P0 验收标准明确要求「库中只存 token_hash」—— 四份简报里找不到任何断言
+>      （与 Task 2「真实 DDL 从未被 apply」是同一型问题）。
+>      新增 `platform/test/session.test.js`（**用真实 SQLite 库**）断言 4 条：
+>      ① 库里不存在明文 token，`token_hash` 是 64 位 sha256 十六进制；
+>      ② 过期 token 解析为 null 且该行被顺手删掉；
+>      ③ `revokeAllSessions` 之后该用户的全部会话都失效；
+>      ④ 滑动续期（见 ⑥）。
+>      另加 `platform/test/users.test.js` 覆盖 ③ 与 ④ 的对外形状：
+>      重复手机号 → 409 领域错误；仓储层行与对外形状都**不含 password_hash**。
+> **⑥（m5-2 Minor）设计文档 §7.5 要求「绝对过期 + 滑动续期」，简报只实现了绝对过期。**
+>      P0 补上**滑动续期**：`resolveSession` 命中有效会话时把 `expires_at` 顺延 `ttlDays`
+>      （默认 7 天，`SESSION_TTL_DAYS` 环境变量可覆盖）→ 设计文档与实现不再不符。
+> 另（m5-1 Minor）过期判定**两种口径不一致**：`resolveSession` 用 `new Date(...)`，
+>      `purgeExpiredSessions` 用字符串比较 —— 不带毫秒的 ISO 串会给出相反结论。
+>      统一为「**解析时间戳再比较**」：JS 侧用 `new Date(...)`，
+>      SQL 侧用 SQLite 的 `datetime()`（不是字符串比较），`now` 一律归一化成 `new Date(now).toISOString()`。
+
 **Files:**
 - Create: `platform/src/auth/password.js`
 - Create: `platform/src/auth/session.js`
 - Create: `platform/src/db/repo/users.js`
 - Create: `platform/src/db/repo/sessions.js`
 - Create: `platform/test/password.test.js`
+- Create: `platform/test/session.test.js`
+- Create: `platform/test/users.test.js`
 
 **Interfaces:**
 - Consumes: `openDatabase()`（Task 2）
 - Produces:
-  - `hashPassword(plain)` → `scrypt$N$r$p$<saltB64>$<hashB64>`
+  - `hashPassword(plain)` → `scrypt$N$r$p$<saltB64>$<hashB64>`（**6 段**）
   - `verifyPassword(plain, stored)` → `boolean`（用 `timingSafeEqual`）
-  - `createSession(db, userId, { ttlDays })` → `{ token, expiresAt }`（明文 token 只返回一次，库中只存 SHA-256）
-  - `resolveSession(db, token)` → `{ userId, expiresAt }` 或 `null`
+  - `createSession(db, userId, { ttlDays, now })` → `{ token, expiresAt }`（明文 token 只返回一次，库中只存 SHA-256）
+  - `resolveSession(db, token, { now, ttlDays })` → `{ userId, expiresAt }` 或 `null`（命中即**滑动续期**）
   - `revokeSession(db, token)` / `revokeAllSessions(db, userId)`
-  - `createUser(db, { name, phone, password, mbaStatus, org })` → user
+  - `sessionTtlDays()` → 天数（默认 7，`SESSION_TTL_DAYS` 覆盖）
+  - `createUser(db, { name, phone, password, mbaStatus, org })` → user 行（**不含 password_hash**）
+  - `toPublicUser(row)` → 对外用户形状（**唯一出口**）
+  - `getCredentialsByPhone(db, phone)` → 含 `password_hash` 的行（**只用于服务端口令校验**）
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -1788,7 +1996,8 @@ test('错误密码校验失败', () => {
 
 test('存储格式包含成本参数', () => {
   const parts = hashPassword('x').split('$');
-  assert.equal(parts.length, 5);
+  // ⛔ 预审修正（C5-1）：6 段 —— scrypt$N$r$p$salt$hash
+  assert.equal(parts.length, 6);
   assert.equal(parts[0], 'scrypt');
   assert.ok(Number.isInteger(Number(parts[1])));
 });
@@ -1799,9 +2008,156 @@ test('损坏的存储串不抛异常，返回 false', () => {
 });
 ```
 
+`platform/test/session.test.js`（**预审修正 I5-4 新增**：会话代码此前零覆盖，
+P0 验收标准要求的「库中只存 token_hash」没有任何断言）：
+
+```javascript
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { openDatabase } from '../src/db/sqlite.js';
+import { applyMigrations } from '../src/db/migrate.js';
+import { createUser } from '../src/db/repo/users.js';
+import {
+  createSession,
+  resolveSession,
+  revokeSession,
+  revokeAllSessions,
+} from '../src/auth/session.js';
+
+// 真实迁移目录（platform/db/migrations）：会话表必须真的被建出来。
+const migrationsDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'db', 'migrations');
+
+function setup() {
+  const dataDir = mkdtempSync(join(tmpdir(), 'hks-sess-'));
+  const { db, close } = openDatabase({ dataDir });
+  applyMigrations(db, migrationsDir);
+  const user = createUser(db, { name: '会话甲', phone: '13900000002', password: 'pw' });
+  return { db, close, dataDir, user };
+}
+
+test('库里只存 token_hash（SHA-256 十六进制），不存在明文 token', () => {
+  const { db, close, dataDir, user } = setup();
+  const { token } = createSession(db, user.id);
+  const rows = db.prepare('SELECT token_hash FROM sessions WHERE user_id = ?').all(user.id);
+  assert.equal(rows.length, 1);
+  assert.notEqual(rows[0].token_hash, token);
+  assert.equal(rows[0].token_hash.length, 64);
+  assert.match(rows[0].token_hash, /^[0-9a-f]{64}$/);
+  // 整张表里任何一列都不含明文 token
+  for (const row of db.prepare('SELECT * FROM sessions').all()) {
+    assert.ok(!Object.values(row).includes(token));
+  }
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('过期 token 解析为 null，并顺手删掉该行', () => {
+  const { db, close, dataDir, user } = setup();
+  const now = new Date('2026-01-01T00:00:00.000Z');
+  const { token } = createSession(db, user.id, { ttlDays: 1, now });
+  assert.ok(resolveSession(db, token, { now: new Date('2026-01-01T12:00:00.000Z'), ttlDays: 1 }));
+  const later = new Date('2026-01-03T00:00:00.000Z');
+  assert.equal(resolveSession(db, token, { now: later, ttlDays: 1 }), null);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM sessions').get().n, 0);
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('revokeAllSessions 之后该用户的全部会话都失效', () => {
+  const { db, close, dataDir, user } = setup();
+  const a = createSession(db, user.id);
+  const b = createSession(db, user.id);
+  assert.ok(resolveSession(db, a.token));
+  assert.ok(resolveSession(db, b.token));
+  revokeAllSessions(db, user.id);
+  assert.equal(resolveSession(db, a.token), null);
+  assert.equal(resolveSession(db, b.token), null);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM sessions WHERE user_id = ?').get(user.id).n, 0);
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('有效会话被访问时滑动续期（expires_at 顺延 ttlDays）', () => {
+  // 依据：设计文档 §7.5「绝对过期 + 滑动续期」
+  const { db, close, dataDir, user } = setup();
+  const now = new Date('2026-01-01T00:00:00.000Z');
+  const { token, expiresAt } = createSession(db, user.id, { ttlDays: 1, now });
+  assert.equal(expiresAt, '2026-01-02T00:00:00.000Z');
+  const later = new Date('2026-01-01T06:00:00.000Z');
+  const got = resolveSession(db, token, { now: later, ttlDays: 1 });
+  assert.ok(got);
+  assert.equal(got.expiresAt, '2026-01-02T06:00:00.000Z');
+  // 库里也确实续期了
+  const row = db.prepare('SELECT expires_at FROM sessions').get();
+  assert.equal(row.expires_at, '2026-01-02T06:00:00.000Z');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+```
+
+`platform/test/users.test.js`（**预审修正 I5-2 / I5-3 新增**）：
+
+```javascript
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { openDatabase } from '../src/db/sqlite.js';
+import { applyMigrations } from '../src/db/migrate.js';
+import { createUser, getUserById, listUsers, toPublicUser } from '../src/db/repo/users.js';
+
+const migrationsDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'db', 'migrations');
+
+function setup() {
+  const dataDir = mkdtempSync(join(tmpdir(), 'hks-users-'));
+  const { db, close } = openDatabase({ dataDir });
+  applyMigrations(db, migrationsDir);
+  return { db, close, dataDir };
+}
+
+test('重复手机号抛 409 领域错误，不漏原始 SQLite 错误', () => {
+  const { db, close, dataDir } = setup();
+  createUser(db, { name: '甲', phone: '13900000003', password: 'pw' });
+  assert.throws(
+    () => createUser(db, { name: '乙', phone: '13900000003', password: 'pw' }),
+    (err) => {
+      assert.equal(err.status, 409);
+      assert.equal(err.code, 'PHONE_TAKEN');
+      assert.ok(!/UNIQUE constraint/.test(err.message), '不能把 SQLite 原文漏到 HTTP 层');
+      return true;
+    },
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('仓储层的行与对外形状都不含 password_hash', () => {
+  const { db, close, dataDir } = setup();
+  const user = createUser(db, { name: '甲', phone: '13900000004', password: 'pw' });
+  assert.equal(user.password_hash, undefined);
+  assert.equal(getUserById(db, user.id).password_hash, undefined);
+  for (const row of listUsers(db)) {
+    assert.equal(row.password_hash, undefined);
+  }
+  const pub = toPublicUser(user);
+  assert.equal(pub.password_hash, undefined);
+  assert.equal(pub.passwordHash, undefined);
+  assert.equal(pub.id, user.id);
+  assert.equal(pub.mbaStatus, user.mba_status);
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+```
+
 - [ ] **Step 2: 运行测试确认失败**
 
-Run: `cd platform && node --test test/password.test.js`
+Run: `cd platform && node --test test/password.test.js test/session.test.js test/users.test.js`
 Expected: FAIL —— `Cannot find module '../src/auth/password.js'`
 
 - [ ] **Step 3: 创建 src/auth/password.js**
@@ -1827,7 +2183,10 @@ export function hashPassword(plain) {
 export function verifyPassword(plain, stored) {
   if (typeof stored !== 'string') return false;
   const parts = stored.split('$');
-  if (parts.length !== 5 || parts[0] !== 'scrypt') return false;
+  // ⛔ 预审修正（C5-1）：守卫原来写 5 段，但 hashPassword 产出的是 6 段
+  //    （scrypt$N$r$p$salt$hash）→ 合法哈希一律被判为 false，没有人能登录。
+  //    规范侧是 6 段（INTERFACES.md:62 / 设计文档 §7.5），守卫与解构必须一致。
+  if (parts.length !== 6 || parts[0] !== 'scrypt') return false;
 
   const [, nStr, rStr, pStr, saltB64, hashB64] = parts;
   const salt = Buffer.from(saltB64, 'base64');
@@ -1855,40 +2214,73 @@ export function verifyPassword(plain, stored) {
 // src/auth/session.js — 服务端会话
 // 依据：设计文档 §7.5。⛔ 不做无状态 JWT —— 难撤销、难审计、难强制下线。
 //   token 只在签发时返回一次，数据库只存 SHA-256 哈希。
+// ⛔ 本文件**不含任何 SQL**（全局约束「所有 SQL 收进 src/db/repo/」）：
+//   这里只做与 SQL 无关的事 —— 生成 token、算 SHA-256 哈希、算过期时间。
+//   （预审修正 I5-1：原来 4 处 db.prepare 写在这里，仓储层只剩两个辅助函数。）
 import { randomBytes, createHash } from 'node:crypto';
+import {
+  insertSession,
+  findSessionByHash,
+  touchSessionExpiry,
+  deleteSessionByHash,
+  deleteSessionsByUser,
+} from '../db/repo/sessions.js';
+
+const DEFAULT_TTL_DAYS = 7;
+
+// 会话有效期（天）。默认 7 天，用 SESSION_TTL_DAYS 覆盖。
+// 每次调用时读 env（不在模块加载时固化）→ 改 env 立即生效，测试也好构造。
+export function sessionTtlDays() {
+  const raw = process.env.SESSION_TTL_DAYS;
+  if (raw === undefined || raw === '') return DEFAULT_TTL_DAYS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_TTL_DAYS;
+}
 
 function tokenHash(token) {
   return createHash('sha256').update(token).digest('hex');
 }
 
-export function createSession(db, userId, { ttlDays = 7, now = new Date() } = {}) {
+function expiryFrom(now, ttlDays) {
+  return new Date(now.getTime() + ttlDays * 86400_000).toISOString();
+}
+
+export function createSession(db, userId, { ttlDays = sessionTtlDays(), now = new Date() } = {}) {
   const token = randomBytes(32).toString('base64url');
-  const expiresAt = new Date(now.getTime() + ttlDays * 86400_000).toISOString();
-  db.prepare(
-    'INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)',
-  ).run(tokenHash(token), userId, now.toISOString(), expiresAt);
+  const expiresAt = expiryFrom(now, ttlDays);
+  insertSession(db, {
+    tokenHash: tokenHash(token),
+    userId,
+    createdAt: now.toISOString(),
+    expiresAt,
+  });
   return { token, expiresAt };
 }
 
-export function resolveSession(db, token, { now = new Date() } = {}) {
+export function resolveSession(db, token, { now = new Date(), ttlDays = sessionTtlDays() } = {}) {
   if (!token) return null;
-  const row = db
-    .prepare('SELECT user_id, expires_at FROM sessions WHERE token_hash = ?')
-    .get(tokenHash(token));
+  const hash = tokenHash(token);
+  const row = findSessionByHash(db, hash);
   if (!row) return null;
+  // 过期判定：解析时间戳再比较，**不做字符串比较**
+  // （'...T00:00:00Z' 与 '...T00:00:00.000Z' 字符串比较会给出相反结论）
   if (new Date(row.expires_at).getTime() <= now.getTime()) {
-    db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(tokenHash(token));
+    deleteSessionByHash(db, hash);
     return null;
   }
-  return { userId: row.user_id, expiresAt: row.expires_at };
+  // 滑动续期（设计文档 §7.5「绝对过期 + 滑动续期」）：命中有效会话就顺延一个 ttl
+  const expiresAt = expiryFrom(now, ttlDays);
+  touchSessionExpiry(db, hash, expiresAt);
+  return { userId: row.user_id, expiresAt };
 }
 
 export function revokeSession(db, token) {
-  db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(tokenHash(token));
+  if (!token) return 0;
+  return deleteSessionByHash(db, tokenHash(token));
 }
 
 export function revokeAllSessions(db, userId) {
-  db.prepare('DELETE FROM sessions WHERE user_id = ?').run(userId);
+  return deleteSessionsByUser(db, userId);
 }
 ```
 
@@ -1899,10 +2291,46 @@ export function revokeAllSessions(db, userId) {
 ```javascript
 // src/db/repo/users.js — 用户仓储
 // 依据：设计文档 §7.2。所有 SQL 收进仓储层，handler 内禁止裸 SQL。
+//
+// ⛔ 预审修正（I5-2）：SELECT 一律**显式列白名单，不含 password_hash**。
+//    原来用 SELECT *，listUsers 一次返回全体用户 + 全部 scrypt 哈希 ——
+//    P0 的 /api/me 手工挑字段所以当下安全，但任何后续 handler 只要
+//    `json(res, 200, user)` 就会把口令哈希发给浏览器。
+//    带哈希的行只允许 getCredentialsByPhone 取，且只用于服务端口令校验。
+const PUBLIC_COLUMNS = 'id, name, phone, mba_status, org, is_superadmin, active, created_at';
+
 import { randomUUID } from 'node:crypto';
 import { hashPassword } from '../../auth/password.js';
 
+/**
+ * 对外用户形状（**唯一出口**）：字段转驼峰，绝不带 password_hash。
+ * 所有要把用户放进 HTTP 响应的地方都必须走它。
+ */
+export function toPublicUser(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    name: row.name,
+    phone: row.phone,
+    mbaStatus: row.mba_status,
+    org: row.org ?? null,
+    isSuperadmin: row.is_superadmin === 1,
+    active: row.active === 1,
+    createdAt: row.created_at,
+  };
+}
+
 export function createUser(db, { name, phone, password, mbaStatus = 'other', org = null }) {
+  // ⛔ 预审修正（I5-3）：重复手机号**先查后写**，抛领域错误（409 / PHONE_TAKEN）。
+  //    原来直接 INSERT，让原始 SQLite 错误 `UNIQUE constraint failed: users.phone`
+  //    漏到 HTTP 层 —— 既只能回 500，又把表名列名暴露给客户端。
+  //    查重不看 active：停用用户的手机号也不能被再次注册。
+  if (findUserByPhone(db, phone)) {
+    const err = new Error('该手机号已注册');
+    err.status = 409;
+    err.code = 'PHONE_TAKEN';
+    throw err;
+  }
   const id = randomUUID();
   const now = new Date().toISOString();
   db.prepare(
@@ -1913,16 +2341,31 @@ export function createUser(db, { name, phone, password, mbaStatus = 'other', org
 }
 
 export function getUserById(db, id) {
-  return db.prepare('SELECT * FROM users WHERE id = ? AND active = 1').get(id) ?? null;
+  return db.prepare(`SELECT ${PUBLIC_COLUMNS} FROM users WHERE id = ? AND active = 1`).get(id) ?? null;
+}
+
+/** 不看 active —— 唯一性查重用（停用用户的手机号也不能被再次注册）。 */
+export function findUserByPhone(db, phone) {
+  return db.prepare(`SELECT ${PUBLIC_COLUMNS} FROM users WHERE phone = ?`).get(phone) ?? null;
 }
 
 export function getUserByPhone(db, phone) {
-  return db.prepare('SELECT * FROM users WHERE phone = ? AND active = 1').get(phone) ?? null;
+  return db.prepare(`SELECT ${PUBLIC_COLUMNS} FROM users WHERE phone = ? AND active = 1`).get(phone) ?? null;
+}
+
+/**
+ * ⛔ 唯一会取出 password_hash 的地方 —— 只用于服务端口令校验（登录），
+ *    绝不进任何 HTTP 响应。对外一律用 toPublicUser(row)。
+ */
+export function getCredentialsByPhone(db, phone) {
+  return db
+    .prepare('SELECT id, password_hash, active FROM users WHERE phone = ?')
+    .get(phone) ?? null;
 }
 
 export function listUsers(db, { limit = 100, offset = 0 } = {}) {
   return db
-    .prepare('SELECT * FROM users WHERE active = 1 ORDER BY created_at LIMIT ? OFFSET ?')
+    .prepare(`SELECT ${PUBLIC_COLUMNS} FROM users WHERE active = 1 ORDER BY created_at LIMIT ? OFFSET ?`)
     .all(limit, offset);
 }
 
@@ -1936,26 +2379,63 @@ export function deactivateUser(db, id) {
 
 ```javascript
 // src/db/repo/sessions.js — 会话仓储
-export function countActiveSessions(db, userId, { now = new Date() } = {}) {
+// 依据：设计文档 §7.5 + 全局约束「所有 SQL 收进 src/db/repo/」。
+// ⛔ 预审修正（I5-1）：会话的全部 SQL 从 src/auth/session.js 搬到这里。
+// ⛔ 库里只存 token_hash（SHA-256 十六进制），**不存明文 token**。
+export function insertSession(db, { tokenHash, userId, createdAt, expiresAt }) {
+  db.prepare(
+    'INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)',
+  ).run(tokenHash, userId, createdAt, expiresAt);
+}
+
+export function findSessionByHash(db, tokenHash) {
   return db
-    .prepare('SELECT COUNT(*) AS n FROM sessions WHERE user_id = ? AND expires_at > ?')
-    .get(userId, now.toISOString()).n;
+    .prepare('SELECT user_id, expires_at FROM sessions WHERE token_hash = ?')
+    .get(tokenHash) ?? null;
+}
+
+/** 滑动续期：把 expires_at 顺延（设计文档 §7.5） */
+export function touchSessionExpiry(db, tokenHash, expiresAt) {
+  return db
+    .prepare('UPDATE sessions SET expires_at = ? WHERE token_hash = ?')
+    .run(expiresAt, tokenHash).changes;
+}
+
+export function deleteSessionByHash(db, tokenHash) {
+  return db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(tokenHash).changes;
+}
+
+export function deleteSessionsByUser(db, userId) {
+  return db.prepare('DELETE FROM sessions WHERE user_id = ?').run(userId).changes;
+}
+
+export function countActiveSessions(db, userId, { now = new Date() } = {}) {
+  // ⛔ 预审修正（m5-1）：过期判定**解析时间戳再比较**，不做字符串比较。
+  //    字符串比较下 '...T00:00:00Z' 与 '...T00:00:00.000Z' 会给出相反结论。
+  //    SQL 侧用 SQLite 的 datetime()（与 JS 侧 new Date(...) 同一口径）。
+  return db
+    .prepare(
+      'SELECT COUNT(*) AS n FROM sessions WHERE user_id = ? AND datetime(expires_at) > datetime(?)',
+    )
+    .get(userId, new Date(now).toISOString()).n;
 }
 
 export function purgeExpiredSessions(db, { now = new Date() } = {}) {
-  return db.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(now.toISOString()).changes;
+  return db
+    .prepare('DELETE FROM sessions WHERE datetime(expires_at) <= datetime(?)')
+    .run(new Date(now).toISOString()).changes;
 }
 ```
 
 - [ ] **Step 6: 运行测试确认通过**
 
-Run: `cd platform && node --test test/password.test.js`
-Expected: PASS（5 个测试全过）
+Run: `cd platform && node --test test/password.test.js test/session.test.js test/users.test.js`
+Expected: PASS（11 个测试全过：password 5 + session 4 + users 2）
 
 - [ ] **Step 7: 提交**
 
 ```bash
-cd platform && git add src/auth src/db/repo test/password.test.js
+cd platform && git add src/auth src/db/repo test/password.test.js test/session.test.js test/users.test.js
 git commit -m "feat(P0): scrypt 密码哈希与服务端会话"
 ```
 
@@ -1963,20 +2443,71 @@ git commit -m "feat(P0): scrypt 密码哈希与服务端会话"
 
 ### Task 6: capability + assignment 权限模型
 
+> **【2026-10-20 预审修正】** 只读预审代理把本 Task 的简报**逐字落到临时目录实跑**，
+> 查出 **2 Critical + 3 Important + 1 Minor**（简报自带的 6 条测试里 **4 条会红**，
+> 且「没有授权时能力为 false」直接抛 `no such column: rc.role_key`
+> → **普通用户的一切权限判定全变 500**）。
+> 修正六处：
+> **①（C6-1 Critical）SQL 用了 schema 里不存在的列 → 权限判定对任何普通用户都抛错。**
+>      简报写 `JOIN role_capabilities rc ON rc.role_key = ur.role_key`，
+>      而 `platform/db/migrations/001_init.sql:37-41` 的列名是 **`role_id`**
+>      （`role_id TEXT NOT NULL REFERENCES roles(key)`）。
+>      `can()` 是全项目**唯一**权限入口（P1–P6 全部依赖），它对非超管一律抛错 → HTTP 层全变 500。
+>      同一份 Task 7 的 seed.js 写的是对的（`INSERT OR IGNORE INTO role_capabilities (role_id, capability)`）
+>      → 这是 Task 6 的单点笔误。改为 `rc.role_id`。
+> **②（C6-2 Critical）scopeClause 占位符数与 params 数不一致 + 语义自相矛盾。**
+>      原实现 SQL 里 3 个占位符却推了 4 个值 → `column index out of range`；
+>      去掉多出的 param 后能执行，但**恒返回空集** —— `a.scope_id = t.id` 拿的是**行主键**，
+>      与传入的 `scopeId` 无关。语义被混成两件事：「按行过滤」vs「按资源过滤」。
+>      **语义写死（本 Task 定稿）**：`scopeClause` 只做**行级过滤** ——
+>      把用户的授权映射到资源表的每一行；「用户对某一个具体资源有没有权限」
+>      是 `can()` 的职责（走 ctx），不是 `scopeClause` 的。
+>      模式一（行级，推荐）：传 scopeType + alias → `params [userId, capability, scopeType]`；
+>      模式二（单资源）：传 scopeType + scopeId（不传 alias）→ `params [userId, capability, scopeType, scopeId]`；
+>      都不传 → 只认 global 授权 → `params [userId, capability]`。
+>      **alias 与 scopeId 互斥**（同时给 → 抛错，fail-fast，不静默挑一个）；
+>      **给了 scopeType 但 alias / scopeId 都没给 → 抛错**；
+>      **params 个数必须永远等于 SQL 里的占位符个数**（这次出事的根因）。
+>      配套用例改成**真执行 SQL**：造两张资源行（一张有权、一张无权），
+>      用 `db.prepare('SELECT id FROM <表> t WHERE ' + sql).all(...params)` 断言结果集，
+>      不再只断言 `sql.includes('?')`（那是恒真条件 —— 实现是坏的时候用例照样 PASS）。
+> **③（I6-1 Important）listAssignments 签名与跨阶段契约冲突。**
+>      契约（INTERFACES.md:76，唯一事实来源）是 `listAssignments(db, { userId, capability })`，
+>      简报写的是 `listAssignments(db, userId, capability)` →
+>      P1–P6 按契约调用会把对象当 userId 绑定（node:sqlite 抛错/查不到）。
+>      统一为**契约形式**（**不改 INTERFACES.md** —— 改契约 = 后面所有阶段都要改）。
+> **④（I6-2 Important）Files 声明要建 `src/db/repo/assignments.js`，但没有任何一步创建它。**
+>      assignments 的 SQL 全写在 `src/auth/permissions.js` → 既违反「SQL 收进 src/db/repo/」，
+>      又留下一份永久缺失的承诺文件（P0 计划的目录树也列了它）。
+>      补一步：新建 `platform/src/db/repo/assignments.js`（grant / revoke / list 三条 SQL），
+>      `src/auth/permissions.js` 改为 import 仓储层；**Files 段落与 P0 目录树两边同步**。
+> **⑤（I6-3 Important）Step 1 的「角色能力命中即为 true」用例没有任何断言。**
+>      插完数据就 `close()` → 恒真用例，中间任何一次"跑测试确认通过"都无法证明角色能力这条路径。
+>      **Step 1 直接写带断言的版本**（断言 `can()` 对有该角色能力的用户返回 true）；
+>      原来的 Step 5「修正测试」改为「**核对列名与 `001_init.sql` 一致**」的说明步骤。
+> **⑥（m6-1 Minor）`user.active` 判断依赖调用方传的对象形状。**
+>      `if (user.active === 0) return false;` —— 传入 `{ id, is_superadmin: 1 }`（无 `active` 字段）时，
+>      被停用的用户会被判为有权。改为 `if (user.active !== undefined && !user.active) return false;`
+> 另：**上级作用域不隐式下推**（edition 授权不自动覆盖其下的 task_package）
+>      —— 写进代码注释与规则文档（本计划 Global Constraints 的「作用域」一行）。
+> 测试从 6 条增至 **12 条**。
+
 **Files:**
 - Create: `platform/src/auth/permissions.js`
 - Create: `platform/src/db/repo/assignments.js`
 - Create: `platform/test/permissions.test.js`
 
 **Interfaces:**
-- Consumes: `openDatabase()`（Task 2）、迁移里的 `capabilities` / `roles` / `role_capabilities` / `assignments` 表（Task 2）
+- Consumes: `openDatabase()`（Task 2）、迁移里的 `capabilities` / `roles` / `role_capabilities` / `assignments` / `user_roles` 表（Task 2）
 - Produces:
   - `can(user, capability, ctx, db)` → `boolean`（**唯一判定入口**）
   - `ctx` 形如 `{ scopeType, scopeId }`
   - `grantAssignment(db, { userId, capability, scopeType, scopeId, grantedBy })`
   - `revokeAssignment(db, assignmentId)`
-  - `listAssignments(db, userId, capability)`
-  - `scopeClause(userId, capability, ctx)` → `{ sql, params }`——生成 WHERE 片段（**必须在 SQL 层过滤，不能先查全量再在 JS 里 filter**）
+  - `listAssignments(db, { userId, capability })`（**契约形式**，INTERFACES.md:76）
+  - `scopeClause(userId, capability, { scopeType, scopeId, alias })` → `{ sql, params }`
+    ——生成 WHERE 片段（**必须在 SQL 层过滤，不能先查全量再在 JS 里 filter**）；
+    `alias` 与 `scopeId` 互斥，给错组合直接抛错
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -1990,7 +2521,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openDatabase } from '../src/db/sqlite.js';
 import { applyMigrations } from '../src/db/migrate.js';
-import { can, grantAssignment, scopeClause } from '../src/auth/permissions.js';
+import { can, grantAssignment, listAssignments, scopeClause } from '../src/auth/permissions.js';
 import { createUser } from '../src/db/repo/users.js';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
@@ -2013,6 +2544,12 @@ function setup() {
   return { db, close, dataDir, user };
 }
 
+/** 造两张资源行：r_ok 有权、r_no 无权（用来真跑 scopeClause 生成的 SQL） */
+function seedResources(db) {
+  db.exec('CREATE TABLE fake_resources (id TEXT PRIMARY KEY, title TEXT)');
+  db.exec("INSERT INTO fake_resources (id, title) VALUES ('r_ok', '有权'), ('r_no', '无权')");
+}
+
 test('超级管理员拥有一切能力', () => {
   const { db, close, dataDir, user } = setup();
   user.is_superadmin = 1;
@@ -2029,10 +2566,12 @@ test('没有授权时能力为 false', () => {
 });
 
 test('角色能力命中即为 true', () => {
+  // ⛔ 预审修正（I6-3）：原用例插完数据就 close()，**一条断言都没有** ——
+  //    实现坏掉时它照样 PASS，"跑测试确认通过"证明不了角色能力这条路径。
   const { db, close, dataDir, user } = setup();
   db.prepare("INSERT INTO role_capabilities (role_id, capability) VALUES ('judge','score:write')").run();
   db.prepare("INSERT INTO user_roles (user_id, role_key) VALUES (?, 'judge')").run(user.id);
-  // 注：user_roles 表在后续迁移补齐；本用例先跳过断言用户角色
+  assert.equal(can(user, 'score:write', { scopeType: 'task_package', scopeId: 'tp_1' }, db), true);
   close();
   rmSync(dataDir, { recursive: true, force: true });
 });
@@ -2063,12 +2602,103 @@ test('global scope 匹配任何资源', () => {
   rmSync(dataDir, { recursive: true, force: true });
 });
 
-test('scopeClause 生成带参数的 SQL 片段，不做字符串插值', () => {
+test('listAssignments 按契约签名（对象参数）返回该用户该能力的授权', () => {
+  // ⛔ 预审修正（I6-1）：契约是 listAssignments(db, { userId, capability })
   const { db, close, dataDir, user } = setup();
-  const { sql, params } = scopeClause(user.id, 'score:write');
-  assert.ok(sql.includes('EXISTS'));
-  assert.ok(sql.includes('?'));
-  assert.ok(params.includes(user.id));
+  const id = grantAssignment(db, {
+    userId: user.id, capability: 'score:write',
+    scopeType: 'global', scopeId: null, grantedBy: user.id,
+  });
+  const rows = listAssignments(db, { userId: user.id, capability: 'score:write' });
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].id, id);
+  assert.equal(rows[0].scope_type, 'global');
+  assert.equal(listAssignments(db, { userId: user.id, capability: 'team:read' }).length, 0);
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('scopeClause 行级过滤真跑 SQL：有权那行在结果里、无权那行不在', () => {
+  // ⛔ 预审修正（C6-2）：原用例只断言 sql.includes('?')（恒真）→ 实现坏掉也 PASS。
+  //    现在真执行 SQL：造两张资源行，一张有权一张无权。
+  const { db, close, dataDir, user } = setup();
+  seedResources(db);
+  grantAssignment(db, {
+    userId: user.id, capability: 'score:write',
+    scopeType: 'task_package', scopeId: 'r_ok', grantedBy: user.id,
+  });
+  const { sql, params } = scopeClause(user.id, 'score:write', {
+    scopeType: 'task_package', alias: 't',
+  });
+  const rows = db.prepare('SELECT t.id FROM fake_resources t WHERE ' + sql).all(...params);
+  assert.deepEqual(rows.map((r) => r.id), ['r_ok']);
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('scopeClause 单资源模式：scopeId 命中才放行', () => {
+  // 模式二是**单资源守卫**：它回答「用户对 scopeId 这个资源有没有权限」，
+  // 用法是配合 `WHERE t.id = ?` 一起用（P1 的单条读取接口就是这种用法），
+  // 它本身不是行过滤器 —— 行过滤用模式一（alias）。
+  const { db, close, dataDir, user } = setup();
+  seedResources(db);
+  grantAssignment(db, {
+    userId: user.id, capability: 'score:write',
+    scopeType: 'task_package', scopeId: 'r_ok', grantedBy: user.id,
+  });
+  const allowed = scopeClause(user.id, 'score:write', { scopeType: 'task_package', scopeId: 'r_ok' });
+  const denied = scopeClause(user.id, 'score:write', { scopeType: 'task_package', scopeId: 'r_no' });
+  const ok = db.prepare('SELECT t.id FROM fake_resources t WHERE t.id = ? AND ' + allowed.sql)
+    .all('r_ok', ...allowed.params);
+  const no = db.prepare('SELECT t.id FROM fake_resources t WHERE t.id = ? AND ' + denied.sql)
+    .all('r_no', ...denied.params);
+  assert.deepEqual(ok.map((r) => r.id), ['r_ok']);
+  assert.deepEqual(no.map((r) => r.id), []);
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('scopeClause 的占位符个数恒等于 params 个数', () => {
+  // ⛔ 预审修正（C6-2）：原实现 SQL 3 个占位符却推 4 个值 → column index out of range。
+  const { db, close, dataDir, user } = setup();
+  const modes = [
+    scopeClause(user.id, 'score:write'),
+    scopeClause(user.id, 'score:write', { scopeType: 'task_package', alias: 't' }),
+    scopeClause(user.id, 'score:write', { scopeType: 'task_package', scopeId: 'tp_1' }),
+  ];
+  for (const { sql, params } of modes) {
+    const placeholders = (sql.match(/\?/g) || []).length;
+    assert.equal(placeholders, params.length);
+  }
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('scopeClause：alias 与 scopeId 互斥，同时给直接抛错', () => {
+  assert.throws(
+    () => scopeClause('u_1', 'score:write', { scopeType: 'task_package', alias: 't', scopeId: 'tp_1' }),
+    /互斥/,
+  );
+});
+
+test('scopeClause：给了 scopeType 却没给 alias / scopeId 直接抛错', () => {
+  assert.throws(
+    () => scopeClause('u_1', 'score:write', { scopeType: 'task_package' }),
+    /alias|scopeId/,
+  );
+});
+
+test('停用用户判 false；没有 active 字段的精简对象不当成停用', () => {
+  // ⛔ 预审修正（m6-1）：原来写 user.active === 0 ——
+  //    传入 { id, is_superadmin: 1 }（无 active 字段）时，被停用的用户会被判为有权。
+  const { db, close, dataDir, user } = setup();
+  grantAssignment(db, {
+    userId: user.id, capability: 'score:write',
+    scopeType: 'global', scopeId: null, grantedBy: user.id,
+  });
+  assert.equal(can(user, 'score:write', null, db), true);
+  assert.equal(can({ id: user.id, is_superadmin: 0 }, 'score:write', null, db), true);
+  assert.equal(can({ id: user.id, is_superadmin: 0, active: 0 }, 'score:write', null, db), false);
   close();
   rmSync(dataDir, { recursive: true, force: true });
 });
@@ -2086,35 +2716,48 @@ Expected: FAIL —— `Cannot find module '../src/auth/permissions.js'`
 // 依据：设计文档 §7.1 / §7.2。
 //   权限不靠角色枚举，靠「能力 + 授权记录」。
 //   can() 是唯一判定入口；scopeClause() 把行级过滤下推到 SQL。
+// ⛔ 本文件**不含裸 SQL**：assignments 的 SQL 收在 src/db/repo/assignments.js
+//    （预审修正 I6-2 —— Files 段落声明了这个文件，却没有任何一步创建它）。
 import { randomUUID } from 'node:crypto';
+import {
+  insertAssignment,
+  deleteAssignmentById,
+  listAssignmentsByUserAndCapability,
+} from '../db/repo/assignments.js';
 
 export function grantAssignment(
   db,
   { userId, capability, scopeType, scopeId = null, grantedBy = null },
 ) {
   const id = randomUUID();
-  db.prepare(
-    `INSERT INTO assignments (id, user_id, capability, scope_type, scope_id, granted_by, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
-  ).run(id, userId, capability, scopeType, scopeId, grantedBy, new Date().toISOString());
+  insertAssignment(db, {
+    id,
+    userId,
+    capability,
+    scopeType,
+    scopeId,
+    grantedBy,
+    createdAt: new Date().toISOString(),
+  });
   return id;
 }
 
 export function revokeAssignment(db, assignmentId) {
-  return db.prepare('DELETE FROM assignments WHERE id = ?').run(assignmentId).changes;
+  return deleteAssignmentById(db, assignmentId);
 }
 
-export function listAssignments(db, userId, capability) {
-  return db
-    .prepare('SELECT * FROM assignments WHERE user_id = ? AND capability = ?')
-    .all(userId, capability);
+// 契约（INTERFACES.md:76）：listAssignments(db, { userId, capability })
+// ⛔ 预审修正（I6-1）：原来写成 (db, userId, capability) —— P1–P6 按契约调用
+//    会把对象当 userId 绑定（node:sqlite 抛错/查不到）。统一为契约形式。
+export function listAssignments(db, { userId, capability }) {
+  return listAssignmentsByUserAndCapability(db, userId, capability);
 }
 
 function roleGrants(db, userId, capability) {
   return db
     .prepare(
       `SELECT 1 FROM user_roles ur
-       JOIN role_capabilities rc ON rc.role_key = ur.role_key
+       JOIN role_capabilities rc ON rc.role_id = ur.role_key
        WHERE ur.user_id = ? AND rc.capability = ?
        LIMIT 1`,
     )
@@ -2123,15 +2766,18 @@ function roleGrants(db, userId, capability) {
 
 export function can(user, capability, ctx = null, db = null) {
   if (!user) return false;
-  if (user.active === 0) return false;
+  // ⛔ 预审修正（m6-1）：原来写 user.active === 0 —— 传入没有 active 字段的
+  //    精简对象 { id, is_superadmin: 1 } 时，被停用的用户会被判为有权。
+  //    只有**明确带 active 且为假**才拒绝。
+  if (user.active !== undefined && !user.active) return false;
   if (user.is_superadmin === 1) return true;
+  if (!db) return false;
 
   // 角色能力
-  if (db && roleGrants(db, user.id, capability)) return true;
+  if (roleGrants(db, user.id, capability)) return true;
 
   // 资源级授权
-  if (!db) return false;
-  const rows = listAssignments(db, user.id, capability);
+  const rows = listAssignments(db, { userId: user.id, capability });
   for (const row of rows) {
     if (row.scope_type === 'global') return true;
     if (!ctx) continue;
@@ -2144,15 +2790,53 @@ export function can(user, capability, ctx = null, db = null) {
  * 生成行级过滤的 SQL 片段。
  * ⛔ 关键：权限过滤必须在 SQL 的 WHERE 里，不能"先查全量再在 JS 里 filter"，
  *    否则单条读取接口会绕过列表过滤导致越权（设计文档 §7.2 约束 2）。
+ *
+ * 语义（2026-10-20 预审修正 C6-2 定稿）：
+ *   scopeClause 只做**行级过滤** —— 把用户的授权映射到资源表的每一行。
+ *   「用户对某一个具体资源有没有权限」是 can() 的职责（走 ctx），不是 scopeClause 的。
+ *
+ *   模式一（行级，推荐）：传 scopeType + alias
+ *     SQL  : ... AND (a.scope_type = 'global' OR (a.scope_type = ? AND a.scope_id = <alias>.id))
+ *     params: [userId, capability, scopeType]
+ *   模式二（单资源）：传 scopeType + scopeId（不传 alias）
+ *     SQL  : ... AND (a.scope_type = 'global' OR (a.scope_type = ? AND a.scope_id = ?))
+ *     params: [userId, capability, scopeType, scopeId]
+ *     ⚠️ 模式二是**单资源守卫**（回答「用户对 scopeId 这个资源有没有权限」），
+ *        用法是配合 `WHERE t.id = ?` 一起用；它本身不是行过滤器 —— 行过滤用模式一。
+ *   都不传：只认 global 授权
+ *     params: [userId, capability]
+ *
+ * ⚠️ alias 与 scopeId **互斥**：同时给 → 抛错（fail-fast，不静默挑一个）。
+ * ⚠️ 给了 scopeType 但 alias 与 scopeId 都没给 → 抛错（fail-fast）。
+ * ⚠️ **params 的个数必须永远等于 SQL 里的占位符个数** —— 2026-10-20 预审实测：
+ *    原实现 SQL 3 个占位符却推了 4 个值 → `column index out of range`。
+ * ⚠️ 上级作用域**不隐式下推**：edition 授权不自动覆盖其下的 task_package
+ *    （要覆盖必须显式再授权一条 task_package 的记录）。
  */
 export function scopeClause(userId, capability, { scopeType, scopeId, alias = null } = {}) {
-  const prefix = alias ? `${alias}.` : '';
+  const hasScopeId = scopeId !== undefined && scopeId !== null;
+  if (alias && hasScopeId) {
+    throw new Error('scopeClause：alias 与 scopeId 互斥，只能给一个');
+  }
+  if (scopeType && !alias && !hasScopeId) {
+    throw new Error('scopeClause：给了 scopeType 就必须给 alias（行级）或 scopeId（单资源）');
+  }
+  if (alias && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(alias)) {
+    // alias 是 SQL 标识符（会被拼进 SQL），必须限制成安全的标识符字符
+    throw new Error(`scopeClause：alias 必须是合法 SQL 标识符：${alias}`);
+  }
+
   const params = [userId, capability];
   const scopeCond = [];
 
   if (scopeType) {
-    scopeCond.push(`(a.scope_type = ? AND a.scope_id = ${prefix}id)`);
-    params.push(scopeType, scopeId);
+    if (alias) {
+      scopeCond.push(`(a.scope_type = ? AND a.scope_id = ${alias}.id)`);
+      params.push(scopeType);
+    } else {
+      scopeCond.push(`(a.scope_type = ? AND a.scope_id = ?)`);
+      params.push(scopeType, scopeId);
+    }
   }
   const scopeSql = scopeCond.length ? ` OR ${scopeCond.join(' OR ')}` : '';
 
@@ -2165,7 +2849,42 @@ export function scopeClause(userId, capability, { scopeType, scopeId, alias = nu
 }
 ```
 
-- [ ] **Step 4: 确认 user_roles 表已在 001_init.sql 中**
+- [ ] **Step 4: 创建 src/db/repo/assignments.js**
+
+> ⛔ 预审修正（I6-2）：这个文件原本**只出现在 Files 段落与目录树里，没有任何一步创建它**，
+> 而 assignments 的 SQL 全写在 `src/auth/permissions.js` → 既违反「SQL 收进 src/db/repo/」，
+> 又留下一份永久缺失的承诺文件。这里补上。
+
+`platform/src/db/repo/assignments.js`：
+
+```javascript
+// src/db/repo/assignments.js — 授权仓储
+// 依据：设计文档 §7.2 + 全局约束「所有 SQL 收进 src/db/repo/」。
+export function insertAssignment(
+  db,
+  { id, userId, capability, scopeType, scopeId = null, grantedBy = null, createdAt },
+) {
+  db.prepare(
+    `INSERT INTO assignments (id, user_id, capability, scope_type, scope_id, granted_by, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(id, userId, capability, scopeType, scopeId, grantedBy, createdAt);
+}
+
+export function deleteAssignmentById(db, id) {
+  return db.prepare('DELETE FROM assignments WHERE id = ?').run(id).changes;
+}
+
+export function listAssignmentsByUserAndCapability(db, userId, capability) {
+  return db
+    .prepare(
+      `SELECT id, user_id, capability, scope_type, scope_id, granted_by, created_at
+         FROM assignments WHERE user_id = ? AND capability = ?`,
+    )
+    .all(userId, capability);
+}
+```
+
+- [ ] **Step 5: 确认 user_roles 表已在 001_init.sql 中**
 
 `user_roles` 表**已在 Task 2 的 `001_init.sql` 里建好**（迁移版本号是全局唯一序位，002 留给 P1 的 `002_registration.sql`）。
 本步只需确认它存在：
@@ -2181,36 +2900,104 @@ db.close();
 ```
 Expected: `user_roles 存在`
 
-- [ ] **Step 5: 修正测试中的角色用例**
+- [ ] **Step 6: 核对列名与 001_init.sql 一致**
 
-把 `test/permissions.test.js` 里的「角色能力命中即为 true」改成：
-
-```javascript
-test('角色能力命中即为 true', () => {
-  const { db, close, dataDir, user } = setup();
-  db.prepare("INSERT INTO role_capabilities (role_id, capability) VALUES ('judge','score:write')").run();
-  db.prepare("INSERT INTO user_roles (user_id, role_key) VALUES (?, 'judge')").run(user.id);
-  assert.equal(can(user, 'score:write', { scopeType: 'task_package', scopeId: 'tp_1' }, db), true);
-  close();
-  rmSync(dataDir, { recursive: true, force: true });
-});
-```
-
-- [ ] **Step 6: 运行测试确认通过**
-
-Run: `cd platform && node --test test/permissions.test.js`
-Expected: PASS（6 个测试全过）
-
-- [ ] **Step 7: 提交**
+⛔ 预审修正（I6-3）：原 Step 5 是「修正测试里的角色用例」—— 但带断言的版本现在**直接写在 Step 1**
+（`test/permissions.test.js` 的「角色能力命中即为 true」），本步不再改测试代码。
+本步改成**核对列名**（C6-1 的根因就是列名笔误，必须当场对着 DDL 核一遍）：
 
 ```bash
-cd platform && git add src/auth/permissions.js src/db/repo test/permissions.test.js
+cd platform && node -e "
+const {DatabaseSync}=require('node:sqlite');
+const db=new DatabaseSync('./data/app.db');
+for (const t of ['role_capabilities','user_roles']) {
+  console.log(t, db.prepare('PRAGMA table_info(' + t + ')').all().map(r => r.name).join(','));
+}
+db.close();
+"
+```
+Expected: `role_capabilities role_id,capability` ｜ `user_roles user_id,role_key`
+
+> `permissions.js` 里角色能力查询的 JOIN 条件必须是 `rc.role_id = ur.role_key`
+> （`role_capabilities.role_id` 与 `roles.key`、`user_roles.role_key` 与 `roles.key` 指的是同一个角色键）。
+> 写成 `rc.role_key` 会得到 `no such column: rc.role_key` → `can()` 对非超管一律抛错。
+
+- [ ] **Step 7: 运行测试确认通过**
+
+Run: `cd platform && node --test test/permissions.test.js`
+Expected: PASS（12 个测试全过）
+
+- [ ] **Step 8: 提交**
+
+```bash
+cd platform && git add src/auth/permissions.js src/db/repo/assignments.js test/permissions.test.js
 git commit -m "feat(P0): capability + assignment 权限模型与 SQL 层行级过滤"
 ```
 
 ---
 
 ### Task 7: 静态文件服务、前端骨架与服务器入口
+
+> **【2026-10-20 预审修正】** 只读预审代理把本 Task 的简报**逐字落到临时目录实跑**，
+> 查出 **2 Critical + 4 Important + 4 Minor**。
+> 注意：简报自带的 4 条测试**全绿** —— 因为**一条都没碰登录态与静态文件**，
+> 下面两个 Critical 全都测不出来（"测试全过"≠"主功能可用"，这正是预审存在的意义）。
+> **② 波及 P3**：P3 计划用 `hk_session=${createSession(...).token}` 写测试，
+> P3 旗舰用例「GET /api/leaderboard/:stageId?scope=rank 返回 A 榜」会整片 500。
+> 修正十处：
+> **①（C7-1 Critical）目录穿越防护缺路径分隔符边界 → 可读出 web 目录的兄弟目录。**
+>      原判断 `target.startsWith(normalize(webDir))` **没有分隔符边界** ——
+>      `'/…/web-secret/passwd'.startsWith('/…/web')` 为真 → 预审实测 **200 + 兄弟目录文件内容**。
+>      改为**三重防护**：① 用 `resolve` + **带分隔符的前缀比较**
+>      （`target !== root && !target.startsWith(root + sep)` → 拒绝）；
+>      ② `rel` 先 `decodeURIComponent`，并显式拒绝含 `..` 的路径段（`%2e%2e` 也挡住）；
+>      ③ `rel` 以 `/` 开头时用 `resolve(root, '.' + rel)`（`.` 前缀）避免被当成绝对路径。
+>      补 1 条测试：构造 `web/` 的兄弟目录 `web-secret/`，请求 `/../web-secret/passwd` 必须拿不到内容。
+> **②（C7-2 Critical）已登录用户访问 `/api/me` 返回 500。**
+>      Task 5 的 `resolveSession` 返回 `{ userId, expiresAt }`，
+>      Task 7 却读 `session.user_id`（undefined）→ node:sqlite 绑定 undefined 直接抛错
+>      （`TypeError: Provided value cannot be bound to SQLite parameter 1.`）。
+>      契约 INTERFACES.md:67 就是 `{ userId, expiresAt }` → 改为 `session.userId`。
+>      补 1 条测试：**带有效 session cookie → `/api/me` 返回 200 且 body 含当前用户**。
+> **③（I7-1 Important）P0 没有登录接口，也从不下发 Session Cookie。**
+>      P0 README 宣称的交付物是「**能登录的空系统**」，但 Task 7 只注册 `/api/health` 与 `/api/me`，
+>      预审实测 `POST /api/auth/login` → 404、无 `Set-Cookie`；
+>      前端登录视图 `api.post('/api/auth/login', {...})` 必然 404；
+>      服务端从不调用 `createSession` → Task 5 产出的会话能力**没有任何调用方**；
+>      设计文档 §7.5 要求的 `HttpOnly + SameSite=Lax + Secure(生产) + Path=/` 全项目无处落地。
+>      补两条路由：`POST /api/auth/login`（按手机号取用户 → `verifyPassword` → `createSession` → 下发
+>      `Set-Cookie: hk_session=<token>; HttpOnly; SameSite=Lax; Path=/; Max-Age=<ttlSeconds>`，生产加 `Secure`；
+>      密码错 / 用户不存在**一律 401**，不区分二者，避免用户枚举）、
+>      `POST /api/auth/logout`（`revokeSession` + 清 Cookie）。
+>      补 2 条测试：① 正确手机号+密码登录 → 200 + 有 `Set-Cookie` + 响应里不含口令哈希等敏感信息；
+>      ② 错误密码 → 401 + **不**下发 Cookie。
+> **④（I7-2 Important）种子脚本用硬编码默认口令创建超管。**
+>      `process.env.ADMIN_PASSWORD || 'change-me-now'` —— 典型的「缺省兜底掩盖缺失」：
+>      没配环境变量就用一个写死在代码里的公开口令当组委会超管口令（预审实测已打印出来），
+>      P6 之后这套脚本要在公网机器上跑。与项目原则「校验不过就拒绝启动，绝不降级为默认值」冲突。
+>      改为**不兜底**：没有 `ADMIN_PASSWORD` → `console.error` 明确报错 + `process.exit(1)`，**不创建任何账号**；
+>      创建成功后只打印账号与「请立即修改密码」的提示（口令本身绝不兜底，也不再打印到 stdout）。
+> **⑤（I7-3 Important）500 响应把内部错误原文回给客户端。**
+>      预审实测那条 500 直接带出了 `Provided value cannot be bound to SQLite parameter 1.`，
+>      SQLite 错误还会带表名列名；另外 `err.code` 取的是 Node 错误码（`ERR_INVALID_ARG_TYPE`）而非领域码。
+>      改为：`status >= 500` 时对外只回 `{ error: { code: 'INTERNAL', message: '服务内部错误' } }`，
+>      详细信息只进 `console.error`；4xx 的领域错误统一用约定的 `code` 字段（Node 的 `ERR_*` 不外泄）。
+> **⑥（I7-4 Important）handler 协议只能返回 200。**
+>      成功状态码无法表达 201/204，P1 起大量「POST 创建资源 → 201 Created」实现不了。
+>      约定 handler 可返回 `{ status, body }`（可选 `headers` 附加响应头）：
+>      返回 `undefined` → 视为 200（保持现有行为）；返回 `{ status, body }` → 按返回的状态码与 body 响应。
+>      同步写进 INTERFACES.md 的 handler 说明（**只加这一句，不改其他契约**）。
+> **⑦（m7-1 Minor）`server.listen(port)` 默认绑 0.0.0.0，但启动日志写 `http://127.0.0.1:8080`。**
+>      改为显式 `server.listen(port, '127.0.0.1')`（云主机部署时再改 `0.0.0.0`），日志与实际绑定一致。
+> **⑧（m7-2 Minor）`parseCookie` 对 cookie 值直接 `decodeURIComponent`，畸形编码抛 URIError。**
+>      改为 try/catch，失败时原样透传该 cookie 值。
+> **⑨（m7-3 Minor）前端 `api.js` 的 `subscribe()`（SSE）指向的端点整个 P0–P6 都没实现。**
+>      **不在本期实现**，但在 `web/api.js` 的 `subscribe()` 上加注释标明「端点在 P2 启用；P0/P1 调用会 404」，
+>      并把 P0 计划目录树里的 `src/http/sse.js` 标注为 P2 建 —— 不留一个必然 404 却没有说明的接口。
+> **⑩（m7-4 Minor）P0-2 验收文案与实际输出不符。**
+>      验收标准写「启动报『权重合计 = 1.05』」，实现实际输出「权重合计 = 1.1000，必须等于 1（100%）」
+>      （`toFixed(4)` + 后缀）。验收口径改为「报错里出现『权重合计』且进程以**非 0 退出码**退出」。
+> 测试从 4 条增至 **9 条**。
 
 **Files:**
 - Create: `platform/src/http/static.js`
@@ -2228,10 +3015,12 @@ git commit -m "feat(P0): capability + assignment 权限模型与 SQL 层行级�
 - Test: `platform/test/server.test.js`
 
 **Interfaces:**
-- Consumes: Task 2 `openDatabase`、Task 3 `loadRules`、Task 4 `createRouter/json/error`、Task 5 `createSession/resolveSession`、Task 6 `can`
+- Consumes: Task 2 `openDatabase`、Task 3 `loadRules`、Task 4 `createRouter/json/error`、Task 5 `createSession/resolveSession/revokeSession/verifyPassword`、Task 6 `can`、Task 5 `toPublicUser`
 - Produces:
   - `serveStatic(webDir, req, res)` → `boolean`（命中返回 true）
   - `createApp({ db, rules, webDir })` → `{ router, handle(req, res) }`——可测的请求处理入口
+  - 路由：`GET /api/health` ｜ `GET /api/me` ｜ `POST /api/auth/login` ｜ `POST /api/auth/logout`
+  - **handler 返回约定**：返回 `undefined` → 200；返回 `{ status, body }`（可选 `headers`）→ 按返回值应答
   - `src/server.js` 进程入口：加载配置 → 校验 → 建库 → 迁移 → 装配 → 监听
   - 前端：`api.js` 导出 `{ get, post, patch, del, subscribe }`；`api.demo.js` 导出同名接口的 localStorage 实现
 
@@ -2242,7 +3031,7 @@ git commit -m "feat(P0): capability + assignment 权限模型与 SQL 层行级�
 ```javascript
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -2250,19 +3039,27 @@ import { openDatabase } from '../src/db/sqlite.js';
 import { applyMigrations } from '../src/db/migrate.js';
 import { loadRules } from '../src/config.js';
 import { createApp } from '../src/server.js';
+import { createUser } from '../src/db/repo/users.js';
+import { createSession } from '../src/auth/session.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrationsDir = join(here, '..', 'db', 'migrations');
 const rulesDir = join(here, '..', 'rules');
-const webDir = join(here, '..', 'web');
 
 function setup() {
   const dataDir = mkdtempSync(join(tmpdir(), 'hks-srv-'));
   const { db, close } = openDatabase({ dataDir });
   applyMigrations(db, migrationsDir);
   const { rules } = loadRules(rulesDir);
+  // web/ 旁边造一个兄弟目录 web-secret/ —— 用来验证目录穿越防护（C7-1）
+  const webRoot = mkdtempSync(join(tmpdir(), 'hks-web-'));
+  const webDir = join(webRoot, 'web');
+  mkdirSync(webDir, { recursive: true });
+  mkdirSync(join(webRoot, 'web-secret'), { recursive: true });
+  writeFileSync(join(webDir, 'index.html'), '<h1>home</h1>');
+  writeFileSync(join(webRoot, 'web-secret', 'passwd'), 'TOP-SECRET');
   const app = createApp({ db, rules, webDir });
-  return { db, close, dataDir, app };
+  return { db, close, dataDir, webRoot, app };
 }
 
 function call(app, method, path, { headers = {}, body = null } = {}) {
@@ -2320,11 +3117,89 @@ test('配置非法时 createApp 抛错（fail-fast）', () => {
   const dataDir = mkdtempSync(join(tmpdir(), 'hks-bad-'));
   const { db, close } = openDatabase({ dataDir });
   assert.throws(
-    () => createApp({ db, rules: { scoring: { initial: { dimensions: [{ weight: 0.5 }] } } }, webDir }),
+    () => createApp({ db, rules: { scoring: { initial: { dimensions: [{ weight: 0.5 }] } } }, webDir: '/tmp' }),
     /规则|校验/,
   );
   close();
   rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('正确手机号+密码登录返回 200 并下发 Session Cookie', async () => {
+  // ⛔ 预审修正（I7-1）：P0 原本**没有登录接口**，README 宣称的「能登录的空系统」不成立。
+  const { db, close, dataDir, app } = setup();
+  createUser(db, { name: '甲', phone: '13800000001', password: 'pw123' });
+  const res = await call(app, 'POST', '/api/auth/login', {
+    body: { phone: '13800000001', password: 'pw123' },
+  });
+  assert.equal(res.status, 200);
+  const cookie = res.headers['Set-Cookie'];
+  assert.ok(cookie, '必须下发 Set-Cookie');
+  assert.match(cookie, /^hk_session=/);
+  assert.match(cookie, /HttpOnly/);
+  assert.match(cookie, /SameSite=Lax/);
+  assert.match(cookie, /Path=\//);
+  assert.match(cookie, /Max-Age=\d+/);
+  // 响应体不得含口令哈希等敏感信息
+  assert.equal(res.body.includes('scrypt$'), false);
+  assert.equal(res.body.includes('password'), false);
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('密码错误返回 401 且不下发 Cookie（用户不存在同码，不泄露用户是否存在）', async () => {
+  const { db, close, dataDir, app } = setup();
+  createUser(db, { name: '甲', phone: '13800000002', password: 'pw123' });
+  const res = await call(app, 'POST', '/api/auth/login', {
+    body: { phone: '13800000002', password: 'wrong' },
+  });
+  assert.equal(res.status, 401);
+  assert.equal(res.headers['Set-Cookie'], undefined);
+  const missing = await call(app, 'POST', '/api/auth/login', {
+    body: { phone: '13900000009', password: 'pw123' },
+  });
+  assert.equal(missing.status, 401);
+  assert.equal(
+    JSON.parse(missing.body).error.code,
+    JSON.parse(res.body).error.code,
+    '用户不存在与密码错必须同一个错误码（防用户枚举）',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('带有效 session cookie 的 /api/me 返回 200 且 body 含当前用户', async () => {
+  // ⛔ 预审修正（C7-2）：原来读 session.user_id（undefined）→ node:sqlite 绑定 undefined 抛错 → 500。
+  const { db, close, dataDir, app } = setup();
+  const user = createUser(db, { name: '甲', phone: '13800000003', password: 'pw123' });
+  const { token } = createSession(db, user.id);
+  const res = await call(app, 'GET', '/api/me', { headers: { cookie: `hk_session=${token}` } });
+  assert.equal(res.status, 200);
+  const body = JSON.parse(res.body);
+  assert.equal(body.user.id, user.id);
+  assert.equal(body.user.name, '甲');
+  assert.equal(body.user.password_hash, undefined);
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('畸形百分号编码的 URL 返回 400，不抛异常', async () => {
+  // ⛔ 预审修正（C4-2）：畸形编码不能打死进程，也不能被当成 404。
+  const { db, close, dataDir, app } = setup();
+  const res = await call(app, 'GET', '/api/teams/%E0%A4%A');
+  assert.equal(res.status, 400);
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('目录穿越拿不到 web 兄弟目录的内容', async () => {
+  // ⛔ 预审修正（C7-1）：'/…/web-secret/passwd'.startsWith('/…/web') 为真 → 兄弟目录可被读出。
+  const { db, close, dataDir, webRoot, app } = setup();
+  const res = await call(app, 'GET', '/../web-secret/passwd');
+  assert.notEqual(res.status, 200);
+  assert.equal(res.body.includes('TOP-SECRET'), false);
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+  rmSync(webRoot, { recursive: true, force: true });
 });
 ```
 
@@ -2339,7 +3214,7 @@ Expected: FAIL —— `Cannot find module '../src/server.js'`
 // src/http/static.js — 静态文件服务
 // 依据：设计文档 §14.2。生产环境静态资源由 nginx 直出，这里是内网/本地兜底。
 import { createReadStream, statSync } from 'node:fs';
-import { join, normalize, extname } from 'node:path';
+import { resolve, sep, extname } from 'node:path';
 import { createHash } from 'node:crypto';
 
 const MIME = {
@@ -2354,10 +3229,25 @@ const MIME = {
 
 export function serveStatic(webDir, req, res) {
   const url = (req.url || '/').split('?')[0];
-  const rel = url === '/' ? '/index.html' : url;
-  // 防目录穿越：normalize 后必须仍在 webDir 内
-  const target = normalize(join(webDir, rel));
-  if (!target.startsWith(normalize(webDir))) return false;
+  let rel;
+  try {
+    rel = decodeURIComponent(url === '/' ? '/index.html' : url);
+  } catch {
+    // 畸形百分号编码 → 不当静态资源处理
+    return false;
+  }
+  // ⛔ 预审修正（C7-1）：路径段里显式拒绝 '..'。
+  //    必须在 decode **之后**判，否则 %2e%2e 能绕过。
+  if (rel.split('/').some((seg) => seg === '..')) return false;
+
+  // 防目录穿越（三重）：
+  // ① rel 以 '/' 开头时用 '.' 前缀，resolve 不会把它当成绝对路径
+  // ② 前缀比较必须带分隔符边界：'/x/web-secret'.startsWith('/x/web') 为真，
+  //    只比前缀会把 web 的**兄弟目录**也放进来（预审实测 200 + 兄弟目录文件内容）
+  const root = resolve(webDir);
+  const relPath = rel.startsWith('/') ? rel : `/${rel}`;
+  const target = resolve(root, `.${relPath}`);
+  if (target !== root && !target.startsWith(root + sep)) return false;
 
   let stat;
   try {
@@ -2396,17 +3286,56 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { openDatabase } from './db/sqlite.js';
 import { applyMigrations } from './db/migrate.js';
-import { loadRules } from './config.js';
+import { loadRules, validateRules } from './config.js';
 import { createRouter } from './http/router.js';
 import { json, error } from './http/respond.js';
 import { readJsonBody } from './http/body.js';
 import { serveStatic } from './http/static.js';
-import { resolveSession } from './auth/session.js';
+import { createSession, resolveSession, revokeSession } from './auth/session.js';
 import { can } from './auth/permissions.js';
-import { getUserById } from './db/repo/users.js';
-import { validateRules } from './config.js';
+import { verifyPassword } from './auth/password.js';
+import { getUserById, getCredentialsByPhone, toPublicUser } from './db/repo/users.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
+
+// 会话 Cookie（设计文档 §7.5）：HttpOnly + SameSite=Lax + Path=/ + Secure(生产)
+function sessionCookie(token, maxAge, secure) {
+  const parts = [
+    `hk_session=${token}`,
+    'HttpOnly',
+    'SameSite=Lax',
+    'Path=/',
+    `Max-Age=${maxAge}`,
+  ];
+  if (secure) parts.push('Secure');
+  return parts.join('; ');
+}
+
+/**
+ * 畸形百分号编码（如 '%E0%A4%A'）会让 decodeURIComponent 抛 URIError。
+ * router 内部已把这类段视为「不匹配」，这里再判一次是为了把
+ * 「请求本身非法（400）」与「没这个接口（404）」区分开。
+ */
+function hasMalformedEncoding(path) {
+  try {
+    decodeURIComponent(path);
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * 领域错误码：Node 内置错误的 .code（如 ERR_INVALID_ARG_TYPE）不是领域码，
+ * 不能原样回给客户端 —— 那会暴露内部实现细节。
+ */
+function domainCode(err, fallback) {
+  const code = err && err.code;
+  if (typeof code === 'string' && /^[A-Z][A-Z0-9_]*$/.test(code) && !code.startsWith('ERR_')) {
+    return code;
+  }
+  return fallback;
+}
 
 export function createApp({ db, rules, webDir }) {
   // fail-fast：规则不合法直接拒绝启动
@@ -2416,6 +3345,8 @@ export function createApp({ db, rules, webDir }) {
   }
 
   const router = createRouter();
+  // 生产环境 Cookie 加 Secure；开发环境不加（http://127.0.0.1 会被浏览器拒收）
+  const secureCookies = process.env.NODE_ENV === 'production';
 
   router.add('GET', '/api/health', async () => ({ ok: true, at: new Date().toISOString() }));
 
@@ -2426,26 +3357,70 @@ export function createApp({ db, rules, webDir }) {
       e.code = 'UNAUTHENTICATED';
       throw e;
     }
-    return { user: { id: user.id, name: user.name, mbaStatus: user.mba_status, org: user.org } };
+    return { user: toPublicUser(user) };
+  });
+
+  // ⛔ 预审修正（I7-1）：P0 原本**没有登录接口** → README 宣称的「能登录的空系统」不成立，
+  //    Task 5 产出的 createSession 也没有任何调用方。补上登录/登出。
+  router.add('POST', '/api/auth/login', async ({ body }) => {
+    const phone = String(body?.phone ?? '').trim();
+    const password = String(body?.password ?? '');
+    const cred = getCredentialsByPhone(db, phone);
+    // 用户不存在与密码错误返回**同一个**错误码 → 避免用户枚举
+    const ok = !!cred && cred.active === 1 && verifyPassword(password, cred.password_hash);
+    if (!ok) {
+      const e = new Error('手机号或密码不正确');
+      e.status = 401;
+      e.code = 'INVALID_CREDENTIALS';
+      throw e;
+    }
+    const { token, expiresAt } = createSession(db, cred.id);
+    const maxAge = Math.max(0, Math.floor((new Date(expiresAt).getTime() - Date.now()) / 1000));
+    return {
+      status: 200,
+      body: { user: toPublicUser(getUserById(db, cred.id)) },
+      headers: { 'Set-Cookie': sessionCookie(token, maxAge, secureCookies) },
+    };
+  });
+
+  router.add('POST', '/api/auth/logout', async ({ sessionToken }) => {
+    if (sessionToken) revokeSession(db, sessionToken);
+    return {
+      status: 200,
+      body: { ok: true },
+      headers: { 'Set-Cookie': sessionCookie('', 0, secureCookies) },
+    };
   });
 
   async function handle(req, res) {
     const url = req.url || '/';
     if (url.startsWith('/api/')) {
-      const match = router.match(req.method, url);
-      if (!match) {
-        error(res, 404, 'NOT_FOUND', `无此接口: ${req.method} ${url}`);
-        return;
-      }
       try {
+        // ⛔ 预审修正（C4-2）：router.match 必须**在 try 块内**。
+        //    原来它在 try 之外 → 畸形百分号编码抛出的 URIError 越过 catch
+        //    → Node 默认未捕获异常退出 → 整个服务器进程死亡。
+        const match = router.match(req.method, url);
+        if (!match) {
+          // 畸形 URL 编码 → 400（请求本身非法）；真没这个接口 → 404
+          if (hasMalformedEncoding(url)) {
+            error(res, 400, 'BAD_REQUEST', 'URL 编码非法');
+            return;
+          }
+          error(res, 404, 'NOT_FOUND', `无此接口: ${req.method} ${url}`);
+          return;
+        }
         const sessionToken = parseCookie(req.headers?.cookie || '')['hk_session'];
         const session = sessionToken ? resolveSession(db, sessionToken) : null;
-        const user = session ? getUserById(db, session.user_id) : null;
+        // ⛔ 预审修正（C7-2）：resolveSession 返回 { userId, expiresAt }（契约 INTERFACES.md:67），
+        //    原来读 session.user_id（undefined）→ node:sqlite 绑定 undefined 抛错 → 500。
+        const user = session ? getUserById(db, session.userId) : null;
         const body = ['POST', 'PATCH', 'PUT', 'DELETE'].includes(req.method)
           ? await readJsonBody(req)
           : null;
         const ctx = {
           user,
+          session,
+          sessionToken,
           db,
           rules,
           params: match.params,
@@ -2454,11 +3429,34 @@ export function createApp({ db, rules, webDir }) {
           can: (capability, c) => can(user, capability, c, db),
         };
         const result = await match.handler(ctx);
+        // ⛔ 预审修正（I7-4）：handler 返回约定 ——
+        //   undefined → 200（保持原行为）；{ status, body }（可选 headers）→ 按返回值应答。
+        if (result && typeof result === 'object' && typeof result.status === 'number') {
+          const { status, body: payload } = result;
+          if (status === 204) {
+            res.writeHead(204);
+            res.end();
+            return;
+          }
+          json(res, status, payload ?? null, result.headers || {});
+          return;
+        }
         json(res, 200, result ?? { ok: true });
       } catch (err) {
         const status = err.status || 500;
-        const code = err.code || 'INTERNAL';
-        if (status >= 500) console.error('[server]', err);
+        if (status >= 500) {
+          // ⛔ 预审修正（I7-3）：内部错误原文不外泄 ——
+          //    SQLite 错误带表名列名，Node 错误带内部实现细节。只进日志。
+          console.error('[server]', err);
+          json(res, 500, { error: { code: 'INTERNAL', message: '服务内部错误' } });
+          return;
+        }
+        const code = domainCode(err, 'BAD_REQUEST');
+        if (status === 413) {
+          // 请求体超限：连接已不可用 → 关掉，不复用
+          json(res, 413, { error: { code, message: err.message } }, { Connection: 'close' });
+          return;
+        }
         error(res, status, code, err.message);
       }
       return;
@@ -2474,7 +3472,17 @@ function parseCookie(header) {
   const out = {};
   for (const part of String(header).split(';')) {
     const idx = part.indexOf('=');
-    if (idx > 0) out[part.slice(0, idx).trim()] = decodeURIComponent(part.slice(idx + 1).trim());
+    if (idx <= 0) continue;
+    const name = part.slice(0, idx).trim();
+    const raw = part.slice(idx + 1).trim();
+    let value = raw;
+    try {
+      value = decodeURIComponent(raw);
+    } catch {
+      // ⛔ 预审修正（m7-2）：畸形编码不能抛 URIError —— 原样透传该 cookie 值
+      value = raw;
+    }
+    out[name] = value;
   }
   return out;
 }
@@ -2494,7 +3502,9 @@ if (isMain) {
   const app = createApp({ db, rules, webDir });
 
   const server = http.createServer(app.handle);
-  server.listen(port, () => {
+  // ⛔ 预审修正（m7-1）：显式绑 127.0.0.1（默认是 0.0.0.0，会暴露到局域网/公网），
+  //    日志与实际绑定保持一致；云主机部署时再显式改成 '0.0.0.0'。
+  server.listen(port, '127.0.0.1', () => {
     console.log(`heikesong-platform 启动于 http://127.0.0.1:${port}（规则版本 ${version}）`);
   });
 
@@ -2517,10 +3527,22 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { openDatabase } from '../src/db/sqlite.js';
 import { applyMigrations } from '../src/db/migrate.js';
-import { createUser } from '../src/db/repo/users.js';
+import { createUser, findUserByPhone } from '../src/db/repo/users.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const dataDir = process.env.DATA_DIR || join(here, '..', 'data');
+
+// ⛔ 预审修正（I7-2）：管理员口令**不兜底**。
+//    原来写 `process.env.ADMIN_PASSWORD || 'change-me-now'` —— 一个写死在代码里的
+//    公开口令当组委会超管口令（预审实测已打印出来）。P6 之后这套脚本要跑在公网机器上，
+//    与项目原则「校验不过就拒绝启动，绝不降级为默认值」直接冲突。
+//    没有 ADMIN_PASSWORD → 明确报错 + 退出码 1，**不创建任何账号**。
+const adminPassword = process.env.ADMIN_PASSWORD;
+if (!adminPassword) {
+  console.error('缺少环境变量 ADMIN_PASSWORD，拒绝创建管理员账号（不提供默认口令）。');
+  console.error("用法：ADMIN_PASSWORD='你的密码' node scripts/seed.js");
+  process.exit(1);
+}
 
 const CAPABILITIES = [
   ['registration:write', '提交报名'],
@@ -2579,15 +3601,16 @@ try {
   for (const [role, cap] of ROLE_CAPABILITIES) insRc.run(role, cap);
 
   const adminPhone = process.env.ADMIN_PHONE || '13800000000';
-  const adminPassword = process.env.ADMIN_PASSWORD || 'change-me-now';
-  let admin = db.prepare('SELECT * FROM users WHERE phone = ?').get(adminPhone);
+  // 查重用仓储层（不写裸 SQL；行里不含 password_hash）
+  let admin = findUserByPhone(db, adminPhone);
   if (!admin) {
     admin = createUser(db, {
       name: '组委会管理员', phone: adminPhone, password: adminPassword, mbaStatus: 'mba',
     });
     db.prepare('UPDATE users SET is_superadmin = 1 WHERE id = ?').run(admin.id);
     db.prepare("INSERT OR IGNORE INTO user_roles (user_id, role_key) VALUES (?, 'admin')").run(admin.id);
-    console.log(`已创建管理员：${adminPhone} / ${adminPassword}  ← 请立即修改密码`);
+    // 只打印账号，不回显口令
+    console.log(`已创建管理员：${adminPhone}  ← 请立即修改密码`);
   } else {
     console.log(`管理员已存在：${adminPhone}`);
   }
@@ -2710,6 +3733,7 @@ export const api = {
   del: (path) => request('DELETE', path),
   subscribe(path, onMessage) {
     // SSE：单向推送，走普通 HTTP，穿透代理容易，EventSource 自带断线重连
+    // ⚠️ SSE 端点在 **P2** 才实现（src/http/sse.js）—— P0/P1 调用会 404，不要在 P0/P1 用。
     const es = new EventSource(BASE + path);
     es.onmessage = (e) => {
       try { onMessage(JSON.parse(e.data)); } catch { onMessage(e.data); }
@@ -2899,18 +3923,24 @@ nav a { color: var(--accent); margin-right: 16px; }
 - [ ] **Step 7: 运行测试确认通过**
 
 Run: `cd platform && node --test test/server.test.js`
-Expected: PASS（4 个测试全过）
+Expected: PASS（9 个测试全过）
 
 - [ ] **Step 8: 全量测试 + 实跑**
 
 Run: `cd platform && node --test`
 Expected: 全部通过
 
-Run: `cd platform && node scripts/migrate.js && node scripts/seed.js && node src/server.js &`
+Run: `cd platform && node scripts/migrate.js && ADMIN_PASSWORD='change-me-now-temporary' node scripts/seed.js && node src/server.js &`
 Expected: 输出 `heikesong-platform 启动于 http://127.0.0.1:8080（规则版本 2026-10-20）`
+
+> ⛔ 预审修正（I7-2）：`scripts/seed.js` **不再兜底默认口令** ——
+> 没有 `ADMIN_PASSWORD` 会直接报错退出（退出码 1），所以实跑命令里必须显式带上。
 
 Run: `curl -s http://127.0.0.1:8080/api/health`
 Expected: `{"ok":true,"at":"..."}`
+
+Run: `curl -s -i -X POST http://127.0.0.1:8080/api/auth/login -H 'Content-Type: application/json' -d '{"phone":"13800000000","password":"change-me-now-temporary"}'`
+Expected: `HTTP/1.1 200 OK` + `Set-Cookie: hk_session=...; HttpOnly; SameSite=Lax; Path=/; Max-Age=...`
 
 - [ ] **Step 9: 提交**
 
@@ -2926,11 +3956,12 @@ git commit -m "feat(P0): 静态服务、前端骨架、种子数据与服务器�
 | # | 标准 | 怎么验 |
 |---|---|---|
 | P0-1 | 零依赖 | `node --test test/zero-deps.test.js` 通过；无 `node_modules`、无 `package-lock.json` |
-| P0-2 | 配置 fail-fast | 故意把 `scoring-final.json` 某权重改成 0.30 → 启动报「权重合计 = 1.05」并拒绝启动 |
+| P0-2 | 配置 fail-fast | 故意把 `scoring-final.json` 某权重改成 0.30 → 启动报错里出现「权重合计」，且进程以**非 0 退出码**退出（实际文案是「权重合计 = 1.1000，必须等于 1（100%）」，用 `toFixed(4)`） |
 | P0-3 | 迁移幂等 | 连续跑两次 `scripts/migrate.js`，第二次输出「本次无新迁移」 |
-| P0-4 | 权限判定唯一入口 | `permissions.test.js` 6 个用例通过；`scopeClause` 生成的是参数化 SQL |
-| P0-5 | 密码与会话 | `password.test.js` 5 个用例通过；库中只存 `token_hash` |
-| P0-6 | 跨平台 | 在 Mac 上 `node src/server.js` 成功；把 `platform/` 拷到另一台机器重复同样命令 |
+| P0-4 | 权限判定唯一入口 | `permissions.test.js` **12** 个用例通过；`scopeClause` 生成的 SQL **能真跑**（有权那行在结果里、无权那行不在），且占位符个数 == `params.length` |
+| P0-5 | 密码与会话 | `password.test.js` 5 + `session.test.js` 4 + `users.test.js` 2 个用例通过；**库中只存 `token_hash`**（`session.test.js` 断言：库里无明文 token，`token_hash` 是 64 位 sha256 十六进制） |
+| P0-6 | 登录闭环 | `server.test.js` **9** 个用例通过：登录 200 + 下发 `hk_session` Cookie（HttpOnly/SameSite=Lax/Path=/）；带 Cookie 访问 `/api/me` 返回 200；密码错 401 且不下发 Cookie |
+| P0-7 | 跨平台 | 在 Mac 上 `node src/server.js` 成功；把 `platform/` 拷到另一台机器重复同样命令 |
 
 ---
 

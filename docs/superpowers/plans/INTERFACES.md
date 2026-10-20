@@ -78,6 +78,8 @@ listAssignments(db, { userId, capability })
 // src/server.js
 createApp({ db, rules, webDir })         // → { router, handle(req, res) }
 serveStatic(webDir, req, res)            // → boolean（已处理则 true）
+//   handler 返回约定（2026-10-20 补）：handler 返回 undefined → 视为 200；
+//   返回 { status, body }（可选 headers 附加响应头）→ 按返回的状态码/响应体/响应头应答。
 ```
 
 **P0 已建表**（`001_init.sql`，**只有这一个迁移文件**）：`users` / `sessions` / `capabilities` / `roles` / `role_capabilities` / `assignments` / `user_roles` / `audit_log`
