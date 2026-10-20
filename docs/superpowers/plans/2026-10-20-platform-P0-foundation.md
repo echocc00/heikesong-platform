@@ -159,10 +159,10 @@ Expected: FAIL —— `ENOENT: no such file or directory, open 'platform/package
   "type": "module",
   "engines": { "node": ">=22.5.0" },
   "scripts": {
-    "start": "node src/server.js",
-    "test": "node --test",
-    "migrate": "node scripts/migrate.js",
-    "seed": "node scripts/seed.js"
+    "start": "node --disable-warning=ExperimentalWarning src/server.js",
+    "test": "node --disable-warning=ExperimentalWarning --test",
+    "migrate": "node --disable-warning=ExperimentalWarning scripts/migrate.js",
+    "seed": "node --disable-warning=ExperimentalWarning scripts/seed.js"
   }
 }
 ```
@@ -177,11 +177,17 @@ Expected: FAIL —— `ENOENT: no such file or directory, open 'platform/package
 零依赖 Node 单体。`git clone` 后不需要 `npm install`，直接：
 
 ```bash
+cd platform                                  # 下面所有命令都在 platform/ 下跑
+
 node scripts/migrate.js   # 建库 + 迁移
 node scripts/seed.js      # 种子数据（可选）
 node src/server.js        # http://127.0.0.1:8080
-node --test         # 跑测试
+node --test               # 跑测试
 ```
+
+> **为什么命令里没有 `--disable-warning=ExperimentalWarning`**：`npm run start` / `npm test` 等
+> 脚本里已经带上了。直接 `node xxx.js` 时 Node 22 会对内置 `node:sqlite` 打印
+> `ExperimentalWarning`（实验特性提示），不影响功能，只影响输出整洁度。
 
 ## 硬约束
 

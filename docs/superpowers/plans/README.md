@@ -49,6 +49,9 @@ P0 ──→ P1 ──→ P2 ──→ P3 ──→ P4 ──→ P5 ──→ P6
 npm 依赖    0 个。package.json 只有 {"type":"module"}，不得新增 dependencies
 数据库      node:sqlite（内置，无原生编译）。单文件 data/app.db，WAL 模式
 测试        node:test（内置）。命令：node --test
+            ⚠️ node:sqlite 在 Node 22 仍会打 ExperimentalWarning（实验特性提示）。
+               npm scripts 里已统一加 --disable-warning=ExperimentalWarning，输出保持干净。
+               直接 `node xxx.js` 仍会打印这一行——只影响观感，不影响功能。
             ⚠️ 不要写成 `node --test test/`：Node 22 的位置参数按 glob/模块路径处理，
                目录【不会】被展开 → MODULE_NOT_FOUND，pass 0 / fail 1。
                实测（Node v22.23.2）：`node --test` ✅ ｜ `node --test test/` ❌ ｜
