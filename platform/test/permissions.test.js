@@ -15,8 +15,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openDatabase } from '../src/db/sqlite.js';
 import { applyMigrations } from '../src/db/migrate.js';
-import { can, grantAssignment, listAssignments, scopeClause } from '../src/auth/permissions.js';
+import { can, grantAssignment, revokeAssignment, listAssignments, scopeClause } from '../src/auth/permissions.js';
 import { createUser } from '../src/db/repo/users.js';
+import { AppError } from '../src/errors.js';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
 
@@ -210,6 +211,163 @@ test('超管标志两种形状都认（仓储行 / toPublicUser 的驼峰形状�
     can({ id: user.id, isSuperadmin: false, active: true }, 'score:write', null, db),
     false,
   );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('scopeClause 对超管不做行级过滤（与 can() 一致）', () => {
+  // ⛔ 评审修正（Important）：can() 与 scopeClause 曾对超管给出**相反结论** ——
+  //    can() = true（超管什么都能干），scopeClause 却过滤出 0 行。
+  //    这直接违反 INTERFACES.md:22「判定只有 can() 一个入口，SQL 层过滤用 scopeClause(...)」：
+  //    一个说"有权限"，另一个说"看不到任何行"。
+  //    P0 没有调用方，但 P2 计划明写「行级 scope 由 P3/P4 的 scopeClause 补齐」——
+  //    P3/P4 的列表接口一接，超管就会看到空列表。
+  const { db, close, dataDir, user } = setup();
+  seedResources(db);
+  db.prepare('UPDATE users SET is_superadmin = 1 WHERE id = ?').run(user.id);
+  const row = db.prepare('SELECT * FROM users WHERE id = ?').get(user.id);
+  assert.equal(can(row, 'score:write', {}, db), true);
+  const { sql, params } = scopeClause(user.id, 'score:write', {
+    scopeType: 'task_package', alias: 't',
+  });
+  const rows = db.prepare('SELECT t.id FROM fake_resources t WHERE ' + sql).all(...params);
+  assert.deepEqual(rows.map((r) => r.id).sort(), ['r_no', 'r_ok'], '超管应看到全部行');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('scopeClause 对角色授权用户不做行级过滤（与 can() 一致）', () => {
+  // ⛔ 评审修正（Important）：同上，但走的是 role_capabilities 这条路。
+  //    设计文档 §7.1 的判定顺序是「超管 → true；role_capability 命中 → true」，
+  //    两者都是**无作用域**授权 → 行级过滤对它们一律不设限。
+  const { db, close, dataDir, user } = setup();
+  seedResources(db);
+  db.prepare("INSERT INTO role_capabilities (role_id, capability) VALUES ('judge','score:write')").run();
+  db.prepare("INSERT INTO user_roles (user_id, role_key) VALUES (?, 'judge')").run(user.id);
+  const row = db.prepare('SELECT * FROM users WHERE id = ?').get(user.id);
+  assert.equal(can(row, 'score:write', {}, db), true);
+  const { sql, params } = scopeClause(user.id, 'score:write', {
+    scopeType: 'task_package', alias: 't',
+  });
+  const rows = db.prepare('SELECT t.id FROM fake_resources t WHERE ' + sql).all(...params);
+  assert.deepEqual(rows.map((r) => r.id).sort(), ['r_no', 'r_ok'], '角色授权用户应看到全部行');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('scopeClause 对**停用**用户不放开行级过滤', () => {
+  // 与 can() 保持一致：停用用户 can() = false，行级过滤也不能给他行。
+  const { db, close, dataDir, user } = setup();
+  seedResources(db);
+  db.prepare('UPDATE users SET is_superadmin = 1, active = 0 WHERE id = ?').run(user.id);
+  const row = db.prepare('SELECT * FROM users WHERE id = ?').get(user.id);
+  assert.equal(can(row, 'score:write', {}, db), false);
+  const { sql, params } = scopeClause(user.id, 'score:write', {
+    scopeType: 'task_package', alias: 't',
+  });
+  const rows = db.prepare('SELECT t.id FROM fake_resources t WHERE ' + sql).all(...params);
+  assert.deepEqual(rows.map((r) => r.id), [], '停用用户不应看到任何行');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('alias 必须是合法 SQL 标识符（SQL 注入防护）', () => {
+  // ⚠️ 评审修正（Important）：这道护栏此前**零测试覆盖** ——
+  //    把白名单整行删掉，13 条用例照样全绿（评审实测）。
+  //    alias 会被拼进 SQL 字符串，注入面必须钉住。
+  const payloads = [
+    't; DROP TABLE users',
+    't x',
+    't/*c*/',
+    '"t"',
+    '`t`',
+    't)',
+    't,',
+    '1t',
+    't-1',
+  ];
+  for (const alias of payloads) {
+    assert.throws(
+      () => scopeClause('u_1', 'score:write', { scopeType: 'task_package', alias }),
+      /alias/,
+      `alias=${JSON.stringify(alias)} 必须被拒绝`,
+    );
+  }
+  for (const alias of ['t', 'tp', '_x', 'T1', 'task_package']) {
+    assert.doesNotThrow(
+      () => scopeClause('u_1', 'score:write', { scopeType: 'task_package', alias }),
+      `alias=${alias} 是合法标识符，不该被拒`,
+    );
+  }
+});
+
+test('grantAssignment 对未注册能力点/不存在用户抛领域错误，不漏原始 SQLite 错误', () => {
+  // ⚠️ 评审修正（Important）：原来直接 INSERT → SQLite 原始外键错误
+  //    「FOREIGN KEY constraint failed」冒到 HTTP 层（只能回 500，且泄露表结构）。
+  //    这与 I5-3（users.phone 重复）是同一类问题 —— 当时修了，这儿漏了。
+  const { db, close, dataDir, user } = setup();
+  assert.throws(
+    () => grantAssignment(db, {
+      userId: user.id, capability: 'no:such:cap', scopeType: 'global', scopeId: null,
+    }),
+    (err) => {
+      assert.ok(err instanceof AppError, '领域错误必须是 AppError（契约 INTERFACES.md「错误」纪律）');
+      assert.equal(err.status, 400);
+      assert.equal(err.code, 'CAPABILITY_UNKNOWN');
+      assert.ok(!/FOREIGN KEY/.test(err.message), '不能把 SQLite 原文漏到 HTTP 层');
+      return true;
+    },
+  );
+  assert.throws(
+    () => grantAssignment(db, {
+      userId: 'no_such_user', capability: 'score:write', scopeType: 'global', scopeId: null,
+    }),
+    (err) => {
+      assert.ok(err instanceof AppError, '领域错误必须是 AppError（契约 INTERFACES.md「错误」纪律）');
+      assert.equal(err.status, 404);
+      assert.equal(err.code, 'USER_NOT_FOUND');
+      assert.ok(!/FOREIGN KEY/.test(err.message), '不能把 SQLite 原文漏到 HTTP 层');
+      return true;
+    },
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('revokeAssignment 撤销后该条授权失效', () => {
+  // ⚠️ 评审修正（Minor）：revokeAssignment 是 INTERFACES.md 契约里的 API，
+  //    但此前**零测试覆盖**（变异「撤销空转」全绿）。
+  const { db, close, dataDir, user } = setup();
+  const id = grantAssignment(db, {
+    userId: user.id, capability: 'score:write', scopeType: 'global', scopeId: null, grantedBy: user.id,
+  });
+  assert.equal(can(user, 'score:write', null, db), true);
+  assert.equal(revokeAssignment(db, id), 1);
+  assert.equal(can(user, 'score:write', null, db), false);
+  assert.equal(listAssignments(db, { userId: user.id, capability: 'score:write' }).length, 0);
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('can() 对缺 id 的用户 fail-closed 返回 false，而不是抛错', () => {
+  // ⚠️ 评审修正：原来直接拿 undefined 去绑定 SQLite 参数 → TypeError → 整个请求 500。
+  //    权限判定的失败方向必须是"少给权限"，不是"整个服务崩掉"。
+  const { db, close, dataDir } = setup();
+  assert.equal(can({}, 'score:write', {}, db), false);
+  assert.equal(can({ id: undefined }, 'score:write', {}, db), false);
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('停用用户（布尔形状）判 false', () => {
+  // ⚠️ 评审修正：active 的**布尔形状**（正是 toPublicUser 产出的形状）此前没被钉住 ——
+  //    把判断改回 `user.active === 0` 时，`false === 0` 为 false → 停用用户被放行。
+  const { db, close, dataDir, user } = setup();
+  grantAssignment(db, {
+    userId: user.id, capability: 'score:write', scopeType: 'global', scopeId: null, grantedBy: user.id,
+  });
+  assert.equal(can({ id: user.id, active: false, isSuperadmin: false }, 'score:write', null, db), false);
+  assert.equal(can({ id: user.id, active: true, isSuperadmin: false }, 'score:write', null, db), true);
   close();
   rmSync(dataDir, { recursive: true, force: true });
 });

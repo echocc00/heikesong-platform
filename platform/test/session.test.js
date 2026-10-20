@@ -83,3 +83,71 @@ test('有效会话被访问时滑动续期（expires_at 顺延 ttlDays）', () =
   close();
   rmSync(dataDir, { recursive: true, force: true });
 });
+
+test('会话有绝对过期上限：持续使用也不能无限续命', () => {
+  // ⚠️ 评审修正（Important）：设计文档 §7.5 明写「绝对过期 + 滑动续期」，
+  //    原来**只实现了滑动续期** —— 只要一直有人在用，这个会话就永不过期。
+  //    （评审探针实测：ttl=1 天的会话每 12 小时碰一次，跨 5 天 10/10 次全部存活。）
+  //    绝对上限从**签发时刻**算起，到点一律作废，不因使用频率而延后。
+  const { db, close, dataDir, user } = setup();
+  const now = new Date('2026-01-01T00:00:00.000Z');
+  // 签发于 2026-01-01，绝对上限 10 天 → 硬边界是 2026-01-11T00:00:00.000Z
+  const { token } = createSession(db, user.id, { ttlDays: 1, absoluteTtlDays: 10, now });
+  // 每 12 小时碰一次 → 滑动续期一直把 expires_at 往后推（签发后 10 天内一直有效）
+  for (let h = 12; h < 10 * 24; h += 12) {
+    const at = new Date(now.getTime() + h * 3600_000);
+    assert.ok(
+      resolveSession(db, token, { now: at, ttlDays: 1, absoluteTtlDays: 10 }),
+      `第 ${h} 小时应仍然有效（滑动续期生效中）`,
+    );
+  }
+  // 越过绝对上限 → 一律作废并删行（哪怕上一分钟刚用过）
+  assert.equal(resolveSession(db, token, {
+    now: new Date('2026-01-11T00:00:00.000Z'), ttlDays: 1, absoluteTtlDays: 10,
+  }), null);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM sessions').get().n, 0);
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('即使 expires_at 被改到绝对上限之后，到点仍作废', () => {
+  // 绝对上限**不依赖** expires_at：库里的行即使被改成很远的将来（历史数据 / 被篡改），
+  // 到硬边界也必须作废 —— 否则"绝对过期"就只是一个装饰性字段。
+  const { db, close, dataDir, user } = setup();
+  const now = new Date('2026-01-01T00:00:00.000Z');
+  const { token } = createSession(db, user.id, { ttlDays: 1, absoluteTtlDays: 10, now });
+  db.prepare("UPDATE sessions SET expires_at = '2026-12-31T00:00:00.000Z' WHERE user_id = ?").run(user.id);
+  assert.equal(resolveSession(db, token, {
+    now: new Date('2026-01-11T00:00:00.000Z'), ttlDays: 1, absoluteTtlDays: 10,
+  }), null);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM sessions').get().n, 0);
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('滑动续期不得越过绝对上限', () => {
+  // ttl(30 天) > absolute(10 天) 时，expires_at 必须被夹在绝对上限上，
+  // 否则库里记的过期时间会比真实可用的时间更晚 —— 审计链在说谎。
+  const { db, close, dataDir, user } = setup();
+  const now = new Date('2026-01-01T00:00:00.000Z');
+  const { token } = createSession(db, user.id, { ttlDays: 30, absoluteTtlDays: 10, now });
+  const row = db.prepare('SELECT expires_at FROM sessions').get();
+  assert.equal(row.expires_at, '2026-01-11T00:00:00.000Z');
+  const got = resolveSession(db, token, {
+    now: new Date('2026-01-05T00:00:00.000Z'), ttlDays: 30, absoluteTtlDays: 10,
+  });
+  assert.equal(got.expiresAt, '2026-01-11T00:00:00.000Z');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('会话 token 是 32 字节随机（base64url 43 字符）', () => {
+  // ⚠️ 评审修正（Minor）：token 熵此前没有任何断言钉住。
+  const { db, close, dataDir, user } = setup();
+  const a = createSession(db, user.id).token;
+  const b = createSession(db, user.id).token;
+  assert.match(a, /^[A-Za-z0-9_-]{43}$/);
+  assert.notEqual(a, b, '两个会话的 token 必须不同');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});

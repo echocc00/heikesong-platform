@@ -9,8 +9,10 @@ export function insertSession(db, { tokenHash, userId, createdAt, expiresAt }) {
 }
 
 export function findSessionByHash(db, tokenHash) {
+  // ⚠️ created_at 必须一起取：绝对过期上限是从**签发时刻**算起的（设计文档 §7.5），
+  //    没有签发时刻就无从判断"这个会话最多能活多久"。
   return db
-    .prepare('SELECT user_id, expires_at FROM sessions WHERE token_hash = ?')
+    .prepare('SELECT user_id, created_at, expires_at FROM sessions WHERE token_hash = ?')
     .get(tokenHash) ?? null;
 }
 

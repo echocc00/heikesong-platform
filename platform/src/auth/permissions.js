@@ -13,12 +13,25 @@ import {
   deleteAssignmentById,
   listAssignmentsByUserAndCapability,
   hasRoleCapability,
+  capabilityExists,
 } from '../db/repo/assignments.js';
+import { userExists } from '../db/repo/users.js';
+import { appError } from '../errors.js';
 
 export function grantAssignment(
   db,
   { userId, capability, scopeType, scopeId = null, grantedBy = null },
 ) {
+  // ⛔ 评审修正（Important）：授权前先校验入参。
+  //    原来直接 INSERT，让 SQLite 的原始外键错误「FOREIGN KEY constraint failed」
+  //    抛到 HTTP 层 —— 既只能回 500（没有 .status），又把表结构暴露给客户端。
+  //    这与 I5-3（users.phone 重复）是同一类问题，当时修了，这儿漏了。
+  if (!capabilityExists(db, capability)) {
+    throw appError(400, 'CAPABILITY_UNKNOWN', `能力点未注册：${capability}`);
+  }
+  if (!userExists(db, userId)) {
+    throw appError(404, 'USER_NOT_FOUND', `用户不存在：${userId}`);
+  }
   const id = randomUUID();
   insertAssignment(db, {
     id,
@@ -62,6 +75,10 @@ export function can(user, capability, ctx = null, db = null) {
   //    （失败方向是 fail-closed：认不出超管只会少给权限，不会多给。）
   if (user.is_superadmin === 1 || user.isSuperadmin === true) return true;
   if (!db) return false;
+  // ⛔ 评审修正（Minor→Important）：缺 user.id 时**不能**拿去绑定 SQLite 参数 ——
+  //    node:sqlite 抛 TypeError → 整个请求变 500。
+  //    权限判定的失败方向必须是"少给权限"，不是"整个服务崩掉"。
+  if (!user.id) return false;
 
   // 角色能力
   if (roleGrants(db, user.id, capability)) return true;
@@ -116,24 +133,50 @@ export function scopeClause(userId, capability, { scopeType, scopeId, alias = nu
     throw new Error(`scopeClause：alias 必须是合法 SQL 标识符：${alias}`);
   }
 
-  const params = [userId, capability];
   const scopeCond = [];
+  const scopeParams = [];
 
   if (scopeType) {
     if (alias) {
       scopeCond.push(`(a.scope_type = ? AND a.scope_id = ${alias}.id)`);
-      params.push(scopeType);
+      scopeParams.push(scopeType);
     } else {
       scopeCond.push(`(a.scope_type = ? AND a.scope_id = ?)`);
-      params.push(scopeType, scopeId);
+      scopeParams.push(scopeType, scopeId);
     }
   }
   const scopeSql = scopeCond.length ? ` OR ${scopeCond.join(' OR ')}` : '';
 
+  // ⛔ 评审修正（Important）：**超管与角色授权不做行级过滤**。
+  //    原来这段 SQL 只认 assignments，于是：
+  //      超管        → can() = true，但 scopeClause 过滤出 0 行
+  //      角色授权用户 → can() = true，但 scopeClause 过滤出 0 行
+  //    can() 与 scopeClause 对同一用户给出**相反结论** —— 这直接违反
+  //    INTERFACES.md:22「判定只有 can() 一个入口，SQL 层过滤用 scopeClause(...)」：
+  //    一个说"有权限"，另一个说"看不到任何行"。
+  //    P0 没有调用方，但 P2 计划明写「行级 scope 由 P3/P4 的 scopeClause 补齐」——
+  //    P3/P4 的列表接口一接，超管和角色授权用户就会看到空列表。
+  //    设计文档 §7.1 的判定顺序是：超管 → true；role_capability 命中 → true。
+  //    两者都是**无作用域**的授权，因此行级过滤对它们一律不设限。
+  //
+  // ⚠️ 占位符顺序必须与 params 顺序**逐字对应**：
+  //    ①users.id(启用) ②assignments.user_id ③assignments.capability
+  //    ④scopeType[⑤scopeId] ⑥超管.user_id ⑦角色.user_id ⑧角色.capability
+  const sql = `(
+    EXISTS (SELECT 1 FROM users u WHERE u.id = ? AND u.active = 1)
+    AND (
+      EXISTS (SELECT 1 FROM assignments a
+               WHERE a.user_id = ? AND a.capability = ?
+                 AND (a.scope_type = 'global'${scopeSql}))
+      OR EXISTS (SELECT 1 FROM users su WHERE su.id = ? AND su.is_superadmin = 1)
+      OR EXISTS (SELECT 1 FROM user_roles ur
+                  JOIN role_capabilities rc ON rc.role_id = ur.role_key
+                  WHERE ur.user_id = ? AND rc.capability = ?)
+    )
+  )`;
+
   return {
-    sql: `EXISTS (SELECT 1 FROM assignments a
-            WHERE a.user_id = ? AND a.capability = ?
-              AND (a.scope_type = 'global'${scopeSql}))`,
-    params,
+    sql,
+    params: [userId, userId, capability, ...scopeParams, userId, userId, capability],
   };
 }

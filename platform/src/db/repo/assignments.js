@@ -49,3 +49,12 @@ export function hasRoleCapability(db, userId, capability) {
     )
     .get(userId, capability) !== undefined;
 }
+
+/**
+ * 能力点是否已注册。
+ * ⛔ 评审修正（Important）：授权前校验用 —— 不校验就是让 SQLite 的原始外键错误
+ *    「FOREIGN KEY constraint failed」冒到 HTTP 层（只能回 500，且泄露表结构）。
+ */
+export function capabilityExists(db, capability) {
+  return db.prepare('SELECT 1 FROM capabilities WHERE key = ?').get(capability) !== undefined;
+}

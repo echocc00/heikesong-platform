@@ -18,8 +18,8 @@
 | 数据层 | 所有 SQL 收在 `src/db/repo/*.js`。handler / service 里**不出现 SQL 字符串** |
 | 时间 | 统一传 `now`（ISO 字符串或 `Date`），不直接调 `new Date()`（领域层）或 `Date.now()`（服务层用 `now ?? new Date().toISOString()`） |
 | 随机数 | 领域层需要随机时传 `rng` 参数，默认 `Math.random` |
-| 错误 | 抛 `AppError`（`code` + `message` + `status`），由 HTTP 层转成 `error(res, status, code, message, detail)` |
-| 权限 | 判定只有 `can(user, capability, ctx, db)` 一个入口。SQL 层过滤用 `scopeClause(...)` |
+| 错误 | 抛 `AppError`（`status` + `code` + `message` + `detail`，**status-first**），由 HTTP 层转成 `error(res, status, code, message, detail)`。类型定义在 `src/errors.js`（**P0 建立**，P1–P6 全部复用，禁止再新建第二套） |
+| 权限 | 判定只有 `can(user, capability, ctx, db)` 一个入口。SQL 层过滤用 `scopeClause(...)` —— 两者**必须给出相同结论**（超管 / role_capability 授权一律不做行级过滤） |
 | 规则 | 可变规则一律进 `rules/*.json`。代码里出现魔法数字 = 违规（例外：算法常量如 `100` 分制上限） |
 | 溯源 | 每条规则逻辑的注释写明来源文档与章节，例：`// S7 §3.1` |
 | 状态码 | 列表不满足 → `200` + 空集；单条不满足 → `404`；规则被禁用 → `403` |
@@ -63,15 +63,21 @@ hashPassword(plain)                      // → 'scrypt$N$r$p$saltB64$hashB64'
 verifyPassword(plain, stored)            // → boolean
 
 // src/auth/session.js
-createSession(db, userId, { ttlDays, now })   // → { token, expiresAt }
-resolveSession(db, token, { now })            // → { userId, expiresAt } | null
+createSession(db, userId, { ttlDays, absoluteTtlDays, now })   // → { token, expiresAt }
+resolveSession(db, token, { now, ttlDays, absoluteTtlDays })    // → { userId, expiresAt } | null
+// ⚠️ 绝对过期（设计文档 §7.5）：从**签发时刻**算起的硬上限（默认 30 天，SESSION_ABSOLUTE_TTL_DAYS 可覆盖），
+//    滑动续期不得突破它。缺了这条，令牌泄露即可无限续命。
 revokeSession(db, token)
 revokeAllSessions(db, userId)
 
 // src/auth/permissions.js
 can(user, capability, ctx, db)           // → boolean（唯一入口）
 scopeClause(userId, capability, { scopeType, scopeId, alias })  // → { sql, params }
+// ⚠️ scopeClause 与 can() 必须一致：超管与 role_capability 授权**不做行级过滤**（全部行可见），
+//    停用用户一律不可见。两者若给出相反结论，P3/P4 的列表接口会出现「有权限却空列表」。
 grantAssignment(db, { userId, capability, scopeType, scopeId, grantedBy })
+// ⚠️ 授权前校验：capability 未注册 → 400 CAPABILITY_UNKNOWN；user 不存在 → 404 USER_NOT_FOUND。
+//    不校验就会把 SQLite 原始外键错误漏到 HTTP 层（只能回 500，且泄露表结构）。
 revokeAssignment(db, assignmentId)
 listAssignments(db, { userId, capability })
 
@@ -563,7 +569,7 @@ docs/deployment.md           部署与运维手册
 
 | 文件 | 拥有者 | 后续阶段怎么用 | 为什么这么定 |
 |---|---|---|---|
-| `src/errors.js` | **P1** | P4 **追加**快捷函数；P3 **直接复用** | P3 原打算新建 `src/errors/app-error.js` 且签名是 `appError(code, message, status)`，与 P1/P4 的 `appError(status, code, message, detail)` **参数顺序相反**。两套并存 → `err.status` 与 `err.code` 互换 → HTTP 层返回错误状态码。**统一为 status-first** |
+| `src/errors.js` | **P0**（最早建立者拥有） | P1 / P3 **直接复用**；P4 **追加**快捷函数 | ⚠️ 原裁决是「P1 建」，但 P0 的 Task 4/5/6 已需要抛领域错误（body 413/400、重复手机号 409、授权参数校验）。**P0 建立后即为最早建立者**，按本表原则归 P0，后续阶段一律 Modify（追加），不得重建。P3 原打算新建 `src/errors/app-error.js` 且签名是 `appError(code, message, status)`，与全项目的 `appError(status, code, message, detail)` **参数顺序相反**。两套并存 → `err.status` 与 `err.code` 互换 → HTTP 层返回错误状态码。**统一为 status-first** |
 | `src/audit/log.js` | **P2** | P4 **改造**（把内联 SQL 下沉到仓储层）+ **追加**查询 | P2 先写审计日志。P4 改造时**函数签名一个字不改**，P2 已有的调用点不必跟着改 |
 | `src/db/repo/computations.js` | **P2** | P4 **追加** `nextRevision` / `listComputationRows` | 计算快照表由 P2 的 `003_review.sql` 建，写入方是 P2 的 `computeStage`。P4 只做读与复算 |
 | `src/db/repo/tiers.js` | **P3** | P4 **追加**只读的 `getTeamTierRow(db, teamId)` | P3 已建 `insertTierRecord(db, { …, reasonsJson, … })`。P4 原打算重复定义且参数名写作 `reasons`——参数名不同会让 `reasons` 静默变 `undefined` → 段位降级原因丢失 → R-PTS-04「降级须公示」破 |

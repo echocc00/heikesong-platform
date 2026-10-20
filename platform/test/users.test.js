@@ -6,7 +6,15 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openDatabase } from '../src/db/sqlite.js';
 import { applyMigrations } from '../src/db/migrate.js';
-import { createUser, getUserById, listUsers, toPublicUser } from '../src/db/repo/users.js';
+import {
+  createUser,
+  getUserById,
+  getCredentialsByPhone,
+  listUsers,
+  toPublicUser,
+} from '../src/db/repo/users.js';
+import { verifyPassword } from '../src/auth/password.js';
+import { AppError } from '../src/errors.js';
 
 const migrationsDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'db', 'migrations');
 
@@ -23,6 +31,7 @@ test('重复手机号抛 409 领域错误，不漏原始 SQLite 错误', () => {
   assert.throws(
     () => createUser(db, { name: '乙', phone: '13900000003', password: 'pw' }),
     (err) => {
+      assert.ok(err instanceof AppError, '领域错误必须是 AppError（契约 INTERFACES.md「错误」纪律）');
       assert.equal(err.status, 409);
       assert.equal(err.code, 'PHONE_TAKEN');
       assert.ok(!/UNIQUE constraint/.test(err.message), '不能把 SQLite 原文漏到 HTTP 层');
@@ -41,11 +50,45 @@ test('仓储层的行与对外形状都不含 password_hash', () => {
   for (const row of listUsers(db)) {
     assert.equal(row.password_hash, undefined);
   }
-  const pub = toPublicUser(user);
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('库里存的是 scrypt 哈希，不是明文口令', () => {
+  // ⚠️ 评审修正（Important）：Task 5 的核心命题就是"口令哈希入库"，
+  //    但原来**没有任何断言**证明这一点 —— 把 hashPassword(password) 换成
+  //    String(password)（明文入库），Task 5 自己的用例全绿。
+  //    这里直接读库里的 password_hash 验三件事：格式是 scrypt$、不等于明文、验签通过。
+  const { db, close, dataDir } = setup();
+  createUser(db, { name: '甲', phone: '13900000009', password: 'pw-plain' });
+  const cred = getCredentialsByPhone(db, '13900000009');
+  assert.ok(cred.password_hash.startsWith('scrypt$'), '库里必须是 scrypt 哈希');
+  assert.notEqual(cred.password_hash, 'pw-plain', '库里不能是明文口令');
+  assert.equal(verifyPassword('pw-plain', cred.password_hash), true);
+  assert.equal(verifyPassword('other', cred.password_hash), false);
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('toPublicUser 对带哈希的行也不漏 password_hash（对外键集合精确）', () => {
+  // ⚠️ 评审修正（Important）：原来断言的是 toPublicUser(createUser(...))，
+  //    而 createUser 的返回值**本来就没有** password_hash 键 ——
+  //    "输出里没有 password_hash"对任何"照抄缺失键"的实现都成立 = 恒真断言。
+  //    （评审实测：往 toPublicUser 里加上 password_hash 字段，全量 79/79 仍绿。）
+  //    这里改用 getCredentialsByPhone —— 那一行**确实带** password_hash，
+  //    再把对外键集合也精确断言住（多泄一个字段同样会红）。
+  const { db, close, dataDir } = setup();
+  createUser(db, { name: '甲', phone: '13900000010', password: 'pw' });
+  const cred = getCredentialsByPhone(db, '13900000010');
+  assert.ok(cred.password_hash, '前提：这一行确实带 password_hash');
+  const pub = toPublicUser(cred);
   assert.equal(pub.password_hash, undefined);
   assert.equal(pub.passwordHash, undefined);
-  assert.equal(pub.id, user.id);
-  assert.equal(pub.mbaStatus, user.mba_status);
+  assert.deepEqual(
+    Object.keys(pub).sort(),
+    ['active', 'createdAt', 'id', 'isSuperadmin', 'mbaStatus', 'name', 'org', 'phone'],
+    '对外形状的键集合必须精确等于约定的 8 个字段（多一个也算泄露）',
+  );
   close();
   rmSync(dataDir, { recursive: true, force: true });
 });

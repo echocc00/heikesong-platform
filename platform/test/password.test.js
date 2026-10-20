@@ -31,3 +31,11 @@ test('损坏的存储串不抛异常，返回 false', () => {
   assert.equal(verifyPassword('x', 'garbage'), false);
   assert.equal(verifyPassword('x', ''), false);
 });
+
+test('盐是 16 字节、派生密钥是 64 字节（设计文档 §7.5）', () => {
+  // ⚠️ 评审修正（Minor）：盐长度此前没有任何断言钉住 —— 把 16 改成 8 也能过 CI。
+  const parts = hashPassword('x').split('$');
+  assert.equal(parts.length, 6);
+  assert.equal(Buffer.from(parts[4], 'base64').length, 16, '每用户独立 16 字节随机盐');
+  assert.equal(Buffer.from(parts[5], 'base64').length, 64, '派生密钥 64 字节');
+});

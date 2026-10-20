@@ -71,7 +71,7 @@ platform/
 │   ├── domain/    util.js · ranking.js · points.js · tier.js · behavior.js · visibility.js（全部纯函数）
 │   ├── services/  leaderboard.js · performance-card.js · tier.js
 │   ├── db/repo/   leaderboard.js · points.js · tiers.js（全部 SQL）
-│   └── errors.js                      ★ AppError（**P1 已建**，本阶段只复用不重建）
+│   └── errors.js                      ★ AppError（**P0 已建**，本阶段只复用不重建）
 ├── web/views/    leaderboard.js · tier.js · card.js
 └── test/         leaderboard-migration · ranking · points · tier · behavior · visibility
                   · leaderboard-service · leaderboard-web（8 个 .test.js）
@@ -1897,7 +1897,7 @@ git commit -m "feat(P3): API 层可见性过滤与 C-02 段位公示裁决"
 
 **Files:**
 - Create: `platform/src/db/repo/leaderboard.js`、`platform/src/db/repo/points.js`、`platform/src/db/repo/tiers.js`、`platform/src/services/leaderboard.js`、`platform/src/services/performance-card.js`、`platform/src/services/tier.js`、`platform/test/leaderboard-service.test.js`
-- Modify: `platform/src/errors.js`（P1 已建，本阶段**只复用**：统一为 status-first 顺序 `AppError(status, code, message, detail)`，不新建 `errors/app-error.js`）
+- Modify: `platform/src/errors.js`（P0 已建，本阶段**只复用**：统一为 status-first 顺序 `AppError(status, code, message, detail)`，不新建 `errors/app-error.js`）
 - Modify: `platform/src/server.js`
 
 **Interfaces:**
@@ -2135,9 +2135,9 @@ Run: `cd platform && node --test test/leaderboard-service.test.js` → Expected:
 
 - [ ] **Step 3: 接入 src/errors.js 与创建三个仓储文件**
 
-`platform/src/errors.js` 由 **P1 的 Task 3 建立**，本阶段**只复用、不重建**（重建会产生两套参数顺序相反的错误构造器）：
+`platform/src/errors.js` 由 **P0 的 Task 4 建立**，本阶段**只复用、不重建**（重建会产生两套参数顺序相反的错误构造器）：
 ```javascript
-// src/errors.js — 由 P1 建立，P3 直接 import（不复制、不改）
+// src/errors.js — 由 P0 建立，P3 直接 import（不复制、不改）
 // 签名：appError(status, code, message, detail)
 //   ⚠️ 参数顺序是 status 在前。P3 文末偏差表里原本写的 appError(code, message, status)
 //      已统一为 status-first，与 P1/P4 一致。
@@ -3177,7 +3177,7 @@ git commit -m "feat(P3): 榜单页、段位榜与战绩卡前端"
 | 5 | `src/domain/points.js` 新增 `computePrizeShares` | 未列 | 新增 `computePrizeShares({ ordered, prizeTable })` | R-JDG-20「并列共享奖金（总额不变）」需要一条可执行算法才能被验证；奖金表本身仍由调用方传入（目前无配置文件规定金额） |
 | 6 | `applyTiebreakChain` / `rankTeams` 的返回值是超集 | `{ ordered, applied }` / `{ ordered, tieGroups, rankStyle }` | 分别追加 `groups` / `warnings` / `applied` | `applied` 与 `groups` 是计算 1224 名次与「降级告警置顶」所必需的中间量；契约里已有的字段全部保留且语义不变 |
 | 7 | `applyVisibility` 的 `context` 追加 `viewerTeamIds` | `context` 未展开 | `{ scope, viewerTeamIds?, viewerTeamId?, tierOrder? }` | 一名选手可同时在多支队伍里，单个 `viewerTeamId` 表达不了 |
-| 8 | ~~新增 `src/errors/app-error.js`~~ → **改为复用 P1 的 `src/errors.js`** | §0 要求「抛 AppError」，但 P0 未建该类 | 本阶段**不新建**错误模块；直接 `import { AppError, appError } from '../errors.js'`（P1 Task 3 建立），签名统一为 **status-first**：`AppError(status, code, message, detail)` / `appError(status, code, message, detail)` | ⚠️ 原写法是 `appError(code, message, status)`（code 在前），与 P1/P4 的 `appError(status, code, message)` **参数顺序相反**。两套并存必然有一半调用点写错顺序，且 `err.status` / `err.code` 会互换——HTTP 层会返回错误的状态码。已统一为 status-first，并把 P3 内 12 处调用点全部改写 |
+| 8 | ~~新增 `src/errors/app-error.js`~~ → **改为复用 P0 的 `src/errors.js`** | §0 要求「抛 AppError」，P0 已建该类（Task 4） | 本阶段**不新建**错误模块；直接 `import { AppError, appError } from '../errors.js'`（**P0 建立**），签名统一为 **status-first**：`AppError(status, code, message, detail)` / `appError(status, code, message, detail)` | ⚠️ 原写法是 `appError(code, message, status)`（code 在前），与 P1/P4 的 `appError(status, code, message)` **参数顺序相反**。两套并存必然有一半调用点写错顺序，且 `err.status` / `err.code` 会互换——HTTP 层会返回错误的状态码。已统一为 status-first，并把 P3 内 12 处调用点全部改写 |
 | 9 | `rules/*.json` 的加载与校验在 `src/config.js` 里扩展 | §1 只列了 9 份 P0 规则文件 | `src/config.js` 的 `FILES` / `grouped` / `validateRules` 追加 `points` 与 `criteria` | P3 新增 2 份规则文件，必须走同一条 fail-fast 校验通路，否则「改 JSON 即改规则」这条 S-2 会破 |
 | 10 | 新增 3 个仓储文件 | 未列仓储文件名 | `src/db/repo/leaderboard.js` / `points.js` / `tiers.js` | 所有 SQL 必须收在 `src/db/repo/`；文件名带 P3 语义，避免与 P1/P2 的仓储重名冲突 |
 

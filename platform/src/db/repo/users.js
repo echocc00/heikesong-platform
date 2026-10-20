@@ -10,6 +10,7 @@ const PUBLIC_COLUMNS = 'id, name, phone, mba_status, org, is_superadmin, active,
 
 import { randomUUID } from 'node:crypto';
 import { hashPassword } from '../../auth/password.js';
+import { appError } from '../../errors.js';
 
 /**
  * 对外用户形状（**唯一出口**）：字段转驼峰，绝不带 password_hash。
@@ -35,10 +36,7 @@ export function createUser(db, { name, phone, password, mbaStatus = 'other', org
   //    漏到 HTTP 层 —— 既只能回 500，又把表名列名暴露给客户端。
   //    查重不看 active：停用用户的手机号也不能被再次注册。
   if (findUserByPhone(db, phone)) {
-    const err = new Error('该手机号已注册');
-    err.status = 409;
-    err.code = 'PHONE_TAKEN';
-    throw err;
+    throw appError(409, 'PHONE_TAKEN', '该手机号已注册');
   }
   const id = randomUUID();
   const now = new Date().toISOString();
@@ -76,6 +74,14 @@ export function listUsers(db, { limit = 100, offset = 0 } = {}) {
   return db
     .prepare(`SELECT ${PUBLIC_COLUMNS} FROM users WHERE active = 1 ORDER BY created_at LIMIT ? OFFSET ?`)
     .all(limit, offset);
+}
+
+/**
+ * 用户是否存在（不看 active —— 停用是软删除，记录仍在）。
+ * ⛔ 评审修正（Important）：授权前校验用 —— 不校验就是让 SQLite 的原始外键错误冒到 HTTP 层。
+ */
+export function userExists(db, id) {
+  return db.prepare('SELECT 1 FROM users WHERE id = ?').get(id) !== undefined;
 }
 
 // ⛔ 软删除：禁止硬删（设计文档 §11「事后篡改」防护）

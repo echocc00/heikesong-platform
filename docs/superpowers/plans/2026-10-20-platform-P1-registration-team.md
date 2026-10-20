@@ -32,7 +32,7 @@ SQL 边界    所有 SQL 收进 src/db/repo/；handler 内禁止裸 SQL
 ID          crypto.randomUUID()，字符串主键
 追加式      registration_events 只增不改；改级/申诉都写新事件，不覆盖历史
 软删除      业务表带 deleted_at；删除 = 写时间戳，不删行
-错误        抛 AppError(code + message + status)，HTTP 层转 error(res, status, code, message, detail)
+错误        抛 AppError(status + code + message + detail)（status-first），HTTP 层转 error(res, status, code, message, detail)
 纯函数出口  scoreRegistration / classifyLevel / validateRegistrationAnswers / scoreSolvability
             的入参里【不存在】now / db / 随机数；传入也被忽略
 硬门槛      队长必须一堂 MBA 在籍（R-REG-05 已定）；人数 ≥2（R-REG-02 已定）；
@@ -53,7 +53,7 @@ platform/
 │   ├── schedule.json              5 赛段时间轴与交付物（R-STG-01）
 │   └── compliance.json            IP 归属 + 合规红线 + 同意清单（R-ENT-11 / R-ENT-12）
 ├── src/
-│   ├── errors.js                  AppError（契约 §0 要求的错误类型，P0 未提供）
+│   ├── errors.js                  AppError（契约 §0 要求的错误类型，**P0 已建**，本阶段只复用）
 │   ├── domain/
 │   │   ├── registration.js        报名算分分级纯函数
 │   │   └── solvability.js         六维可解性纯函数
@@ -1182,7 +1182,7 @@ git commit -m "feat(P1): 报名算分分级纯函数与 SABC 问卷配置
 ### Task 3: 报名服务与 API
 
 **Files:**
-- Create: `platform/src/errors.js`
+- Modify: `platform/src/errors.js`（**P0 已建**，本阶段**只复用**：核对签名为 status-first，**不重建**）
 - Create: `platform/src/services/registration.js`
 - Create: `platform/src/http/routes/registration.js`
 - Create: `platform/rules/team-formation.json`
@@ -1381,25 +1381,22 @@ test('申诉：level 省略时只留痕不改级', () => {
 Run: `cd platform && node --test test/registration-service.test.js`
 Expected: FAIL —— `Cannot find module '../src/services/registration.js'`
 
-- [ ] **Step 3: 创建 src/errors.js**
+- [ ] **Step 3: 核对 src/errors.js（P0 已建，本阶段只复用）**
 
-```javascript
-// src/errors.js — AppError
-// 依据：INTERFACES.md §0「错误：抛 AppError（code + message + status），
-//       由 HTTP 层转成 error(res, status, code, message, detail)」
-export class AppError extends Error {
-  constructor(status, code, message, detail) {
-    super(message);
-    this.name = 'AppError';
-    this.status = status;
-    this.code = code;
-    if (detail !== undefined) this.detail = detail;
-  }
-}
+⚠️ **不重建**。`src/errors.js` 已由 **P0 的 Task 4** 建立（文件归属裁决表：`src/errors.js` 归 **P0**，
+P1 / P3 直接复用，P4 只追加快捷函数）。重建会产生两套参数顺序相反的错误构造器 ——
+`err.status` 与 `err.code` 互换 → HTTP 层返回错误状态码。
 
-export function appError(status, code, message, detail) {
-  return new AppError(status, code, message, detail);
-}
+核对签名是否与契约一致（**status-first**）：
+
+```bash
+cd platform && node -e "
+import('./src/errors.js').then((m) => {
+  const e = m.appError(400, 'X', 'msg');
+  console.log(e.status, e.code, e.message, e instanceof m.AppError);
+});
+"
+# 期望输出：400 X msg true
 ```
 
 - [ ] **Step 4: 创建 src/services/registration.js**
@@ -2099,7 +2096,7 @@ Expected: PASS（服务 10 个 + API 8 个用例全过）
 - [ ] **Step 10: 提交**
 
 ```bash
-cd platform && git add src/errors.js src/services/registration.js src/http/routes/registration.js rules/team-formation.json rules/schedule.json rules/compliance.json src/config.js src/server.js test/registration-service.test.js test/registration-api.test.js
+cd platform && git add src/services/registration.js src/http/routes/registration.js rules/team-formation.json rules/schedule.json rules/compliance.json src/config.js src/server.js test/registration-service.test.js test/registration-api.test.js
 git commit -m "feat(P1): 报名服务与 API（幂等 409 / 改级留痕 / 可见性过滤）+ P1 规则加载
 
 对应需求：R-REG-06 / R-REG-07 / R-REG-08 / R-REG-09 / R-REG-11 / R-ENT-12 / R-STG-01"
