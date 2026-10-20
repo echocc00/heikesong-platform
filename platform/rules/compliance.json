@@ -1,0 +1,22 @@
+{
+  "id": "compliance",
+  "version": "2026-10-20",
+  "source": "顶层文档 §3.1 S9（R-ENT-11 IP 与成果归属）+ §3.1 S15 与 §3.9（R-ENT-12 合规红线与同意记录）",
+  "ipOwnership": {
+    "team": "团队保留全部知识产权",
+    "committee": "组委会仅享有非商业性的展示与宣传权",
+    "enterprise": "企业享有成果优先对接洽谈权（不自动获得知识产权）"
+  },
+  "redLines": [
+    { "key": "no_data_export", "label": "数据出境：未经授权不得将参赛数据传出中国境内" },
+    { "key": "privacy_protection", "label": "隐私保护：涉及个人信息须取得授权并脱敏" },
+    { "key": "ai_generated_content", "label": "AI 生成内容：须标注来源与生成方式" },
+    { "key": "ip_no_infringement", "label": "知识产权：不得使用未授权的第三方成果" },
+    { "key": "identity_real", "label": "参赛者身份：报名信息须真实，冒名参赛取消资格" }
+  ],
+  "consent": {
+    "required": true,
+    "prompt": "我已阅读并同意《参赛协议》《IP 与成果归属说明》《数据与隐私合规红线》",
+    "enterprisePrompt": "我确认本任务卡不涉及未授权数据出境，且我方已指定唯一责任人"
+  }
+}

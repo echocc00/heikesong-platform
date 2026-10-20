@@ -16,6 +16,7 @@ import { can } from './auth/permissions.js';
 import { verifyPassword, hashPassword } from './auth/password.js';
 import { getUserById, getCredentialsByPhone, toPublicUser } from './db/repo/users.js';
 import { appError, AppError } from './errors.js';
+import { registerRegistrationRoutes } from './http/routes/registration.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -98,6 +99,8 @@ export function createApp({ db, rules, webDir }) {
   }
 
   const router = createRouter();
+  // 注册 P1 报名端点（提交 / 查询 / 列表 / 改级 / 公开筛选标准）
+  registerRegistrationRoutes({ router, db, rules });
   // 生产环境 Cookie 加 Secure；开发环境不加（http://127.0.0.1 会被浏览器拒收）
   const secureCookies = process.env.NODE_ENV === 'production';
 
@@ -243,7 +246,9 @@ export function createApp({ db, rules, webDir }) {
           json(res, 413, { error: { code, message } }, { Connection: 'close' });
           return;
         }
-        error(res, status, code, message);
+        // detail 同理：**只透传 AppError 的 detail** —— detail 可能含表名 / 列名
+        //（问卷缺项说明是我们自己写的文案，可给前端看；裸 Error 的 detail 不行）。
+        error(res, status, code, message, err instanceof AppError ? err.detail : undefined);
       }
       return;
     }

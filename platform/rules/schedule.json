@@ -1,0 +1,25 @@
+{
+  "id": "schedule",
+  "version": "2026-10-20",
+  "source": "任务书 2.0 §六 赛段表（R-STG-01）",
+  "note": "日期为赛段相对日序（月-日）；落到具体日历日期由 edition.starts_at 偏移。",
+  "stages": [
+    { "key": "S1", "name": "调研", "start": "10-01", "end": "10-10",
+      "deliverables": ["企业问题确认书", "数据可得性说明"] },
+    { "key": "S2", "name": "任务", "start": "10-10", "end": "10-13",
+      "deliverables": ["任务清单", "里程碑清单确认"] },
+    { "key": "S3", "name": "开发", "start": "10-13", "end": "10-25",
+      "deliverables": ["可运行原型", "版本记录与代码仓"] },
+    { "key": "S4", "name": "路演", "start": "10-26", "end": "10-28",
+      "deliverables": ["路演材料", "演示 Demo"] },
+    { "key": "S5", "name": "落地", "start": "10-29", "end": "10-31",
+      "deliverables": ["试点或意向确认", "成果归属确认"],
+      "hardRequirement": false,
+      "note": "R-STG-05：任务书 §六「由于时间关系，商业验证赛段不做要求，以甲方投决积分为主」→ S5 不做硬性交付要求" }
+  ],
+  "advancement": {
+    "rate": 0.25,
+    "finalTopN": 32,
+    "source": "R-OPS-10：顶层文档 §3.1 S11「入围率 25%（对标 CICC 24%、浙大站 26%）；决赛 TOP32」"
+  }
+}

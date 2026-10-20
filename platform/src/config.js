@@ -18,6 +18,9 @@ const FILES = {
   registration: 'registration-scoring.json',
   solvability: 'solvability.json',
   milestones: 'milestones.default.json',
+  teamFormation: 'team-formation.json',
+  schedule: 'schedule.json',
+  compliance: 'compliance.json',
 };
 
 function readJson(path) {
@@ -333,6 +336,110 @@ export function validateRules(rules) {
     }
   }
 
+  // ── 组队规则（R-REG-02 / R-REG-04 / R-REG-05 已定，不可被配置改掉）──
+  const tf = rules.teamFormation;
+  if (!tf) {
+    errors.push('teamFormation 缺失');
+  } else {
+    if (!(tf.teamSize?.min >= 2)) {
+      errors.push('teamFormation.teamSize.min 必须 ≥ 2（R-REG-02 已定：不接受 1 人组队）');
+    }
+    if (tf.teamSize?.max < tf.teamSize?.min) {
+      errors.push('teamFormation.teamSize.max 必须 ≥ min');
+    }
+    if (tf.captainMustBeMba !== true) {
+      errors.push('teamFormation.captainMustBeMba 必须为 true（R-REG-05 已定：组长必须一堂 MBA 在籍）');
+    }
+    if (!(tf.teamsPerPackage?.min >= 1) || tf.teamsPerPackage?.max < tf.teamsPerPackage?.min) {
+      errors.push('teamFormation.teamsPerPackage 必须满足 1 ≤ min ≤ max（R-REG-01：每任务包 2–3 队）');
+    }
+    const mixSum = (tf.packageQuotaMix?.enterprise ?? 0) + (tf.packageQuotaMix?.free ?? 0);
+    if (Math.abs(mixSum - 1) > 1e-9) {
+      errors.push(`teamFormation.packageQuotaMix 合计 = ${mixSum.toFixed(4)}，必须等于 1`);
+    }
+    if (tf.singleMemberTriggersMerge !== true) {
+      errors.push('teamFormation.singleMemberTriggersMerge 必须为 true（R-REG-04 已定）');
+    }
+    if (!(tf.singleMemberMergeDeadlineDays > 0)) {
+      errors.push('teamFormation.singleMemberMergeDeadlineDays 必须为正整数');
+    }
+  }
+
+  // ── 赛程时间轴（R-STG-01）──
+  const stages = rules.schedule?.stages;
+  if (!Array.isArray(stages) || stages.length !== 5) {
+    errors.push('schedule.stages 必须是 5 个赛段（R-STG-01）');
+  } else {
+    // ⚠️ 父代理预审修正（规格自相矛盾，原实现会让服务器**拒绝启动**）：
+    //    原来判 `stages[i].start <= stages[i - 1].end`（要求严格递增），
+    //    但 R-STG-01 的赛段表本身就是**交接式相接**的：
+    //      S1 调研 10/1-10/10 → S2 任务 10/10-13 → S3 开发 10/13-25
+    //      → S4 路演 10/26-28 → S5 落地 10/29-31
+    //    （见 docs/requirements-traceability.md 的 R-STG-01 一行）
+    //    上一段的**结束当天就是下一段的开始日** → `start == 上一段 end` 恒成立
+    //    → 原规则会让计划自带的 schedule.json 校验失败 → **fail-fast 拒绝启动**
+    //    → P1 一上线就是死的。父代理预审实跑复现：18 条用例全红，
+    //    报错「schedule.stages 必须按时间递增（第 3 段）」。
+    //    正确的判据是**不许重叠**（`start < 上一段 end`），相接是合法的；
+    //    同时补一条「本段 end 不得早于本段 start」。
+    for (let i = 1; i < stages.length; i += 1) {
+      if (stages[i].start < stages[i - 1].end) {
+        errors.push(`schedule.stages 第 ${i + 1} 段与上一段时间重叠（R-STG-01）`);
+      }
+    }
+    for (const st of stages) {
+      if (st.end < st.start) {
+        errors.push(`schedule.stages ${st.key} 的结束日早于开始日`);
+      }
+    }
+  }
+
+  // ── 合规与 IP（R-ENT-11 / R-ENT-12）──
+  if (!rules.compliance?.redLines?.length) {
+    errors.push('compliance.redLines 不得为空（R-ENT-12 合规红线）');
+  }
+  if (!rules.compliance?.ipOwnership?.team) {
+    errors.push('compliance.ipOwnership.team 缺失（R-ENT-11 团队保留 IP）');
+  }
+
+  // ── 报名问卷（R-REG-11）──
+  const q = rules.registration?.questions;
+  if (!q?.dimensionItems) {
+    errors.push('registration.questions.dimensionItems 缺失（R-REG-11）');
+  } else {
+    for (const d of rules.registration.dimensions) {
+      const items = q.dimensionItems[d.key] ?? [];
+      if (items.length !== 5) {
+        errors.push(`registration.questions.dimensionItems.${d.key} 必须是 5 题（SABC v1 §六：3 维各 5 题）`);
+      }
+    }
+  }
+  const funnel = rules.registration?.funnel;
+  if (!Array.isArray(funnel) || funnel.length !== 5) {
+    errors.push('registration.funnel 必须是 5 阶段（R-REG-10）');
+  } else {
+    for (let i = 1; i < funnel.length; i += 1) {
+      const prev = funnel[i - 1].rate;
+      const cur = funnel[i].rate;
+      if (prev !== null && cur !== null && cur > prev) {
+        errors.push(`registration.funnel 必须逐级收窄（第 ${i + 1} 段）`);
+      }
+    }
+  }
+
+  // ── 任务卡配比（R-ENT-09）──
+  const tm = rules.solvability?.taskMix;
+  if (tm) {
+    const sum = (tm.enterprise ?? 0) + (tm.free ?? 0);
+    if (Math.abs(sum - 1) > 1e-9) {
+      errors.push(`solvability.taskMix 合计 = ${sum.toFixed(4)}，必须等于 1（R-ENT-09：70% B 端 + 30% 自由）`);
+    }
+    const splitSum = Object.values(tm.enterpriseGradeSplit ?? {}).reduce((a, b) => a + b, 0);
+    if (Object.keys(tm.enterpriseGradeSplit ?? {}).length && Math.abs(splitSum - (tm.enterprise ?? 0)) > 1e-9) {
+      errors.push(`solvability.taskMix.enterpriseGradeSplit 合计 = ${splitSum.toFixed(4)}，必须等于 enterprise = ${tm.enterprise}`);
+    }
+  }
+
   return errors;
 }
 
@@ -352,6 +459,9 @@ export function loadRules(rulesDir) {
     registration: rules.registration,
     solvability: rules.solvability,
     milestones: rules.milestones,
+    teamFormation: rules.teamFormation,
+    schedule: rules.schedule,
+    compliance: rules.compliance,
   };
 
   const errors = validateRules(grouped);

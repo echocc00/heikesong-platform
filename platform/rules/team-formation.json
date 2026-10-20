@@ -1,0 +1,12 @@
+{
+  "id": "team-formation",
+  "version": "2026-10-20",
+  "source": "任务书 §六 组队规则 + 顶层文档 §3.1",
+  "teamSize": { "min": 2, "max": 5 },
+  "captainMustBeMba": true,
+  "teamsPerPackage": { "min": 2, "max": 3 },
+  "packageQuotaMix": { "enterprise": 0.70, "free": 0.30 },
+  "memberChange": { "allowedDuringStage": true, "requireCaptainOrAdmin": true },
+  "singleMemberTriggersMerge": true,
+  "singleMemberMergeDeadlineDays": 3
+}
