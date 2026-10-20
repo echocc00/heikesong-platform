@@ -106,26 +106,27 @@ test('退化迁移文件名会被拒绝（不静默开版本缺口）', () => {
   // "_init.sql" —— Number('') === 0，会被当成版本 0
   const dirA = tempDir();
   writeFileSync(join(dirA, '_init.sql'), 'CREATE TABLE a (x INTEGER);');
-  assert.throws(() => readMigrationFiles(dirA), /迁移文件名必须形如 NNN_name\.sql/);
+  assert.throws(() => readMigrationFiles(dirA), /迁移文件名必须形如 <版本号>_<名称>\.sql/);
   rmSync(dirA, { recursive: true, force: true });
 
   // "1e3_x.sql" —— Number('1e3') === 1000，会静默跳到版本 1000，
   // 在「全局唯一序位」（001=P0 … 006=P5）上开出一个静默缺口
   const dirB = tempDir();
   writeFileSync(join(dirB, '1e3_x.sql'), 'CREATE TABLE a (x INTEGER);');
-  assert.throws(() => readMigrationFiles(dirB), /迁移文件名必须形如 NNN_name\.sql/);
+  assert.throws(() => readMigrationFiles(dirB), /迁移文件名必须形如 <版本号>_<名称>\.sql/);
   rmSync(dirB, { recursive: true, force: true });
 
   // "001.sql" —— 缺下划线
   const dirC = tempDir();
   writeFileSync(join(dirC, '001.sql'), 'CREATE TABLE a (x INTEGER);');
-  assert.throws(() => readMigrationFiles(dirC), /迁移文件名必须形如 NNN_name\.sql/);
+  assert.throws(() => readMigrationFiles(dirC), /迁移文件名必须形如 <版本号>_<名称>\.sql/);
   rmSync(dirC, { recursive: true, force: true });
 });
 
 test('同版本号冲突时错误信息里的文件名顺序是确定的（跨平台稳定）', () => {
-  // readdirSync 的返回顺序在 POSIX 里未定义（ext4/xfs 是 hash 序）。
-  // 同版本号必须按文件名二次排序，否则错误信息里的先后会随机 → CI 偶发红。
+  // readdirSync 的返回顺序在 POSIX 里未定义：APFS 按名序、ext4/xfs 按 hash 序。
+  // 错误信息里的两个文件名由实现**显式**按字节序排好 —— 跨平台保证由构造成立，
+  // 不依赖 readdir 恰好有序（这条保证在 macOS 上无法用变异检出，靠的是构造本身）。
   for (const [first, second] of [['a', 'b'], ['b', 'a']]) {
     const dir = tempDir();
     writeFileSync(join(dir, `001_${first}.sql`), 'CREATE TABLE a (x INTEGER);');
@@ -137,6 +138,20 @@ test('同版本号冲突时错误信息里的文件名顺序是确定的（跨�
     );
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('版本号必须从 001 起，且描述符不能为空', () => {
+  // 0 不是合法序位（001=P0 … 006=P5）
+  const dirA = tempDir();
+  writeFileSync(join(dirA, '0_x.sql'), 'CREATE TABLE a (x INTEGER);');
+  assert.throws(() => readMigrationFiles(dirA), /迁移版本号必须从 001 起/);
+  rmSync(dirA, { recursive: true, force: true });
+
+  // "01_.sql" —— 描述符为空
+  const dirB = tempDir();
+  writeFileSync(join(dirB, '01_.sql'), 'CREATE TABLE a (x INTEGER);');
+  assert.throws(() => readMigrationFiles(dirB), /迁移文件名必须形如/);
+  rmSync(dirB, { recursive: true, force: true });
 });
 
 // ⚠️ 下面两条断言的是「当前迁移集」的快照：P1 加入 002_registration.sql 之后，

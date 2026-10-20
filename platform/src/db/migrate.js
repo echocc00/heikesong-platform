@@ -26,24 +26,28 @@ export function readMigrationFiles(dir) {
   const files = readdirSync(dir)
     .filter((f) => f.endsWith('.sql'))
     .map((name) => {
-      // 严格解析：文件名必须形如 NNN_name.sql。
+      // 严格解析：文件名必须形如 <版本号>_<名称>.sql。
       // ⛔ 不能用 Number(name.split('_')[0])：那样 '_init.sql'（Number('')===0）、
       //    '1e3_x.sql'（Number('1e3')===1000）会被静默当成合法版本号 ——
       //    在「全局唯一序位」（001=P0、002=P1 … 006=P5）上开出一个静默缺口。
       //    依据：docs/superpowers/plans/INTERFACES.md「迁移版本号是全局唯一序位，
       //    002 起依次是 P1→P5」；同文档的重复版本号检查也以 '_' 为分隔符
       //    （ls -1 *.sql | cut -d_ -f1 | sort | uniq -d）。
-      const m = /^(\d+)_/.exec(name);
+      const m = /^(\d+)_(.+)\.sql$/.exec(name);
       if (!m) {
-        throw new Error(`迁移文件名必须形如 NNN_name.sql: ${name}`);
+        throw new Error(`迁移文件名必须形如 <版本号>_<名称>.sql: ${name}`);
       }
       const version = Number(m[1]);
+      // 版本号从 001 起 —— 0 不是合法序位（001=P0 … 006=P5）。
+      if (version < 1) {
+        throw new Error(`迁移版本号必须从 001 起: ${name}`);
+      }
       return { version, name, sql: readFileSync(join(dir, name), 'utf8') };
     })
     // 排序：版本号升序 + 同版本号按文件名字节序。
-    // ⚠️ readdirSync 的返回顺序在 POSIX 里未定义（ext4/xfs 是 hash 序），
-    //    只按 version 排序会让同版本号的两个文件谁在前取决于 readdir 顺序 →
-    //    错误信息里的文件名先后随机 → CI 偶发红。
+    // ⚠️ readdirSync 的返回顺序在 POSIX 里未定义：APFS 按名序、ext4/xfs 按 hash 序，
+    //    只按 version 排序会让同版本号的两个文件谁在前**因平台而异** →
+    //    跨平台不一致（R-OPS-02）。
     //    比较用字节序（< / >），**不用 localeCompare**：后者依赖 locale，跨平台不一致。
     //    依据：R-OPS-02「跨平台稳定」。
     .sort((a, b) => (a.version - b.version) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
@@ -54,8 +58,12 @@ export function readMigrationFiles(dir) {
   for (const f of files) {
     const prev = seen.get(f.version);
     if (prev) {
+      // 两个文件名**显式**按字节序排好再拼进错误信息 ——
+      // 这样即使上面的排序被改回去，错误信息本身仍然确定（不依赖 readdir 顺序）。
+      // 跨平台保证由**构造**成立，而不是靠"恰好 readdir 有序"。
+      const [x, y] = prev.name < f.name ? [prev.name, f.name] : [f.name, prev.name];
       throw new Error(
-        `迁移版本号重复: ${versionLabel(prev.name)} (${prev.name}, ${f.name})`,
+        `迁移版本号重复: ${versionLabel(x)} (${x}, ${y})`,
       );
     }
     seen.set(f.version, f);
