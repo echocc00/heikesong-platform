@@ -54,7 +54,13 @@ export function can(user, capability, ctx = null, db = null) {
   //    精简对象 { id, is_superadmin: 1 } 时，被停用的用户会被判为有权。
   //    只有**明确带 active 且为假**才拒绝。
   if (user.active !== undefined && !user.active) return false;
-  if (user.is_superadmin === 1) return true;
+  // ⚠️ 超管标志**同时认两种形状**：仓储层行是 `is_superadmin: 0|1`（snake_case），
+  //    toPublicUser() 的对外形状是 `isSuperadmin: boolean`（camelCase）。
+  //    can() 是全项目**唯一**权限入口（P1–P6 全部依赖）。若只认一种形状，
+  //    调用方传错形状会让**超管静默失去全部权限** —— 症状是"管理员登进去
+  //    什么都点不动"，极难定位。多认一种形状，把这类静默降级从根上消除。
+  //    （失败方向是 fail-closed：认不出超管只会少给权限，不会多给。）
+  if (user.is_superadmin === 1 || user.isSuperadmin === true) return true;
   if (!db) return false;
 
   // 角色能力

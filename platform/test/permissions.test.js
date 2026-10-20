@@ -196,3 +196,20 @@ test('停用用户判 false；没有 active 字段的精简对象不当成停用
   close();
   rmSync(dataDir, { recursive: true, force: true });
 });
+
+test('超管标志两种形状都认（仓储行 / toPublicUser 的驼峰形状）', () => {
+  // ⛔ 跨 Task 接口缝：can() 只认 snake_case 时，调用方传 toPublicUser() 的
+  //    驼峰形状会让**超管静默失去全部权限**（症状：管理员登进去什么都点不动）。
+  //    can() 是全项目唯一权限入口，必须两种形状都认。
+  const { db, close, dataDir, user } = setup();
+  user.is_superadmin = 1;
+  assert.equal(can(user, 'score:write', null, db), true);
+  assert.equal(can({ id: user.id, isSuperadmin: true, active: true }, 'score:write', null, db), true);
+  // 反向：非超管的驼峰形状不能被误判成超管
+  assert.equal(
+    can({ id: user.id, isSuperadmin: false, active: true }, 'score:write', null, db),
+    false,
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
