@@ -379,26 +379,27 @@ test('退化迁移文件名会被拒绝（不静默开版本缺口）', () => {
   // "_init.sql" —— Number('') === 0，会被当成版本 0
   const dirA = tempDir();
   writeFileSync(join(dirA, '_init.sql'), 'CREATE TABLE a (x INTEGER);');
-  assert.throws(() => readMigrationFiles(dirA), /迁移文件名必须形如 NNN_name\.sql/);
+  assert.throws(() => readMigrationFiles(dirA), /迁移文件名必须形如 <版本号>_<名称>\.sql/);
   rmSync(dirA, { recursive: true, force: true });
 
   // "1e3_x.sql" —— Number('1e3') === 1000，会静默跳到版本 1000，
   // 在「全局唯一序位」（001=P0 … 006=P5）上开出一个静默缺口
   const dirB = tempDir();
   writeFileSync(join(dirB, '1e3_x.sql'), 'CREATE TABLE a (x INTEGER);');
-  assert.throws(() => readMigrationFiles(dirB), /迁移文件名必须形如 NNN_name\.sql/);
+  assert.throws(() => readMigrationFiles(dirB), /迁移文件名必须形如 <版本号>_<名称>\.sql/);
   rmSync(dirB, { recursive: true, force: true });
 
   // "001.sql" —— 缺下划线
   const dirC = tempDir();
   writeFileSync(join(dirC, '001.sql'), 'CREATE TABLE a (x INTEGER);');
-  assert.throws(() => readMigrationFiles(dirC), /迁移文件名必须形如 NNN_name\.sql/);
+  assert.throws(() => readMigrationFiles(dirC), /迁移文件名必须形如 <版本号>_<名称>\.sql/);
   rmSync(dirC, { recursive: true, force: true });
 });
 
 test('同版本号冲突时错误信息里的文件名顺序是确定的（跨平台稳定）', () => {
-  // readdirSync 的返回顺序在 POSIX 里未定义（ext4/xfs 是 hash 序）。
-  // 同版本号必须按文件名二次排序，否则错误信息里的先后会随机 → CI 偶发红。
+  // readdirSync 的返回顺序在 POSIX 里未定义：APFS 按名序、ext4/xfs 按 hash 序。
+  // 错误信息里的两个文件名由实现**显式**按字节序排好 —— 跨平台保证由构造成立，
+  // 不依赖 readdir 恰好有序（这条保证在 macOS 上无法用变异检出，靠的是构造本身）。
   for (const [first, second] of [['a', 'b'], ['b', 'a']]) {
     const dir = tempDir();
     writeFileSync(join(dir, `001_${first}.sql`), 'CREATE TABLE a (x INTEGER);');
@@ -410,6 +411,20 @@ test('同版本号冲突时错误信息里的文件名顺序是确定的（跨�
     );
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('版本号必须从 001 起，且描述符不能为空', () => {
+  // 0 不是合法序位（001=P0 … 006=P5）
+  const dirA = tempDir();
+  writeFileSync(join(dirA, '0_x.sql'), 'CREATE TABLE a (x INTEGER);');
+  assert.throws(() => readMigrationFiles(dirA), /迁移版本号必须从 001 起/);
+  rmSync(dirA, { recursive: true, force: true });
+
+  // "01_.sql" —— 描述符为空
+  const dirB = tempDir();
+  writeFileSync(join(dirB, '01_.sql'), 'CREATE TABLE a (x INTEGER);');
+  assert.throws(() => readMigrationFiles(dirB), /迁移文件名必须形如/);
+  rmSync(dirB, { recursive: true, force: true });
 });
 
 // ⚠️ 下面两条断言的是「当前迁移集」的快照：P1 加入 002_registration.sql 之后，
@@ -570,24 +585,28 @@ export function readMigrationFiles(dir) {
   const files = readdirSync(dir)
     .filter((f) => f.endsWith('.sql'))
     .map((name) => {
-      // 严格解析：文件名必须形如 NNN_name.sql。
+      // 严格解析：文件名必须形如 <版本号>_<名称>.sql。
       // ⛔ 不能用 Number(name.split('_')[0])：那样 '_init.sql'（Number('')===0）、
       //    '1e3_x.sql'（Number('1e3')===1000）会被静默当成合法版本号 ——
       //    在「全局唯一序位」（001=P0、002=P1 … 006=P5）上开出一个静默缺口。
       //    依据：docs/superpowers/plans/INTERFACES.md「迁移版本号是全局唯一序位，
       //    002 起依次是 P1→P5」；同文档的重复版本号检查也以 '_' 为分隔符
       //    （ls -1 *.sql | cut -d_ -f1 | sort | uniq -d）。
-      const m = /^(\d+)_/.exec(name);
+      const m = /^(\d+)_(.+)\.sql$/.exec(name);
       if (!m) {
-        throw new Error(`迁移文件名必须形如 NNN_name.sql: ${name}`);
+        throw new Error(`迁移文件名必须形如 <版本号>_<名称>.sql: ${name}`);
       }
       const version = Number(m[1]);
+      // 版本号从 001 起 —— 0 不是合法序位（001=P0 … 006=P5）。
+      if (version < 1) {
+        throw new Error(`迁移版本号必须从 001 起: ${name}`);
+      }
       return { version, name, sql: readFileSync(join(dir, name), 'utf8') };
     })
     // 排序：版本号升序 + 同版本号按文件名字节序。
-    // ⚠️ readdirSync 的返回顺序在 POSIX 里未定义（ext4/xfs 是 hash 序），
-    //    只按 version 排序会让同版本号的两个文件谁在前取决于 readdir 顺序 →
-    //    错误信息里的文件名先后随机 → CI 偶发红。
+    // ⚠️ readdirSync 的返回顺序在 POSIX 里未定义：APFS 按名序、ext4/xfs 按 hash 序，
+    //    只按 version 排序会让同版本号的两个文件谁在前**因平台而异** →
+    //    跨平台不一致（R-OPS-02）。
     //    比较用字节序（< / >），**不用 localeCompare**：后者依赖 locale，跨平台不一致。
     //    依据：R-OPS-02「跨平台稳定」。
     .sort((a, b) => (a.version - b.version) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
@@ -598,8 +617,12 @@ export function readMigrationFiles(dir) {
   for (const f of files) {
     const prev = seen.get(f.version);
     if (prev) {
+      // 两个文件名**显式**按字节序排好再拼进错误信息 ——
+      // 这样即使上面的排序被改回去，错误信息本身仍然确定（不依赖 readdir 顺序）。
+      // 跨平台保证由**构造**成立，而不是靠"恰好 readdir 有序"。
+      const [x, y] = prev.name < f.name ? [prev.name, f.name] : [f.name, prev.name];
       throw new Error(
-        `迁移版本号重复: ${versionLabel(prev.name)} (${prev.name}, ${f.name})`,
+        `迁移版本号重复: ${versionLabel(x)} (${x}, ${y})`,
       );
     }
     seen.set(f.version, f);
@@ -769,7 +792,7 @@ try {
 - [ ] **Step 7: 运行测试确认通过**
 
 Run: `cd platform && node --test test/migrate.test.js`
-Expected: PASS（9 个测试全过）
+Expected: PASS（10 个测试全过）
 
 - [ ] **Step 8: 实跑迁移脚本**
 
@@ -809,6 +832,19 @@ git commit -m "feat(P0): SQLite 封装、迁移机制与初始表结构"
 > **⑧** **`solvability.grades` 的评分区间不得重叠** —— A/B/C/D 是**互斥**区间（A 10-12 / B 7-9 / C 4-6 / D 0-3），
 > 实测改成重叠后**不报错**；重叠会让同一分数落进两个等级，评级结果取决于查表顺序 → 不可复算。
 > 对应测试从 13 条增至 **16 条**。
+>
+> **【2026-10-20 评审后第 3 轮补强】** Task 3 首轮评审 Approved，但评审挖出一条**规格级 Important**：
+> `docs/rule-decisions.md:119-121` 的 **C-05 裁决**要求 `rules/scoring-*.json` 里必须有
+> `fallback: "global" | "raw"`（归一化在样本不足时的兜底策略，**可配**），实测 **9 份 JSON 一处都没有** ——
+> 裁决没有写进规则配置文件，与该文件开篇「每条冲突必须有裁决，且裁决必须写进规则配置文件」直接冲突。
+> 顺带补齐另两条裁决的落地方式：**C-03** 要求 tiebreak 有序链**逐项**标注来源文档（原来只有文件级 source）；
+> **C-04** 要求 `scoring-final.json` 加说明字段说明「完成度以 §2.2 的 20% 为准」。
+> 本轮新增/修正 6 条校验 + 6 条测试：
+> **⑨** `fallback` 必须是 `global` / `raw`（C-05）；**⑩** `conflictRef: C-01` ⇒ `wEnterprise === 0.10`
+> **由运行时校验器锁住**（原来只靠测试，同时改 wEnterprise 与企业维度权重可绕过）；
+> **⑪** `solvability.grades` 反向区间 `min > max` 当场拒绝；**⑫** 维度缺 `key` 当场拒绝；
+> **⑬** 9 份配置缺 `version` 当场拒绝（原来只校验「存在的那几份全等」）；
+> **⑭** tiebreak 每项必须有 `source`（C-03）。对应测试从 16 条增至 **22 条**。
 >
 > ⚠️ 本轮父代理自己写的校验代码里也踩了一个坑（已修正）：`[...new Set(arr)]` 得到的是**数组**，
 > 判重数要用 `.length`；写成 `.size` 会拿到 `undefined`，`undefined > 1` 恒为 false，
@@ -974,6 +1010,61 @@ test('solvability.grades 的评分区间不得重叠', () => {
   broken.solvability.grades[1].minScore = broken.solvability.grades[0].minScore; // B 覆盖到 A
   assert.ok(validateRules(broken).some((e) => e.includes('区间重叠')));
 });
+
+// ── 以下 6 条来自 Task 3 评审（rule-decisions 裁决的落地方式未落实）──────────
+
+test('归一化的兜底策略 fallback 必须是 global 或 raw（C-05 裁决）', () => {
+  const { rules } = loadRules(rulesDir);
+  assert.equal(rules.scoring.initial.fallback, 'global');
+  assert.equal(rules.scoring.final.fallback, 'global');
+  const broken = structuredClone(rules);
+  delete broken.scoring.final.fallback;
+  assert.ok(validateRules(broken).some((e) => e.includes('fallback')));
+});
+
+test('C-01 裁决由运行时校验器锁住（不只靠测试）', () => {
+  const { rules } = loadRules(rulesDir);
+  const broken = structuredClone(rules);
+  // 同时改 wEnterprise 与企业维度权重，并把完成度调低 —— 合计仍是 100%。
+  // 这正是「只靠测试锁不住」的绕过路径。
+  broken.scoring.initial.wEnterprise = 0.20;
+  const ent = broken.scoring.initial.dimensions.find((d) => d.seat === 'enterprise');
+  ent.weight = 0.20;
+  broken.scoring.initial.dimensions.find((d) => d.key === 'completeness').weight = 0.15;
+  const errors = validateRules(broken);
+  assert.ok(
+    errors.some((e) => e.includes('C-01')),
+    'C-01 裁决的初赛企业确认权重 10% 必须由校验器锁住',
+  );
+});
+
+test('solvability.grades 的反向区间（min > max）会被拒绝', () => {
+  const { rules } = loadRules(rulesDir);
+  const broken = structuredClone(rules);
+  broken.solvability.grades[0].maxScore = 6; // A 变成 10-6，永远匹配不到
+  assert.ok(validateRules(broken).some((e) => e.includes('区间非法')));
+});
+
+test('维度缺少 key 会被拒绝（否则算分无法映射回维度）', () => {
+  const { rules } = loadRules(rulesDir);
+  const broken = structuredClone(rules);
+  delete broken.scoring.final.dimensions[0].key;
+  assert.ok(validateRules(broken).some((e) => e.includes('缺少 key')));
+});
+
+test('某份配置缺少 version 会被拒绝（不能只校验存在的那几份）', () => {
+  const { rules } = loadRules(rulesDir);
+  const broken = structuredClone(rules);
+  delete broken.tiebreak.version;
+  assert.ok(validateRules(broken).some((e) => e.includes('缺少 version')));
+});
+
+test('破同分链每一项都必须标注来源文档（C-03 落地要求）', () => {
+  const { rules } = loadRules(rulesDir);
+  const broken = structuredClone(rules);
+  delete broken.tiebreak.chain[1].source;
+  assert.ok(validateRules(broken).some((e) => e.includes('source')));
+});
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -991,10 +1082,11 @@ Expected: FAIL —— `Cannot find module '../src/config.js'`
   "version": "2026-10-20",
   "conflictRef": "C-01",
   "source": "S7 §2.1 初赛权重表 + §3.1 评分公式",
-  "note": "初赛 wEnterprise=0.10 —— 依据权重表合计正好 100% 反推，见 rule-decisions.md C-01",
+  "note": "初赛 wEnterprise=0.10 —— 依据权重表合计正好 100% 反推，见 rule-decisions.md C-01；fallback=global 依据 C-05 裁决（S7 §3.1 原文：样本数<5 退回全局均值方差）",
   "wEnterprise": 0.10,
   "normalizationStrategy": "zscore",
   "minSamplesForJudgeNormalization": 5,
+  "fallback": "global",
   "trimOutliers": true,
   "minJudgesForTrim": 5,
   "dimensions": [
@@ -1014,10 +1106,13 @@ Expected: FAIL —— `Cannot find module '../src/config.js'`
 {
   "id": "scoring-final",
   "version": "2026-10-20",
+  "conflictRef": "C-04",
   "source": "S7 §2.2 决赛权重表 + §3.1 评分公式",
+  "note": "完成度以 §2.2 权重表的 20% 为准；S7 §6 的「25%→15%」是历史叙述章节、不具规则效力（rule-decisions.md C-04）。fallback=global 依据 C-05 裁决",
   "wEnterprise": 0.25,
   "normalizationStrategy": "zscore",
   "minSamplesForJudgeNormalization": 5,
+  "fallback": "global",
   "trimOutliers": true,
   "minJudgesForTrim": 5,
   "dimensions": [
@@ -1040,12 +1135,12 @@ Expected: FAIL —— `Cannot find module '../src/config.js'`
   "conflictRef": "C-03",
   "source": "S7 §3.3 + S10 §0.4 + S10 §3.3（原文互相冲突，此处为裁决后的有序链）",
   "chain": [
-    { "key": "total",          "label": "总分",             "direction": "desc", "scope": "always" },
-    { "key": "tiebreak_extra", "label": "加时陈述复议分",   "direction": "desc", "scope": "final_only", "manual": true },
-    { "key": "peer",           "label": "互评分",           "direction": "desc", "scope": "tied_only" },
-    { "key": "enterprise_raw", "label": "企业确认原始分",   "direction": "desc", "scope": "tied_only" },
-    { "key": "behavior",       "label": "行为分",           "direction": "desc", "scope": "tied_only" },
-    { "key": "team_id",        "label": "队伍编号",         "direction": "asc",  "scope": "always", "deterministic": true }
+    { "key": "total",          "label": "总分",           "direction": "desc", "scope": "always",     "source": "S7 §3.1 总分" },
+    { "key": "tiebreak_extra", "label": "加时陈述复议分", "direction": "desc", "scope": "final_only", "manual": true, "source": "S10 §0.4 加时陈述复议" },
+    { "key": "peer",           "label": "互评分",         "direction": "desc", "scope": "tied_only",  "source": "S7 §3.3 互评（唯一破同分工具）" },
+    { "key": "enterprise_raw", "label": "企业确认原始分", "direction": "desc", "scope": "tied_only",  "source": "S7 §3.3 兜底（主观但独立于互评）" },
+    { "key": "behavior",       "label": "行为分",         "direction": "desc", "scope": "tied_only",  "source": "S10 §3.3 过程参与度，≤10%，最弱" },
+    { "key": "team_id",        "label": "队伍编号",       "direction": "asc",  "scope": "always", "deterministic": true, "source": "C-03 新增：三份文档都没写的最终确定性兜底，保证排序永远可复现（满足 R-AUD-01）" }
   ]
 }
 ```
@@ -1233,6 +1328,10 @@ function readJson(path) {
 
 // 归一化策略四选一（设计文档 §6.2 裁决：可切换）
 const VALID_NORMALIZATIONS = ['zscore', 'median', 'trimmed', 'bayes'];
+// 归一化的兜底策略二选一（rule-decisions.md C-05 裁决）：
+//   global —— 退回全局均值方差（S7 §3.1 原文）；raw —— 直接用原始分。
+//   缺这个键 = 样本不足时的归一化行为无定义，必须当场拒绝。
+const VALID_FALLBACKS = ['global', 'raw'];
 // 里程碑确认方只有两种：企业侧确认 / 评委确认
 const VALID_CONFIRMERS = ['enterprise', 'judge'];
 
@@ -1249,6 +1348,11 @@ function hasDuplicateKeys(items) {
 // 校验器的第一职责是**自己不崩**、给出可读错误，而不是把裸 TypeError 抛给调用方。
 function hasBadItem(items) {
   return items.some((i) => i === null || typeof i !== 'object');
+}
+
+// 维度必须都有 key —— 否则算分时无法把分数映射回维度。
+function hasMissingKey(items) {
+  return items.some((i) => typeof i.key !== 'string' || !i.key);
 }
 
 export function validateRules(rules) {
@@ -1270,6 +1374,11 @@ export function validateRules(rules) {
     rules?.solvability?.version,
     rules?.milestones?.version,
   ].filter((v) => v !== undefined && v !== null && v !== '');
+  // 9 份必须**都有** version —— 只校验「存在的那几份全等」是不够的：
+  // 缺一份时 loadRules 对外报的 version 会取到别人的值，等于说谎。
+  if (versionValues.length < 9) {
+    push(`规则配置有 ${9 - versionValues.length} 份缺少 version 字段`);
+  }
   if (versionValues.length > 1) {
     const distinct = [...new Set(versionValues)];
     // ⚠️ distinct 是**数组**（Set 被展开），判重数用 .length —— 用 .size 会拿到
@@ -1312,6 +1421,20 @@ export function validateRules(rules) {
     if (!VALID_NORMALIZATIONS.includes(cfg.normalizationStrategy)) {
       push(`scoring.${key} normalizationStrategy 非法`);
     }
+    // C-05 裁决：兜底策略可配 —— "global" 退回全局均值方差（S7 §3.1 原文），
+    // "raw" 直接用原始分。缺这个键 = 样本不足时归一化怎么走没有定义。
+    if (!VALID_FALLBACKS.includes(cfg.fallback)) {
+      push(`scoring.${key}.fallback 必须是 ${VALID_FALLBACKS.join(' / ')}（C-05 裁决）`);
+    }
+    // C-01 裁决：初赛企业确认权重锁定 10%（由 S7 §2.1 权重表合计正好 100% 反推）。
+    // 只靠测试锁不住 —— 同时改 wEnterprise 与企业维度权重（保持合计 100%）能绕过测试，
+    // 所以校验器也要锁。改动此项须同步改 rule-decisions.md 的 C-01。
+    if (cfg.conflictRef === 'C-01' && Math.abs(cfg.wEnterprise - 0.10) > 1e-9) {
+      push(`scoring.${key}.wEnterprise 必须为 0.10（C-01 裁决）`);
+    }
+    if (hasMissingKey(cfg.dimensions)) {
+      push(`scoring.${key}.dimensions 存在缺少 key 的维度`);
+    }
     if (hasDuplicateKeys(cfg.dimensions)) {
       push(`scoring.${key}.dimensions 存在重复 key`);
     }
@@ -1333,6 +1456,11 @@ export function validateRules(rules) {
     }
     if (hasDuplicateKeys(chain)) {
       push('tiebreak.chain 存在重复 key');
+    }
+    // C-03 落地要求：有序链的**每一项**都要标注来源文档与生效条件
+    // （生效条件 = scope，已有；来源文档 = source，必须有）。
+    if (chain.some((c) => typeof c.source !== 'string' || !c.source)) {
+      push('tiebreak.chain 存在缺少 source 的项（C-03 要求逐项标注来源文档）');
     }
   }
 
@@ -1377,6 +1505,9 @@ export function validateRules(rules) {
   } else if (hasBadItem(regDims)) {
     push('registration.dimensions 含非对象元素');
   } else {
+    if (hasMissingKey(regDims)) {
+      push('registration.dimensions 存在缺少 key 的维度');
+    }
     const sum = weightSum(regDims);
     if (Math.abs(sum - 1) > 1e-9) {
       push(`registration.dimensions 权重合计 = ${sum.toFixed(4)}，必须等于 1`);
@@ -1390,6 +1521,9 @@ export function validateRules(rules) {
   } else if (hasBadItem(sol.dimensions)) {
     push('solvability.dimensions 含非对象元素');
   } else {
+    if (hasMissingKey(sol.dimensions)) {
+      push('solvability.dimensions 存在缺少 key 的维度');
+    }
     const sum = weightSum(sol.dimensions);
     if (Math.abs(sum - 1) > 1e-9) {
       push(`solvability.dimensions 权重合计 = ${sum.toFixed(4)}，必须等于 1`);
@@ -1402,6 +1536,16 @@ export function validateRules(rules) {
   } else if (hasDuplicateKeys(sol.grades)) {
     push('solvability.grades 存在重复 key');
   } else {
+    // 反向区间（minScore > maxScore）永远匹配不到任何分数 —— 当场拒绝。
+    for (const g of sol.grades) {
+      if (typeof g.minScore !== 'number' || typeof g.maxScore !== 'number'
+        || g.minScore > g.maxScore) {
+        push(
+          `solvability.grades 等级 ${g.key} 的区间非法`
+          + `（minScore=${g.minScore}, maxScore=${g.maxScore}）`,
+        );
+      }
+    }
     // A/B/C/D 是**互斥**的评分区间：重叠会让同一个分数落进两个等级，
     // 评级结果取决于查表顺序 —— 不可复算。
     const sorted = [...sol.grades].sort((a, b) => a.minScore - b.minScore);
@@ -1526,7 +1670,7 @@ export function loadRules(rulesDir) {
 - [ ] **Step 5: 运行测试确认通过**
 
 Run: `cd platform && node --test test/config.test.js`
-Expected: PASS（16 个测试全过）
+Expected: PASS（22 个测试全过）
 
 - [ ] **Step 6: 提交**
 
