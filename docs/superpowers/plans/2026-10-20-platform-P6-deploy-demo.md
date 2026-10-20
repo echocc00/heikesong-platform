@@ -6,7 +6,7 @@
 
 **Architecture:** 正式版 = 单进程 Node（仅标准库）+ SQLite 单文件 + nginx 反代。**⛔ 单写者**：禁止多 Node worker 进程同时写同一个 `.db`（SQLite 官方：single writer at a time），扩容只能加「读」（静态资源交给 nginx 直出）；⚠️ WAL 要求所有进程在同一台主机，**一旦要多机部署必须换 Postgres，没有第三条路**。演示版 = **同源静态前端 + `web/api.demo.js`（localStorage 适配器）**，它**直接 import `../src/domain/*.js`**（领域层本来就是无 IO 的纯函数 ESM，相对路径 import 即可，**不需要打包器**）→ **规则引擎在浏览器里真实运行**，演示出来的算法行为与正式系统一致。
 
-**Tech Stack:** Node ≥22.5（生产建议 24）｜`node:sqlite`（含 `backup()` API）｜`node:crypto`（scrypt）｜`node:test`｜原生 ESM 前端，无构建｜**npm 依赖 0 个**
+**Tech Stack:** Node ≥22.16.0（生产建议 24）｜`node:sqlite`（含 `backup()` API）｜`node:crypto`（scrypt）｜`node:test`｜原生 ESM 前端，无构建｜**npm 依赖 0 个**
 
 ## 需求覆盖（本阶段负责的 8 条 NFR）
 
@@ -24,7 +24,7 @@
 ## Global Constraints
 
 ```
-运行时      Node ≥ 22.5（不使用任何 Node-24-only API；URLPattern 不可用，路由手写）
+运行时      Node ≥ 22.16.0（不使用任何 Node-24-only API；URLPattern 不可用，路由手写）
 npm 依赖    0 个。package.json 只有 {"type":"module"}，不得新增 dependencies
 数据库      node:sqlite。data/app.db，WAL 模式。单写者：禁止多 worker 写同一文件
 测试        node:test。命令：node --test
@@ -3494,7 +3494,7 @@ sudo SERVER_NAME=heikesong.example.com \
 
 `install.sh` 做这些事（**幂等，可重复执行**）：
 
-1. 检查 Node ≥ 22.5，不满足则装 Node 24
+1. 检查 Node ≥ 22.16.0，不满足则装 Node 24
 2. 创建系统用户 `heikesong` 与数据目录 `/var/lib/heikesong/data`
 3. 同步程序到 `/opt/heikesong/platform`
 4. 写 `/etc/heikesong/platform.env`（**不含任何口令**）

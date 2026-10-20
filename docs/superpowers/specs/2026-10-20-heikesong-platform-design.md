@@ -242,7 +242,7 @@ MLH 的组织者指南明确建议：**不要自建评审系统，用 Gavel 或 
 
 | 决策 | 取值 | 依据 |
 |---|---|---|
-| 运行时 | Node ≥ 22.5 | `node:sqlite` 最低版本要求 |
+| 运行时 | Node ≥ 22.16.0 | `node:sqlite` 免 `--experimental-sqlite` 的下限 22.13.0 与 `sqlite.backup()` 的下限 22.16.0，取**并集** |
 | **npm 依赖** | **0 个** | R-OPS-01/02：不能依赖联网 `npm install` |
 | 数据库 | `node:sqlite`（内置） | 无原生编译、跨平台、单文件 |
 | 前端框架 | 无。原生 ESM + 哈希路由 | 同上 |
@@ -260,8 +260,19 @@ MLH 的组织者指南明确建议：**不要自建评审系统，用 Gavel 或 
 | `scrypt` 密码哈希 / `randomBytes` token / HMAC / `timingSafeEqual` | ✅ 可用 |
 | SSE 零依赖推送 | ✅ 可用 |
 
-**【决策】目标运行时 Node ≥ 22.5，开发与测试锚定本机 22.23.2**。
+**【决策】目标运行时 Node ≥ 22.16.0，开发与测试锚定本机 22.23.2**。
 **理由**：Node 22.18+ 起默认开启 TypeScript type stripping（`.ts` 可直接 `node server.ts`），所以**后端也能零构建**，不只前端。
+
+**版本下限为什么是 22.16.0（事实性修正，2026-10-20）**：初稿写的 `22.5` 是**错的** —— 22.5.0 只是 `node:sqlite` 的「引入版本」，不是「可用版本」。依据 Node v22 官方文档 SQLite 页的 History 表（<https://nodejs.org/docs/latest-v22.x/api/sqlite.html>）：
+
+| 版本 | 官方原文 | 对本项目的含义 |
+|---|---|---|
+| v22.5.0 | `Added in: v22.5.0` | 引入 `node:sqlite`，但**必须**加 `--experimental-sqlite` 才能 import |
+| v22.13.0 | `SQLite is no longer behind --experimental-sqlite but still experimental` | **免 flag 的真实下限** —— 本项目全程不用该 flag，故 22.5.0–22.12.x 会在 `import { DatabaseSync } from 'node:sqlite'` 处直接抛错 |
+| v22.16.0 | `sqlite.backup(sourceDb, destination[, options])` — `Added in: v22.16.0` | §14 备份方案所依赖的一致性备份 API 的下限 |
+
+`package.json` 的 `engines` 是**项目级**单一声明，应表达整个系统的运行时下限，因此取两个下限的**并集** = max(22.13.0, 22.16.0) = **22.16.0**。声明一个跑不起来的版本比声明一个略严的版本更糟：前者让用户以为 22.5 可用、装完才炸；后者只是提前挡掉 22.13–22.15（这三个小版本早已无人使用，22.16.0 发布于 2025-02）。生产仍推荐 Node 24。
+
 **Node 24 是推荐的生产运行时，但本设计不使用任何 Node-24-only API**：
 - Node 22 没有 `URLPattern`（Node 24 才有）→ **路由手写约 100 行**，不因此抬高运行时门槛
 - 生命周期：Node 22 EOL **2027-04-30**；Node 24 EOL **2028-04-30**（2026-10-20 进维护期）

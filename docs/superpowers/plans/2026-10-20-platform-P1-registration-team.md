@@ -6,12 +6,12 @@
 
 **Architecture:** 沿用 P0 单进程 Node（仅标准库）骨架。`src/domain/` 放纯函数规则引擎（`registration.js` 算分分级、`solvability.js` 六维可解性，无 IO / 无 `Date.now()` / 无 `Math.random()`）；`src/services/` 做用例编排（报名 / 战队 / 任务卡）；`src/db/repo/` 收全部 SQL（7 张新表 + 7 个仓储模块）；`src/http/routes/` 挂 P1 的 14 个 API 端点（报名 5 + 战队 5 + 任务卡 4）。可见性在 API 层过滤：报名筛选标准公开可读，个人报名明细只对本人与组委会可见。
 
-**Tech Stack:** Node ≥22.5（生产建议 24）｜`node:sqlite`｜`node:crypto`（scrypt）｜`node:test`｜原生 ESM 前端，无构建｜**npm 依赖 0 个**
+**Tech Stack:** Node ≥22.16.0（生产建议 24）｜`node:sqlite`｜`node:crypto`（scrypt）｜`node:test`｜原生 ESM 前端，无构建｜**npm 依赖 0 个**
 
 ## Global Constraints
 
 ```
-运行时      Node ≥ 22.5（不使用任何 Node-24-only API；URLPattern 不可用，路由手写）
+运行时      Node ≥ 22.16.0（不使用任何 Node-24-only API；URLPattern 不可用，路由手写）
 npm 依赖    0 个。package.json 只有 {"type":"module"}，不得新增 dependencies
 数据库      node:sqlite。data/app.db，WAL 模式。单写者：禁止多 worker 写同一文件
 测试        node:test。命令：node --test

@@ -6,12 +6,12 @@
 
 **Architecture:** 延续 P0 分层：`src/domain/*` 纯函数（无 IO、无 `Date.now()`、无 `Math.random()`），`src/services/*` 编排用例，`src/db/repo/*` 收全部 SQL，`web/views/*` 原生 ESM 前端。P3 消费 P2 的 `stage_results`（总分口径）与 `computation_snapshots`（trace 与降级告警）、P1 的 `teams` / `task_packages` / `team_members`，**新增一条独立的行为分数据通路**（`behavior_events`），行为分只从这条路进破同分链的最后一档。发榜是显式动作（`publishLeaderboard`），每次发榜写 `leaderboard_snapshots` 快照 + 审计日志，满足"可复算"。
 
-**Tech Stack:** Node ≥22.5（生产建议 24）｜`node:sqlite`｜`node:crypto`（scrypt）｜`node:test`｜原生 ESM 前端，无构建｜**npm 依赖 0 个**
+**Tech Stack:** Node ≥22.16.0（生产建议 24）｜`node:sqlite`｜`node:crypto`（scrypt）｜`node:test`｜原生 ESM 前端，无构建｜**npm 依赖 0 个**
 
 ## Global Constraints
 
 ```
-运行时      Node ≥ 22.5（不使用任何 Node-24-only API；URLPattern 不可用，路由手写）
+运行时      Node ≥ 22.16.0（不使用任何 Node-24-only API；URLPattern 不可用，路由手写）
 npm 依赖    0 个。package.json 只有 {"type":"module"}，不得新增 dependencies
 数据库      node:sqlite。data/app.db，WAL 模式。单写者：禁止多 worker 写同一文件
 测试        node:test。命令：node --test

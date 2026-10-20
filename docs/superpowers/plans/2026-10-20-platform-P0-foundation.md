@@ -6,12 +6,12 @@
 
 **Architecture:** 单进程 Node（仅标准库）。`src/http/` 提供路由与响应；`src/db/` 提供 SQLite 封装、迁移与仓储层（所有 SQL 收在这里）；`src/domain/` 放纯函数规则引擎（无 IO，本阶段先建空壳接口）；`src/auth/` 管认证与权限判定；`src/config.js` 加载并校验 `rules/*.json`，校验不过直接拒绝启动。前端为原生 ESM，`web/` 静态托管，`web/api.js` 与 `web/api.demo.js` 双适配器共用同一套视图。
 
-**Tech Stack:** Node ≥22.5（生产建议 24）｜`node:sqlite`｜`node:crypto`（scrypt）｜`node:test`｜原生 ESM 前端，无构建｜**npm 依赖 0 个**
+**Tech Stack:** Node ≥22.16.0（生产建议 24）｜`node:sqlite`｜`node:crypto`（scrypt）｜`node:test`｜原生 ESM 前端，无构建｜**npm 依赖 0 个**
 
 ## Global Constraints
 
 ```
-运行时      Node ≥ 22.5（不使用任何 Node-24-only API；URLPattern 不可用，路由手写）
+运行时      Node ≥ 22.16.0（不使用任何 Node-24-only API；URLPattern 不可用，路由手写）
 npm 依赖    0 个。package.json 只有 {"type":"module"}，不得新增 dependencies
 数据库      node:sqlite。data/app.db，WAL 模式。单写者：禁止多 worker 写同一文件
 测试        node:test。命令：node --test
@@ -157,7 +157,7 @@ Expected: FAIL —— `ENOENT: no such file or directory, open 'platform/package
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=22.5.0" },
+  "engines": { "node": ">=22.16.0" },
   "scripts": {
     "start": "node --disable-warning=ExperimentalWarning src/server.js",
     "test": "node --disable-warning=ExperimentalWarning --test",
@@ -227,6 +227,15 @@ git commit -m "feat(P0): 零依赖骨架与零依赖守卫测试"
 
 ### Task 2: SQLite 封装与迁移机制
 
+> **【2026-10-20 评审后修正】** 本 Task 的代码块已按实现回写（评审判定 Needs fixes，3 条 Important）。
+> 修正三处：**①** `engines.node` 由 `>=22.5.0` 改为 `>=22.16.0`（22.5.0 只是 `node:sqlite` 的引入版本，
+> 22.5.0–22.12.x 免不了 `--experimental-sqlite` 标志会直接抛错；`sqlite.backup()` 又需 ≥22.16.0，取并集）；
+> **②** `readMigrationFiles` 增加**重复版本号 fail-fast**（原实现按 version 静默去重 → 第二次运行
+> 打印"本次无新迁移"、退出码 0，而被遮蔽的那张表永远建不出来，schema 缺口被静默固化）；
+> **③** 新增**真实 `001_init.sql` 冒烟测试**（原实现的测试全部用临时目录内联 SQL，
+> 真实 DDL 从未被 apply 过，可带错而 CI 全绿）。详见 Step 1 的测试清单与下方代码块。
+> 归因与官方出处见设计文档 §4.2「运行时与依赖」。
+
 **Files:**
 - Create: `platform/src/db/sqlite.js`
 - Create: `platform/src/db/migrate.js`
@@ -248,11 +257,17 @@ git commit -m "feat(P0): 零依赖骨架与零依赖守卫测试"
 ```javascript
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { openDatabase } from '../src/db/sqlite.js';
 import { applyMigrations, readMigrationFiles } from '../src/db/migrate.js';
+
+// 真实迁移目录（platform/db/migrations）—— 本文件在 platform/test/ 下，故取上一级。
+// 真实 DDL 必须被真正 apply 过：否则 001_init.sql 可以带着语法/外键/类型错误
+// 而 CI 全绿（迁移文件本身从不进任何测试夹具）。
+const REAL_MIGRATIONS = join(dirname(fileURLToPath(import.meta.url)), '..', 'db', 'migrations');
 
 function tempDir() {
   return mkdtempSync(join(tmpdir(), 'hks-mig-'));
@@ -293,6 +308,135 @@ test('WAL 与 foreign_keys 已开启', () => {
   db.close();
   rmSync(dataDir, { recursive: true, force: true });
 });
+
+test('重复版本号：响亮报错，而不是静默跳过', () => {
+  const dir = tempDir();
+  writeFileSync(join(dir, '001_a.sql'), 'CREATE TABLE a (x INTEGER);');
+  writeFileSync(join(dir, '001_b.sql'), 'CREATE TABLE b (x INTEGER);');
+
+  // 错误信息必须同时含版本号与冲突的两个文件名
+  assert.throws(
+    () => readMigrationFiles(dir),
+    /迁移版本号重复: 001 \(001_a\.sql, 001_b\.sql\)/,
+  );
+
+  const dataDir = tempDir();
+  const { db } = openDatabase({ dataDir });
+  assert.throws(() => applyMigrations(db, dir), /迁移版本号重复/);
+
+  // 报错发生在应用任何 SQL 之前：连 schema_migrations 都不该被建出来
+  const tables = db
+    .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+    .all()
+    .map((r) => r.name);
+  assert.deepEqual(tables, [], '重复版本号时不应执行任何迁移 SQL');
+
+  db.close();
+  rmSync(dir, { recursive: true, force: true });
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('已应用的迁移文件被改名：响亮报错，而不是静默跳过', () => {
+  const dir = tempDir();
+  const dataDir = tempDir();
+  const { db } = openDatabase({ dataDir });
+
+  writeFileSync(join(dir, '001_a.sql'), 'CREATE TABLE a (x INTEGER);');
+  const first = applyMigrations(db, dir);
+  assert.deepEqual(first.applied, ['001_a.sql']);
+
+  // 模拟迁移文件被改名/挪位：版本号不变，文件名变了
+  rmSync(join(dir, '001_a.sql'));
+  writeFileSync(join(dir, '001_b.sql'), 'CREATE TABLE a (x INTEGER);');
+
+  assert.throws(
+    () => applyMigrations(db, dir),
+    /迁移 001 已以 001_a\.sql 应用，当前文件名为 001_b\.sql；迁移文件名不可变更/,
+  );
+
+  db.close();
+  rmSync(dir, { recursive: true, force: true });
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+// ⚠️ 下面两条断言的是「当前迁移集」的快照：P1 加入 002_registration.sql 之后，
+//    「恰好 9 张表 / schema_migrations 恰好 1 行 / version 仍为 1」需要放宽为
+//    「包含 001_init.sql 的那几项」。到 P1 时按此提示修改。
+test('真实迁移目录：建出全部表并记录版本', () => {
+  const dataDir = tempDir();
+  const { db } = openDatabase({ dataDir });
+
+  const first = applyMigrations(db, REAL_MIGRATIONS);
+  assert.deepEqual(first.applied, ['001_init.sql']);
+  assert.equal(first.version, 1);
+
+  const tables = db
+    .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+    .all()
+    .map((r) => r.name);
+  for (const t of [
+    'users',
+    'sessions',
+    'capabilities',
+    'roles',
+    'role_capabilities',
+    'assignments',
+    'user_roles',
+    'audit_log',
+    'schema_migrations',
+  ]) {
+    assert.ok(tables.includes(t), `真实迁移应建出表 ${t}`);
+  }
+  assert.equal(tables.length, 9, '真实迁移应恰好建出 9 张表');
+
+  const rows = db.prepare('SELECT version, name FROM schema_migrations').all();
+  assert.equal(rows.length, 1, 'schema_migrations 应恰好 1 行');
+  assert.equal(rows[0].version, 1);
+  assert.equal(rows[0].name, '001_init.sql');
+
+  // 幂等：再跑一次不应再应用
+  const second = applyMigrations(db, REAL_MIGRATIONS);
+  assert.deepEqual(second.applied, [], '真实迁移重复执行不应再应用');
+  assert.equal(second.version, 1);
+
+  db.close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('真实 schema 下外键约束确实生效', () => {
+  const dataDir = tempDir();
+  const { db } = openDatabase({ dataDir });
+  applyMigrations(db, REAL_MIGRATIONS);
+
+  const now = new Date().toISOString();
+  db.prepare(
+    'INSERT INTO users (id, name, phone, password_hash, created_at) VALUES (?, ?, ?, ?, ?)',
+  ).run('u1', '张三', '13800000000', 'hash', now);
+
+  // 指向存在的用户 → 外键放行
+  db.prepare(
+    'INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)',
+  ).run('token-hash-1', 'u1', now, now);
+  assert.equal(
+    db.prepare('SELECT COUNT(*) AS n FROM sessions').get().n,
+    1,
+    '指向真实用户的 session 应插入成功',
+  );
+
+  // 指向不存在的用户 → 外键拦下
+  assert.throws(
+    () => {
+      db.prepare(
+        'INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)',
+      ).run('token-hash-2', 'no-such-user', now, now);
+    },
+    /FOREIGN KEY constraint failed/,
+    '指向不存在用户的 session 应被外键拦下',
+  );
+
+  db.close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -306,6 +450,17 @@ Expected: FAIL —— `Cannot find module '../src/db/sqlite.js'`
 // src/db/sqlite.js — SQLite 连接封装
 // 依据：设计文档 §4.2。node:sqlite 是同步 API，慢查询会阻塞 event loop，
 //       因此所有 SQL 必须在仓储层预编译 + 参数化。
+//
+// ⚠️ Node 版本下限 = 22.16.0（package.json engines）。这是两个下限的**并集**：
+//    - 22.13.0：node:sqlite 不再需要 --experimental-sqlite 标志。
+//      v22.5.0–v22.12.x 上 import 本文件会直接抛错（而本项目四个 scripts 都不带该 flag）。
+//    - 22.16.0：sqlite.backup() —— §14 备份方案依赖的一致性备份 API（P6 的备份/恢复脚本）。
+//    依据：Node v22 官方文档 SQLite 页 History 表
+//    （https://nodejs.org/docs/latest-v22.x/api/sqlite.html）原文：
+//      v22.5.0   Added in: v22.5.0
+//      v22.13.0  SQLite is no longer behind --experimental-sqlite but still experimental.
+//    以及 `sqlite.backup(sourceDb, destination[, options])` 条目：Added in: v22.16.0。
+//    详见设计文档 §4.2「运行时与依赖」。
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
@@ -338,6 +493,11 @@ export function openDatabase({ dataDir = './data', filename = 'app.db' } = {}) {
 // 依据：设计文档 §14.2。迁移只向前，不回滚；用 schema_migrations 表记录版本。
 //   ⛔ 不赌原生 ALTER TABLE 的能力边界（node:sqlite 捆绑的 SQLite 版本未核实），
 //      一律"新表 + 迁移"，expand-contract 三步走。
+//   ⛔ 版本号重复 → **响亮抛错**，绝不静默跳过。
+//      依据：全局约束「配置校验 fail-fast：权重合计≠100% / 阈值不单调 → 拒绝启动并报错」。
+//      同一类缺陷在迁移层的表现是"两个文件抢同一个版本号"：若静默跳过，
+//      先跑通的那个版本会把后一个永久遮蔽 —— schema 缺口被固化，
+//      而运维看到的是"迁移完成 / 本次无新迁移"、退出码 0，看不出任何异常。
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -348,8 +508,13 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
   applied_at TEXT NOT NULL
 );`;
 
+// 版本号在文件名里的原始写法（保留前导零），仅用于错误信息展示
+function versionLabel(name) {
+  return name.split('_')[0];
+}
+
 export function readMigrationFiles(dir) {
-  return readdirSync(dir)
+  const files = readdirSync(dir)
     .filter((f) => f.endsWith('.sql'))
     .map((name) => {
       const version = Number(name.split('_')[0]);
@@ -359,17 +524,46 @@ export function readMigrationFiles(dir) {
       return { version, name, sql: readFileSync(join(dir, name), 'utf8') };
     })
     .sort((a, b) => a.version - b.version);
+
+  // 重复版本号 → 抛错。必须在任何迁移 SQL 落地**之前**发现，
+  // 否则先落地的那张表会把后一个永久遮蔽（静默跳过 = schema 缺口被固化）。
+  const seen = new Map();
+  for (const f of files) {
+    const prev = seen.get(f.version);
+    if (prev) {
+      throw new Error(
+        `迁移版本号重复: ${versionLabel(prev.name)} (${prev.name}, ${f.name})`,
+      );
+    }
+    seen.set(f.version, f);
+  }
+
+  return files;
 }
 
 export function applyMigrations(db, migrationsDir) {
+  // 先读文件并校验：重复版本号 / 文件名格式错误必须在任何 SQL 执行前失败
+  const files = readMigrationFiles(migrationsDir);
+
   db.exec(MIGRATION_TABLE);
-  const done = new Set(
-    db.prepare('SELECT version FROM schema_migrations').all().map((r) => r.version),
+  // 已应用版本 → 当初应用时的文件名（用于校验迁移文件有没有被改名/挪位）
+  const appliedMap = new Map(
+    db.prepare('SELECT version, name FROM schema_migrations').all().map((r) => [r.version, r.name]),
   );
 
   const applied = [];
-  for (const m of readMigrationFiles(migrationsDir)) {
-    if (done.has(m.version)) continue;
+  for (const m of files) {
+    const recordedName = appliedMap.get(m.version);
+    if (recordedName !== undefined) {
+      // 已应用过：文件名必须与当初一致。
+      // 被改名/挪位 → 抛错，而不是"跳过"（跳过会让迁移历史与文件对不上账）。
+      if (recordedName !== m.name) {
+        throw new Error(
+          `迁移 ${versionLabel(m.name)} 已以 ${recordedName} 应用，当前文件名为 ${m.name}；迁移文件名不可变更`,
+        );
+      }
+      continue;
+    }
     // 单事务内串行执行：要么全成功，要么全不成功
     db.exec('BEGIN IMMEDIATE');
     try {
@@ -381,6 +575,9 @@ export function applyMigrations(db, migrationsDir) {
       );
       db.exec('COMMIT');
       applied.push(m.name);
+      // 防御性纵深：循环内登记已应用版本，
+      // 不让"同一版本被应用两次"这类问题依赖循环外的快照。
+      appliedMap.set(m.version, m.name);
     } catch (err) {
       db.exec('ROLLBACK');
       throw new Error(`迁移 ${m.name} 失败: ${err.message}`);
@@ -453,7 +650,9 @@ CREATE INDEX idx_assignments_lookup ON assignments(user_id, capability);
 -- 一人可以同时是选手 + 队长 + 评委（借 hackerspace3 assignment 模型的做法）
 -- ⚠️ 本表并入 001_init.sql，不单独开 002 迁移：
 --    迁移版本号是全局唯一序位，002 必须留给 P1 的 002_registration.sql。
---    两个迁移抢同一个版本号时，后执行的那张表永远建不出来（applyMigrations 按 version 去重）。
+--    两个迁移抢同一个版本号时，后执行的那张表永远建不出来。
+--    ⚠️ 现在 applyMigrations 对重复版本号**直接抛错**（fail-fast），
+--       不再是"按 version 静默去重"—— 静默跳过会把 schema 缺口固化，运维看不出来。
 CREATE TABLE user_roles (
   user_id  TEXT NOT NULL REFERENCES users(id),
   role_key TEXT NOT NULL REFERENCES roles(key),
@@ -503,7 +702,7 @@ try {
 - [ ] **Step 7: 运行测试确认通过**
 
 Run: `cd platform && node --test test/migrate.test.js`
-Expected: PASS（3 个测试全过）
+Expected: PASS（7 个测试全过）
 
 - [ ] **Step 8: 实跑迁移脚本**
 

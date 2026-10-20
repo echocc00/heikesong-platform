@@ -45,7 +45,10 @@ P0 ──→ P1 ──→ P2 ──→ P3 ──→ P4 ──→ P5 ──→ P6
 ## 全局约束（所有计划共享，逐字复制）
 
 ```
-运行时      Node ≥ 22.5（生产建议 24；不使用任何 Node-24-only API）
+运行时      Node ≥ 22.16.0（生产建议 24；不使用任何 Node-24-only API）
+            ⚠️ 下限是「node:sqlite 免 --experimental-sqlite 的 22.13.0」与
+               「sqlite.backup() 的 22.16.0」的并集 —— 声明一个跑不起来的
+               版本比声明一个略严的版本更糟。出处见设计文档 §4.2。
 npm 依赖    0 个。package.json 只有 {"type":"module"}，不得新增 dependencies
 数据库      node:sqlite（内置，无原生编译）。单文件 data/app.db，WAL 模式
 测试        node:test（内置）。命令：node --test

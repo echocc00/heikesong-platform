@@ -6,7 +6,7 @@
 
 **Architecture:** 延续 P0 的单进程零依赖架构。`src/domain/` 放纯函数（diff / anticheat / evidence / field-dictionary，无 IO、无 `Date.now()`、无 `Math.random()`）；`src/services/` 放用例编排（audit / rate-limit / idempotency / review-state / anticheat）；所有 SQL 收在 `src/db/repo/`；`src/routes/audit.js` 挂 7 个 P4 路由；`web/views/audit.js`（trace 抽屉）与 `web/views/flags.js`（复核队列）是两个原生 ESM 视图，无构建。**本阶段的灵魂不是"加日志"，而是"让空结果与降级必须显式暴露"**：批量返回空 → 4xx；限频超限 → 429 + `retryAfterSeconds`；复算不一致 → diff 出现在 API 响应与前端（不是只写一条日志）；禁用清单为空 → 扫描闸直接报错退出。
 
-**Tech Stack:** Node ≥22.5（生产建议 24）｜`node:sqlite`｜`node:crypto`（scrypt）｜`node:test`｜原生 ESM 前端，无构建｜**npm 依赖 0 个**
+**Tech Stack:** Node ≥22.16.0（生产建议 24）｜`node:sqlite`｜`node:crypto`（scrypt）｜`node:test`｜原生 ESM 前端，无构建｜**npm 依赖 0 个**
 
 > **上游依赖（执行前确认）**：本阶段消费 P0（基础设施 / `audit_log` 表 / 权限与 `can()`）、**P2**（`src/domain/scoring.js` 的 `scoreStage` 纯函数、`computation_snapshots` 表）、**P3**（`tier_records` 表，用于申诉范围判定）。若 P2/P3 尚未落地，P4 的测试会以「找不到模块 / 缺表」失败——这是依赖缺失，不是本阶段的 bug。
 
@@ -15,7 +15,7 @@
 （代码块，逐字复制 P0 约束块 + 本阶段追加）
 
 ```
-运行时      Node ≥ 22.5（不使用任何 Node-24-only API；URLPattern 不可用，路由手写）
+运行时      Node ≥ 22.16.0（不使用任何 Node-24-only API；URLPattern 不可用，路由手写）
 npm 依赖    0 个。package.json 只有 {"type":"module"}，不得新增 dependencies
 数据库      node:sqlite。data/app.db，WAL 模式。单写者：禁止多 worker 写同一文件
 测试        node:test。命令：node --test

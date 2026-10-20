@@ -6,7 +6,7 @@
 
 **Architecture:** 延续 P0 的单进程零依赖架构。`src/domain/` 放纯函数（三池派生 / 任务完成证据校验 / iCal 生成，无 IO、无 `Date.now()`、无 `Math.random()`）；`src/services/` 放用例编排（workflow / pools / public-api）；所有 SQL 收在 `src/db/repo/`；`src/routes/` 挂 P5 的 9 条 API；`web/views/tasks.js` 是唯一的本阶段前端视图。**本阶段的灵魂是「一个派生值只有一个计算点、一条任务只有一个有效领取、一个公开接口只给该给的字段」**：三池同步是幂等重建（不是增量累加），任务领取靠数据库唯一约束兜底（不是应用层先查再插），公开接口显式过 `applyVisibility` 再做字段白名单投影（不是"默认给全量"）。
 
-**Tech Stack:** Node ≥22.5（生产建议 24）｜`node:sqlite`｜`node:crypto`（scrypt）｜`node:test`｜原生 ESM 前端，无构建｜**npm 依赖 0 个**
+**Tech Stack:** Node ≥22.16.0（生产建议 24）｜`node:sqlite`｜`node:crypto`（scrypt）｜`node:test`｜原生 ESM 前端，无构建｜**npm 依赖 0 个**
 
 > **上游依赖（执行前确认）**：本阶段消费 P0（基础设施 / `users` / `can()` / `audit_log`）、**P1**（`teams` / `team_members` / `task_packages` / `registrations`）、**P2**（`stage_results` / `stages`，**只读**）、**P3**（`points_ledger` / `tier_records` / `applyVisibility`）、**P4**（`src/errors.js` 的 `appError` / `src/db/tx.js` 的 `withTransaction`）。
 > ⚠️ `INTERFACES.md` §8 的依赖表写的是「P5 ← P0 + P1 + P3」，但 §6 的 `syncPoolProjects` 明确要求从 `stage_results` 派生，而 `stage_results` 是 **P2** 建的表 → **P5 额外只读 P2 的两张表**（见文末偏差章节 D-4）。
@@ -17,7 +17,7 @@
 （代码块，逐字复制 P0 约束块 + 本阶段追加）
 
 ```
-运行时      Node ≥ 22.5（不使用任何 Node-24-only API；URLPattern 不可用，路由手写）
+运行时      Node ≥ 22.16.0（不使用任何 Node-24-only API；URLPattern 不可用，路由手写）
 npm 依赖    0 个。package.json 只有 {"type":"module"}，不得新增 dependencies
 数据库      node:sqlite。data/app.db，WAL 模式。单写者：禁止多 worker 写同一文件
 测试        node:test。命令：node --test
