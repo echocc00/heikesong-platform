@@ -1,0 +1,25 @@
+{
+  "id": "solvability",
+  "version": "2026-10-20",
+  "source": "顶层文档 §3.2 六维可解性准入",
+  "dimensions": [
+    { "key": "problem_clarity", "label": "问题确定性", "weight": 0.30, "max": 3 },
+    { "key": "data_access",     "label": "数据可得性", "weight": 0.25, "max": 3 },
+    { "key": "validation",      "label": "验证周期",   "weight": 0.20, "max": 2 },
+    { "key": "decision_chain",  "label": "决策链长度", "weight": 0.10, "max": 1 },
+    { "key": "accountability",  "label": "责任可归属", "weight": 0.10, "max": 1 },
+    { "key": "precedent",       "label": "先例存在性", "weight": 0.05, "max": 1 }
+  ],
+  "grades": [
+    { "key": "A", "minScore": 10, "maxScore": 12, "commitment": "试点承诺",   "agreement": "试点承诺书 + 数据授权说明" },
+    { "key": "B", "minScore": 7,  "maxScore": 9,  "commitment": "对标试点",   "agreement": "对标试点协议" },
+    { "key": "C", "minScore": 4,  "maxScore": 6,  "commitment": "不承诺试点", "agreement": "场景提供协议" },
+    { "key": "D", "minScore": 0,  "maxScore": 3,  "commitment": "无",         "agreement": "退回，但必出问题可解性诊断报告" }
+  ],
+  "vetoes": [
+    { "key": "no_data_authorization", "label": "无法提供《数据授权说明》" },
+    { "key": "no_responsible_owner",  "label": "无企业侧唯一责任人" },
+    { "key": "production_undisclosed","label": "涉及生产系统且未谈责任归属" }
+  ],
+  "taskMix": { "enterprise": 0.70, "free": 0.30 }
+}

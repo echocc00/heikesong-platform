@@ -1,0 +1,20 @@
+{
+  "id": "visibility",
+  "version": "2026-10-20",
+  "conflictRef": "C-02",
+  "source": "S10 §0.3 分层公开 + §8 风险表",
+  "rank": {
+    "public": true,
+    "publicFromTier": "C",
+    "privateBelowTier": "D",
+    "showEnterpriseName": false
+  },
+  "business": {
+    "milestoneProgressPublic": true,
+    "scoresPublic": false,
+    "signatoryPublic": false
+  },
+  "peerReview": {
+    "showSource": false
+  }
+}

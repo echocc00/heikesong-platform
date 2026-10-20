@@ -1,0 +1,17 @@
+{
+  "id": "registration",
+  "version": "2026-10-20",
+  "source": "SABC v1 §二 3 维画像筛选",
+  "dimensions": [
+    { "key": "direction",    "label": "方向维度", "weight": 0.25, "min": 1, "max": 5 },
+    { "key": "capability",   "label": "能力维度", "weight": 0.35, "min": 1, "max": 5 },
+    { "key": "collaboration","label": "协作维度", "weight": 0.40, "min": 1, "max": 5 }
+  ],
+  "levels": [
+    { "key": "S", "label": "顶级种子", "minScore": 80, "accept": true },
+    { "key": "A", "label": "优秀候选", "minScore": 60, "accept": true },
+    { "key": "B", "label": "潜力候选", "minScore": 40, "accept": true },
+    { "key": "C", "label": "底线外",   "minScore": 0,  "accept": false }
+  ],
+  "openQuestion": { "required": true, "maxLength": 500 }
+}

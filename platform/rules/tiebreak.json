@@ -1,0 +1,14 @@
+{
+  "id": "tiebreak",
+  "version": "2026-10-20",
+  "conflictRef": "C-03",
+  "source": "S7 §3.3 + S10 §0.4 + S10 §3.3（原文互相冲突，此处为裁决后的有序链）",
+  "chain": [
+    { "key": "total",          "label": "总分",             "direction": "desc", "scope": "always" },
+    { "key": "tiebreak_extra", "label": "加时陈述复议分",   "direction": "desc", "scope": "final_only", "manual": true },
+    { "key": "peer",           "label": "互评分",           "direction": "desc", "scope": "tied_only" },
+    { "key": "enterprise_raw", "label": "企业确认原始分",   "direction": "desc", "scope": "tied_only" },
+    { "key": "behavior",       "label": "行为分",           "direction": "desc", "scope": "tied_only" },
+    { "key": "team_id",        "label": "队伍编号",         "direction": "asc",  "scope": "always", "deterministic": true }
+  ]
+}

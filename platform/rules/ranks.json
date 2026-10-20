@@ -1,0 +1,25 @@
+{
+  "id": "ranks",
+  "version": "2026-10-20",
+  "source": "S10 §2.2 段位表 + §2.3 降级与权益",
+  "tiers": [
+    { "key": "D", "name": "出题", "minMilestones": 0, "requiresBusinessSignoff": false },
+    { "key": "C", "name": "立项", "minMilestones": 1, "requiresBusinessSignoff": false },
+    { "key": "B", "name": "原型", "minMilestones": 2, "requiresBusinessSignoff": false },
+    { "key": "A", "name": "接入", "minMilestones": 3, "requiresBusinessSignoff": false, "requiresDataOrPrototype": true },
+    { "key": "S", "name": "验证", "minMilestones": 5, "requiresBusinessSignoff": true }
+  ],
+  "demotion": {
+    "onSignoffRevoked": true,
+    "inactiveDays": 14,
+    "inactiveDropLevels": 1,
+    "publishDemotion": true
+  },
+  "benefits": {
+    "C": ["企业对接会", "导师匹配资格"],
+    "B": ["Demo Day 路演资格"],
+    "A": ["辅导期名额候选"],
+    "S": ["辅导期名额优先", "完赛证明"]
+  },
+  "neverUnlocks": ["奖金", "决赛名次"]
+}

@@ -1,0 +1,18 @@
+{
+  "id": "scoring-final",
+  "version": "2026-10-20",
+  "source": "S7 §2.2 决赛权重表 + §3.1 评分公式",
+  "wEnterprise": 0.25,
+  "normalizationStrategy": "zscore",
+  "minSamplesForJudgeNormalization": 5,
+  "trimOutliers": true,
+  "minJudgesForTrim": 5,
+  "dimensions": [
+    { "key": "enterprise",    "name": "企业确认",   "weight": 0.25, "seat": "enterprise" },
+    { "key": "innovation",    "name": "创新性",     "weight": 0.20, "seat": "judge" },
+    { "key": "feasibility",   "name": "技术可行性", "weight": 0.20, "seat": "judge" },
+    { "key": "completeness",  "name": "完成度",     "weight": 0.20, "seat": "judge" },
+    { "key": "collaboration", "name": "团队协作",   "weight": 0.10, "seat": "judge" },
+    { "key": "self_eval",     "name": "自评测",     "weight": 0.05, "seat": "self" }
+  ]
+}
