@@ -115,6 +115,10 @@ platform/web/app.js                           注册 P1 三页路由
 - Create: `platform/src/db/repo/teams.js`
 - Create: `platform/src/db/repo/teamMembers.js`
 - Create: `platform/test/migration-002.test.js`
+- Modify: `platform/test/migrate.test.js`（**P0 遗留的跨里程碑缺口**：该文件的迁移集快照断言
+  自带 TODO「P1 加入 002 之后…到 P1 时按此提示修改」，但 P1 计划的 7 个 Task **无一 owns 它**
+  → 002 一落地必红。002 落地后必须按 TODO 处方把「恰好 N 张表 / 恰好 1 行 / version 仍为 1」
+  改成「期望值从迁移目录推导」，**断言强度不减**（漏建表 / 迁移没被应用 / 历史对不上账仍被抓））
 
 **Interfaces:**
 - Consumes: `openDatabase()`（P0 Task 2）、`applyMigrations()`（P0 Task 2）、`users` 表（P0 Task 2）
@@ -522,7 +526,21 @@ export function getTaskPackage(db, id) {
 
 export function listTaskPackagesByEdition(db, editionId) {
   return db
-    .prepare('SELECT * FROM task_packages WHERE edition_id = ? AND deleted_at IS NULL ORDER BY submitted_at, id')
+    // ⚠️ 父代理预审修正（确定性排序）：原来的兜底排序键是 `id`，
+    //    而 id 是 `crypto.randomUUID()` —— **随机 UUID**。
+    //    后果有两类，都很硬：
+    //    ① **审计事件顺序随机**：`registration_events` 用 `ORDER BY created_at, id`，
+    //       而「提交」与「改级」常发生在**同一毫秒**（服务层 now 由调用方传入，
+    //       测试里更是同一个常量）→ created_at 相等 → 顺序由随机 UUID 决定。
+    //       父代理预审实测：同一条用例连跑 8 次挂了 6 次 —— **随机 flaky**，
+    //       CI 上会表现为「有时绿有时红」，极难定位。
+    //    ② **分页不稳定**：列表接口用 `LIMIT ? OFFSET ?` 分页，排序键随机
+    //       → 翻页时行会**重复或漏掉**。
+    //    改法：兜底排序键改用 SQLite 的隐式 `rowid` —— 它按**插入顺序**单调递增，
+    //    对「只增不改」的追加式表（注册事件 / 成员进出历史）正是审计轨迹该有的顺序。
+    //    （本项目自己的设计决策「破同分兜底用行 ID 而非时间戳」也是同一个道理：
+    //      兜底键必须是**确定性**的，不能是随机 UUID。）
+    .prepare('SELECT * FROM task_packages WHERE edition_id = ? AND deleted_at IS NULL ORDER BY submitted_at, rowid')
     .all(editionId);
 }
 
@@ -605,9 +623,23 @@ export function listRegistrationRows(db, {
   if (level) { where.push('level = ?'); params.push(level); }
   params.push(limit, offset);
   return db
+    // ⚠️ 父代理预审修正（确定性排序）：原来的兜底排序键是 `id`，
+    //    而 id 是 `crypto.randomUUID()` —— **随机 UUID**。
+    //    后果有两类，都很硬：
+    //    ① **审计事件顺序随机**：`registration_events` 用 `ORDER BY created_at, id`，
+    //       而「提交」与「改级」常发生在**同一毫秒**（服务层 now 由调用方传入，
+    //       测试里更是同一个常量）→ created_at 相等 → 顺序由随机 UUID 决定。
+    //       父代理预审实测：同一条用例连跑 8 次挂了 6 次 —— **随机 flaky**，
+    //       CI 上会表现为「有时绿有时红」，极难定位。
+    //    ② **分页不稳定**：列表接口用 `LIMIT ? OFFSET ?` 分页，排序键随机
+    //       → 翻页时行会**重复或漏掉**。
+    //    改法：兜底排序键改用 SQLite 的隐式 `rowid` —— 它按**插入顺序**单调递增，
+    //    对「只增不改」的追加式表（注册事件 / 成员进出历史）正是审计轨迹该有的顺序。
+    //    （本项目自己的设计决策「破同分兜底用行 ID 而非时间戳」也是同一个道理：
+    //      兜底键必须是**确定性**的，不能是随机 UUID。）
     .prepare(
       `SELECT * FROM registrations WHERE ${where.join(' AND ')}
-       ORDER BY created_at, id LIMIT ? OFFSET ?`,
+       ORDER BY created_at, rowid LIMIT ? OFFSET ?`,
     )
     .all(...params);
 }
@@ -649,7 +681,21 @@ export function insertRegistrationEvent(db, {
 
 export function listRegistrationEvents(db, registrationId) {
   return db
-    .prepare('SELECT * FROM registration_events WHERE registration_id = ? ORDER BY created_at, id')
+    // ⚠️ 父代理预审修正（确定性排序）：原来的兜底排序键是 `id`，
+    //    而 id 是 `crypto.randomUUID()` —— **随机 UUID**。
+    //    后果有两类，都很硬：
+    //    ① **审计事件顺序随机**：`registration_events` 用 `ORDER BY created_at, id`，
+    //       而「提交」与「改级」常发生在**同一毫秒**（服务层 now 由调用方传入，
+    //       测试里更是同一个常量）→ created_at 相等 → 顺序由随机 UUID 决定。
+    //       父代理预审实测：同一条用例连跑 8 次挂了 6 次 —— **随机 flaky**，
+    //       CI 上会表现为「有时绿有时红」，极难定位。
+    //    ② **分页不稳定**：列表接口用 `LIMIT ? OFFSET ?` 分页，排序键随机
+    //       → 翻页时行会**重复或漏掉**。
+    //    改法：兜底排序键改用 SQLite 的隐式 `rowid` —— 它按**插入顺序**单调递增，
+    //    对「只增不改」的追加式表（注册事件 / 成员进出历史）正是审计轨迹该有的顺序。
+    //    （本项目自己的设计决策「破同分兜底用行 ID 而非时间戳」也是同一个道理：
+    //      兜底键必须是**确定性**的，不能是随机 UUID。）
+    .prepare('SELECT * FROM registration_events WHERE registration_id = ? ORDER BY created_at, rowid')
     .all(registrationId);
 }
 ```
@@ -704,7 +750,21 @@ export function listTeamRows(db, {
   if (captainId) { where.push('captain_id = ?'); params.push(captainId); }
   if (status) { where.push('status = ?'); params.push(status); }
   return db
-    .prepare(`SELECT * FROM teams WHERE ${where.join(' AND ')} ORDER BY created_at, id`)
+    // ⚠️ 父代理预审修正（确定性排序）：原来的兜底排序键是 `id`，
+    //    而 id 是 `crypto.randomUUID()` —— **随机 UUID**。
+    //    后果有两类，都很硬：
+    //    ① **审计事件顺序随机**：`registration_events` 用 `ORDER BY created_at, id`，
+    //       而「提交」与「改级」常发生在**同一毫秒**（服务层 now 由调用方传入，
+    //       测试里更是同一个常量）→ created_at 相等 → 顺序由随机 UUID 决定。
+    //       父代理预审实测：同一条用例连跑 8 次挂了 6 次 —— **随机 flaky**，
+    //       CI 上会表现为「有时绿有时红」，极难定位。
+    //    ② **分页不稳定**：列表接口用 `LIMIT ? OFFSET ?` 分页，排序键随机
+    //       → 翻页时行会**重复或漏掉**。
+    //    改法：兜底排序键改用 SQLite 的隐式 `rowid` —— 它按**插入顺序**单调递增，
+    //    对「只增不改」的追加式表（注册事件 / 成员进出历史）正是审计轨迹该有的顺序。
+    //    （本项目自己的设计决策「破同分兜底用行 ID 而非时间戳」也是同一个道理：
+    //      兜底键必须是**确定性**的，不能是随机 UUID。）
+    .prepare(`SELECT * FROM teams WHERE ${where.join(' AND ')} ORDER BY created_at, rowid`)
     .all(...params);
 }
 
@@ -750,13 +810,27 @@ export function insertTeamMember(db, {
 
 export function listActiveMembers(db, teamId) {
   return db
-    .prepare('SELECT * FROM team_members WHERE team_id = ? AND left_at IS NULL ORDER BY joined_at, id')
+    // ⚠️ 父代理预审修正（确定性排序）：原来的兜底排序键是 `id`，
+    //    而 id 是 `crypto.randomUUID()` —— **随机 UUID**。
+    //    后果有两类，都很硬：
+    //    ① **审计事件顺序随机**：`registration_events` 用 `ORDER BY created_at, id`，
+    //       而「提交」与「改级」常发生在**同一毫秒**（服务层 now 由调用方传入，
+    //       测试里更是同一个常量）→ created_at 相等 → 顺序由随机 UUID 决定。
+    //       父代理预审实测：同一条用例连跑 8 次挂了 6 次 —— **随机 flaky**，
+    //       CI 上会表现为「有时绿有时红」，极难定位。
+    //    ② **分页不稳定**：列表接口用 `LIMIT ? OFFSET ?` 分页，排序键随机
+    //       → 翻页时行会**重复或漏掉**。
+    //    改法：兜底排序键改用 SQLite 的隐式 `rowid` —— 它按**插入顺序**单调递增，
+    //    对「只增不改」的追加式表（注册事件 / 成员进出历史）正是审计轨迹该有的顺序。
+    //    （本项目自己的设计决策「破同分兜底用行 ID 而非时间戳」也是同一个道理：
+    //      兜底键必须是**确定性**的，不能是随机 UUID。）
+    .prepare('SELECT * FROM team_members WHERE team_id = ? AND left_at IS NULL ORDER BY joined_at, rowid')
     .all(teamId);
 }
 
 export function listMemberHistory(db, teamId) {
   return db
-    .prepare('SELECT * FROM team_members WHERE team_id = ? ORDER BY joined_at, id')
+    .prepare('SELECT * FROM team_members WHERE team_id = ? ORDER BY joined_at, rowid')
     .all(teamId);
 }
 
@@ -786,15 +860,25 @@ export function lastLeaveAt(db, teamId) {
 }
 ```
 
-- [ ] **Step 8: 运行测试确认通过**
+- [ ] **Step 8: 放宽 migrate.test.js 的迁移集快照断言（P0 遗留 TODO）**
+
+> ⛔ **【2026-10-21 父代理预审修正】** `platform/test/migrate.test.js` 里有一组**跨里程碑**的快照断言
+> （「恰好 9 张表 / 恰好 1 行迁移 / version 仍为 1」），该文件自带 TODO：
+> 「P1 加入 002 之后…到 P1 时按此提示修改」。但 P1 计划的 7 个 Task **无一 owns 这个文件**
+> → 002 一落地必红（父代理预审实跑：147 pass / 1 fail）。
+> 修法：把期望值改成**从迁移目录推导**（读 `platform/db/migrations/` 实际内容算张数与行数），
+> 而不是写死数字。**断言强度不减**：漏建表 / 迁移没被应用 / 历史对不上账仍会被抓住
+> （已用「把 cities 改名」变异实测）。
+
+- [ ] **Step 9: 运行测试确认通过**
 
 Run: `cd platform && node --test test/migration-002.test.js`
 Expected: PASS（7 个测试全过）
 
-- [ ] **Step 9: 提交**
+- [ ] **Step 10: 提交**
 
 ```bash
-cd platform && git add db/migrations/002_registration.sql src/db/repo test/migration-002.test.js
+cd platform && git add db/migrations/002_registration.sql src/db/repo test/migration-002.test.js test/migrate.test.js
 git commit -m "feat(P1): 报名与组队数据模型（7 张表 + 仓储层）
 
 对应需求：R-REG-01 / R-REG-02 / R-REG-03 / R-REG-04 / R-ENT-01 / R-ENT-10 / R-OPS-09"
@@ -917,6 +1001,13 @@ test('explain 给出每维 raw / weight / weighted（可解释明细）', () => 
   assert.equal(dir.weight, 0.25);
   assert.equal(dir.weighted, 0.95);
   assert.ok(dir.note.includes('方向维度'), 'note 必须说明这一维怎么算的');
+  // ⚠️ 父代理预审补充（弱断言 → 强断言）：原来只断言 note 含维度名，
+  //    把 note 里的「权重 25%」「加权 0.95」删掉照样全绿 —— 而 note 是
+  //    「可解释明细」界面给用户看的**唯一**说明（设计文档 §9 / R-REG-09）。
+  //    少了权重，用户看到的「这一维凭什么拿 0.95 分」就无从核对。
+  assert.ok(dir.note.includes('权重 25%'), `note 必须写出这一维的权重：${dir.note}`);
+  assert.ok(dir.note.includes('加权 0.95'), `note 必须写出这一维的加权分：${dir.note}`);
+  assert.ok(dir.note.includes('5 题'), `note 必须写出题数：${dir.note}`);
 });
 
 test('classifyLevel 阈值边界与 scoreRegistration 判定一致', () => {
@@ -1850,9 +1941,26 @@ import { registerRegistrationRoutes } from './http/routes/registration.js';
   if (!Array.isArray(stages) || stages.length !== 5) {
     errors.push('schedule.stages 必须是 5 个赛段（R-STG-01）');
   } else {
+    // ⚠️ 父代理预审修正（规格自相矛盾，原实现会让服务器**拒绝启动**）：
+    //    原来判 `stages[i].start <= stages[i - 1].end`（要求严格递增），
+    //    但 R-STG-01 的赛段表本身就是**交接式相接**的：
+    //      S1 调研 10/1-10/10 → S2 任务 10/10-13 → S3 开发 10/13-25
+    //      → S4 路演 10/26-28 → S5 落地 10/29-31
+    //    （见 docs/requirements-traceability.md 的 R-STG-01 一行）
+    //    上一段的**结束当天就是下一段的开始日** → `start == 上一段 end` 恒成立
+    //    → 原规则会让计划自带的 schedule.json 校验失败 → **fail-fast 拒绝启动**
+    //    → P1 一上线就是死的。父代理预审实跑复现：18 条用例全红，
+    //    报错「schedule.stages 必须按时间递增（第 3 段）」。
+    //    正确的判据是**不许重叠**（`start < 上一段 end`），相接是合法的；
+    //    同时补一条「本段 end 不得早于本段 start」。
     for (let i = 1; i < stages.length; i += 1) {
-      if (stages[i].start <= stages[i - 1].end) {
-        errors.push(`schedule.stages 必须按时间递增（第 ${i + 1} 段）`);
+      if (stages[i].start < stages[i - 1].end) {
+        errors.push(`schedule.stages 第 ${i + 1} 段与上一段时间重叠（R-STG-01）`);
+      }
+    }
+    for (const st of stages) {
+      if (st.end < st.start) {
+        errors.push(`schedule.stages ${st.key} 的结束日早于开始日`);
       }
     }
   }
@@ -1924,6 +2032,7 @@ import { createUser } from '../src/db/repo/users.js';
 import { createEdition } from '../src/db/repo/editions.js';
 import { createSession } from '../src/auth/session.js';
 import { grantAssignment } from '../src/auth/permissions.js';
+import { insertCapability } from '../src/db/repo/capabilities.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrationsDir = join(here, '..', 'db', 'migrations');
@@ -1950,6 +2059,14 @@ function setup() {
   const other = createUser(db, { name: '选手乙', phone: '13900003002', password: 'pw', mbaStatus: 'mba' });
   const admin = createUser(db, { name: '组委会', phone: '13900003003', password: 'pw', mbaStatus: 'mba' });
   db.prepare('UPDATE users SET is_superadmin = 1 WHERE id = ?').run(admin.id);
+  // ⚠️ 父代理预审修正（规格缺口）：**能力点必须先注册**。
+  //    `grantAssignment` 会先校验 capability 是否在 `capabilities` 表里注册过
+  //    （P0 的评审修正 I5 同类：入参要先校验，不把 SQLite 原文漏到 HTTP 层），
+  //    不注册就抛 400 CAPABILITY_UNKNOWN —— 父代理预审实跑：9 条用例全红，
+  //    报错「能力点未注册：registration:write」。
+  //    这里用 P0 的仓储函数注册（**不写裸 SQL**，守住 SQL 边界）。
+  insertCapability(db, 'registration:write', '提交报名');
+  insertCapability(db, 'registration:review', '审核报名分级');
   grantAssignment(db, {
     userId: user.id, capability: 'registration:write', scopeType: 'global', scopeId: null, grantedBy: admin.id,
   });
