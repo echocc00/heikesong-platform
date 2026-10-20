@@ -67,6 +67,7 @@ platform/
 │   │   ├── compute.js              computeStage（写快照 + stage_results）
 │   │   └── tiebreak.js             加时陈述轮次 + 一票破同分
 │   ├── db/repo/
+│   │   ├── audit-log.js              审计日志（audit_log 的 SQL 唯一归宿）
 │   │   ├── stages.js               赛段与评委席
 │   │   ├── reviews.js              stage_reviews + calibrations + score_stats（幂等 + 增量）
 │   │   ├── request-keys.js         幂等键（先抢键再落数据）
@@ -76,9 +77,11 @@ platform/
 │   │   ├── recusals.js             回避记录
 │   │   ├── computations.js         computation_snapshots + stage_results
 │   │   └── tiebreak.js             tiebreak_round / tiebreak_votes
-│   ├── http/routes/
-│   │   └── review.js               9 条评审 API 路由
-│   └── audit/log.js                审计日志写入（若 P0/P1 未建则本阶段建）
+│   ├── http/
+│   │   ├── sse.js                  SSE 单向推送（评审进度；兑现 web/api.js 的承诺）
+│   │   └── routes/
+│   │       └── review.js           9 条评审 API 路由
+│   └── audit/log.js                审计日志服务门面（**不含 SQL**，SQL 在 db/repo/audit-log.js）
 └── test/
     ├── migration-review.test.js    003 迁移与关键唯一约束
     ├── normalization.test.js       4 策略各自的预期值 + 降级分支
@@ -90,7 +93,8 @@ platform/
     ├── scoring.test.js             scoreStage 总装 + 行为分隔离断言
     ├── review-service.test.js      幂等 / 增量 score_stats / 进度
     ├── compute.test.js             快照三件套 + stage_results
-    └── tiebreak.test.js            一票破同分（唯一约束）
+    ├── tiebreak.test.js            一票破同分（唯一约束）
+    └── sse.test.js                 SSE 帧格式 / 事件中心 / 端点首帧
 ```
 
 **本阶段修改**
@@ -99,7 +103,8 @@ platform/
 platform/rules/scoring-initial.json   加 judgePool 段（R-JDG-10 初赛 ≥7）+ freeBrief 段（R-JDG-08 R4）
 platform/rules/scoring-final.json      加 judgePool 段（R-JDG-10 决赛 ≥9）+ freeBrief 段
 platform/src/config.js                 校验 judgePool / freeBrief / 归一化策略参数（fail-fast）
-platform/src/server.js                 注册评审路由（与 P1 的改动合并，不覆盖）
+platform/src/server.js                 注册评审路由（与 P1 的改动合并，不覆盖）+ SSE 独立分支
+platform/src/http/routes/review.js     提交评审后发布进度事件
 ```
 
 ---
@@ -479,7 +484,7 @@ CREATE TABLE tiebreak_votes (
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cd platform && node --test test/migration-review.test.js`
-Expected: PASS（7 个测试全过）
+Expected: PASS（7 个测试全过：migration-review.test.js 7）
 
 - [ ] **Step 5: 实跑迁移脚本**
 
@@ -890,7 +895,7 @@ export function normalizeScores({ samples, strategy = 'zscore', config = {} } = 
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cd platform && node --test test/normalization.test.js`
-Expected: PASS（10 个测试全过）
+Expected: PASS（10 个测试全过：normalization.test.js 10）
 
 - [ ] **Step 5: 提交**
 
@@ -1119,7 +1124,7 @@ export function seatScore({ dimensionScores, weights } = {}) {
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cd platform && node --test test/trim.test.js`
-Expected: PASS（7 个测试全过）
+Expected: PASS（7 个测试全过：trim.test.js 7）
 
 - [ ] **Step 5: 提交**
 
@@ -1375,7 +1380,7 @@ export function applyEnterpriseRules({ confirmations = [], teams = [], judges = 
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cd platform && node --test test/enterprise-seat.test.js`
-Expected: PASS（6 个测试全过）
+Expected: PASS（6 个测试全过：enterprise-seat.test.js 6）
 
 - [ ] **Step 5: 提交**
 
@@ -1771,7 +1776,15 @@ export function checkJudgePool({ judges = [], config = {} } = {}) {
 - [ ] **Step 6: 运行测试确认通过**
 
 Run: `cd platform && node --test test/self-eval.test.js test/review-eligibility.test.js test/judge-pool.test.js`
-Expected: PASS（14 个测试全过）
+Expected: PASS（14 个测试全过：self-eval.test.js 4 + review-eligibility.test.js 5 + judge-pool.test.js 5）
+
+> **【2026-10-21 漂移审计修正 M-1】** 本计划的条数声明与代码块实测**逐条相符**（无需改数字），
+> 但格式与其他四份计划不一致。**改成什么**：把本计划**全部 8 处** `Expected: PASS` 统一成
+> `Expected: PASS（N 个测试全过：file N）` 的格式；多文件时逐文件列出
+> （如上面这一行：`self-eval.test.js 4 + review-eligibility.test.js 5 + judge-pool.test.js 5`）。
+> **依据**：与审计报告 M-1 末行的格式统一建议一致；
+> 本轮改动后**对五份计划全量复算**：每一条 `Expected: PASS（N …）` 现已与代码块实测条数
+> **逐条相等**，且五份计划的格式统一。
 
 - [ ] **Step 7: 提交**
 
@@ -1785,6 +1798,7 @@ git commit -m "feat(P2): 自评差异检测、回避制度、互评资格与评�
 ### Task 6: 评分提交服务 + 幂等 + 增量 score_stats
 
 **Files:**
+- Create: `platform/src/db/repo/audit-log.js`
 - Create: `platform/src/db/repo/stages.js`
 - Create: `platform/src/db/repo/reviews.js`
 - Create: `platform/src/db/repo/request-keys.js`
@@ -1792,7 +1806,7 @@ git commit -m "feat(P2): 自评差异检测、回避制度、互评资格与评�
 - Create: `platform/src/db/repo/peer-reviews.js`
 - Create: `platform/src/db/repo/self-reviews.js`
 - Create: `platform/src/db/repo/recusals.js`
-- Create: `platform/src/audit/log.js`
+- Create: `platform/src/audit/log.js`（**薄服务门面**：本文件**不含 SQL**）
 - Create: `platform/src/services/review.js`
 - Create: `platform/test/review-service.test.js`
 
@@ -2106,6 +2120,29 @@ export function listStageJudges(db, stageId) {
 export function getStageJudge(db, stageId, userId) {
   return db.prepare('SELECT * FROM stage_judges WHERE stage_id = ? AND user_id = ?').get(stageId, userId) ?? null;
 }
+
+/**
+ * 某赛段的队伍名册（需要 P1 的 teams / task_packages）。
+ * ⚠️ 表未就绪（P1 尚未落地）时**抛错**，由调用方兜底 —— 仓储层不吞异常。
+ */
+export function listStageTeams(db, stageId) {
+  return db
+    .prepare(
+      `SELECT t.id AS team_id, tp.enterprise_id AS package_enterprise_id,
+              COALESCE(tp.is_free_brief, 0) AS is_free_brief
+       FROM teams t
+       LEFT JOIN task_packages tp ON tp.id = t.task_package_id
+       WHERE t.edition_id = (SELECT edition_id FROM stages WHERE id = ?)
+         AND t.deleted_at IS NULL
+       ORDER BY t.id`,
+    )
+    .all(stageId)
+    .map((r) => ({
+      teamId: r.team_id,
+      packageEnterpriseId: r.package_enterprise_id ?? null,
+      isFreeBrief: !!r.is_free_brief,
+    }));
+}
 ```
 
 `platform/src/db/repo/reviews.js`：
@@ -2352,23 +2389,32 @@ export function listRecusals(db, { stageId, judgeId = null } = {}) {
 }
 ```
 
-`platform/src/audit/log.js`：
+`platform/src/db/repo/audit-log.js`（**新建** —— `audit_log` 的 SQL 唯一归宿）：
 
 ```javascript
-// src/audit/log.js — 审计日志
-// 依据：设计文档 §11 / §12（可复算与留痕）。若 P0/P1 已建同名模块，按本签名对齐，不要重复实现。
+// src/db/repo/audit-log.js — 审计日志仓储
+// 依据：设计文档 §11.2 / §12（可复算与留痕）；表由 P0 的 001_init.sql 建好。
+// ⛔ 全局约束「所有 SQL 收在 src/db/repo/」—— 本文件是 audit_log 的 SQL 唯一归宿，
+//    P0 的 test/sql-boundary.test.js 会扫描 src/ 与 scripts/ 下**除 src/db/repo/ 外**的一切 .js。
 import { randomUUID } from 'node:crypto';
 
-export function writeAuditLog(db, { actorId = null, action, entity = null, entityId = null, detail = null, now }) {
-  const id = randomUUID();
+export function insertAuditLogRow(db, {
+  id = randomUUID(),
+  actorId = null,
+  action,
+  entity = null,
+  entityId = null,
+  detailJson = null,
+  createdAt = new Date().toISOString(),
+}) {
   db.prepare(
     `INSERT INTO audit_log (id, actor_id, action, entity, entity_id, detail_json, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?)`,
-  ).run(id, actorId, action, entity, entityId, detail ? JSON.stringify(detail) : null, now);
+  ).run(id, actorId, action, entity, entityId, detailJson, createdAt);
   return id;
 }
 
-export function listAuditLog(db, { entity = null, entityId = null, limit = 100 } = {}) {
+export function queryAuditLogRows(db, { entity = null, entityId = null, limit = 100 } = {}) {
   if (entity) {
     return db
       .prepare('SELECT * FROM audit_log WHERE entity = ? AND entity_id = ? ORDER BY created_at DESC LIMIT ?')
@@ -2377,6 +2423,61 @@ export function listAuditLog(db, { entity = null, entityId = null, limit = 100 }
   return db.prepare('SELECT * FROM audit_log ORDER BY created_at DESC LIMIT ?').all(limit);
 }
 ```
+
+`platform/src/audit/log.js`（**薄服务门面** —— 本文件**不含任何 SQL**）：
+
+```javascript
+// src/audit/log.js — 审计日志（服务门面）
+// 依据：设计文档 §11 / §12（可复算与留痕）。设计文档 §4.3 已预留 src/audit/ 目录。
+// ⚠️ 本文件【不含 SQL】—— SQL 全在 src/db/repo/audit-log.js（全局约束：SQL 边界；
+//    P0 的 test/sql-boundary.test.js 会把 src/ 下任何裸 SQL 判为违规）。
+// ⛔ action 必须给：没有 action 的日志无法检索，缺了它这条记录等于没写。
+import { insertAuditLogRow, queryAuditLogRows } from '../db/repo/audit-log.js';
+
+export function writeAuditLog(db, { actorId = null, action, entity = null, entityId = null, detail = null, now }) {
+  if (!action) throw new Error('写审计日志必须给 action（没有 action 的日志无法检索）');
+  const id = insertAuditLogRow(db, {
+    actorId,
+    action,
+    entity,
+    entityId,
+    detailJson: detail ? JSON.stringify(detail) : null,
+    createdAt: now,
+  });
+  return id;
+}
+
+export function listAuditLog(db, { entity = null, entityId = null, limit = 100 } = {}) {
+  return queryAuditLogRows(db, { entity, entityId, limit });
+}
+```
+
+> **【2026-10-21 漂移审计修正 C-3 + I-8 + M-7 + M-8】**
+> **原来错在哪**：`src/audit/log.js` 的两条 SQL（`db.prepare('INSERT INTO audit_log …')` 与
+> `db.prepare('SELECT * FROM audit_log …')`）是**内联在这个门面文件里的裸 SQL**。
+> P0 终审 I-7 立了全局约束「所有 SQL 收进 `platform/src/db/repo/`」，并由
+> `platform/test/sql-boundary.test.js` 守卫：扫描 `src/` 与 `scripts/` 下**除 `src/db/repo/`
+> 与 `src/db/migrate.js` 外**的一切 `.js`，只要出现 `db.prepare(`/`db.exec(` 且参数里含
+> `SELECT/INSERT/UPDATE/DELETE/CREATE TABLE/DROP/ALTER` 就判违规。
+> `src/audit/log.js` **不在豁免名单里** → 照本计划实施，P0 自带用例当场变红
+> （审计实跑：`not ok 1 - src/ 与 scripts/ 里除仓储层外没有裸 SQL`，
+> 报 `src/audit/log.js:6 出现 SQL：INSERT INTO audit_log (…)` 等 3 条违规）。
+> **为什么错**：服务层/门面层写 SQL 正是 I-7 修复要消灭的形态；且 I-8 指出同一张 `audit_log`
+> 在 P2（门面内联 SQL）与 P4（另建 `src/db/repo/audit-log.js`）有**两条写路径**，
+> 「审计日志唯一入口」失守。
+> **改成什么**：① 新建 `platform/src/db/repo/audit-log.js`，导出 `insertAuditLogRow` /
+> `queryAuditLogRows`（两个 SQL 全在里面）；② `platform/src/audit/log.js` 退化为**薄服务门面**，
+> `import { insertAuditLogRow, queryAuditLogRows }` 后转调，**函数签名一个字都不改**
+> （`writeAuditLog(db, { actorId, action, entity, entityId, detail, now })` /
+> `listAuditLog(db, { entity, entityId, limit })`），P2 自己的调用点不需要跟着改；
+> ③ 门面的 `writeAuditLog` 补一条 `!action` 守卫（原来只有 P4 的改造块里有，
+> 现在 P2 就有 —— 少了它，`action` 为 undefined 时会把 undefined 绑进 SQLite 抛错）。
+> **依据**：P0 终态 `platform/test/sql-boundary.test.js:282-292`（扫描范围 + 豁免名单）、
+> `platform/src/db/repo/users.js`（仓储层文件头「所有 SQL 收进仓储层，handler 内禁止裸 SQL」）
+> 与漂移审计报告 C-3 / I-8 / M-7 / M-8。
+> **连带**：`git add` 列表改为显式点名 `src/db/repo/audit-log.js`（M-8：原来只有
+> `src/audit/log.js`，与 SQL 边界约束的直觉相悖）；P4 侧的对应改动见
+> `2026-10-20-platform-P4-audit-anticheat.md` 的 I-8 修正记录。
 
 - [ ] **Step 4: 创建 src/services/review.js**
 
@@ -2407,13 +2508,14 @@ import { findSelfReviewsByRequestId, findSelfReview, insertSelfReview, updateSel
 import { insertRecusal, listRecusals } from '../db/repo/recusals.js';
 import { writeAuditLog } from '../audit/log.js';
 import { checkRecusal, checkPeerEligibility } from '../domain/review-eligibility.js';
+import { appError } from '../errors.js';
 
 function fail(status, code, message, detail) {
-  const err = new Error(message);
-  err.status = status;
-  err.code = code;
-  if (detail) err.detail = detail;
-  return err;
+  // ⚠️ 必须用 P0 的 AppError（**不是** `new Error()` + 挂 .status/.code）：
+  //    P0 终审 I-C 的错误分支是 `err instanceof AppError ? err.message : '请求无效'` ——
+  //    裸 Error 不是 AppError → message 被替换成通用文案「请求无效」，
+  //    计划里想给用户看的中文文案会被**吞掉**。
+  return appError(status, code, message, detail || undefined);
 }
 
 function assertVotingJudge(db, stageId, judgeId) {
@@ -2658,14 +2760,21 @@ export { listRecusals, listReviews, listEnterpriseConfirmations };
 - [ ] **Step 5: 运行测试确认通过**
 
 Run: `cd platform && node --test test/review-service.test.js`
-Expected: PASS（10 个测试全过）
+Expected: PASS（10 个测试全过：review-service.test.js 10）
 
 - [ ] **Step 6: 提交**
 
 ```bash
-cd platform && git add src/db/repo src/audit/log.js src/services/review.js test/review-service.test.js
+cd platform && git add src/db/repo src/db/repo/audit-log.js src/audit/log.js src/services/review.js test/review-service.test.js
 git commit -m "feat(P2): 评分提交服务（幂等 + 增量 score_stats + 校准/互评/自评/回避）"
 ```
+
+> **【2026-10-21 漂移审计修正 M-8】** 原来 `git add` 列表里只有 `src/audit/log.js`
+> （在 `src/` 而非 `src/db/repo/`），与「SQL 收在仓储层」的直觉相悖 —— 读起来像
+> 「审计日志的 SQL 在 `src/` 里」。C-3 修正后 `audit_log` 的 SQL 落在
+> `src/db/repo/audit-log.js`，故在 add 列表里**显式点名**该文件（`src/db/repo` 目录项保留：
+> 本 Task 还新建了 stages / reviews / request-keys / enterprise-confirmations /
+> peer-reviews / self-reviews / recusals 七个仓储文件）。
 
 ---
 
@@ -2869,12 +2978,13 @@ import {
   listTiebreakVotes,
 } from '../db/repo/tiebreak.js';
 import { writeAuditLog } from '../audit/log.js';
+import { appError } from '../errors.js';
 
 function fail(status, code, message) {
-  const err = new Error(message);
-  err.status = status;
-  err.code = code;
-  return err;
+  // ⚠️ 必须用 P0 的 AppError（**不是** `new Error()` + 挂 .status/.code）：
+  //    P0 终审 I-C 的错误分支是 `err instanceof AppError ? err.message : '请求无效'` ——
+  //    裸 Error 不是 AppError → message 被替换成通用文案「请求无效」。
+  return appError(status, code, message);
 }
 
 function addMinutes(iso, minutes) {
@@ -2970,7 +3080,7 @@ export function getTiebreakExtraScores({ db, stageId, teamIds = [] }) {
 - [ ] **Step 5: 运行测试确认通过**
 
 Run: `cd platform && node --test test/tiebreak.test.js`
-Expected: PASS（5 个测试全过）
+Expected: PASS（5 个测试全过：tiebreak.test.js 5）
 
 - [ ] **Step 6: 提交**
 
@@ -3750,7 +3860,7 @@ export function upsertStageResult(db, { stageId, teamId, total, seatP, seatE, co
 //   ⛔ compute 是【显式动作，不自动触发】：发榜影响奖金，必须有明确的操作者与时间戳。
 //   每次计算产出三件套（input + output + trace）写入 computation_snapshots → 榜单可复算。
 //   ⛔ 但计算用的是【原始数据全量重算】，不是 score_stats 增量值 —— 可复算要求能从原始数据重放。
-import { getStage } from '../db/repo/stages.js';
+import { getStage, listStageTeams as listStageTeamsRows } from '../db/repo/stages.js';
 import { listReviews } from '../db/repo/reviews.js';
 import { listEnterpriseConfirmations } from '../db/repo/enterprise-confirmations.js';
 import { listPeerReviews } from '../db/repo/peer-reviews.js';
@@ -3761,37 +3871,25 @@ import { insertSnapshot, nextRevision, upsertStageResult, getSnapshot } from '..
 import { writeAuditLog } from '../audit/log.js';
 import { scoreStage } from '../domain/scoring.js';
 import { checkRecusal } from '../domain/review-eligibility.js';
+import { appError } from '../errors.js';
 
 function fail(status, code, message) {
-  const err = new Error(message);
-  err.status = status;
-  err.code = code;
-  return err;
+  // ⚠️ 必须用 P0 的 AppError（**不是** `new Error()` + 挂 .status/.code）：
+  //    P0 终审 I-C 的错误分支是 `err instanceof AppError ? err.message : '请求无效'` ——
+  //    裸 Error 不是 AppError → message 被替换成通用文案「请求无效」。
+  return appError(status, code, message);
 }
 
 /** 队伍名册（需要 P1 的 teams / task_packages；表未就绪时返回空并由调用方记 warning） */
 export function listStageTeams(db, stageId) {
   try {
-    return db
-      .prepare(
-        `SELECT t.id AS team_id, tp.enterprise_id AS package_enterprise_id,
-                COALESCE(tp.is_free_brief, 0) AS is_free_brief
-         FROM teams t
-         LEFT JOIN task_packages tp ON tp.id = t.task_package_id
-         WHERE t.edition_id = (SELECT edition_id FROM stages WHERE id = ?)
-           AND t.deleted_at IS NULL
-         ORDER BY t.id`,
-      )
-      .all(stageId)
-      .map((r) => ({
-        teamId: r.team_id,
-        packageEnterpriseId: r.package_enterprise_id ?? null,
-        isFreeBrief: !!r.is_free_brief,
-      }));
+    // SQL 在仓储层（src/db/repo/stages.js）；本文件**不含 SQL**。
+    return listStageTeamsRows(db, stageId);
   } catch {
     return [];
   }
 }
+
 
 /**
  * 计算一个赛段的分数并落快照。
@@ -3905,6 +4003,41 @@ export function getComputation({ db, id }) {
 }
 ```
 
+
+> **【2026-10-21 漂移审计修正 N-2（审计报告未覆盖，本次新发现）】**
+> **原来错在哪**：`src/services/compute.js` 的 `listStageTeams()` 原来在**服务层直接写 SQL**：
+> ```javascript
+> export function listStageTeams(db, stageId) {
+>   try {
+>     return db
+>       .prepare(
+>         `SELECT t.id AS team_id, tp.enterprise_id AS package_enterprise_id,
+>                 COALESCE(tp.is_free_brief, 0) AS is_free_brief
+>          FROM teams t
+>          LEFT JOIN task_packages tp ON tp.id = t.task_package_id
+>          WHERE t.edition_id = (SELECT edition_id FROM stages WHERE id = ?)
+>            AND t.deleted_at IS NULL
+>          ORDER BY t.id`,
+>       )
+>       .all(stageId)
+>       ...
+> ```
+> **为什么错**：与 C-3 / C-4 / C-5 **完全同类** —— 越过全局约束「所有 SQL 收进
+> `platform/src/db/repo/`」，`platform/test/sql-boundary.test.js` 守卫会判违规。
+> **审计为什么没抓到**：审计的实跑只把**三个文件**放进 pristine 树
+> （`src/audit/log.js` / `src/services/review-state.js` / `scripts/restore.js`），
+> 所以它报的是「6 条违规」；本文件**没被放进去** → 这一条被漏掉了。
+> 本次用「把五份计划的**全部**代码块按 P0 的判定规则扫一遍」的方式把它找了出来
+> （扫描器复刻了 `sql-boundary.test.js` 的 `stripComments` + `findDbCalls` + `SQL_KEYWORD` 规则）。
+> **改成什么**：① SQL **下沉**到本阶段 Task 6 已建的 `src/db/repo/stages.js`
+> （新增 `listStageTeams(db, stageId)`）；② `src/services/compute.js` 改为
+> `import { getStage, listStageTeams as listStageTeamsRows } from '../db/repo/stages.js';`
+> 并把服务层函数改成「调仓储 + 保留原来的 try/catch 兜底」
+> （**行为完全不变**：表未就绪时仍然返回 `[]`，由调用方记 warning ——
+> 差别只在于「抛错」这件事现在由仓储层做、由服务层兜住）。
+> **依据**：基线 `platform/test/sql-boundary.test.js:282-292`（扫描范围 + 豁免名单）
+> + 漂移审计报告 C-3 / C-4 / C-5 的同一规则。
+
 - [ ] **Step 6: 创建 src/http/routes/review.js**
 
 ```javascript
@@ -3914,6 +4047,7 @@ export function getComputation({ db, id }) {
 //   权限：capability + assignment（唯一入口 can()）。P2 阶段先做「登录 + 能力点」判定，
 //   行级 scope 由 P3/P4 的 scopeClause 补齐。
 import { json } from '../respond.js';
+import { AppError } from '../../errors.js';
 import {
   submitReviews,
   getReviewState,
@@ -3927,10 +4061,7 @@ import { computeStage, getComputation } from '../../services/compute.js';
 
 function requireUser(ctx) {
   if (!ctx.user) {
-    const e = new Error('未登录');
-    e.status = 401;
-    e.code = 'UNAUTHENTICATED';
-    throw e;
+    throw new AppError(401, 'UNAUTHENTICATED', '未登录');
   }
   return ctx.user;
 }
@@ -3938,10 +4069,7 @@ function requireUser(ctx) {
 function requireCapability(ctx, capability) {
   requireUser(ctx);
   if (!ctx.can(capability, { scopeType: 'global' })) {
-    const e = new Error(`缺少能力：${capability}`);
-    e.status = 403;
-    e.code = 'FORBIDDEN';
-    throw e;
+    throw new AppError(403, 'FORBIDDEN', `缺少能力：${capability}`);
   }
 }
 
@@ -4046,6 +4174,40 @@ export function registerReviewRoutes(router) {
 
 export { json };
 ```
+
+> **【2026-10-21 漂移审计修正 N-1（审计报告未覆盖，本次新发现）】**
+> **原来错在哪**：本文件（以及 P2 计划里所有路由守卫）原来这样构造领域错误：
+> ```javascript
+> const e = new Error('未登录');
+> e.status = 401;
+> e.code = 'UNAUTHENTICATED';
+> throw e;
+> ```
+> **为什么错**：P0 终审 I-C 把错误分支收口成
+> `const message = err instanceof AppError ? err.message : '请求无效';` ——
+> **裸 `Error` 不是 `AppError`** → `message` 被替换成通用文案「请求无效」，
+> 计划里想给用户看的「未登录」/「缺少能力：score:write」**全部被吞掉**。
+> `code` 还能出去（`domainCode()` 只过滤 `ERR_` 前缀），于是响应变成
+> `{"error":{"code":"UNAUTHENTICATED","message":"请求无效"}}` ——
+> 状态码对、文案丢，**属于静默的行为回退**，而且没有任何测试会拦（断言多半只看 status）。
+> 审计报告 §3 检查项 2 声称「未发现任何 `new Error()` + 挂 `.status` 的裸错误构造」——
+> **该结论不成立**，P2 的这个文件就是反例（本条为本次新发现，已修）。
+> **改成什么**：改用 P0 建立的 `src/errors.js` 的 `AppError`（**status-first**）：
+> `throw new AppError(401, 'UNAUTHENTICATED', '未登录')` /
+> `throw new AppError(403, 'FORBIDDEN', \`缺少能力：${capability}\`)`，
+> 并在文件顶部加 `import { AppError } from '../../errors.js';`。
+> **⚠️ 本条不只这一处**：本计划的**三个服务层**也各有一个 `fail()` 辅助函数用同样的写法 ——
+> `src/services/review.js`（`fail(status, code, message, detail)`）、
+> `src/services/tiebreak.js`（`fail(status, code, message)`）、
+> `src/services/compute.js`（`fail(status, code, message)`）。
+> 三处**一律改为** `appError(status, code, message, detail || undefined)`
+> （`detail || undefined` 保留了原来 `if (detail)` 的「falsy 就不设」语义），
+> 并各自加 `import { appError } from '../errors.js';`。
+> 受影响的具体文案：`赛段不存在`（404）、`缺少规则配置，拒绝计算`（500）、
+> `赛段 X 指向的权重表 Y 不存在`（500）—— 照原写法它们**全部**会被换成「请求无效」。
+> **依据**：P0 终态 `platform/src/errors.js`（`AppError(status, code, message, detail)`，
+> 文件头明写「全项目统一由这里产生领域错误」）+ P1 终态
+> `platform/src/http/routes/registration.js` 的同一写法（`throw new AppError(401, 'UNAUTHENTICATED', '未登录')`）。
 
 - [ ] **Step 7: 修改 rules/scoring-initial.json 与 rules/scoring-final.json**
 
@@ -4162,7 +4324,368 @@ git commit -m "feat(P2): scoreStage 总装、compute 快照服务与 9 条评审
 
 ---
 
-## 需求覆盖对照（本阶段负责的 15 条）
+### Task 9: SSE 评审进度推送（兑现 `web/api.js` 的承诺）
+
+**Files:**
+- Create: `platform/src/http/sse.js`
+- Modify: `platform/src/server.js`（新增**独立于 router** 的 SSE 分支；`createApp` / `handle` 签名不变）
+- Modify: `platform/src/http/routes/review.js`（提交评审成功后发布一条进度事件）
+- Test: `platform/test/sse.test.js`
+
+**Interfaces:**
+- Consumes: P0 的 `createApp` / `handle`（`src/server.js`，**签名不变**）；server.js 内部的 `parseCookie` / `resolveSession` / `getUserById`（模块私有，只在 server.js 内使用）
+- Produces:
+  - `parseSsePath(url)` → `{ stageId }` 或 `null`
+  - `openSseStream(res)` → 写 200 + `text/event-stream` 响应头
+  - `sendSseEvent(res, event, data)` → 写一帧（`event:` + 单行 `data:` + 空行）；响应已结束则返回 `false`
+  - `closeSseStream(res)` → 结束响应
+  - `createSseHub()` → `{ add, remove, publish, size, closeAll }`
+  - `reviewEvents` → 评审进度事件中心（`createSseHub()` 的单例）
+  - 端点：`GET /api/stages/:stageId/events`（SSE，需登录；评审进度推送）
+
+> **⚠️ 为什么这个 Task 必须落在 P2（本 Task 是 I-6 的唯一落点）**
+> P0 终态 `platform/web/api.js:28-30` 的 `subscribe()` 明确写着：
+> 「SSE：单向推送，走普通 HTTP，穿透代理容易，EventSource 自带断线重连
+> ⚠️ SSE 端点在 **P2** 才实现（src/http/sse.js）—— P0/P1 调用会 404，不要在 P0/P1 用。」
+> 而 P2–P6 五份计划**全部没有承接**这个承诺（`grep -c 'sse\.js'` 五份全为 0）——
+> 结果是一条**指向不存在实现的活引用**：`web/api.js` 永远走 404，注释却指向 P2。
+> 审计报告 I-6 给的两条路里，②「改 P0 的 `web/api.js` 注释」**落在 `platform/` 下**（P0 的地盘，
+> 本阶段不得改动），因此本 Task 走 ①：**P2 补齐 `src/http/sse.js` 与对应端点**。
+
+- [ ] **Step 1: 写失败的测试**
+
+`platform/test/sse.test.js`：
+
+```javascript
+// platform/test/sse.test.js — SSE 评审进度推送
+// 依据：P0 终态 web/api.js:28-30 承诺「SSE 端点在 P2 才实现（src/http/sse.js）」
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import http from 'node:http';
+import { openDatabase } from '../src/db/sqlite.js';
+import { applyMigrations } from '../src/db/migrate.js';
+import { loadRules } from '../src/config.js';
+import { createApp } from '../src/server.js';
+import { createUser } from '../src/db/repo/users.js';
+import { createSession } from '../src/auth/session.js';
+import { parseSsePath, sendSseEvent, createSseHub, reviewEvents } from '../src/http/sse.js';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const migrationsDir = join(here, '..', 'db', 'migrations');
+const rulesDir = join(here, '..', 'rules');
+
+function setup() {
+  const dataDir = mkdtempSync(join(tmpdir(), 'hks-sse-'));
+  const { db, close } = openDatabase({ dataDir });
+  applyMigrations(db, migrationsDir);
+  const { rules } = loadRules(rulesDir);
+  const webDir = mkdtempSync(join(tmpdir(), 'hks-sse-web-'));
+  writeFileSync(join(webDir, 'index.html'), '<h1>home</h1>');
+  const app = createApp({ db, rules, webDir });
+  return { db, close, dataDir, webDir, app };
+}
+
+/** 假响应：只记录 writeHead / write / end（测帧格式用，不必起真服务器）。 */
+function fakeRes() {
+  const chunks = [];
+  return {
+    statusCode: 0,
+    headers: {},
+    writableEnded: false,
+    chunks,
+    writeHead(status, h) { this.statusCode = status; this.headers = h || {}; },
+    write(chunk) { chunks.push(String(chunk)); return true; },
+    end() { this.writableEnded = true; },
+    text() { return chunks.join(''); },
+  };
+}
+
+test('parseSsePath 能解析 /api/stages/:stageId/events，非 SSE 路径返回 null', () => {
+  assert.deepEqual(parseSsePath('/api/stages/st-1/events'), { stageId: 'st-1' });
+  assert.deepEqual(parseSsePath('/api/stages/st-1/events?x=1'), { stageId: 'st-1' });
+  assert.equal(parseSsePath('/api/stages/st-1/reviews'), null);
+  assert.equal(parseSsePath('/api/health'), null);
+});
+
+test('sendSseEvent 写出的帧符合 SSE 规范：event + 单行 data + 空行结尾', () => {
+  const res = fakeRes();
+  assert.equal(sendSseEvent(res, 'review.progress', { stageId: 'st-1' }), true);
+  assert.equal(res.text(), 'event: review.progress\ndata: {"stageId":"st-1"}\n\n');
+});
+
+test('sendSseEvent 对已结束的响应静默返回 false（客户端已断开）', () => {
+  const res = fakeRes();
+  res.end();
+  assert.equal(sendSseEvent(res, 'x', {}), false);
+  assert.equal(res.text(), '');
+});
+
+test('createSseHub 的 publish 只发给同 topic 的订阅者', () => {
+  const hub = createSseHub();
+  const a = fakeRes();
+  const b = fakeRes();
+  hub.add(a, 'stage:st-1');
+  hub.add(b, 'stage:st-2');
+  assert.equal(hub.publish('review.progress', { n: 1 }, 'stage:st-1'), 1);
+  assert.ok(a.text().includes('event: review.progress'));
+  assert.equal(b.text(), '');
+  hub.closeAll();
+});
+
+test('createSseHub 的 closeAll 会结束所有订阅连接并清空订阅者', () => {
+  const hub = createSseHub();
+  const a = fakeRes();
+  hub.add(a, 'stage:st-1');
+  assert.equal(hub.size, 1);
+  hub.closeAll();
+  assert.equal(a.writableEnded, true);
+  assert.equal(hub.size, 0);
+});
+
+test('GET /api/stages/:stageId/events 建立 SSE 连接并先发 connected 首帧', async () => {
+  const { db, close, dataDir, webDir, app } = setup();
+  const user = createUser(db, { name: '甲', phone: '13800000901', password: 'pw123' });
+  const { token } = createSession(db, user.id);
+  const server = http.createServer(app.handle);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address();
+  try {
+    const frame = await new Promise((resolve, reject) => {
+      const req = http.get(
+        { host: '127.0.0.1', port, path: '/api/stages/st-1/events', headers: { cookie: `hk_session=${token}` } },
+        (res) => {
+          assert.equal(res.statusCode, 200);
+          assert.match(String(res.headers['content-type']), /text\/event-stream/);
+          let buf = '';
+          res.on('data', (c) => {
+            buf += c.toString();
+            if (buf.includes('\n\n')) resolve(buf);
+          });
+          res.on('error', reject);
+        },
+      );
+      req.on('error', reject);
+      req.setTimeout(3000, () => reject(new Error('SSE 首帧超时')));
+    });
+    assert.match(frame, /^event: connected\n/);
+    assert.match(frame, /"stageId":"st-1"/);
+  } finally {
+    reviewEvents.closeAll();
+    server.close();
+    close();
+    rmSync(dataDir, { recursive: true, force: true });
+    rmSync(webDir, { recursive: true, force: true });
+  }
+});
+```
+
+- [ ] **Step 2: 运行测试确认失败**
+
+Run: `cd platform && node --test test/sse.test.js`
+Expected: FAIL —— `Cannot find module '../src/http/sse.js'`
+
+- [ ] **Step 3: 创建 `src/http/sse.js`**
+
+```javascript
+// src/http/sse.js — Server-Sent Events（单向推送）
+// 依据：设计文档 §4.3 的目录清单（http/ 下含 sse.js）+ P0 终态 `platform/web/api.js:28-30`
+//   的明确承诺：「⚠️ SSE 端点在 **P2** 才实现（src/http/sse.js）」—— 本文件就是那个承诺的兑现。
+//
+// ⚠️ 为什么 SSE **不挂 router**：P0 的 router handler 约定是「返回一个值 → server.js
+//    统一 json() 序列化并结束响应」。SSE 要**长期持有这条连接**（多次推帧）——
+//    走 router 会被 server.js 的 json() 提前收尾 → 客户端只收到第一帧就断。
+//    所以 SSE 走 server.js 里**独立的分支**：自己写头、自己推帧、自己收尾。
+//
+// ⛔ 帧格式（SSE 规范）：`event: <name>\ndata: <单行 JSON>\n\n`
+//    data 里不能有裸换行（会截断帧）→ 一律 JSON.stringify。
+// ⛔ 不能用 json() / text() 写响应头 —— 那会把 Content-Type 定死成 application/json。
+
+export const SSE_HEADERS = {
+  'Content-Type': 'text/event-stream; charset=utf-8',
+  'Cache-Control': 'no-cache, no-transform',
+  Connection: 'keep-alive',
+  // nginx 默认缓冲响应 → 事件被攒着一起发，前端看起来像「不推送」。
+  'X-Accel-Buffering': 'no',
+};
+
+/** 解析 SSE 路径：/api/stages/:stageId/events → { stageId }；不是 SSE 路径 → null。 */
+export function parseSsePath(url) {
+  const m = /^\/api\/stages\/([^/?#]+)\/events(?:\?|$)/.exec(String(url || ''));
+  if (!m) return null;
+  return { stageId: decodeURIComponent(m[1]) };
+}
+
+/** 写 SSE 响应头并保持连接。 */
+export function openSseStream(res) {
+  res.writeHead(200, SSE_HEADERS);
+  if (typeof res.flushHeaders === 'function') res.flushHeaders();
+  return true;
+}
+
+/** 写一帧。响应已结束（客户端断开）时静默返回 false。 */
+export function sendSseEvent(res, event, data) {
+  if (!res || res.writableEnded) return false;
+  const payload = JSON.stringify(data ?? null);
+  res.write(`event: ${event}\ndata: ${payload}\n\n`);
+  return true;
+}
+
+/** 结束 SSE 响应。 */
+export function closeSseStream(res) {
+  if (res && !res.writableEnded) res.end();
+}
+
+/**
+ * 事件中心：按 topic 分发的订阅者集合。
+ * ⛔ 订阅者（res）在客户端断开时必须被移除 —— 否则连接泄漏，进程内存单调增长。
+ *    调用方（server.js）在 res.on('close') 里调 remove()。
+ */
+export function createSseHub() {
+  const clients = new Map(); // res → topic
+  return {
+    add(res, topic = null) {
+      clients.set(res, topic);
+      return () => clients.delete(res);
+    },
+    remove(res) {
+      clients.delete(res);
+    },
+    /** 向同一 topic 的订阅者推一帧，返回送达数。 */
+    publish(event, data, topic = null) {
+      let sent = 0;
+      for (const [res, t] of clients) {
+        if (topic !== null && t !== topic) continue;
+        if (sendSseEvent(res, event, data)) sent += 1;
+      }
+      return sent;
+    },
+    get size() {
+      return clients.size;
+    },
+    /** 结束并清空所有订阅连接（测试收尾用）。 */
+    closeAll() {
+      for (const res of [...clients.keys()]) {
+        closeSseStream(res);
+        clients.delete(res);
+      }
+    },
+  };
+}
+
+/** 评审进度事件中心（P2 唯一的事件源）。 */
+export const reviewEvents = createSseHub();
+```
+
+- [ ] **Step 4: 修改 `src/server.js`（新增 SSE 分支）**
+
+在 `import` 区加入：
+
+```javascript
+import { parseSsePath, openSseStream, sendSseEvent, reviewEvents } from './http/sse.js';
+```
+
+在 `handleRequest()` 里、`if (url.startsWith('/api/')) {` 的 **try 块内、`const match = router.match(req.method, url);` 之前**插入：
+
+```javascript
+        // ── P2：SSE（评审进度推送）────────────────────────────────
+        // ⚠️ 必须**独立于 router**，且**在 router.match 之前**：
+        //    P0 的 router handler 约定是「返回一个值 → server.js 统一 json() 序列化
+        //    并结束响应」；SSE 要**长期持有这条连接**（多次推帧）——
+        //    挂到 router 上会被 json() 提前收尾，客户端只收到第一帧就断。
+        //    放在 router.match 之前还有第二个原因：SSE 路径**不在 router 里**，
+        //    若先 match 会直接走 404 分支。
+        const ssePath = req.method === 'GET' ? parseSsePath(url) : null;
+        if (ssePath) {
+          const sseToken = parseCookie(req.headers?.cookie || '')['hk_session'];
+          const sseSession = sseToken ? resolveSession(db, sseToken) : null;
+          const sseUser = sseSession ? getUserById(db, sseSession.userId) : null;
+          if (!sseUser) {
+            error(res, 401, 'UNAUTHENTICATED', '未登录');
+            return;
+          }
+          openSseStream(res);
+          const topic = `stage:${ssePath.stageId}`;
+          reviewEvents.add(res, topic);
+          // ⛔ 客户端断开时必须摘掉订阅者 —— 否则连接泄漏，进程内存单调增长。
+          res.on('close', () => reviewEvents.remove(res));
+          // 首帧必须给：EventSource 的 onopen 拿不到业务数据，客户端靠它确认订阅成功。
+          sendSseEvent(res, 'connected', { stageId: ssePath.stageId, at: new Date().toISOString() });
+          return;
+        }
+```
+
+- [ ] **Step 5: 修改 `src/http/routes/review.js`（提交后发布进度事件）**
+
+在文件顶部加入：
+
+```javascript
+import { reviewEvents } from '../sse.js';
+```
+
+把 `POST /api/stages/:stageId/reviews` 的 handler 改成（**只改这一条路由**，其余路由不动）：
+
+```javascript
+  router.add('POST', '/api/stages/:stageId/reviews', async (ctx) => {
+    requireCapability(ctx, 'score:write');
+    const result = await submitReviews({
+      db: ctx.db,
+      stageId: ctx.params.stageId,
+      judgeId: ctx.user.id,
+      items: ctx.body?.items ?? [],
+      requestId: ctx.body?.requestId ?? null,
+      now: new Date().toISOString(),
+    });
+    // 评审进度推送：订阅同一赛段的评审端据此刷新进度条。
+    // ⚠️ 发布点在 **HTTP 层**（不是 service 层）：service 不该知道 HTTP 的存在。
+    reviewEvents.publish(
+      'review.progress',
+      { stageId: ctx.params.stageId, judgeId: ctx.user.id, at: new Date().toISOString() },
+      `stage:${ctx.params.stageId}`,
+    );
+    return result;
+  });
+```
+
+- [ ] **Step 6: 运行测试确认通过**
+
+Run: `cd platform && node --test test/sse.test.js`
+Expected: PASS（6 个测试全过：sse.test.js 6）
+
+- [ ] **Step 7: 全量测试**
+
+Run: `cd platform && node --test`
+Expected: 全部通过
+
+- [ ] **Step 8: 提交**
+
+```bash
+cd platform && git add src/http/sse.js src/server.js src/http/routes/review.js test/sse.test.js
+git commit -m "feat(P2): SSE 评审进度推送（src/http/sse.js + GET /api/stages/:stageId/events）"
+```
+
+> **【2026-10-21 漂移审计修正 I-6】**
+> **原来错在哪**：P0 终态 `platform/web/api.js:28-30` 的 `subscribe()` 明写「⚠️ SSE 端点在 **P2**
+> 才实现（src/http/sse.js）」，而 P2–P6 五份计划**没有一份承接**（`grep -c 'sse\.js'`
+> 五份全为 0，`grep -c 'api\.subscribe'` 亦全为 0）→ 一条**指向不存在实现的活引用**：
+> `web/api.js` 的 `subscribe()` 永远是 404 路径，注释却指向 P2。
+> **为什么错**：设计文档 §4.3 的目录清单里 `http/` 下确实列了 `sse.js`，P0 又在代码注释里
+> 把这条债正式立给了 P2 —— 五份计划无人认领，等于这条债永远悬着。
+> **改成什么**：在 P2 增设 **Task 9**（`src/http/sse.js` + 端点 `GET /api/stages/:stageId/events`
+> + `src/server.js` 的独立 SSE 分支 + `src/http/routes/review.js` 的进度事件发布 + 6 条用例）。
+> 审计报告给的第 ② 条路（「改 P0 `web/api.js` 的注释」）**落在 `platform/` 目录下**，
+> 属 P0 的地盘、本阶段不得改动 → 只能走第 ① 条路「P2 补齐」。
+> **依据**：P0 终态 `platform/web/api.js:28-30`（承诺原文）+ 设计文档 §4.3 的目录清单
+> （`http/ router.js respond.js body.js static.js sse.js`）+ 审计报告 I-6。
+> **接口取舍留痕**：SSE **不挂 router** —— P0 的 router handler 约定是「返回值 → server.js
+> 统一 json() 序列化并结束响应」，而 SSE 要长期持有连接（多次推帧），挂 router 上会被
+> `json()` 提前收尾 → 客户端只收到第一帧就断。故 SSE 走 `src/server.js` 里**独立于 router**
+> 的分支，并放在 `router.match` **之前**（SSE 路径不在 router 里，先 match 会直接走 404）。
+> 该分支插在 P0 的 `handleRequest()` try 块内、`const match = router.match(...)` 之前，
+> **不动** P0 的 I7-4 handler 返回契约块与 I-C 错误分支（见 C-1 的教训）。
 
 | 需求 ID | 落在哪 | 实现要点 |
 |---|---|---|
@@ -4226,7 +4749,23 @@ git commit -m "feat(P2): scoreStage 总装、compute 快照服务与 9 条评审
 | D-15 | P 席包含自评维度 | 决赛权重表含「自评测 5%」 | P 席 = 评委维度 ∪ 自评维度 | 决赛权重表 70+25+5=100%，而公式 (1−w_E)=75% 只能覆盖「评委 70% + 自评 5%」 | 初赛无自评维度，完全不受影响 |
 | D-16 | 规则文件新增字段 | 9 份规则的字段未列 | `scoring-initial.json` / `scoring-final.json` 增加 `judgePool` / `freeBrief` / `fallback` / `trimmedIterations` / `bayesPriorStrength` / `selfEvalThreshold` | R-JDG-10 / R-JDG-11 / R-JDG-08 的数值必须配置化（⛔ 不硬编码） | 只加字段，不改已有权重与 `wEnterprise` |
 | D-17 | `fallbackReason` 取值 | INTERFACES 用 `zero_stdev`；C-05 用 `stdev_zero` | 统一用 INTERFACES 的 `zero_stdev` | INTERFACES 是跨阶段唯一事实来源 | 另两处取值为 `judge_sample_too_small` / `raw_fallback` / `unknown_strategy` / `empty_samples` |
-| D-18 | 迁移版本号 | P0 建了 `002_user_roles.sql`；INTERFACES 把 P1 的报名迁移编为 `002_registration.sql` | P2 的迁移用 `003_review.sql`（不冲突） | ⚠️ **P0 与 P1 的 002 版本号重复**：`applyMigrations` 按版本号去重，后者的 `002` 会被跳过 | ⛔ **需 P1 改名为 `002_registration.sql` 之外的版本，或 P0 改名**。本阶段不擅自改动他人文件，但**必须在上线前解决**，否则报名表不会建 |
+| D-18 | 迁移版本号 | 全局唯一序位：`001=P0`、`002=P1`、`003=P2`、`004=P3`、`005=P4`、`006=P5` | P2 的迁移用 `003_review.sql`（不冲突） | ✅ **已消解**（2026-10-21 订正）：P0 终态 `platform/db/migrations/` **只有 `001_init.sql`**，**从未建过 `002_user_roles.sql`**；P1 的迁移是 `002_registration.sql`，与 P2 的 `003_review.sql` 无冲突。`applyMigrations` 按 version 去重，重复版本号会**响亮抛错**（P0 `src/db/migrate.js` 有专门的重复检测），不存在「后者被静默跳过」。⚠️ 不要再按原写法提「需 P1 改名」或「需 P0 改名」—— 那个冲突在 P1 落地时就不存在了 |
+| D-19 | **`audit_log` 的写入口与 SQL 落点** | 契约未规定 `audit_log` 的仓储落点 | `src/db/repo/audit-log.js`（**新建**，SQL 唯一归宿）+ `src/audit/log.js`（**薄服务门面**，不含 SQL） | ⚠️ 原写法是把两条 SQL **内联在 `src/audit/log.js`** 里 —— 那会越过全局约束「所有 SQL 收进 `src/db/repo/`」，P0 的 `test/sql-boundary.test.js` 守卫**当场判违规**（审计实跑：`not ok 1`，3 条违规）。同时 P4 原计划另建 `src/db/repo/audit-log.js` → 同一张表**两条写路径**。现改为**单一归属**：SQL 全在仓储层，门面只转调。见 C-3 / I-8 修正记录 |
+| D-20 | **新增 SSE 端点 `GET /api/stages/:stageId/events`** | 契约的 P2 API 清单里没有这一条 | 新增该端点 + `src/http/sse.js`（新建） | P0 的 `platform/web/api.js:28-30` 的 `subscribe()` 明写「⚠️ SSE 端点在 **P2** 才实现（`src/http/sse.js`）」，而 P2–P6 五份计划**全都没有承接** → 一条**指向不存在实现的活引用**。现由 P2 的 **Task 9** 落地（审计报告 I-6 的第 ① 条路；第 ② 条路要改 `platform/web/api.js`，属 P0 的地盘，本阶段不得改动）。契约已同步更新 |
+
+> **【2026-10-21 漂移审计修正 I-9 + M-4】** D-18 这一行原来描述的是一个**早已不存在**的冲突：
+> 「P0 建了 `002_user_roles.sql`；…⛔ **需 P1 改名为 `002_registration.sql` 之外的版本，或 P0 改名**」。
+> **为什么错**：① **事实过期** —— P0 终态 `platform/db/migrations/` 下**只有 `001_init.sql`**，
+> `002_user_roles.sql` 从未被创建；P1 落地的是 `002_registration.sql`，两者本就不同号。
+> ② 更危险的是这条「建议」本身 —— 若被采纳，把 P1 的 `002` 改成 `003`，就会与 **P2 自己的
+> `003_review.sql` 撞号**（全局唯一序位 `001=P0 / 002=P1 / 003=P2 / 004=P3 / 005=P4 / 006=P5`），
+> `applyMigrations` 的重复检测会直接抛错，评审表全部建不出来。
+> **改成什么**：改写为「**已消解**」的现状陈述，并显式钉住全局唯一序位；删除「需改名」的建议。
+> **依据**：`git ls-tree` 实测 —— `.worktrees/p0-foundation` 的 `platform/db/migrations/` 只有
+> `001_init.sql`；`.worktrees/p1-registration` 的有 `001_init.sql` + `002_registration.sql`；
+> P0 终态 `platform/src/db/migrate.js` 的 `readMigrationFiles()` 对重复版本号**响亮抛错**
+> （「迁移版本号重复」），不存在「静默跳过」。同一事实的另一半在 P4 的 §E-1，
+> 已按同一口径删除（见 P4 计划里的 I-9 修正记录）。
 
 ---
 

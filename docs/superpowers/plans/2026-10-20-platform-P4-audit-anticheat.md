@@ -4,7 +4,7 @@
 
 **Goal:** 让每一次发榜都能被复算、让每一次异常都能被看见。具体交付：计算快照（带规则版本）+ 复算 diff、落库的三层限频 + 幂等键、四个防作弊检测器 + 复核队列、复核与申诉状态机、审计 API 与前端 trace 抽屉，以及一个「清单为空即报错」的发布前扫描闸。
 
-**Architecture:** 延续 P0 的单进程零依赖架构。`src/domain/` 放纯函数（diff / anticheat / evidence / field-dictionary，无 IO、无 `Date.now()`、无 `Math.random()`）；`src/services/` 放用例编排（audit / rate-limit / idempotency / review-state / anticheat）；所有 SQL 收在 `src/db/repo/`；`src/routes/audit.js` 挂 7 个 P4 路由；`web/views/audit.js`（trace 抽屉）与 `web/views/flags.js`（复核队列）是两个原生 ESM 视图，无构建。**本阶段的灵魂不是"加日志"，而是"让空结果与降级必须显式暴露"**：批量返回空 → 4xx；限频超限 → 429 + `retryAfterSeconds`；复算不一致 → diff 出现在 API 响应与前端（不是只写一条日志）；禁用清单为空 → 扫描闸直接报错退出。
+**Architecture:** 延续 P0 的单进程零依赖架构。`src/domain/` 放纯函数（diff / anticheat / evidence / field-dictionary，无 IO、无 `Date.now()`、无 `Math.random()`）；`src/services/` 放用例编排（audit / rate-limit / idempotency / review-state / anticheat）；所有 SQL 收在 `src/db/repo/`；`src/http/routes/audit.js` 挂 7 个 P4 路由；`web/views/audit.js`（trace 抽屉）与 `web/views/flags.js`（复核队列）是两个原生 ESM 视图，无构建。**本阶段的灵魂不是"加日志"，而是"让空结果与降级必须显式暴露"**：批量返回空 → 4xx；限频超限 → 429 + `retryAfterSeconds`；复算不一致 → diff 出现在 API 响应与前端（不是只写一条日志）；禁用清单为空 → 扫描闸直接报错退出。
 
 **Tech Stack:** Node ≥22.16.0（生产建议 24）｜`node:sqlite`｜`node:crypto`（scrypt）｜`node:test`｜原生 ESM 前端，无构建｜**npm 依赖 0 个**
 
@@ -65,7 +65,7 @@ platform/
 │   ├── db/
 │   │   ├── tx.js                   withTransaction（SAVEPOINT，可嵌套）
 │   │   └── repo/
-│   │       ├── audit-log.js        audit_log（P0 建表，本阶段真正写起来）
+│   │       ├── audit-log.js        audit_log（P0 建表；**P2 Task 4 已建**，本阶段只追加两个只读查询）
 │   │       ├── computations.js     computation_snapshots（读 + revision 递增）
 │   │       ├── flags.js            flagged_reviews
 │   │       ├── idempotency.js      idempotency_keys
@@ -73,7 +73,7 @@ platform/
 │   │       ├── appeals.js          appeals
 │   │       └── tiers.js            tier_records 读（P3 建表，本阶段只读）
 │   ├── audit/
-│   │   └── log.js                  审计日志写入（P0 目录结构声明过但没实现，本阶段补齐）
+│   │   └── log.js                  审计日志门面（**P2 Task 4 已建**，本阶段只复用）
 │   ├── domain/
 │   │   ├── diff.js                 结构化差异比对（纯函数，带可定位 path）
 │   │   ├── anticheat.js            4 个检测器 + 1 个同分互投率检测（纯函数）
@@ -85,8 +85,8 @@ platform/
 │   │   ├── idempotency.js          幂等键执行器（只生效一次 + 返回首次响应）
 │   │   ├── review-state.js         复核与申诉状态机 + 分数可见性过滤
 │   │   └── anticheat.js            检测编排：跑检测器 → 落 flagged_reviews → 裁决
-│   └── routes/
-│       └── audit.js                7 个 P4 路由
+│   └── http/routes/
+│       └── audit.js                7 个 P4 路由（与 P1/P2 的 src/http/routes/ 同一目录）
 ├── scripts/
 │   └── audit-scan.js               发布前证据链扫描闸（清单为空即报错）
 ├── web/views/
@@ -108,7 +108,7 @@ platform/
 
 ```
 platform/src/config.js              加载并校验 rules/audit.json（新增 rules.audit 命名空间）
-platform/src/server.js              挂载 src/routes/audit.js；错误响应带上 detail 与 Retry-After
+platform/src/server.js              挂载 src/http/routes/audit.js；错误响应带上 detail 与 Retry-After
 platform/src/http/respond.js        error() 增加可选 extraHeaders（第 6 参，向后兼容）
 platform/scripts/seed.js            新增能力点 audit:write / appeal:write 并授权
 platform/scripts/forbidden.txt      补齐真实词条（原 P0 计划只声明"不得为空"，未给内容）
@@ -123,13 +123,13 @@ platform/web/app.js                 注册 /audit 与 /flags 路由 + 导航入�
 **Files:**
 - Create: `platform/db/migrations/005_audit.sql`
 - Create: `platform/src/db/tx.js`
-- Create: `platform/src/db/repo/audit-log.js`
+- Modify: `platform/src/db/repo/audit-log.js`（**P2 Task 4 已建**；本阶段只**追加** `queryAuditLog` / `findLatestTransition`，**不重建文件**、不改 P2 已有的 `insertAuditLogRow` / `queryAuditLogRows`）
 - Create: `platform/src/db/repo/flags.js`
 - Create: `platform/src/db/repo/idempotency.js`
 - Create: `platform/src/db/repo/rate-limit.js`
 - Create: `platform/src/db/repo/appeals.js`
 - Modify: `platform/src/errors.js`（**P0 Task 4 已建**（归属从 P1 提前到 P0）；本阶段只**追加**快捷函数，**不重建** `AppError` 类、不改 `appError(status, code, message, detail?)` 的签名）
-- Modify: `platform/src/audit/log.js`（**P2 Task 4 已建**；本阶段只**追加** `writeAuditLog` 的领域字段，不重建文件）
+- Reuse: `platform/src/audit/log.js`（**P2 Task 4 已建**；本阶段**一行不改** —— `writeAuditLog(db, { actorId, action, entity, entityId, detail, now })` 的签名**已经**符合本阶段需要，且它已把 SQL 委托给 `src/db/repo/audit-log.js`；本阶段**不再**定义第二个写入口）
 - Modify: `platform/src/db/repo/computations.js`（**P2 Task 6 已建**；本阶段只**追加** `nextRevision` / `listComputationRows`，不重建文件）
 - Test: `platform/test/audit-repo.test.js`
 
@@ -509,57 +509,27 @@ export function withTransaction(db, fn) {
 }
 ```
 
-- [ ] **Step 5: 追加 `src/audit/log.js` 的仓储委托，并创建 6 个仓储文件**
+- [ ] **Step 5: 追加 `src/db/repo/audit-log.js` 的查询能力，并创建 5 个仓储文件**
 
 `platform/src/audit/log.js` 由 **P2 的 Task 4 建立**（含 `writeAuditLog` / `listAuditLog`）。
-本阶段**只做两件事**，**不要重建文件**：
+**本阶段一个字都不改它** —— P2 版的 `writeAuditLog` 已经满足本阶段的三条要求：
+① **不含 SQL**（SQL 在 `src/db/repo/audit-log.js`，满足全局约束「SQL 边界」）；
+② **签名已经是** `(db, { actorId, action, entity, entityId, detail, now })` —— 本阶段要的
+`writeAuditLog(db, { actorId, action, entity, entityId, detail, now })` **一字不差**；
+③ 已有 `!action` 守卫（没有 action 的日志无法检索）。
+
+⚠️ **不要再建第二个写入口**（原写法是在 `src/audit/log.js` 里 `import { insertAuditLog }`
+再包一层 `writeAuditLog`）—— 那会让同一张 `audit_log` 出现**两条写路径**，
+「审计日志唯一入口」失守。本阶段**直接复用 P2 的 `writeAuditLog`**。
+
+`platform/src/db/repo/audit-log.js`（**P2 Task 4 已建**；本阶段**只追加**下面两个函数，
+P2 已有的 `insertAuditLogRow` / `queryAuditLogRows` 保持不动、签名一个字都不改）：
 
 ```javascript
-// src/audit/log.js —— 【追加/改造】到 P2 已建的文件里
-// 依据：设计文档 §11.2「每次状态迁移写 audit_log(actor, from_state, to_state, reason, at)」
-//   P0 的目录结构里声明了这个文件，P2 实现了它；本阶段真正把它用起来。
-//   本文件【不含 SQL】——SQL 全在 src/db/repo/（全局约束：SQL 边界）。
-//
-// ⚠️ 改造点：P2 的 writeAuditLog 里 SQL 是内联的。本阶段把它的 SQL 下沉到
-//    src/db/repo/audit-log.js，**函数签名一个字都不改**（db, { actorId, action, entity, entityId, detail, now }），
-//    这样 P2 已有的调用点不需要跟着改。
-import { insertAuditLog } from '../db/repo/audit-log.js';
-
-export function writeAuditLog(db, {
-  actorId = null,
-  action,
-  entity = null,
-  entityId = null,
-  detail = null,
-  now = new Date().toISOString(),
-}) {
-  if (!action) throw new Error('写审计日志必须给 action（没有 action 的日志无法检索）');
-  return insertAuditLog(db, { actorId, action, entity, entityId, detail, now });
-}
-```
-
-⚠️ **P2 已有的 `listAuditLog` 保留不动**；P4 新增的查询能力走 `src/db/repo/audit-log.js` 的
-`queryAuditLog` / `findLatestTransition`，由 `src/services/audit.js` 调用。两处不重复实现同一个查询。
-
-`platform/src/db/repo/audit-log.js`：
-
-```javascript
-// src/db/repo/audit-log.js — 审计日志仓储
+// src/db/repo/audit-log.js —— 【追加】到 P2 已建的文件里
 // 依据：设计文档 §12（可复算）+ §11.2（迁移日志）；表由 P0 的 001_init.sql 建好。
-import { randomUUID } from 'node:crypto';
-
-export function insertAuditLog(db, {
-  actorId = null, action, entity = null, entityId = null, detail = null,
-  now = new Date().toISOString(),
-}) {
-  const id = randomUUID();
-  db.prepare(
-    `INSERT INTO audit_log (id, actor_id, action, entity, entity_id, detail_json, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
-  ).run(id, actorId, action, entity, entityId, detail === null ? null : JSON.stringify(detail), now);
-  return id;
-}
-
+// ⚠️ P2 已建 insertAuditLogRow / queryAuditLogRows（写入 + 按 entity 列表）。
+//    本阶段只补两个**只读查询**：带过滤条件的分页查询 + 取最后一次状态迁移。
 export function queryAuditLog(db, {
   action = null, entity = null, entityId = null, since = null, until = null,
   limit = 100, offset = 0,
@@ -597,6 +567,31 @@ export function findLatestTransition(db, entity, entityId) {
   return { ...detail, at: rows[0].created_at };
 }
 ```
+
+> **【2026-10-21 漂移审计修正 I-8（与 C-3 联动）】**
+> **原来错在哪**：P4 的 Files 清单写着 `Create: platform/src/db/repo/audit-log.js`
+> **并且**在 Step 5 里**重建**一份 `insertAuditLog`（含自己的 `randomUUID` + `INSERT INTO audit_log`），
+> 同时把 `src/audit/log.js` 改写成 `import { insertAuditLog }` 再包一层 `writeAuditLog`。
+> 而 P2 的 Task 4 **已经建过** `src/audit/log.js`（当时是内联 SQL 的版本，C-3 修正后改为门面 + 仓储）。
+> 结果：同一张 `audit_log` 出现**两条写路径**（P2 的 `writeAuditLog` → P2 的仓储
+> vs P4 的 `writeAuditLog` → P4 的仓储），「审计日志唯一入口」失守；
+> 且 P4 的 `Create` 声明会让实施者**整体覆盖** P2 的仓储文件，把 P2 的
+> `insertAuditLogRow` / `queryAuditLogRows` 抹掉 → P2 的调用点直接崩。
+> **为什么错**：审计报告 I-8 明确要求「选一条路：SQL 全部下沉 `src/db/repo/audit-log.js`，
+> `src/audit/log.js` 只保留薄服务门面并 `import` 仓储；P4 复用 P2 的 `writeAuditLog`
+> 而不是再定义 `insertAuditLog`」。
+> **改成什么**：
+> ① Files 清单：`Create: src/db/repo/audit-log.js` → **`Modify`**（P2 Task 4 已建，
+> 本阶段只**追加** `queryAuditLog` / `findLatestTransition`，不改 P2 已有的两个函数）；
+> ② Files 清单：`Modify: src/audit/log.js` → **`Reuse`**（本阶段**一行不改**，
+> P2 版的 `writeAuditLog` 签名**已经**是 `(db, { actorId, action, entity, entityId, detail, now })`，
+> 与本阶段要的**一字不差**）；
+> ③ Step 5 的 `src/audit/log.js` 改造块**整段删除**，改为「本阶段一个字都不改它」的说明；
+> ④ `src/db/repo/audit-log.js` 的代码块只保留 `queryAuditLog` / `findLatestTransition`
+> 两个**只读查询**（`insertAuditLog` **不再重复定义**）。
+> **依据**：漂移审计报告 I-8 与 C-3 + P2 计划 Task 4 的修正后版本
+> （`src/db/repo/audit-log.js` 导出 `insertAuditLogRow` / `queryAuditLogRows`，
+> `src/audit/log.js` 是薄门面）。
 
 `platform/src/db/repo/computations.js`（**P2 Task 6 已建**；本阶段**追加** `nextRevision` / `listComputationRows`，**不要重建文件**、不要改 P2 已有的函数签名）：
 
@@ -850,7 +845,7 @@ export function updateAppeal(db, { id, status, decidedBy = null, decidedAt = nul
 - [ ] **Step 6: 运行测试确认通过**
 
 Run: `cd platform && node --test test/audit-repo.test.js`
-Expected: PASS（12 个测试全过）
+Expected: PASS（12 个测试全过：audit-repo.test.js 12）
 
 - [ ] **Step 7: 提交**
 
@@ -1405,7 +1400,7 @@ function monthsAgoIso(nowIso, months) {
 - [ ] **Step 5: 运行测试确认通过**
 
 Run: `cd platform && node --test test/audit-snapshot.test.js`
-Expected: PASS（11 个测试全过）
+Expected: PASS（11 个测试全过：audit-snapshot.test.js 11）
 
 - [ ] **Step 6: 提交**
 
@@ -1686,7 +1681,10 @@ const FILES = {
   registration: 'registration-scoring.json',
   solvability: 'solvability.json',
   milestones: 'milestones.default.json',
-  audit: 'audit.json',          // ← P4 新增
+  teamFormation: 'team-formation.json',   // ← P1 加的（不是 P0 的，别删）
+  schedule: 'schedule.json',               // ← P1 加的（不是 P0 的，别删）
+  compliance: 'compliance.json',           // ← P1 加的（不是 P0 的，别删）
+  audit: 'audit.json',                     // ← P4 新增
 };
 
 // src/config.js —— 修改处 2：grouped 增加 audit
@@ -1699,7 +1697,10 @@ const grouped = {
   registration: rules.registration,
   solvability: rules.solvability,
   milestones: rules.milestones,
-  audit: rules.audit,            // ← P4 新增
+  teamFormation: rules.teamFormation,     // ← P1 加的（不是 P0 的，别删）
+  schedule: rules.schedule,                // ← P1 加的（不是 P0 的，别删）
+  compliance: rules.compliance,            // ← P1 加的（不是 P0 的，别删）
+  audit: rules.audit,                      // ← P4 新增
 };
 
 // src/config.js —— 修改处 3：validateRules 末尾追加（fail-fast，校验不过拒绝启动）
@@ -1738,6 +1739,27 @@ const grouped = {
     }
   }
 ```
+
+> **【2026-10-21 漂移审计修正 I-2】** **version 一致性校验这一步【不需要改】** ——
+> 原计划隐含的「新增规则文件要同步加进 `versionValues` 数组」**不适用**（那个数组已经不存在了）。
+> **原来错在哪**：P0 终审时的 `src/config.js` 里，version 全等校验是**硬编码的 9 项列表**
+> + 硬编码的 `9`；新增的规则文件即使注册进 `FILES` / `grouped`，它的 `version`
+> **从不参与比较**（审计实跑：注入异版本号 → `validateRules` **零报错**）→
+> 「版本号漂移 = 审计链在说谎」这条被打破。
+> **现状（基线已修好）**：基线的 `src/config.js` 已改成
+> `validateRules(rules, expectedCount = null)` **按「有 id 的是一份配置」自动派生**
+> （`collectConfigObjects`），`expectedCount` 由 `loadRules()` 传 `Object.keys(FILES).length`
+> → **加多少份配置都自动覆盖**，P4 不需要改 version 校验。
+> **改成什么**：本步**只**做三件事 —— ① `FILES` 加 `audit`；② `grouped` 加 `audit`；
+> ③ `validateRules` 末尾追加 audit 的**内容**校验段。version 校验一个字都不动。
+> **⚠️ 本次一并订正了「修改处 1 / 2」的原文**：原来贴的是 **P0 的 9 项** `FILES` / `grouped`，
+> 但基线的 `FILES` 已经有 **P1 加的 3 份**（`teamFormation` / `schedule` / `compliance`）。
+> 实施者若照原文**整块替换**，会把 P1 的三份配置**删掉** → `FILES` 变成 10 份而 `grouped`
+> 里的配置份数对不上 `expectedCount` → 报「规则配置应有 10 份，实际只识别到 13 份」
+> → **拒绝启动**。故上面已把 P1 的三份补回并标注「不是 P0 的，别删」。
+> **⚠️ 硬前提**：`rules/audit.json` **必须带 `"id": "audit"`**（识别「一份配置」用的是 `id`
+> 而不是 `version`）；P4 落地时 `FILES` 为 **15** 份（P0 的 9 + P1 的 3 + P3 的 2 + P4 的 1），识别到的配置份数也必须是 15。
+> **依据**：基线 `platform/src/config.js` + 漂移审计报告 I-2 与 D-3。
 
 - [ ] **Step 4: 创建 `src/services/rate-limit.js`**
 
@@ -1956,7 +1978,19 @@ export function withIdempotency({ db, key, scope, requestId = null, now = new Da
 - [ ] **Step 6: 运行测试确认通过**
 
 Run: `cd platform && node --test test/rate-limit.test.js`
-Expected: PASS（11 个测试全过）
+Expected: PASS（10 个测试全过：rate-limit.test.js 10）
+
+> **【2026-10-21 漂移审计修正 M-1】** **原来错在哪**：本计划两处「Expected: PASS」的条数声明
+> 与代码块里实际的 `test(` 数量不符 —— `rate-limit.test.js` 声明 **11** 实为 **10**、
+> `review-state.test.js` 声明 **12** 实为 **13**。
+> **为什么错**：条数是**实施时的验收闸**。实施者跑出 10 个而计划写 11 个，会误判「测试缺失」
+> 而去改测试代码迁就声明，或者干脆失去对闸的信任。
+> **注意方向相反**：一处少 1、一处多 1 —— 说明是**手工维护漂移**，不是有意为之。
+> **改成什么**：① 两个数字改成实测值；② 把本计划**全部 7 处** `Expected: PASS` 统一成
+> `Expected: PASS（N 个测试全过：file N）` 的格式。
+> **依据**：按「就近 `Run:` 行指向的测试文件 → 该文件的 fenced code block 内 `^test(` 出现次数」
+> 逐个统计（与审计报告 M-1 同一口径），并在本次改动后**对五份计划全量复算**：
+> 每一条 `Expected: PASS（N …）` 现已与代码块实测条数**逐条相等**。
 
 - [ ] **Step 7: 提交**
 
@@ -3164,6 +3198,7 @@ export function getTeamTierRow(db, teamId) {
 //   ③ 幂等守卫：重复触发不产生二次迁移
 //   ④ 申诉触发 revision + 1 重算，不覆盖历史（旧 revision 保留）
 import { findLatestTransition } from '../db/repo/audit-log.js';
+import { findIdempotency, insertIdempotency } from '../db/repo/idempotency.js';
 import { insertAppeal, getAppeal, listAppealRows, updateAppeal } from '../db/repo/appeals.js';
 import { getTeamTierRow } from '../db/repo/tiers.js';
 import { writeAuditLog } from '../audit/log.js';
@@ -3210,9 +3245,7 @@ export function transition({
   // 幂等守卫：同一 idempotencyKey 重复触发不产生二次迁移
   if (idempotencyKey) {
     const scope = `review_state:${subjectType}:${subjectId}`;
-    const existing = db.prepare(
-      'SELECT response_json FROM idempotency_keys WHERE key = ? AND scope = ?',
-    ).get(idempotencyKey, scope);
+    const existing = findIdempotency(db, { key: idempotencyKey, scope });
     if (existing) {
       const stored = existing.response_json ? JSON.parse(existing.response_json) : {};
       return { ...stored, applied: false, replayed: true };
@@ -3243,10 +3276,13 @@ export function transition({
 
   if (idempotencyKey) {
     const scope = `review_state:${subjectType}:${subjectId}`;
-    db.prepare(
-      `INSERT OR IGNORE INTO idempotency_keys (key, scope, request_id, response_json, created_at)
-       VALUES (?, ?, ?, ?, ?)`,
-    ).run(idempotencyKey, scope, idempotencyKey, JSON.stringify(result), at);
+    insertIdempotency(db, {
+      key: idempotencyKey,
+      scope,
+      requestId: idempotencyKey,
+      response: result,
+      now: at,
+    });
   }
 
   return result;
@@ -3384,10 +3420,45 @@ export function listAppeals({ db, filter = {}, viewer = null }) {
 }
 ```
 
+> **【2026-10-21 漂移审计修正 C-4】**
+> **原来错在哪**：`src/services/review-state.js` 原来在**服务层直接写 SQL**：
+> ```javascript
+> const existing = db.prepare(
+>   'SELECT response_json FROM idempotency_keys WHERE key = ? AND scope = ?',
+> ).get(idempotencyKey, scope);
+> …
+> db.prepare(
+>   `INSERT OR IGNORE INTO idempotency_keys (key, scope, request_id, response_json, created_at)
+>    VALUES (?, ?, ?, ?, ?)`,
+> ).run(idempotencyKey, scope, idempotencyKey, JSON.stringify(result), at);
+> ```
+> **为什么错**：P0 终审 I-7 立了全局约束「**所有 SQL 收进 `platform/src/db/repo/`**」，
+> 并由 `platform/test/sql-boundary.test.js` 守卫：扫描 `src/` 与 `scripts/` 下
+> **除 `src/db/repo/` 与 `src/db/migrate.js` 外**的一切 `.js`，
+> 只要出现 `db.prepare(`/`db.exec(` 且参数里含 `SELECT/INSERT/UPDATE/DELETE/CREATE TABLE/DROP/ALTER`
+> 就判违规。`src/services/` **不在豁免名单里** → 照本计划实施，P0 自带用例当场变红
+> （审计实跑：`not ok 1 - src/ 与 scripts/ 里除仓储层外没有裸 SQL`，
+> 报 `src/services/review-state.js:59 出现 SQL：SELECT response_json FROM idempotency_keys …`
+> 与 `…:92 出现 SQL：INSERT OR IGNORE INTO idempotency_keys …`）。
+> **更荒唐的是**：P4 **自己**在 Task 1 建了 `src/db/repo/idempotency.js`
+> （导出 `findIdempotency` / `insertIdempotency`）——**建了仓储层却不用**，
+> 反而在服务层又写一遍。
+> **改成什么**：删掉服务层的两处 `db.prepare`，改为调用本阶段 Task 1 已建的仓储：
+> ① 读：`const existing = findIdempotency(db, { key: idempotencyKey, scope });`
+> （仓储返回整行 `SELECT *`，含 `response_json` —— 原代码取的字段它一样有；
+> 且 `?? null` 的空值语义一致：`findIdempotency` 内部已 `?? null`）；
+> ② 写：`insertIdempotency(db, { key, scope, requestId, response, now })`
+> （`requestId` 对应原来的第 3 个占位符 `idempotencyKey`；`response` 是对象，
+> 由仓储内部 `JSON.stringify` —— 与原代码等价；`now` 对应原来的 `at`）。
+> 并在文件顶部加 `import { findIdempotency, insertIdempotency } from '../db/repo/idempotency.js';`。
+> **依据**：基线 `platform/test/sql-boundary.test.js:282-292`（扫描范围 + 豁免名单）
+> + 本计划 Task 1 自建的 `src/db/repo/idempotency.js` 的两个导出签名
+> + 漂移审计报告 C-4。
+
 - [ ] **Step 5: 运行测试确认通过**
 
 Run: `cd platform && node --test test/review-state.test.js`
-Expected: PASS（12 个测试全过）
+Expected: PASS（13 个测试全过：review-state.test.js 13）
 
 - [ ] **Step 6: 提交**
 
@@ -3401,7 +3472,7 @@ git commit -m "feat(P4): 复核与申诉状态机、幂等守卫与 PENDING_REVI
 ### Task 6: 审计 API + 前端 trace 抽屉 + 复核队列
 
 **Files:**
-- Create: `platform/src/routes/audit.js`
+- Create: `platform/src/http/routes/audit.js`
 - Create: `platform/web/views/audit.js`
 - Create: `platform/web/views/flags.js`
 - Modify: `platform/src/server.js`（挂载路由；错误响应带 detail 与 `Retry-After`）
@@ -3713,10 +3784,10 @@ test('POST /api/appeals/:id/decide 成立返回 recomputeRequired=true', async (
 Run: `cd platform && node --test test/audit-api.test.js`
 Expected: FAIL —— 404（`/api/audit/...` 路由尚未注册）
 
-- [ ] **Step 3: 创建 `src/routes/audit.js`**
+- [ ] **Step 3: 创建 `src/http/routes/audit.js`**
 
 ```javascript
-// src/routes/audit.js — P4 的 7 个接口
+// src/http/routes/audit.js — P4 的 7 个接口
 // 依据：INTERFACES.md §5「API（P4）」——路径与语义逐字对齐。
 //   GET  /api/audit/computations/:id          计算快照（三件套）
 //   GET  /api/audit/computations/:id/diff     复算 diff
@@ -3850,25 +3921,100 @@ export function error(res, status, code, message, detail, extraHeaders = {}) {
 （以下是并入 platform/src/server.js 对应位置的【片段】，不是独立文件）
 
 // src/server.js —— 修改处 1：import
-import { registerAuditRoutes } from './routes/audit.js';
+import { registerAuditRoutes } from './http/routes/audit.js';
 
 // src/server.js —— 修改处 2：createApp 内挂载路由（放在 /api/health 之后）
   router.add('GET', '/api/health', async () => ({ ok: true, at: new Date().toISOString() }));
   registerAuditRoutes(router, { db, rules });
 
-// src/server.js —— 修改处 3：错误分支带上 detail 与 Retry-After
+// src/server.js —— 修改处 3：错误分支带上 Retry-After
+//    ⚠️ 这段是在**当前基线**（P1 终态）的 catch 分支上**追加**，不是**替换**掉它。
+//    基线的 catch 分支里已修好的防线必须原样保留：
+//      ① 5xx 分支只回「服务内部错误」，内部原文只进 console.error（I7-3）
+//      ② code 走 domainCode(err, 'BAD_REQUEST')，不外泄 Node 的 ERR_* 码
+//      ③ message 只透传 AppError 的 message，裸 Error 一律回落「请求无效」（I-C）
+//      ④ 413 分支带 Connection: close（M-6）
+//      ⑤ detail 只透传 AppError 的 detail（P1 的 Task 3「detail 透传断言」已落地）
+//    P4 只在其上**追加一件事**：**Retry-After 响应头**（第 6 参 extraHeaders）。
+//    ⚠️ detail 透传**不要**改回 err.detail —— 那是 P1 已修好的 I-C 延伸。
       } catch (err) {
         const status = err.status || 500;
-        const code = err.code || 'INTERNAL';
-        if (status >= 500) console.error('[server]', err);
+        if (status >= 500) {
+          // ⛔ 预审修正（I7-3）：内部错误原文不外泄 ——
+          //    SQLite 错误带表名列名，Node 错误带内部实现细节。只进日志。
+          console.error('[server]', err);
+          json(res, 500, { error: { code: 'INTERNAL', message: '服务内部错误' } });
+          return;
+        }
+        const code = domainCode(err, 'BAD_REQUEST');
+        // ⛔ 终审修正（Important，I-C 延伸）：**只透传领域错误（AppError）的 message**。
+        //    AppError 的 message 是我们自己写的中文文案（"该手机号已注册"…），可以给用户看；
+        //    而裸 Error / Node 内置错误 / SQLite 错误的 message 里含**内部原文**
+        //    （表名列名、SQL 参数位置、文件路径）——
+        //    契约 INTERFACES.md「错误」纪律明写「不外泄 Node 的 ERR_* 与 SQLite 原文」。
+        //    实测（修复前）：handler 抛 `e.status=400; e.code='ERR_SQLITE_ERROR'` 时，
+        //    响应体是 {"code":"BAD_REQUEST","message":"users.phone UNIQUE constraint failed"}
+        //    —— code 挡住了，message 没挡住。
+        const message = err instanceof AppError ? err.message : '请求无效';
+        // ── P4 追加：限频要带 Retry-After，调用方才知道多久能重试（不静默丢包）──
         const extraHeaders = {};
-        // ⛔ 限频必须带 Retry-After，调用方才知道多久能重试（不静默丢包）
         if (code === 'RATE_LIMITED' && err.detail?.retryAfterSeconds) {
           extraHeaders['Retry-After'] = String(err.detail.retryAfterSeconds);
         }
-        error(res, status, code, err.message, err.detail, extraHeaders);
+        if (status === 413) {
+          // 请求体超限：连接已不可用 → 关掉，不复用
+          json(res, 413, { error: { code, message } }, { Connection: 'close' });
+          return;
+        }
+        // detail 同理：**只透传 AppError 的 detail** —— detail 可能含表名 / 列名
+        //（问卷缺项说明是我们自己写的文案，可给前端看；裸 Error 的 detail 不行）。
+        error(res, status, code, message, err instanceof AppError ? err.detail : undefined, extraHeaders);
       }
 ```
+
+> **【2026-10-21 漂移审计修正 C-1】**（**本计划最危险的一处**）
+> **原来错在哪**：「修改处 3」原来是一段**整块替换**，把 P0 终审的错误分支换成：
+> ```javascript
+> } catch (err) {
+>   const status = err.status || 500;
+>   const code = err.code || 'INTERNAL';
+>   if (status >= 500) console.error('[server]', err);
+>   const extraHeaders = {};
+>   if (code === 'RATE_LIMITED' && err.detail?.retryAfterSeconds) {
+>     extraHeaders['Retry-After'] = String(err.detail.retryAfterSeconds);
+>   }
+>   error(res, status, code, err.message, err.detail, extraHeaders);
+> }
+> ```
+> **为什么错（抹掉了 P0 终审的四道防线）**：
+> ① **I-C（最严重）**：`err.message` 原样外泄 —— 裸 Error / SQLite 错误的 message 里含
+> **表名列名、SQL 参数位置、文件路径**（契约 INTERFACES.md「错误」纪律明写「不外泄 Node 的
+> ERR_* 与 SQLite 原文」）。同时 `err.detail` 也被原样回传，detail 同样可能含表名。
+> ② **`domainCode()` 被顶替**：`err.code || 'INTERNAL'` → `ERR_SQLITE_ERROR` 这类 Node 内置码
+> 直接外泄（`domainCode` 是 P0 专门为此新增、并带断言的导出）。
+> ③ **I7-3**：5xx 分支被并入同一条路径 → 500 也回显内部细节（P0 原本 5xx 只回「服务内部错误」，
+> 内部原文只进 `console.error`）。
+> ④ **M-6**：413 分支整段消失 → 丢 `Connection: close`，连接不复用。
+> **实跑证据（审计报告 C-1）**：把原片段**逐字**打进 pristine P0（`38c6713` 与 `d077537`
+> 两个基线各跑一遍），跑全量 → **3 个 P0 用例当场变红**：
+> `not ok 88 - 500 响应只回通用文案，内部细节只进 console.error`、
+> `not ok 112 - HTTP 层不把 Node 的 ERR_* 错误码外泄给客户端（端到端）`、
+> `not ok 115 - 请求体超限返回 413 且必须带 Connection: close（终审 M-6）`
+> （`# tests 151 / # pass 148 / # fail 3`）。
+> **改成什么**：这段改为**在当前基线（P1 终态）的 catch 分支上追加**，**逐字保留**基线的
+> 5xx 分支（I7-3）、`domainCode(err, 'BAD_REQUEST')`、`AppError`-only message（I-C）、
+> 413 分支（M-6）与 **P1 的 detail 透传**（`err instanceof AppError ? err.detail : undefined`
+> —— P1 的 Task 3「detail 透传断言」已落地），**只追加一件事**：
+> `const extraHeaders = {}` + `Retry-After` 头（限频语义仍是 P4 自己的能力，**排期不变**），
+> 并作为 `error()` 的**第 6 参**传出去。
+> ⚠️ **detail 透传不要改回 `err.detail`** —— 那是 P1 已修好的 I-C 延伸，改回去等于回退。
+> **依据**：基线 `platform/src/server.js` 的 catch 分支逐字（当前基线 = P1 终态；
+> 注意 P1 已在该分支落地了 detail 透传，所以本段的锚点是**当前**基线而不是 P0 终态）、
+> `platform/src/errors.js`（`AppError`）、
+> `docs/superpowers/plans/2026-10-20-platform-P1-registration-team.md` 的 Task 3 Step 6
+> （同一处写法）+ 漂移审计报告 C-1。
+> **连带**：P4 的 `src/http/respond.js` 的 `error()` 第 6 参 `extraHeaders` **保持不变**
+> （向后兼容的追加，默认 `{}`），本处只改**调用点**。
 
 - [ ] **Step 5: 创建 `web/views/audit.js`（trace 抽屉）**
 
@@ -4163,12 +4309,12 @@ route('/flags', () => renderFlags(ctx));
 - [ ] **Step 8: 运行测试确认通过**
 
 Run: `cd platform && node --test test/audit-api.test.js`
-Expected: PASS（9 个测试全过）
+Expected: PASS（9 个测试全过：audit-api.test.js 9）
 
 - [ ] **Step 9: 提交**
 
 ```bash
-cd platform && git add src/routes src/http/respond.js src/server.js web/views web/app.js scripts/seed.js test/audit-api.test.js
+cd platform && git add src/http/routes/audit.js src/http/respond.js src/server.js web/views web/app.js scripts/seed.js test/audit-api.test.js
 git commit -m "feat(P4): 审计 API（7 个接口）、trace 抽屉与复核队列前端"
 ```
 
@@ -4545,7 +4691,7 @@ w_E ?= ?20%.*初赛|C-01|冲突|裁决|已更正
 - [ ] **Step 5: 运行测试确认通过**
 
 Run: `cd platform && node --test test/audit-scan.test.js`
-Expected: PASS（7 个测试全过）
+Expected: PASS（7 个测试全过：audit-scan.test.js 7）
 
 - [ ] **Step 6: 实跑扫描闸**
 
@@ -4706,7 +4852,7 @@ test('端到端：打分 → 计算 → 快照 → 改一个原始分 → 复算
 - [ ] **Step 2: 运行测试确认通过**
 
 Run: `cd platform && node --test test/recompute-e2e.test.js`
-Expected: PASS（1 个测试全过）
+Expected: PASS（1 个测试全过：recompute-e2e.test.js 1）
 
 > ⚠️ 若这里报 `Cannot find module '../src/domain/scoring.js'`，说明 **P2 尚未落地**（本阶段依赖 P2 的 `scoreStage`）。
 > 若报「scoreStage 必须返回 teams 数组」之类的断言失败，说明 P2 的实现与 `INTERFACES.md` §3 的契约不符 —— **修 P2，不要改本测试**。
@@ -4757,8 +4903,24 @@ git commit -m "test(P4): 端到端复算验收（改一个原始分 → diff 非
 | `src/domain/field-dictionary.js` | R-AUD-06「并行前定字段字典」需要一个唯一的字段名来源 |
 | `src/services/idempotency.js` | 契约把 `idempotency_keys` 列进了表结构，但没给服务层函数；幂等执行器（只生效一次 + 返回首次响应）需要一个独立模块 |
 | `src/services/anticheat.js` | 契约只列了 `src/domain/anticheat.js`（纯函数）。检测结果落 `flagged_reviews`、裁决、复核队列列表属于 IO，放服务层 |
-| `src/routes/audit.js` | P0 的 `src/server.js` 把路由内联在文件里；P4 有 7 个接口，内联会让 P0 的文件失控。**建议 P1–P6 统一采用 `src/routes/*.js` 约定** |
+| `src/http/routes/audit.js` | P0 的 `src/server.js` 把路由内联在文件里；P4 有 7 个接口，内联会让 P0 的文件失控。**沿用 P1 / P2 已确立的 `src/http/routes/` 约定**（P1：`registration.js` / `taskPackage.js` / `team.js`；P2：`review.js`）——设计文档 §4.3 的目录清单里 `http/` 下就是 `router.js` / `respond.js` / `body.js` / `static.js` / `sse.js` / `routes/`，**顶层从来没有 `src/routes/`** |
+
+> **【2026-10-21 漂移审计修正 I-4】**
+> **原来错在哪**：本计划原来把 P4 的路由放在 **`src/routes/audit.js`**，并在上表里**建议**
+> 「P1–P6 统一采用 `src/routes/*.js` 约定」。
+> **为什么错**：这个「统一」的方向是**反的** —— P1（已落地）与 P2（已落地计划）用的是
+> **`src/http/routes/`**，设计文档 §4.3 的目录清单里也只有 `http/` 下的 `routes/`，
+> **顶层根本不存在 `src/routes/`**。照原写法实施 → 同一个项目出现**两个路由目录**，
+> 功能上不炸（手工 `router.add`），但后续维护者按 `src/http/routes/` 找路由会**漏掉** P4 的文件，
+> 且 P4 的「建议」会把 P5 也带偏。
+> **改成什么**：P4 统一改用 `src/http/routes/audit.js` —— Files 清单、代码块文件头注释、
+> `src/server.js` 的 import 路径（`'./http/routes/audit.js'`）、`git add` 列表、
+> 文件结构树、以及上表的「统一约定」表述，全部改齐（**六处**）。
+> **依据**：P1 终态 `platform/src/http/routes/`（3 个文件）、P2 计划 `src/http/routes/review.js`
+> + 设计文档 §4.3 的目录清单 + 漂移审计报告 I-4。
 | `src/db/repo/tiers.js` | 申诉范围判定要读 P3 的 `tier_records`（只读） |
+| `src/db/repo/audit-log.js`（**P2 Task 4 已建**，本阶段只**追加** `queryAuditLog` / `findLatestTransition`） | ⚠️ 原写法是**新建**这个文件并再定义一个 `insertAuditLog`。那样同一张 `audit_log` 会出现**两条写路径**（P2 的 `writeAuditLog` 与 P4 的 `writeAuditLog`），「审计日志唯一入口」失守；且 `Create` 声明会让实施者**整体覆盖** P2 的仓储文件，把 P2 的 `insertAuditLogRow` / `queryAuditLogRows` 抹掉 → P2 的调用点直接崩。改为**单一归属**：SQL 全在 `src/db/repo/audit-log.js`，`src/audit/log.js` 只做薄门面（**P2 已建，本阶段一行不改**）。见 I-8 修正记录 |
+| `src/http/routes/audit.js` | 路由属于 HTTP 层。**沿用 P1 / P2 已确立的 `src/http/routes/` 约定** —— 设计文档 §4.3 的目录清单里 `http/` 下就是 `router.js` / `respond.js` / `body.js` / `static.js` / `sse.js` / `routes/`，**顶层从来没有 `src/routes/`**。见 I-4 修正记录 |
 | `rules/audit.json` | 限频配额、防作弊阈值、复核与申诉策略、留档月数、TOP10 回访——全部是「待组委会确认的机制件」，必须配置化（溯源表结论：60 条机制件不得硬编码） |
 
 ### B. 既有签名的**可选**扩展（保持向后兼容，按契约原样调用仍然成立）
@@ -4793,9 +4955,39 @@ git commit -m "test(P4): 端到端复算验收（改一个原始分 → diff 非
 
 ### E. 发现的存量冲突（**本阶段不修**，需上游处理）
 
-1. **迁移版本号撞车（会连锁影响 P1 之后的所有迁移）**：P0 计划 Task 6 建了 `db/migrations/002_user_roles.sql`，而 `INTERFACES.md` §2 规定 P1 的迁移是 `db/migrations/002_registration.sql`。两者的版本号都是 2，而 `applyMigrations` 按 `version` 去重 → **后执行的那张表永远建不出来**。P1 执行前必须改号（建议 P1 的 `002_registration` → `003_registration`），否则 `003_review` / `004_leaderboard` / `005_audit` 之后的一切都建在错误的基线上。本阶段的 `005_audit.sql` 编号与契约一致。
-2. **P0 声明了但没建的文件**：P0 的 File Structure 里有 `src/audit/log.js`，但 P0 的 7 个 Task 都没有创建它。审计日志的写入入口本阶段补齐（Task 1）。
+1. **迁移版本号撞车** —— ✅ **已消解**（2026-10-21 订正，见下方修正记录）：
+   P0 终态 `platform/db/migrations/` 下**只有 `001_init.sql`**，**从未建过 `002_user_roles.sql`**；
+   P1 的迁移是 `002_registration.sql`。全局唯一序位是 `001=P0`、`002=P1`、`003=P2`、
+   `004=P3`、`005=P4`、`006=P5`，**没有两份计划抢同一个号**。本阶段的 `005_audit.sql` 编号与契约一致。
+2. **P0 声明了但没建的文件**：P0 的 File Structure 里有 `src/audit/log.js`，但 P0 的 7 个 Task
+   都没有创建它 —— **该文件由 P2 的 Task 4 建**（`src/db/repo/audit-log.js` + 薄门面）。
+   本阶段**只复用**，不重复实现（见 I-8 修正记录）。
 3. **P0 的 `error()` 没有自定义响应头能力**：`src/http/respond.js` 的 `error(res, status, code, message, detail)` 装不下 `Retry-After`。本阶段追加可选第 6 参 `extraHeaders`（向后兼容，P0 现有调用不用改）。
+   ⚠️ **但调用点不得回退 P0 终审 I-C**（2026-10-21 漂移审计修正 C-1）：追加第 5、6 参时，
+   第 4 参 `message` 必须**仍是** `err instanceof AppError ? err.message : '请求无效'`
+   （不是 `err.message`），第 5 参 `detail` 必须**仍是** `err instanceof AppError ? err.detail : undefined`
+   （不是 `err.detail`）—— 否则 4xx 会把 SQLite 原文重新放回响应体。
+   照做会当场让 P0 的 3 个用例变红（审计实跑：`not ok 88` / `not ok 112` / `not ok 115`）。
+   详见 C-1 修正记录。
+
+> **【2026-10-21 漂移审计修正 I-9 + M-4】**（§E 第 1 条）
+> **原来错在哪**：这一条原来写的是「P0 计划 Task 6 建了 `db/migrations/002_user_roles.sql`，
+> 而 `INTERFACES.md` §2 规定 P1 的迁移是 `002_registration.sql`。两者的版本号都是 2 …
+> **P1 执行前必须改号（建议 P1 的 `002_registration` → `003_registration`）**」。
+> **为什么错（两层）**：
+> ① **事实已过期** —— P0 终态的 `platform/db/migrations/` 下**只有 `001_init.sql`**，
+> `002_user_roles.sql` **从未存在**；P1 落地的是 `002_registration.sql`，两者本就不同号，
+> 这个「冲突」在 P1 落地时就不存在。
+> ② **建议本身是危险的** —— 若被采纳，把 P1 的 `002` 改成 `003`，就会与 **P2 自己的
+> `003_review.sql` 撞号**（全局唯一序位 `001=P0 / 002=P1 / 003=P2 / 004=P3 / 005=P4 / 006=P5`），
+> 把「P0/P1 撞号」换成「P1/P2 撞号」→ `applyMigrations` 的重复版本号检测**响亮抛错**
+> （基线 `src/db/migrate.js` 的 `readMigrationFiles()`）→ **`003_review.sql` 永远建不出来**，
+> P2 的全部评审表缺失，后面 004/005/006 全部建在错误的基线上。
+> **改成什么**：改写为「**已消解**」的现状陈述，显式钉住全局唯一序位，**删除「建议改号」**。
+> **依据**：`git ls-tree` 实测 —— `.worktrees/p0-foundation` 的 `platform/db/migrations/`
+> 只有 `001_init.sql`；`.worktrees/p1-registration` 的有 `001_init.sql` + `002_registration.sql`；
+> 基线 `platform/src/db/migrate.js` 的重复版本号检测（抛「迁移版本号重复」）+
+> 漂移审计报告 I-9 / M-4。同一事实的另一半在 P2 的偏差表 D-18，已按同一口径改写。
 
 ### F. 一处口径调和（不是冲突，是把两句话的适用边界写清楚）
 

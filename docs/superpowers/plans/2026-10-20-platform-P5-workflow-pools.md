@@ -4,7 +4,7 @@
 
 **Goal:** 把「任务包 → 工作流 → 任务清单 → 队员自主领取任务完成」这条链路落成可运行的代码（R-OPS-13），并在**不提供岗位制**的前提下保证任务只能被自主领取（R-OPS-14）；在此之上建三池**底座**——项目池 / 人才池 / 资源池的派生同步与只读 API（R-POOL-01/02/03），以及增长飞轮闭环的最小可观测形态（R-POOL-04）；最后给出**无需登录**的公开榜单 API（token 鉴权 + 可见性过滤）与赛程 iCal 订阅，并配套个人积分终生上榜（R-RNK-10）。
 
-**Architecture:** 延续 P0 的单进程零依赖架构。`src/domain/` 放纯函数（三池派生 / 任务完成证据校验 / iCal 生成，无 IO、无 `Date.now()`、无 `Math.random()`）；`src/services/` 放用例编排（workflow / pools / public-api）；所有 SQL 收在 `src/db/repo/`；`src/routes/` 挂 P5 的 9 条 API；`web/views/tasks.js` 是唯一的本阶段前端视图。**本阶段的灵魂是「一个派生值只有一个计算点、一条任务只有一个有效领取、一个公开接口只给该给的字段」**：三池同步是幂等重建（不是增量累加），任务领取靠数据库唯一约束兜底（不是应用层先查再插），公开接口显式过 `applyVisibility` 再做字段白名单投影（不是"默认给全量"）。
+**Architecture:** 延续 P0 的单进程零依赖架构。`src/domain/` 放纯函数（三池派生 / 任务完成证据校验 / iCal 生成，无 IO、无 `Date.now()`、无 `Math.random()`）；`src/services/` 放用例编排（workflow / pools / public-api）；所有 SQL 收在 `src/db/repo/`；`src/http/routes/` 挂 P5 的 9 条 API；`web/views/tasks.js` 是唯一的本阶段前端视图。**本阶段的灵魂是「一个派生值只有一个计算点、一条任务只有一个有效领取、一个公开接口只给该给的字段」**：三池同步是幂等重建（不是增量累加），任务领取靠数据库唯一约束兜底（不是应用层先查再插），公开接口显式过 `applyVisibility` 再做字段白名单投影（不是"默认给全量"）。
 
 **Tech Stack:** Node ≥22.16.0（生产建议 24）｜`node:sqlite`｜`node:crypto`（scrypt）｜`node:test`｜原生 ESM 前端，无构建｜**npm 依赖 0 个**
 
@@ -79,7 +79,7 @@ platform/
 │   ├── db/repo/
 │   │   ├── workflows.js             workflows + workflow_tasks（工作流与任务清单）
 │   │   ├── task-claims.js           task_claims（唯一约束在这一层被数据库兜住）
-│   │   ├── team-membership.js       只读 P1 的 team_members / teams（不依赖 P1 仓储的导出名）
+│   │   ├── teamMembers.js           **P1 已建**；本阶段【追加】hasActiveMembership / listMemberTeams（team_members 的唯一归属）
 │   │   ├── pools.js                 pool_projects / pool_talents / pool_resources
 │   │   ├── pool-sources.js          只读派生源：teams / stages / stage_results / tier_records / points_ledger / registrations / task_packages / users
 │   │   └── public-tokens.js         public_tokens（签发 / 校验 / 吊销）
@@ -110,7 +110,7 @@ platform/
 
 ```
 platform/src/config.js                加载并校验 rules/pools.json（新增 rules.pools 命名空间）
-platform/src/server.js                挂载 src/routes/workflow.js + pools.js + public.js；响应支持原文输出（.ics）
+platform/src/server.js                挂载 src/http/routes/workflow.js + pools.js + public.js；响应支持原文输出（.ics）
 platform/web/app.js                   注册 /tasks/:workflowId 路由 + 把路由参数透传给视图
 ```
 
@@ -125,7 +125,6 @@ platform/web/app.js                   注册 /tasks/:workflowId 路由 + 把路�
 - Create: `platform/db/migrations/006_pools.sql`
 - Create: `platform/src/db/repo/workflows.js`
 - Create: `platform/src/db/repo/task-claims.js`
-- Create: `platform/src/db/repo/team-membership.js`
 - Create: `platform/src/db/repo/pools.js`
 - Create: `platform/src/db/repo/pool-sources.js`
 - Create: `platform/src/db/repo/public-tokens.js`
@@ -141,7 +140,7 @@ platform/web/app.js                   注册 /tasks/:workflowId 路由 + 把路�
   - `pool_talents(id, user_id, edition_id, name, org, total_points, mba_status, stages_joined, skills_json, created_at)`
   - `pool_resources(id, edition_id, enterprise_id, enterprise_name, kind, detail, created_at)`
   - `public_tokens(token, scope, edition_id, expires_at, created_at)`
-  - 仓储函数：`insertWorkflow` / `getWorkflow` / `listWorkflowsByEdition` / `insertWorkflowTask` / `getWorkflowTask` / `listWorkflowTasksByWorkflow` / `updateWorkflowTaskStatus` / `completeWorkflowTask` / `insertTaskClaim` / `getActiveClaim` / `releaseTaskClaim` / `countActiveClaims` / `isActiveMember` / `listMemberTeams` / `listTeamsByPackage` / `insertPoolProject` / `updatePoolProject` / `deletePoolProject` / `listPoolProjectRows` / `insertPoolTalent` / `updatePoolTalent` / `deletePoolTalent` / `listPoolTalentRows` / `insertPoolResource` / `updatePoolResource` / `deletePoolResource` / `listPoolResourceRows` / 派生源读取 / `insertPublicToken` / `findPublicToken` / `deletePublicToken`
+  - 仓储函数：`insertWorkflow` / `getWorkflow` / `listWorkflowsByEdition` / `insertWorkflowTask` / `getWorkflowTask` / `listWorkflowTasksByWorkflow` / `updateWorkflowTaskStatus` / `completeWorkflowTask` / `insertTaskClaim` / `getActiveClaim` / `releaseTaskClaim` / `countActiveClaims` / `hasActiveMembership` / `listMemberTeams` / `insertPoolProject` / `updatePoolProject` / `deletePoolProject` / `listPoolProjectRows` / `insertPoolTalent` / `updatePoolTalent` / `deletePoolTalent` / `listPoolTalentRows` / `insertPoolResource` / `updatePoolResource` / `deletePoolResource` / `listPoolResourceRows` / 派生源读取 / `insertPublicToken` / `findPublicToken` / `deletePublicToken`
 
 > **⚠️ 本 Task 的灵魂（并发安全）**
 > **「同一任务不能被两人同时领取」必须由数据库保证，不能由应用层保证。**
@@ -541,19 +540,32 @@ export function countActiveClaims(db, taskId) {
 }
 ```
 
-- [ ] **Step 6: 创建 `src/db/repo/team-membership.js`**
+- [ ] **Step 6: 追加 `src/db/repo/teamMembers.js` 的两个只读函数（**P1 已建的文件**）**
+
+⚠️ **本阶段不新建 `src/db/repo/team-membership.js`**（原写法）—— 见下方 I-3 修正记录。
+`platform/src/db/repo/teamMembers.js` 由 **P1 建立**（`insertTeamMember` / `listActiveMembers` /
+`listMemberHistory` / `findActiveMembershipByUser` / `markMemberLeft` / `countActiveMembers` /
+`lastLeaveAt`）。本阶段**只追加**下面两个函数，**不重建文件**、**不改 P1 已有的函数签名**：
 
 ```javascript
-// src/db/repo/team-membership.js — 队成员与队-任务包关系（只读 P1 的表）
+// src/db/repo/teamMembers.js —— 【追加】到 P1 已建的文件里
 // 依据：R-OPS-13 / R-OPS-14（自主领取的人必须是某个队的成员）
-// ⚠️ 不依赖 P1 仓储层的导出名（契约未规定），本阶段自建只读入口，避免跨阶段撞名。
-export function isActiveMember(db, teamId, userId) {
+// ⚠️ 本文件由 P1 建立。本阶段【追加】下面两个函数，P1 已有的函数保持不动
+//    （签名一个字都不改）。
+//
+// hasActiveMembership：这个人**是不是这支队的**在队成员。
+// ⛔ 不能用 P1 的 countActiveMembers(db, teamId) > 0 代替 ——
+//    那问的是「这支队还有没有在队成员」，不是「这个人是不是在队成员」。
+//    两者在「队里只剩别人」时结论完全相反（前者 true、后者 false）。
+export function hasActiveMembership(db, teamId, userId) {
   const row = db
     .prepare('SELECT 1 AS ok FROM team_members WHERE team_id = ? AND user_id = ? AND left_at IS NULL')
     .get(teamId, userId);
   return row !== undefined;
 }
 
+// listMemberTeams：这个人在哪些队（可选按届期过滤）。
+// 依据：R-REG-03「赛程中成员可持续招募汰换」→ 只要 left_at IS NULL 就算在队。
 export function listMemberTeams(db, userId, { editionId = null } = {}) {
   const sql = editionId
     ? `SELECT t.* FROM teams t
@@ -567,13 +579,37 @@ export function listMemberTeams(db, userId, { editionId = null } = {}) {
   const rows = editionId ? db.prepare(sql).all(userId, editionId) : db.prepare(sql).all(userId);
   return rows;
 }
-
-export function listTeamsByPackage(db, editionId, taskPackageId) {
-  return db
-    .prepare('SELECT * FROM teams WHERE edition_id = ? AND task_package_id = ? AND deleted_at IS NULL ORDER BY id')
-    .all(editionId, taskPackageId);
-}
 ```
+
+> **【2026-10-21 漂移审计修正 I-3】**
+> **原来错在哪**：本阶段原来**新建** `platform/src/db/repo/team-membership.js`，
+> 里面放 `isActiveMember` / `listMemberTeams` / `listTeamsByPackage`，
+> 后面 Task 2 又**追加** `getTeamById`。
+> **为什么错**：
+> ① **同一张 `team_members` 表出现两个仓储文件、两套函数** ——
+> `teamMembers.js`（P1，camelCase）与 `team-membership.js`（P5，kebab-case）。
+> P5 的 `isActiveMember` 与 P1 的 `findActiveMembershipByUser` 语义重叠。
+> ② **更糟的是同一个函数体有两份拷贝**：P5 的
+> ```javascript
+> export function getTeamById(db, id) {
+>   return db.prepare('SELECT * FROM teams WHERE id = ? AND deleted_at IS NULL').get(id) ?? null;
+> }
+> ```
+> 与 P1 终态 `platform/src/db/repo/teams.js:32-34` 的 `getTeam` **逐字相同**（含 SQL 与 `?? null`）。
+> 将来修一处忘一处，就会出现「P5 认为在队、P1 认为已离队」的数据分歧 ——
+> 这正是「`src/db/repo/*` 文件归属冲突」要找的那类问题。
+> ③ 原写法的前提「契约未规定 P1 仓储层的导出名，自建只读入口可避免跨阶段撞名」
+> **已经不成立** —— P1 终态的仓储导出名是**既成事实**，照着那个名字写只会撞名。
+> **改成什么**：**删除** `src/db/repo/team-membership.js`，改为复用 P1 的两个仓储：
+> | 原 P5 函数 | 改成 | 理由 |
+> |---|---|---|
+> | `getTeamById(db, id)` | **P1 的 `getTeam(db, id)`**（`src/db/repo/teams.js`） | 与 P1 逐字相同，不重复实现 |
+> | `isActiveMember(db, teamId, userId)` | **追加** `hasActiveMembership(db, teamId, userId)` 到 P1 的 `src/db/repo/teamMembers.js` | 查「这个人是不是这支队的成员」；⚠️ **不能用** P1 的 `countActiveMembers(db, teamId) > 0` 代替 —— 那问的是「这支队还有没有在队成员」，在「队里只剩别人」时结论相反 |
+> | `listMemberTeams(db, userId, { editionId })` | **追加**到 P1 的 `src/db/repo/teamMembers.js` | P1 没有等价物（`findActiveMembershipByUser` 用 `LIMIT 1` 只返回一支队），确属新增 |
+> | `listTeamsByPackage(db, editionId, taskPackageId)` | **P1 的 `listTeamRows(db, { editionId, taskPackageId })`**（`src/db/repo/teams.js`） | 过滤条件等价（都排除 `deleted_at IS NULL`），不必再写一份 |
+> 文件归属由此单一：`team_members` → `teamMembers.js`；`teams` → `teams.js`。
+> **依据**：P1 终态 `platform/src/db/repo/teams.js`（`getTeam` / `listTeamRows`）
+> 与 `platform/src/db/repo/teamMembers.js`（7 个导出）+ 漂移审计报告 I-3。
 
 - [ ] **Step 7: 创建 `src/db/repo/pools.js`**
 
@@ -834,7 +870,7 @@ export function listPublicTokens(db, { editionId = null } = {}) {
 - [ ] **Step 10: 运行测试确认通过**
 
 Run: `cd platform && node --test test/pools-migration.test.js`
-Expected: PASS（5 个测试全过）
+Expected: PASS（5 个测试全过：pools-migration.test.js 5）
 
 - [ ] **Step 11: 实跑迁移**
 
@@ -860,7 +896,7 @@ git commit -m "feat(P5): 工作流与三池数据模型（006_pools.sql）+ 领�
 **Files:**
 - Create: `platform/src/domain/task-evidence.js`
 - Create: `platform/src/services/workflow.js`
-- Modify: `platform/src/db/repo/team-membership.js`（追加 `getTeamById`）
+- Modify: `platform/src/db/repo/teamMembers.js`（**P1 Task 已建**；本阶段只**追加** `hasActiveMembership` / `listMemberTeams`，**不重建文件**）
 - Test: `platform/test/workflow-service.test.js`
 
 **Interfaces:**
@@ -1173,14 +1209,29 @@ function isAcceptableArtifact(url) {
 }
 ```
 
-- [ ] **Step 4: 追加 `getTeamById` 到 `src/db/repo/team-membership.js`**
+- [ ] **Step 4: 确认 `getTeam` 的来源（**P1 已建，本阶段不重复实现**）**
+
+⚠️ 原写法是「追加 `getTeamById` 到 `src/db/repo/team-membership.js`」——
+**该文件本阶段已不存在**（见 Task 1 Step 6 的 I-3 修正记录）。
+
+`getTeam(db, id)` 由 **P1 的 `platform/src/db/repo/teams.js`** 提供，
+与 P5 原来的 `getTeamById` **逐字相同**（含 SQL 与 `?? null`）：
 
 ```javascript
-// 追加到 src/db/repo/team-membership.js 末尾
-export function getTeamById(db, id) {
-  return db.prepare('SELECT * FROM teams WHERE id = ? AND deleted_at IS NULL').get(id) ?? null;
-}
+// src/db/repo/teams.js —— 由 P1 建立，本阶段【直接 import，不追加、不重建】
+//   export function getTeam(db, id) {
+//     return db.prepare('SELECT * FROM teams WHERE id = ? AND deleted_at IS NULL').get(id) ?? null;
+//   }
 ```
+
+本阶段的 `src/services/workflow.js` 相应改为：
+
+```javascript
+import { getTeam, listTeamRows } from '../db/repo/teams.js';
+import { hasActiveMembership, listMemberTeams } from '../db/repo/teamMembers.js';
+```
+
+（原来那行 `import { … } from '../db/repo/team-membership.js';` **整行删掉**。）
 
 - [ ] **Step 5: 创建 `src/services/workflow.js`**
 
@@ -1203,7 +1254,8 @@ import { validateTaskEvidence } from '../domain/task-evidence.js';
 import { getUserById } from '../db/repo/users.js';
 import * as wfRepo from '../db/repo/workflows.js';
 import * as claimRepo from '../db/repo/task-claims.js';
-import { isActiveMember, listMemberTeams, listTeamsByPackage, getTeamById } from '../db/repo/team-membership.js';
+import { hasActiveMembership, listMemberTeams } from '../db/repo/teamMembers.js';
+import { getTeam, listTeamRows } from '../db/repo/teams.js';
 
 function nowIso(now) {
   return now ?? new Date().toISOString();
@@ -1219,8 +1271,8 @@ function requireUser(db, userId) {
 function canViewWorkflow(db, viewer, workflow) {
   if (!viewer) return false;
   if (viewer.is_superadmin === 1) return true;
-  const teams = listTeamsByPackage(db, workflow.edition_id, workflow.task_package_id);
-  return teams.some((t) => isActiveMember(db, t.id, viewer.id));
+  const teams = listTeamRows(db, { editionId: workflow.edition_id, taskPackageId: workflow.task_package_id });
+  return teams.some((t) => hasActiveMembership(db, t.id, viewer.id));
 }
 
 /**
@@ -1235,8 +1287,8 @@ export function createWorkflow({ db, editionId, taskPackageId, name, actorId, no
   }
   const title = typeof name === 'string' ? name.trim() : '';
   if (!title) throw appError(400, 'NAME_REQUIRED', '工作流名称必填');
-  const teams = listTeamsByPackage(db, editionId, taskPackageId);
-  const allowed = actor.is_superadmin === 1 || teams.some((t) => isActiveMember(db, t.id, actorId));
+  const teams = listTeamRows(db, { editionId, taskPackageId });
+  const allowed = actor.is_superadmin === 1 || teams.some((t) => hasActiveMembership(db, t.id, actorId));
   if (!allowed) {
     throw appError(403, 'FORBIDDEN', '只有认领该任务包的队员（或组委会）才能拆解工作流');
   }
@@ -1257,9 +1309,9 @@ export function createWorkflowTask({ db, workflowId, title, detail, ownerTeamId,
   const taskTitle = typeof title === 'string' ? title.trim() : '';
   if (!taskTitle) throw appError(400, 'TITLE_REQUIRED', '任务标题必填');
   if (ownerTeamId) {
-    const team = getTeamById(db, ownerTeamId);
+    const team = getTeam(db, ownerTeamId);
     if (!team) throw appError(404, 'TEAM_NOT_FOUND', '队伍不存在');
-    if (actor.is_superadmin !== 1 && !isActiveMember(db, ownerTeamId, actorId)) {
+    if (actor.is_superadmin !== 1 && !hasActiveMembership(db, ownerTeamId, actorId)) {
       throw appError(403, 'FORBIDDEN', '只能给自己所在的队建任务');
     }
   }
@@ -1390,9 +1442,9 @@ export function completeTask({ db, taskId, userId, now, evidence }) {
 /** 领取人所在队：显式指定则校验成员身份；未指定则在本人所在队中选唯一的一支。 */
 function resolveTeam(db, userId, teamId) {
   if (teamId) {
-    const team = getTeamById(db, teamId);
+    const team = getTeam(db, teamId);
     if (!team) throw appError(404, 'TEAM_NOT_FOUND', '队伍不存在');
-    if (!isActiveMember(db, teamId, userId)) {
+    if (!hasActiveMembership(db, teamId, userId)) {
       throw appError(403, 'NOT_TEAM_MEMBER', '你不是该队成员，不能替该队领取任务');
     }
     return team;
@@ -1409,12 +1461,24 @@ function resolveTeam(db, userId, teamId) {
 - [ ] **Step 6: 运行测试确认通过**
 
 Run: `cd platform && node --test test/workflow-service.test.js`
-Expected: PASS（11 个测试全过）
+Expected: PASS（12 个测试全过：workflow-service.test.js 12）
+
+> **【2026-10-21 漂移审计修正 M-1】** **原来错在哪**：本计划两处「Expected: PASS」的条数声明
+> 与代码块里实际的 `test(` 数量不符 —— `workflow-service.test.js` 声明 **11** 实为 **12**、
+> `pools-sync.test.js` 声明 **8** 实为 **7**。
+> **为什么错**：条数是**实施时的验收闸**。实施者跑出 12 个而计划写 11 个，会误判「测试缺失」
+> 而去改测试代码迁就声明，或者干脆失去对闸的信任。
+> **注意方向相反**：一处多 1、一处少 1 —— 说明是**手工维护漂移**，不是有意为之。
+> **改成什么**：① 两个数字改成实测值；② 把本计划**全部 5 处** `Expected: PASS` 统一成
+> `Expected: PASS（N 个测试全过：file N）` 的格式。
+> **依据**：按「就近 `Run:` 行指向的测试文件 → 该文件的 fenced code block 内 `^test(` 出现次数」
+> 逐个统计（与审计报告 M-1 同一口径），并在本次改动后**对五份计划全量复算**：
+> 每一条 `Expected: PASS（N …）` 现已与代码块实测条数**逐条相等**。
 
 - [ ] **Step 7: 提交**
 
 ```bash
-cd platform && git add src/domain/task-evidence.js src/services/workflow.js src/db/repo/team-membership.js test/workflow-service.test.js
+cd platform && git add src/domain/task-evidence.js src/services/workflow.js src/db/repo/teamMembers.js test/workflow-service.test.js
 git commit -m "feat(P5): 任务清单与自主领取（禁止岗位制，R-OPS-14）
 
 对应 R-OPS-13 / R-OPS-14 / R-STG-04：
@@ -2222,6 +2286,24 @@ function safeParse(raw) {
     pools: rules.pools,
 ```
 
+> **【2026-10-21 漂移审计修正 I-2】** **version 一致性校验这一步【不需要改】** ——
+> 原计划隐含的「新增规则文件要同步加进 `versionValues` 数组」**不适用**（那个数组已经不存在了）。
+> **原来错在哪**：P0 终审时的 `src/config.js` 里，version 全等校验是**硬编码的 9 项列表**
+> + 硬编码的 `9`；新增的规则文件即使注册进 `FILES` / `grouped`，它的 `version`
+> **从不参与比较**（审计实跑：注入异版本号 → `validateRules` **零报错**）→
+> 「版本号漂移 = 审计链在说谎」这条被打破。
+> **现状（基线已修好）**：基线的 `src/config.js` 已改成
+> `validateRules(rules, expectedCount = null)` **按「有 id 的是一份配置」自动派生**
+> （`collectConfigObjects`），`expectedCount` 由 `loadRules()` 传 `Object.keys(FILES).length`
+> → **加多少份配置都自动覆盖**，P5 不需要改 version 校验。
+> **改成什么**：本步**只**做三件事 —— ① `FILES` 加 `pools`；② `grouped` 加 `pools`；
+> ③ `validateRules` 末尾追加 pools 的**内容**校验段。version 校验一个字都不动。
+> **⚠️ 硬前提**：`rules/pools.json` **必须带 `"id": "pools"`**（识别「一份配置」用的是 `id`
+> 而不是 `version`；`collectConfigObjects` 命中配置对象即 `return`，**嵌套对象里的 `id` 不算**）。
+> P5 落地时 `FILES` 为 **16** 份（P0 的 9 + P1 的 3 + P3 的 2 + P4 的 1 + P5 的 1），
+> 识别到的配置份数也必须是 16，否则报「规则配置应有 16 份，实际只识别到 N 份」→ **拒绝启动**。
+> **依据**：基线 `platform/src/config.js` + 漂移审计报告 I-2 与 D-3。
+
 在 `validateRules()` 的 `return errors;` 之前追加：
 
 ```javascript
@@ -2275,10 +2357,30 @@ function safeParse(raw) {
 - [ ] **Step 7: 运行测试确认通过**
 
 Run: `cd platform && node --test test/pools-sync.test.js`
-Expected: PASS（8 个测试全过）
+Expected: PASS（7 个测试全过：pools-sync.test.js 7）
 
 Run: `cd platform && node --test test/config.test.js`
-Expected: PASS（仓库自带的 9 份 + 本阶段的 `pools.json` 一起通过校验）
+Expected: PASS（23 个测试全过：config.test.js 23）——仓库自带的**全部 16 份**规则配置
+（P0 的 9 + P1 的 3 + P3 的 2 + P4 的 1 + P5 的 1）加上本阶段的 `pools.json` 一起通过校验
+
+> **【2026-10-21 漂移审计修正 M-2】**
+> **原来错在哪**：这一行原来写的是
+> `Expected: PASS（仓库自带的 9 份 + 本阶段的 \`pools.json\` 一起通过校验）` ——
+> **「9 份」早就过期了**，而且格式不是任务要求的 `Expected: PASS（N 个测试全过：file N）`。
+> **为什么错**：① 「9 份」是 P0 时的份数，P1 加了 3 份（`teamFormation` / `schedule` /
+> `compliance`）、P3 加了 2 份（`points` / `criteria`）、P4 加了 1 份（`audit`）、
+> P5 本阶段再加 1 份（`pools`）→ 到本阶段是 **9 + 3 + 2 + 1 + 1 = 16 份**。
+> 照「9 份」写，实施者会以为规则配置**少了一大半**。
+> ② 「条数声明」本身也不该靠人记 —— 改成实测条数。
+> **改成什么**：改成 `Expected: PASS（23 个测试全过：config.test.js 23）` +
+> 「全部 **16 份**规则配置一起通过校验」的说明。
+> **依据**：基线 `platform/test/config.test.js` **23 条**（P0 建立、P1 未改条数）；
+> 基线 `platform/src/config.js` 的 `FILES` 共 12 键（P0 的 9 + P1 的 3）→ 逐阶段累加得 16。
+> ⚠️ **审计报告 M-2 自己写的「13 份」也漏算了 P1 的 3 份**（它按「P0 的 9 + P3 的 2 +
+> P4 的 1 + P5 的 1」算）→ 本次按实际算 **16 份**，并在 P4 / P5 的 I-2 修正记录里
+> 把份数算式一并订正（P3 = 14、P4 = 15、P5 = 16）。
+> **旁证**：P1 已把 `test/config.test.js` 里的「9 份」措辞泛化为「全部规则配置」
+> （3 处）—— 说明「份数」不该硬编码在测试名与文案里，本阶段沿用同一口径。
 
 - [ ] **Step 8: 提交**
 
@@ -2298,9 +2400,9 @@ git commit -m "feat(P5): 三池派生同步（幂等重建 + 派生值唯一计�
 
 **Files:**
 - Create: `platform/src/services/public-api.js`
-- Create: `platform/src/routes/workflow.js`
-- Create: `platform/src/routes/pools.js`
-- Create: `platform/src/routes/public.js`
+- Create: `platform/src/http/routes/workflow.js`
+- Create: `platform/src/http/routes/pools.js`
+- Create: `platform/src/http/routes/public.js`
 - Modify: `platform/src/server.js`（挂载 P5 三组路由 + 支持原文响应 `.ics`）
 - Test: `platform/test/public-api.test.js`
 
@@ -2726,10 +2828,10 @@ function projectPublicRows(rows, rules, warnings, stageId) {
 }
 ```
 
-- [ ] **Step 4: 创建 `src/routes/workflow.js`**
+- [ ] **Step 4: 创建 `src/http/routes/workflow.js`**
 
 ```javascript
-// src/routes/workflow.js — 任务清单 API
+// src/http/routes/workflow.js — 任务清单 API
 // 依据：INTERFACES.md §6 的 P5 API 清单；R-OPS-13 / R-OPS-14
 // ⛔ R-OPS-14：禁止岗位制，任务只能自主领取 —— 这里【没有】任何"按岗位分配任务"的端点。
 import { appError } from '../errors.js';
@@ -2795,10 +2897,10 @@ export function registerWorkflowRoutes(router, { db, rules }) {
 }
 ```
 
-- [ ] **Step 5: 创建 `src/routes/pools.js`**
+- [ ] **Step 5: 创建 `src/http/routes/pools.js`**
 
 ```javascript
-// src/routes/pools.js — 三池只读 API + 同步
+// src/http/routes/pools.js — 三池只读 API + 同步
 // 依据：INTERFACES.md §6 的 P5 API 清单；R-POOL-01/02/03/04
 // ⚠️ 一期【不做三池前台页面】（设计文档 §1.2）：这里只提供只读 API 与同步入口。
 import { appError } from '../errors.js';
@@ -2859,10 +2961,10 @@ export function registerPoolsRoutes(router, { db, rules }) {
 }
 ```
 
-- [ ] **Step 6: 创建 `src/routes/public.js`**
+- [ ] **Step 6: 创建 `src/http/routes/public.js`**
 
 ```javascript
-// src/routes/public.js — 公开接口（无需登录，token 鉴权）
+// src/http/routes/public.js — 公开接口（无需登录，token 鉴权）
 // 依据：INTERFACES.md §6 的 P5 API 清单
 // ⚠️ token 走 query 参数（契约如此）：部署时应在 nginx 层关掉 query 串的访问日志（P6 负责）。
 import { getPublicLeaderboard } from '../services/public-api.js';
@@ -2884,9 +2986,9 @@ export function registerPublicRoutes(router, { db, rules }) {
 
 ```javascript
 import { json, error, text } from './http/respond.js';
-import { registerWorkflowRoutes } from './routes/workflow.js';
-import { registerPoolsRoutes } from './routes/pools.js';
-import { registerPublicRoutes } from './routes/public.js';
+import { registerWorkflowRoutes } from './http/routes/workflow.js';
+import { registerPoolsRoutes } from './http/routes/pools.js';
+import { registerPublicRoutes } from './http/routes/public.js';
 ```
 
 （把原来那行 `import { json, error } from './http/respond.js';` 替换成上面这行。）
@@ -2900,14 +3002,29 @@ import { registerPublicRoutes } from './routes/public.js';
   registerPublicRoutes(router, { db, rules });
 ```
 
-在 `handle()` 里，把
+在 `handleRequest()` 里（**不是 `handle()`** —— `handle()` 是外层兜底，这段在它里面的
+`handleRequest()` 中），找到下面这段**原文**（P0 终审 I7-4 立的 handler 返回约定，
+**整段保留、不许删**）：
 
 ```javascript
         const result = await match.handler(ctx);
-        json(res, 200, result ?? { ok: true });
+        // ⛔ 预审修正（I7-4）：handler 返回约定 ——
+        //   undefined → 200（保持原行为）；{ status, body }（可选 headers）→ 按返回值应答。
+        if (result && typeof result === 'object' && typeof result.status === 'number') {
 ```
 
-替换成：
+在 `const result = await match.handler(ctx);` **之后**、`if (result && …)` **之前**
+**插入**下面这 5 行（**插入，不是替换**）：
+
+```javascript
+        // 原文响应（.ics 等）：P0 的 handler 统一 json() 序列化，这里走 text()
+        if (result && typeof result === 'object' && result.__rawText === true) {
+          text(res, 200, String(result.body ?? ''), result.contentType || 'text/plain; charset=utf-8');
+          return;
+        }
+```
+
+插入后该段应是（**顺序：原文 → 插入段 → I7-4 块 → json 兜底**）：
 
 ```javascript
         const result = await match.handler(ctx);
@@ -2916,13 +3033,61 @@ import { registerPublicRoutes } from './routes/public.js';
           text(res, 200, String(result.body ?? ''), result.contentType || 'text/plain; charset=utf-8');
           return;
         }
+        // ⛔ 预审修正（I7-4）：handler 返回约定 ——
+        //   undefined → 200（保持原行为）；{ status, body }（可选 headers）→ 按返回值应答。
+        if (result && typeof result === 'object' && typeof result.status === 'number') {
+          const { status, body: payload } = result;
+          if (status === 204) {
+            res.writeHead(204);
+            res.end();
+            return;
+          }
+          json(res, status, payload ?? null, result.headers || {});
+          return;
+        }
         json(res, 200, result ?? { ok: true });
 ```
+
+> **【2026-10-21 漂移审计修正 C-2 + M-5】**（**本计划最危险的一处**）
+> **原来错在哪**：原指令是「在 `handle()` 里，把
+> ```javascript
+>         const result = await match.handler(ctx);
+>         json(res, 200, result ?? { ok: true });
+> ```
+> **替换成**：……」—— 这两行在 P0 终态里**并不相邻**：中间夹着 I7-4 的 12 行
+> handler 返回契约块（基线 `src/server.js:208-221`）。
+> **为什么错（两层）**：
+> ① **落点锚点不存在** —— 实施者按字面「替换这两行」只有两种落法：**要么找不到锚点卡住**，
+> **要么把整段 I7-4 一起删掉**。
+> ② **删掉的后果是灾难性的** —— `/api/auth/login` 路由返回 `{ status, body, headers }`，
+> 靠 I7-4 块才会被翻译成「200 + 正确 body + `Set-Cookie` 头」。删掉后
+> `json(res, 200, result)` 会把 `{status, body, headers}` **整个当 body 序列化**，
+> **`Set-Cookie` 头消失** → 浏览器拿不到会话 → **登录功能整体失效**。
+> **实跑证据（审计报告 C-2）**：把原替换逐字打进 pristine P0（`38c6713` 与 `d077537`
+> 两个基线各跑一遍），跑全量 → **3 个 P0 用例当场变红**：
+> `not ok 82 - 正确手机号+密码登录返回 200 并下发 Session Cookie`、
+> `not ok 104 - 登出响应必须下发清空 Cookie 的 Set-Cookie（终审 M-3）`、
+> `not ok 107 - 登录响应体必须带回当前用户，且不得含 password_hash（复核 I1）`
+> （`# tests 151 / # pass 148 / # fail 3`）。审计还用脚本验证过
+> 「`const result = await match.handler(ctx);` 紧邻 `json(res, 200, …)`」这个锚点
+> 在两个基线上**均不存在**（`adjacent-anchor exists: False`）。
+> **改成什么**：① 指令从「**替换**」改为「**插入**」，锚点更新成 P0 终态的**真实原文**
+> （含 I7-4 块，逐字抄自基线 `src/server.js`）；② 插入位置明确为
+> 「`const result = await match.handler(ctx);` 之后、`if (result && …)` 之前」——
+> 这个位置既在 I7-4 块**之前**（`__rawText` 分支要抢在 JSON 应答之前），
+> 又**不触碰** I7-4 块本身；③ 补上「插入后该段应长什么样」的完整示意，便于实施者自检。
+> **M-5 一并订正**：定位词从 `handle()` 改成 **`handleRequest()`** ——
+> `handle()` 是外层兜底（`try { await handleRequest(req, res); } catch { …500… }`），
+> 这段代码在 `handleRequest()` 里；写错定位词会让人在错误的函数里找锚点，
+> 与 C-2 叠加会**放大误删风险**。
+> **依据**：基线 `platform/src/server.js:206-221`（逐字）+
+> `platform/src/server.js:151-170`（`handle` 与 `handleRequest` 的关系）
+> + 漂移审计报告 C-2 与 M-5。
 
 - [ ] **Step 8: 运行测试确认通过**
 
 Run: `cd platform && node --test test/public-api.test.js`
-Expected: PASS（10 个测试全过）
+Expected: PASS（10 个测试全过：public-api.test.js 10）
 
 Run: `cd platform && node --test`
 Expected: 全部通过（P0–P5 累计）
@@ -2930,7 +3095,7 @@ Expected: 全部通过（P0–P5 累计）
 - [ ] **Step 9: 提交**
 
 ```bash
-cd platform && git add src/services/public-api.js src/routes src/server.js test/public-api.test.js
+cd platform && git add src/services/public-api.js src/http/routes src/server.js test/public-api.test.js
 git commit -m "feat(P5): 公开榜单 API（token 鉴权 + 显式可见性过滤）与 P5 路由挂载
 
 对应 R-RNK-04 / R-RNK-10 / R-POOL-01~04：
@@ -2946,7 +3111,7 @@ git commit -m "feat(P5): 公开榜单 API（token 鉴权 + 显式可见性过滤
 **Files:**
 - Create: `platform/src/domain/icalendar.js`
 - Modify: `platform/src/services/public-api.js`（追加 `buildICalendar`）
-- Modify: `platform/src/routes/public.js`（追加 `GET /api/public/calendar.ics`）
+- Modify: `platform/src/http/routes/public.js`（追加 `GET /api/public/calendar.ics`）
 - Test: `platform/test/icalendar.test.js`
 
 **Interfaces:**
@@ -3252,7 +3417,7 @@ function addOneDay(value) {
 }
 ```
 
-- [ ] **Step 5: 在 `src/routes/public.js` 追加日历路由**
+- [ ] **Step 5: 在 `src/http/routes/public.js` 追加日历路由**
 
 把导入区改成：
 
@@ -3276,12 +3441,12 @@ import { getPublicLeaderboard, buildICalendar, resolvePublicToken } from '../ser
 - [ ] **Step 6: 运行测试确认通过**
 
 Run: `cd platform && node --test test/icalendar.test.js`
-Expected: PASS（8 个测试全过）
+Expected: PASS（8 个测试全过：icalendar.test.js 8）
 
 - [ ] **Step 7: 提交**
 
 ```bash
-cd platform && git add src/domain/icalendar.js src/services/public-api.js src/routes/public.js test/icalendar.test.js
+cd platform && git add src/domain/icalendar.js src/services/public-api.js src/http/routes/public.js test/icalendar.test.js
 git commit -m "feat(P5): iCal 日历导出（手写 RFC 5545，零依赖）
 
 对应设计文档 §8 公开日历订阅：
@@ -3507,7 +3672,7 @@ test('端到端：工作流 → 任务 → 领取 → 完成 → 同步三池 �
 - [ ] **Step 2: 运行测试确认失败**
 
 Run: `cd platform && node --test test/workflow-e2e.test.js`
-Expected: FAIL —— `POST /api/workflows` 返回 404（`src/routes/workflow.js` 未在 `src/server.js` 挂载，或视图文件不存在）
+Expected: FAIL —— `POST /api/workflows` 返回 404（`src/http/routes/workflow.js` 未在 `src/server.js` 挂载，或视图文件不存在）
 
 - [ ] **Step 3: 创建 `web/views/tasks.js`**
 
@@ -3717,7 +3882,7 @@ git commit -m "feat(P5): 任务清单前端页 + 端到端验收（工作流→�
 | P5-1 | 迁移 006 建出七张表 | `cd platform && node --test test/pools-migration.test.js` 通过；`node scripts/migrate.js` 输出「迁移完成，当前版本 6」 |
 | P5-2 | **同一任务不能被两人同时领取** | `node --test test/workflow-service.test.js` 通过：甲领取成功后乙领取返回 409 `TASK_ALREADY_CLAIMED`，且 `SELECT count(*) FROM task_claims WHERE task_id=? AND released_at IS NULL` 恒为 1；绕过应用层直接第二次 INSERT 被数据库拒绝（部分唯一索引） |
 | P5-3 | 完成必须给可运行状态或明确阻塞点，**且不加分** | 同上文件：只传 `summary` → 400 `EVIDENCE_REQUIRED` 且任务状态不变；`kind=runnable` 且带链接+版本 → 200 且状态 `done`、证据落库；`kind=blocked` 且写明阻塞点与解除条件 → 状态 `blocked`；完成一个任务后 `SELECT count(*) FROM points_ledger` 不变（任务完成 ≠ 赛段交付物得分） |
-| P5-4 | **禁止岗位制**（刻意缺失） | `grep -nE "assignTask\|assignByRole\|assignTaskByPosition\|dispatchTask\|allocateTask" platform/src/services/workflow.js platform/src/routes/workflow.js` 无命中；服务层导出里只有 `claimTask` 能让人拿到任务；`rules/pools.json` 的 `workflow.claimMode` = `self_claim_only`，改成别的值启动即失败 |
+| P5-4 | **禁止岗位制**（刻意缺失） | `grep -nE "assignTask\|assignByRole\|assignTaskByPosition\|dispatchTask\|allocateTask" platform/src/services/workflow.js platform/src/http/routes/workflow.js` 无命中；服务层导出里只有 `claimTask` 能让人拿到任务；`rules/pools.json` 的 `workflow.claimMode` = `self_claim_only`，改成别的值启动即失败 |
 | P5-5 | 三池同步幂等 | `node --test test/pools-sync.test.js` 通过：连跑两次同步后三表内容 `deepEqual`；改积分流水后重跑 → 积分为重算值（16）而不是累加值（23） |
 | P5-6 | 派生值单一真源 | 同上文件：库里的 `total_points` 等于积分流水聚合；同步时的自检不抛错（若派生源与派生值不一致 → 500 `POOL_TALENT_POINTS_MISMATCH`） |
 | P5-7 | **公开 API 鉴权** | `node --test test/public-api.test.js` 通过：无 token → 403 `PUBLIC_TOKEN_MISSING`；过期 → 403 `PUBLIC_TOKEN_EXPIRED`；跨届期 → 403 `PUBLIC_TOKEN_EDITION_MISMATCH`；scope 不符 → 403 `PUBLIC_TOKEN_SCOPE_MISMATCH`；`public_tokens.token` 存的是 SHA-256（长度 64，不等于明文） |
@@ -3740,8 +3905,8 @@ git commit -m "feat(P5): 任务清单前端页 + 端到端验收（工作流→�
 | `src/domain/pool-derive.js` | 契约只给了三池的**服务层**，但派生值必须是纯函数（无 IO、无 `Date.now()`）。这个文件是「派生值唯一计算点」 |
 | `src/domain/task-evidence.js` | 任务完成证据的校验必须是纯函数（R-STG-04）。⚠️ **刻意不叫 `evidence.js`**：P4 已占用 `src/domain/evidence.js`（R-AUD-04 证据三列 + 按发行方去重，是**审计**概念）；这里是 **R-STG-04 的任务完成证据**，是另一个东西。同名不同义 → 后写的阶段覆盖先写的模块，是「同一动作在两份材料里被标成一手与二手」的同构风险 |
 | `src/domain/icalendar.js` | iCal 的转义 / 折叠 / 时间戳必须是纯函数；服务层的 `buildICalendar` 只负责取赛段数据 |
-| `src/routes/workflow.js` / `pools.js` / `public.js` | P4 已建议 P1–P6 统一采用 `src/routes/*.js`（P1/P2 用的是 `src/http/routes/`）。本阶段跟随 P4（更晚 = 更接近终态）；若 P6 决定统一回 `src/http/routes/`，只需移动文件 |
-| `src/db/repo/team-membership.js` | 只读 P1 的 `team_members` / `teams`。契约未规定 P1 仓储层的导出名，自建只读入口可避免跨阶段撞名 |
+| `src/http/routes/workflow.js` / `pools.js` / `public.js` | 路由属于 HTTP 层。**沿用 P1 / P2 已确立的 `src/http/routes/` 约定**（P1：`registration.js` / `taskPackage.js` / `team.js`；P2：`review.js`；P4：`audit.js`）—— 设计文档 §4.3 的目录清单里 `http/` 下就是 `router.js` / `respond.js` / `body.js` / `static.js` / `sse.js` / `routes/`，**顶层从来没有 `src/routes/`**。⚠️ 原写法是跟随 P4 的 `src/routes/*.js` 建议（「更晚 = 更接近终态」）—— 那个建议方向是**反的**，已按 I-4 修正记录改齐 |
+| `src/db/repo/teamMembers.js`（**P1 已建**，本阶段**追加** `hasActiveMembership` / `listMemberTeams`） | 只读 P1 的 `team_members`。⚠️ 原写法是**新建** `src/db/repo/team-membership.js` 自建一套只读入口 —— 那样同一张 `team_members` 会出现**两个仓储文件、两套函数**，且 `getTeamById` 与 P1 的 `getTeam` **逐字相同**（将来修一处忘一处 → 「P5 认为在队、P1 认为已离队」的数据分歧）。改为**单一归属**：`team_members` → `teamMembers.js`、`teams` → `teams.js`（`getTeam` / `listTeamRows` 直接复用）。见 I-3 修正记录 |
 | `src/db/repo/pool-sources.js` | 三池派生源（teams / stages / stage_results / tier_records / points_ledger / registrations / task_packages / users）的只读入口 |
 | `rules/pools.json` | 三池与工作流的规则（包状态过滤 / 积分口径 / 公开 scope / 令牌有效期 / 证据要求 / `claimMode`）——这些是「待组委会确认的机制件」，必须配置化 |
 

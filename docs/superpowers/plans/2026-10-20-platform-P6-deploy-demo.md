@@ -121,6 +121,7 @@ platform/package.json               scripts 增加 backup / restore / build:demo
 - Create: `platform/scripts/backup.js`
 - Create: `platform/scripts/restore.js`
 - Create: `platform/src/runtime/pidfile.js`
+- Modify: `platform/src/db/migrate.js`（**追加**导出 `currentVersion(db)`；P0 已建，本阶段只**追加**一个函数，**不改** `applyMigrations` 的签名与行为）
 - Modify: `platform/src/server.js`（启动写 pid 文件、退出删）
 - Test: `platform/test/backup.test.js`
 - Test: `platform/test/restore.test.js`
@@ -546,7 +547,70 @@ if (isMain) {
 }
 ```
 
-- [ ] **Step 5: 创建 `scripts/restore.js`**
+- [ ] **Step 5: 追加 `src/db/migrate.js` 的 `currentVersion(db)`（**P0 已建**）**
+
+`platform/src/db/migrate.js` 由 **P0 建立**（迁移执行器：`readMigrationFiles` / `applyMigrations`）。
+本阶段**只追加**下面这个导出，**不改** `applyMigrations` 的签名与行为
+（`applyMigrations` 内部原本就有一行同样的 SQL，本步让它改调 `currentVersion`，**行为不变**）：
+
+```javascript
+// src/db/migrate.js —— 【追加】到 P0 已建的文件里
+//
+// 读当前已应用的 schema 版本（迁移表里的 MAX(version)）。
+// 依据：运维脚本（backup / restore）需要知道「这个备份对应哪个 schema 版本」，
+//   但**不能自己写 SQL** —— 全局约束「所有 SQL 收在 src/db/repo/」，
+//   而 src/db/migrate.js 是该守卫**唯一豁免的文件**（见 platform/test/sql-boundary.test.js
+//   的豁免清单与「迁移执行器确实执行 SQL」那条断言）。
+// @returns {number|null} 一次迁移都没应用过时返回 null
+export function currentVersion(db) {
+  const row = db.prepare('SELECT MAX(version) AS v FROM schema_migrations').get();
+  return row?.v ?? null;
+}
+```
+
+并把 `applyMigrations` 末尾那一行
+
+```javascript
+  const row = db.prepare('SELECT MAX(version) AS v FROM schema_migrations').get();
+  return { applied, version: row?.v ?? 0 };
+```
+
+改成
+
+```javascript
+  return { applied, version: currentVersion(db) ?? 0 };
+```
+
+（**语义完全等价**：`currentVersion` 返回 `row?.v ?? null`，外面再 `?? 0`。）
+
+> **【2026-10-21 漂移审计修正 C-5】**
+> **原来错在哪**：`scripts/restore.js` 的 `verifyBackupFile()` 原来自己写 SQL 读 schema 版本：
+> ```javascript
+> schemaVersion = db.prepare('SELECT MAX(version) AS v FROM schema_migrations').get()?.v ?? null;
+> ```
+> **为什么错**：P0 终审 I-7 立了全局约束「**所有 SQL 收进 `platform/src/db/repo/`**」，
+> 并由 `platform/test/sql-boundary.test.js` 守卫：扫描 `src/` 与 **`scripts/`** 下
+> **除 `src/db/repo/` 与 `src/db/migrate.js` 外**的一切 `.js`，
+> 只要出现 `db.prepare(`/`db.exec(` 且参数里含 `SELECT/INSERT/UPDATE/DELETE/CREATE TABLE/DROP/ALTER`
+> 就判违规。`scripts/` **在扫描范围内**，`scripts/restore.js` **不在豁免名单里**
+> → 照本计划实施，P0 自带用例当场变红（审计实跑：
+> `not ok 1 - src/ 与 scripts/ 里除仓储层外没有裸 SQL`，
+> 报 `scripts/restore.js:55 出现 SQL：SELECT MAX(version) AS v FROM schema_migrations`）。
+> 另外从设计上讲：`scripts/` 是**运维脚本**，理应复用 `src/db/migrate.js` 那套读版本逻辑，
+> 而不是自己抄一份 SQL —— 抄的那份迟早与执行器那份漂移（执行器改了，脚本没改，
+> 就会出现「备份显示 schema 版本 5，实际是 6」这种查不出来的错）。
+> **改成什么**：
+> ① 在 `platform/src/db/migrate.js`（**P0 已建**，该文件是 SQL 守卫的唯一豁免文件）
+> **追加**导出 `currentVersion(db)`；
+> ② `applyMigrations` 末尾改调它（**语义等价**，签名与行为不变）；
+> ③ `scripts/restore.js` 改为 `import { currentVersion } from '../src/db/migrate.js';`
+> 并把那一行改成 `schemaVersion = currentVersion(db);`（**返回值语义一致**：
+> 未迁移过时两边都是 `null`）。
+> **依据**：基线 `platform/test/sql-boundary.test.js:282-292`（扫描范围含 `scripts/` + 豁免名单）
+> + 基线 `platform/src/db/migrate.js`（`applyMigrations` 末尾那行 SQL 的原样）
+> + 漂移审计报告 C-5。
+
+- [ ] **Step 6: 创建 `scripts/restore.js`**
 
 ```javascript
 // scripts/restore.js — 从备份恢复
@@ -561,6 +625,7 @@ import { join, basename, dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { readPidFile, isProcessAlive } from '../src/runtime/pidfile.js';
+import { currentVersion } from '../src/db/migrate.js';
 
 /** 列出备份文件（新 → 旧）：文件名是 UTC 时间戳，字典序倒排即时间倒序。 */
 function listBackupFiles(dir) {
@@ -603,7 +668,7 @@ export function verifyBackupFile(path) {
     const integrity = db.prepare('PRAGMA integrity_check').get()?.integrity_check;
     let schemaVersion = null;
     try {
-      schemaVersion = db.prepare('SELECT MAX(version) AS v FROM schema_migrations').get()?.v ?? null;
+      schemaVersion = currentVersion(db);
     } catch {
       schemaVersion = null; // 备份里没有迁移表（还没 migrate 过）——不算损坏
     }
@@ -702,7 +767,7 @@ if (isMain) {
 }
 ```
 
-- [ ] **Step 6: 修改 `src/server.js`（写 pid 文件）**
+- [ ] **Step 7: 修改 `src/server.js`（写 pid 文件）**
 
 在 `src/server.js` 的 `isMain` 分支里，`openDatabase` 之后加：
 
@@ -714,12 +779,12 @@ import { writePidFile, removePidFile } from './runtime/pidfile.js';
   removePidFile(dataDir);
 ```
 
-- [ ] **Step 7: 运行测试确认通过**
+- [ ] **Step 8: 运行测试确认通过**
 
 Run: `cd platform && node --test test/backup.test.js test/restore.test.js`
 Expected: PASS（backup 4 个用例 + restore 4 个用例全过）
 
-- [ ] **Step 8: 实跑一次备份与恢复**
+- [ ] **Step 9: 实跑一次备份与恢复**
 
 Run: `cd platform && node scripts/migrate.js && node scripts/seed.js && node scripts/backup.js`
 Expected: 输出 `[backup] 完成：app-<时间戳>.db（… 字节，… 页）`，且 `data/backups/` 下出现一个 `.db` 文件
@@ -727,10 +792,10 @@ Expected: 输出 `[backup] 完成：app-<时间戳>.db（… 字节，… 页）
 Run: `cd platform && node scripts/restore.js && node -e "const{DatabaseSync}=require('node:sqlite');const db=new DatabaseSync('./data/app.db');console.log(db.prepare('SELECT COUNT(*) n FROM users').get().n);db.close();"`
 Expected: 输出一个正整数（恢复后库可正常打开读表）
 
-- [ ] **Step 9: 提交**
+- [ ] **Step 10: 提交**
 
 ```bash
-cd platform && git add src/runtime scripts/backup.js scripts/restore.js src/server.js test/backup.test.js test/restore.test.js
+cd platform && git add src/runtime scripts/backup.js scripts/restore.js src/db/migrate.js src/server.js test/backup.test.js test/restore.test.js
 git commit -m "feat(P6): 一致性备份与恢复脚本（sqlite.backup() API + 停服务前置检查）"
 ```
 
@@ -904,6 +969,11 @@ SyslogIdentifier=heikesong
 Environment=PORT=8080
 Environment=DATA_DIR=__DATA_DIR__
 Environment=NODE_ENV=production
+# ⛔⛔ **绝对不要设 DEMO_MODE=1**（2026-10-21 漂移审计修正 I-5）：
+#    DEMO_MODE=1 会把 /src/domain/* 与 /rules/* 挂到 HTTP 上 ——
+#    那是**领域层算法源码**（打分 / 破同分 / 防作弊判定）与**全部规则配置**
+#    （权重表、破同分链、行为分、段位表）。生产部署下必须一律 404。
+#    这道门只给本地预览（scripts/serve-demo.js）与开发服务器用。
 
 # 资源与安全
 LimitNOFILE=65535
@@ -1063,6 +1133,10 @@ services:
       PORT: "8080"
       DATA_DIR: "/data"
       NODE_ENV: "production"
+      # ⛔⛔ **绝对不要设 DEMO_MODE=1**（2026-10-21 漂移审计修正 I-5）：
+      #    DEMO_MODE=1 会把 /src/domain/* 与 /rules/* 挂到 HTTP 上 ——
+      #    那是**领域层算法源码**与**全部规则配置**。生产部署下必须一律 404。
+      #    这道门只给本地预览（scripts/serve-demo.js）与开发服务器用。
     ports:
       # 只绑回环：对外由 nginx 反代
       - "127.0.0.1:8080:8080"
@@ -1331,7 +1405,7 @@ main "$@"
 - [ ] **Step 7: 运行测试确认通过**
 
 Run: `cd platform && node --test test/deploy-assets.test.js`
-Expected: PASS（7 个测试全过）
+Expected: PASS（7 个测试全过：deploy-assets.test.js 7）
 
 - [ ] **Step 8: 语法自检（不执行）**
 
@@ -1659,7 +1733,7 @@ Expected: 输出 `[audit-scan] 词条 N 条｜扫描 M 个文件` … `[audit-sc
 - [ ] **Step 5: 运行测试确认通过**
 
 Run: `cd platform && node --test test/audit-scan-release.test.js`
-Expected: PASS（6 个测试全过）
+Expected: PASS（6 个测试全过：audit-scan-release.test.js 6）
 
 Run: `cd platform && node scripts/audit-scan.js`
 Expected: 输出 `[audit-scan] 词条 N 条｜扫描 M 个文件` … `[audit-scan] ✓ 未发现禁用表述`，退出码 0
@@ -1929,7 +2003,17 @@ Expected: FAIL —— `ENOENT: no such file or directory, open 'platform/web/see
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cd platform && node --test test/demo-seed.test.js`
-Expected: PASS（7 个测试全过）
+Expected: PASS（8 个测试全过：demo-seed.test.js 8）
+
+> **【2026-10-21 漂移审计修正 M-1】** **原来错在哪**：本计划一处「Expected: PASS」的条数声明
+> 与代码块里实际的 `test(` 数量不符 —— `demo-seed.test.js` 声明 **7** 实为 **8**。
+> **为什么错**：条数是**实施时的验收闸**。实施者跑出 8 个而计划写 7 个，会误判「多了一条」
+> 或「测试缺失」而去改测试代码迁就声明，或者干脆失去对闸的信任。
+> **改成什么**：① 数字改成实测值；② 把本计划**全部 4 处** `Expected: PASS` 统一成
+> `Expected: PASS（N 个测试全过：file N）` 的格式。
+> **依据**：按「就近 `Run:` 行指向的测试文件 → 该文件的 fenced code block 内 `^test(` 出现次数」
+> 逐个统计（与审计报告 M-1 同一口径），并在本次改动后**对五份计划全量复算**：
+> 每一条 `Expected: PASS（N …）` 现已与代码块实测条数**逐条相等**。
 
 - [ ] **Step 5: 提交**
 
@@ -2898,7 +2982,7 @@ git commit -m "feat(P6): 演示版适配器扩展为完整流程（浏览器内�
 - Create: `platform/scripts/serve-demo.js`
 - Modify: `platform/web/index.html`（资源路径改相对路径 + 演示版横幅）
 - Modify: `platform/web/app.js`（演示模式数据加载 + 演示路由）
-- Modify: `platform/src/server.js`（挂载 `/src/domain/*` 与 `/rules/*`，供开发服务器的演示模式）
+- Modify: `platform/src/server.js`（**仅在 `DEMO_MODE=1` 时**挂载 `/src/domain/*` 与 `/rules/*`，供开发服务器的演示模式；**默认不挂** —— 生产部署下这两个路径一律 404，见 I-5 修正记录）
 - Modify: `platform/package.json`（scripts 增加 `backup` / `restore` / `build:demo` / `serve:demo`）
 - Modify: `platform/.gitignore` 或仓库根 `.gitignore`（忽略 `web/dist/`、`data/`）
 - Test: `platform/test/demo-static.test.js`
@@ -3297,16 +3381,48 @@ function demoBanner() {
 }
 ```
 
-- [ ] **Step 7: 修改 `src/server.js`（挂载领域层与规则配置，供开发服务器演示模式）**
+- [ ] **Step 7: 修改 `src/server.js`（挂载领域层与规则配置，供开发服务器的演示模式）**
 
-在 `src/server.js` 的 `handle()` 里，把静态托管那段替换为：
+在 `src/server.js` 的 **`handleRequest()`** 里（**不是 `handle()`** —— `handle()` 是外层兜底），
+找到下面这段**原文**（P0 评审修正的静态分支，**整段保留 try/catch**）：
 
 ```javascript
+    // ⛔ 评审修正（Important）：静态分支原来在 try/catch **之外** ——
+    //    serveStatic 抛出的任何异常都会逸出 handle → 进程死亡。
+    //    现在它在自己的 try 里；异常一律回 404，不影响进程。
     if (req.method === 'GET') {
-      if (serveStatic(webDir, req, res)) return;
-      // 演示模式（?demo=1）：领域层与规则配置不在 web/ 下，挂出去。
-      // ⚠️ serveStatic 的签名不变（webDir, req, res）——这里只换 webDir，不改它。
-      if (serveMounted(req, res)) return;
+      try {
+        if (serveStatic(webDir, req, res)) return;
+      } catch (err) {
+        console.error('[server] 静态服务异常', err);
+      }
+    }
+```
+
+在 `if (serveStatic(webDir, req, res)) return;` **之后**、`} catch (err) {` **之前**
+**插入** 3 行（2 行注释 + 1 行代码，**插入，不是替换；try/catch 必须原样保留**）：
+
+```javascript
+        // 演示模式（DEMO_MODE=1）：领域层与规则配置不在 web/ 下，挂出去。
+        // ⚠️ serveStatic 的签名不变（webDir, req, res）——这里只换 webDir，不改它。
+        if (serveMounted(req, res)) return;
+```
+
+插入后该段应是：
+
+```javascript
+    // ⛔ 评审修正（Important）：静态分支原来在 try/catch **之外** ——
+    //    serveStatic 抛出的任何异常都会逸出 handle → 进程死亡。
+    //    现在它在自己的 try 里；异常一律回 404，不影响进程。
+    if (req.method === 'GET') {
+      try {
+        if (serveStatic(webDir, req, res)) return;
+        // 演示模式（DEMO_MODE=1）：领域层与规则配置不在 web/ 下，挂出去。
+        // ⚠️ serveStatic 的签名不变（webDir, req, res）——这里只换 webDir，不改它。
+        if (serveMounted(req, res)) return;
+      } catch (err) {
+        console.error('[server] 静态服务异常', err);
+      }
     }
     error(res, 404, 'NOT_FOUND', '页面不存在');
 ```
@@ -3316,12 +3432,20 @@ function demoBanner() {
 ```javascript
 // 演示模式的静态挂载：/src/domain/* 与 /rules/* 在 platform/ 下，不在 web/ 下。
 // ⛔ 只读、只挂这两个白名单目录，不开放整个 platform/。
-const DEMO_MOUNTS = [
+//
+// ⚠️⛔ **默认不挂**（2026-10-21 漂移审计修正 I-5）：
+//    这两个目录里是**领域层算法源码**（打分 / 破同分 / 防作弊判定）与**全部规则配置**
+//    （权重表、破同分链、行为分、段位表）。无条件挂载 = 公网可读全部源码与配置。
+//    本阶段正是「部署到公网 + nginx + systemd」的阶段，所以这道门必须有。
+//    只有显式设了 DEMO_MODE=1 才挂；deploy/ 里的 systemd 与 docker-compose
+//    **不得**设 DEMO_MODE=1（生产部署下这两个路径一律 404）。
+const DEMO_MOUNTS = process.env.DEMO_MODE === '1' ? [
   { prefix: '/src/domain/', dir: join(here, '..', 'src', 'domain') },
   { prefix: '/rules/', dir: join(here, '..', 'rules') },
-];
+] : [];
 
 function serveMounted(req, res) {
+  if (!DEMO_MOUNTS.length) return false;
   for (const m of DEMO_MOUNTS) {
     if (!req.url || !req.url.startsWith(m.prefix)) continue;
     const rel = req.url.split('?')[0].slice(m.prefix.length);
@@ -3333,6 +3457,46 @@ function serveMounted(req, res) {
   return false;
 }
 ```
+
+> **【2026-10-21 漂移审计修正 I-1 + I-5 + M-6】**
+> **原来错在哪（一处 I-1、一处 I-5、一处 M-6）**：
+> ① **I-1**：原指令是「把静态托管那段**替换**为」一段**没有 try/catch** 的代码：
+> ```javascript
+> if (req.method === 'GET') {
+>   if (serveStatic(webDir, req, res)) return;
+>   if (serveMounted(req, res)) return;
+> }
+> ```
+> ② **I-5**：原文的 `DEMO_MOUNTS` 是**无条件**的常量数组，调用处 `if (serveMounted(req, res)) return;`
+> **也没有任何条件判断** —— 注释与 Files 清单都说「供开发服务器的演示模式（`?demo=1`）」，
+> 但**代码里根本没有 `?demo=1` 的判断**（审计 grep：`demo=1` 只出现在注释与
+> `web/app.js` 的前端适配器选择里，`serveMounted` 内部无门）。
+> ③ **M-6**：定位词写成 `handle()`，实际在 `handleRequest()`。
+> **为什么错**：
+> - **I-1**：P0 终审的评审修正把静态分支放进**自己的 try**（`serveStatic` 抛出的任何异常
+>   都不能逸出 `handle` → 否则进程死亡）。替换文本没有 try/catch → 静态服务抛错
+>   （TOCTOU 竞态、权限错误）时，P0 行为是「记日志 + 回 404」，
+>   改后变成「冒泡到 `handle()` 外层兜底 → 回 **500 INTERNAL**」→ **404 静默变 500**。
+>   **审计实跑：按原片段替换后跑全量 → 151/151 全绿，两个基线都拦不住** ——
+>   P0 那条相关用例的断言是 `assert.ok(res.status >= 400)`，**太松**，500 也满足 → **回归静默通过**。
+> - **I-5**：`/src/domain/*` 与 `/rules/*` 里是**领域层算法源码**（打分 / 破同分 / 防作弊判定）
+>   与**全部规则配置**（权重表、破同分链、行为分、段位表）。无条件挂载 = **公网可读全部源码与配置**；
+>   而本阶段正是「部署到公网 + nginx + systemd」的阶段。
+>   （`serveStatic` 的 realpath 边界仍然生效、`..` 也拦得住 —— 但**这层门本来就不该开**。）
+> **改成什么**：
+> - **I-1**：从「替换」改为「**在 `if (serveStatic(webDir, req, res)) return;` 之后插入**」，
+>   **P0 的 try/catch 与注释逐字保留**，并给出「插入后该段应长什么样」的完整示意供实施者自检。
+> - **I-5**：加门 —— `const DEMO_MOUNTS = process.env.DEMO_MODE === '1' ? [ … ] : [];`
+>   （`serveMounted` 里再加一道 `if (!DEMO_MOUNTS.length) return false;` 早退），
+>   并写明 `deploy/` 的 systemd 与 docker-compose **不得**设 `DEMO_MODE=1`
+>   → 生产部署下这两个路径一律 404。
+> - **M-6**：定位词从 `handle()` 改成 **`handleRequest()`**（`handle()` 是外层兜底，
+>   `handleRequest()` 才是处理请求的那一层；写错定位词会让人在错误的函数里找锚点）。
+> **依据**：基线 `platform/src/server.js:249-261`（静态分支逐字）+
+> `platform/src/server.js:151-170`（`handle` 与 `handleRequest` 的关系）
+> + 漂移审计报告 I-1 / I-5 / M-6。
+> **连带（不在本步，但必须同步）**：本阶段的 `deploy/` 资产（systemd / nginx / docker-compose）
+> **不得**设置 `DEMO_MODE=1`；`scripts/serve-demo.js`（本地预览）**应当**设置它。
 
 - [ ] **Step 8: 修改 `package.json` 与 `.gitignore`**
 
@@ -3364,7 +3528,7 @@ platform/data/
 - [ ] **Step 9: 运行测试确认通过**
 
 Run: `cd platform && node --test test/demo-static.test.js`
-Expected: PASS（5 个测试全过）
+Expected: PASS（5 个测试全过：demo-static.test.js 5）
 
 Run: `cd platform && node scripts/build-demo.js`
 Expected: 输出 `[build-demo] 产物目录：…/web/dist` 与 `[build-demo] ✅ 领域层浏览器安全检查通过`
@@ -3935,12 +4099,13 @@ git commit -m "test(P6): 全链路验收 + 跨平台可移植性验收"
 |---|---|---|
 | 1 | `INTERFACES.md` §5（P4）与 §7（P6）**都**列了 `scripts/audit-scan.js`，存在归属重叠 | **P6 不重建该文件**（两个 writer 写同一路径必然冲突）。P6 在 P4 已建的实现上**追加**发布产物扫描 / `--forbidden` / `--json` / `--evidence-chain`，并新建独立测试文件 `test/audit-scan-release.test.js`（不改 P4 的 `test/audit-scan.test.js`）。`parseManifest` / `scanText` / `scanRoots` / `main` 的**签名一律不变**。 |
 | 2 | `INTERFACES.md` §4.3 的目录结构写 `seed/ demo-data.json`（在 `platform/` 根下），而 §7 与本计划写 `web/seed/demo-data.json` | **以 `INTERFACES.md` §7（P6 产出清单）为准**：用 `web/seed/demo-data.json`。理由：演示站要发布 `web/` 目录，种子数据必须在其中才能被静态站 fetch 到。 |
-| 3 | `INTERFACES.md` §1 规定 `serveStatic(webDir, req, res)` | **签名保持不变**。演示模式需要的 `/src/domain/*` 与 `/rules/*` 两个挂载点**在 `src/server.js` 里**用「换 webDir + 浅拷贝请求代理」实现，不改 `serveStatic` 本体。 |
+| 3 | `INTERFACES.md` §1 规定 `serveStatic(webDir, req, res)` | **签名保持不变**。演示模式需要的 `/src/domain/*` 与 `/rules/*` 两个挂载点**在 `src/server.js` 里**用「换 webDir + 浅拷贝请求代理」实现，不改 `serveStatic` 本体。⚠️ **2026-10-21 漂移审计修正 I-5：这两个挂载点改为「仅在 `DEMO_MODE=1` 时」才存在** —— 原写法是**无条件**挂载（代码里根本没有注释所说的 `?demo=1` 判断），而这两个目录里是**领域层算法源码**与**全部规则配置**，本阶段又是「部署到公网」的阶段 → 公网可读全部源码与配置。现改为 `process.env.DEMO_MODE === '1'` 门禁（`serveMounted` 里另有 `if (!DEMO_MOUNTS.length) return false;` 早退），且 `deploy/` 的 systemd 与 docker-compose **不得**设 `DEMO_MODE=1`。 |
 | 4 | `INTERFACES.md` §1 规定 `createApp({ db, rules, webDir })` | **签名与参数保持不变**（没有新增任何必填或可选参数）。演示模式挂载是模块级常量 + 模块级函数，与 `createApp` 无关。 |
 | 5 | `INTERFACES.md` §2–§6 没有收录 P6 需要的 `src/runtime/pidfile.js` | 这是 P6 **新增**的模块（服务于「恢复前先停服务」这条约束），不与任何既有接口冲突。 |
 | 6 | `INTERFACES.md` §1 的 P0 产出清单里没有 `scripts/backup.js` / `scripts/restore.js`（P6 §7 才有） | 一致，无偏差。`backupDatabase` / `restoreDatabase` / `checkServiceState` / `verifyBackupFile` 是 P6 **新增**导出，不覆盖任何既有签名。 |
 | 7 | `web/api.demo.js` 里的规则加载方式 | `INTERFACES.md` 未规定前端如何取规则。P6 用「按文件名逐个 `fetch` `rules/*.json`」的方式，**不新增 `rules/index.json` 这类聚合文件**（避免与 `src/config.js` 的 `RULE_FILES` 产生第二份真相），并由 `scripts/build-demo.js` 校验所需文件齐全。 |
-| 8 | **P4 的 `scripts/forbidden.txt` 有三条词条永远命中不了** | P4 的 `scanText()` 用 **`line.includes(term)` 字面串匹配**，但 P4 清单里有 `四维各 ?25%` / `初赛企业确认权重 ?20%` / `w_E ?= ?20%.*初赛` —— `?` 与 `.*` 在字面匹配下没有意义，**这三条词条等于没写**（R-AUD-03 被架空）。P6 在「修改 `scripts/forbidden.txt`」这一步里把这几条**拆成空格变体**（沿用平台自带 `platform/scripts/forbidden.txt` 的既有约定：空格变体各写一条），P6 自己新增的词条也一律用字面串。**不改 `scanText` 的匹配语义**（P4 的行为与测试都不动）。 |
+| 8 | **P6 的 `scripts/restore.js` 需要读 schema 版本** | `INTERFACES.md` §1 的 P0 产出清单里 `src/db/migrate.js` 只有 `applyMigrations` / `readMigrationFiles`。P6 **追加**一个导出 `currentVersion(db)`（P0 已建，本阶段只追加，**不改 `applyMigrations` 的签名与行为**），`scripts/restore.js` 改为 import 它。⚠️ **不能在 `scripts/` 里自己写 SQL** —— 全局约束「所有 SQL 收进 `src/db/repo/`」，而 `src/db/migrate.js` 是 `platform/test/sql-boundary.test.js` 守卫的**唯一豁免文件**（守卫扫描 `src/` **与 `scripts/`**）；照原写法（`db.prepare('SELECT MAX(version) …')`）**当场判违规**。见 C-5 修正记录 |
+| 9 | **P4 的 `scripts/forbidden.txt` 有三条词条永远命中不了** | P4 的 `scanText()` 用 **`line.includes(term)` 字面串匹配**，但 P4 清单里有 `四维各 ?25%` / `初赛企业确认权重 ?20%` / `w_E ?= ?20%.*初赛` —— `?` 与 `.*` 在字面匹配下没有意义，**这三条词条等于没写**（R-AUD-03 被架空）。P6 在「修改 `scripts/forbidden.txt`」这一步里把这几条**拆成空格变体**（沿用平台自带 `platform/scripts/forbidden.txt` 的既有约定：空格变体各写一条），P6 自己新增的词条也一律用字面串。**不改 `scanText` 的匹配语义**（P4 的行为与测试都不动）。 |
 
 ---
 

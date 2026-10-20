@@ -425,6 +425,34 @@ CREATE INDEX idx_milestone_signoffs_milestone ON milestone_signoffs(milestone_id
 
 `FILES` 追加 `points: 'points.json'`、`criteria: 'criteria.json'`；`grouped` 追加 `points: rules.points`、`criteria: rules.criteria`；顶部补 `import { fileURLToPath } from 'node:url';` 与 `import { dirname } from 'node:path';`；`validateRules` 末尾（`return errors` 之前）追加：
 
+> **【2026-10-21 漂移审计修正 I-2】** **version 一致性校验这一步【不需要改】** ——
+> 原计划隐含的「新增规则文件要同步加进 `versionValues` 数组」**不适用**，照做反而会出事。
+> **原来错在哪**：P0 终审时的 `src/config.js` 里，version 全等校验是**硬编码的 9 项列表**
+> （`rules.scoring.initial.version` … `rules.milestones.version`）+ 硬编码的 `9`。
+> 新增的规则文件即使注册进了 `FILES` / `grouped`，它的 `version` **从不参与比较**
+> （审计实跑：注入 `points.version='2099-01-01'`、`criteria.version='2099-12-31'` →
+> `validateRules` **零报错**）→ 设计文档写明的「版本号漂移 = 审计链在说谎」这条被打破。
+> **现状（基线已修好）**：基线的 `src/config.js` **已经不是**那个硬编码形态了 ——
+> `validateRules(rules, expectedCount = null)` 改成**按「有 id 的是一份配置」自动派生**
+> （`collectConfigObjects` 摊平配置对象），`expectedCount` 由 `loadRules()` 传
+> `Object.keys(FILES).length`。**加多少份配置都自动覆盖** → `versionValues` 那个数组
+> **已经不存在了**，P3 无需（也无法）去改它。
+> **改成什么**：本步**只**做三件事 —— ① `FILES` 加 2 行；② `grouped` 加 2 行；
+> ③ `validateRules` 末尾追加 points / criteria 的**内容**校验段。
+> **version 一致性校验一个字都不动。**
+> **⚠️ 两个硬前提（漏了会直接拒绝启动）**：
+> ① **每份新配置文件必须带 `"id"` 字段** —— 识别「一份配置」用的是 `id` 而不是 `version`
+> （一份配置**缺了 version** 时仍要能被认出来，否则它会被当成命名空间 →「缺少 version」
+> 那条检查反过来失效）。`rules/points.json` 有 `"id": "points"`、`rules/criteria.json` 有
+> `"id": "criteria"` ✓。**嵌套对象里的 `id` 不算**（`collectConfigObjects` 命中配置对象即 `return`，
+> 不再往里递归）。
+> ② **份数必须对上**：`expectedCount = Object.keys(FILES).length`，
+> 识别到的配置份数与之不等 → 报「规则配置应有 N 份，实际只识别到 M 份」→ **拒绝启动**。
+> P3 落地时 `FILES` 从 12 份变 14 份，`grouped` 里能被识别到的配置份数也必须是 14。
+> **依据**：基线 `platform/src/config.js`（`collectConfigObjects` / `validateRules(rules, expectedCount)`
+> / `loadRules` 传 `Object.keys(FILES).length`）+ 漂移审计报告 I-2 与 D-3
+> （「P3 的 config.js 改造必须先于 P4/P5」——但**改造内容已由 P1 提前完成**）。
+
 ```javascript
   // ── 名次积分（P3）────────────────────────────────────────
   const pts = rules.points;
@@ -475,7 +503,7 @@ export function getDefaultRules() {
 
 - [ ] **Step 6: 运行测试确认通过**
 
-Run: `cd platform && node --test test/leaderboard-migration.test.js` → Expected: PASS（8 个测试全过）
+Run: `cd platform && node --test test/leaderboard-migration.test.js` → Expected: PASS（8 个测试全过：leaderboard-migration.test.js 8）
 Run: `cd platform && node --test` → Expected: 全部通过（P0 的 `config.test.js` 仍通过——新增规则文件不影响既有断言）
 
 - [ ] **Step 7: 提交**
@@ -817,7 +845,19 @@ export function rankTeams({ teams, tiebreakChain, tiebreakData, pointsConfig }) 
 
 - [ ] **Step 5: 运行测试确认通过**
 
-Run: `cd platform && node --test test/ranking.test.js` → Expected: PASS（11 个测试全过）
+Run: `cd platform && node --test test/ranking.test.js` → Expected: PASS（10 个测试全过：ranking.test.js 10）
+
+> **【2026-10-21 漂移审计修正 M-1】** **原来错在哪**：本计划三处「Expected: PASS」的条数声明
+> 与代码块里实际的 `test(` 数量不符 —— `ranking.test.js` 声明 **11** 实为 **10**、
+> `points.test.js` 声明 **8** 实为 **7**、`leaderboard-service.test.js` 声明 **9** 实为 **8**。
+> **为什么错**：条数是**实施时的验收闸**。实施者跑出 10 个而计划写 11 个，会误判「测试缺失」
+> 而去改测试代码迁就声明，或者干脆失去对闸的信任。三个数字方向一致（都少 1），
+> 说明是**手工维护漂移**，不是有意为之。
+> **改成什么**：① 三个数字改成实测值；② 把本计划**全部 8 处** `Expected: PASS` 统一成
+> `Expected: PASS（N 个测试全过：file N）` 的格式（多文件时逐文件列出）。
+> **依据**：按「就近 `Run:` 行指向的测试文件 → 该文件的 fenced code block 内 `^test(` 出现次数」
+> 逐个统计（与审计报告 M-1 同一口径），并在本次改动后**对五份计划全量复算**：
+> 每一条 `Expected: PASS（N …）` 现已与代码块实测条数**逐条相等**。
 
 - [ ] **Step 6: 提交**
 
@@ -1155,7 +1195,7 @@ export function computePrizeShares({ ordered, prizeTable }) {
 
 - [ ] **Step 4: 运行测试确认通过**
 
-Run: `cd platform && node --test test/points.test.js` → Expected: PASS（8 个测试全过）
+Run: `cd platform && node --test test/points.test.js` → Expected: PASS（7 个测试全过：points.test.js 7）
 
 - [ ] **Step 5: 提交**
 
@@ -1404,7 +1444,7 @@ export function applyTierDemotion({ tier, daysSinceLastActivity, revokedSignoffs
 
 - [ ] **Step 4: 运行测试确认通过**
 
-Run: `cd platform && node --test test/tier.test.js` → Expected: PASS（7 个测试全过）
+Run: `cd platform && node --test test/tier.test.js` → Expected: PASS（7 个测试全过：tier.test.js 7）
 
 - [ ] **Step 5: 提交**
 
@@ -1663,7 +1703,7 @@ export function behaviorScore({ events, behaviorConfig }) {
 
 - [ ] **Step 4: 运行测试确认通过**
 
-Run: `cd platform && node --test test/behavior.test.js` → Expected: PASS（5 个测试全过）
+Run: `cd platform && node --test test/behavior.test.js` → Expected: PASS（5 个测试全过：behavior.test.js 5）
 
 - [ ] **Step 5: 提交**
 
@@ -1882,7 +1922,7 @@ export function applyVisibility({ payload, viewer, visibilityConfig, context }) 
 
 - [ ] **Step 4: 运行测试确认通过**
 
-Run: `cd platform && node --test test/visibility.test.js` → Expected: PASS（5 个测试全过）
+Run: `cd platform && node --test test/visibility.test.js` → Expected: PASS（5 个测试全过：visibility.test.js 5）
 
 - [ ] **Step 5: 提交**
 
@@ -1897,7 +1937,7 @@ git commit -m "feat(P3): API 层可见性过滤与 C-02 段位公示裁决"
 
 **Files:**
 - Create: `platform/src/db/repo/leaderboard.js`、`platform/src/db/repo/points.js`、`platform/src/db/repo/tiers.js`、`platform/src/services/leaderboard.js`、`platform/src/services/performance-card.js`、`platform/src/services/tier.js`、`platform/test/leaderboard-service.test.js`
-- Modify: `platform/src/errors.js`（P0 已建，本阶段**只复用**：统一为 status-first 顺序 `AppError(status, code, message, detail)`，不新建 `errors/app-error.js`）
+- Reuse: `platform/src/errors.js`（P0 已建，本阶段**只复用、一行不改**：已是 status-first 顺序 `AppError(status, code, message, detail)`；不新建 `errors/app-error.js`）
 - Modify: `platform/src/server.js`
 
 **Interfaces:**
@@ -2145,6 +2185,18 @@ import { AppError, appError } from '../errors.js';
 ```
 
 **本阶段所有 `new AppError(...)` 调用一律用 status-first 顺序**：`new AppError(404, 'STAGE_NOT_FOUND', '赛段不存在')`。
+
+> **【2026-10-21 漂移审计修正 M-3】** 本阶段的 Files 清单原来写的是
+> `- Modify: platform/src/errors.js`（"只复用"），**标注与正文自相矛盾**：
+> 正文明确说「只复用、不重建」，Files 却标 `Modify` → 实施者会以为自己要改这个文件，
+> 而 `git add src/errors` 又把它**纳入提交**（一个一行没改的文件被提交，等于制造噪音，
+> 也让「本阶段到底动了哪些文件」失真）。
+> **为什么错**：`src/errors.js` **P0 的 Task 4 就建好了**，而且**已经是 status-first**
+> （`constructor(status, code, message, detail = undefined)`）—— 本阶段没有任何理由动它。
+> **改成什么**：Files 清单改为 `- Reuse: platform/src/errors.js`（本阶段**只复用、一行不改**），
+> 并从 `git add` 列表里**删掉 `src/errors`**。
+> **依据**：基线 `platform/src/errors.js:9`（`constructor(status, code, message, detail = undefined)`，
+> 文件头注释明写「参数顺序是 status-first」）+ 漂移审计报告 M-3。
 
 `platform/src/db/repo/leaderboard.js`：
 
@@ -2785,12 +2837,12 @@ import { getTeamTier } from './services/tier.js';
 
 - [ ] **Step 7: 运行测试确认通过**
 
-Run: `cd platform && node --test test/leaderboard-service.test.js` → Expected: PASS（9 个测试全过）
+Run: `cd platform && node --test test/leaderboard-service.test.js` → Expected: PASS（8 个测试全过：leaderboard-service.test.js 8）
 
 - [ ] **Step 8: 提交**
 
 ```bash
-cd platform && git add src/errors src/db/repo src/services src/server.js test/leaderboard-service.test.js
+cd platform && git add src/db/repo src/services src/server.js test/leaderboard-service.test.js
 git commit -m "feat(P3): 榜单服务、战绩卡与 4 个榜单 API"
 ```
 
@@ -3099,7 +3151,7 @@ route('/card/:teamId', (c) => renderCard(c));
 
 - [ ] **Step 6: 运行测试确认通过**
 
-Run: `cd platform && node --test test/leaderboard-web.test.js` → Expected: PASS（6 个测试全过）
+Run: `cd platform && node --test test/leaderboard-web.test.js` → Expected: PASS（6 个测试全过：leaderboard-web.test.js 6）
 
 - [ ] **Step 7: 全量回归**
 
@@ -3180,6 +3232,7 @@ git commit -m "feat(P3): 榜单页、段位榜与战绩卡前端"
 | 8 | ~~新增 `src/errors/app-error.js`~~ → **改为复用 P0 的 `src/errors.js`** | §0 要求「抛 AppError」，P0 已建该类（Task 4） | 本阶段**不新建**错误模块；直接 `import { AppError, appError } from '../errors.js'`（**P0 建立**），签名统一为 **status-first**：`AppError(status, code, message, detail)` / `appError(status, code, message, detail)` | ⚠️ 原写法是 `appError(code, message, status)`（code 在前），与 P1/P4 的 `appError(status, code, message)` **参数顺序相反**。两套并存必然有一半调用点写错顺序，且 `err.status` / `err.code` 会互换——HTTP 层会返回错误的状态码。已统一为 status-first，并把 P3 内 12 处调用点全部改写 |
 | 9 | `rules/*.json` 的加载与校验在 `src/config.js` 里扩展 | §1 只列了 9 份 P0 规则文件 | `src/config.js` 的 `FILES` / `grouped` / `validateRules` 追加 `points` 与 `criteria` | P3 新增 2 份规则文件，必须走同一条 fail-fast 校验通路，否则「改 JSON 即改规则」这条 S-2 会破 |
 | 10 | 新增 3 个仓储文件 | 未列仓储文件名 | `src/db/repo/leaderboard.js` / `points.js` / `tiers.js` | 所有 SQL 必须收在 `src/db/repo/`；文件名带 P3 语义，避免与 P1/P2 的仓储重名冲突 |
+| 11 | **新增规则文件的 `version` 参与一致性校验的方式** | 契约只写「规则配置的 version 必须全等」 | **不需要在本阶段改 `src/config.js` 的 version 校验** —— 基线已按「有 `id` 的是一份配置」**自动派生**（`validateRules(rules, expectedCount)` + `loadRules` 传 `Object.keys(FILES).length`），加多少份配置都自动覆盖 | ⚠️ 原计划隐含「要把 points / criteria 加进 `versionValues` 数组」—— 那个数组**已不存在**（P0 当时是硬编码 9 项，P1 已改成自动派生）。若照原意去改，会动到一份**不该动**的校验代码。**硬前提**：新配置文件必须带 `"id"`（`points.json` → `"id": "points"`、`criteria.json` → `"id": "criteria"`），且识别到的配置份数必须等于 `FILES` 的键数，否则**拒绝启动**。依据：基线 `platform/src/config.js` + 漂移审计报告 I-2 / D-3 |
 
 **待组委会确认的判断（非接口偏差，是本阶段做的口径选择）**
 

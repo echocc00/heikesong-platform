@@ -314,7 +314,27 @@ POST /api/stages/:stageId/self-review
 POST /api/stages/:stageId/compute
 GET  /api/stages/:stageId/computations/:computationId   （trace 三件套）
 POST /api/stages/:stageId/recusals
+GET  /api/stages/:stageId/events                       （SSE：评审进度推送）
 ```
+
+> **【订正 2026-10-21 漂移审计 I-6】** 上面这一条 SSE 端点是**新增**的 —— P0 的
+> `platform/web/api.js:28-30` 的 `subscribe()` 明写「⚠️ SSE 端点在 **P2** 才实现
+> （`src/http/sse.js`）」，而 P2–P6 五份计划**全都没有承接**这个承诺
+> （`grep -c 'sse\.js'` 五份全为 0）→ 一条**指向不存在实现的活引用**。
+> 现由 **P2 的 Task 9** 落地，模块与端点如下：
+> ```js
+> // src/http/sse.js  （P2 Task 9 新建）
+> parseSsePath(url)                // → { stageId } | null
+> openSseStream(res)               // 写 200 + text/event-stream 响应头
+> sendSseEvent(res, event, data)   // 写一帧：event: <name>\ndata: <单行 JSON>\n\n
+> closeSseStream(res)              // 结束响应
+> createSseHub()                   // → { add, remove, publish, size, closeAll }
+> reviewEvents                     // 评审进度事件中心（createSseHub() 的单例）
+> ```
+> ⚠️ SSE **不挂 router**（P0 的 router handler 约定是「返回值 → server.js 统一 json()
+> 序列化并结束响应」，而 SSE 要长期持有连接）→ 走 `src/server.js` 里**独立于 router** 的分支，
+> 放在 `router.match` **之前**（SSE 路径不在 router 里，先 match 会直接走 404）。
+> 端点需登录；事件：`connected`（订阅确认首帧）/ `review.progress`。
 
 ---
 
@@ -552,6 +572,23 @@ web/seed/demo-data.json      演示种子数据
 web/api.demo.js              扩展：浏览器内真实跑规则引擎
 docs/deployment.md           部署与运维手册
 ```
+
+> **【订正 2026-10-21 漂移审计 C-5】** P6 的 Task 1 会**追加**一个导出到 P0 已建的
+> `platform/src/db/migrate.js`：
+> ```js
+> // src/db/migrate.js —— P6 Task 1 追加（P0 已建，本阶段只追加，不改 applyMigrations 的签名与行为）
+> currentVersion(db)            // → number | null（schema_migrations 里的 MAX(version)；没迁移过时 null）
+> ```
+> `scripts/restore.js` 用它读「备份对应哪个 schema 版本」——
+> ⚛️ **不能在 `scripts/` 里自己写 SQL**：全局约束「所有 SQL 收进 `src/db/repo/`」，
+> 而 `src/db/migrate.js` 是 `platform/test/sql-boundary.test.js` 守卫的**唯一豁免文件**
+> （守卫扫描 `src/` **与 `scripts/`**）。
+>
+> **【订正 2026-10-21 漂移审计 I-5】** P6 的 `deploy/heikesong.service` 与
+> `deploy/docker-compose.yml` **绝对不得**设置 `DEMO_MODE=1` ——
+> 该变量会让 `/src/domain/*`（领域层算法源码）与 `/rules/*`（全部规则配置）
+> 挂到 HTTP 上。它只给本地预览（`scripts/serve-demo.js`）与开发服务器用；
+> 生产部署下这两个路径一律 404。
 
 ---
 
