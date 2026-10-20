@@ -42,9 +42,39 @@ function hasDuplicateKeys(items) {
   return new Set(keys).size !== keys.length;
 }
 
+// 数组元素必须是非 null 对象 —— 否则下面访问 item.key / item.points 会抛 TypeError。
+// 校验器的第一职责是**自己不崩**、给出可读错误，而不是把裸 TypeError 抛给调用方。
+function hasBadItem(items) {
+  return items.some((i) => i === null || typeof i !== 'object');
+}
+
 export function validateRules(rules) {
   const errors = [];
   const push = (msg) => errors.push(msg);
+
+  // ── 版本号一致性 ─────────────────────────────────────────
+  // 9 份配置的 version 必须全等。version 会写进计算 trace（设计原则
+  // 「每次计算留 trace」）—— 版本号漂移 = 审计链在说谎：trace 上标注的版本
+  // 与实际生效的规则对不上，事后复算无法自证。
+  const versionValues = [
+    rules?.scoring?.initial?.version,
+    rules?.scoring?.final?.version,
+    rules?.tiebreak?.version,
+    rules?.ranks?.version,
+    rules?.behavior?.version,
+    rules?.visibility?.version,
+    rules?.registration?.version,
+    rules?.solvability?.version,
+    rules?.milestones?.version,
+  ].filter((v) => v !== undefined && v !== null && v !== '');
+  if (versionValues.length > 1) {
+    const distinct = [...new Set(versionValues)];
+    // ⚠️ distinct 是**数组**（Set 被展开），判重数用 .length —— 用 .size 会拿到
+    //    undefined，比较恒为 false，这条校验会静默失效。
+    if (distinct.length > 1) {
+      push(`规则配置 version 不一致：${distinct.join(' / ')} —— 9 份配置必须同版本`);
+    }
+  }
 
   // ── 评分配置 ──────────────────────────────────────────────
   for (const key of ['initial', 'final']) {
@@ -55,6 +85,10 @@ export function validateRules(rules) {
     }
     if (!Array.isArray(cfg.dimensions) || cfg.dimensions.length === 0) {
       push(`scoring.${key}.dimensions 缺失或为空`);
+      continue;
+    }
+    if (hasBadItem(cfg.dimensions)) {
+      push(`scoring.${key}.dimensions 含非对象元素`);
       continue;
     }
     const sum = weightSum(cfg.dimensions);
@@ -84,6 +118,8 @@ export function validateRules(rules) {
   const chain = rules?.tiebreak?.chain;
   if (!Array.isArray(chain) || chain.length === 0) {
     push('tiebreak.chain 缺失或为空');
+  } else if (hasBadItem(chain)) {
+    push('tiebreak.chain 含非对象元素');
   } else {
     const last = chain[chain.length - 1];
     if (!last.deterministic) {
@@ -102,6 +138,8 @@ export function validateRules(rules) {
   const tierKeys = new Set();
   if (!Array.isArray(tiers) || tiers.length === 0) {
     push('ranks.tiers 缺失或为空');
+  } else if (hasBadItem(tiers)) {
+    push('ranks.tiers 含非对象元素');
   } else {
     for (const t of tiers) tierKeys.add(t.key);
     for (let i = 1; i < tiers.length; i += 1) {
@@ -118,6 +156,8 @@ export function validateRules(rules) {
   const levels = rules?.registration?.levels;
   if (!Array.isArray(levels) || levels.length === 0) {
     push('registration.levels 缺失或为空');
+  } else if (hasBadItem(levels)) {
+    push('registration.levels 含非对象元素');
   } else {
     for (let i = 1; i < levels.length; i += 1) {
       if (levels[i].minScore > levels[i - 1].minScore) {
@@ -131,6 +171,8 @@ export function validateRules(rules) {
   const regDims = rules?.registration?.dimensions;
   if (!Array.isArray(regDims) || regDims.length === 0) {
     push('registration.dimensions 缺失或为空');
+  } else if (hasBadItem(regDims)) {
+    push('registration.dimensions 含非对象元素');
   } else {
     const sum = weightSum(regDims);
     if (Math.abs(sum - 1) > 1e-9) {
@@ -142,6 +184,8 @@ export function validateRules(rules) {
   const sol = rules?.solvability;
   if (!Array.isArray(sol?.dimensions) || sol.dimensions.length === 0) {
     push('solvability.dimensions 缺失或为空');
+  } else if (hasBadItem(sol.dimensions)) {
+    push('solvability.dimensions 含非对象元素');
   } else {
     const sum = weightSum(sol.dimensions);
     if (Math.abs(sum - 1) > 1e-9) {
@@ -150,8 +194,23 @@ export function validateRules(rules) {
   }
   if (!Array.isArray(sol?.grades) || sol.grades.length === 0) {
     push('solvability.grades 缺失或为空');
+  } else if (hasBadItem(sol.grades)) {
+    push('solvability.grades 含非对象元素');
   } else if (hasDuplicateKeys(sol.grades)) {
     push('solvability.grades 存在重复 key');
+  } else {
+    // A/B/C/D 是**互斥**的评分区间：重叠会让同一个分数落进两个等级，
+    // 评级结果取决于查表顺序 —— 不可复算。
+    const sorted = [...sol.grades].sort((a, b) => a.minScore - b.minScore);
+    for (let i = 1; i < sorted.length; i += 1) {
+      if (sorted[i].minScore <= sorted[i - 1].maxScore) {
+        push(
+          `solvability.grades 分值区间重叠：${sorted[i - 1].key}`
+          + `(${sorted[i - 1].minScore}-${sorted[i - 1].maxScore}) 与 `
+          + `${sorted[i].key}(${sorted[i].minScore}-${sorted[i].maxScore})`,
+        );
+      }
+    }
   }
 
   // ── 行为分 ───────────────────────────────────────────────
@@ -170,6 +229,8 @@ export function validateRules(rules) {
     }
     if (!Array.isArray(behavior.events) || behavior.events.length === 0) {
       push('behavior.events 缺失或为空');
+    } else if (hasBadItem(behavior.events)) {
+      push('behavior.events 含非对象元素');
     } else {
       if (hasDuplicateKeys(behavior.events)) {
         push('behavior.events 存在重复 key');
@@ -206,6 +267,8 @@ export function validateRules(rules) {
   } else {
     if (!Array.isArray(ms.items) || ms.items.length === 0) {
       push('milestones.items 缺失或为空');
+    } else if (hasBadItem(ms.items)) {
+      push('milestones.items 含非对象元素');
     } else {
       if (hasDuplicateKeys(ms.items)) {
         push('milestones.items 存在重复 key');

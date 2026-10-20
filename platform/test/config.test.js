@@ -104,3 +104,30 @@ test('维度 key 重复会被拒绝', () => {
   broken.scoring.final.dimensions[1].key = broken.scoring.final.dimensions[0].key;
   assert.ok(validateRules(broken).some((e) => e.includes('重复 key')));
 });
+
+// ── 以下 3 条来自实现者实测反馈的 3 条漏检（父代理裁决后采纳）──────────
+
+test('9 份配置的 version 必须一致（漂移会让计算 trace 说谎）', () => {
+  const { rules } = loadRules(rulesDir);
+  const broken = structuredClone(rules);
+  broken.tiebreak.version = '2099-01-01';
+  assert.ok(validateRules(broken).some((e) => e.includes('version')));
+});
+
+test('数组里混入 null 元素时报友好错误，而不是抛 TypeError', () => {
+  const { rules } = loadRules(rulesDir);
+  const broken = structuredClone(rules);
+  broken.behavior.events[0] = null;
+  const errors = validateRules(broken);
+  assert.ok(
+    errors.some((e) => e.includes('behavior.events')),
+    'null 元素应被当作校验错误报告，而不是抛 TypeError',
+  );
+});
+
+test('solvability.grades 的评分区间不得重叠', () => {
+  const { rules } = loadRules(rulesDir);
+  const broken = structuredClone(rules);
+  broken.solvability.grades[1].minScore = broken.solvability.grades[0].minScore; // B 覆盖到 A
+  assert.ok(validateRules(broken).some((e) => e.includes('区间重叠')));
+});
