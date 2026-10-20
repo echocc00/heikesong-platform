@@ -56,7 +56,9 @@ CREATE INDEX idx_assignments_lookup ON assignments(user_id, capability);
 -- 一人可以同时是选手 + 队长 + 评委（借 hackerspace3 assignment 模型的做法）
 -- ⚠️ 本表并入 001_init.sql，不单独开 002 迁移：
 --    迁移版本号是全局唯一序位，002 必须留给 P1 的 002_registration.sql。
---    两个迁移抢同一个版本号时，后执行的那张表永远建不出来（applyMigrations 按 version 去重）。
+--    两个迁移抢同一个版本号时，后执行的那张表永远建不出来。
+--    ⚠️ 现在 applyMigrations 对重复版本号**直接抛错**（fail-fast），
+--       不再是"按 version 静默去重"—— 静默跳过会把 schema 缺口固化，运维看不出来。
 CREATE TABLE user_roles (
   user_id  TEXT NOT NULL REFERENCES users(id),
   role_key TEXT NOT NULL REFERENCES roles(key),
