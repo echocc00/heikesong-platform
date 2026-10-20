@@ -24,13 +24,28 @@ function gradeOf(score, config) {
 //   ② 无企业侧唯一责任人     ← 责任可归属 = 0
 //   ③ 涉及生产系统且未谈责任归属 ← 只能由出题方自报
 // ① ② 由六维推导（这两维本身就是同一件事的两种说法），③ 只能自报。
+//
+// ⚠️ 2026-10-21 独立评审修正（Minor M-1：**key 硬编码在领域层 → 配置改名即静默失效**）：
+//    原来这里写死两个 key（'no_data_authorization' / 'no_responsible_owner'）。
+//    后果：把配置里的 key 改名（或者新增一条同类否决项）→ 领域层仍然按老 key 判定
+//    → **维度推导出的否决项整个消失**，且实跑表现为「grade=B, vetoes=[]」
+//    （独立评审探针实测）—— 也就是说「数据可得性 = 0 → 一票否决」这条规则
+//    可以被一次配置改名**静默关掉**，没有任何报错。
+//    现在改成**从配置读触发条件**：带 `auto: { dimension, equals }` 的否决项
+//    由「该维度取值等于该值」自动触发。key 只是标识，判定逻辑不再依赖它。
 function detectVetoes({ answers, config }) {
   const hit = new Set();
   for (const key of Array.isArray(answers.vetoes) ? answers.vetoes : []) {
     if (config.vetoes.some((v) => v.key === key)) hit.add(key);
   }
-  if (Number(answers.data_access ?? 0) <= 0) hit.add('no_data_authorization');
-  if (Number(answers.accountability ?? 0) <= 0) hit.add('no_responsible_owner');
+  // 维度推导：配置里带 auto 的否决项，按「某维度取值等于某值」自动命中
+  for (const v of config.vetoes) {
+    const auto = v.auto;
+    if (!auto || typeof auto.dimension !== 'string') continue;
+    const value = Number(answers[auto.dimension] ?? 0);
+    const target = Number(auto.equals ?? 0);
+    if (value === target) hit.add(v.key);
+  }
   return config.vetoes.filter((v) => hit.has(v.key)).map((v) => v.key);
 }
 

@@ -64,3 +64,32 @@ test('配置份数对不上会被拒绝（整份配置没被识别到）', () =>
   const errors = validateRules(rules, 99);
   assert.ok(errors.some((e) => e.includes('份')), `必须报份数不符，实际 ${JSON.stringify(errors)}`);
 });
+
+test('solvability 的否决项配置坏了会被拒绝（vetoes 非空 / key 唯一 / auto 指向真实维度）', () => {
+  // ⚠️ 2026-10-21 独立评审修正（Minor M-2：**vetoes 完全没有校验**）：
+  //    原来 validateRules 只查 dimensions 与 grades，`solvability.vetoes` 一个字都没查 ——
+  //    否决项写成空数组、或两条同名、或 auto 指向不存在的维度，都能通过校验、
+  //    直到算分时才出问题（或者干脆**静默失效**：维度推导出的否决项整个消失）。
+  const { rules } = loadRules(rulesDir);
+
+  const empty = structuredClone(rules);
+  empty.solvability.vetoes = [];
+  assert.ok(
+    validateRules(empty).some((e) => e.includes('vetoes')),
+    'vetoes 为空必须被拒绝',
+  );
+
+  const duplicated = structuredClone(rules);
+  duplicated.solvability.vetoes[1].key = duplicated.solvability.vetoes[0].key;
+  assert.ok(
+    validateRules(duplicated).some((e) => e.includes('重复 key')),
+    'vetoes 的 key 重复必须被拒绝',
+  );
+
+  const dangling = structuredClone(rules);
+  dangling.solvability.vetoes[0].auto.dimension = 'no_such_dimension';
+  assert.ok(
+    validateRules(dangling).some((e) => e.includes('auto.dimension')),
+    'auto 指向不存在的维度必须被拒绝',
+  );
+});

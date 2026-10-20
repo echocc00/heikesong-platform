@@ -44,6 +44,13 @@ function setup() {
   const enterprise = createUser(db, { name: '企业甲', phone: '13900005001', password: 'pw', mbaStatus: 'other' });
   const admin = createUser(db, { name: '组委会', phone: '13900005002', password: 'pw', mbaStatus: 'mba' });
   const outsider = createUser(db, { name: '无权限者', phone: '13900005003', password: 'pw', mbaStatus: 'mba' });
+  // ⚠️ 2026-10-21 独立评审修正（Important I-3：**三条路由的能力点常量不可区分**）：
+  //    独立评审变异 M37/M37b/M37c：`write`↔`read`、`approve`↔`read` 互换后
+  //    全量用例照样全绿 —— 因为测试里的企业账号同时有 write + read，
+  //    超管又绕过一切检查 → 换掉常量没有任何用例会红。
+  //    这里造两个**只有单一能力点**的账号，把「哪个端点要哪个能力点」钉死。
+  const reader = createUser(db, { name: '只读账号', phone: '13900005006', password: 'pw', mbaStatus: 'mba' });
+  const writer = createUser(db, { name: '可写不可签级账号', phone: '13900005007', password: 'pw', mbaStatus: 'mba' });
   setSuperadmin(db, admin.id);
   // 能力点必须先注册（grantAssignment 会校验 capabilities 表）
   insertCapability(db, 'task_package:read', '读取任务卡');
@@ -57,12 +64,28 @@ function setup() {
     userId: enterprise.id, capability: 'task_package:read',
     scopeType: 'global', scopeId: null, grantedBy: admin.id,
   });
+  grantAssignment(db, {
+    userId: reader.id, capability: 'task_package:read',
+    scopeType: 'global', scopeId: null, grantedBy: admin.id,
+  });
+  grantAssignment(db, {
+    userId: writer.id, capability: 'task_package:write',
+    scopeType: 'global', scopeId: null, grantedBy: admin.id,
+  });
+  // 「可写不可签级」账号**同时给 read** —— 这样把 approve 端点的能力点
+  // 换成 read 时它仍然能通过 → 用例必须变红（否则换掉常量无人察觉）。
+  grantAssignment(db, {
+    userId: writer.id, capability: 'task_package:read',
+    scopeType: 'global', scopeId: null, grantedBy: admin.id,
+  });
   const app = createApp({ db, rules, webDir });
   return {
-    db, close, dataDir, app, edition, enterprise, admin, outsider,
+    db, close, dataDir, app, edition, enterprise, admin, outsider, reader, writer,
     tokenEnterprise: createSession(db, enterprise.id).token,
     tokenAdmin: createSession(db, admin.id).token,
     tokenOutsider: createSession(db, outsider.id).token,
+    tokenReader: createSession(db, reader.id).token,
+    tokenWriter: createSession(db, writer.id).token,
   };
 }
 
@@ -347,6 +370,121 @@ test('POST /api/task-packages/:id/solvability 任务卡不存在 → 404', async
   });
   assert.equal(res.status, 404);
   assert.equal(JSON.parse(res.body).error.code, 'TASK_PACKAGE_NOT_FOUND');
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('能力点常量钉死：只有 task_package:read 不能评估，只有 task_package:write 不能签级', async () => {
+  // ⚠️ 2026-10-21 独立评审修正（Important I-3）。
+  //    「提交/评估」要 write，「分级签约」要 approve，「读列表」要 read ——
+  //    三个常量互换，任何一个用例都不会红（独立评审变异 M37/M37b/M37c SURVIVED）。
+  const s = setup();
+  const created = await call(s.app, 'POST', '/api/task-packages', {
+    token: s.tokenEnterprise, body: { ...PAYLOAD, editionId: s.edition.id },
+  });
+  assert.equal(created.status, 200, created.body);
+  const id = JSON.parse(created.body).id;
+
+  // 只读账号：有 read 没有 write → 评估必须 403
+  const byReader = await call(s.app, 'POST', `/api/task-packages/${id}/solvability`, {
+    token: s.tokenReader, body: { answers: FULL },
+  });
+  assert.equal(byReader.status, 403, '只有 read 的账号不得评估');
+
+  // 只写账号：有 write 没有 approve → 签级必须 403
+  const byWriter = await call(s.app, 'POST', `/api/task-packages/${id}/approve`, {
+    token: s.tokenWriter, body: { grade: 'A' },
+  });
+  assert.equal(byWriter.status, 403, '只有 write 的账号不得分级签约');
+  assert.equal(JSON.parse(byWriter.body).error.code, 'FORBIDDEN');
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('配比体检只对组委会开放（非组委会拿不到 mix）', async () => {
+  // ⚠️ 2026-10-21 独立评审修正（Important I-4）：
+  //    原来「mix 只对组委会开放」这条规则**没有任何断言** ——
+  //    把 mix 对所有人开放，全量用例照样全绿（独立评审变异 M46/M47 SURVIVED）。
+  //    mix 是任务池的经营数据（配比是否达标），不该流向普通选手/企业。
+  const s = setup();
+  await call(s.app, 'POST', '/api/task-packages', {
+    token: s.tokenEnterprise, body: { ...PAYLOAD, editionId: s.edition.id },
+  });
+  const byEnterprise = await call(s.app, 'GET', `/api/task-packages?editionId=${s.edition.id}`, { token: s.tokenEnterprise });
+  assert.equal(byEnterprise.status, 200);
+  assert.equal(JSON.parse(byEnterprise.body).mix, null, '非组委会不得拿到配比体检结果');
+  const byAdmin = await call(s.app, 'GET', `/api/task-packages?editionId=${s.edition.id}`, { token: s.tokenAdmin });
+  assert.ok(JSON.parse(byAdmin.body).mix, '组委会必须拿到配比体检结果');
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('六维取值越界（负数 / 非整数）→ 400 INVALID_SOLVABILITY_ANSWERS', async () => {
+  // ⚠️ 2026-10-21 独立评审修正（Minor M-4：负数取值分支零断言）。
+  const s = setup();
+  const created = await call(s.app, 'POST', '/api/task-packages', {
+    token: s.tokenEnterprise, body: { ...PAYLOAD, editionId: s.edition.id },
+  });
+  const id = JSON.parse(created.body).id;
+  const negative = await call(s.app, 'POST', `/api/task-packages/${id}/solvability`, {
+    token: s.tokenEnterprise, body: { answers: { ...FULL, problem_clarity: -1 } },
+  });
+  assert.equal(negative.status, 400);
+  assert.equal(JSON.parse(negative.body).error.code, 'INVALID_SOLVABILITY_ANSWERS');
+  const fractional = await call(s.app, 'POST', `/api/task-packages/${id}/solvability`, {
+    token: s.tokenEnterprise, body: { answers: { ...FULL, validation: 1.5 } },
+  });
+  assert.equal(fractional.status, 400);
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('自报未知否决项 → 400 INVALID_VETO_KEY', async () => {
+  // ⚠️ 2026-10-21 独立评审修正（Minor M-4：INVALID_VETO_KEY 分支零断言）。
+  const s = setup();
+  const created = await call(s.app, 'POST', '/api/task-packages', {
+    token: s.tokenEnterprise, body: { ...PAYLOAD, editionId: s.edition.id },
+  });
+  const id = JSON.parse(created.body).id;
+  const res = await call(s.app, 'POST', `/api/task-packages/${id}/solvability`, {
+    token: s.tokenEnterprise, body: { answers: { ...FULL, vetoes: ['not_a_real_veto'] } },
+  });
+  assert.equal(res.status, 400);
+  assert.equal(JSON.parse(res.body).error.code, 'INVALID_VETO_KEY');
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('approve 不存在的任务卡 → 404', async () => {
+  // ⚠️ 2026-10-21 独立评审修正（Minor M-4：approve 的 404 分支零断言）。
+  const s = setup();
+  const res = await call(s.app, 'POST', '/api/task-packages/not-a-real-id/approve', {
+    token: s.tokenAdmin, body: { grade: 'A' },
+  });
+  assert.equal(res.status, 404);
+  assert.equal(JSON.parse(res.body).error.code, 'TASK_PACKAGE_NOT_FOUND');
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('GET /api/task-packages 不带 editionId → 返回全部届期的卡', async () => {
+  // ⚠️ 2026-10-21 独立评审修正（Minor M-3：editionId 缺省语义未钉住）。
+  //    只断言「不 500」不够 —— 语义必须写死：缺省 = 不按届期过滤。
+  const s = setup();
+  const otherEdition = createEdition(s.db, {
+    name: '第二届', city: '北京', startsAt: '2027-10-01', endsAt: '2027-10-31',
+  });
+  await call(s.app, 'POST', '/api/task-packages', {
+    token: s.tokenEnterprise, body: { ...PAYLOAD, editionId: s.edition.id },
+  });
+  await call(s.app, 'POST', '/api/task-packages', {
+    token: s.tokenEnterprise, body: { ...PAYLOAD, title: '第二届的题', editionId: otherEdition.id },
+  });
+  const all = await call(s.app, 'GET', '/api/task-packages', { token: s.tokenAdmin });
+  assert.equal(all.status, 200);
+  assert.equal(JSON.parse(all.body).items.length, 2, '不带 editionId 必须返回全部届期');
+  const one = await call(s.app, 'GET', `/api/task-packages?editionId=${s.edition.id}`, { token: s.tokenAdmin });
+  assert.equal(JSON.parse(one.body).items.length, 1, '带 editionId 必须只返回本届');
   s.close();
   rmSync(s.dataDir, { recursive: true, force: true });
 });

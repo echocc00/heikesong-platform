@@ -295,6 +295,32 @@ export function validateRules(rules, expectedCount = null) {
       }
     }
   }
+  // ⚠️ 2026-10-21 独立评审修正（Minor M-2：**vetoes 完全没有校验**）：
+  //    原来这里只校验 dimensions 与 grades，`solvability.vetoes` 一个字都没查 ——
+  //    否决项写成空数组、或两条同名、或 `auto.dimension` 指向一个不存在的维度，
+  //    全都能通过校验、直到算分时才出问题（或者干脆**静默失效**）。
+  //    现在校验：非空、key 唯一、label 非空、`auto` 的形状与指向的维度存在。
+  if (!Array.isArray(sol?.vetoes) || sol.vetoes.length === 0) {
+    push('solvability.vetoes 缺失或为空（R-ENT-07 三条一票否决）');
+  } else if (hasBadItem(sol.vetoes)) {
+    push('solvability.vetoes 含非对象元素');
+  } else if (hasDuplicateKeys(sol.vetoes)) {
+    push('solvability.vetoes 存在重复 key');
+  } else {
+    const dimensionKeys = new Set((sol.dimensions ?? []).map((d) => d.key));
+    for (const v of sol.vetoes) {
+      if (typeof v.label !== 'string' || !v.label) {
+        push(`solvability.vetoes ${v.key} 缺少 label`);
+      }
+      if (v.auto === undefined || v.auto === null) continue;
+      if (typeof v.auto !== 'object' || typeof v.auto.dimension !== 'string'
+        || typeof v.auto.equals !== 'number') {
+        push(`solvability.vetoes ${v.key} 的 auto 必须是 { dimension: string, equals: number }`);
+      } else if (dimensionKeys.size && !dimensionKeys.has(v.auto.dimension)) {
+        push(`solvability.vetoes ${v.key} 的 auto.dimension 引用了不存在的维度 ${v.auto.dimension}`);
+      }
+    }
+  }
 
   // ── 行为分 ───────────────────────────────────────────────
   // 行为分只用于破同分、不进总分（分轨强制）；但它仍有自己的阈值与上限，必须校验。
