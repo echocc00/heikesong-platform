@@ -1,0 +1,13 @@
+{
+  "id": "pools",
+  "version": "2026-10-20",
+  "source": "任务书 §九 三池沉淀 + §二 增长飞轮闭环 + S10 §3.3 个人积分终生上榜（R-RNK-10）+ S10 §3.4 反作弊第 3 条",
+  "packageStatusFilter": [],
+  "talentPointKinds": { "atomic": ["stage_rank", "mvp", "roadshow"], "rollup": "personal_rollup" },
+  "talentTotalScope": "lifetime",
+  "resourceKinds": ["enterprise_brief", "free_brief"],
+  "publicScopes": ["leaderboard", "calendar", "all"],
+  "publicTokenTtlDays": 30,
+  "taskEvidence": { "requireRunnableOrBlocker": true, "requireVersionTag": true, "maxSummaryLength": 500 },
+  "workflow": { "claimMode": "self_claim_only" }
+}

@@ -24,6 +24,7 @@ const FILES = {
   compliance: 'compliance.json',
   points: 'points.json',
   criteria: 'criteria.json',
+  pools: 'pools.json',
 };
 
 function readJson(path) {
@@ -591,6 +592,32 @@ export function validateRules(rules, expectedCount = null) {
     }
   }
 
+  // ── 三池与工作流（P5）────────────────────────────────────────────
+  const pools = rules.pools;
+  if (!pools) {
+    errors.push('pools 缺失');
+  } else {
+    // R-OPS-14：禁止岗位制——claimMode 只允许 self_claim_only，写别的值直接拒绝启动
+    if (pools.workflow?.claimMode !== 'self_claim_only') {
+      errors.push('pools.workflow.claimMode 必须是 self_claim_only（R-OPS-14 禁止岗位制，不允许其他取值）');
+    }
+    if (!Number.isInteger(pools.publicTokenTtlDays) || pools.publicTokenTtlDays <= 0) {
+      errors.push('pools.publicTokenTtlDays 必须是正整数');
+    }
+    if (!Array.isArray(pools.publicScopes) || !pools.publicScopes.includes('all')) {
+      errors.push('pools.publicScopes 必须包含 all');
+    }
+    const kinds = pools.talentPointKinds;
+    if (!kinds || !Array.isArray(kinds.atomic) || !kinds.atomic.length || !kinds.rollup) {
+      errors.push('pools.talentPointKinds 必须给出 atomic 数组与 rollup 名称');
+    }
+    if (pools.talentTotalScope !== 'lifetime') {
+      errors.push('pools.talentTotalScope 必须是 lifetime（R-RNK-10 个人积分终生上榜）');
+    }
+    if (!pools.taskEvidence?.requireRunnableOrBlocker) {
+      errors.push('pools.taskEvidence.requireRunnableOrBlocker 必须为 true（R-STG-04）');
+    }
+  }
   return errors;
 }
 
@@ -615,6 +642,7 @@ export function loadRules(rulesDir) {
     compliance: rules.compliance,
     points: rules.points,
     criteria: rules.criteria,
+    pools: rules.pools,
   };
 
   const errors = validateRules(grouped, Object.keys(FILES).length);
