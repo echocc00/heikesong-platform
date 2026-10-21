@@ -12,15 +12,15 @@
 
 | 计划 | 阶段 | 交付物 | 依赖 | 计划文件 | 规模 |
 |---|---|---|---|---|---|
-| 1 | **P0 地基** | 能登录的空系统；配置改错则启动失败；权限骨架 | — | `2026-10-20-platform-P0-foundation.md` | 7 Task / 8621 行 |
+| 1 | **P0 地基** | 能登录的空系统；配置改错则启动失败；权限骨架 | — | `2026-10-20-platform-P0-foundation.md` | 7 Task / 8752 行 |
 | 2 | **P1 报名与组队** | 报名→自动分级→组队→任务包认领 全链路 | P0 | `2026-10-20-platform-P1-registration-team.md` | 7 Task / 7464 行 |
 | 3 | **P2 评审引擎** | 能真实算分（z-score + 去极值 + 双签 + 回避 + 自评检测） | P1 | `2026-10-20-platform-P2-review-engine.md` | 10 Task / 10744 行 |
 | 4 | **P3 榜单与积分** | 能真实发榜（A/B/个人榜 + 段位 + 行为分隔离 + 战绩卡） | P2 | `2026-10-20-platform-P3-leaderboard-points.md` | 8 Task / 6478 行 |
 | 5 | **P4 审计与防作弊** | 榜单可复算（trace 抽屉 + 复算 diff）+ 限频 + 复核状态机 | P3 | `2026-10-20-platform-P4-audit-anticheat.md` | 8 Task / 8815 行 |
 | 6 | **P5 工作流与三池** | 任务清单与领取；三池底座接口；公开榜单 API + iCal + 任务清单页 | P4 | `2026-10-20-platform-P5-workflow-pools.md` | 6 Task / 8707 行 |
-| 7 | **P6 部署与演示版** | 云主机部署资产 + 公网演示 URL + 端到端/跨平台验收 | P5 | `2026-10-20-platform-P6-deploy-demo.md` | 8 Task / 10001 行 |
+| 7 | **P6 部署与演示版** | 云主机部署资产 + 公网演示 URL + 端到端/跨平台验收 | P5 | `2026-10-20-platform-P6-deploy-demo.md` | 8 Task / 10342 行 |
 
-合计 **54 个 Task**、**60 830 行**计划文档。
+合计 **54 个 Task**、**61 302 行**计划文档。
 
 > 规模数字是**实施后**的实况（每份计划末尾都追加了父代理预审 / 修复轮 / 实施台账章节，所以比撰写期大）。
 > 复算：`wc -l docs/superpowers/plans/2026-10-20-platform-P*.md`。
@@ -102,7 +102,9 @@ SQL 边界    所有 SQL 收进 src/db/repo/；handler 内禁止裸 SQL
 
 ```
 platform/
-├── package.json            scripts: start / test / migrate / seed（四个都带 --disable-warning=ExperimentalWarning）
+├── package.json            scripts: start / test / migrate / seed / backup / restore
+│                           / build:demo / serve:demo / audit / audit:temp（十个都带
+│                           --disable-warning=ExperimentalWarning）
 ├── rules/                  16 份声明式规则配置（各阶段追加自己的）
 ├── src/
 │   ├── server.js           进程入口
@@ -122,9 +124,13 @@ platform/
 │                           views/ 含 tasks.js（任务清单页，P5 Task 6）
 ├── db/migrations/          001_init.sql 002_registration.sql 003_review.sql
 │                           004_leaderboard.sql 005_audit.sql 006_pools.sql
-├── test/                   75 个 *.test.js
+├── test/                   76 个 *.test.js
+├── test-helpers/           共享测试工具：http-call（进程内 HTTP 调用器）
+│                           strip-comments（剥注释）db-worker（子进程 DB）
+│                           tmp（**本进程临时目录隔离 + 退出回收**，防临时目录泄漏）
 ├── scripts/                migrate seed backup restore audit-scan forbidden.txt
 │                           build-demo.js serve-demo.js node-globals.txt
+│                           temp-leak-scan.js（**临时目录泄漏闸**）
 └── deploy/                 heikesong.service nginx.conf nginx-http2-compat.sh
                             docker-compose.yml install.sh
 ```
@@ -182,6 +188,12 @@ node docs/tools/plan-block-sync.mjs --verify <plan> platform <文件...>
 
 # ⑤ 需求落地表重生成（96 条逐条「落在哪 / 怎么验」）
 python3 docs/tools/requirement-map.py --trees . --out docs/requirement-implementation-map.md
+
+# ⑥ 临时目录泄漏闸（防测试把服务器磁盘吃满）
+#    R1 用到 tmpdir() 的测试文件必须 import test-helpers/tmp.js 并调用 isolateTempDir()
+#    R2 isolateTempDir() 必须早于第一处 tmpdir()
+#    --run 追加动态差分：跑完全量后临时目录里有新残留 ⇒ 判违规
+cd platform && node scripts/temp-leak-scan.js ; echo "退出码=$?"
 ```
 
 > **计划块漂移的口径**（本轮统一确立）：后续阶段按「最早建立者 owns、后续 Modify 追加不得重建」

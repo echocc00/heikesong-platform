@@ -13,6 +13,7 @@
     "restore": "node --disable-warning=ExperimentalWarning scripts/restore.js",
     "build:demo": "node --disable-warning=ExperimentalWarning scripts/build-demo.js",
     "serve:demo": "node --disable-warning=ExperimentalWarning scripts/serve-demo.js",
-    "audit": "node --disable-warning=ExperimentalWarning scripts/audit-scan.js"
+    "audit": "node --disable-warning=ExperimentalWarning scripts/audit-scan.js",
+    "audit:temp": "node --disable-warning=ExperimentalWarning scripts/temp-leak-scan.js"
   }
 }

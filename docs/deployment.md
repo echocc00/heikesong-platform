@@ -235,8 +235,15 @@ node scripts/serve-demo.js     # 本地预览 http://127.0.0.1:8090/
 cd platform
 node --test            # 全绿
 node scripts/audit-scan.js   # 扫描闸：禁用表述 0 命中
+node scripts/temp-leak-scan.js   # 泄漏闸：测试不许往临时目录里留垃圾
 node scripts/build-demo.js   # 演示站构建：领域层浏览器安全检查通过
 ```
+
+> **为什么清单里要有泄漏闸**：测试用 `mkdtempSync` 建临时目录，清理写在用例体末尾 ——
+> 断言一失败就漏。macOS 的 `$TMPDIR` 系统会清（**开发机看不见**），
+> 而 Linux 的 `/tmp` 不会自动清 ⇒ **在服务器上跑一次全量就是几十个 `hks-*` 目录**，
+> 跑得越多堆得越多，终将把磁盘吃满。
+> 现在测试进程退出时会把本进程的临时目录**整体回收**，泄漏闸负责守住这条不被回退。
 
 ---
 
@@ -782,7 +789,7 @@ heikesong-platform 启动于 http://127.0.0.1:8080（规则版本 2026-10-20）
 
 | # | 跑了什么 | 观察到 |
 |---|---|---|
-| E1 | `cd platform && node --disable-warning=ExperimentalWarning --test` | **1279 例 / 1278 通过 / 0 失败 / 1 跳过**（macOS / darwin arm64；测于提交 `25a7296`；基线 981/981）<br>⚠️ 数字是**测得时**的实况；后续阶段合入会变（用例数只增不减）⇒ **以实跑为准** |
+| E1 | `cd platform && node --disable-warning=ExperimentalWarning --test` | **1290 例 / 1289 通过 / 0 失败 / 1 跳过**（macOS / darwin arm64；测于「测试临时目录泄漏修复轮」的工作树；此前基线 981/981）<br>⚠️ 数字是**测得时**的实况；后续阶段合入会变（用例数只增不减）⇒ **以实跑为准** |
 | E2 | `cd platform && node scripts/audit-scan.js` | **退出码 0**（词条 15 条、扫描 224 个文件、发布产物 `platform/web/dist` 另扫 60 个、0 违规） |
 | E3 | `DATA_DIR=<tmp>/data node scripts/migrate.js` | `迁移完成，当前版本 6`（本次应用 001–006 六个迁移） |
 | E4 | `node scripts/seed.js` 连跑两次 | 第一次「已创建管理员：13800000000」，第二次「管理员已存在」⇒ 幂等 |
@@ -802,7 +809,9 @@ heikesong-platform 启动于 http://127.0.0.1:8080（规则版本 2026-10-20）
 | E18 | **真机**（8.133.200.235 / Debian 12 / ext4 / Node v22.22.2 / nginx 1.22.1 / systemd 252）跑 `nginx-http2-compat.sh` | `nginx 1.22.1 < 1.25.1：已降级为 listen ... ssl http2;`；独立的 `http2 on;` 行**已消失** |
 | E19 | 真机上把降级后的站点配置（替换占位符 + 临时自签证书）喂给 `nginx -t -c <临时主配置>` | `syntax is ok` / `test is successful`（退出码 0）；**系统既有配置的 `nginx -t` 仍然正常**（本轮没写 `/etc/nginx/**`、没 reload） |
 | E20 | 真机上 `heikesong.service`（替换占位符后）`systemd-analyze verify` | 退出码 0、**零告警**（systemd 252） |
-| E21 | **真机跨平台复现**（P6 Task 8 Step 4 的原配方，三条命令） | `node scripts/migrate.js` ⇒ `迁移完成，当前版本 6`；`node --test` ⇒ **1279 例 / 1277 通过 / 0 失败 / 2 跳过**（2 跳过各有一条：Task 5 已落地故不适用；**以 root 跑、mode 000 也读得到**）；`node scripts/build-demo.js` ⇒ 产物 60 文件、**伴生文件 0 个** |
+| E21 | **真机跨平台复现**（P6 Task 8 Step 4 的原配方，三条命令） | `node scripts/migrate.js` ⇒ `迁移完成，当前版本 6`；`node --test` ⇒ **1290 例 / 1288 通过 / 0 失败 / 2 跳过**（2 跳过各有一条：Task 5 已落地故不适用；**以 root 跑、mode 000 也读得到**）；`node scripts/build-demo.js` ⇒ 产物 60 文件、**伴生文件 0 个** |
+| E22 | **临时目录泄漏闸 + 泄漏差分**（本轮新增 `scripts/temp-leak-scan.js`） | 静态闸：本机与真机**各 0 违规**（退出码 0）；跑完全量后**两侧临时目录残留都是 0 个**（修前：本机 3 个、真机 4 个，真机历史累计 80+ 个）<br>⇒ 这条是**服务器运维口径**：测试跑完不会再往 `/tmp` 里堆 `hks-*` 目录把磁盘吃满 |
+| E23 | 清理历史残留（本机 macOS） | `$TMPDIR` 下 **24 252 个** `hks-*` 目录 / **5.7 GB** ⇒ 同盘暂存后一次性交给 `mavis-trash` 回收（可恢复）⇒ `$TMPDIR` 从 ~5.9 GB 降到 **229 MB** |
 
 ---
 
