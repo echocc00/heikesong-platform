@@ -4739,11 +4739,20 @@ import { fileURLToPath } from 'node:url';
 import { openDatabase } from '../src/db/sqlite.js';
 import { applyMigrations } from '../src/db/migrate.js';
 import { loadRules } from '../src/config.js';
-import { createPublicToken, resolvePublicToken, getPublicLeaderboard } from '../src/services/public-api.js';
+import { createApp } from '../src/server.js';
+import { createSession } from '../src/auth/session.js';
+import { insertWorkflow, insertWorkflowTask } from '../src/db/repo/workflows.js';
+import {
+  createPublicToken, resolvePublicToken, getPublicLeaderboard, PUBLIC_NOTICE,
+} from '../src/services/public-api.js';
+import { call } from '../test-helpers/http-call.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrationsDir = join(here, '..', 'db', 'migrations');
 const rulesDir = join(here, '..', 'rules');
+const webDir = join(here, '..', 'web');
+// 统一注入时间：所有时间断言都基于它，口径可复算
+const NOW = '2026-10-20T00:00:00.000Z';
 
 function setup() {
   const dataDir = mkdtempSync(join(tmpdir(), 'hks-p5pub-'));
@@ -4753,7 +4762,8 @@ function setup() {
   db.exec(`
     INSERT INTO users (id, name, phone, password_hash, mba_status, org, is_superadmin, active, created_at)
     VALUES ('u_a', '甲', '13900000031', 'x', 'mba', '学堂', 0, 1, '2026-10-01T00:00:00.000Z'),
-           ('u_sign', '签字人丁', '13900000032', 'x', 'other', '某银行', 0, 1, '2026-10-01T00:00:00.000Z');
+           ('u_sign', '签字人丁', '13900000032', 'x', 'other', '某银行', 0, 1, '2026-10-01T00:00:00.000Z'),
+           ('u_super', '组委会', '13900000033', 'x', 'mba', '组委会', 1, 1, '2026-10-01T00:00:00.000Z');
     INSERT INTO editions (id, name, city, starts_at, ends_at, created_at)
     VALUES ('ed_1', '第一届', '杭州', '2026-10-01', '2026-10-31', '2026-10-01T00:00:00.000Z');
     INSERT INTO task_packages (id, edition_id, enterprise_id, enterprise_name, title, pain_point,
@@ -4764,26 +4774,62 @@ function setup() {
     INSERT INTO teams (id, edition_id, name, captain_id, task_package_id, tier, status, created_at, deleted_at)
     VALUES ('tm_1', 'ed_1', '一队', 'u_a', 'tp_1', 'C', 'active', '2026-10-01T00:00:00.000Z', NULL),
            ('tm_2', 'ed_1', '二队', 'u_a', 'tp_1', 'D', 'active', '2026-10-01T00:00:00.000Z', NULL),
-           ('tm_ghost', 'ed_1', '幽灵队', 'u_a', 'tp_1', 'C', 'active', '2026-10-01T00:00:00.000Z', NULL);
+           ('tm_ghost', 'ed_1', '幽灵队', 'u_a', 'tp_1', 'C', 'active', '2026-10-01T00:00:00.000Z', NULL),
+           ('tm_3', 'ed_1', '三队', 'u_a', 'tp_1', 'C', 'active', '2026-10-01T00:00:00.000Z', NULL);
     INSERT INTO team_members (team_id, user_id, role, joined_at, left_at)
     VALUES ('tm_1', 'u_a', 'captain', '2026-10-01T00:00:00.000Z', NULL);
     INSERT INTO stages (id, edition_id, key, name, kind, starts_at, ends_at, freeze_at, scoring_config_key, status)
     VALUES ('st_1', 'ed_1', 's1', '调研', 'initial', '2026-10-01', '2026-10-10', NULL, 'initial', 'computed');
     INSERT INTO stage_results (id, stage_id, team_id, rank, total, seat_p, seat_e, tied_with, points, computation_id, created_at)
     VALUES ('sr_1', 'st_1', 'tm_1', 1, 90.0, 88.0, 95.0, 0, 10, NULL, '2026-10-10T00:00:00.000Z'),
-           ('sr_2', 'st_1', 'tm_2', 2, 80.0, 82.0, 76.0, 0, 8, NULL, '2026-10-10T00:00:00.000Z');
+           ('sr_2', 'st_1', 'tm_2', 2, 80.0, 82.0, 76.0, 0, 8, NULL, '2026-10-10T00:00:00.000Z'),
+           ('sr_3', 'st_1', 'tm_3', 3, 70.0, 72.0, 68.0, 1, 6, NULL, '2026-10-10T00:00:00.000Z');
     INSERT INTO tier_records (id, team_id, tier, milestone_count, business_signoff_count, reasons_json, computed_at, deleted_at)
-    VALUES ('tr_1', 'tm_1', 'C', 2, 1, '[]', '2026-10-12T00:00:00.000Z', NULL),
-           ('tr_2', 'tm_2', 'D', 0, 0, '[]', '2026-10-12T00:00:00.000Z', NULL);
+    VALUES ('tr_0', 'tm_1', 'D', 0, 0, '[]', '2026-10-11T00:00:00.000Z', NULL),
+           ('tr_1', 'tm_1', 'C', 2, 1, '[]', '2026-10-12T00:00:00.000Z', NULL),
+           ('tr_2', 'tm_2', 'D', 0, 0, '[]', '2026-10-12T00:00:00.000Z', NULL),
+           ('tr_3', 'tm_1', 'B', 3, 1, '[]', '2026-10-13T00:00:00.000Z', '2026-10-13T00:00:00.000Z');
     INSERT INTO peer_reviews (id, stage_id, from_team_id, to_team_id, score, request_id, created_at)
     VALUES ('pr_1', 'st_1', 'tm_ghost', 'tm_1', 7.5, 'req_1', '2026-10-10T00:00:00.000Z');
+    INSERT INTO points_ledger (id, edition_id, stage_id, team_id, user_id, kind, points, created_at)
+    VALUES ('pl_1', 'ed_1', 'st_1', 'tm_1', 'u_a', 'stage_rank', 10, '2026-10-10T00:00:00.000Z');
+    INSERT INTO capabilities (key, description) VALUES ('pool:read', '读取三池'), ('pool:write', '维护三池');
   `);
-  return { db, close, dataDir, rules };
+  const app = createApp({ db, rules, webDir });
+  return {
+    db,
+    close,
+    dataDir,
+    rules,
+    app,
+    tokenMember: createSession(db, 'u_a').token,
+    tokenOutsider: createSession(db, 'u_sign').token,
+    tokenSuper: createSession(db, 'u_super').token,
+  };
 }
 
 function cleanup(db, close, dataDir) {
   close();
   rmSync(dataDir, { recursive: true, force: true });
+}
+
+// 工作流夹具：用**仓储层的真实写入方**建（数据形状与生产写入一致）
+function seedWorkflow(db) {
+  const wf = insertWorkflow(db, {
+    id: 'wf_1', editionId: 'ed_1', taskPackageId: 'tp_1', name: '工作流一',
+    now: '2026-10-01T00:00:00.000Z',
+  });
+  const task = insertWorkflowTask(db, {
+    id: 'wt_1', workflowId: wf.id, title: '做风控原型',
+    now: '2026-10-01T00:00:00.000Z',
+  });
+  return { wf, task };
+}
+
+function leaderboardToken(db, { scope = 'leaderboard', editionId = 'ed_1', expiresAt = '2027-01-01T00:00:00.000Z' } = {}) {
+  return createPublicToken({
+    db, scope, editionId, expiresAt, now: '2026-10-01T00:00:00.000Z',
+  }).token;
 }
 
 test('无 token → 403', () => {
@@ -4879,6 +4925,11 @@ test('公开接口必须显式调用可见性过滤（源码里有 applyVisibili
   const src = readFileSync(join(here, '..', 'src', 'services', 'public-api.js'), 'utf8');
   assert.ok(src.includes('applyVisibility'), '公开接口必须显式过 applyVisibility（P3 产出）');
   assert.ok(src.includes("from '../domain/visibility.js'"), '必须从 P3 的 visibility 模块导入');
+  // ⚠️ 补（P5 Task 4 实跑后追加）：context 必须是 scope='rank'。
+  //    P3 的 rank 分支只剔互评来源与企业名，**不做段位过滤**（段位下限由 P5 自己执行）；
+  //    写成 'tier' 会让 P3 先按它自己的段位表过滤 —— 两层口径一旦漂移，
+  //    公开榜就会随 P3 的改动而变（D 段是否公示不再由 P5 单独决定）。
+  assert.ok(src.includes("context: { scope: 'rank'"), 'applyVisibility 的 context 必须是 scope=rank');
 });
 
 test('token 只存哈希：库里看不到明文', () => {
@@ -4905,11 +4956,486 @@ test('resolvePublicToken 对有效 token 返回 scope 与届期', () => {
   assert.equal(resolved.editionId, 'ed_1');
   cleanup(db, close, dataDir);
 });
+
+// ── 以下为 P5 Task 4 实跑后补齐的用例（计划原块只覆盖服务层，
+//    新建的 3 个路由文件 + server.js 的原文响应分支**零覆盖**）──
+
+test('resolvePublicToken 同时返回 expiresAt（调用方据此判断剩余有效期）', () => {
+  const { db, close, dataDir } = setup();
+  const { token } = createPublicToken({
+    db, scope: 'leaderboard', editionId: 'ed_1', expiresAt: '2027-01-01T00:00:00.000Z', now: '2026-10-01T00:00:00.000Z',
+  });
+  const resolved = resolvePublicToken({
+    db, token, now: '2026-10-20T00:00:00.000Z', requiredScope: 'leaderboard', editionId: 'ed_1',
+  });
+  assert.equal(resolved.expiresAt, '2027-01-01T00:00:00.000Z');
+  cleanup(db, close, dataDir);
+});
+
+test('token 库里查不到 → 403 PUBLIC_TOKEN_INVALID', () => {
+  const { db, close, dataDir } = setup();
+  assert.throws(
+    () => resolvePublicToken({ db, token: '根本没签发过', now: NOW, requiredScope: 'leaderboard' }),
+    (err) => err.status === 403 && err.code === 'PUBLIC_TOKEN_INVALID',
+  );
+  cleanup(db, close, dataDir);
+});
+
+test('createPublicToken 不给 expiresAt → 按 rules.pools.publicTokenTtlDays 推算（默认 30 天）', () => {
+  const { db, close, dataDir } = setup();
+  const created = createPublicToken({
+    db, scope: 'leaderboard', editionId: 'ed_1', now: '2026-10-01T00:00:00.000Z',
+  });
+  assert.equal(created.expiresAt, '2026-10-31T00:00:00.000Z');
+  cleanup(db, close, dataDir);
+});
+
+test('createPublicToken 的 scope 必须在 publicScopes 内 → 否则 400', () => {
+  const { db, close, dataDir } = setup();
+  assert.throws(
+    () => createPublicToken({ db, scope: 'admin', editionId: 'ed_1', now: '2026-10-01T00:00:00.000Z' }),
+    (err) => err.status === 400 && err.code === 'PUBLIC_SCOPE_INVALID',
+  );
+  cleanup(db, close, dataDir);
+});
+
+test('createPublicToken 缺 editionId → 400', () => {
+  const { db, close, dataDir } = setup();
+  assert.throws(
+    () => createPublicToken({ db, scope: 'leaderboard', now: '2026-10-01T00:00:00.000Z' }),
+    (err) => err.status === 400 && err.code === 'EDITION_REQUIRED',
+  );
+  cleanup(db, close, dataDir);
+});
+
+test('getPublicLeaderboard 缺规则 → 500 RULES_MISSING（拒绝出数，不用默认口径凑数）', () => {
+  const { db, close, dataDir } = setup();
+  const token = leaderboardToken(db);
+  assert.throws(
+    () => getPublicLeaderboard({ db, token, editionId: 'ed_1' }),
+    (err) => err.status === 500 && err.code === 'RULES_MISSING',
+  );
+  cleanup(db, close, dataDir);
+});
+
+test('getPublicLeaderboard 缺 editionId → 400', () => {
+  const { db, close, dataDir, rules } = setup();
+  const token = leaderboardToken(db);
+  assert.throws(
+    () => getPublicLeaderboard({ db, token, rules, now: NOW }),
+    (err) => err.status === 400 && err.code === 'EDITION_REQUIRED',
+  );
+  cleanup(db, close, dataDir);
+});
+
+test('公开 payload 的元信息：editionId / generatedAt / scope / notice / 赛段信息', () => {
+  const { db, close, dataDir, rules } = setup();
+  const token = leaderboardToken(db);
+  const payload = getPublicLeaderboard({ db, token, editionId: 'ed_1', rules, now: NOW });
+  assert.equal(payload.editionId, 'ed_1');
+  assert.equal(payload.generatedAt, NOW, 'generatedAt 必须落在注入的时间上');
+  assert.equal(payload.scope, 'rank');
+  assert.equal(payload.notice, PUBLIC_NOTICE);
+  assert.equal(payload.stages[0].stageId, 'st_1');
+  assert.equal(payload.stages[0].stageKey, 's1');
+  assert.equal(payload.stages[0].stageName, '调研');
+  cleanup(db, close, dataDir);
+});
+
+test('段位取最新的一条【有效】记录（软删除的不算）', () => {
+  const { db, close, dataDir, rules } = setup();
+  const token = leaderboardToken(db);
+  const payload = getPublicLeaderboard({ db, token, editionId: 'ed_1', rules, now: NOW });
+  // 种子里有 tm_1 的三条段位记录：tr_0（D, 更早）/ tr_1（C）/ tr_3（B, 更晚但已软删除）
+  assert.equal(payload.stages[0].rows[0].tier, 'C', '取最新的一条有效记录；软删除的不生效');
+  cleanup(db, close, dataDir);
+});
+
+test('公开行的分值字段逐个透传（total / points / tiedWith）', () => {
+  const { db, close, dataDir, rules } = setup();
+  const token = leaderboardToken(db);
+  const payload = getPublicLeaderboard({ db, token, editionId: 'ed_1', rules, now: NOW });
+  const row = payload.stages[0].rows[0];
+  assert.equal(row.total, 90);
+  assert.equal(row.points, 10);
+  assert.equal(row.tiedWith, 0);
+  cleanup(db, close, dataDir);
+});
+
+test('被段位门槛挡下的队伍要留下 warning（不是静默丢弃）', () => {
+  const { db, close, dataDir, rules } = setup();
+  const token = leaderboardToken(db);
+  const payload = getPublicLeaderboard({ db, token, editionId: 'ed_1', rules, now: NOW });
+  const hidden = payload.warnings.find((w) => w.code === 'tier_below_public_threshold_hidden');
+  assert.ok(hidden, '低于公示门槛的队伍必须留 warning');
+  assert.equal(hidden.stageId, 'st_1');
+  // 二队（D 段）+ 三队（无段位记录 = 段位未知 = 视为未达 C 段）
+  assert.equal(hidden.count, 2);
+  cleanup(db, close, dataDir);
+});
+
+test('段位未知（无 tier_record）= 视为未达 C 段 → 不公示（fail-closed）', () => {
+  const { db, close, dataDir, rules } = setup();
+  const token = leaderboardToken(db);
+  const payload = getPublicLeaderboard({ db, token, editionId: 'ed_1', rules, now: NOW });
+  const names = payload.stages[0].rows.map((r) => r.teamName);
+  assert.deepEqual(names, ['一队'], '三队段位未知 ⇒ 与 D 段同待遇，不公示');
+  cleanup(db, close, dataDir);
+});
+
+test('公示门槛可配置：publicFromTier 提到 B → C 段队伍也不公示', () => {
+  const { db, close, dataDir, rules } = setup();
+  const token = leaderboardToken(db);
+  const strict = {
+    ...rules,
+    visibility: { ...rules.visibility, rank: { ...rules.visibility.rank, publicFromTier: 'B' } },
+  };
+  const payload = getPublicLeaderboard({ db, token, editionId: 'ed_1', rules: strict, now: NOW });
+  assert.equal(payload.stages[0].rows.length, 0, '门槛提到 B 段后 C 段队伍也不公示');
+  cleanup(db, close, dataDir);
+});
+
+test('HTTP GET /api/public/leaderboard 带有效 token → 200，且只给白名单字段', async () => {
+  const s = setup();
+  const token = leaderboardToken(s.db);
+  const res = await call(s.app, 'GET', `/api/public/leaderboard?token=${token}&editionId=ed_1`);
+  assert.equal(res.status, 200, res.body);
+  const payload = JSON.parse(res.body);
+  assert.equal(payload.stages.length, 1);
+  assert.deepEqual(
+    Object.keys(payload.stages[0].rows[0]).sort(),
+    ['points', 'rank', 'teamName', 'tier', 'tiedWith', 'total'].sort(),
+  );
+  assert.equal(res.body.includes('二队'), false, 'D 段队伍不公示');
+  assert.equal(res.body.includes('某银行'), false, '企业名不公示');
+  cleanup(s.db, s.close, s.dataDir);
+});
+
+test('HTTP GET /api/public/leaderboard 无 token → 403', async () => {
+  const s = setup();
+  const res = await call(s.app, 'GET', '/api/public/leaderboard?editionId=ed_1');
+  assert.equal(res.status, 403, res.body);
+  assert.equal(JSON.parse(res.body).error.code, 'PUBLIC_TOKEN_MISSING');
+  cleanup(s.db, s.close, s.dataDir);
+});
+
+test('HTTP GET /api/public/leaderboard token 无效 → 403', async () => {
+  const s = setup();
+  const res = await call(s.app, 'GET', '/api/public/leaderboard?token=not-a-real-token&editionId=ed_1');
+  assert.equal(res.status, 403, res.body);
+  assert.equal(JSON.parse(res.body).error.code, 'PUBLIC_TOKEN_INVALID');
+  cleanup(s.db, s.close, s.dataDir);
+});
+
+test('HTTP GET /api/public/leaderboard 缺 editionId → 400', async () => {
+  const s = setup();
+  const token = leaderboardToken(s.db);
+  const res = await call(s.app, 'GET', `/api/public/leaderboard?token=${token}`);
+  assert.equal(res.status, 400, res.body);
+  assert.equal(JSON.parse(res.body).error.code, 'EDITION_REQUIRED');
+  cleanup(s.db, s.close, s.dataDir);
+});
+
+test('HTTP GET /api/workflows/:id/tasks 未登录 → 401', async () => {
+  const s = setup();
+  const { wf } = seedWorkflow(s.db);
+  const res = await call(s.app, 'GET', `/api/workflows/${wf.id}/tasks`);
+  assert.equal(res.status, 401, res.body);
+  cleanup(s.db, s.close, s.dataDir);
+});
+
+test('HTTP GET /api/workflows/:id/tasks 队成员 → 200 + 任务清单', async () => {
+  const s = setup();
+  const { wf, task } = seedWorkflow(s.db);
+  const res = await call(s.app, 'GET', `/api/workflows/${wf.id}/tasks`, { token: s.tokenMember });
+  assert.equal(res.status, 200, res.body);
+  const payload = JSON.parse(res.body);
+  assert.equal(payload.tasks.length, 1);
+  assert.equal(payload.tasks[0].id, task.id);
+  cleanup(s.db, s.close, s.dataDir);
+});
+
+test('HTTP GET /api/workflows/:id/tasks 非队成员 → 200 + 空集（列表三态）', async () => {
+  const s = setup();
+  const { wf } = seedWorkflow(s.db);
+  const res = await call(s.app, 'GET', `/api/workflows/${wf.id}/tasks`, { token: s.tokenOutsider });
+  assert.equal(res.status, 200, res.body);
+  assert.deepEqual(JSON.parse(res.body).tasks, []);
+  cleanup(s.db, s.close, s.dataDir);
+});
+
+test('HTTP GET /api/workflows/<不存在> → 404（单条不存在）', async () => {
+  const s = setup();
+  const res = await call(s.app, 'GET', '/api/workflows/wf_none/tasks', { token: s.tokenMember });
+  assert.equal(res.status, 404, res.body);
+  cleanup(s.db, s.close, s.dataDir);
+});
+
+test('HTTP POST /api/tasks/:id/claim 未登录 → 401', async () => {
+  const s = setup();
+  const { task } = seedWorkflow(s.db);
+  const res = await call(s.app, 'POST', `/api/tasks/${task.id}/claim`, { body: {} });
+  assert.equal(res.status, 401, res.body);
+  cleanup(s.db, s.close, s.dataDir);
+});
+
+test('HTTP POST /api/tasks/:id/claim → 200；重复领取 → 409（唯一领取由数据库兜底）', async () => {
+  const s = setup();
+  const { task } = seedWorkflow(s.db);
+  const first = await call(s.app, 'POST', `/api/tasks/${task.id}/claim`, { token: s.tokenMember, body: {} });
+  assert.equal(first.status, 200, first.body);
+  assert.equal(JSON.parse(first.body).task.status, 'in_progress');
+  const second = await call(s.app, 'POST', `/api/tasks/${task.id}/claim`, { token: s.tokenMember, body: {} });
+  assert.equal(second.status, 409, second.body);
+  assert.equal(JSON.parse(second.body).error.code, 'TASK_ALREADY_CLAIMED');
+  cleanup(s.db, s.close, s.dataDir);
+});
+
+test('HTTP POST /api/tasks/:id/release 未登录 → 401', async () => {
+  const s = setup();
+  const { task } = seedWorkflow(s.db);
+  const res = await call(s.app, 'POST', `/api/tasks/${task.id}/release`, { body: {} });
+  assert.equal(res.status, 401, res.body);
+  cleanup(s.db, s.close, s.dataDir);
+});
+
+test('HTTP POST /api/tasks/:id/release 非领取人 → 403（谁领的谁放，不存在上级指派）', async () => {
+  const s = setup();
+  const { task } = seedWorkflow(s.db);
+  await call(s.app, 'POST', `/api/tasks/${task.id}/claim`, { token: s.tokenMember, body: {} });
+  const res = await call(s.app, 'POST', `/api/tasks/${task.id}/release`, { token: s.tokenOutsider, body: {} });
+  assert.equal(res.status, 403, res.body);
+  assert.equal(JSON.parse(res.body).error.code, 'NOT_CLAIM_HOLDER');
+  cleanup(s.db, s.close, s.dataDir);
+});
+
+test('HTTP POST /api/tasks/:id/complete 未登录 → 401', async () => {
+  const s = setup();
+  const { task } = seedWorkflow(s.db);
+  const res = await call(s.app, 'POST', `/api/tasks/${task.id}/complete`, { body: {} });
+  assert.equal(res.status, 401, res.body);
+  cleanup(s.db, s.close, s.dataDir);
+});
+
+test('HTTP POST /api/tasks/:id/complete 证据不合格 → 400；合格 → 200 done', async () => {
+  const s = setup();
+  const { task } = seedWorkflow(s.db);
+  await call(s.app, 'POST', `/api/tasks/${task.id}/claim`, { token: s.tokenMember, body: {} });
+  const bad = await call(s.app, 'POST', `/api/tasks/${task.id}/complete`, {
+    token: s.tokenMember, body: { evidence: { kind: 'runnable', summary: '做完了' } },
+  });
+  assert.equal(bad.status, 400, bad.body);
+  assert.equal(JSON.parse(bad.body).error.code, 'EVIDENCE_REQUIRED');
+  const good = await call(s.app, 'POST', `/api/tasks/${task.id}/complete`, {
+    token: s.tokenMember,
+    body: { evidence: { kind: 'runnable', summary: '原型跑通了', artifactUrl: 'https://example.com/repo', version: 'v1' } },
+  });
+  assert.equal(good.status, 200, good.body);
+  assert.equal(JSON.parse(good.body).task.status, 'done');
+  cleanup(s.db, s.close, s.dataDir);
+});
+
+test('HTTP GET /api/pools/{projects,talents,resources} 未登录 → 200 + 空集（列表三态）', async () => {
+  const s = setup();
+  for (const [path, key] of [
+    ['/api/pools/projects', 'projects'],
+    ['/api/pools/talents', 'talents'],
+    ['/api/pools/resources', 'resources'],
+  ]) {
+    const res = await call(s.app, 'GET', `${path}?editionId=ed_1`);
+    assert.equal(res.status, 200, res.body);
+    assert.deepEqual(JSON.parse(res.body)[key], [], `${path} 应返回空集`);
+  }
+  cleanup(s.db, s.close, s.dataDir);
+});
+
+test('HTTP POST /api/pools/sync 未登录 → 401', async () => {
+  const s = setup();
+  const res = await call(s.app, 'POST', '/api/pools/sync', { body: { editionId: 'ed_1' } });
+  assert.equal(res.status, 401, res.body);
+  cleanup(s.db, s.close, s.dataDir);
+});
+
+test('HTTP POST /api/pools/sync 缺 editionId → 400', async () => {
+  const s = setup();
+  const res = await call(s.app, 'POST', '/api/pools/sync', { token: s.tokenSuper, body: {} });
+  assert.equal(res.status, 400, res.body);
+  assert.equal(JSON.parse(res.body).error.code, 'EDITION_REQUIRED');
+  cleanup(s.db, s.close, s.dataDir);
+});
+
+test('HTTP POST /api/pools/sync 无 pool:write 权限 → 403（can() 是唯一判定入口）', async () => {
+  const s = setup();
+  const res = await call(s.app, 'POST', '/api/pools/sync', { token: s.tokenMember, body: { editionId: 'ed_1' } });
+  assert.equal(res.status, 403, res.body);
+  assert.equal(JSON.parse(res.body).error.code, 'FORBIDDEN');
+  cleanup(s.db, s.close, s.dataDir);
+});
+
+test('原文响应（__rawText）走 text() 而不是 json()', async () => {
+  const s = setup();
+  s.app.router.add('GET', '/api/test-raw', async () => ({
+    __rawText: true, body: 'BEGIN:VCALENDAR\r\nEND:VCALENDAR', contentType: 'text/calendar; charset=utf-8',
+  }));
+  const raw = await call(s.app, 'GET', '/api/test-raw');
+  assert.equal(raw.status, 200);
+  assert.equal(raw.body, 'BEGIN:VCALENDAR\r\nEND:VCALENDAR', '原文响应必须原样输出');
+  assert.equal(raw.headers['Content-Type'], 'text/calendar; charset=utf-8');
+  // 对照：普通 handler 仍走 JSON
+  const jsonRes = await call(s.app, 'GET', '/api/health');
+  assert.equal(jsonRes.headers['Content-Type'], 'application/json; charset=utf-8');
+  assert.equal(JSON.parse(jsonRes.body).ok, true);
+  cleanup(s.db, s.close, s.dataDir);
+});
+
+test('可见性过滤抛错 → 记 warning 并用严格投影兜底（fail-safe：宁可少给不可多给）', () => {
+  const { db, close, dataDir, rules } = setup();
+  const token = leaderboardToken(db);
+  // 只让 peerReview 这个键抛错：applyVisibility 读它时炸，
+  // 而 projectPublicRows 读的是 rank.publicFromTier（不炸）⇒ 兜底路径可被观测。
+  const boom = new Proxy({ rank: rules.visibility.rank }, {
+    get(target, prop) {
+      if (prop === 'peerReview') throw new Error('可见性配置炸了');
+      return target[prop];
+    },
+  });
+  const payload = getPublicLeaderboard({ db, token, editionId: 'ed_1', rules: { ...rules, visibility: boom }, now: NOW });
+  const w = payload.warnings.find((x) => x.code === 'visibility_filter_failed');
+  assert.ok(w, '过滤失败必须留 warning，不能静默');
+  assert.equal(payload.stages[0].rows.length, 1, '兜底后仍只给 C 段队伍（D 段照旧不公示）');
+  cleanup(db, close, dataDir);
+});
+
+test('HTTP GET /api/workflows/<不存在> 未登录 → 401（先判登录，不泄露工作流是否存在）', async () => {
+  const s = setup();
+  const res = await call(s.app, 'GET', '/api/workflows/wf_none/tasks');
+  assert.equal(res.status, 401, res.body);
+  cleanup(s.db, s.close, s.dataDir);
+});
+
+test('HTTP POST /api/workflows 未登录 → 401', async () => {
+  const s = setup();
+  const res = await call(s.app, 'POST', '/api/workflows', {
+    body: { editionId: 'ed_1', taskPackageId: 'tp_1', name: '工作流一' },
+  });
+  assert.equal(res.status, 401, res.body);
+  cleanup(s.db, s.close, s.dataDir);
+});
+
+test('HTTP POST /api/workflows 认领该任务包的队员 → 200（任务包 → 工作流）', async () => {
+  const s = setup();
+  const res = await call(s.app, 'POST', '/api/workflows', {
+    token: s.tokenMember, body: { editionId: 'ed_1', taskPackageId: 'tp_1', name: '工作流一' },
+  });
+  assert.equal(res.status, 200, res.body);
+  const payload = JSON.parse(res.body);
+  assert.equal(payload.workflow.task_package_id, 'tp_1');
+  assert.equal(payload.workflow.name, '工作流一');
+  cleanup(s.db, s.close, s.dataDir);
+});
+
+test('HTTP POST /api/workflows/:id/tasks 未登录 → 401', async () => {
+  const s = setup();
+  const { wf } = seedWorkflow(s.db);
+  const res = await call(s.app, 'POST', `/api/workflows/${wf.id}/tasks`, { body: { title: '任务一' } });
+  assert.equal(res.status, 401, res.body);
+  cleanup(s.db, s.close, s.dataDir);
+});
+
+test('HTTP POST /api/workflows/:id/tasks 指定 ownerTeamId → 落库（队伍归属明确）', async () => {
+  const s = setup();
+  const { wf } = seedWorkflow(s.db);
+  const res = await call(s.app, 'POST', `/api/workflows/${wf.id}/tasks`, {
+    token: s.tokenMember, body: { title: '任务二', ownerTeamId: 'tm_1' },
+  });
+  assert.equal(res.status, 200, res.body);
+  assert.equal(JSON.parse(res.body).task.owner_team_id, 'tm_1');
+  cleanup(s.db, s.close, s.dataDir);
+});
+
+test('HTTP POST /api/workflows/:id/tasks 队成员 → 200（工作流 → 任务清单）', async () => {
+  const s = setup();
+  const { wf } = seedWorkflow(s.db);
+  const res = await call(s.app, 'POST', `/api/workflows/${wf.id}/tasks`, {
+    token: s.tokenMember, body: { title: '任务一', detail: '细节' },
+  });
+  assert.equal(res.status, 200, res.body);
+  const payload = JSON.parse(res.body);
+  assert.equal(payload.task.title, '任务一');
+  assert.equal(payload.task.workflow_id, wf.id);
+  cleanup(s.db, s.close, s.dataDir);
+});
+
+test('HTTP GET /api/pools/projects 组委会 → 200 + 4 支队伍（限流与过滤参数生效）', async () => {
+  const s = setup();
+  await call(s.app, 'POST', '/api/pools/sync', { token: s.tokenSuper, body: { editionId: 'ed_1' } });
+  const res = await call(s.app, 'GET', '/api/pools/projects?editionId=ed_1', { token: s.tokenSuper });
+  assert.equal(res.status, 200, res.body);
+  assert.equal(JSON.parse(res.body).projects.length, 4);
+  cleanup(s.db, s.close, s.dataDir);
+});
+
+test('HTTP GET /api/pools/talents 组委会 → 200 + 个人积分（minPoints / userId 过滤生效）', async () => {
+  const s = setup();
+  await call(s.app, 'POST', '/api/pools/sync', { token: s.tokenSuper, body: { editionId: 'ed_1' } });
+  const all = await call(s.app, 'GET', '/api/pools/talents?editionId=ed_1', { token: s.tokenSuper });
+  assert.equal(all.status, 200, all.body);
+  const talents = JSON.parse(all.body).talents;
+  assert.equal(talents.length, 1);
+  assert.equal(talents[0].userId, 'u_a');
+  assert.equal(talents[0].totalPoints, 10);
+  const none = await call(s.app, 'GET', '/api/pools/talents?editionId=ed_1&minPoints=100', { token: s.tokenSuper });
+  assert.deepEqual(JSON.parse(none.body).talents, []);
+  const other = await call(s.app, 'GET', '/api/pools/talents?editionId=ed_1&userId=nobody', { token: s.tokenSuper });
+  assert.deepEqual(JSON.parse(other.body).talents, []);
+  cleanup(s.db, s.close, s.dataDir);
+});
+
+test('HTTP GET /api/pools/resources 组委会 → 200 + 企业侧资源（kind 过滤生效）', async () => {
+  const s = setup();
+  await call(s.app, 'POST', '/api/pools/sync', { token: s.tokenSuper, body: { editionId: 'ed_1' } });
+  const res = await call(s.app, 'GET', '/api/pools/resources?editionId=ed_1', { token: s.tokenSuper });
+  assert.equal(res.status, 200, res.body);
+  const resources = JSON.parse(res.body).resources;
+  assert.equal(resources.length, 1);
+  assert.equal(resources[0].kind, 'enterprise_brief');
+  const none = await call(s.app, 'GET', '/api/pools/resources?editionId=ed_1&kind=free_brief', { token: s.tokenSuper });
+  assert.deepEqual(JSON.parse(none.body).resources, []);
+  cleanup(s.db, s.close, s.dataDir);
+});
+
+test('HTTP POST /api/pools/sync 缺 editionId（且无 pool:write）→ 400（先判参数，再判权限）', async () => {
+  const s = setup();
+  const res = await call(s.app, 'POST', '/api/pools/sync', { token: s.tokenMember, body: {} });
+  assert.equal(res.status, 400, res.body);
+  assert.equal(JSON.parse(res.body).error.code, 'EDITION_REQUIRED');
+  cleanup(s.db, s.close, s.dataDir);
+});
+
+test('HTTP POST /api/pools/sync 的 editionId 也可以走 query 参数', async () => {
+  const s = setup();
+  const res = await call(s.app, 'POST', '/api/pools/sync?editionId=ed_1', { token: s.tokenSuper, body: {} });
+  assert.equal(res.status, 200, res.body);
+  assert.equal(JSON.parse(res.body).projects.editionId, 'ed_1');
+  cleanup(s.db, s.close, s.dataDir);
+});
+
+test('HTTP POST /api/pools/sync 三池都同步（项目 / 人才 / 资源）', async () => {
+  const s = setup();
+  const res = await call(s.app, 'POST', '/api/pools/sync', { token: s.tokenSuper, body: { editionId: 'ed_1' } });
+  assert.equal(res.status, 200, res.body);
+  const payload = JSON.parse(res.body);
+  assert.equal(payload.projects.total, 4, '4 支队（幽灵队也在内）进项目池');
+  assert.equal(payload.talents.total, 1, '有积分流水的人进人才池');
+  assert.equal(payload.resources.total, 1);
+  cleanup(s.db, s.close, s.dataDir);
+});
+
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
 
-Run: `cd platform && node --test test/public-api.test.js`
+Run: `cd platform && node --disable-warning=ExperimentalWarning --test test/public-api.test.js`
 Expected: FAIL —— `Cannot find module '../src/services/public-api.js'`
 
 - [ ] **Step 3: 创建 `src/services/public-api.js`**
@@ -5136,11 +5662,11 @@ function projectPublicRows(rows, rules, warnings, stageId) {
 // src/http/routes/workflow.js — 任务清单 API
 // 依据：INTERFACES.md §6 的 P5 API 清单；R-OPS-13 / R-OPS-14
 // ⛔ R-OPS-14：禁止岗位制，任务只能自主领取 —— 这里【没有】任何"按岗位分配任务"的端点。
-import { appError } from '../errors.js';
+import { appError } from '../../errors.js';
 import {
   createWorkflow, createWorkflowTask, listWorkflowTasks,
   claimTask, releaseTask, completeTask,
-} from '../services/workflow.js';
+} from '../../services/workflow.js';
 
 export function registerWorkflowRoutes(router, { db, rules }) {
   router.add('GET', '/api/workflows/:id/tasks', async ({ user, params }) => {
@@ -5205,12 +5731,12 @@ export function registerWorkflowRoutes(router, { db, rules }) {
 // src/http/routes/pools.js — 三池只读 API + 同步
 // 依据：INTERFACES.md §6 的 P5 API 清单；R-POOL-01/02/03/04
 // ⚠️ 一期【不做三池前台页面】（设计文档 §1.2）：这里只提供只读 API 与同步入口。
-import { appError } from '../errors.js';
-import { can } from '../auth/permissions.js';
+import { appError } from '../../errors.js';
+import { can } from '../../auth/permissions.js';
 import {
   syncPoolProjects, syncPoolTalents, syncPoolResources,
   listPoolProjects, listPoolTalents, listPoolResources,
-} from '../services/pools.js';
+} from '../../services/pools.js';
 
 export function registerPoolsRoutes(router, { db, rules }) {
   router.add('GET', '/api/pools/projects', async ({ user, query }) => ({
@@ -5269,7 +5795,7 @@ export function registerPoolsRoutes(router, { db, rules }) {
 // src/http/routes/public.js — 公开接口（无需登录，token 鉴权）
 // 依据：INTERFACES.md §6 的 P5 API 清单
 // ⚠️ token 走 query 参数（契约如此）：部署时应在 nginx 层关掉 query 串的访问日志（P6 负责）。
-import { getPublicLeaderboard } from '../services/public-api.js';
+import { getPublicLeaderboard } from '../../services/public-api.js';
 
 export function registerPublicRoutes(router, { db, rules }) {
   router.add('GET', '/api/public/leaderboard', async ({ query }) =>
@@ -5388,22 +5914,22 @@ import { registerPublicRoutes } from './http/routes/public.js';
 
 - [ ] **Step 8: 运行测试确认通过**
 
-Run: `cd platform && node --test test/public-api.test.js`
-Expected: PASS（10 个测试全过：public-api.test.js 10）
+Run: `cd platform && node --disable-warning=ExperimentalWarning --test test/public-api.test.js`
+Expected: PASS（**55** 个测试全过：public-api.test.js 55）
 
-Run: `cd platform && node --test`
-Expected: 全部通过（P0–P5 累计）
+Run: `cd platform && node --disable-warning=ExperimentalWarning --test`
+Expected: 全部通过（P0–P5 累计：**1076** 例 / 通过 1075 / 失败 0 / 跳过 1）
 
 - [ ] **Step 9: 提交**
 
 ```bash
-cd platform && git add src/services/public-api.js src/http/routes src/server.js test/public-api.test.js
-git commit -m "feat(P5): 公开榜单 API（token 鉴权 + 显式可见性过滤）与 P5 路由挂载
-
-对应 R-RNK-04 / R-RNK-10 / R-POOL-01~04：
-- 无 token / 过期 / 跨届期 / scope 不符一律 403
-- 公开响应显式过 applyVisibility + 字段白名单投影，D 段队伍不公示
-- 补齐任务清单与三池的 HTTP 入口"
+git add platform/src/services/public-api.js platform/src/http/routes/workflow.js \
+  platform/src/http/routes/pools.js platform/src/http/routes/public.js \
+  platform/src/server.js platform/test/public-api.test.js
+git commit -m "feat(P5): 公开榜单 API（token 鉴权 + 显式可见性过滤）与 P5 路由挂载" -- \
+  platform/src/services/public-api.js platform/src/http/routes/workflow.js \
+  platform/src/http/routes/pools.js platform/src/http/routes/public.js \
+  platform/src/server.js platform/test/public-api.test.js
 ```
 
 ---
@@ -7044,3 +7570,128 @@ test('computePersonalPoints：无 userId 的条目不参与累加；口径外的
 | `platform/test/leaderboard-migration.test.js` | Modify（P3） | `rules.points.personal` 的 deepEqual 跟随新键 |
 | `docs/superpowers/plans/INTERFACES.md` | Modify | §4 的 `rules/points.json` 示例 + 一段说明（口径唯一化） |
 | `docs/superpowers/plans/2026-10-20-platform-P5-workflow-pools.md` | Modify | 计划代码块逐字回写 + 本章台账 |
+
+---
+
+## P5 Task 4 实施台账（2026-10-21）
+
+> 执行者：P5 Task 4 实现 Agent。**规格 = 本计划 Task 4 章节**（唯一权威）。
+> 本台账记六件事：① 实施方法（先跑后派）；② 实跑发现的规格缺陷与处置；③ 逐字回写位置；
+> ④ 实跑证据；⑤ 变异检验；⑥ 计划块逐字核验；⑦ 遗留需上游注意。
+> **落盘文件与本计划 Task 4 的代码块逐字一致**（核验脚本见 T4-F）。
+
+### T4-A 实施方法（先跑后派：规格改动必须先在独立工程实跑通过）
+
+| 步骤 | 动作 | 证据 |
+|---|---|---|
+| A-1 | 把 Task 4 的 **11 个围栏代码块**抽到独立工程 `/tmp/p5-t4/`（`extract.mjs` 按块号落盘，保留计划行号） | `/tmp/p5-t4/blocks/00..10-*.txt` |
+| A-2 | 独立工程 = `cp -R` worktree 的 `platform/` ⇒ `/tmp/p5-t4/platform`（**不在仓库里试错**） | — |
+| A-3 | **Step 2 期望失败实跑**：只落测试块 → `node --test test/public-api.test.js` | `ERR_MODULE_NOT_FOUND: .../src/services/public-api.js`（与计划 Expected 逐字一致） |
+| A-4 | 落 4 个实现块 + 按计划改 `server.js`（3 处） | 见 T4-B 的实跑缺陷 |
+| A-5 | 规格缺陷**先在独立工程里修好并跑通**，再把修正内容**逐字回写**计划对应代码块 | T4-C |
+| A-6 | 独立工程全量绿后，才把文件落进 worktree | `/tmp/p5-t4/platform` → worktree |
+| A-7 | 变异检验在 **`cp -R` 副本** `/tmp/p5-mutate/work` 上跑（变异会改文件 ⇒ 绝不能污染 worktree）；变异脚本**不进仓库** | `/tmp/p5-mutate/t4.mjs` |
+
+> ⛔ **A-3 的顺序纪律**：先跑「Step 2 期望失败」，再落实现 —— 否则「测试通过」不能证明
+> 「测试对被测行为有判别力」。
+
+### T4-B 规格缺陷清单
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| T4-C1 | **Important** | 三个路由文件的**相对导入深度错了一层**：计划写 `from '../errors.js'`，但文件在 `src/http/routes/` ⇒ 解析到 `src/http/errors.js`（不存在）。同款错误还有 `'../auth/permissions.js'`、`'../services/*.js'` | 把计划块**逐字**落盘后跑 `node --test test/server.test.js` 当场红：`Error [ERR_MODULE_NOT_FOUND]: Cannot find module '/private/tmp/p5-t4/platform/src/http/errors.js' imported from .../src/http/routes/workflow.js` | 改为 `../../errors.js` / `../../auth/permissions.js` / `../../services/*.js`（与 P1/P2 既有路由文件 `src/http/routes/team.js:3-6` **逐字同款**）；**回写计划三个路由块** |
+| T4-C2 | **Important** | 计划的测试块**只覆盖服务层**（10 例）⇒ 本 Task 新建的 **3 个路由文件 + `server.js` 的原文响应分支零覆盖**（与 Task 1 的 T1-1 C-1 同款病根：机制写下来了，测试却没接线） | 变异检验实测：路由与 `server.js` 的变异体若不补测将**全体存活**；实测「`__rawText` 分支删掉」在原 10 例下**测试全绿** | 补测：测试块 **10 → 55 例**（服务层 25 例 + HTTP 层 30 例）。补的判别性数据：段位记录 `tr_0`(更早,活) / `tr_1` / `tr_3`(更晚,**软删除**)、`points_ledger` 一行、三个能力点、组委会超管账号 |
+| T4-C3 | Minor | Step 9 的提交命令**没有 `-- <paths…>` 显式路径**，且 `git add` 给了**目录**（`src/http/routes`）而不是文件 | 本项目提交纪律（见 T1-1 C-8） | 改为逐文件显式路径 + `--` |
+| T4-C4 | Minor | Step 2 / Step 8 的测试命令缺 `--disable-warning=ExperimentalWarning`（`package.json` 四个 scripts 都带这个 flag，计划里是旧口径） | — | 两处补上 |
+| T4-C5 | Minor | Step 8 的 Expected 写「10 个测试全过」，与补测后的实际数字不符 | 实跑 55 例 / 全量 1076 例 | 回写为 `55` / `1076`（见 T4-C 的逐字回写位置） |
+| T4-C6 | Minor（知悉） | `server.js` 的「原文引用」块（4 行：`const result = …` + I7-4 三行）在插入 `__rawText` 段后**按设计不再连续出现在实现里** | 计划自己的措辞是「**找到**下面这段**原文**」⇒ 它是**定位锚点**；紧随其后的「插入后该段应是」（19 行）才是逐字契约 | **不改计划**：19 行块已逐字命中（见 T4-F）。父代理评审时不必把 4 行块的「不命中」当缺陷 |
+
+> **编号说明**：本 Task 的台账条目一律用 `T4-C*` 前缀（Task 1 用裸 `C-*`、Task 2 用 `T2-C*`、
+> Task 3 用 `T3-C*`、Task 3 修复轮用 `T3R-C*`）⇒ **不重号**。
+
+### T4-C 逐字回写位置（计划文档 → 实际文件）
+
+| 计划的代码块 | 实际文件 | 回写内容 |
+|---|---|---|
+| Task 4 Step 1 的测试块（计划行 4732 起） | `platform/test/public-api.test.js` | 整块替换为 55 例（10 例原文**逐字保留** + 45 例新增）；种子补 3 行（`tr_0` / `tr_3` / `points_ledger`）与 2 条夹具（能力点、组委会超管） |
+| Task 4 Step 3 的服务块（计划行 5443 起） | `platform/src/services/public-api.js` | **逐字未改**（实跑无缺陷） |
+| Task 4 Step 4 的路由块（计划行 5661 起） | `platform/src/http/routes/workflow.js` | 仅改 2 行导入深度（`../` → `../../`） |
+| Task 4 Step 5 的路由块（计划行 5730 起） | `platform/src/http/routes/pools.js` | 仅改 3 行导入深度 |
+| Task 4 Step 6 的路由块（计划行 5794 起） | `platform/src/http/routes/public.js` | 仅改 1 行导入深度 |
+| Task 4 Step 7 的 3 个 `server.js` 片段 | `platform/src/server.js` | **逐字未改**（实测插入点全部命中；I7-4 块整段保留） |
+| Task 4 Step 2 / Step 8 / Step 9 的文字 | 计划正文 | 补 `--disable-warning=ExperimentalWarning`；Expected 数字回写；提交命令补 `--` 与显式路径 |
+
+### T4-D 实跑证据
+
+| 环节 | 命令 | 结果 |
+|---|---|---|
+| Step 2 期望失败 | `cd platform && node --disable-warning=ExperimentalWarning --test test/public-api.test.js` | `ERR_MODULE_NOT_FOUND`（`/…/src/services/public-api.js`）✅ 与计划 Expected 逐字一致 |
+| 本 Task 单文件 | `cd platform && node --disable-warning=ExperimentalWarning --test test/public-api.test.js` | **55 例 / 通过 55 / 失败 0 / 跳过 0** |
+| **全量** | `cd platform && node --disable-warning=ExperimentalWarning --test` | **1076 例 / 通过 1075 / 失败 0 / 跳过 1**（跳过的 1 例是 P0–P4 既有的） |
+| 禁用表述扫描 | `cd platform && node scripts/audit-scan.js; echo "退出码=$?"` | **退出码 0**（扫描 152 个文件，11 条词条，未发现禁用表述） |
+| 计划块核验 | `node /tmp/p3fix/plan-blocks.mjs <计划> platform` | Task 4 的 5 个整文件块全部 `✅一致`；`src/server.js` 为 `片段块（实现含此片段）` |
+| 片段核验 | `node /tmp/p4-proof/fragment-check.mjs <计划> platform <6 个文件>` | `核验 6 个片段块，不一致 0 个` |
+
+> ⚠️ 唯一一处「整文件块❌不一致」是 `web/app.js`（计划行 6661，Task 6 的 1 行片段）——
+> **本 Task 之前就已存在**（用改前备份 `plan-blocks.mjs` 复跑确认同样报不一致），**与本 Task 无关**。
+
+### T4-E 变异检验（`/tmp/p5-mutate/t4.mjs`，**不进仓库**）
+
+**69 个变异体 → 杀 60 / 真等价 3 / 不可观测 6 / 缺口 0**（锚点命中 0 次的 0 个；命中次数 ≠ 1 的 0 个）。
+
+| 类别 | 编号 | 为什么能判成这一类（**必须有探针差分实证**） |
+|---|---|---|
+| **真等价**（3） | T4-M43 | `filterOk = false` → `true`：catch 分支里 `visibleRows` 恒为 `null` ⇒ `if (filterOk && visibleRows)` 两边都假 ⇒ 标志位**恒为冗余**，任何输入都不可分辨 |
+| | T4-M44 | `if (Array.isArray(visible.teams)) return visible.teams;` → 删掉：P3 的 `applyVisibility` **恒**返回 `out.rows` ⇒ 该分支是**死代码**（保留作形状变化的防御） |
+| | T4-M68 | `registerWorkflowRoutes(router, { db, rules })` → `{ db }`：`workflow.js` 的路由**根本不用** `rules` ⇒ 参数未被读取 |
+| **不可观测**（6）<br>（当前配置/测试集下测不出，但**见证探针证明它会改变行为**） | T4-M29 | `?? 'C'` → `?? 'D'`：`validateRules` **强制** `visibility.rank.publicFromTier` 必填 ⇒ 兜底在正常配置下不可达；**见证**（放宽校验器 + 删掉该键）⇒ 隐藏队伍数 `2` vs `1` |
+| | T4-M31 | 段位未知兜底 `-1` → `0`：**见证**（把门槛降到 `'D'`）⇒ 隐藏队伍数不同（`-1` 是 fail-closed 兜底，**不要**改成 `0`） |
+| | T4-M39 | 删掉「身份集合求交」：**见证**（让 P3 的 `scope='rank'` 分支开始删行）⇒ 公开行数 `0` vs `1` |
+| | T4-M40 | `extractRows` 的 `return visible.rows` → `return raw.rows`：**见证**（同上）⇒ 公开行数 `0` vs `1` |
+| | T4-M60 | `syncPoolProjects({ db, editionId, rules })` → 不传 rules：**见证**（`packageStatusFilter` 改成非空）⇒ 项目标题 `一队` vs `零售风控助手` |
+| | T4-M69 | `registerPoolsRoutes(router, { db, rules })` → `{ db }`：**见证**（同上）⇒ 同步结果不同 |
+| **杀死**（60） | T4-M01…M67 中其余 60 个 | 覆盖：token 只存哈希 / 四种 403 / 缺规则 500 / 缺 editionId 400 / scope 白名单 / TTL 推算 / 段位下限与 fail-closed / 字段白名单投影 / warning / 赛段元信息 / 可见性过滤抛错兜底 / 三个路由文件的每条分支 / `__rawText` 原文响应 / 路由挂载 |
+
+**探针差分方法**（`/tmp/p5-mutate/probe.mjs`）：对「全绿但存活」的变异体，跑一个**全表面快照**
+（公开榜单 + 5 条公开/工作流/三池 HTTP 调用），归一化掉时间戳与 UUID 后与基线**逐字节**比较；
+相同 ⇒ 等价/不可观测，不同 ⇒ 存活（要归类）。**见证脚本** `/tmp/p5-mutate/t4-witness.mjs`：
+对判为「不可观测」的 6 个变异体，**再叠加一个场景改动**（放宽配置校验 / 改门槛 / 让 P3 删行 /
+改 `packageStatusFilter`），证明 base ≠ mutant ⇒ 它们**不是逻辑等价**，只是当前空间测不出。
+**见证成立 6 / 6**。
+
+### T4-F 计划块逐字核验
+
+| 文件 | 核验结果 |
+|---|---|
+| `platform/test/public-api.test.js` | 整文件块 ✅一致（701 行） |
+| `platform/src/services/public-api.js` | 整文件块 ✅一致（213 行） |
+| `platform/src/http/routes/workflow.js` | 整文件块 ✅一致（64 行） |
+| `platform/src/http/routes/pools.js` | 整文件块 ✅一致（59 行） |
+| `platform/src/http/routes/public.js` | 整文件块 ✅一致（14 行） |
+| `platform/src/server.js` | 片段块（导入段 / 挂载段 / `__rawText` 插入段 / 插入后整段）**逐字命中**；I7-4 块整段保留、未被删改 |
+
+### T4-G 遗留需上游注意
+
+| # | 事项 | 说明 |
+|---|---|---|
+| G-1 | **「身份集合求交」在 P3 当前实现下是空操作** | P3 的 `scope='rank'` 分支**只剔字段、不删行** ⇒ `visible.rows` 与 `raw.rows` 的身份集合恒等 ⇒ 公开榜里的求交过滤不产生任何差异（T4-M39 见证）。它是**纵深防御**：P3 一旦改成会删行，求交立刻生效。**不要**因为「看起来没用」就删掉它 |
+| G-2 | `projectPublicRows` 的 `?? 'C'` 兜底**在正常配置下不可达** | `validateRules` 强制 `visibility.rank.publicFromTier` 必填 ⇒ 兜底只在「绕过 `loadRules` 手搓 rules」时生效。它是那时的 fail-closed 保护，**不要**改成 `'D'` |
+| G-3 | `extractRows` 的 `visible.teams` 分支是**死代码** | 保留作形状变化的防御；**不要**当它有效，也不要在没有 P3 形状变更证据时删它 |
+| G-4 | **`registerXRoutes` 有两套参数风格并存** | P5 的三个路由用**位置参数** `registerXRoutes(router, { db, rules })`（与计划的 Step 7 一致）；P1 的五个路由用**对象参数** `registerXRoutes({ router, db, rules })`。本 Task **按计划逐字实现**，未擅自统一。若上游要统一口径，**建议在 P5 收尾时统一**（会动 P1–P4 的 5 个路由文件） |
+| G-5 | 公开 token 走 **query 串**（契约如此） | 部署时须在 nginx 层关掉 query 串访问日志（P6 负责）；否则 token 会落进访问日志 |
+| G-6 | `pool:write` 目前**只由 admin 角色**授予 | `POST /api/pools/sync` 的 `can()` 判定走 `scopeType:'edition'`；非 admin 用户即便被授予 `pool:write`，也需带 `scopeId=editionId` 才通过 |
+| G-7 | Task 5 可直接用 `__rawText` | `server.js` 的原文响应分支已挂好并有测试（`原文响应（__rawText）走 text() 而不是 json()`）⇒ Task 5 只需在 `src/http/routes/public.js` 追加 `GET /api/public/calendar.ics` 路由并返回 `{ __rawText: true, body, contentType }` |
+| G-8 | `public_tokens.token` 无 `NOT NULL` | Task 1 台账 T1-1 C-6 已登记（沿用 P0–P4 约定），本 Task 未单点偏离 |
+| G-9 | 公开榜的**段位门槛**目前是**双写**的 | `rules.visibility.rank.publicFromTier` 同时被 P3 的 `scope='tier'` 分支与 P5 的 `projectPublicRows` 读取；两者读的是**同一个**配置键 ⇒ 当前不会漂移。若将来 P3 改用自己的段位表，两层口径会分叉（P3 段位表是 `DEFAULT_TIER_ORDER = ['D','C','B','A','S']`，P5 用 `rules.ranks.tiers` 的顺序）⇒ **建议上游确认这两张表恒等** |
+
+### T4-H 本 Task 改动的文件清单
+
+| 文件 | 性质 | 说明 |
+|---|---|---|
+| `platform/src/services/public-api.js` | **新建**（P5） | `createPublicToken` / `resolvePublicToken` / `getPublicLeaderboard` / `PUBLIC_NOTICE` / `hashPublicToken` |
+| `platform/src/http/routes/workflow.js` | **新建**（P5） | 任务清单 API 6 条（建工作流 / 建任务 / 列任务 / 领取 / 释放 / 完成） |
+| `platform/src/http/routes/pools.js` | **新建**（P5） | 三池只读 API 3 条 + 同步 1 条 |
+| `platform/src/http/routes/public.js` | **新建**（P5） | 公开榜单 1 条（无需登录，token 鉴权） |
+| `platform/src/server.js` | Modify（P0 建立，**本 Task 只追加**） | 导入段 + 3 条路由挂载 + `__rawText` 原文响应分支；I7-4 块**整段保留** |
+| `platform/test/public-api.test.js` | **新建**（P5） | 55 例（服务层 25 + HTTP 层 30） |
+| `docs/superpowers/plans/2026-10-20-platform-P5-workflow-pools.md` | Modify | Task 4 代码块逐字回写 + 本章台账 |
