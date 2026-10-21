@@ -48,26 +48,26 @@
 
 | 需求 | 一句话 | 状态 | 落地（阶段·Task） | 落地文件 | 怎么验 |
 |---|---|---|---|---|---|
-| **R-REG-01** | 报名即认领任务包 | ✅ 已落地 | P0·Task 3 规则配置与 fail-fast 校验<br>P1·Task 1 报名数据模型与迁移<br>P1·Task 3 报名服务与 API<br>P1·Task 5 战队与成员管理<br>P1·Task 6 前端三页 | `platform/db/migrations/002_registration.sql`<br>`platform/src/config.js`<br>`platform/src/db/repo/teams.js`<br>`platform/src/services/registration.js`<br>…共 6 个文件 | `P1-1` 报名分级三个边界<br>`P1-3` 重复报名 409 且不覆盖<br>`P1-5` 组队三条硬门槛<br>…共 23 条 |
-| **R-REG-02** | 组队下限 2 人，不接受 1 人 | ✅ 已落地 | P0·Task 3 规则配置与 fail-fast 校验<br>P1·Task 1 报名数据模型与迁移<br>P1·Task 5 战队与成员管理 | `platform/db/migrations/002_registration.sql`<br>`platform/src/config.js`<br>`platform/src/services/team.js` | `P1-3` 重复报名 409 且不覆盖<br>`P1-5` 组队三条硬门槛<br>`P1-10` 全链路 + 零依赖<br>…共 20 条 |
+| **R-REG-01** | 报名即认领任务包 | ✅ 已落地 | P0·Task 3 规则配置与 fail-fast 校验<br>P1·Task 1 报名数据模型与迁移<br>P1·Task 3 报名服务与 API<br>P1·Task 5 战队与成员管理<br>P1·Task 6 前端三页 | `platform/db/migrations/002_registration.sql`<br>`platform/src/config.js`<br>`platform/src/db/repo/teams.js`<br>`platform/src/services/registration.js`<br>…共 6 个文件 | `P1-1` 报名分级三个边界<br>`P1-3` 重复报名 409 且不覆盖<br>`P1-5` 组队三条硬门槛<br>…共 24 条 |
+| **R-REG-02** | 组队下限 2 人，不接受 1 人 | ✅ 已落地 | P0·Task 3 规则配置与 fail-fast 校验<br>P1·Task 1 报名数据模型与迁移<br>P1·Task 5 战队与成员管理 | `platform/db/migrations/002_registration.sql`<br>`platform/src/config.js`<br>`platform/src/services/team.js` | `P1-3` 重复报名 409 且不覆盖<br>`P1-5` 组队三条硬门槛<br>`P1-10` 全链路 + 零依赖<br>…共 21 条 |
 | **R-REG-03** | 赛程中成员可持续招募汰换 | ✅ 已落地 | P1·Task 1 报名数据模型与迁移<br>P1·Task 5 战队与成员管理<br>P1·Task 6 前端三页 | `platform/db/migrations/002_registration.sql`<br>`platform/src/db/repo/teamMembers.js`<br>`platform/src/services/team.js`<br>`platform/web/views/team.js` | `P1-5` 组队三条硬门槛<br>`P1-10` 全链路 + 零依赖<br>`P0-12` 终审 8 条 Minor 逐条处置<br>…共 6 条 |
-| **R-REG-04** | 仅剩 1 人时触发并队 | ✅ 已落地 | P0·Task 3 规则配置与 fail-fast 校验<br>P1·Task 1 报名数据模型与迁移<br>P1·Task 5 战队与成员管理<br>P1·Task 6 前端三页 | `platform/db/migrations/002_registration.sql`<br>`platform/src/config.js`<br>`platform/src/db/repo/teamMembers.js`<br>`platform/src/services/team.js`<br>…共 5 个文件 | `P1-3` 重复报名 409 且不覆盖<br>`P1-5` 组队三条硬门槛<br>`P1-10` 全链路 + 零依赖<br>…共 22 条 |
-| **R-REG-05** | 组长资格硬门槛 | ✅ 已落地 | P0·Task 3 规则配置与 fail-fast 校验<br>P1·Task 1 报名数据模型与迁移<br>P1·Task 5 战队与成员管理 | `platform/db/migrations/002_registration.sql`<br>`platform/src/config.js`<br>`platform/src/services/team.js` | `P1-3` 重复报名 409 且不覆盖<br>`P1-5` 组队三条硬门槛<br>`P1-10` 全链路 + 零依赖<br>…共 20 条 |
+| **R-REG-04** | 仅剩 1 人时触发并队 | ✅ 已落地 | P0·Task 3 规则配置与 fail-fast 校验<br>P1·Task 1 报名数据模型与迁移<br>P1·Task 5 战队与成员管理<br>P1·Task 6 前端三页 | `platform/db/migrations/002_registration.sql`<br>`platform/src/config.js`<br>`platform/src/db/repo/teamMembers.js`<br>`platform/src/services/team.js`<br>…共 5 个文件 | `P1-3` 重复报名 409 且不覆盖<br>`P1-5` 组队三条硬门槛<br>`P1-10` 全链路 + 零依赖<br>…共 23 条 |
+| **R-REG-05** | 组长资格硬门槛 | ✅ 已落地 | P0·Task 3 规则配置与 fail-fast 校验<br>P1·Task 1 报名数据模型与迁移<br>P1·Task 5 战队与成员管理 | `platform/db/migrations/002_registration.sql`<br>`platform/src/config.js`<br>`platform/src/services/team.js` | `P1-3` 重复报名 409 且不覆盖<br>`P1-5` 组队三条硬门槛<br>`P1-10` 全链路 + 零依赖<br>…共 21 条 |
 | **R-REG-06** | 报名筛选 3 维 100 分 | ✅ 已落地 | P1·Task 2 报名算分分级纯函数<br>P1·Task 3 报名服务与 API | `platform/src/domain/registration.js`<br>`platform/src/services/registration.js` | `P1-1` 报名分级三个边界<br>`P1-3` 重复报名 409 且不覆盖<br>`P1-10` 全链路 + 零依赖 |
 | **R-REG-07** | 总分→等级阈值 80/60/40 | ✅ 已落地 | P1·Task 2 报名算分分级纯函数<br>P1·Task 3 报名服务与 API | `platform/src/domain/registration.js`<br>`platform/src/services/registration.js` | `P1-1` 报名分级三个边界<br>`P1-3` 重复报名 409 且不覆盖<br>`P1-10` 全链路 + 零依赖 |
 | **R-REG-08** | C 级不接收 | ✅ 已落地 | P1·Task 2 报名算分分级纯函数<br>P1·Task 3 报名服务与 API<br>P1·Task 5 战队与成员管理 | `platform/src/domain/registration.js`<br>`platform/src/services/registration.js`<br>`platform/src/services/team.js` | `P1-1` 报名分级三个边界<br>`P1-3` 重复报名 409 且不覆盖<br>`P1-5` 组队三条硬门槛<br>…共 4 条 |
 | **R-REG-09** | 筛选标准对外透明 | ✅ 已落地 | P1·Task 2 报名算分分级纯函数<br>P1·Task 3 报名服务与 API<br>P1·Task 6 前端三页 | `platform/src/domain/registration.js`<br>`platform/src/http/routes/registration.js`<br>`platform/src/services/registration.js`<br>`platform/web/views/admin-registration.js`<br>…共 5 个文件 | `P1-1` 报名分级三个边界<br>`P1-3` 重复报名 409 且不覆盖<br>`P1-10` 全链路 + 零依赖 |
-| **R-REG-10** | 5 阶段筛选漏斗 | ✅ 已落地 | P0·Task 3 规则配置与 fail-fast 校验<br>P1·Task 2 报名算分分级纯函数<br>P1·Task 3 报名服务与 API<br>P1·Task 6 前端三页 | `platform/rules/registration-scoring.json`<br>`platform/src/config.js`<br>`platform/src/http/routes/registration.js`<br>`platform/web/views/admin-registration.js` | `P1-1` 报名分级三个边界<br>`P1-3` 重复报名 409 且不覆盖<br>`P1-5` 组队三条硬门槛<br>…共 20 条 |
-| **R-REG-11** | 问卷字段设计 | ✅ 已落地 | P0·Task 3 规则配置与 fail-fast 校验<br>P1·Task 2 报名算分分级纯函数 | `platform/src/config.js`<br>`platform/src/domain/registration.js` | `P0-6` 登录闭环<br>`P0-10` 修复轮 3 的安全边界<br>`P0-11` 终审 Important 三项（I-A / I-B / I-C）<br>…共 20 条 |
+| **R-REG-10** | 5 阶段筛选漏斗 | ✅ 已落地 | P0·Task 3 规则配置与 fail-fast 校验<br>P1·Task 2 报名算分分级纯函数<br>P1·Task 3 报名服务与 API<br>P1·Task 6 前端三页 | `platform/rules/registration-scoring.json`<br>`platform/src/config.js`<br>`platform/src/http/routes/registration.js`<br>`platform/web/views/admin-registration.js` | `P1-1` 报名分级三个边界<br>`P1-3` 重复报名 409 且不覆盖<br>`P1-5` 组队三条硬门槛<br>…共 21 条 |
+| **R-REG-11** | 问卷字段设计 | ✅ 已落地 | P0·Task 3 规则配置与 fail-fast 校验<br>P1·Task 2 报名算分分级纯函数 | `platform/src/config.js`<br>`platform/src/domain/registration.js` | `P0-6` 登录闭环<br>`P0-10` 修复轮 3 的安全边界<br>`P0-11` 终审 Important 三项（I-A / I-B / I-C）<br>…共 21 条 |
 
 ### 模块二 · 赛段与交付物（Stage）
 
 | 需求 | 一句话 | 状态 | 落地（阶段·Task） | 落地文件 | 怎么验 |
 |---|---|---|---|---|---|
-| **R-STG-01** | 5 赛段时间轴与交付物 | ✅ 已落地 | P0·Task 3 规则配置与 fail-fast 校验<br>P1·Task 1 报名数据模型与迁移<br>P1·Task 3 报名服务与 API | `platform/db/migrations/002_registration.sql`<br>`platform/rules/schedule.json`<br>`platform/src/config.js`<br>`platform/src/http/routes/registration.js` | `P1-1` 报名分级三个边界<br>`P1-3` 重复报名 409 且不覆盖<br>`P1-5` 组队三条硬门槛<br>…共 21 条 |
+| **R-STG-01** | 5 赛段时间轴与交付物 | ✅ 已落地 | P0·Task 3 规则配置与 fail-fast 校验<br>P1·Task 1 报名数据模型与迁移<br>P1·Task 3 报名服务与 API | `platform/db/migrations/002_registration.sql`<br>`platform/rules/schedule.json`<br>`platform/src/config.js`<br>`platform/src/http/routes/registration.js` | `P1-1` 报名分级三个边界<br>`P1-3` 重复报名 409 且不覆盖<br>`P1-5` 组队三条硬门槛<br>…共 22 条 |
 | **R-STG-02** | 赛段排名积分 10/8/5 | ✅ 已落地 | P3·Task 3 名次积分 + MVP + 个人积分 | `platform/src/domain/points.js` | `P3-2` 名次积分写死 10/8/5<br>`P5-2` **同一任务不能被两人同时领取**<br>`P5-5` 三池同步幂等<br>…共 5 条 |
 | **R-STG-03** | 里程碑清单报名时固定 | ✅ 已落地 | P1·Task 1 报名数据模型与迁移<br>P1·Task 5 战队与成员管理<br>P3·Task 7 榜单服务 + 战绩卡 + API<br>P5·Task 2 任务清单与自主领取 | `platform/db/migrations/002_registration.sql`<br>`platform/src/db/repo/tiers.js`<br>`platform/src/services/team.js`<br>`platform/src/services/workflow.js` | `P1-5` 组队三条硬门槛<br>`P1-10` 全链路 + 零依赖<br>`P5-2` **同一任务不能被两人同时领取**<br>…共 7 条 |
-| **R-STG-04** | 交付物须为可运行状态 | ✅ 已落地 | P0·Task 3 规则配置与 fail-fast 校验<br>P3·Task 1 榜单数据模型与迁移 `004_leaderboa…<br>P3·Task 5 行为分<br>P3·终审修复轮<br>P5·Task 1 工作流与三池数据模型与迁移<br>P5·Task 2 任务清单与自主领取 | `platform/db/migrations/006_pools.sql`<br>`platform/rules/criteria.json`<br>`platform/src/config.js`<br>`platform/src/domain/behavior.js`<br>…共 7 个文件 | `P3-2` 名次积分写死 10/8/5<br>`P3-3` 1224 并列名次<br>`P3-5` ★ 行为分与总分隔离<br>…共 20 条 |
+| **R-STG-04** | 交付物须为可运行状态 | ✅ 已落地 | P0·Task 3 规则配置与 fail-fast 校验<br>P3·Task 1 榜单数据模型与迁移 `004_leaderboa…<br>P3·Task 5 行为分<br>P3·终审修复轮<br>P5·Task 1 工作流与三池数据模型与迁移<br>P5·Task 2 任务清单与自主领取 | `platform/db/migrations/006_pools.sql`<br>`platform/rules/criteria.json`<br>`platform/src/config.js`<br>`platform/src/domain/behavior.js`<br>…共 7 个文件 | `P3-2` 名次积分写死 10/8/5<br>`P3-3` 1224 并列名次<br>`P3-5` ★ 行为分与总分隔离<br>…共 21 条 |
 | **R-STG-05** | 商业验证赛段不做硬要求 | ✅ 已落地 | P1·Task 3 报名服务与 API | `platform/rules/schedule.json` | — |
 
 ### 模块三 · 评审打分（Judging）—— 全部来自 S7
@@ -81,16 +81,16 @@
 | **R-JDG-05** | R1 分赛道打分 | ✅ 已落地 | P2·Task 4 企业席 E 与 R1 / R2 / R3 / R4 | `platform/src/domain/enterprise-seat.js` | `P2-6` 企业席 R1–R4 |
 | **R-JDG-06** | R2 双签生效 | ✅ 已落地 | P2·Task 4 企业席 E 与 R1 / R2 / R3 / R4 | `platform/src/domain/enterprise-seat.js` | `P2-6` 企业席 R1–R4 |
 | **R-JDG-07** | R3 权重封顶 | ✅ 已落地 | P2·Task 4 企业席 E 与 R1 / R2 / R3 / R4 | `platform/src/domain/enterprise-seat.js` | `P2-6` 企业席 R1–R4 |
-| **R-JDG-08** | R4 自由命题组处理 | ✅ 已落地 | P0·Task 3 规则配置与 fail-fast 校验<br>P2·Task 4 企业席 E 与 R1 / R2 / R3 / R4 | `platform/src/config.js`<br>`platform/src/domain/enterprise-seat.js` | `P0-6` 登录闭环<br>`P0-10` 修复轮 3 的安全边界<br>`P0-11` 终审 Important 三项（I-A / I-B / I-C）<br>…共 20 条 |
+| **R-JDG-08** | R4 自由命题组处理 | ✅ 已落地 | P0·Task 3 规则配置与 fail-fast 校验<br>P2·Task 4 企业席 E 与 R1 / R2 / R3 / R4 | `platform/src/config.js`<br>`platform/src/domain/enterprise-seat.js` | `P0-6` 登录闭环<br>`P0-10` 修复轮 3 的安全边界<br>`P0-11` 终审 Important 三项（I-A / I-B / I-C）<br>…共 21 条 |
 | **R-JDG-09** | R5 回避制度 | ✅ 已落地 | P2·Task 1 评审数据模型与迁移<br>P2·Task 5 自评测差异检测 + 回避制度 + 互评资格 + …<br>P2·Task 6 评分提交服务 + 幂等 + 增量 score_s…<br>P2·Task 7 加时陈述与一票破同分<br>P2·Task 8 `scoreStage` 总装 + `compu… | `platform/db/migrations/003_review.sql`<br>`platform/src/db/repo/recusals.js`<br>`platform/src/db/repo/stages.js`<br>`platform/src/domain/review-eligibility.js`<br>…共 7 个文件 | `P2-8` 幂等 + 一票一人<br>`P2-9` 关键唯一约束<br>`P2-10` 可复算<br>…共 9 条 |
-| **R-JDG-10** | 评委池规模下限 | ✅ 已落地 | P0·Task 3 规则配置与 fail-fast 校验<br>P2·Task 5 自评测差异检测 + 回避制度 + 互评资格 + …<br>P2·Task 8 `scoreStage` 总装 + `compu… | `platform/src/config.js`<br>`platform/src/domain/judge-pool.js`<br>`platform/src/services/compute.js` | `P2-10` 可复算<br>`P2-13` ⭐ SSE 评审进度推送<br>`P0-6` 登录闭环<br>…共 20 条 |
-| **R-JDG-11** | 评委席构成 | ✅ 已落地 | P0·Task 3 规则配置与 fail-fast 校验<br>P2·Task 1 评审数据模型与迁移<br>P2·Task 5 自评测差异检测 + 回避制度 + 互评资格 + …<br>P2·Task 6 评分提交服务 + 幂等 + 增量 score_s…<br>P2·Task 7 加时陈述与一票破同分<br>P2·Task 8 `scoreStage` 总装 + `compu… | `platform/db/migrations/003_review.sql`<br>`platform/src/config.js`<br>`platform/src/domain/judge-pool.js`<br>`platform/src/domain/scoring.js`<br>…共 7 个文件 | `P2-4` 初赛 w_E = 10%<br>`P2-5` ⭐ 行为分进不了总分<br>`P2-8` 幂等 + 一票一人<br>…共 26 条 |
+| **R-JDG-10** | 评委池规模下限 | ✅ 已落地 | P0·Task 3 规则配置与 fail-fast 校验<br>P2·Task 5 自评测差异检测 + 回避制度 + 互评资格 + …<br>P2·Task 8 `scoreStage` 总装 + `compu… | `platform/src/config.js`<br>`platform/src/domain/judge-pool.js`<br>`platform/src/services/compute.js` | `P2-10` 可复算<br>`P2-13` ⭐ SSE 评审进度推送<br>`P0-6` 登录闭环<br>…共 21 条 |
+| **R-JDG-11** | 评委席构成 | ✅ 已落地 | P0·Task 3 规则配置与 fail-fast 校验<br>P2·Task 1 评审数据模型与迁移<br>P2·Task 5 自评测差异检测 + 回避制度 + 互评资格 + …<br>P2·Task 6 评分提交服务 + 幂等 + 增量 score_s…<br>P2·Task 7 加时陈述与一票破同分<br>P2·Task 8 `scoreStage` 总装 + `compu… | `platform/db/migrations/003_review.sql`<br>`platform/src/config.js`<br>`platform/src/domain/judge-pool.js`<br>`platform/src/domain/scoring.js`<br>…共 7 个文件 | `P2-4` 初赛 w_E = 10%<br>`P2-5` ⭐ 行为分进不了总分<br>`P2-8` 幂等 + 一票一人<br>…共 27 条 |
 | **R-JDG-12** | 开赛前校准打分 | ✅ 已落地 | P2·Task 1 评审数据模型与迁移<br>P2·Task 6 评分提交服务 + 幂等 + 增量 score_s… | `platform/db/migrations/003_review.sql`<br>`platform/src/services/review.js` | `P2-8` 幂等 + 一票一人<br>`P2-9` 关键唯一约束<br>`P2-10` 可复算 |
 | **R-JDG-13** | 自评测差异检测 ±10 | ✅ 已落地 | P2·Task 1 评审数据模型与迁移<br>P2·Task 5 自评测差异检测 + 回避制度 + 互评资格 + …<br>P2·Task 8 `scoreStage` 总装 + `compu… | `platform/db/migrations/003_review.sql`<br>`platform/src/domain/scoring.js`<br>`platform/src/domain/self-eval.js`<br>`platform/src/http/routes/review.js` | `P2-4` 初赛 w_E = 10%<br>`P2-5` ⭐ 行为分进不了总分<br>`P2-7` 自评三区间<br>…共 9 条 |
 | **R-JDG-14** | 企业签字必须有内容 | ✅ 已落地 | P2·Task 1 评审数据模型与迁移<br>P2·Task 4 企业席 E 与 R1 / R2 / R3 / R4<br>P2·Task 6 评分提交服务 + 幂等 + 增量 score_s…<br>P3·Task 1 榜单数据模型与迁移 `004_leaderboa…<br>P3·终审修复轮 | `platform/db/migrations/003_review.sql`<br>`platform/db/migrations/004_leaderboard.sql`<br>`platform/src/db/repo/enterprise-confirmations.js`<br>`platform/src/domain/enterprise-seat.js`<br>…共 6 个文件 | `P2-6` 企业席 R1–R4<br>`P2-8` 幂等 + 一票一人<br>`P2-9` 关键唯一约束<br>…共 4 条 |
 | **R-JDG-15** | 签字有成本 | ✅ 已落地 | P3·Task 1 榜单数据模型与迁移 `004_leaderboa… | `platform/rules/criteria.json` | （验收行未点名该测试文件）<br>被测：`leaderboard-migration.test.js` |
 | **R-JDG-16** | TOP10 反向抽查 | ✅ 已落地 | P4·Task 3 限频三层 + 幂等键<br>P4·Task 4 防作弊检测器 + 证据三列 + 字段字典 | `platform/rules/audit.json`<br>`platform/src/services/anticheat.js` | `P4-7` **检测 ≠ 处罚** |
-| **R-JDG-17** | 全程留档 6 个月 | ✅ 已落地 | P0·Task 3 规则配置与 fail-fast 校验<br>P2·Task 1 评审数据模型与迁移<br>P4·Task 2 计算快照与复算 diff | `platform/db/migrations/003_review.sql`<br>`platform/src/config.js`<br>`platform/src/services/audit.js` | `P0-6` 登录闭环<br>`P0-10` 修复轮 3 的安全边界<br>`P0-11` 终审 Important 三项（I-A / I-B / I-C）<br>…共 22 条 |
+| **R-JDG-17** | 全程留档 6 个月 | ✅ 已落地 | P0·Task 3 规则配置与 fail-fast 校验<br>P2·Task 1 评审数据模型与迁移<br>P4·Task 2 计算快照与复算 diff | `platform/db/migrations/003_review.sql`<br>`platform/src/config.js`<br>`platform/src/services/audit.js` | `P0-6` 登录闭环<br>`P0-10` 修复轮 3 的安全边界<br>`P0-11` 终审 Important 三项（I-A / I-B / I-C）<br>…共 23 条 |
 | **R-JDG-18** | 利益冲突声明 | ✅ 已落地 | P2·Task 1 评审数据模型与迁移<br>P2·Task 6 评分提交服务 + 幂等 + 增量 score_s… | `platform/db/migrations/003_review.sql`<br>`platform/src/db/repo/stages.js` | `P2-8` 幂等 + 一票一人<br>`P2-9` 关键唯一约束<br>`P2-10` 可复算<br>…共 5 条 |
 | **R-JDG-19** | 同分加时陈述 | ✅ 已落地 | P2·Task 7 加时陈述与一票破同分<br>P2·Task 8 `scoreStage` 总装 + `compu… | `platform/src/db/repo/tiebreak.js`<br>`platform/src/domain/scoring.js`<br>`platform/src/services/tiebreak.js` | `P2-4` 初赛 w_E = 10%<br>`P2-5` ⭐ 行为分进不了总分<br>`P2-8` 幂等 + 一票一人<br>…共 7 条 |
 | **R-JDG-20** | 并列共享奖金 | ✅ 已落地 | P3·Task 3 名次积分 + MVP + 个人积分 | `platform/src/domain/points.js` | `P3-2` 名次积分写死 10/8/5<br>`P5-2` **同一任务不能被两人同时领取**<br>`P5-5` 三池同步幂等<br>…共 5 条 |
@@ -103,13 +103,13 @@
 | **R-RNK-01** | 双榜并列，不合成一个总分 | ✅ 已落地 | P3·Task 7 榜单服务 + 战绩卡 + API | `platform/src/services/leaderboard.js` | （验收行未点名该测试文件）<br>被测：`behavior-service.test.js`、`leaderboard-service.test.js`、`leaderboard-web.test.js` |
 | **R-RNK-02** | B 榜不碰奖金与名次 | ✅ 已落地 | P3·Task 7 榜单服务 + 战绩卡 + API | `platform/src/services/leaderboard.js` | （验收行未点名该测试文件）<br>被测：`behavior-service.test.js`、`leaderboard-service.test.js`、`leaderboard-web.test.js` |
 | **R-RNK-03** | A 榜不碰资源解锁 | ✅ 已落地 | P3·Task 7 榜单服务 + 战绩卡 + API | `platform/src/services/leaderboard.js` | （验收行未点名该测试文件）<br>被测：`behavior-service.test.js`、`leaderboard-service.test.js`、`leaderboard-web.test.js` |
-| **R-RNK-04** | 滚动榜单全程公开 | ✅ 已落地 | P3·Task 7 榜单服务 + 战绩卡 + API | `platform/src/services/leaderboard.js` | （验收行未点名该测试文件）<br>被测：`behavior-service.test.js`、`leaderboard-service.test.js`、`leaderboard-web.test.js` |
+| **R-RNK-04** | 滚动榜单全程公开 | ✅ 已落地 | P3·Task 7 榜单服务 + 战绩卡 + API<br>P5·Task 4 公开榜单 API + token 鉴权 | `platform/src/services/leaderboard.js`<br>`platform/src/services/public-api.js` | `P5-7` **公开 API 鉴权** |
 | **R-RNK-05** | 互评权重 ≤20% | ✅ 已落地 | P0·Task 3 规则配置与 fail-fast 校验 | `platform/rules/tiebreak.json` | `P3-3` 1224 并列名次 |
 | **R-RNK-06** | 互评只用于破同分 | ✅ 已落地 | P3·Task 2 破同分链执行器 + 1224 并列名次 | `platform/src/domain/ranking.js` | `P3-3` 1224 并列名次<br>`P3-5` ★ 行为分与总分隔离 |
 | **R-RNK-07** | 互评资格门槛 | ✅ 已落地 | P2·Task 1 评审数据模型与迁移<br>P2·Task 5 自评测差异检测 + 回避制度 + 互评资格 + …<br>P2·Task 6 评分提交服务 + 幂等 + 增量 score_s…<br>P3·Task 7 榜单服务 + 战绩卡 + API | `platform/db/migrations/003_review.sql`<br>`platform/src/domain/review-eligibility.js`<br>`platform/src/services/leaderboard.js`<br>`platform/src/services/review.js` | `P2-8` 幂等 + 一票一人<br>`P2-9` 关键唯一约束<br>`P2-10` 可复算 |
 | **R-RNK-08** | 异常互评检测 | ✅ 已落地 | P4·Task 4 防作弊检测器 + 证据三列 + 字段字典 | `platform/src/domain/anticheat.js`<br>`platform/src/services/anticheat.js` | `P4-7` **检测 ≠ 处罚** |
 | **R-RNK-09** | MVP 评定 | ✅ 已落地 | P3·Task 3 名次积分 + MVP + 个人积分 | `platform/src/domain/points.js` | `P3-2` 名次积分写死 10/8/5<br>`P5-2` **同一任务不能被两人同时领取**<br>`P5-5` 三池同步幂等<br>…共 5 条 |
-| **R-RNK-10** | 个人积分终生上榜 | ✅ 已落地 | P0·Task 3 规则配置与 fail-fast 校验<br>P3·Task 3 名次积分 + MVP + 个人积分<br>P3·Task 7 榜单服务 + 战绩卡 + API<br>P5·Task 1 工作流与三池数据模型与迁移<br>P5·Task 3 三池派生同步 | `platform/rules/pools.json`<br>`platform/src/config.js`<br>`platform/src/db/repo/pool-sources.js`<br>`platform/src/domain/personal-points.js`<br>…共 8 个文件 | `P3-2` 名次积分写死 10/8/5<br>`P3-3` 1224 并列名次<br>`P3-5` ★ 行为分与总分隔离<br>…共 22 条 |
+| **R-RNK-10** | 个人积分终生上榜 | ✅ 已落地 | P0·Task 3 规则配置与 fail-fast 校验<br>P3·Task 3 名次积分 + MVP + 个人积分<br>P3·Task 7 榜单服务 + 战绩卡 + API<br>P5·Task 1 工作流与三池数据模型与迁移<br>P5·Task 3 三池派生同步 | `platform/rules/pools.json`<br>`platform/src/config.js`<br>`platform/src/db/repo/pool-sources.js`<br>`platform/src/domain/personal-points.js`<br>…共 8 个文件 | `P3-2` 名次积分写死 10/8/5<br>`P3-3` 1224 并列名次<br>`P3-5` ★ 行为分与总分隔离<br>…共 23 条 |
 | **R-PTS-01** | L0 段位锚定企业签字里程碑 | ✅ 已落地 | P3·Task 4 段位计算与降级<br>P3·Task 7 榜单服务 + 战绩卡 + API | `platform/src/domain/tier.js`<br>`platform/src/services/tier.js` | `P3-6` ★ 段位边界<br>`P6-9` 种子数据触发每条 trace 分支 |
 | **R-PTS-02** | 段位表 D/C/B/A/S | ✅ 已落地 | P3·Task 4 段位计算与降级 | `platform/src/domain/tier.js` | `P3-6` ★ 段位边界<br>`P6-9` 种子数据触发每条 trace 分支 |
 | **R-PTS-03** | S 段要业务部门签字 | ✅ 已落地 | P3·Task 1 榜单数据模型与迁移 `004_leaderboa…<br>P3·Task 4 段位计算与降级<br>P3·终审修复轮 | `platform/db/migrations/004_leaderboard.sql`<br>`platform/rules/criteria.json`<br>`platform/src/domain/tier.js`<br>`platform/src/services/milestone.js` | `P3-6` ★ 段位边界<br>`P6-9` 种子数据触发每条 trace 分支 |
@@ -117,7 +117,7 @@
 | **R-PTS-05** | 段位换资源不换钱 | ✅ 已落地 | P3·Task 1 榜单数据模型与迁移 `004_leaderboa…<br>P3·Task 4 段位计算与降级 | `platform/rules/points.json`<br>`platform/src/domain/tier.js` | `P3-6` ★ 段位边界<br>`P5-5` 三池同步幂等<br>`P6-6` 扫描闸能识别「闸未生效」<br>…共 4 条 |
 | **R-PTS-06** | 辅导期名额只影响同分排序 | ✅ 已落地 | P3·Task 4 段位计算与降级 | `platform/src/domain/tier.js` | `P3-6` ★ 段位边界<br>`P6-9` 种子数据触发每条 trace 分支 |
 | **R-PTS-07** | L1 行为分明细 | ✅ 已落地 | P3·Task 5 行为分 | `platform/src/domain/behavior.js` | `P3-5` ★ 行为分与总分隔离 |
-| **R-PTS-08** | 行为分 ≤10% 且只做"垫底排序" | ✅ 已落地 | P0·Task 3 规则配置与 fail-fast 校验<br>P3·Task 2 破同分链执行器 + 1224 并列名次<br>P3·Task 5 行为分 | `platform/src/config.js`<br>`platform/src/domain/behavior.js`<br>`platform/src/domain/ranking.js` | `P3-2` 名次积分写死 10/8/5<br>`P3-3` 1224 并列名次<br>`P3-5` ★ 行为分与总分隔离<br>…共 19 条 |
+| **R-PTS-08** | 行为分 ≤10% 且只做"垫底排序" | ✅ 已落地 | P0·Task 3 规则配置与 fail-fast 校验<br>P3·Task 2 破同分链执行器 + 1224 并列名次<br>P3·Task 5 行为分 | `platform/src/config.js`<br>`platform/src/domain/behavior.js`<br>`platform/src/domain/ranking.js` | `P3-2` 名次积分写死 10/8/5<br>`P3-3` 1224 并列名次<br>`P3-5` ★ 行为分与总分隔离<br>…共 20 条 |
 | **R-PTS-09** | 行为分达标线 60 = 完赛 | ✅ 已落地 | P3·Task 5 行为分 | `platform/src/domain/behavior.js` | `P3-5` ★ 行为分与总分隔离 |
 | **R-PTS-10** | 反作弊 5 条 | ✅ 已落地 | P1·Task 5 战队与成员管理<br>P3·Task 1 榜单数据模型与迁移 `004_leaderboa…<br>P3·Task 5 行为分<br>P3·终审修复轮 | `platform/db/migrations/004_leaderboard.sql`<br>`platform/rules/criteria.json`<br>`platform/src/domain/behavior.js`<br>`platform/src/http/routes/behavior.js`<br>…共 6 个文件 | `P3-5` ★ 行为分与总分隔离<br>`P1-5` 组队三条硬门槛<br>`P1-10` 全链路 + 零依赖 |
 | **R-PTS-11** | L2 商业里程碑分 | ✅ 已落地 | P3·终审修复轮 | `platform/rules/milestones.default.json`<br>`platform/src/services/milestone.js` | — |
@@ -134,21 +134,21 @@
 | **R-ENT-04** | B 榜签字不公开 | ✅ 已落地 | P3·Task 7 榜单服务 + 战绩卡 + API<br>P3·Task 8 前端榜单页 + 段位榜 + 战绩卡 + 回归验收 | `platform/src/services/leaderboard.js`<br>`platform/src/services/performance-card.js`<br>`platform/web/views/card.js` | （验收行未点名该测试文件）<br>被测：`behavior-service.test.js`、`leaderboard-service.test.js`、`leaderboard-web.test.js` |
 | **R-ENT-05** | 派单/战绩榜（长期） | ✅ 已落地 | P5·Task 1 工作流与三池数据模型与迁移 | `platform/db/migrations/006_pools.sql` | — |
 | **R-ENT-06** | 六维可解性评估准入 | ✅ 已落地 | P1·Task 1 报名数据模型与迁移<br>P1·Task 4 任务卡与六维可解性<br>P1·Task 5 战队与成员管理 | `platform/db/migrations/002_registration.sql`<br>`platform/src/domain/solvability.js`<br>`platform/src/http/routes/taskPackage.js`<br>`platform/src/services/taskPackage.js`<br>…共 5 个文件 | `P1-5` 组队三条硬门槛<br>`P1-10` 全链路 + 零依赖<br>`P0-12` 终审 8 条 Minor 逐条处置<br>…共 4 条 |
-| **R-ENT-07** | 三条一票否决 | ✅ 已落地 | P0·Task 3 规则配置与 fail-fast 校验<br>P1·Task 1 报名数据模型与迁移<br>P1·Task 4 任务卡与六维可解性 | `platform/db/migrations/002_registration.sql`<br>`platform/src/config.js`<br>`platform/src/domain/solvability.js`<br>`platform/src/http/routes/taskPackage.js`<br>…共 5 个文件 | `P1-3` 重复报名 409 且不覆盖<br>`P1-5` 组队三条硬门槛<br>`P1-10` 全链路 + 零依赖<br>…共 20 条 |
+| **R-ENT-07** | 三条一票否决 | ✅ 已落地 | P0·Task 3 规则配置与 fail-fast 校验<br>P1·Task 1 报名数据模型与迁移<br>P1·Task 4 任务卡与六维可解性 | `platform/db/migrations/002_registration.sql`<br>`platform/src/config.js`<br>`platform/src/domain/solvability.js`<br>`platform/src/http/routes/taskPackage.js`<br>…共 5 个文件 | `P1-3` 重复报名 409 且不覆盖<br>`P1-5` 组队三条硬门槛<br>`P1-10` 全链路 + 零依赖<br>…共 21 条 |
 | **R-ENT-08** | 分级签约与对应协议 | ✅ 已落地 | P1·Task 1 报名数据模型与迁移<br>P1·Task 4 任务卡与六维可解性 | `platform/db/migrations/002_registration.sql`<br>`platform/src/domain/solvability.js`<br>`platform/src/http/routes/taskPackage.js`<br>`platform/src/services/taskPackage.js` | `P1-10` 全链路 + 零依赖<br>`P0-12` 终审 8 条 Minor 逐条处置<br>`P2-9` 关键唯一约束 |
-| **R-ENT-09** | 任务卡配比 70% B 端 + 30% 自由 | ✅ 已落地 | P0·Task 3 规则配置与 fail-fast 校验<br>P0·Task 7 静态文件服务、前端骨架与服务器入口<br>P1·Task 1 报名数据模型与迁移<br>P1·Task 4 任务卡与六维可解性<br>P1·Task 5 战队与成员管理<br>P1·Task 6 前端三页 | `platform/db/migrations/002_registration.sql`<br>`platform/rules/solvability.json`<br>`platform/scripts/seed.js`<br>`platform/src/config.js`<br>…共 9 个文件 | `P1-3` 重复报名 409 且不覆盖<br>`P1-5` 组队三条硬门槛<br>`P1-10` 全链路 + 零依赖<br>…共 21 条 |
+| **R-ENT-09** | 任务卡配比 70% B 端 + 30% 自由 | ✅ 已落地 | P0·Task 3 规则配置与 fail-fast 校验<br>P0·Task 7 静态文件服务、前端骨架与服务器入口<br>P1·Task 1 报名数据模型与迁移<br>P1·Task 4 任务卡与六维可解性<br>P1·Task 5 战队与成员管理<br>P1·Task 6 前端三页 | `platform/db/migrations/002_registration.sql`<br>`platform/rules/solvability.json`<br>`platform/scripts/seed.js`<br>`platform/src/config.js`<br>…共 9 个文件 | `P1-3` 重复报名 409 且不覆盖<br>`P1-5` 组队三条硬门槛<br>`P1-10` 全链路 + 零依赖<br>…共 22 条 |
 | **R-ENT-10** | 自由题无企业签字 | ✅ 已落地 | P0·Task 7 静态文件服务、前端骨架与服务器入口<br>P1·Task 1 报名数据模型与迁移<br>P1·Task 4 任务卡与六维可解性 | `platform/db/migrations/002_registration.sql`<br>`platform/scripts/seed.js`<br>`platform/src/http/routes/taskPackage.js`<br>`platform/src/services/taskPackage.js` | `P1-10` 全链路 + 零依赖<br>`P0-9` 安全边界钉住<br>`P0-10` 修复轮 3 的安全边界<br>…共 6 条 |
-| **R-ENT-11** | IP 与成果归属 | ✅ 已落地 | P0·Task 3 规则配置与 fail-fast 校验<br>P1·Task 1 报名数据模型与迁移<br>P1·Task 3 报名服务与 API<br>P1·Task 4 任务卡与六维可解性 | `platform/db/migrations/002_registration.sql`<br>`platform/rules/compliance.json`<br>`platform/src/config.js`<br>`platform/src/http/routes/registration.js`<br>…共 5 个文件 | `P1-1` 报名分级三个边界<br>`P1-3` 重复报名 409 且不覆盖<br>`P1-5` 组队三条硬门槛<br>…共 21 条 |
-| **R-ENT-12** | 合规红线与同意记录 | ✅ 已落地 | P0·Task 3 规则配置与 fail-fast 校验<br>P0·Task 7 静态文件服务、前端骨架与服务器入口<br>P1·Task 1 报名数据模型与迁移<br>P1·Task 3 报名服务与 API<br>P1·Task 4 任务卡与六维可解性 | `platform/db/migrations/002_registration.sql`<br>`platform/rules/compliance.json`<br>`platform/scripts/seed.js`<br>`platform/src/config.js`<br>…共 8 个文件 | `P1-1` 报名分级三个边界<br>`P1-3` 重复报名 409 且不覆盖<br>`P1-5` 组队三条硬门槛<br>…共 22 条 |
+| **R-ENT-11** | IP 与成果归属 | ✅ 已落地 | P0·Task 3 规则配置与 fail-fast 校验<br>P1·Task 1 报名数据模型与迁移<br>P1·Task 3 报名服务与 API<br>P1·Task 4 任务卡与六维可解性 | `platform/db/migrations/002_registration.sql`<br>`platform/rules/compliance.json`<br>`platform/src/config.js`<br>`platform/src/http/routes/registration.js`<br>…共 5 个文件 | `P1-1` 报名分级三个边界<br>`P1-3` 重复报名 409 且不覆盖<br>`P1-5` 组队三条硬门槛<br>…共 22 条 |
+| **R-ENT-12** | 合规红线与同意记录 | ✅ 已落地 | P0·Task 3 规则配置与 fail-fast 校验<br>P0·Task 7 静态文件服务、前端骨架与服务器入口<br>P1·Task 1 报名数据模型与迁移<br>P1·Task 3 报名服务与 API<br>P1·Task 4 任务卡与六维可解性 | `platform/db/migrations/002_registration.sql`<br>`platform/rules/compliance.json`<br>`platform/scripts/seed.js`<br>`platform/src/config.js`<br>…共 8 个文件 | `P1-1` 报名分级三个边界<br>`P1-3` 重复报名 409 且不覆盖<br>`P1-5` 组队三条硬门槛<br>…共 23 条 |
 
 ### 模块六 · 三池底座（Pools）
 
 | 需求 | 一句话 | 状态 | 落地（阶段·Task） | 落地文件 | 怎么验 |
 |---|---|---|---|---|---|
-| **R-POOL-01** | 项目池 | ✅ 已落地 | P5·Task 1 工作流与三池数据模型与迁移<br>P5·Task 3 三池派生同步 | `platform/db/migrations/006_pools.sql`<br>`platform/src/db/repo/pools.js`<br>`platform/src/domain/pool-derive.js`<br>`platform/src/services/pools.js` | `P5-1` 迁移 006 建出七张表<br>`P5-5` 三池同步幂等 |
-| **R-POOL-02** | 人才池 | ✅ 已落地 | P5·Task 1 工作流与三池数据模型与迁移<br>P5·Task 3 三池派生同步 | `platform/src/db/repo/pools.js`<br>`platform/src/domain/pool-derive.js`<br>`platform/src/services/pools.js` | `P5-1` 迁移 006 建出七张表<br>`P5-5` 三池同步幂等 |
-| **R-POOL-03** | 资源池 | ✅ 已落地 | P5·Task 1 工作流与三池数据模型与迁移<br>P5·Task 3 三池派生同步 | `platform/src/db/repo/pools.js`<br>`platform/src/domain/pool-derive.js`<br>`platform/src/services/pools.js` | `P5-1` 迁移 006 建出七张表<br>`P5-5` 三池同步幂等 |
-| **R-POOL-04** | 增长飞轮闭环 | ✅ 已落地 | P5·Task 3 三池派生同步 | `platform/src/services/pools.js` | `P5-1` 迁移 006 建出七张表<br>`P5-5` 三池同步幂等<br>`P5-11` **增长飞轮的沉淀物可计量**（R-POOL-04） |
+| **R-POOL-01** | 项目池 | ✅ 已落地 | P5·Task 1 工作流与三池数据模型与迁移<br>P5·Task 3 三池派生同步<br>P5·Task 4 公开榜单 API + token 鉴权 | `platform/db/migrations/006_pools.sql`<br>`platform/src/db/repo/pools.js`<br>`platform/src/domain/pool-derive.js`<br>`platform/src/http/routes/pools.js`<br>…共 5 个文件 | `P5-1` 迁移 006 建出七张表<br>`P5-5` 三池同步幂等 |
+| **R-POOL-02** | 人才池 | ✅ 已落地 | P5·Task 1 工作流与三池数据模型与迁移<br>P5·Task 3 三池派生同步<br>P5·Task 4 公开榜单 API + token 鉴权 | `platform/src/db/repo/pools.js`<br>`platform/src/domain/pool-derive.js`<br>`platform/src/http/routes/pools.js`<br>`platform/src/services/pools.js` | `P5-1` 迁移 006 建出七张表<br>`P5-5` 三池同步幂等 |
+| **R-POOL-03** | 资源池 | ✅ 已落地 | P5·Task 1 工作流与三池数据模型与迁移<br>P5·Task 3 三池派生同步<br>P5·Task 4 公开榜单 API + token 鉴权 | `platform/src/db/repo/pools.js`<br>`platform/src/domain/pool-derive.js`<br>`platform/src/http/routes/pools.js`<br>`platform/src/services/pools.js` | `P5-1` 迁移 006 建出七张表<br>`P5-5` 三池同步幂等 |
+| **R-POOL-04** | 增长飞轮闭环 | ✅ 已落地 | P5·Task 3 三池派生同步<br>P5·Task 4 公开榜单 API + token 鉴权 | `platform/src/http/routes/pools.js`<br>`platform/src/services/pools.js` | `P5-1` 迁移 006 建出七张表<br>`P5-5` 三池同步幂等<br>`P5-11` **增长飞轮的沉淀物可计量**（R-POOL-04） |
 
 ### 模块七 · 审计与证据链（Audit）—— 来自项目自身复盘
 
@@ -169,21 +169,21 @@
 | **R-OPS-10** | 晋级率 25%，决赛 TOP32 | ✅ 已落地 | P1·Task 3 报名服务与 API | `platform/rules/schedule.json` | — |
 | **R-OPS-11** | Demo Day 观众投票权重 | ✅ 已落地 | P3·Task 1 榜单数据模型与迁移 `004_leaderboa… | `platform/rules/points.json` | `P5-5` 三池同步幂等<br>`P6-6` 扫描闸能识别「闸未生效」<br>`P6-9` 种子数据触发每条 trace 分支 |
 | **R-OPS-12** | 奖项结构：资源≈现金 1:1.55 | ✅ 已落地 | P3·Task 1 榜单数据模型与迁移 `004_leaderboa… | `platform/rules/points.json` | `P5-5` 三池同步幂等<br>`P6-6` 扫描闸能识别「闸未生效」<br>`P6-9` 种子数据触发每条 trace 分支 |
-| **R-OPS-13** | 任务清单工作流拆解 | ✅ 已落地 | P1·Task 1 报名数据模型与迁移<br>P5·Task 1 工作流与三池数据模型与迁移<br>P5·Task 2 任务清单与自主领取 | `platform/db/migrations/006_pools.sql`<br>`platform/src/db/repo/task-claims.js`<br>`platform/src/db/repo/teamMembers.js`<br>`platform/src/db/repo/workflows.js`<br>…共 5 个文件 | `P5-1` 迁移 006 建出七张表<br>`P5-2` **同一任务不能被两人同时领取** |
-| **R-OPS-14** | 禁止岗位制 | ✅ 已落地 | P0·Task 3 规则配置与 fail-fast 校验<br>P1·Task 1 报名数据模型与迁移<br>P5·Task 1 工作流与三池数据模型与迁移<br>P5·Task 2 任务清单与自主领取 | `platform/src/config.js`<br>`platform/src/db/repo/task-claims.js`<br>`platform/src/db/repo/teamMembers.js`<br>`platform/src/services/workflow.js` | `P5-1` 迁移 006 建出七张表<br>`P5-2` **同一任务不能被两人同时领取**<br>`P5-5` 三池同步幂等<br>…共 21 条 |
+| **R-OPS-13** | 任务清单工作流拆解 | ✅ 已落地 | P1·Task 1 报名数据模型与迁移<br>P5·Task 1 工作流与三池数据模型与迁移<br>P5·Task 2 任务清单与自主领取<br>P5·Task 4 公开榜单 API + token 鉴权 | `platform/db/migrations/006_pools.sql`<br>`platform/src/db/repo/task-claims.js`<br>`platform/src/db/repo/teamMembers.js`<br>`platform/src/db/repo/workflows.js`<br>…共 6 个文件 | `P5-1` 迁移 006 建出七张表<br>`P5-2` **同一任务不能被两人同时领取**<br>`P5-7` **公开 API 鉴权** |
+| **R-OPS-14** | 禁止岗位制 | ✅ 已落地 | P0·Task 3 规则配置与 fail-fast 校验<br>P1·Task 1 报名数据模型与迁移<br>P5·Task 1 工作流与三池数据模型与迁移<br>P5·Task 2 任务清单与自主领取<br>P5·Task 4 公开榜单 API + token 鉴权 | `platform/src/config.js`<br>`platform/src/db/repo/task-claims.js`<br>`platform/src/db/repo/teamMembers.js`<br>`platform/src/http/routes/workflow.js`<br>…共 5 个文件 | `P5-1` 迁移 006 建出七张表<br>`P5-2` **同一任务不能被两人同时领取**<br>`P5-5` 三池同步幂等<br>…共 22 条 |
 
 ### 模块九 · 非功能需求（NFR）
 
 | 需求 | 一句话 | 状态 | 落地（阶段·Task） | 落地文件 | 怎么验 |
 |---|---|---|---|---|---|
-| **R-OPS-01** | 可移植 | ✅ 已落地 | P0·Task 2 SQLite 封装与迁移机制<br>P6·Task 2 部署资产 | `platform/deploy/install.sh`<br>`platform/src/db/sqlite.js` | `P0-1` 零依赖<br>`P0-4` 权限判定唯一入口<br>`P0-5` 密码与会话<br>…共 31 条 |
-| **R-OPS-02** | 跨平台稳定 | ✅ 已落地 | P0·Task 2 SQLite 封装与迁移机制 | `platform/src/db/migrate.js` | `P0-4` 权限判定唯一入口<br>`P0-5` 密码与会话<br>`P0-6` 登录闭环<br>…共 24 条 |
+| **R-OPS-01** | 可移植 | ✅ 已落地 | P0·Task 2 SQLite 封装与迁移机制<br>P6·Task 2 部署资产 | `platform/deploy/install.sh`<br>`platform/src/db/sqlite.js` | `P0-1` 零依赖<br>`P0-4` 权限判定唯一入口<br>`P0-5` 密码与会话<br>…共 32 条 |
+| **R-OPS-02** | 跨平台稳定 | ✅ 已落地 | P0·Task 2 SQLite 封装与迁移机制 | `platform/src/db/migrate.js` | `P0-4` 权限判定唯一入口<br>`P0-5` 密码与会话<br>`P0-6` 登录闭环<br>…共 25 条 |
 | **R-OPS-03** | 可扩容 | ✅ 已落地 | P6·Task 2 部署资产 | `platform/deploy/heikesong.service` | `P6-3` 部署资产齐全且守住单写者 |
-| **R-OPS-04** | 性能 | ✅ 已落地 | P0·Task 2 SQLite 封装与迁移机制 | `platform/src/db/sqlite.js` | `P0-1` 零依赖<br>`P0-4` 权限判定唯一入口<br>`P0-5` 密码与会话<br>…共 30 条 |
+| **R-OPS-04** | 性能 | ✅ 已落地 | P0·Task 2 SQLite 封装与迁移机制 | `platform/src/db/sqlite.js` | `P0-1` 零依赖<br>`P0-4` 权限判定唯一入口<br>`P0-5` 密码与会话<br>…共 31 条 |
 | **R-OPS-05** | 云主机部署 | ✅ 已落地 | P6·Task 2 部署资产 | `platform/deploy/install.sh` | `P6-3` 部署资产齐全且守住单写者 |
 | **R-OPS-06** | 公网可访问 | ⬜ 计划中 | P6·表 阶段需求覆盖表 | — | — |
-| **R-OPS-07** | 零 npm 依赖 | ✅ 已落地 | P0·Task 2 SQLite 封装与迁移机制 | `platform/src/db/sqlite.js` | `P0-1` 零依赖<br>`P0-4` 权限判定唯一入口<br>`P0-5` 密码与会话<br>…共 30 条 |
-| **R-OPS-08** | 单文件数据库 | ✅ 已落地 | P0·Task 2 SQLite 封装与迁移机制 | `platform/src/db/sqlite.js` | `P0-1` 零依赖<br>`P0-4` 权限判定唯一入口<br>`P0-5` 密码与会话<br>…共 30 条 |
+| **R-OPS-07** | 零 npm 依赖 | ✅ 已落地 | P0·Task 2 SQLite 封装与迁移机制 | `platform/src/db/sqlite.js` | `P0-1` 零依赖<br>`P0-4` 权限判定唯一入口<br>`P0-5` 密码与会话<br>…共 31 条 |
+| **R-OPS-08** | 单文件数据库 | ✅ 已落地 | P0·Task 2 SQLite 封装与迁移机制 | `platform/src/db/sqlite.js` | `P0-1` 零依赖<br>`P0-4` 权限判定唯一入口<br>`P0-5` 密码与会话<br>…共 31 条 |
 
 ---
 
@@ -226,7 +226,7 @@
 
 | **R-PTS-13** 押金是负债不入营收 | ⚪ 平台不实现 | **财务科目口径**而非平台功能；「中途不退部分去向」本身是规则空白。溯源表已声明平台不实现，并禁止任何人往平台里加「报名费 / 押金」字段或退费流程。 |
 
-### 四、已落地但**验收标准未逐字点名该测试文件**（13 条）
+### 四、已落地但**验收标准未逐字点名该测试文件**（12 条）
 
 > 这些需求的**验证确实发生了**（实现文件被测试文件引用，测试在跑），
 > 但那条验收标准是用「同文件」或散文描述指向它的，**没有逐字点名测试文件名**
@@ -240,7 +240,6 @@
 | **R-RNK-01** 双榜并列，不合成一个总分 | ✅ 已落地（P3 Task 7） | `leaderboard.js` | behavior-service.test.js`、`leaderboard-service.test.js`、`leaderboard-web.test.js |
 | **R-RNK-02** B 榜不碰奖金与名次 | ✅ 已落地（P3 Task 7） | `leaderboard.js` | behavior-service.test.js`、`leaderboard-service.test.js`、`leaderboard-web.test.js |
 | **R-RNK-03** A 榜不碰资源解锁 | ✅ 已落地（P3 Task 7） | `leaderboard.js` | behavior-service.test.js`、`leaderboard-service.test.js`、`leaderboard-web.test.js |
-| **R-RNK-04** 滚动榜单全程公开 | ✅ 已落地（P3 Task 7） | `leaderboard.js` | behavior-service.test.js`、`leaderboard-service.test.js`、`leaderboard-web.test.js |
 | **R-PTS-11** L2 商业里程碑分 | ✅ 已落地（P3 终审修复轮） | `milestones.default.json`、`milestone.js` | —（未被任何测试文件引用） |
 | **R-PTS-12** L2 与段位同源但规则不共享 | ✅ 已落地（P3 终审修复轮） | `milestones.default.json`、`milestone.js` | —（未被任何测试文件引用） |
 | **R-ENT-02** 企业签字里程碑 | ✅ 已落地（P3 Task 1、P3 终审修复轮） | `004_leaderboard.sql`、`milestone.js` | —（未被任何测试文件引用） |
