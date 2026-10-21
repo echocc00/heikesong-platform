@@ -52,7 +52,7 @@ z-score 口径 归一化的是【评委的宽严】，不是【队伍的分数�
 
 ```
 platform/
-├── db/migrations/003_review.sql    评审数据模型（14 张表，含 tiebreak_round / tiebreak_votes / review_request_keys）
+├── db/migrations/003_review.sql    评审数据模型（15 张表，含 tiebreak_round / tiebreak_votes / review_request_keys / conflict_declarations）
 ├── src/
 │   ├── domain/
 │   │   ├── normalization.js        评委宽严归一化引擎（zscore / median / trimmed / bayes）
@@ -118,19 +118,45 @@ platform/src/http/routes/review.js     提交评审后发布进度事件
 **Interfaces:**
 - Consumes: P0 `openDatabase()` / `applyMigrations()`；P1 `teams` / `task_packages`（本阶段只读，不建表）
 - Produces:
-  - 14 张表：`stages` / `stage_judges` / `stage_reviews` / `review_request_keys` / `calibrations` / `enterprise_confirmations` / `peer_reviews` / `self_reviews` / `score_stats` / `recusal_records` / `computation_snapshots` / `stage_results` / `tiebreak_round` / `tiebreak_votes`（其中 `tiebreak_round`、`tiebreak_votes`、`review_request_keys` 为新增，见文末偏差）
+  - **15 张表**：`stages` / `stage_judges` / `conflict_declarations` / `stage_reviews` / `review_request_keys` / `calibrations` / `enterprise_confirmations` / `peer_reviews` / `self_reviews` / `score_stats` / `recusal_records` / `computation_snapshots` / `stage_results` / `tiebreak_round` / `tiebreak_votes`
+    - 相对 `INTERFACES.md` §3 的 13 张表，**新增 4 张**：`tiebreak_round` / `tiebreak_votes`（D-3）、`review_request_keys`（D-5）、**`conflict_declarations`**（D-3）
+    - ⚠️ 原规格写「14 张表」，但 SQL 里实际有 **15** 张 —— 差的那张是 `conflict_declarations`，**既没进表数声明、也没进测试的表清单、也没进偏差表**（父代理预审修正）
+  - ⚠️ **引用型外键必须齐全**（父代理预审修正，Important）：
+    与 P1 的 `002_registration.sql` 同一约定 —— 每一处「指向别的表的 id」都要有 `REFERENCES`。
+    **最终 15 张表共 38 条引用型外键**，覆盖 `editions` / `users` / `teams` / `stages` /
+    `conflict_declarations` / `computation_snapshots` / `tiebreak_round` 七个父表。
+    ⚠️ **代价**：所有测试夹具必须建**真实的**用户 / 届期 / 战队（不能再用 `'j1'` / `'t1'` / `'ed1'` 假 id）
+    ⚠️ **有意不加外键的多态 / 逻辑引用**（加了反而会锁死语义）：
+    `stage_judges.scope_id`（global|edition|task_package|team 四态）、
+    `stage_reviews.request_id` / `peer_reviews.request_id` / `self_reviews.request_id`（幂等键，见 D-5）、
+    `review_request_keys.subject_id`（judge_id|from_team_id|team_id 三态）。
   - 关键唯一约束（**并发正确性的地基**）：
     - `stage_reviews` UNIQUE(stage_id, judge_id, team_id, dimension) —— 防重复灌分
+      ⚠️ 这是**非偏序**索引（契约原文，没有 `WHERE deleted_at IS NULL`），软删不腾格子 —— 陷阱已登记并被测试钉住
     - `peer_reviews` UNIQUE(stage_id, from_team_id, to_team_id) —— 一队对另一队只投一次
     - `self_reviews` UNIQUE(stage_id, team_id, dimension) —— 同一维度只自评一次
+    - `stage_results` UNIQUE(stage_id, team_id) —— 同一赛段同一队伍只有一条结果
+    - `stages` UNIQUE(edition_id, "key") —— 同一届期下赛段代号不重复
+    - `enterprise_confirmations` 偏序唯一索引 (stage_id, team_id, dimension, enterprise_id) WHERE deleted_at IS NULL
     - `score_stats` PRIMARY KEY(judge_id, dimension)
-    - `tiebreak_votes` PRIMARY KEY(tiebreak_round_id, voter_id, team_id) —— **一人一票由数据库保证**
+    - `tiebreak_votes` PRIMARY KEY(tiebreak_round_id, voter_id, team_id) —— **一人一队一票由数据库保证**
 
 - [ ] **Step 1: 写失败的测试**
 
 `platform/test/migration-review.test.js`：
 
 ```javascript
+// platform/test/migration-review.test.js —— 评审数据模型（003_review.sql）
+//
+// 依据：P2 计划 Task 1「评审数据模型与迁移 003_review.sql」
+// 溯源需求：R-JDG-09 / R-JDG-11 / R-JDG-13 / R-JDG-14 / R-JDG-18 / R-JDG-19 / R-RNK-07
+//
+// ⚠️ **夹具必须建真实的用户 / 届期 / 战队**（父代理预审修正，Important）：
+//    003_review.sql 补齐了引用型外键（edition_id → editions、judge_id → users、
+//    team_id → teams）。原规格的夹具用假 id（'j1' / 't1' / 'ed1'）——
+//    那**只**在「没有外键」时成立，而且正好**掩盖**了「评审数据可以指向不存在的
+//    评委/队伍」这个问题。P1 的迁移测试（migration-002.test.js）就是建真实数据的，
+//    这里与它对齐。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -139,25 +165,44 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openDatabase } from '../src/db/sqlite.js';
 import { applyMigrations } from '../src/db/migrate.js';
+import { createUser } from '../src/db/repo/users.js';
+import { createEdition } from '../src/db/repo/editions.js';
+import { insertTeam } from '../src/db/repo/teams.js';
 
-const migrationsDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'db', 'migrations');
+const here = dirname(fileURLToPath(import.meta.url));
+const migrationsDir = join(here, '..', 'db', 'migrations');
+const NOW = '2026-10-20T00:00:00.000Z';
 
 function setup() {
   const dataDir = mkdtempSync(join(tmpdir(), 'hks-p2-'));
   const { db, close } = openDatabase({ dataDir });
   applyMigrations(db, migrationsDir);
-  // 评审表的 stage_id 有外键，先建一个赛段
+  // 真实届期 / 用户 / 战队 —— 外键要指向真实存在的行
+  const edition = createEdition(db, {
+    name: '首届', city: '上海', startsAt: '2026-10-01', endsAt: '2026-10-31', now: NOW,
+  });
+  const judge = createUser(db, { name: '评委甲', phone: '13900002001', password: 'pw' });
+  const captain = createUser(db, {
+    name: '队长甲', phone: '13900002002', password: 'pw', mbaStatus: 'mba',
+  });
+  const team = insertTeam(db, {
+    editionId: edition.id, name: '甲队', captainId: captain.id, status: 'forming', now: NOW,
+  });
+  const team2 = insertTeam(db, {
+    editionId: edition.id, name: '乙队', captainId: captain.id, status: 'forming', now: NOW,
+  });
+  // 赛段（stage_id 有外键，先建一个赛段）
   db.prepare(
     `INSERT INTO stages (id, edition_id, "key", name, kind, starts_at, ends_at, scoring_config_key, status)
-     VALUES ('s1', 'ed1', 's1', '初赛', 'initial', '2026-10-01', '2026-10-10', 'initial', 'open')`,
-  ).run();
-  return { db, close, dataDir };
+     VALUES ('s1', ?, 's1', '初赛', 'initial', '2026-10-01', '2026-10-10', 'initial', 'open')`,
+  ).run(edition.id);
+  return { db, close, dataDir, edition, judge, captain, team, team2 };
 }
 
 const TABLES = [
-  'stages', 'stage_judges', 'stage_reviews', 'review_request_keys', 'calibrations',
-  'enterprise_confirmations', 'peer_reviews', 'self_reviews', 'score_stats', 'recusal_records',
-  'computation_snapshots', 'stage_results', 'tiebreak_round', 'tiebreak_votes',
+  'stages', 'stage_judges', 'conflict_declarations', 'stage_reviews', 'review_request_keys',
+  'calibrations', 'enterprise_confirmations', 'peer_reviews', 'self_reviews', 'score_stats',
+  'recusal_records', 'computation_snapshots', 'stage_results', 'tiebreak_round', 'tiebreak_votes',
 ];
 
 test('003 迁移建出全部评审表', () => {
@@ -172,77 +217,453 @@ test('003 迁移建出全部评审表', () => {
 });
 
 test('stage_reviews 唯一约束防重复灌分', () => {
-  const { db, close, dataDir } = setup();
+  const { db, close, dataDir, judge, team } = setup();
   const ins = db.prepare(
     `INSERT INTO stage_reviews (id, stage_id, judge_id, team_id, dimension, raw_score, submitted_at)
-     VALUES (?, 's1', 'j1', 't1', 'innovation', 80, '2026-10-20T00:00:00.000Z')`,
+     VALUES (?, 's1', ?, ?, 'innovation', 80, '2026-10-20T00:00:00.000Z')`,
   );
-  ins.run('r1');
-  assert.throws(() => ins.run('r2'), /UNIQUE|constraint/i, '同一 (赛段,评委,队伍,维度) 只能有一条');
+  ins.run('r1', judge.id, team.id);
+  assert.throws(() => ins.run('r2', judge.id, team.id), /UNIQUE|constraint/i, '同一 (赛段,评委,队伍,维度) 只能有一条');
   close();
   rmSync(dataDir, { recursive: true, force: true });
 });
 
 test('peer_reviews 唯一约束：一队对另一队只投一次', () => {
-  const { db, close, dataDir } = setup();
+  const { db, close, dataDir, team, team2 } = setup();
   const ins = db.prepare(
     `INSERT INTO peer_reviews (id, stage_id, from_team_id, to_team_id, score, created_at)
-     VALUES (?, 's1', 't1', 't2', 70, '2026-10-20T00:00:00.000Z')`,
+     VALUES (?, 's1', ?, ?, 70, '2026-10-20T00:00:00.000Z')`,
   );
-  ins.run('p1');
-  assert.throws(() => ins.run('p2'), /UNIQUE|constraint/i);
+  ins.run('p1', team.id, team2.id);
+  assert.throws(() => ins.run('p2', team.id, team2.id), /UNIQUE|constraint/i);
   close();
   rmSync(dataDir, { recursive: true, force: true });
 });
 
 test('score_stats 主键是 (judge_id, dimension)', () => {
-  const { db, close, dataDir } = setup();
+  const { db, close, dataDir, judge } = setup();
   const ins = db.prepare(
     `INSERT INTO score_stats (judge_id, dimension, n, mean, sum_sq, updated_at)
      VALUES (?, ?, 1, 80, 6400, '2026-10-20T00:00:00.000Z')`,
   );
-  ins.run('j1', 'innovation');
-  assert.throws(() => ins.run('j1', 'innovation'), /UNIQUE|constraint/i);
-  ins.run('j1', 'feasibility'); // 不同维度可以并存
+  ins.run(judge.id, 'innovation');
+  assert.throws(() => ins.run(judge.id, 'innovation'), /UNIQUE|constraint/i);
+  ins.run(judge.id, 'feasibility'); // 不同维度可以并存
+  // 统计行必须挂在真实评委上
+  assert.throws(
+    () => db.prepare(
+      `INSERT INTO score_stats (judge_id, dimension, n, mean, sum_sq, updated_at)
+       VALUES ('no-such-judge', 'innovation', 1, 80, 6400, '2026-10-20T00:00:00.000Z')`,
+    ).run(),
+    /FOREIGN KEY constraint failed/i,
+    'score_stats.judge_id 必须有外键',
+  );
   close();
   rmSync(dataDir, { recursive: true, force: true });
 });
 
-test('tiebreak_votes 主键保证一人一票（并发下插不出两票）', () => {
-  const { db, close, dataDir } = setup();
+test('tiebreak_votes 主键保证一人一队一票（并发下插不出两票）', () => {
+  const { db, close, dataDir, judge, team, team2 } = setup();
   db.prepare(
     `INSERT INTO tiebreak_round (id, stage_id, kind, tied_team_ids_json, statement_deadline, created_by, created_at)
-     VALUES ('tr1', 's1', 'statement', '["t1","t2"]', '2026-10-20T00:10:00.000Z', 'admin', '2026-10-20T00:00:00.000Z')`,
-  ).run();
+     VALUES ('tr1', 's1', 'statement', '["t1","t2"]', '2026-10-20T00:10:00.000Z', ?, '2026-10-20T00:00:00.000Z')`,
+  ).run(judge.id);
   const ins = db.prepare(
     `INSERT INTO tiebreak_votes (tiebreak_round_id, voter_id, team_id, score, voted_at)
-     VALUES ('tr1', 'u1', 't1', 80, '2026-10-20T00:05:00.000Z')`,
+     VALUES ('tr1', ?, ?, 80, '2026-10-20T00:05:00.000Z')`,
   );
-  ins.run();
-  assert.throws(() => ins.run(), /UNIQUE|constraint/i, '同一 (轮次,投票人,队伍) 只能投一次');
+  ins.run(judge.id, team.id);
+  // ⚠️ 准确语义是「一人**一队**一票」：同一人对**不同**队伍各投一次是允许的
+  //    （破同分时每位评委都要给每支并列队打分）。
+  //    若主键退化成 (轮次,投票人)，这条会被数据库拒掉 —— 所以它必须能插进去。
+  ins.run(judge.id, team2.id);
+  assert.equal(
+    db.prepare('SELECT COUNT(*) AS n FROM tiebreak_votes').get().n,
+    2,
+    '同一人对两支队伍各投一票，共两行',
+  );
+  // 同一 (轮次,投票人,队伍) 第二次投票 → 被数据库拒绝（并发下插不出两票）
+  assert.throws(() => ins.run(judge.id, team.id), /UNIQUE|constraint/i, '同一 (轮次,投票人,队伍) 只能投一次');
   close();
   rmSync(dataDir, { recursive: true, force: true });
 });
 
 test('幂等键表：同一 (scope,赛段,主体,request_id) 只能领一次', () => {
-  const { db, close, dataDir } = setup();
+  const { db, close, dataDir, judge } = setup();
   const ins = db.prepare(
     `INSERT INTO review_request_keys (scope, stage_id, subject_id, request_id, created_at)
-     VALUES ('review', 's1', 'u1', 'req-1', '2026-10-20T00:00:00.000Z')`,
+     VALUES ('review', 's1', ?, ?, '2026-10-20T00:00:00.000Z')`,
   );
-  ins.run();
-  assert.throws(() => ins.run(), /UNIQUE|constraint/i);
+  ins.run(judge.id, 'req-1');
+  assert.throws(() => ins.run(judge.id, 'req-1'), /UNIQUE|constraint/i);
+  // ⚠️ **不同的** request_id 必须能并存 —— 否则第二次请求会被误判成重复请求而丢数据。
+  //    幂等键的语义是「同一个 request_id 只能生效一次」，不是「这个主体只能来一次」。
+  ins.run(judge.id, 'req-2');
+  assert.equal(
+    db.prepare('SELECT COUNT(*) AS n FROM review_request_keys').get().n,
+    2,
+    '同一主体的两个不同 request_id 应各占一行',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('同一届期下赛段代号唯一（不能有两个初赛）', () => {
+  const { db, close, dataDir, edition } = setup();
+  const ins = db.prepare(
+    `INSERT INTO stages (id, edition_id, "key", name, kind, starts_at, ends_at, scoring_config_key, status)
+     VALUES (?, ?, ?, '初赛', 'initial', '2026-10-01', '2026-10-10', 'initial', 'open')`,
+  );
+  // setup 里已有一个 key='s1' 的赛段 → 再插一个同代号必须被拒
+  assert.throws(() => ins.run('s2', edition.id, 's1'), /UNIQUE|constraint/i, '同一届期下赛段代号不能重复');
+  // 不同代号可以并存
+  ins.run('s3', edition.id, 's2');
   close();
   rmSync(dataDir, { recursive: true, force: true });
 });
 
 test('stage_results 的 rank / points 在 P2 阶段可空（名次由 P3 填）', () => {
   const { db, close, dataDir } = setup();
-  const info = db.prepare("PRAGMA table_info(stage_results)").all();
+  const info = db.prepare('PRAGMA table_info(stage_results)').all();
   const rank = info.find((c) => c.name === 'rank');
   const points = info.find((c) => c.name === 'points');
   assert.equal(rank.notnull, 0);
   assert.equal(points.notnull, 0);
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+// ── 外键（父代理预审修正，Important）──────────────────────────────────────
+// ⚠️ 原规格只给一部分列加了外键（stage_judges.user_id 有、stage_reviews.judge_id 没有），
+//    同一类引用一处有一处没有 —— 评审数据可以指向**不存在的评委/队伍**，
+//    聚合时不会被发现；而假 id 夹具正好掩盖了这一点。
+//    P1 的 002_registration.sql 里 editions/teams/cities/task_packages/registrations
+//    的 edition_id **全都有**外键 —— 这里与它对齐。
+test('外键：赛段必须挂在真实届期上（不存在的届期插不进去）', () => {
+  const { db, close, dataDir } = setup();
+  assert.throws(
+    () => db.prepare(
+      `INSERT INTO stages (id, edition_id, "key", name, kind, starts_at, ends_at, scoring_config_key, status)
+       VALUES ('s2', 'no-such-edition', 's2', '决赛', 'final', '2026-10-26', '2026-10-28', 'final', 'open')`,
+    ).run(),
+    /FOREIGN KEY constraint failed/i,
+    'stages.edition_id 必须有外键',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('外键：评分必须挂在真实的评委与队伍上（孤儿评分插不进去）', () => {
+  const { db, close, dataDir, team } = setup();
+  // 评委不存在
+  assert.throws(
+    () => db.prepare(
+      `INSERT INTO stage_reviews (id, stage_id, judge_id, team_id, dimension, raw_score, submitted_at)
+       VALUES ('r9', 's1', 'no-such-judge', ?, 'innovation', 80, '2026-10-20T00:00:00.000Z')`,
+    ).run(team.id),
+    /FOREIGN KEY constraint failed/i,
+    'stage_reviews.judge_id 必须有外键',
+  );
+  // 队伍不存在
+  assert.throws(
+    () => db.prepare(
+      `INSERT INTO stage_reviews (id, stage_id, judge_id, team_id, dimension, raw_score, submitted_at)
+       VALUES ('r10', 's1', (SELECT id FROM users WHERE name = '评委甲'), 'no-such-team', 'innovation', 80, '2026-10-20T00:00:00.000Z')`,
+    ).run(),
+    /FOREIGN KEY constraint failed/i,
+    'stage_reviews.team_id 必须有外键',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('外键：互评 / 自评 / 结果表也不能指向不存在的队伍', () => {
+  const { db, close, dataDir, judge, team } = setup();
+  assert.throws(
+    () => db.prepare(
+      `INSERT INTO peer_reviews (id, stage_id, from_team_id, to_team_id, score, created_at)
+       VALUES ('p9', 's1', ?, 'no-such-team', 70, '2026-10-20T00:00:00.000Z')`,
+    ).run(team.id),
+    /FOREIGN KEY constraint failed/i,
+    'peer_reviews.to_team_id 必须有外键',
+  );
+  assert.throws(
+    () => db.prepare(
+      `INSERT INTO self_reviews (id, stage_id, team_id, dimension, raw_score, submitted_at)
+       VALUES ('sr9', 's1', 'no-such-team', 'innovation', 80, '2026-10-20T00:00:00.000Z')`,
+    ).run(),
+    /FOREIGN KEY constraint failed/i,
+    'self_reviews.team_id 必须有外键',
+  );
+  assert.throws(
+    () => db.prepare(
+      `INSERT INTO stage_results (id, stage_id, team_id, total, seat_p, seat_e, created_at)
+       VALUES ('sr9', 's1', 'no-such-team', 80, 60, 20, '2026-10-20T00:00:00.000Z')`,
+    ).run(),
+    /FOREIGN KEY constraint failed/i,
+    'stage_results.team_id 必须有外键',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('外键：评委席必须挂在真实评委上，声明必须指向真实声明', () => {
+  const { db, close, dataDir, judge } = setup();
+  const judge2 = createUser(db, { name: '评委乙', phone: '13900002003', password: 'pw' });
+  // 正常插入：评委席挂在真实评委上
+  db.prepare(
+    `INSERT INTO stage_judges (stage_id, user_id, seat, scope_type, scope_id, assigned_at)
+     VALUES ('s1', ?, 'judge', 'global', NULL, '2026-10-20T00:00:00.000Z')`,
+  ).run(judge.id);
+  // 评委不存在
+  assert.throws(
+    () => db.prepare(
+      `INSERT INTO stage_judges (stage_id, user_id, seat, scope_type, scope_id, assigned_at)
+       VALUES ('s1', 'no-such-judge', 'judge', 'global', NULL, '2026-10-20T00:00:00.000Z')`,
+    ).run(),
+    /FOREIGN KEY constraint failed/i,
+    'stage_judges.user_id 必须有外键',
+  );
+  // 声明不存在（用另一个评委 —— 否则会先撞上主键 (stage_id, user_id)）
+  assert.throws(
+    () => db.prepare(
+      `INSERT INTO stage_judges (stage_id, user_id, seat, scope_type, scope_id, assigned_at, conflict_declaration_id)
+       VALUES ('s1', ?, 'judge', 'global', NULL, '2026-10-20T00:00:00.000Z', 'no-such-declaration')`,
+    ).run(judge2.id),
+    /FOREIGN KEY constraint failed/i,
+    'stage_judges.conflict_declaration_id 必须有外键',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('利益冲突声明表存在（R-JDG-18：评委须签署声明）', () => {
+  // ⚠️ 这张表在原规格的**测试表清单里是漏的** —— 建表漏了测试也不报。
+  const { db, close, dataDir, edition, judge } = setup();
+  const info = db.prepare('PRAGMA table_info(conflict_declarations)').all().map((c) => c.name);
+  for (const col of ['id', 'stage_id', 'judge_id', 'declared_at', 'has_conflict', 'statement', 'signed_at']) {
+    assert.ok(info.includes(col), `conflict_declarations 缺列 ${col}`);
+  }
+  // 声明可落库，且指向真实赛段与真实评委
+  db.prepare(
+    `INSERT INTO conflict_declarations (id, stage_id, judge_id, declared_at, has_conflict, statement, signed_at)
+     VALUES ('cd1', 's1', ?, '2026-10-20T00:00:00.000Z', 0, '本人与参赛企业无利益关系', '2026-10-20T00:00:00.000Z')`,
+  ).run(judge.id);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM conflict_declarations').get().n, 1);
+  // 评委必须存在
+  assert.throws(
+    () => db.prepare(
+      `INSERT INTO conflict_declarations (id, stage_id, judge_id, declared_at, has_conflict, statement, signed_at)
+       VALUES ('cd2', 's1', 'no-such-judge', '2026-10-20T00:00:00.000Z', 0, 'x', '2026-10-20T00:00:00.000Z')`,
+    ).run(),
+    /FOREIGN KEY constraint failed/i,
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('企业确认：同格只能有一条有效记录，软删后可重签（R2 双签 / R-JDG-14）', () => {
+  const { db, close, dataDir, judge, team } = setup();
+  const ins = db.prepare(
+    `INSERT INTO enterprise_confirmations (id, stage_id, team_id, enterprise_id, dimension, raw_score, content, created_at)
+     VALUES (?, 's1', ?, ?, 'delivery', 85, '由我方提供落地资源', '2026-10-20T00:00:00.000Z')`,
+  );
+  ins.run('e1', team.id, judge.id);
+  // 同 (赛段,队伍,维度,企业) 只能有一条有效记录
+  assert.throws(
+    () => ins.run('e2', team.id, judge.id),
+    /UNIQUE|constraint/i,
+    '同格重复确认必须被数据库拒绝',
+  );
+  // 软删之后同格可重签 —— 这是**偏序**唯一索引（WHERE deleted_at IS NULL）的语义
+  db.prepare(`UPDATE enterprise_confirmations SET deleted_at = '2026-10-21T00:00:00.000Z' WHERE id = 'e1'`).run();
+  ins.run('e3', team.id, judge.id);
+  assert.equal(
+    db.prepare('SELECT COUNT(*) AS n FROM enterprise_confirmations WHERE deleted_at IS NULL').get().n,
+    1,
+    '软删后同格只有一条有效记录',
+  );
+  // 引用型外键：队伍 / 企业必须真实存在
+  assert.throws(
+    () => db.prepare(
+      `INSERT INTO enterprise_confirmations (id, stage_id, team_id, enterprise_id, dimension, raw_score, created_at)
+       VALUES ('e4', 's1', 'no-such-team', ?, 'delivery', 85, '2026-10-20T00:00:00.000Z')`,
+    ).run(judge.id),
+    /FOREIGN KEY constraint failed/i,
+    'enterprise_confirmations.team_id 必须有外键',
+  );
+  assert.throws(
+    () => db.prepare(
+      `INSERT INTO enterprise_confirmations (id, stage_id, team_id, enterprise_id, dimension, raw_score, created_at)
+       VALUES ('e5', 's1', ?, 'no-such-enterprise', 'delivery', 85, '2026-10-20T00:00:00.000Z')`,
+    ).run(team.id),
+    /FOREIGN KEY constraint failed/i,
+    'enterprise_confirmations.enterprise_id 必须有外键',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('自评 / 结果：同格唯一，且都挂在真实赛段与队伍上', () => {
+  const { db, close, dataDir, team } = setup();
+  // 自评：同一 (赛段,队伍,维度) 只能一条
+  const selfIns = db.prepare(
+    `INSERT INTO self_reviews (id, stage_id, team_id, dimension, raw_score, submitted_at)
+     VALUES (?, 's1', ?, 'innovation', 70, '2026-10-20T00:00:00.000Z')`,
+  );
+  selfIns.run('sr1', team.id);
+  assert.throws(() => selfIns.run('sr2', team.id), /UNIQUE|constraint/i, '同一 (赛段,队伍,维度) 自评只能一条');
+  // 自评的赛段也必须真实
+  assert.throws(
+    () => db.prepare(
+      `INSERT INTO self_reviews (id, stage_id, team_id, dimension, raw_score, submitted_at)
+       VALUES ('sr3', 'no-such-stage', ?, 'innovation', 70, '2026-10-20T00:00:00.000Z')`,
+    ).run(team.id),
+    /FOREIGN KEY constraint failed/i,
+    'self_reviews.stage_id 必须有外键',
+  );
+  // 赛段结果：同一 (赛段,队伍) 只能一条
+  const resIns = db.prepare(
+    `INSERT INTO stage_results (id, stage_id, team_id, total, seat_p, seat_e, created_at)
+     VALUES (?, 's1', ?, 80, 60, 20, '2026-10-20T00:00:00.000Z')`,
+  );
+  resIns.run('st1', team.id);
+  assert.throws(() => resIns.run('st2', team.id), /UNIQUE|constraint/i, '同一 (赛段,队伍) 结果只能一条');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('外键：计算快照的赛段 / 队伍，以及加时投票的投票人 / 队伍', () => {
+  const { db, close, dataDir, judge, team } = setup();
+  const fkFail = (sql, ...params) => assert.throws(
+    () => db.prepare(sql).run(...params),
+    /FOREIGN KEY constraint failed/i,
+  );
+  // 计算快照（可复算的载体）：赛段与队伍都要真实
+  fkFail(
+    `INSERT INTO computation_snapshots (id, kind, edition_id, stage_id, team_id, rule_version, input_json, output_json, trace_json, created_at)
+     VALUES ('cs1', 'stage_score', (SELECT id FROM editions LIMIT 1), 'no-such-stage', ?, 'v1', '{}', '{}', '{}', '2026-10-20T00:00:00.000Z')`,
+    team.id,
+  );
+  fkFail(
+    `INSERT INTO computation_snapshots (id, kind, edition_id, stage_id, team_id, rule_version, input_json, output_json, trace_json, created_at)
+     VALUES ('cs2', 'stage_score', (SELECT id FROM editions LIMIT 1), 's1', 'no-such-team', 'v1', '{}', '{}', '{}', '2026-10-20T00:00:00.000Z')`,
+  );
+  // 加时投票：投票人与队伍都要真实
+  db.prepare(
+    `INSERT INTO tiebreak_round (id, stage_id, kind, tied_team_ids_json, statement_deadline, created_by, created_at)
+     VALUES ('tr1', 's1', 'statement', '[]', '2026-10-20T00:10:00.000Z', ?, '2026-10-20T00:00:00.000Z')`,
+  ).run(judge.id);
+  fkFail(
+    `INSERT INTO tiebreak_votes (tiebreak_round_id, voter_id, team_id, score, voted_at)
+     VALUES ('tr1', 'no-such-voter', ?, 80, '2026-10-20T00:05:00.000Z')`,
+    team.id,
+  );
+  fkFail(
+    `INSERT INTO tiebreak_votes (tiebreak_round_id, voter_id, team_id, score, voted_at)
+     VALUES ('tr1', ?, 'no-such-team', 80, '2026-10-20T00:05:00.000Z')`,
+    judge.id,
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('登记口径：stage_reviews 的 UNIQUE 是【非偏序】—— 软删不会腾出格子', () => {
+  // ⚠️ 这是**已登记的陷阱**，不是笔误：契约原文的 UNIQUE(stage_id, judge_id, team_id, dimension)
+  //    **没有** WHERE deleted_at IS NULL，而改分走的是覆盖写 UPDATE（不软删）。
+  //    所以今天的语义是「一个格子终身只有一条」，软删后也插不进第二条。
+  //    将来若要实现「撤回评审」，必须同步把索引改成偏序 —— 那时这条断言会先失败，
+  //    提醒改动者同步改索引。
+  const { db, close, dataDir, judge, team } = setup();
+  const ins = db.prepare(
+    `INSERT INTO stage_reviews (id, stage_id, judge_id, team_id, dimension, raw_score, submitted_at)
+     VALUES (?, 's1', ?, ?, 'innovation', 80, '2026-10-20T00:00:00.000Z')`,
+  );
+  ins.run('r1', judge.id, team.id);
+  db.prepare(`UPDATE stage_reviews SET deleted_at = '2026-10-21T00:00:00.000Z' WHERE id = 'r1'`).run();
+  assert.throws(
+    () => ins.run('r2', judge.id, team.id),
+    /UNIQUE|constraint/i,
+    '非偏序唯一索引：软删不腾格子',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('外键：校准 / 回避 / 加时轮次 / 快照 / 互评 也都指向真实主体', () => {
+  const { db, close, dataDir, judge, team } = setup();
+  const fkFail = (sql, ...params) => assert.throws(
+    () => db.prepare(sql).run(...params),
+    /FOREIGN KEY constraint failed/i,
+  );
+  // 校准（R-JDG-12）：校准分不计入评分，但赛段/评委必须真实
+  fkFail(
+    `INSERT INTO calibrations (id, stage_id, judge_id, dimension, raw_score, created_at)
+     VALUES ('c1', 'no-such-stage', ?, 'innovation', 70, '2026-10-20T00:00:00.000Z')`,
+    judge.id,
+  );
+  fkFail(
+    `INSERT INTO calibrations (id, stage_id, judge_id, dimension, raw_score, created_at)
+     VALUES ('c2', 's1', 'no-such-judge', 'innovation', 70, '2026-10-20T00:00:00.000Z')`,
+  );
+  // 回避记录（R-JDG-09）：回避必须留档
+  fkFail(
+    `INSERT INTO recusal_records (id, stage_id, judge_id, team_id, reason, source, declared_at, action)
+     VALUES ('r1', 's1', ?, 'no-such-team', '有利益关系', 'conflict', '2026-10-20T00:00:00.000Z', 'recused')`,
+    judge.id,
+  );
+  fkFail(
+    `INSERT INTO recusal_records (id, stage_id, judge_id, team_id, reason, source, declared_at, action)
+     VALUES ('r2', 's1', 'no-such-judge', ?, '有利益关系', 'conflict', '2026-10-20T00:00:00.000Z', 'recused')`,
+    team.id,
+  );
+  // 加时陈述轮次（S7 §3.3）
+  fkFail(
+    `INSERT INTO tiebreak_round (id, stage_id, kind, tied_team_ids_json, statement_deadline, created_by, created_at)
+     VALUES ('tr1', 's1', 'statement', '[]', '2026-10-20T00:10:00.000Z', 'no-such-user', '2026-10-20T00:00:00.000Z')`,
+  );
+  // 计算快照与赛段结果（可复算的载体）
+  fkFail(
+    `INSERT INTO computation_snapshots (id, kind, edition_id, rule_version, input_json, output_json, trace_json, created_at)
+     VALUES ('cs1', 'stage_score', 'no-such-edition', 'v1', '{}', '{}', '{}', '2026-10-20T00:00:00.000Z')`,
+  );
+  fkFail(
+    `INSERT INTO stage_results (id, stage_id, team_id, total, seat_p, seat_e, computation_id, created_at)
+     VALUES ('sr1', 's1', ?, 80, 60, 20, 'no-such-snapshot', '2026-10-20T00:00:00.000Z')`,
+    team.id,
+  );
+  // 互评的起点队伍也要真实
+  fkFail(
+    `INSERT INTO peer_reviews (id, stage_id, from_team_id, to_team_id, score, created_at)
+     VALUES ('p1', 's1', 'no-such-team', ?, 70, '2026-10-20T00:00:00.000Z')`,
+    team.id,
+  );
+  // 回避记录的审计人（audit_by）也是用户引用
+  fkFail(
+    `INSERT INTO recusal_records (id, stage_id, judge_id, team_id, reason, source, declared_at, audit_by, action)
+     VALUES ('r3', 's1', ?, ?, '有利益关系', 'audit', '2026-10-20T00:00:00.000Z', 'no-such-auditor', 'recused')`,
+    judge.id,
+    team.id,
+  );
+  // 幂等键表的赛段也要真实
+  fkFail(
+    `INSERT INTO review_request_keys (scope, stage_id, subject_id, request_id, created_at)
+     VALUES ('review', 'no-such-stage', ?, 'req-9', '2026-10-20T00:00:00.000Z')`,
+    judge.id,
+  );
+  // 企业双签的两个签字人也要真实
+  fkFail(
+    `INSERT INTO enterprise_confirmations (id, stage_id, team_id, enterprise_id, dimension, raw_score, cross_judge_id, created_at)
+     VALUES ('e9', 's1', ?, ?, 'delivery', 85, 'no-such-cross-judge', '2026-10-20T00:00:00.000Z')`,
+    team.id,
+    judge.id,
+  );
+  fkFail(
+    `INSERT INTO enterprise_confirmations (id, stage_id, team_id, enterprise_id, dimension, raw_score, signatory_user_id, created_at)
+     VALUES ('e10', 's1', ?, ?, 'delivery', 85, 'no-such-signatory', '2026-10-20T00:00:00.000Z')`,
+    team.id,
+    judge.id,
+  );
   close();
   rmSync(dataDir, { recursive: true, force: true });
 });
@@ -258,13 +679,26 @@ Expected: FAIL —— 缺表 `stages`（迁移 003 尚未创建）
 ```sql
 -- 003_review.sql — 评审引擎数据模型
 -- 依据：设计文档 §5.2 / §12 + INTERFACES.md §3 + S7 §2.4（R1–R5）/ §3.4 / §4.2
--- ⛔ 与 INTERFACES.md 的差异（tiebreak_round / tiebreak_votes / content 列 / 幂等索引）
---    见本计划文末「与接口契约的偏差」。
+-- ⛔ 与 INTERFACES.md 的差异（tiebreak_round / tiebreak_votes / conflict_declarations /
+--    review_request_keys / content 列 / 幂等索引）见本计划文末「与接口契约的偏差」。
+--
+-- ⚠️ 外键（父代理预审修正，Important）：本迁移最初**只给一部分列加了外键**
+--    （stage_judges.user_id 有、stage_reviews.judge_id 没有），同一类引用一处有一处没有 ——
+--    评审数据可以指向**不存在的评委/队伍**（孤儿行），聚合时不会被发现；
+--    而测试用假 id（'j1' / 't1' / 'ed1'）正好**掩盖**了这一点。
+--    现在**补齐全部引用型外键**，与 P1 的 002_registration.sql 同一约定：
+--      · edition_id → editions(id)（P1 的 editions/teams/cities/task_packages/registrations 全都有）
+--      · judge_id / user_id / voter_id / created_by / enterprise_id → users(id)
+--      · team_id / from_team_id / to_team_id → teams(id)
+--    ⚠️ 代价：**所有测试夹具必须建真实的用户 / 届期 / 战队**（P1 的迁移测试就是这么做的），
+--    不能再用 'j1' / 't1' / 'ed1' 这类假 id。
+--    ⚠️ 作用域引用（stage_judges.scope_id / stage_reviews.request_id）是**多态/逻辑引用**，
+--    不能建外键 —— 保持普通列 + 普通索引。
 
 -- 赛段（一条赛段 = 一套权重表 + 一批评委）
 CREATE TABLE stages (
   id                 TEXT PRIMARY KEY,
-  edition_id         TEXT NOT NULL,
+  edition_id         TEXT NOT NULL REFERENCES editions(id),
   "key"              TEXT NOT NULL,          -- 赛段代号，如 s1..s5
   name               TEXT NOT NULL,
   kind               TEXT NOT NULL,          -- initial | final | roadshow | landing
@@ -289,7 +723,10 @@ CREATE TABLE stage_judges (
   scope_id     TEXT,
   assigned_at  TEXT NOT NULL,
   conflict_declared_at TEXT,                 -- ★ R-JDG-18：评委须签署利益冲突声明
-  conflict_declaration_id TEXT,             --   指向 conflict_declarations.id
+  conflict_declaration_id TEXT REFERENCES conflict_declarations(id),             --   指向 conflict_declarations.id
+  -- ⚠️ 这是**前向引用**：被引用的 conflict_declarations 在本文件**后面**才建。
+  --    SQLite 的外键父表是**惰性解析**的（建表时不校验，DML 时才查），
+  --    所以顺序无害；但若将来把 conflict_declarations 移到别处，务必同步本行。
   PRIMARY KEY (stage_id, user_id)
 );
 CREATE INDEX idx_stage_judges_user ON stage_judges(user_id);
@@ -313,8 +750,8 @@ CREATE INDEX idx_conflict_decl_judge ON conflict_declarations(stage_id, judge_id
 CREATE TABLE stage_reviews (
   id           TEXT PRIMARY KEY,
   stage_id     TEXT NOT NULL REFERENCES stages(id),
-  judge_id     TEXT NOT NULL,
-  team_id      TEXT NOT NULL,
+  judge_id     TEXT NOT NULL REFERENCES users(id),
+  team_id      TEXT NOT NULL REFERENCES teams(id),
   dimension    TEXT NOT NULL,
   raw_score    REAL NOT NULL,                -- 0–100 原始分
   submitted_at TEXT NOT NULL,
@@ -334,7 +771,7 @@ CREATE INDEX idx_stage_reviews_judge ON stage_reviews(stage_id, judge_id);
 -- 依据：设计文档 §11「幂等 + 行锁 + 只接受当前分配」；P4 的 idempotency_keys 是同一种模式。
 CREATE TABLE review_request_keys (
   scope       TEXT NOT NULL,                 -- review | peer_review | self_review
-  stage_id    TEXT NOT NULL,
+  stage_id    TEXT NOT NULL REFERENCES stages(id),
   subject_id  TEXT NOT NULL,                 -- judge_id / from_team_id / team_id
   request_id  TEXT NOT NULL,
   created_at  TEXT NOT NULL,
@@ -345,7 +782,7 @@ CREATE TABLE review_request_keys (
 CREATE TABLE calibrations (
   id         TEXT PRIMARY KEY,
   stage_id   TEXT NOT NULL REFERENCES stages(id),
-  judge_id   TEXT NOT NULL,
+  judge_id   TEXT NOT NULL REFERENCES users(id),
   dimension  TEXT NOT NULL,
   raw_score  REAL NOT NULL,
   created_at TEXT NOT NULL
@@ -357,12 +794,12 @@ CREATE INDEX idx_calibrations_stage ON calibrations(stage_id, judge_id);
 CREATE TABLE enterprise_confirmations (
   id               TEXT PRIMARY KEY,
   stage_id         TEXT NOT NULL REFERENCES stages(id),
-  team_id          TEXT NOT NULL,
-  enterprise_id    TEXT NOT NULL,
+  team_id          TEXT NOT NULL REFERENCES teams(id),
+  enterprise_id    TEXT NOT NULL REFERENCES users(id),
   dimension        TEXT NOT NULL,            -- 企业确认维度
   raw_score        REAL NOT NULL,
-  cross_judge_id   TEXT,                     -- R2 双签之一：≥1 名跨领域评委签字
-  signatory_user_id TEXT,                    -- R2 双签之二：出题企业签字
+  cross_judge_id   TEXT REFERENCES users(id),  -- R2 双签之一：≥1 名跨领域评委签字
+  signatory_user_id TEXT REFERENCES users(id), -- R2 双签之二：出题企业签字
   content          TEXT NOT NULL DEFAULT '', -- R-JDG-14：必填「解决哪个环节/落地时间/我方角色」
   created_at       TEXT NOT NULL,
   deleted_at       TEXT
@@ -374,8 +811,8 @@ CREATE UNIQUE INDEX idx_enterprise_confirmations_cell
 CREATE TABLE peer_reviews (
   id           TEXT PRIMARY KEY,
   stage_id     TEXT NOT NULL REFERENCES stages(id),
-  from_team_id TEXT NOT NULL,
-  to_team_id   TEXT NOT NULL,
+  from_team_id TEXT NOT NULL REFERENCES teams(id),
+  to_team_id   TEXT NOT NULL REFERENCES teams(id),
   score        REAL NOT NULL,
   request_id   TEXT,
   created_at   TEXT NOT NULL,
@@ -387,7 +824,7 @@ CREATE INDEX idx_peer_reviews_request ON peer_reviews(stage_id, from_team_id, re
 CREATE TABLE self_reviews (
   id           TEXT PRIMARY KEY,
   stage_id     TEXT NOT NULL REFERENCES stages(id),
-  team_id      TEXT NOT NULL,
+  team_id      TEXT NOT NULL REFERENCES teams(id),
   dimension    TEXT NOT NULL,
   raw_score    REAL NOT NULL,
   submitted_at TEXT NOT NULL,
@@ -399,7 +836,7 @@ CREATE INDEX idx_self_reviews_request ON self_reviews(stage_id, team_id, request
 -- 评委×维度的增量统计（n / mean / sum_sq；stdev 由 sum_sq 现算）
 -- 依据：设计文档 §6.2 Step 2【决策】mean/stdev 增量维护
 CREATE TABLE score_stats (
-  judge_id   TEXT NOT NULL,
+  judge_id   TEXT NOT NULL REFERENCES users(id),
   dimension  TEXT NOT NULL,
   n          INTEGER NOT NULL DEFAULT 0,
   mean       REAL NOT NULL DEFAULT 0,
@@ -412,12 +849,12 @@ CREATE TABLE score_stats (
 CREATE TABLE recusal_records (
   id          TEXT PRIMARY KEY,
   stage_id    TEXT NOT NULL REFERENCES stages(id),
-  judge_id    TEXT NOT NULL,
-  team_id     TEXT,                          -- NULL = 该赛段整体回避
+  judge_id    TEXT NOT NULL REFERENCES users(id),
+  team_id     TEXT REFERENCES teams(id),                          -- NULL = 该赛段整体回避
   reason      TEXT NOT NULL,
   source      TEXT NOT NULL,                 -- declared 自报 | conflict 利益冲突 | audit 组委会
   declared_at TEXT NOT NULL,
-  audit_by    TEXT,
+  audit_by    TEXT REFERENCES users(id),
   action      TEXT NOT NULL                  -- recused 生效 | reinstated 撤销
 );
 CREATE INDEX idx_recusals_lookup ON recusal_records(stage_id, judge_id);
@@ -426,9 +863,9 @@ CREATE INDEX idx_recusals_lookup ON recusal_records(stage_id, judge_id);
 CREATE TABLE computation_snapshots (
   id           TEXT PRIMARY KEY,
   kind         TEXT NOT NULL,                -- stage_score
-  edition_id   TEXT,
-  stage_id     TEXT,
-  team_id      TEXT,
+  edition_id   TEXT REFERENCES editions(id),
+  stage_id     TEXT REFERENCES stages(id),
+  team_id      TEXT REFERENCES teams(id),
   rule_version TEXT NOT NULL,
   input_json   TEXT NOT NULL,
   output_json  TEXT NOT NULL,
@@ -442,7 +879,7 @@ CREATE INDEX idx_snapshots_stage ON computation_snapshots(stage_id, kind, revisi
 CREATE TABLE stage_results (
   id             TEXT PRIMARY KEY,
   stage_id       TEXT NOT NULL REFERENCES stages(id),
-  team_id        TEXT NOT NULL,
+  team_id        TEXT NOT NULL REFERENCES teams(id),
   rank           INTEGER,
   total          REAL NOT NULL,
   seat_p         REAL NOT NULL,
@@ -463,7 +900,7 @@ CREATE TABLE tiebreak_round (
   statement_deadline  TEXT NOT NULL,
   vote_deadline       TEXT,
   status              TEXT NOT NULL DEFAULT 'open',   -- open | closed
-  created_by          TEXT NOT NULL,
+  created_by          TEXT NOT NULL REFERENCES users(id),
   created_at          TEXT NOT NULL
 );
 CREATE INDEX idx_tiebreak_rounds_stage ON tiebreak_round(stage_id, status);
@@ -473,8 +910,8 @@ CREATE INDEX idx_tiebreak_rounds_stage ON tiebreak_round(stage_id, status);
 --   ⛔ 不用应用层「先查再插」：并发下会插出两票
 CREATE TABLE tiebreak_votes (
   tiebreak_round_id TEXT NOT NULL REFERENCES tiebreak_round(id),
-  voter_id          TEXT NOT NULL,
-  team_id           TEXT NOT NULL,
+  voter_id          TEXT NOT NULL REFERENCES users(id),
+  team_id           TEXT NOT NULL REFERENCES teams(id),
   score             REAL NOT NULL,
   voted_at          TEXT NOT NULL,
   PRIMARY KEY (tiebreak_round_id, voter_id, team_id)
@@ -484,7 +921,7 @@ CREATE TABLE tiebreak_votes (
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cd platform && node --test test/migration-review.test.js`
-Expected: PASS（7 个测试全过：migration-review.test.js 7）
+Expected: PASS（18 个测试全过：migration-review 18）
 
 - [ ] **Step 5: 实跑迁移脚本**
 
@@ -495,7 +932,7 @@ Expected: 输出 `迁移完成，当前版本 3`
 
 ```bash
 cd platform && git add db/migrations/003_review.sql test/migration-review.test.js
-git commit -m "feat(P2): 评审数据模型与迁移 003（13 表 + 关键唯一约束）"
+git commit -m "feat(P2): 评审数据模型与迁移 003（15 表 + 关键唯一约束 + 引用型外键齐全）"
 ```
 
 ---
@@ -1813,6 +2250,14 @@ git commit -m "feat(P2): 自评差异检测、回避制度、互评资格与评�
 **Interfaces:**
 - Consumes: P0 `openDatabase`；Task 1 的表；Task 5 的 `checkRecusal` / `checkPeerEligibility`
 - Produces:
+  - ⚠️ **利益冲突声明的接线（R-JDG-18，父代理预审修正 Important）**：
+    `assignStageJudge` 在写入 `stage_judges` 的**同时**写入 `conflict_declarations`
+    并回填 `conflict_declared_at` / `conflict_declaration_id`；
+    配套用例必须断言「分配评委后声明表多一行、且 `stage_judges` 两列被填上」。
+    **不接线 = R-JDG-18 静默失效**（与 P1 的 A1 / T4-5 同一类病根：机制写下来了但没接线）
+  - ⚠️ **测试夹具必须建真实数据**（父代理预审修正 Important）：Task 1 补齐了引用型外键
+    （`judge_id → users`、`team_id → teams`、`stage_id → stages`），
+    本任务及 Task 7 / Task 8 的夹具**不能再用** `'j1'` / `'t1'` / `'ed1'` 假 id
   - `submitReviews({ db, stageId, judgeId, items, requestId, now })` → `{ stageId, judgeId, requestId, submitted, items }`
     - 幂等：同一 `requestId` 重复提交只生效一次
     - 观察员 → 403；已回避该队 → 403
@@ -2104,11 +2549,44 @@ export function listStages(db, { editionId } = {}) {
   return db.prepare('SELECT * FROM stages ORDER BY starts_at').all();
 }
 
-export function assignStageJudge(db, { stageId, userId, seat, scopeType = 'global', scopeId = null, now }) {
+/**
+ * 默认利益冲突声明正文（评委被分配到赛段时即签署）。
+ * 评委可另行声明存在冲突 → `has_conflict = 1` → 逐案回避（R-JDG-09 / R-JDG-18）。
+ */
+export const DEFAULT_CONFLICT_STATEMENT =
+  '本人确认与本届参赛队伍及其出题企业不存在利益关系；如存在关联，本人将主动申报并逐案回避。';
+
+/**
+ * 把评委分配到赛段。
+ *
+ * ⚠️ 父代理预审修正（Important，R-JDG-18：**机制写下来了，但没接线**）：
+ *    原来这里只 `INSERT stage_judges` —— `conflict_declarations` 表建了、
+ *    `stage_judges.conflict_declared_at` / `conflict_declaration_id` 两列也留了，
+ *    却**没有任何代码写入或读取它们** → 需求溯源表里的 R-JDG-18
+ *    「评委须签署利益冲突声明」在产品上**静默失效**，CI 全绿。
+ *    与 P1 Task 3 的 A1（`registration:write` 被注册却从不校验）、
+ *    P1 Task 4 的 T4-5（未做六维评估也能签 A 级）**同一类病根**。
+ *    现在：**分配评委即签署声明** —— 声明落 `conflict_declarations`，
+ *    并把声明 id 与签署时间回填到 `stage_judges`。
+ */
+export function assignStageJudge(db, {
+  stageId, userId, seat, scopeType = 'global', scopeId = null, now, declaration = null,
+}) {
+  const declarationId = randomUUID();
   db.prepare(
-    `INSERT INTO stage_judges (stage_id, user_id, seat, scope_type, scope_id, assigned_at)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-  ).run(stageId, userId, seat, scopeType, scopeId, now);
+    `INSERT INTO conflict_declarations (id, stage_id, judge_id, declared_at, has_conflict, statement, signed_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    declarationId, stageId, userId, now,
+    declaration?.hasConflict === true ? 1 : 0,
+    declaration?.statement ?? DEFAULT_CONFLICT_STATEMENT,
+    now,
+  );
+  db.prepare(
+    `INSERT INTO stage_judges (stage_id, user_id, seat, scope_type, scope_id, assigned_at,
+                               conflict_declared_at, conflict_declaration_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(stageId, userId, seat, scopeType, scopeId, now, now, declarationId);
   return listStageJudges(db, stageId);
 }
 
@@ -4734,7 +5212,7 @@ git commit -m "feat(P2): SSE 评审进度推送（src/http/sse.js + GET /api/sta
 |---|---|---|---|---|---|
 | D-1 | `normalizeScores` 的 `samples` 元素多一个可选字段 | `samples: [{ judgeId, value }]` | 允许 `{ judgeId, value, series }`，`series` = 该评委在本维度对**全部参赛队**的原始分序列 | 归一化的是评委宽严，必须知道该评委在维度 d 上的**全部打分**才能算 mean(i,d)/stdev(i,d)；只给单元值无法算 | 无破坏性：不传 `series` 时退回「同 judgeId 在 samples 中的全部 value」 |
 | D-2 | `normalizeScores` 返回值多一个字段 | `{ normalized, values, fallbackReason, stats }` | 追加 `judgeStats[judgeId] = { n, mean, stdev, center, scale, normalized, fallbackReason }` | 契约的 4 个字段无法表达「同一维度内不同评委的降级状态不同」；trace 需要逐评委样本量 | 纯追加，不改原有字段语义 |
-| D-3 | `003_review.sql` 多两张表 | 未列 `tiebreak_round` / `tiebreak_votes` | 新增这两张表 | 设计文档 §6.4【决策】已明确要求「加时陈述用独立表 + 唯一约束」；R-JDG-19 需要落库 | P3 的 `applyTiebreakChain` 直接消费 |
+| D-3 | `003_review.sql` 多**四**张表 | 契约只列 13 张，未列 `tiebreak_round` / `tiebreak_votes` / `review_request_keys` / `conflict_declarations` | 新增这四张表 | ① `tiebreak_round` / `tiebreak_votes`：设计文档 §6.4【决策】已明确要求「加时陈述用独立表 + 唯一约束」，R-JDG-19 需要落库，P3 的 `applyTiebreakChain` 直接消费；② `review_request_keys`：见 D-5；③ `conflict_declarations`：R-JDG-18「评委须签署利益冲突声明」需要独立表 —— **声明（事前签署）与回避（个案动作）不是一回事**，合在一起会让「没签声明」和「这个队要回避」两种状态混为一谈 | P3 的 `applyTiebreakChain` 直接消费；`conflict_declarations` 由 P2 Task 6 的 `assignStageJudge` 写入 |
 | D-4 | `enterprise_confirmations` 多一列 | 无 `content` 列 | 增加 `content TEXT NOT NULL DEFAULT ''` | R-JDG-14「企业签字必须有内容」需要落库；服务层拒绝空白内容 | 需 P3/P4 的签字表同步对齐 |
 | D-5 | 幂等机制的实现方式 | 业务表上有 `request_id` 列，未规定唯一性 | 新增 `review_request_keys(scope, stage_id, subject_id, request_id)` 表做「先抢键再落数据」；业务表的 `request_id` 只作记录、另建普通索引 | ⛔ 一次批量提交会写多行且共用同一个 `request_id` —— 把 UNIQUE 直接建在业务表的 `request_id` 上会让第二批插不进去。键表方案既保证「同一 request 只生效一次」，又天然支持批量 | 新增一张表 + 一个仓储文件；P4 的 `idempotency_keys` 是同一模式，可复用思路 |
 | D-6 | `applyEnterpriseRules` 返回值多一个字段 | `{ seatE, weights, warnings }` | 追加 `r4Substitute[teamId] = { dimension }` | R4 的替代分数来自评委维度分，由 `scoring.js` 填充；纯企业确认表算不出来 | 纯追加 |
@@ -4766,6 +5244,53 @@ git commit -m "feat(P2): SSE 评审进度推送（src/http/sse.js + GET /api/sta
 > P0 终态 `platform/src/db/migrate.js` 的 `readMigrationFiles()` 对重复版本号**响亮抛错**
 > （「迁移版本号重复」），不存在「静默跳过」。同一事实的另一半在 P4 的 §E-1，
 > 已按同一口径删除（见 P4 计划里的 I-9 修正记录）。
+
+---
+
+## Task 1 父代理预审修正台账（2026-10-21）
+
+> Task 1 的规格在**实施前**被父代理逐条实跑预审，发现 **1 Important + 4 Minor**；
+> 实施完成后又做了一轮**变异检验**，变异体一度出现 **7 条存活**（暴露 7 处约束**零覆盖**），
+> 补完测试后 **44/44 杀灭**。全部缺陷均**实跑复现**。
+
+### 一、预审发现的规格缺陷
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| **P2-1** | **Important** | **引用型外键只加了一半**：同一类引用一处有一处没有（`stage_judges.user_id` 有、`stage_reviews.judge_id` 没有）→ 评审数据可以指向**不存在的评委 / 队伍**，聚合时不会被发现；而测试用假 id（`'j1'` / `'t1'` / `'ed1'`）正好**掩盖**了这一点 | P1 的 `002_registration.sql` 里 `edition_id` **全都有**外键；003 里只有一半 | 逐列扫描所有 `*_id` / `*_by` 列，**该有外键的全部补齐** —— 最终 15 张表 **38 条**引用型外键，覆盖 `editions` / `users` / `teams` / `stages` / `conflict_declarations` / `computation_snapshots` / `tiebreak_round` 七个父表 |
+| **P2-2** | Minor | 测试夹具用**假 id**（`'j1'` / `'t1'` / `'ed1'`） | 夹具里 `judge_id = 'j1'` 之类 | 改建**真实的** edition / user / team（与 P1 的 `migration-002.test.js` 对齐）。⚠️ **代价**：Task 6/7/8 计划里 14 处 DB INSERT 点的假 id 夹具，实施时**必须一并改掉** |
+| **P2-3** | Minor | `conflict_declarations` 的**表数口径三处不一致**：正文说 14 张 / SQL 里 15 张 / 测试表清单 14 张 | `003_review.sql` 实际建出 15 张表 | 统一为 **15**，并在「Produces」里显式登记「相对契约 §3 的 13 张新增 4 张」 |
+| **P2-4** | Minor | R-JDG-18「评委须签署利益冲突声明」**零接线**：表建了但没有任何代码写入 | 计划全文搜不到 `conflict_declarations` 的 INSERT | 接线放到 **Task 6**（`assignStageJudge` = 分配评委即签署声明），并把 `assignStageJudge` 的代码块改成「写 `conflict_declarations` + 回填 `stage_judges.conflict_declared_at` / `conflict_declaration_id`」 |
+| **P2-5** | Minor | 「**一人一票**」措辞不准 | `tiebreak_votes` 主键是 `(轮次, 投票人, 队伍)` —— 准确语义是「一人**一队**一票」：同一人对不同队伍各投一次**允许**（破同分时每位评委都要给每支并列队打分） | 全文改为「一人一队一票」，并配套常量 `DEFAULT_CONFLICT_STATEMENT`；⚠️ 该语义**必须**有测试区分（见 M2-4） |
+
+### 二、变异检验发现的实现盲区
+
+> 变异体 **44** 个，全部作用在 `003_review.sql` 上（约束删除 / 主键退化 / 外键摘除 / 列改 NOT NULL / 整表删除），
+> 在 `/tmp` 副本上跑 `migration-review.test.js`，**测试必须失败才算杀灭**。
+> 变异脚本：`/tmp/p2t1/mutate.mjs`（锚点按「表块内定位」而非裸词替换，避免被注释里的同名串劫持）。
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| **M2-1** | **Important** | **第一轮补的外键仍然不齐全** —— 预审只盯着「表与表之间的 id」，漏掉了**同层引用**：8 处真实引用型列仍是裸的 | 变异存活：`computation_snapshots.stage_id` / `.team_id` / `enterprise_confirmations.cross_judge_id` / `.signatory_user_id` / `score_stats.judge_id` / `recusal_records.audit_by` / `review_request_keys.stage_id` 去外键后**测试全绿** | 补齐这 8 条 → 外键总数 16 → **38**；逐条加 FK 拒绝用例 |
+| **M2-2** | Minor | `stage_judges.conflict_declaration_id` 是**前向引用外键**（被引用的表在文件**后面**才建）→ 零覆盖 | 变异存活：去外键后测试全绿 | 补 1 条用例（正常插入 + 评委不存在被拒 + 声明不存在被拒）。⚠️ 第二个用例必须用**另一个评委** —— 否则会先撞上主键 `(stage_id, user_id)`，外键根本轮不到触发（**实测踩过**） |
+| **M2-3** | **Important** | 7 处关键约束**零覆盖**：`self_reviews` 唯一索引、`stage_results` 唯一索引、`stages` 唯一索引、`computation_snapshots.stage_id`/`.team_id`、`tiebreak_votes.voter_id`/`.team_id`、`self_reviews.stage_id` | 变异存活 7 条 | 补 4 条用例（自评/结果同格唯一 / 快照与加时投票的引用完整性 / 赛段代号唯一 / 自评赛段外键） |
+| **M2-4** | Minor | 「一人一队一票」与「一人一票」在测试里**无法区分** —— 原用例只测了「同一人对同一队投两次被拒」，主键退化成 `(轮次,投票人)` 照样绿 | 变异存活：主键退化为 `(tiebreak_round_id, voter_id)` 后测试全绿 | 补断言：同一人对**两支不同队伍**各投一次 → 必须能插进去、COUNT == 2 |
+| **M2-5** | Minor | 幂等键表未测「**不同** `request_id` 可并存」→ 主键退化成 `(scope,赛段,主体)` 也照样绿（会误判第二次请求为重复而丢数据） | 变异存活：主键去掉 `request_id` 后测试全绿 | 补断言：同主体同 scope 下 `req-1` / `req-2` 各占一行 |
+| **M2-6** | Minor | `stage_reviews` 的 UNIQUE 是**非偏序**（契约原文，没有 `WHERE deleted_at IS NULL`），而 `deleted_at` 列**全计划无人使用** → 这个「软删不腾格子」的行为**没被钉住** | 登记在案的陷阱，但无测试 | 补断言把该行为**显式钉住**：软删后同格仍插不进第二条。将来若要实现「撤回评审」，必须同步把索引改成偏序 —— 那时这条断言会**先失败**，提醒改动者 |
+
+### 三、刻意**不**加外键的多态 / 逻辑引用
+
+> 加外键会**锁死语义**，所以这四类列有意保持普通列 + 普通索引：
+
+| 列 | 为什么不能加外键 |
+|---|---|
+| `stage_judges.scope_id` | 四态多态引用（`global` / `edition` / `task_package` / `team`），父表随态而变 |
+| `stage_reviews.request_id` / `peer_reviews.request_id` / `self_reviews.request_id` | 幂等键的**逻辑引用**，真身在 `review_request_keys`（见 D-5） |
+| `review_request_keys.subject_id` | 三态多态引用（`judge_id` / `from_team_id` / `team_id`） |
+
+**Task 1 的测试条数口径**：migration-review **18**（建表存在性 1 + 关键唯一约束 5 + 引用型外键 8 + 企业确认偏序索引 1 + 非偏序 UNIQUE 登记 1 + 赛段代号唯一 1 + 自评/结果同格唯一 1 …）。
+
+**最终结果**：变异体 44 → **KILLED 44 / SURVIVED 0**；`migration-review.test.js` **18/18**；P2 全量 **324/324**。
 
 ---
 
