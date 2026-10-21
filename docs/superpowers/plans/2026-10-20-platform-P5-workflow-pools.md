@@ -79,7 +79,7 @@ platform/
 │   ├── db/repo/
 │   │   ├── workflows.js             workflows + workflow_tasks（工作流与任务清单）
 │   │   ├── task-claims.js           task_claims（唯一约束在这一层被数据库兜住）
-│   │   ├── teamMembers.js           **P1 已建**；本阶段【追加】hasActiveMembership / listMemberTeams（team_members 的唯一归属）
+│   │   ├── teamMembers.js           **P1 已建**；hasActiveMembership / listMemberTeams **已由 Task 1 追加**（team_members 的唯一归属；P5 Task 2 不再追加，见台账 T2-1 C-1）
 │   │   ├── pools.js                 pool_projects / pool_talents / pool_resources
 │   │   ├── pool-sources.js          只读派生源：teams / stages / stage_results / tier_records / points_ledger / registrations / task_packages / users
 │   │   └── public-tokens.js         public_tokens（签发 / 校验 / 吊销）
@@ -1484,7 +1484,7 @@ git commit -m "feat(P5): 工作流与三池数据模型（006_pools.sql）+ 领�
 **Files:**
 - Create: `platform/src/domain/task-evidence.js`
 - Create: `platform/src/services/workflow.js`
-- Modify: `platform/src/db/repo/teamMembers.js`（**P1 Task 已建**；本阶段只**追加** `hasActiveMembership` / `listMemberTeams`，**不重建文件**）
+- Modify: ~~`platform/src/db/repo/teamMembers.js`~~ → **本阶段不需改**：`hasActiveMembership` / `listMemberTeams` **已由 Task 1 追加到位**（见台账 T2-1 C-1），重复实现会造成两个真相源
 - Test: `platform/test/workflow-service.test.js`
 
 **Interfaces:**
@@ -1519,12 +1519,26 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { Worker } from 'node:worker_threads';
 import { openDatabase } from '../src/db/sqlite.js';
 import { applyMigrations } from '../src/db/migrate.js';
 import * as workflow from '../src/services/workflow.js';
+import { validateTaskEvidence } from '../src/domain/task-evidence.js';
+// 「真实写入方」：新增用例的世界用仓储层的真实写入函数造数据
+// （判别性 + 不让「手造 input」把一致变成假象 —— 本项目踩过的坑）
+import { createUser, setSuperadmin } from '../src/db/repo/users.js';
+import { createEdition } from '../src/db/repo/editions.js';
+import { createTaskPackage } from '../src/db/repo/taskPackages.js';
+import { insertTeam } from '../src/db/repo/teams.js';
+import { insertTeamMember } from '../src/db/repo/teamMembers.js';
+import { insertStage } from '../src/db/repo/stages.js';
+import { insertLedgerEntry, insertBehaviorEvent } from '../src/db/repo/points.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
+
+// 统一的注入时间戳（领域层无 Date.now()：所有时间都必须由调用方注入）
+const NOW = '2026-10-02T00:00:00.000Z';
 const migrationsDir = join(here, '..', 'db', 'migrations');
 
 function setup() {
@@ -1718,6 +1732,13 @@ test('禁止岗位制：服务层没有任何"按岗位/身份分配任务"的�
   assert.ok(exported.includes('claimTask'), '唯一获得任务的入口是自主领取');
   const src = readFileSync(join(here, '..', 'src', 'services', 'workflow.js'), 'utf8');
   assert.ok(src.includes('R-OPS-14'), '代码注释必须标注 R-OPS-14：禁止岗位制，任务只能自主领取');
+  // 判别性：`includes('R-OPS-14')` 会被**任何一处**出现满足 ——
+  //   而规格要求的是「这行注释必须留着」，所以把整行逐字钉住。
+  //   （否则「删掉溯源注释」是一个等价变异体，测试根本区分不出来。）
+  assert.ok(
+    src.includes('// R-OPS-14：禁止岗位制，任务只能自主领取'),
+    '必须逐字保留这行注释：// R-OPS-14：禁止岗位制，任务只能自主领取',
+  );
 });
 
 test('未登录领取 → 401', () => {
@@ -1728,6 +1749,764 @@ test('未登录领取 → 401', () => {
     (err) => err.status === 401,
   );
   cleanup(db, close, dataDir);
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// P5 Task 2 追加：规格缺陷补测（台账 T2-1 / T2-2）
+//
+// 计划原测试块 12 例覆盖了主链路（领取唯一性 / 释放 / 完成证据 / 禁止岗位制 /
+// 完成不加分），但**判别力不足**：多处期望值「恰好相同」区分不出两种实现；
+// 若干分支（403/404/409 的细分、并发兜底、behavior_events 边界、真实写入方形状）
+// **零覆盖**。下面按三条纪律补：
+//
+//   ① 判别性：每个用例的期望值必须让「两种算法」产生**不同**结果，
+//      否则「一致」只是巧合（例如「同届期不同任务包」与「同队不同届期」都不可见，
+//      只测前者测不出「漏了 editionId 过滤」）。
+//   ② 真实写入方：新增用例的世界用**仓储层的真实写入函数**造数据
+//      （createUser / createEdition / createTaskPackage / insertTeam /
+//      insertTeamMember / insertStage / insertLedgerEntry / insertBehaviorEvent），
+//      不用手写 INSERT —— 免得「手造 input 让一致变成假象」（本项目踩过的坑）：
+//      真实写入方产出 teams.status='forming'、task_packages.status='submitted'，
+//      而计划原种子里手写成 'active' / 'approved' —— 一份偷偷按 status 过滤的
+//      实现，在手造种子里照样绿。
+//   ③ 溯源：每条断言写明依据的规则编号与出处。
+// ════════════════════════════════════════════════════════════════════════════
+
+/**
+ * 「真实写入方」世界。
+ *
+ * 拓扑（用来判别可见性必须**同时**按届期与任务包隔离）：
+ *   ed1/tp1/tm1 —— 一队（captain + member）；本 Task 的主工作流挂在这里
+ *   ed1/tp2/tm2 —— 二队：同届期、**不同任务包** → 对 tp1 的工作流不可见
+ *   ed2/tp3/tm3 —— 三队：**下一届**、不同任务包   → 对 tp1 的工作流不可见
+ *   ed2/tp1/tm4 —— 四队：⚠️ 刻意的「不一致数据」（下一届的队指向本届的任务包）→ 不可见
+ *   admin        —— 组委会（超管），**不属于任何队** → 只能靠超管分支才看得见
+ *   outsider     —— 外单位路人，**不属于任何队** → 不可见
+ */
+function setupWorld() {
+  const dataDir = mkdtempSync(join(tmpdir(), 'hks-p5wfw-'));
+  const { db, close } = openDatabase({ dataDir });
+  applyMigrations(db, migrationsDir);
+
+  const users = {
+    captain: createUser(db, { name: '队长甲', phone: '13900000011', password: 'pw', mbaStatus: 'mba', org: '学堂' }),
+    member: createUser(db, { name: '组员乙', phone: '13900000012', password: 'pw', org: '学堂' }),
+    outsider: createUser(db, { name: '路人丙', phone: '13900000013', password: 'pw', org: '外单位' }),
+    captain2: createUser(db, { name: '队长丁', phone: '13900000014', password: 'pw', org: '学堂' }),
+    captain3: createUser(db, { name: '队长戊', phone: '13900000015', password: 'pw', org: '学堂' }),
+    captain4: createUser(db, { name: '队长己', phone: '13900000017', password: 'pw', org: '学堂' }),
+    admin: createUser(db, { name: '组委会', phone: '13900000016', password: 'pw', org: '组委会' }),
+  };
+  setSuperadmin(db, users.admin.id);
+
+  const editions = {
+    ed1: createEdition(db, { name: '第一届', city: '杭州', startsAt: '2026-10-01', endsAt: '2026-10-31', now: NOW }),
+    ed2: createEdition(db, { name: '第二届', city: '上海', startsAt: '2027-10-01', endsAt: '2027-10-31', now: NOW }),
+  };
+
+  const packages = {
+    tp1: createTaskPackage(db, {
+      editionId: editions.ed1.id, title: '零售风控助手', painPoint: '人工审批慢',
+      expectedDelivery: '可演示原型', acceptanceCriteria: '能跑起来就行',
+      submittedBy: users.captain.id, now: NOW,
+    }),
+    tp2: createTaskPackage(db, {
+      editionId: editions.ed1.id, title: '招股书排版助手', painPoint: '排版太慢',
+      expectedDelivery: '可演示原型', acceptanceCriteria: '能跑起来就行',
+      submittedBy: users.captain2.id, now: NOW,
+    }),
+    tp3: createTaskPackage(db, {
+      editionId: editions.ed2.id, title: '下一届的包', painPoint: '下一届的痛点',
+      expectedDelivery: '可演示原型', acceptanceCriteria: '能跑起来就行',
+      submittedBy: users.captain3.id, now: NOW,
+    }),
+  };
+
+  const teams = {
+    tm1: insertTeam(db, {
+      editionId: editions.ed1.id, name: '一队', captainId: users.captain.id,
+      taskPackageId: packages.tp1.id, tier: 'C', now: NOW,
+    }),
+    tm2: insertTeam(db, {
+      editionId: editions.ed1.id, name: '二队', captainId: users.captain2.id,
+      taskPackageId: packages.tp2.id, now: NOW,
+    }),
+    tm3: insertTeam(db, {
+      editionId: editions.ed2.id, name: '三队', captainId: users.captain3.id,
+      taskPackageId: packages.tp3.id, now: NOW,
+    }),
+    // ⚠️ tm4 是**刻意的「不一致数据」**：队伍挂在 ed_2，却指向 ed_1 的任务包 tp_1。
+    //    为什么要造这条脏数据：可见性的 `editionId` 过滤**只有**在这种数据下才可观测 ——
+    //    正常的「跨届期队」本来就带着别的 task_package_id，光靠 taskPackageId 就已经挡住了，
+    //    于是「漏掉 editionId 过滤」这个变异体在干净数据上**完全等价**（测不出来）。
+    //    这条脏数据是 DDL 允许的（teams.edition_id 与 task_packages.edition_id 之间没有一致性约束），
+    //    真实写入方 insertTeam 也照样能写出来。
+    tm4: insertTeam(db, {
+      editionId: editions.ed2.id, name: '四队', captainId: users.captain4.id,
+      taskPackageId: packages.tp1.id, now: NOW,
+    }),
+  };
+
+  insertTeamMember(db, { teamId: teams.tm1.id, userId: users.captain.id, role: 'captain', now: NOW });
+  insertTeamMember(db, { teamId: teams.tm1.id, userId: users.member.id, role: 'member', now: NOW });
+  insertTeamMember(db, { teamId: teams.tm2.id, userId: users.captain2.id, role: 'captain', now: NOW });
+  insertTeamMember(db, { teamId: teams.tm3.id, userId: users.captain3.id, role: 'captain', now: NOW });
+  insertTeamMember(db, { teamId: teams.tm4.id, userId: users.captain4.id, role: 'captain', now: NOW });
+
+  const stage = insertStage(db, {
+    editionId: editions.ed1.id, key: 's1', name: '调研', kind: 'initial',
+    startsAt: '2026-10-01', endsAt: '2026-10-10', scoringConfigKey: 'initial', status: 'computed',
+  });
+
+  return { db, close, dataDir, users, editions, packages, teams, stage };
+}
+
+/** 在真实写入方的世界里建一条工作流 + 一个任务。 */
+function seedWorldWorkflow(w) {
+  const wf = workflow.createWorkflow({
+    db: w.db, editionId: w.editions.ed1.id, taskPackageId: w.packages.tp1.id,
+    name: '风控助手工作流', actorId: w.users.captain.id, now: NOW,
+  });
+  const task = workflow.createWorkflowTask({
+    db: w.db, workflowId: wf.id, title: '跑通风控模型', detail: '需要一个可演示的 demo',
+    ownerTeamId: w.teams.tm1.id, dueAt: '2026-10-12', actorId: w.users.captain.id, now: NOW,
+  });
+  return { wf, task };
+}
+
+/** 一份合法的 kind=runnable 证据。 */
+function runnableEvidence() {
+  return {
+    kind: 'runnable', summary: '模型已跑通，给出可演示的 demo',
+    artifactUrl: 'https://git.example.com/demo/risk-model', version: 'v0.3.1',
+  };
+}
+
+// ── 领域纯函数层：R-STG-04 的证据校验 ─────────────────────────────────
+
+test('证据校验：kind 不是 runnable/blocked（如 progress）→ 不通过（只认「可运行」或「明确阻塞点」）', () => {
+  const r = validateTaskEvidence({ kind: 'progress', summary: '还在做' });
+  assert.equal(r.ok, false);
+  assert.ok(r.errors.some((e) => e.field === 'kind'), JSON.stringify(r.errors));
+});
+
+test('证据校验：summary 为空或全是空白 → 不通过（纯文字进度说明不给分）', () => {
+  const missing = validateTaskEvidence({ kind: 'runnable', artifactUrl: 'https://x.dev/a', version: 'v1' });
+  assert.equal(missing.ok, false);
+  assert.ok(missing.errors.some((e) => e.field === 'summary'), JSON.stringify(missing.errors));
+
+  const blank = validateTaskEvidence({
+    kind: 'runnable', artifactUrl: 'https://x.dev/a', version: 'v1', summary: '   \n\t ',
+  });
+  assert.equal(blank.ok, false, '纯空白等于没写');
+  assert.ok(blank.errors.some((e) => e.field === 'summary'), JSON.stringify(blank.errors));
+});
+
+test('证据校验：summary 长度边界 500 通过 / 501 不通过（判别性：两个阈值口径结果不同）', () => {
+  const atLimit = validateTaskEvidence({
+    kind: 'runnable', artifactUrl: 'https://x.dev/a', version: 'v1', summary: 'a'.repeat(500),
+  });
+  assert.equal(atLimit.ok, true, JSON.stringify(atLimit.errors));
+
+  const overLimit = validateTaskEvidence({
+    kind: 'runnable', artifactUrl: 'https://x.dev/a', version: 'v1', summary: 'a'.repeat(501),
+  });
+  assert.equal(overLimit.ok, false);
+  assert.ok(overLimit.errors.some((e) => e.field === 'summary'), JSON.stringify(overLimit.errors));
+});
+
+test('证据校验：kind=runnable 缺 artifactUrl → 不通过（必须给出可运行产物）', () => {
+  const r = validateTaskEvidence({ kind: 'runnable', summary: '跑通了', version: 'v1' });
+  assert.equal(r.ok, false);
+  assert.ok(r.errors.some((e) => e.field === 'artifactUrl'), JSON.stringify(r.errors));
+  // 判别性：「**缺**产物」与「产物**形态不对**」是两条不同的错误 ——
+  // 只断言 field 会把两者混为一谈（错误文案是用户能看见的，必须能区分）。
+  assert.ok(
+    r.errors.some((e) => e.message.includes('必须给出可运行产物')),
+    `缺产物的提示语必须是「必须给出可运行产物」，实际 ${JSON.stringify(r.errors)}`,
+  );
+  assert.equal(r.errors.filter((e) => e.field === 'artifactUrl').length, 1, '只报一条 artifactUrl 错误');
+});
+
+test('证据校验：kind=runnable 的 artifactUrl 必须够格（判别性：四种合法形态 vs 两种非法形态）', () => {
+  // 合法：http(s) / ssh / git@ / 裸仓库路径 —— 四种都得放行
+  for (const url of [
+    'https://git.example.com/demo/risk-model', 'http://x.dev/a',
+    'git@github.com:owner/risk-model.git', 'owner/risk-model',
+  ]) {
+    const r = validateTaskEvidence({ kind: 'runnable', summary: '跑通了', artifactUrl: url, version: 'v1' });
+    assert.equal(r.ok, true, `${url} 必须被接受：${JSON.stringify(r.errors)}`);
+  }
+  // 非法：既不是 http(s)/ssh/git@，也不是 owner/repo
+  for (const url of ['not-a-url', 'file:///etc/passwd']) {
+    const r = validateTaskEvidence({ kind: 'runnable', summary: '跑通了', artifactUrl: url, version: 'v1' });
+    assert.equal(r.ok, false, `${url} 必须被拒绝`);
+    assert.ok(r.errors.some((e) => e.field === 'artifactUrl'), JSON.stringify(r.errors));
+    // 判别性：形态不对的提示语与「缺产物」不同（两条错误不能混）
+    assert.ok(
+      r.errors.some((e) => e.message.includes('必须是 http(s) 链接')),
+      `${url} 的提示语必须是「artifactUrl 必须是 http(s) 链接或 git 仓库地址」，实际 ${JSON.stringify(r.errors)}`,
+    );
+  }
+});
+
+test('证据校验：kind=runnable 缺 version → 不通过（S10 §3.4：提交须带版本记录 + 代码仓）', () => {
+  const r = validateTaskEvidence({ kind: 'runnable', summary: '跑通了', artifactUrl: 'https://x.dev/a' });
+  assert.equal(r.ok, false);
+  assert.ok(r.errors.some((e) => e.field === 'version'), JSON.stringify(r.errors));
+});
+
+test('证据校验：kind=blocked 必须写明阻塞点与解除条件（缺一不可）', () => {
+  const noReason = validateTaskEvidence({
+    kind: 'blocked', summary: '卡住了', blocker: { needed: '企业出具《数据授权说明》' },
+  });
+  assert.equal(noReason.ok, false);
+  assert.ok(noReason.errors.some((e) => e.field === 'blocker.reason'), JSON.stringify(noReason.errors));
+
+  const noNeeded = validateTaskEvidence({
+    kind: 'blocked', summary: '卡住了', blocker: { reason: '数据未授权' },
+  });
+  assert.equal(noNeeded.ok, false);
+  assert.ok(noNeeded.errors.some((e) => e.field === 'blocker.needed'), JSON.stringify(noNeeded.errors));
+
+  const good = validateTaskEvidence({
+    kind: 'blocked', summary: '卡住了', blocker: { reason: '数据未授权', needed: '企业出具《数据授权说明》' },
+  });
+  assert.equal(good.ok, true, JSON.stringify(good.errors));
+});
+
+test('证据校验：evidence 为 null / 非对象 → 不通过且不抛异常', () => {
+  for (const ev of [null, undefined, '跑通了', 42]) {
+    const r = validateTaskEvidence(ev);
+    assert.equal(r.ok, false, `${JSON.stringify(ev) ?? 'undefined'} 必须不通过`);
+    assert.ok(r.errors.length > 0);
+  }
+});
+
+// ── 服务层：建工作流 / 建任务的入参与权限 ───────────────────────────────
+
+test('建工作流：非该任务包的队员 → 403（不能替别人拆解工作流）', () => {
+  const w = setupWorld();
+  assert.throws(
+    () => workflow.createWorkflow({
+      db: w.db, editionId: w.editions.ed1.id, taskPackageId: w.packages.tp1.id,
+      name: '越权工作流', actorId: w.users.outsider.id, now: NOW,
+    }),
+    (err) => err.status === 403 && err.code === 'FORBIDDEN',
+    '外单位用户不能拆解别人任务包的工作流',
+  );
+  assert.throws(
+    () => workflow.createWorkflow({
+      db: w.db, editionId: w.editions.ed1.id, taskPackageId: w.packages.tp1.id,
+      name: '越权工作流', actorId: w.users.captain2.id, now: NOW,
+    }),
+    (err) => err.status === 403 && err.code === 'FORBIDDEN',
+    '同届期但认领了别的任务包的队员也不能拆这一包',
+  );
+  cleanup(w.db, w.close, w.dataDir);
+});
+
+test('建工作流：缺 editionId / taskPackageId → 400 EDITION_AND_PACKAGE_REQUIRED', () => {
+  const w = setupWorld();
+  assert.throws(
+    () => workflow.createWorkflow({
+      db: w.db, editionId: null, taskPackageId: w.packages.tp1.id,
+      name: '缺届期', actorId: w.users.captain.id, now: NOW,
+    }),
+    (err) => err.status === 400 && err.code === 'EDITION_AND_PACKAGE_REQUIRED',
+  );
+  assert.throws(
+    () => workflow.createWorkflow({
+      db: w.db, editionId: w.editions.ed1.id, taskPackageId: null,
+      name: '缺任务包', actorId: w.users.captain.id, now: NOW,
+    }),
+    (err) => err.status === 400 && err.code === 'EDITION_AND_PACKAGE_REQUIRED',
+  );
+  cleanup(w.db, w.close, w.dataDir);
+});
+
+test('建工作流：name 为空白 → 400 NAME_REQUIRED', () => {
+  const w = setupWorld();
+  assert.throws(
+    () => workflow.createWorkflow({
+      db: w.db, editionId: w.editions.ed1.id, taskPackageId: w.packages.tp1.id,
+      name: '   ', actorId: w.users.captain.id, now: NOW,
+    }),
+    (err) => err.status === 400 && err.code === 'NAME_REQUIRED',
+  );
+  cleanup(w.db, w.close, w.dataDir);
+});
+
+test('建任务：工作流不存在 → 404 WORKFLOW_NOT_FOUND', () => {
+  const w = setupWorld();
+  assert.throws(
+    () => workflow.createWorkflowTask({
+      db: w.db, workflowId: 'wf_none', title: '任务', ownerTeamId: w.teams.tm1.id,
+      actorId: w.users.captain.id, now: NOW,
+    }),
+    (err) => err.status === 404 && err.code === 'WORKFLOW_NOT_FOUND',
+  );
+  cleanup(w.db, w.close, w.dataDir);
+});
+
+test('建任务：title 为空白 → 400 TITLE_REQUIRED', () => {
+  const w = setupWorld();
+  const { wf } = seedWorldWorkflow(w);
+  assert.throws(
+    () => workflow.createWorkflowTask({
+      db: w.db, workflowId: wf.id, title: '  ', ownerTeamId: w.teams.tm1.id,
+      actorId: w.users.captain.id, now: NOW,
+    }),
+    (err) => err.status === 400 && err.code === 'TITLE_REQUIRED',
+  );
+  cleanup(w.db, w.close, w.dataDir);
+});
+
+test('建任务：ownerTeamId 不存在 → 404 TEAM_NOT_FOUND', () => {
+  const w = setupWorld();
+  const { wf } = seedWorldWorkflow(w);
+  assert.throws(
+    () => workflow.createWorkflowTask({
+      db: w.db, workflowId: wf.id, title: '任务', ownerTeamId: 'tm_none',
+      actorId: w.users.captain.id, now: NOW,
+    }),
+    (err) => err.status === 404 && err.code === 'TEAM_NOT_FOUND',
+  );
+  cleanup(w.db, w.close, w.dataDir);
+});
+
+test('建任务：给别的队建任务 → 403（不能给别人派活——那正是岗位制的入口）', () => {
+  const w = setupWorld();
+  const { wf } = seedWorldWorkflow(w);
+  assert.throws(
+    () => workflow.createWorkflowTask({
+      db: w.db, workflowId: wf.id, title: '给二队的活', ownerTeamId: w.teams.tm2.id,
+      actorId: w.users.captain.id, now: NOW,
+    }),
+    (err) => err.status === 403 && err.code === 'FORBIDDEN',
+    '一队队长不能给二队建任务',
+  );
+  cleanup(w.db, w.close, w.dataDir);
+});
+
+// ── 服务层：列任务清单的三态与可见性 ───────────────────────────────────
+
+test('列任务：工作流不存在 → 404（单条不满足 → 404，不是空集）', () => {
+  const w = setupWorld();
+  assert.throws(
+    () => workflow.listWorkflowTasks({ db: w.db, workflowId: 'wf_none', viewer: { id: w.users.captain.id } }),
+    (err) => err.status === 404 && err.code === 'WORKFLOW_NOT_FOUND',
+  );
+  cleanup(w.db, w.close, w.dataDir);
+});
+
+test('列任务：没有 viewer → 401', () => {
+  const w = setupWorld();
+  const { wf } = seedWorldWorkflow(w);
+  assert.throws(
+    () => workflow.listWorkflowTasks({ db: w.db, workflowId: wf.id, viewer: null }),
+    (err) => err.status === 401,
+  );
+  cleanup(w.db, w.close, w.dataDir);
+});
+
+test('列任务：组委会（超管）全可见（viewer 形状 = { id, is_superadmin }，与 permissions.js 精简对象同款）', () => {
+  const w = setupWorld();
+  const { wf } = seedWorldWorkflow(w);
+  const rows = workflow.listWorkflowTasks({
+    db: w.db, workflowId: wf.id, viewer: { id: w.users.admin.id, is_superadmin: 1 },
+  });
+  assert.equal(rows.length, 1, '超管不看队也能看到任务清单');
+  cleanup(w.db, w.close, w.dataDir);
+});
+
+test('列任务：可见性必须同时按届期与任务包隔离（判别性：三种「不可见」互不等价）', () => {
+  const w = setupWorld();
+  const { wf } = seedWorldWorkflow(w);
+  const view = (id) => workflow.listWorkflowTasks({ db: w.db, workflowId: wf.id, viewer: { id } });
+
+  // 同届期、**不同任务包**的队员 → 不可见（漏掉 taskPackageId 过滤就会露馅）
+  assert.deepEqual(view(w.users.captain2.id), [], '同届期不同任务包 → 200 + 空集');
+  // **下一届**的队员 → 不可见（漏掉 editionId 过滤就会露馅）
+  assert.deepEqual(view(w.users.captain3.id), [], '跨届期 → 200 + 空集');
+  // 外单位 → 不可见
+  assert.deepEqual(view(w.users.outsider.id), [], '非本队成员 → 200 + 空集');
+  // ⚠️ 脏数据队（挂在 ed_2 却指向 ed_1 的任务包 tp_1）→ 仍然不可见：
+  //    届期隔离**优先于**任务包 —— 漏掉 editionId 过滤就会把它放进来。
+  assert.deepEqual(view(w.users.captain4.id), [], '跨届期的队（即使指向同一个任务包）→ 200 + 空集');
+  // 本队 → 可见
+  assert.equal(view(w.users.member.id).length, 1, '本队成员可见');
+  cleanup(w.db, w.close, w.dataDir);
+});
+
+test('列任务：领取人就是自己时 isMine=true（判别性：与「别人领的」结果不同）', () => {
+  const w = setupWorld();
+  const { wf, task } = seedWorldWorkflow(w);
+  workflow.claimTask({
+    db: w.db, taskId: task.id, userId: w.users.captain.id, teamId: w.teams.tm1.id, now: NOW,
+  });
+  const mine = workflow.listWorkflowTasks({ db: w.db, workflowId: wf.id, viewer: { id: w.users.captain.id } });
+  assert.equal(mine[0].isMine, true, '自己领的必须 isMine=true');
+  assert.equal(mine[0].claim.userId, w.users.captain.id);
+  assert.equal(mine[0].claim.teamId, w.teams.tm1.id, '领取记录要带队伍');
+  assert.equal(mine[0].claim.claimedAt, NOW, '领取记录要带领取时间');
+  // 列表的**整条字段映射**也要钉住（判别性：任一字段被改成常量/空都会被抓住）
+  assert.equal(mine[0].id, task.id);
+  assert.equal(mine[0].workflowId, wf.id);
+  assert.equal(mine[0].title, '跑通风控模型');
+  assert.equal(mine[0].detail, '需要一个可演示的 demo');
+  assert.equal(mine[0].ownerTeamId, w.teams.tm1.id);
+  assert.equal(mine[0].status, 'in_progress');
+  assert.equal(mine[0].dueAt, '2026-10-12');
+  assert.equal(mine[0].createdAt, NOW);
+  assert.equal(mine[0].completedAt, null, '还没完成时 completedAt 必须是 null');
+  assert.equal(mine[0].completedBy, null, '还没完成时 completedBy 必须是 null');
+
+  const other = workflow.listWorkflowTasks({ db: w.db, workflowId: wf.id, viewer: { id: w.users.member.id } });
+  assert.equal(other[0].isMine, false, '别人领的必须 isMine=false');
+  cleanup(w.db, w.close, w.dataDir);
+});
+
+// ── 服务层：自主领取 ───────────────────────────────────────────────────
+
+test('领取：任务不存在 → 404 TASK_NOT_FOUND', () => {
+  const w = setupWorld();
+  assert.throws(
+    () => workflow.claimTask({
+      db: w.db, taskId: 'tk_none', userId: w.users.captain.id, teamId: w.teams.tm1.id, now: NOW,
+    }),
+    (err) => err.status === 404 && err.code === 'TASK_NOT_FOUND',
+  );
+  cleanup(w.db, w.close, w.dataDir);
+});
+
+test('领取：任务已完成 → 409 TASK_ALREADY_DONE（已完成的不能再被领走）', () => {
+  const w = setupWorld();
+  const { task } = seedWorldWorkflow(w);
+  workflow.claimTask({
+    db: w.db, taskId: task.id, userId: w.users.captain.id, teamId: w.teams.tm1.id, now: NOW,
+  });
+  workflow.completeTask({
+    db: w.db, taskId: task.id, userId: w.users.captain.id, now: NOW, evidence: runnableEvidence(),
+  });
+  assert.throws(
+    () => workflow.claimTask({
+      db: w.db, taskId: task.id, userId: w.users.member.id, teamId: w.teams.tm1.id, now: NOW,
+    }),
+    (err) => err.status === 409 && err.code === 'TASK_ALREADY_DONE',
+  );
+  cleanup(w.db, w.close, w.dataDir);
+});
+
+test('领取：不是该队成员 → 403 NOT_TEAM_MEMBER（不能替别人队领取）', () => {
+  const w = setupWorld();
+  const { task } = seedWorldWorkflow(w);
+  assert.throws(
+    () => workflow.claimTask({
+      db: w.db, taskId: task.id, userId: w.users.outsider.id, teamId: w.teams.tm1.id, now: NOW,
+    }),
+    (err) => err.status === 403 && err.code === 'NOT_TEAM_MEMBER',
+  );
+  cleanup(w.db, w.close, w.dataDir);
+});
+
+test('领取：队伍不存在 → 404 TEAM_NOT_FOUND', () => {
+  const w = setupWorld();
+  const { task } = seedWorldWorkflow(w);
+  assert.throws(
+    () => workflow.claimTask({
+      db: w.db, taskId: task.id, userId: w.users.captain.id, teamId: 'tm_none', now: NOW,
+    }),
+    (err) => err.status === 404 && err.code === 'TEAM_NOT_FOUND',
+  );
+  cleanup(w.db, w.close, w.dataDir);
+});
+
+test('领取：本人不在任何队伍且未指定 teamId → 400 NO_TEAM', () => {
+  const w = setupWorld();
+  const { task } = seedWorldWorkflow(w);
+  assert.throws(
+    () => workflow.claimTask({
+      db: w.db, taskId: task.id, userId: w.users.outsider.id, now: NOW,
+    }),
+    (err) => err.status === 400 && err.code === 'NO_TEAM',
+  );
+  cleanup(w.db, w.close, w.dataDir);
+});
+
+test('领取：未指定 teamId → 自动落到本人所在队（判别性：不能只认显式传入的队）', () => {
+  const w = setupWorld();
+  const { task } = seedWorldWorkflow(w);
+  const res = workflow.claimTask({ db: w.db, taskId: task.id, userId: w.users.member.id, now: NOW });
+  assert.equal(res.claim.team_id, w.teams.tm1.id, '未指定队伍时必须落到本人所在队');
+  assert.equal(res.claim.user_id, w.users.member.id);
+  cleanup(w.db, w.close, w.dataDir);
+});
+
+test('领取：数据库唯一约束兜底 —— 唯一冲突必须被翻译成 409，而不是漏出裸 SQLite 错误', () => {
+  const w = setupWorld();
+  const { task } = seedWorldWorkflow(w);
+  // ⛔ 为什么用触发器：唯一索引 ux_task_claims_active 在库里，但服务层的**前置检查**
+  //    会先命中，catch 那条「最后一道防线」在串行测试里永远走不到。
+  //    这里用触发器精确制造同样的 SQLITE_CONSTRAINT 错误（错误文本与唯一索引一致），
+  //    验证「数据库拒绝 → 409 TASK_ALREADY_CLAIMED」这条翻译链真的接上了。
+  w.db.exec(`
+    CREATE TRIGGER ux_task_claims_active_sim BEFORE INSERT ON task_claims
+    BEGIN SELECT RAISE(ABORT, 'UNIQUE constraint failed: task_claims.task_id'); END;
+  `);
+  assert.throws(
+    () => workflow.claimTask({
+      db: w.db, taskId: task.id, userId: w.users.captain.id, teamId: w.teams.tm1.id, now: NOW,
+    }),
+    (err) => err.status === 409 && err.code === 'TASK_ALREADY_CLAIMED',
+    '数据库的唯一冲突必须被翻译成 409（不能漏出裸 SQLite 错误）',
+  );
+  const row = w.db.prepare('SELECT status FROM workflow_tasks WHERE id = ?').get(task.id);
+  assert.equal(row.status, 'todo', '插入失败时任务状态不能被改成 in_progress');
+  cleanup(w.db, w.close, w.dataDir);
+});
+
+/**
+ * ★ 真并发用例（服务层）。
+ *
+ * 为什么不能只串行跑：串行的第二次必然被前置检查拦下 —— 那证明不了
+ * 「并发下由数据库仲裁」。本用例用**两个 worker 线程 + 两条独立连接 + 屏障同步**
+ * 让两次 claimTask **真正同时**发起，然后断言：恰好一个成功、另一个拿到
+ * 409 TASK_ALREADY_CLAIMED、库里的有效领取永远只有一条。
+ */
+const CLAIM_WORKER_SRC = `
+import { parentPort, workerData } from 'node:worker_threads';
+import { openDatabase } from ${JSON.stringify(pathToFileURL(join(here, '..', 'src', 'db', 'sqlite.js')).href)};
+import * as workflow from ${JSON.stringify(pathToFileURL(join(here, '..', 'src', 'services', 'workflow.js')).href)};
+const { db, close } = openDatabase({ dataDir: workerData.dataDir });
+parentPort.postMessage({ ready: true });
+const barrier = new Int32Array(workerData.barrier);
+Atomics.add(barrier, 0, 1);
+while (Atomics.load(barrier, 0) < 2) {
+  Atomics.wait(barrier, 0, Atomics.load(barrier, 0), 20);
+}
+const t0 = Number(process.hrtime.bigint() / 1000000n);
+let outcome;
+try {
+  const res = workflow.claimTask({
+    db, taskId: workerData.taskId, userId: workerData.userId, teamId: workerData.teamId, now: workerData.now,
+  });
+  outcome = { ok: true, userId: res.claim.user_id };
+} catch (err) {
+  outcome = { ok: false, status: err && err.status, code: err && err.code, message: String(err && err.message) };
+}
+const t1 = Number(process.hrtime.bigint() / 1000000n);
+close();
+parentPort.postMessage({ ...outcome, t0, t1 });
+`;
+
+function spawnClaimWorker(workerData) {
+  const worker = new Worker(CLAIM_WORKER_SRC, { eval: true, workerData });
+  let resolveReady;
+  let resolveDone;
+  const ready = new Promise((r) => { resolveReady = r; });
+  const done = new Promise((r) => { resolveDone = r; });
+  worker.on('message', (m) => { if (m.ready) resolveReady(); else resolveDone(m); });
+  worker.on('error', (err) => { resolveReady(); resolveDone({ ok: false, message: String(err && err.message) }); });
+  return { ready, done };
+}
+
+test('领取：两人真并发抢同一任务 → 恰好一个成功、另一个 409，库中有效领取只有一条', async () => {
+  const w = setupWorld();
+  const { task } = seedWorldWorkflow(w);
+  // 先把主连接关掉：并发由 worker 持有的两条连接完成
+  w.close();
+
+  const barrier = new SharedArrayBuffer(4);
+  const base = {
+    dataDir: w.dataDir, barrier, taskId: task.id, teamId: w.teams.tm1.id, now: NOW,
+  };
+  const a = spawnClaimWorker({ ...base, userId: w.users.captain.id });
+  await a.ready;                        // 连接 A 已建立
+  const b = spawnClaimWorker({ ...base, userId: w.users.member.id });
+  await b.ready;                        // 连接 B 已建立（错开建立，避开 WAL PRAGMA 抢锁）
+  const [ra, rb] = await Promise.all([a.done, b.done]);
+
+  const winners = [ra, rb].filter((r) => r.ok);
+  const losers = [ra, rb].filter((r) => !r.ok);
+  assert.equal(winners.length, 1, `恰好一条领取成功，实际 ${JSON.stringify([ra, rb])}`);
+  assert.equal(losers.length, 1, `恰好一条被拒，实际 ${JSON.stringify([ra, rb])}`);
+  assert.equal(losers[0].status, 409, '被拒的一方必须拿到 409');
+  assert.equal(losers[0].code, 'TASK_ALREADY_CLAIMED', '被拒的一方必须是 TASK_ALREADY_CLAIMED');
+
+  // 证明这**确实是并发**而不是被测试串行化：两次调用的时间区间必须重叠
+  const earliest = Math.min(ra.t0, rb.t0);
+  const latest = Math.max(ra.t1, rb.t1);
+  assert.ok(earliest < latest, `两次领取必须重叠才叫并发，实际区间 ${earliest}~${latest}`);
+
+  const { db: db2, close: close2 } = openDatabase({ dataDir: w.dataDir });
+  const n = db2
+    .prepare('SELECT COUNT(*) AS n FROM task_claims WHERE task_id = ? AND released_at IS NULL')
+    .get(task.id).n;
+  assert.equal(n, 1, '有效领取永远只有一条');
+  close2();
+  rmSync(w.dataDir, { recursive: true, force: true });
+});
+
+// ── 服务层：释放 ───────────────────────────────────────────────────────
+
+test('释放：任务不存在 → 404 TASK_NOT_FOUND', () => {
+  const w = setupWorld();
+  assert.throws(
+    () => workflow.releaseTask({ db: w.db, taskId: 'tk_none', userId: w.users.captain.id, now: NOW }),
+    (err) => err.status === 404 && err.code === 'TASK_NOT_FOUND',
+  );
+  cleanup(w.db, w.close, w.dataDir);
+});
+
+test('释放：任务当前无人领取 → 409 TASK_NOT_CLAIMED', () => {
+  const w = setupWorld();
+  const { task } = seedWorldWorkflow(w);
+  assert.throws(
+    () => workflow.releaseTask({ db: w.db, taskId: task.id, userId: w.users.captain.id, now: NOW }),
+    (err) => err.status === 409 && err.code === 'TASK_NOT_CLAIMED',
+  );
+  cleanup(w.db, w.close, w.dataDir);
+});
+
+// ── 服务层：提交完成状态 ───────────────────────────────────────────────
+
+test('完成：任务不存在 → 404 TASK_NOT_FOUND', () => {
+  const w = setupWorld();
+  assert.throws(
+    () => workflow.completeTask({
+      db: w.db, taskId: 'tk_none', userId: w.users.captain.id, now: NOW, evidence: runnableEvidence(),
+    }),
+    (err) => err.status === 404 && err.code === 'TASK_NOT_FOUND',
+  );
+  cleanup(w.db, w.close, w.dataDir);
+});
+
+test('完成：任务当前无人领取 → 409 TASK_NOT_CLAIMED', () => {
+  const w = setupWorld();
+  const { task } = seedWorldWorkflow(w);
+  assert.throws(
+    () => workflow.completeTask({
+      db: w.db, taskId: task.id, userId: w.users.captain.id, now: NOW, evidence: runnableEvidence(),
+    }),
+    (err) => err.status === 409 && err.code === 'TASK_NOT_CLAIMED',
+  );
+  cleanup(w.db, w.close, w.dataDir);
+});
+
+test('完成：不是领取人 → 403 NOT_CLAIM_HOLDER（谁领的谁交）', () => {
+  const w = setupWorld();
+  const { task } = seedWorldWorkflow(w);
+  workflow.claimTask({
+    db: w.db, taskId: task.id, userId: w.users.captain.id, teamId: w.teams.tm1.id, now: NOW,
+  });
+  assert.throws(
+    () => workflow.completeTask({
+      db: w.db, taskId: task.id, userId: w.users.member.id, now: NOW, evidence: runnableEvidence(),
+    }),
+    (err) => err.status === 403 && err.code === 'NOT_CLAIM_HOLDER',
+  );
+  cleanup(w.db, w.close, w.dataDir);
+});
+
+test('完成：completed_at 落库 = 注入的 now（判别性：时间戳必须来自入参，不是 Date.now()）', () => {
+  const w = setupWorld();
+  const { task } = seedWorldWorkflow(w);
+  workflow.claimTask({
+    db: w.db, taskId: task.id, userId: w.users.captain.id, teamId: w.teams.tm1.id, now: NOW,
+  });
+  const at = '2026-10-04T08:30:00.000Z';
+  const res = workflow.completeTask({
+    db: w.db, taskId: task.id, userId: w.users.captain.id, now: at, evidence: runnableEvidence(),
+  });
+  assert.equal(res.task.completed_at, at, '完成时间必须落库为传入的 now');
+  assert.equal(res.task.completed_by, w.users.captain.id);
+  assert.equal(res.task.status, 'done');
+  // 列表投影也必须带出完成信息（判别性：completedAt/completedBy 不是常量 null）
+  const rows = workflow.listWorkflowTasks({ db: w.db, workflowId: task.workflow_id, viewer: { id: w.users.captain.id } });
+  assert.equal(rows[0].completedAt, at, '列表必须投影完成时间');
+  assert.equal(rows[0].completedBy, w.users.captain.id, '列表必须投影完成人');
+  assert.equal(rows[0].status, 'done');
+  cleanup(w.db, w.close, w.dataDir);
+});
+
+test('完成：不写 points_ledger、不写 behavior_events、不写 tier_records（红线 ②：任务完成 ≠ 赛段交付物得分）', () => {
+  const w = setupWorld();
+  const { task } = seedWorldWorkflow(w);
+  // 先用**真实写入方**造出三类分数载体（没有既存行的话，「行数不变」是恒真断言）
+  insertLedgerEntry(w.db, {
+    id: 'pl_seed', editionId: w.editions.ed1.id, stageId: w.stage.id, teamId: w.teams.tm1.id,
+    userId: w.users.captain.id, kind: 'stage_rank', points: 10, createdAt: NOW,
+  });
+  insertBehaviorEvent(w.db, {
+    id: 'be_seed', teamId: w.teams.tm1.id, userId: w.users.captain.id,
+    type: 'weekly_progress', points: 3, evidence: '{"repo":"https://x.dev/a"}', createdAt: NOW,
+  });
+  const before = {
+    ledger: w.db.prepare('SELECT COUNT(*) AS n FROM points_ledger').get().n,
+    behavior: w.db.prepare('SELECT COUNT(*) AS n FROM behavior_events').get().n,
+    tiers: w.db.prepare('SELECT COUNT(*) AS n FROM tier_records').get().n,
+  };
+  assert.ok(before.ledger > 0 && before.behavior > 0, '前提：分数载体必须先有既存行，否则断言恒真');
+
+  workflow.claimTask({
+    db: w.db, taskId: task.id, userId: w.users.captain.id, teamId: w.teams.tm1.id, now: NOW,
+  });
+  workflow.completeTask({
+    db: w.db, taskId: task.id, userId: w.users.captain.id, now: NOW, evidence: runnableEvidence(),
+  });
+
+  const after = {
+    ledger: w.db.prepare('SELECT COUNT(*) AS n FROM points_ledger').get().n,
+    behavior: w.db.prepare('SELECT COUNT(*) AS n FROM behavior_events').get().n,
+    tiers: w.db.prepare('SELECT COUNT(*) AS n FROM tier_records').get().n,
+  };
+  assert.deepEqual(after, before, '任务完成不得写任何分数载体（points_ledger / behavior_events / tier_records）');
+  cleanup(w.db, w.close, w.dataDir);
+});
+
+// ── 两条红线 ───────────────────────────────────────────────────────────
+
+test('禁止岗位制：数据列层面也没有「岗位 / 身份」列（PRAGMA table_info）', () => {
+  const w = setupWorld();
+  // ⛔ R-OPS-14：任务**只有** claimTask 一条获得路径。
+  //    owner_team_id 是「任务清单归哪支队」（队维度），不是「谁担任什么岗位」（岗位维度）——
+  //    它约束的是任务归属，不是领取资格；领取资格只由 claimTask 决定。
+  const FORBIDDEN_COLUMNS = [
+    'role', 'position', 'post', 'duty', 'job', 'seat',
+    'assignee', 'assigned_to', 'assigned_user_id', 'owner_user_id', 'member_role',
+  ];
+  for (const table of ['workflow_tasks', 'task_claims']) {
+    const cols = w.db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
+    for (const bad of FORBIDDEN_COLUMNS) {
+      assert.equal(cols.includes(bad), false, `⛔ ${table} 不得有岗位/身份列 ${bad}（R-OPS-14 禁止岗位制）`);
+    }
+  }
+  cleanup(w.db, w.close, w.dataDir);
+});
+
+test('真实写入方的数据照样跑通全链路（判别性：实现不得依赖手造种子的状态值）', () => {
+  const w = setupWorld();
+  // 真实写入方的 teams.status='forming'、task_packages.status='submitted'，
+  // 而计划原种子里手写成 'active' / 'approved' ——
+  // 一份偷偷按 status 过滤的实现，在手造种子里照样绿，在这里必红。
+  const team = w.db.prepare('SELECT status FROM teams WHERE id = ?').get(w.teams.tm1.id);
+  const pkg = w.db.prepare('SELECT status FROM task_packages WHERE id = ?').get(w.packages.tp1.id);
+  assert.equal(team.status, 'forming', '前提：真实写入方产出的是 forming');
+  assert.equal(pkg.status, 'submitted', '前提：真实写入方产出的是 submitted');
+
+  const { wf, task } = seedWorldWorkflow(w);
+  const rows = workflow.listWorkflowTasks({ db: w.db, workflowId: wf.id, viewer: { id: w.users.member.id } });
+  assert.equal(rows.length, 1, '真实数据下任务清单照常可见');
+  const claimed = workflow.claimTask({
+    db: w.db, taskId: task.id, userId: w.users.member.id, teamId: w.teams.tm1.id, now: NOW,
+  });
+  assert.equal(claimed.task.status, 'in_progress');
+  const done = workflow.completeTask({
+    db: w.db, taskId: task.id, userId: w.users.member.id, now: NOW, evidence: runnableEvidence(),
+  });
+  assert.equal(done.task.status, 'done');
+  cleanup(w.db, w.close, w.dataDir);
 });
 ```
 
@@ -2049,7 +2828,7 @@ function resolveTeam(db, userId, teamId) {
 - [ ] **Step 6: 运行测试确认通过**
 
 Run: `cd platform && node --test test/workflow-service.test.js`
-Expected: PASS（12 个测试全过：workflow-service.test.js 12）
+Expected: PASS（49 个测试全过：workflow-service.test.js 49）
 
 > **【2026-10-21 漂移审计修正 M-1】** **原来错在哪**：本计划两处「Expected: PASS」的条数声明
 > 与代码块里实际的 `test(` 数量不符 —— `workflow-service.test.js` 声明 **11** 实为 **12**、
@@ -2066,13 +2845,17 @@ Expected: PASS（12 个测试全过：workflow-service.test.js 12）
 - [ ] **Step 7: 提交**
 
 ```bash
-cd platform && git add src/domain/task-evidence.js src/services/workflow.js src/db/repo/teamMembers.js test/workflow-service.test.js
+cd platform && git add src/domain/task-evidence.js src/services/workflow.js test/workflow-service.test.js
 git commit -m "feat(P5): 任务清单与自主领取（禁止岗位制，R-OPS-14）
 
 对应 R-OPS-13 / R-OPS-14 / R-STG-04：
 - 唯一获得任务的路径是 claimTask；不提供任何按岗位分配任务的出口
 - 完成必须给可运行状态或明确阻塞点，纯文字进度说明被拒
-- 完成任务不写积分（任务完成 ≠ 赛段交付物得分）"
+- 完成任务不写积分（任务完成 ≠ 赛段交付物得分）
+
+测试 49 例（领域纯函数 / 权限与三态分支 / 真并发 / 两条红线断言 / 真实写入方形状）" \
+  -- src/domain/task-evidence.js src/services/workflow.js test/workflow-service.test.js \
+     ../docs/superpowers/plans/2026-10-20-platform-P5-workflow-pools.md
 ```
 
 ---
@@ -4663,3 +5446,80 @@ git commit -m "feat(P5): 任务清单前端页 + 端到端验收（工作流→�
 | 7（javascript） | `platform/src/db/repo/public-tokens.js` | 整个文件 = 计划块 + 结尾换行 |
 | 8（bash） | Step 12 提交命令 | 含 `-- <显式路径>`，且 `-m` 在 `--` 之前 |
 
+
+
+
+---
+
+## Task 2 父代理预审修正台账（2026-10-21）
+
+> 执行者：P5 Task 2 实现 Agent。**规格 = 本计划 Task 2 章节**（唯一权威）。
+> 本台账记三件事：① 实跑发现的规格缺陷与处置；② 变异检验结论；③ 测试数字与计划块核验。
+> **落盘文件与本计划 Task 2 的代码块逐字一致**（核验见 T2-4）。
+
+### T2-1 实跑发现的规格缺陷与处置
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| C-1 | Important | 计划 Task 2 的 Files 段要求「Modify: `platform/src/db/repo/teamMembers.js`（本阶段只**追加** `hasActiveMembership` / `listMemberTeams`）」——但**这两个函数已经存在**（P5 Task 1 的 worker 就加好了） | 实跑：`grep -n 'hasActiveMembership\|listMemberTeams' platform/src/db/repo/teamMembers.js` → 第 76 行 / 第 85 行**已存在**。若照计划再实现一次 → 同一张 `team_members` 出现两个定义，且会与 Task 1 的版本**逐字不一致**（「P5 认为在队、P1 认为已离队」的数据分歧） | 以现状为准：**不重建、不重复实现**。Files 段已改写为「Task 1 已追加到位，本阶段不需改」；本 Task **未触碰** `teamMembers.js` |
+| C-2 | Important | 计划 Task 2 的测试块**判别力不足**：多处期望值「恰好相同」区分不出两种实现；且 403/404/409 的**细分分支**、并发兜底、`behavior_events` 边界**零覆盖** | 实跑（变异探针）：把 `canViewWorkflow` 里 `listTeamRows` 的 `taskPackageId` 过滤删掉（变异 W12）、把 `canViewWorkflow` 的超管分支删掉（W11）、把 `resolveTeam` 的成员校验删掉（W25）—— **计划原 12 例全绿** | 已补：测试 **12 例 → 49 例**（领域纯函数 8 + 建工作流/建任务 7 + 列任务 5 + 领取 8 + 释放 2 + 完成 5 + 两条红线 2 + 真实写入方 1 + 既有 12） |
+| C-3 | Important | 计划的「完成任务不加分」用例只断言 `points_ledger` 行数不变，**没有断言 `behavior_events`** —— 而红线 ② 写的是「⛔ **不写 `points_ledger`、不写 `behavior_events`**、不产生任何分数」 | 实跑（变异探针）：让 `completeTask` 额外写一条 `behavior_events`（变异 W43）→ **计划原 12 例全绿**（因为它压根不看这张表） | 已补：断言 `points_ledger` / `behavior_events` / `tier_records` **三张表**行数都不变；且**先用真实写入方**（`insertLedgerEntry` / `insertBehaviorEvent`）造出既存行 —— 否则「行数不变」是恒真断言（没有既存行时永远成立） |
+| C-4 | Minor | 计划的测试种子是**手写 INSERT**，与**真实写入方**的形状不同：`teams.status` 手写成 `'active'`（真实 `insertTeam` 默认 `'forming'`）、`task_packages.status` 手写成 `'approved'`（真实 `createTaskPackage` 产出 `'submitted'`）、`team_members` **不写 `id`**（真实 `insertTeamMember` 写 randomUUID） | 实跑：新增用例里显式断言真实写入方产出的 `teams.status === 'forming'`、`task_packages.status === 'submitted'`。一份偷偷按 `status='active'` 过滤的实现，在计划原种子里**照样绿** —— 这正是本项目踩过的坑：**手造的 input 会让「一致」变成假象** | 已补：「真实写入方的数据照样跑通全链路」用例 —— 全部用仓储层真实写入函数（`createUser` / `createEdition` / `createTaskPackage` / `insertTeam` / `insertTeamMember` / `insertStage` / `insertLedgerEntry` / `insertBehaviorEvent`）造数据，并显式断言前提（forming / submitted） |
+| C-5 | Minor | 计划原种子让 `team_members.id` 为 NULL（`TEXT PRIMARY KEY` 在 SQLite 里允许 NULL —— Task 1 台账 C-6 已登记同一现象） | 实跑：插入成功；且同一人在两支队的写法会被 P1 的 `idx_team_members_active` 挡下 | 新增用例改用真实写入方 `insertTeamMember`（写真实 UUID）。计划原 12 例的种子**保持原样**（不改动规格既有块） |
+| C-6 | Minor | 计划的 Step 6 写「Expected: PASS（12 个测试全过：workflow-service.test.js 12）」，补测后与实际不符 | 实跑 **49** 例 | 已回写 Step 6 |
+| C-7 | Minor | 计划的 Step 7 提交命令没有 `-- <显式路径…>` | 本项目提交纪律：先 `git add <paths…>`，再 `git commit -m "…" -- <paths…>` | 已回写 Step 7 |
+| C-8 | Minor | 计划的 Files 段把 `teamMembers.js` 列成本 Task 的 Modify 对象，实际不需改 | 见 C-1 | 已回写 Files 段 |
+| C-9 | Important | 计划原「禁止岗位制」用例用 `src.includes('R-OPS-14')` 断言溯源注释 —— 但**任何一处**出现都满足它，规格要求的「这行注释必须留着」没被钉住 | 实跑（变异 `W44`）：删掉 `// R-OPS-14：禁止岗位制，任务只能自主领取。` 这一行后，**计划原 12 例全绿**（文件里还有另外 3 处提到 R-OPS-14） | 已补：断言**整行**注释逐字存在（`src.includes('// R-OPS-14：禁止岗位制，任务只能自主领取')`）→ 复跑 `W44` **KILLED** |
+| C-10 | Important | 领域校验里「**缺** artifactUrl」与「artifactUrl **形态不对**」是**两条不同的错误**（提示语不同），但计划原用例只断言 `field === 'artifactUrl'` → 两者混同测不出来 | 实跑（变异 `E07`）：把「缺产物」分支短路后（改由「形态不对」分支报错，字段仍是 `artifactUrl`），**计划原 12 例全绿** | 已补：分别断言提示语（缺 → 「必须给出可运行产物」；形态不对 → 「必须是 http(s) 链接」）→ 复跑 `E07` **KILLED** |
+| C-11 | Important | 可见性的 `editionId` 过滤在**干净数据**上**不可观测** —— `task_package_id` 已经把队限定住了，正常的「跨届期队」本来就带着别的包，漏掉 `editionId` 过滤也看不出来 | 实跑（变异 `W13`）：删掉 `editionId` 过滤后，补测前的用例**仍全绿** | 已补：造一条**刻意的脏数据** —— 「挂在 ed_2 却指向 ed_1 任务包 tp_1 的队」（DDL 允许：`teams.edition_id` 与 `task_packages.edition_id` 之间没有一致性约束，真实写入方 `insertTeam` 也照样写得出来）→ 复跑 `W13` **KILLED** |
+
+### T2-2 变异检验与测试数字
+
+| 项 | 数 |
+|---|---|
+| 变异体总数 | **72**（领域纯函数 15 + 服务层 57） |
+| KILLED（测试变红） | **70** |
+| 等价 / 不可观测 | **2**（`W20` 前置检查冗余 / `W27` 分支不可达） |
+| **有效缺口** | **0** |
+| 锚点问题（命中数 ≠ 1） | **0**（第一轮 `W05` 锚点命中 2 次 → 已把锚点加长到三行 → 第二轮命中 1 次） |
+
+脚本：`/tmp/p5-mutate/t2.mjs`（指向**已落地**的 `platform/test/workflow-service.test.js`）；
+探针：`/tmp/p5-mutate/t2-probe.mjs`（把服务层的可观测输出打成一个**确定性** JSON 快照 —— 固定 id 的世界 + UUID 归一化，两次跑逐字节相同，实测 10847 字节）。
+判定三态：`KILLED`（测试红）/ `SURVIVED-EQUIV`（测试绿 **且** 探针差分为空 ⇒ 等价）/ `SURVIVED-GAP`（测试绿 **但** 探针差分非空 ⇒ 有效缺口）。
+
+**存活者的定性**（逐个带证据）：
+
+| 变异 | 存活原因 | 证据 |
+|---|---|---|
+| `W20`「`claimTask` 的『已被领取』**前置检查**被删」 | **等价**（纵深防御冗余）：前置检查与「数据库部分唯一索引 `ux_task_claims_active` + catch 翻译」是**同一约束的两道闸**。删掉前者，后者照样给出**完全相同**的 `409 / TASK_ALREADY_CLAIMED`（同一句提示语），且失败的 INSERT 在 SQLite 里不留任何行（语句级回滚） | **探针差分为空**：基线快照与变异体快照**逐字节相同** —— 错误的 status/code/message 一致，`task_claims` 行集一致，`workflow_tasks.status` 一致。保留前置检查（它少一次无谓的写冲突），但**它不是正确性的来源** —— 正确性来自唯一索引 |
+| `W27`「`resolveTeam` 不校验『多队歧义』」 | **不可观测**（上游约束使其不可达）：P1 的部分唯一索引 `idx_team_members_active ON team_members(user_id) WHERE left_at IS NULL` 保证**同一人同时只能在一支队** → `listMemberTeams` 恒返回 ≤ 1 行 → `teams.length > 1` 分支在 P1 约束下**永不可达** | 探针差分为空（探针造不出该状态）。**可达性证据**：`platform/db/migrations/002_registration.sql` 的 `CREATE UNIQUE INDEX idx_team_members_active ON team_members(user_id) WHERE left_at IS NULL` —— 同一 `user_id` 再插一条 `left_at IS NULL` 的成员会撞唯一索引。保留该分支作**纵深防御**（上游若放开「一人一队」，这里不会悄悄选错队） |
+
+> ⚠️ 第一轮变异跑出过 **5 个**存活者（`E07` / `W13` / `W20` / `W27` / `W44`），
+> 其中 **3 个是真缺口**，已按「判别性」纪律补测后复跑杀灭：
+> `E07`（缺产物与形态不对的错误文案混同 → 补断言提示语）、`W13`（`editionId` 过滤在干净数据上不可观测 → 补造「跨届期队指向同任务包」的脏数据）、
+> `W44`（`includes('R-OPS-14')` 会被任何一处出现满足 → 补断言**整行**注释逐字存在）。
+> 复跑结果见上表：**有效缺口 0**。
+
+### T2-3 测试数字
+
+| 项 | 数 |
+|---|---|
+| 新测试文件用例数 | **49**（`test/workflow-service.test.js`：计划原有 12 + 补测 37） |
+| 全量用例数 | **871**（基线 822 + 49），**0 红** |
+| 单文件耗时 | 约 5.4 s（49 例；含 7 次 scrypt 造数 + 1 次真并发 + 1 次触发器） |
+
+### T2-4 计划块逐字核验
+
+核验脚本 `/tmp/p3fix/plan-blocks.mjs`（整文件块判定：落盘文件去掉结尾换行后与围栏块**逐字**相同）：
+
+```
+行  1516 | test/workflow-service.test.js          | 整文件块✅一致   | 块 994 行
+行  2520 | src/domain/task-evidence.js            | 整文件块✅一致   | 块 56 行
+行  2605 | src/services/workflow.js               | 整文件块✅一致   | 块 220 行
+```
+
+**3 / 3 个块逐字一致，不一致 0 个。**（核验命令：
+`node /tmp/p3fix/plan-blocks.mjs docs/superpowers/plans/2026-10-20-platform-P5-workflow-pools.md platform test/workflow-service.test.js src/domain/task-evidence.js src/services/workflow.js`）
+
+> 注：`src/domain/task-evidence.js` 与 `src/services/workflow.js` **一个字都没改** ——
+> 计划里的代码块直接就是实现（这两块不需要回写）。唯一被回写的是**测试块**（12 → 49 例）。
