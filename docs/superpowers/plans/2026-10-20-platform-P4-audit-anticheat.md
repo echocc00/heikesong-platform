@@ -1408,6 +1408,123 @@ test('记录计算时审计日志必须带上规则版本（事后查得到当�
   rmSync(dataDir, { recursive: true, force: true });
 });
 
+// ── ⑪ P2 实际写入的快照形状（父代理预审补测）────────────────────────────
+// ⛔ 上面的 BASE_INPUT 是**手造的**形状：带 `configKey`、`ruleVersion` 带前缀、output 里带 trace。
+//    与 P2 的 `compute.js` **实际写入的形状不一致** —— 用它测出来的「一致」是**假象**：
+//    真实快照复算会恒判「不一致 + 规则版本已变更」，把正常快照全报成「被篡改」。
+//    P2 实际写的 input（`src/services/compute.js`）：
+//      { config, judges, submissions, excludedReviews, enterpriseConfirmations,
+//        peerReviews, selfReviews, teams, judgePool, ruleVersion: config.version }
+//    且 `output_json` **只存 { teams, warnings }**（trace 单独存 trace_json）。
+const P2_INPUT = {
+  config: { id: 'scoring-final', version: '2026-10-20', dimensions: [{ key: 'innovation', weight: 0.2 }] },
+  judges: [{ judgeId: 'j1', seat: 'judge' }],
+  submissions: [
+    { judgeId: 'j1', teamId: 't1', dimension: 'innovation', rawScore: 80 },
+    { judgeId: 'j1', teamId: 't2', dimension: 'innovation', rawScore: 90 },
+  ],
+  excludedReviews: [],
+  enterpriseConfirmations: [],
+  peerReviews: [],
+  selfReviews: [{ teamId: 't1', dimension: 'self_eval', rawScore: 70 }],
+  teams: [
+    { teamId: 't1', packageEnterpriseId: null, isFreeBrief: false },
+    { teamId: 't2', packageEnterpriseId: null, isFreeBrief: false },
+  ],
+  judgePool: { ok: true, errors: [], stats: {} },
+  ruleVersion: '2026-10-20',
+};
+
+// P2 形状的引擎：**名册缺失会给出 team_roster_missing**（复刻 P2 `scoreStage` 的行为）——
+// ⛔ 引擎不转发 teams ⇒ 复算与原计算结果不同 ⇒ 严格重放恒判失败。
+// ⛔ 有自评输入才做自评差异检测（复刻 P2 的 R-JDG-13）—— 引擎不转发 selfReviews 同理。
+function p2ShapeEngine(input) {
+  const roster = input.teams?.length ? input.teams : null;
+  const warnings = roster ? [] : [{ code: 'team_roster_missing', message: '没有队伍名册（R1 / R4 需要任务包归属与自由命题标记），相关判定按「不适用」处理' }];
+  if ((input.selfReviews ?? []).length > 0) {
+    warnings.push({ code: 'self_eval_divergence', message: '自评测与评委分存在差异，已留痕' });
+  }
+  const teams = (input.submissions ?? []).map((s) => ({ teamId: s.teamId, total: s.rawScore }));
+  return { teams, warnings, trace: { steps: [] } };
+}
+
+test('P2 真实写入的快照形状必须能复算出「一致」（否则正常快照被误报成被篡改）', () => {
+  const { db, close, dataDir } = setup();
+  const output = p2ShapeEngine(P2_INPUT);
+  const { id } = recordComputation({
+    db, kind: 'stage_score', stageId: 'st1', ruleVersion: P2_INPUT.ruleVersion,
+    input: P2_INPUT, output: { teams: output.teams, warnings: output.warnings }, trace: output.trace,
+  });
+  const rules = { scoring: { final: { id: 'scoring-final', version: '2026-10-20', dimensions: [{ key: 'innovation', weight: 0.2 }] } } };
+  const r = recomputeAndDiff({
+    db, id, actorId: 'u_admin', now: '2026-10-20T01:00:00.000Z', rules, engine: p2ShapeEngine,
+  });
+  assert.equal(r.identical, true, `P2 形状的快照复算必须一致，实际 diff=${JSON.stringify(r.diff)}`);
+  assert.deepEqual(r.diff, []);
+  assert.ok(
+    !r.warnings.some((w) => w.code === 'rule_version_changed'),
+    '规则版本没变却报「规则版本已变更」= 误报',
+  );
+  assert.ok(
+    !r.warnings.some((w) => w.code === 'strict_replay_failed'),
+    '严格重放失败 = 误报（teams 没被转发就会这样）',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('P2 形状的快照：当前规则版本真的变了时必须报出来（修复不能把版本比对一起吞掉）', () => {
+  const { db, close, dataDir } = setup();
+  const output = p2ShapeEngine(P2_INPUT);
+  const { id } = recordComputation({
+    db, kind: 'stage_score', stageId: 'st1', ruleVersion: P2_INPUT.ruleVersion,
+    input: P2_INPUT, output: { teams: output.teams, warnings: output.warnings }, trace: output.trace,
+  });
+  const rules = { scoring: { final: { id: 'scoring-final', version: '2026-10-21', dimensions: [{ key: 'innovation', weight: 0.2 }] } } };
+  const r = recomputeAndDiff({
+    db, id, actorId: 'u_admin', now: '2026-10-20T01:00:00.000Z', rules, engine: p2ShapeEngine,
+  });
+  assert.equal(r.identical, false, '规则版本变了却报 identical=true = 漏报');
+  const w = r.warnings.find((x) => x.code === 'rule_version_changed');
+  assert.ok(w, '规则版本变了必须在 warnings 里显式说明');
+  assert.equal(w.snapshotRuleVersion, '2026-10-20');
+  assert.equal(w.currentRuleVersion, '2026-10-21');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('diff 的数组 path 在业务主键重复时必须唯一（否则差异定位不到具体那一条）', () => {
+  const before = { warnings: [{ teamId: 't1', code: 'a' }, { teamId: 't1', code: 'b' }] };
+  const after = { warnings: [{ teamId: 't1', code: 'a' }, { teamId: 't1', code: 'c' }] };
+  const diff = diffValues(before, after);
+  assert.equal(diff.length, 1);
+  assert.equal(diff[0].path, 'warnings[1].code', '主键重复时必须回退到下标，否则两条共用一个 path');
+  assert.equal(diff[0].before, 'b');
+  assert.equal(diff[0].after, 'c');
+});
+
+test('同一个版本的两种写法（裸 version 与 key@version）必须判为「同一版」', () => {
+  // 快照写的是带前缀的 ruleVersion、但没有 configKey —— 这是「按契约写的新快照」的形状。
+  // 库里同时存在两种写法（P2 实际写的是裸 version）⇒ 比较必须两边都认。
+  const { db, close, dataDir } = setup();
+  const input = { ...P2_INPUT, ruleVersion: 'scoring.final@2026-10-20' };
+  const output = p2ShapeEngine(input);
+  const { id } = recordComputation({
+    db, kind: 'stage_score', stageId: 'st1', ruleVersion: 'scoring.final@2026-10-20',
+    input, output: { teams: output.teams, warnings: output.warnings }, trace: output.trace,
+  });
+  const rules = { scoring: { final: { id: 'scoring-final', version: '2026-10-20', dimensions: [{ key: 'innovation', weight: 0.2 }] } } };
+  const r = recomputeAndDiff({
+    db, id, actorId: 'u_admin', now: '2026-10-20T01:00:00.000Z', rules, engine: p2ShapeEngine,
+  });
+  assert.ok(
+    !r.warnings.some((w) => w.code === 'rule_version_changed'),
+    '同一个版本的两种写法不该报「规则版本已变更」',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
 function writeAuditLogForTest(db) {
   db.prepare(
     'INSERT INTO audit_log (id, actor_id, action, entity, entity_id, detail_json, created_at) VALUES (?,?,?,?,?,?,?)',
@@ -1456,6 +1573,22 @@ function arrayKey(item, index) {
   return String(index);
 }
 
+/**
+ * 给数组的每个元素算一个**唯一**的 path 键。
+ *
+ * ⛔ 父代理预审修正（Important，P4-11）：同一个数组里**可以出现重复的业务主键**
+ *    （例如 `scoreStage` 的 `warnings` 里多条告警的 `teamId` 相同）。
+ *    直接用主键当 path ⇒ 多条告警共用同一个 path ⇒
+ *    差异被记到同一条上（「这一条变了」其实是「那一条变了」）⇒ 差异**无法定位**。
+ *    ⇒ 键重复时**回退到下标**，保证 path 唯一。
+ */
+function arrayKeys(items) {
+  const keys = items.map((it, i) => arrayKey(it, i));
+  const counts = new Map();
+  for (const k of keys) counts.set(k, (counts.get(k) ?? 0) + 1);
+  return keys.map((k, i) => (counts.get(k) > 1 ? String(i) : k));
+}
+
 export function diffValues(before, after, { path = '', depth = 0, maxDepth = 12 } = {}) {
   const out = [];
   walk(before, after, path, depth, maxDepth, out);
@@ -1490,8 +1623,10 @@ function walk(before, after, path, depth, maxDepth, out) {
 
   if (Array.isArray(before) && Array.isArray(after)) {
     const len = Math.max(before.length, after.length);
+    const beforeKeys = arrayKeys(before);
+    const afterKeys = arrayKeys(after);
     for (let i = 0; i < len; i += 1) {
-      const key = arrayKey(before[i] ?? after[i], i);
+      const key = beforeKeys[i] ?? afterKeys[i] ?? String(i);
       walk(before[i], after[i], `${path}[${key}]`, depth + 1, maxDepth, out);
     }
     return;
@@ -1571,6 +1706,30 @@ export function getComputation({ db, id, viewer = null }) {
   };
 }
 
+/**
+ * 按 `id` 在当前规则里找与快照 config 对应的那一份。
+ *
+ * ⛔ 父代理预审修正（Critical，P4-9）：P2 的 `compute.js` **实际写入的快照 input 里没有 `configKey`**
+ *    （它写的是 `{ config, judges, submissions, excludedReviews, enterpriseConfirmations,
+ *    peerReviews, selfReviews, teams, judgePool, ruleVersion }`，`ruleVersion` 是**裸 version**）。
+ *    计划里声明的 `{ configKey, ruleVersion: 'scoring.final@…' }` 形状是**契约要求**，P2 没照做。
+ *    ⇒ 只认 `configKey` 的话，复算永远拿不到「当前规则」，只能退回快照自带的 config
+ *    ⇒ 版本比对变成「自己跟自己比」⇒ **规则版本变了也发现不了**。
+ *    ⇒ 退路：按快照 config 的 `id`（如 `scoring-final`）在当前规则里找同一份。
+ */
+function findConfigById(rules, cfg) {
+  const id = cfg?.id;
+  if (!id || !rules || typeof rules !== 'object') return null;
+  for (const group of Object.values(rules)) {
+    if (!group || typeof group !== 'object') continue;
+    if (group.id === id) return group;
+    for (const v of Object.values(group)) {
+      if (v && typeof v === 'object' && v.id === id) return v;
+    }
+  }
+  return null;
+}
+
 function pickConfig(rules, input) {
   // 快照里记了 configKey（如 'scoring.final'），据此取当前规则；取不到就退回快照自带的 config
   const key = input?.configKey;
@@ -1579,7 +1738,39 @@ function pickConfig(rules, input) {
     const cfg = rules?.[group]?.[name];
     if (cfg) return cfg;
   }
+  // ⛔ 没有 configKey（P2 实际写入的形状）→ 按 id 找当前规则；再找不到才退回快照自带的 config
+  const byId = findConfigById(rules, input?.config);
+  if (byId) return byId;
   return input?.config ?? null;
+}
+
+/**
+ * 规则版本比较：**兼容裸 version 与 `key@version` 两种写法**。
+ *
+ * ⛔ 父代理预审修正（Critical，P4-9）：P2 写的 `rule_version` 是**裸 version**（`2026-10-20`），
+ *    计划声明的是带前缀的（`scoring.final@2026-10-20`）。两种形状在库里**同时存在**
+ *    （历史快照是裸的，新快照若按计划写就是带前缀的）⇒ 比较必须两边都能认。
+ */
+function sameRuleVersion(a, b) {
+  if (a === b) return true;
+  if (a == null || b == null) return false;
+  const strip = (v) => (typeof v === 'string' && v.includes('@') ? v.slice(v.lastIndexOf('@') + 1) : v);
+  return strip(a) === strip(b);
+}
+
+/**
+ * 剥掉复算结果里的 `trace`。
+ *
+ * ⛔ 父代理预审修正（Important，P4-10）：`scoreStage` 返回 `{ teams, warnings, trace }`，
+ *    但 P2 写快照时 `output_json` **只存 `{ teams, warnings }`**，`trace` 单独存 `trace_json`。
+ *    ⇒ 直接拿复算结果和快照 output 比对，`trace` 这一项会恒定报成差异
+ *    ⇒ **每一次复算都显示「不一致」**。trace 的比对是另一件事（对照 `trace_json`），不在 output 比对范围内。
+ */
+function stripTrace(o) {
+  if (!o || typeof o !== 'object' || Array.isArray(o)) return o;
+  if (!Object.prototype.hasOwnProperty.call(o, 'trace')) return o;
+  const { trace, ...rest } = o;
+  return rest;
 }
 
 function runEngine(engine, input, config) {
@@ -1589,6 +1780,12 @@ function runEngine(engine, input, config) {
     submissions: input?.submissions ?? [],
     enterpriseConfirmations: input?.enterpriseConfirmations ?? [],
     peerReviews: input?.peerReviews ?? [],
+    // ⛔ 父代理预审修正（Critical，P4-9）：必须转发 `teams`（队伍名册）与 `selfReviews`。
+    //    P2 的 `scoreStage` 在没有名册时会退化成「按 submissions 推队伍」，并给
+    //    `team_roster_missing` 告警 ⇒ R1 / R4 判定（任务包归属、自由命题替代维度）**被跳过**
+    //    ⇒ 企业席归零逻辑与原计算不同 ⇒ **严格重放恒判失败**（把正常快照误报成「被篡改」）。
+    teams: input?.teams ?? [],
+    selfReviews: input?.selfReviews ?? [],
   });
 }
 
@@ -1612,27 +1809,36 @@ export function recomputeAndDiff({
   const snapshotRuleVersion = row.rule_version;
 
   const currentConfig = rules ? pickConfig(rules, snapshotInput) : null;
+  // ⛔ 父代理预审修正（Critical，P4-9）：有 configKey 才带前缀；没有就只报 version ——
+  //    否则 P2 的裸 version（`2026-10-20`）会被拼成 `unknown@2026-10-20`，
+  //    **恒判「规则版本已变更」**（正常快照被误报成规则漂移）。
   const currentRuleVersion = currentConfig?.version
-    ? `${snapshotInput?.configKey ?? 'unknown'}@${currentConfig.version}`
+    ? (snapshotInput?.configKey ? `${snapshotInput.configKey}@${currentConfig.version}` : currentConfig.version)
     : null;
-  const ruleVersionChanged = currentRuleVersion !== null && currentRuleVersion !== snapshotRuleVersion;
+  const ruleVersionChanged = currentRuleVersion !== null
+    && !sameRuleVersion(currentRuleVersion, snapshotRuleVersion);
 
   // ① 严格重放：用快照自带的规则版本重放 —— 回答"当时的计算本身可不可复算"
+  //    ⚠️ trace **两侧都剥**：trace 不是 output 契约的一部分（P2 把它单独存 trace_json），
+  //    只剥一侧会造成「快照有 trace、复算没有」这种假差异。
   const strictResult = runEngine(engine, snapshotInput, snapshotInput.config);
-  const strictDiff = diffValues(snapshotOutput, strictResult.output ?? strictResult);
+  const strictDiff = diffValues(
+    stripTrace(snapshotOutput),
+    stripTrace(strictResult.output ?? strictResult),
+  );
 
   // ② 当前规则复算：用当前规则跑同一批输入 —— 回答"现在这套规则还能不能算出同样的结果"
   const baseInput = liveInput ?? snapshotInput;
   const currentResult = currentConfig
     ? runEngine(engine, baseInput, currentConfig)
     : runEngine(engine, baseInput, snapshotInput.config);
-  const currentOutput = currentResult.output ?? currentResult;
+  const currentOutput = stripTrace(currentResult.output ?? currentResult);
 
   const diff = [];
   if (ruleVersionChanged) {
     diff.push({ path: 'ruleVersion', before: snapshotRuleVersion, after: currentRuleVersion });
   }
-  diff.push(...diffValues(snapshotOutput, currentOutput));
+  diff.push(...diffValues(stripTrace(snapshotOutput), currentOutput));
 
   const warnings = [];
   if (ruleVersionChanged) {
@@ -6542,6 +6748,24 @@ git commit -m "test(P4): 端到端复算验收（改一个原始分 → diff 非
 | 2 | **测试补 `seedRefs(db)` 外键夹具** | 规格用例直接用 `'u_admin'` / `'st1'` | 加 `seedRefs(db)`：建 `users` / `editions` / `stages` / `teams` 四类被引用的行 | `PRAGMA foreign_keys = ON`（`src/db/sqlite.js`）；不建被引用的行必然 `FOREIGN KEY constraint failed`（与 P4-5 同款） |
 | 3 | **测试补 8 例** | 规格自带 11 例 | 19 例 | 变异检验暴露的**有效缺口**（详见「Task 2 父代理预审修正台账」二）；补测**只加断言不改语义** |
 
+
+### I. 父代理预审修正轮：复算链路与 **P2 真实快照形状** 的对齐
+
+> 背景：P4 计划「### D. 需要上游配合的跨阶段契约」把快照 `input_json` 的结构写成
+> `{ configKey, ruleVersion: 'scoring.final@…', config, judges, submissions, enterpriseConfirmations, peerReviews }`，
+> 并要求「P2 的 `computeStage` 必须按此写快照，否则 P4 无法重放」。
+> **P2 已经落地，写的是另一个形状** —— 计划声明的契约**没有兑现**。
+> 本轮裁决：**不改 P2**（跨阶段返工 + 回归风险），**P4 侧做成兼容读取**（库里两种形状的快照都存在，读取方必须都认）。
+
+| # | 偏差 | 计划 / P2 实际的写法 | P4 本轮的写法 | 理由 |
+|---|---|---|---|---|
+| 1 | **快照 `input` 没有 `configKey`** | 计划：`{ configKey, ruleVersion, config, judges, submissions, enterpriseConfirmations, peerReviews }`；**P2 实际**（`src/services/compute.js`）：`{ config, judges, submissions, excludedReviews, enterpriseConfirmations, peerReviews, selfReviews, teams, judgePool, ruleVersion: config.version }` | `pickConfig` 增加**按 `config.id` 找当前规则**的退路（P2 的 `rules/scoring-final.json` 带 `"id": "scoring-final"`） | 只认 `configKey` ⇒ 复算永远拿不到「当前规则」⇒ 版本比对变成「自己跟自己比」⇒ **规则版本变了也发现不了** |
+| 2 | **`ruleVersion` 的两种写法** | 计划：`'scoring.final@2026-10-20'`（带前缀）；**P2 实际**：`'2026-10-20'`（裸 version） | 新增 `sameRuleVersion(a, b)`：比较时**两边都剥掉 `key@` 前缀**再比 | 库里两种形状**同时存在**（历史快照是裸的，按计划写的新快照是带前缀的）⇒ 比较必须两边都认，否则**每次复算都误报「规则版本已变更」** |
+| 3 | **`currentRuleVersion` 的拼法** | 计划代码：`\`\${snapshotInput?.configKey ?? 'unknown'}@\${currentConfig.version}\`` | 有 `configKey` 才带前缀，没有就**只报 version** | 按原写法，裸 version 的快照会被拼成 `'unknown@2026-10-20'` ⇒ **与快照恒不相等 ⇒ 恒判「规则版本已变更」** |
+| 4 | **`runEngine` 没转发 `teams` / `selfReviews`** | 计划代码只转发 `config / judges / submissions / enterpriseConfirmations / peerReviews` | 增加转发 `teams` 与 `selfReviews` | P2 的 `scoreStage` 在**没有名册**时会退化成「按 submissions 推队伍」并给 `team_roster_missing` 告警 ⇒ **R1 / R4 判定（任务包归属、自由命题替代维度）被跳过** ⇒ 企业席归零逻辑与原计算不同 ⇒ **严格重放恒判失败**（正常快照被误报成「被篡改」） |
+| 5 | **`trace` 被算进 output 比对** | P2 的 `output_json` **只存 `{ teams, warnings }`**，`trace` 单独存 `trace_json`；而 `scoreStage` 返回 `{ teams, warnings, trace }` | 新增 `stripTrace()`，**比对前两侧都剥** `trace` | 只剥一侧会造成「快照有 trace、复算没有」的假差异；两侧都剥才是「trace 不在 output 契约内」的一致口径。trace 的比对属于 `trace_json` 的事，不在本次范围 |
+| 6 | **diff 的数组 path 在业务主键重复时不唯一** | 计划代码：`arrayKey(item, index)` 直接用 `teamId ?? id ?? judgeId ?? key` | 新增 `arrayKeys(items)`：**键重复时回退到下标** | 同一个数组里可以出现重复的业务主键（如 `scoreStage` 的 `warnings` 里多条告警 `teamId` 相同）⇒ 多条共用一个 path ⇒ 差异**定位不到具体那一条** |
+
 ---
 
 *配套：`../specs/2026-10-20-heikesong-platform-design.md`｜`../requirements-traceability.md`｜`../rule-decisions.md`｜`../`*
@@ -6632,11 +6856,81 @@ git commit -m "test(P4): 端到端复算验收（改一个原始分 → diff 非
 处置：新增 `configSensitiveEngine`（`total = rawScore × config.dimensions[0].weight`），
 并用「权重 0.2 → 0.5」的**不对称数据集** —— 只有当前规则真的参与，`teams[t1].total` 才会变。
 
-**Task 2 的测试条数口径**：audit-snapshot **19**（规格自带 11 + 父代理预审补测 8）。
+**Task 2 的测试条数口径**：audit-snapshot **19**（规格自带 11 + 父代理预审补测 8）
+> ⚠️ **后续追加 4 例**（父代理预审修正轮，见下方「父代理预审修正轮（Task 2 复算链路对齐 P2 真实快照形状）」整章）
+> ⇒ 现为 **23**（19 + 4）。
 
 **最终结果**：变异体 28 → **KILLED 28 / 等价变异体 0 / 有效缺口 0**；
 `audit-snapshot.test.js` **19/19**；P4 全量 **745/745**（Task 1 后的 726 + Task 2 的 19）。
+> ⚠️ **修正轮之后**：变异体 **35** → **KILLED 35 / 存活 0**；`audit-snapshot.test.js` **23/23**；P4 全量 **832/832**。
 
 > **关于全量基线数字**：Task 1 台账原写「723/723」，**实测为 726/726**
 > （`git worktree add --detach 0345ccd` 纯净态实跑；P4 Task 7 的 worker 独立实测结论一致）。
 > 本阶段起一律**以实跑数字为准**。
+---
+
+## 父代理预审修正轮（Task 2 复算链路对齐 P2 真实快照形状）（2026-10-21）
+
+> **背景**：Task 2 落地后，父代理按「**P4 验收标准 P4-2**」的口径去**实跑**复算链路
+> （不是跑 Task 2 自己的用例），发现：**用 P2 真实写入的快照复算，`identical` 恒为 `false`** ——
+> 一切正常的快照都被报成「不可复算 / 被篡改」。
+> 这类问题**单元测试抓不到**：Task 2 的 19 条用例用的是**手造的** input 形状
+> （带 `configKey`、`ruleVersion` 带前缀、output 里带 `trace`），
+> **与 P2 的 `compute.js` 实际写入的形状不一致** ⇒ 测出来的「一致」是**假象**。
+> ⇒ 教训：**测试用的数据形状必须与真实写入方一致**（比「期望值不能恰好相同」更深一层）。
+
+### 一、实跑证据
+
+父代理探针 `/tmp/p4-proof/probe-p2-snapshot-replay.mjs`：**完全照 P2 的 `compute.js` 构造 input**
+（`{ config, judges, submissions, excludedReviews, enterpriseConfirmations, peerReviews, selfReviews, teams, judgePool, ruleVersion: config.version }`，
+且 `output` 只存 `{ teams, warnings }`），用 P2 的 `scoreStage` 算出结果后写快照，再复算：
+
+**修前**：
+
+```
+identical = false
+diff  = [ { "path": "ruleVersion", "before": "2026-10-20", "after": "unknown@2026-10-20" },
+          { "path": "trace", ... },
+          { "path": "warnings[t1].code", "before": "no_enterprise_confirmation", "after": "team_roster_missing" }, ... ]
+warnings = [ { "code": "rule_version_changed", ... },
+             { "code": "strict_replay_failed", ... } ]
+```
+
+**修后**：
+
+```
+identical = true
+diff  = []
+warnings = [ { "code": "strict_replay_identical", "severity": "info", ... } ]
+```
+
+### 二、修了什么（6 处，全部记入偏差表 §I）
+
+| # | 级别 | 缺陷 | 处置 |
+|---|---|---|---|
+| **P4-9** | **Critical** | `runEngine` 不转发 `teams` / `selfReviews` ⇒ P2 的 R1 / R4 判定被跳过 ⇒ **严格重放恒判失败** | 增加转发两个字段 |
+| **P4-9b** | **Critical** | 快照没有 `configKey` ⇒ 拿不到「当前规则」⇒ **规则版本变化永远发现不了** | `pickConfig` 增加按 `config.id` 找当前规则的退路 |
+| **P4-9c** | **Critical** | `currentRuleVersion` 恒拼 `'unknown@'` 前缀 ⇒ **恒判「规则版本已变更」** | 有 `configKey` 才带前缀 |
+| **P4-10** | Important | `trace` 被算进 output 比对 ⇒ 每次复算都多一条假差异 | 新增 `stripTrace()`，**两侧都剥** |
+| **P4-11** | Important | diff 的数组 path 在业务主键重复时不唯一 ⇒ 差异定位不到具体那一条 | 新增 `arrayKeys()`，键重复时回退下标 |
+| **P4-12** | Important | 裸 `version` 与 `key@version` 两种写法互不相等 ⇒ 版本比对误报 | 新增 `sameRuleVersion()`，比较时两边都剥前缀 |
+
+### 三、补测（4 条，**判别性**）
+
+| # | 用例 | 杀掉的变异体 |
+|---|---|---|
+| 20 | P2 真实写入的快照形状必须能复算出「一致」（且不得报 `rule_version_changed` / `strict_replay_failed`） | M29（不转发 teams）、M30（不转发 selfReviews）、M33（不剥 trace）、M34（拼 unknown@ 前缀） |
+| 21 | P2 形状的快照：**当前规则版本真的变了时必须报出来**（修复不能把版本比对一起吞掉） | M15（规则版本变更不识别）、M31（不按 id 找当前规则） |
+| 22 | diff 的数组 path 在业务主键重复时必须唯一 | M35（主键重复不回退下标） |
+| 23 | 同一个版本的两**种**写法（裸 version 与 `key@version`）必须判为「同一版」 | M32（不认两种写法） |
+
+### 四、变异检验
+
+变异脚本 `/tmp/p4-mutate/t2.mjs`：**35** 个变异体 → **KILLED 35 / 存活 0 / 等价 0 / 有效缺口 0**
+（原 28 个 + 本轮新增 7 个：M29–M35）。
+其中 3 个变异体的锚点因本轮修复而失效（M03 / M15 / M27）—— **不是「存活」**，是锚点指错了代码，
+已按纪律「命中 0 次要报出来」改成指向修复后的真实调用点，改完立即被杀灭。
+
+### 五、最终结果
+
+`audit-snapshot.test.js` **23/23**；P4 全量 **833/833**（Task 3 合并后的 829 + 本轮 4 条新用例）。
