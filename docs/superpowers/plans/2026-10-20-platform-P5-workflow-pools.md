@@ -406,9 +406,11 @@ test('public_tokens 表可存可查，且 token 是主键', () => {
  * ⚠️ 屏障必须**两个 worker 都到达**才放行：worker 在连上库之后、
  *    真正发起 INSERT 之前才递增屏障计数 —— 因此「同时」的是 INSERT 本身，
  *    不是连接建立。
- * ⚠️ 两个连接必须**错开建立**：openDatabase() 第一条语句是 PRAGMA journal_mode = WAL，
- *    而 busy_timeout 在它之后才设 —— 两个连接同时执行这条 PRAGMA 会有一方
- *    立刻 "database is locked"（实测，见缺陷台账 C-2）。
+ * ⚠️ 两个连接必须**错开建立**：这是本 Task 落地时（2026-10-21）的**临时变通** ——
+ *    当时 openDatabase() 的第一条语句是 PRAGMA journal_mode = WAL，而 busy_timeout 在它之后才设，
+ *    两个连接同时执行这条 PRAGMA 会有一方立刻 "database is locked"（实测，见缺陷台账 **C-3**）。
+ *    ⚠️ **该缺陷已在上游修掉**（main `a6fd2db`：切 WAL 改成带退避重试，不再裸执行该 PRAGMA），
+ *    所以这个「错开建立」**已不再必要** —— 保留它只是为了让本用例专注于「并发领取」的仲裁语义。
  */
 const CLAIM_WORKER_SRC = `
 import { parentPort, workerData } from 'node:worker_threads';
@@ -5192,7 +5194,7 @@ git commit -m "feat(P5): 任务清单前端页 + 端到端验收（工作流→�
 |---|---|---|---|---|
 | C-1 | Important | Task 1 的测试块**只覆盖迁移层**：本 Task 新建的 5 个仓储文件与 `teamMembers.js` 的两个追加函数**零覆盖** | 把 `getActiveClaim` 的 `AND released_at IS NULL` 删掉后，计划原测试**仍全绿** → 仓储层变异体全部存活 | 已补：测试 5 例 → 13 例（仓储层 6 例 + 约束矩阵 1 例 + 真并发 1 例） |
 | C-2 | Important | 计划里的「并发」用例**是串行的**（同一连接先后两次 insert） | 串行的第二次必然撞唯一索引 —— 证明不了「并发下由数据库仲裁」 | 已补：真并发用例（两个 worker 线程 + 两条独立连接 + `SharedArrayBuffer` 屏障），并断言两次 INSERT 的时间区间**重叠**（实测重叠 11–16 ms，8/8 次） |
-| C-3 | Important | 两条连接**同时**建立会撞 `PRAGMA journal_mode = WAL`（`busy_timeout` 在它**之后**才设） | 实测 `Error: database is locked`（errcode 261）于 `src/db/sqlite.js:25` | 测试里改「握手式错开建立」（A 连接 ready 后才起 B）。⛔ **未改 `src/db/sqlite.js`**（P0 的文件，不在本 Task 范围）→ 登记为**上游建议**（把 `busy_timeout` 提到 `journal_mode` 之前） |
+| C-3 | Important | 两条连接**同时**建立会撞 `PRAGMA journal_mode = WAL`（当时 `busy_timeout` 在它**之后**才设） | 实测 `Error: database is locked`（errcode 261）于 `src/db/sqlite.js:25` | **【已修 —— 上游，main `a6fd2db`】** 父代理在 P5 报出后定位到根因并修在 main：**切 journal_mode 需要独占锁，而别的连接持有写事务（RESERVED 锁）时 SQLite 的 busy handler 不覆盖这一步**（实测 0ms 即抛 SQLITE_BUSY，busy_timeout 对它无效 ⇒ 「只把 `busy_timeout` 提前」**不够**）。修法：busy_timeout 提前 + 切 WAL 改成「已是 `wal` 直接返回（no-op）→ 否则带**退避重试**地切」+ 预算耗尽 fail-fast。回归 4 例（`platform/test/db-concurrency.test.js`），对旧实现**有牙**。⚠️ 限定条件（P4 终审 M-2 实测纠正）：持 **EXCLUSIVE** 锁时 busy handler **仍会**等待 —— 「busy handler 一概不覆盖切 WAL」是过度泛化的说法。本 Task 当时的「握手式错开建立」变通**已不再必要**（可去掉，但保留也无害） |
 | C-4 | Minor | Step 10 写「PASS（5 个测试全过）」，与补测后不符 | 实跑 13 例 | 已回写 Step 10 |
 | C-5 | Minor | DDL 注释引用的「偏差章节 **D-2 / D-7**」**指向空**（偏差章节实际用 A–H 编号） | 全篇 grep：`D-2` / `D-7` 只出现在引用处，无对应条目 | 登记为知悉项；**未改 DDL 注释**（避免无意义 churn，且注释是计划原文） |
 | C-6 | Minor | `TEXT PRIMARY KEY` 在 SQLite 里**允许 NULL**（历史行为）→ `public_tokens.token` **没有** NOT NULL 防线 | 实测：插入 `token = NULL` 成功、不报 NOT NULL；P0–P4 的 id 列全是同一写法 | 已在测试里**钉住**该行为 + 注释说明；沿用 P0–P4 约定，**不在本迁移单点偏离** → 登记为**上游知悉项**（建议全项目统一补 `NOT NULL`） |
