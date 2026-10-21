@@ -2209,10 +2209,11 @@ git commit -m "feat(P6): 部署资产（systemd / nginx / docker-compose / 幂�
 ```javascript
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { readFileSync, mkdtempSync, writeFileSync, rmSync, mkdirSync, copyFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
 import { parseManifest, scanText, main } from '../scripts/audit-scan.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -2291,6 +2292,244 @@ test('发布产物目录也必须过闸（--forbidden 可指定别的清单）',
   assert.equal(code, 1, '命中禁用词必须返回非 0（发布中止）');
   rmSync(dir, { recursive: true, force: true });
 });
+
+// ── 父代理预审追加用例（2026-10-21）────────────────────────────────────
+// 规格自带的 6 个用例盖不住「闸根本没生效」这一类失败：
+//   ① 规格用例 6 名字叫「发布产物目录也必须过闸」，实际测的是 --forbidden + 普通文件，
+//      并没有真的测「platform/web/dist/ 这一趟」；
+//   ② 规格用例 5 在参数还没实现时也会「通过」（未识别的参数被当成扫描路径 → 扫 0 个文件 →
+//      退出码 0），属于假绿。
+// 下面这批用例的期望值在「实现正确」与「实现被改坏」两种情况下必须不同（判别性）。
+
+const PLATFORM_DIR = join(here, '..');
+const SCRIPT = join(PLATFORM_DIR, 'scripts', 'audit-scan.js');
+
+/**
+ * 造一个「能跑 CLI」的临时工程：<root>/platform/scripts/audit-scan.js（脚本副本）+
+ * <root>/platform/scripts/forbidden.txt（清单）+ <root>/docs/（被扫的文件）+
+ * 可选的 <root>/platform/web/dist/（发布产物）。
+ * CLI 里的仓库根 = <root>，所以相对路径可预期（platform/web/dist/index.html）。
+ */
+function cliSandbox({ manifest = '禁用词\n', files = {}, distFiles = null } = {}) {
+  const root = mkdtempSync(join(tmpdir(), 'hks-scan-rel-'));
+  const scriptsDir = join(root, 'platform', 'scripts');
+  mkdirSync(scriptsDir, { recursive: true });
+  mkdirSync(join(root, 'docs'), { recursive: true });
+  copyFileSync(SCRIPT, join(scriptsDir, 'audit-scan.js'));
+  writeFileSync(join(scriptsDir, 'forbidden.txt'), manifest, 'utf8');
+  for (const [name, content] of Object.entries(files)) {
+    writeFileSync(join(root, 'docs', name), content, 'utf8');
+  }
+  if (distFiles) {
+    for (const [name, content] of Object.entries(distFiles)) {
+      const abs = join(root, 'platform', 'web', 'dist', name);
+      mkdirSync(dirname(abs), { recursive: true });
+      writeFileSync(abs, content, 'utf8');
+    }
+  }
+  return { root, scriptsDir };
+}
+
+function runCli(sandbox, args = [], env = undefined) {
+  return spawnSync(process.execPath, [join(sandbox.scriptsDir, 'audit-scan.js'), ...args], {
+    encoding: 'utf8',
+    env: env ? { ...process.env, ...env } : process.env,
+  });
+}
+
+test('仓库自带清单真的能拦住裸引用、放过更正语境（CICC 四维各 25% / 行为分进入总分）', () => {
+  const parsed = parseManifest(readFileSync(join(here, '..', 'scripts', 'forbidden.txt'), 'utf8'));
+
+  // 裸引用（当作现行规则写）→ 必须拦下
+  const bare = scanText('CICC 四维各 25% 是行业通行做法。\n', parsed.terms, { file: 'docs/x.md' });
+  assert.ok(
+    bare.violations.some((v) => v.term.includes('CICC')),
+    '裸引用「CICC 四维各 25%」必须被仓库自带清单拦下',
+  );
+  const bareScore = scanText('行为分进入总分，按 10% 计入。\n', parsed.terms, { file: 'docs/x.md' });
+  assert.ok(
+    bareScore.violations.some((v) => v.term === '行为分进入总分'),
+    '裸引用「行为分进入总分」必须被仓库自带清单拦下',
+  );
+
+  // 更正语境（引用并纠正原始错误表述）→ 不计违规，但要进报告
+  const correction = 'S7 §1.1 已更正：CICC 四维各 25% 的说法有误，本平台改为六维权重表。\n';
+  const ok = scanText(correction, parsed.terms, { file: 'docs/x.md' });
+  assert.ok(
+    !ok.violations.some((v) => v.term.includes('CICC')),
+    '更正语境不得被拦下',
+  );
+  assert.ok(
+    ok.exempted.some((e) => e.term.includes('CICC')),
+    '更正语境必须进报告（豁免不静默）',
+  );
+  const correctionScore = 'S10 §3.3 已更正：行为分进入总分的说法有误，行为分只做垫底排序。\n';
+  const okScore = scanText(correctionScore, parsed.terms, { file: 'docs/x.md' });
+  assert.ok(
+    !okScore.violations.some((v) => v.term === '行为分进入总分'),
+    '更正语境不得被拦下',
+  );
+});
+
+test('发布产物目录（platform/web/dist/）本身必须过闸（发布产物也扫）', () => {
+  const sb = cliSandbox({
+    manifest: '禁用词Z\n',
+    distFiles: { 'index.html': '<html><body>这里有禁用词Z</body></html>\n' },
+  });
+  const r = runCli(sb);
+  assert.equal(
+    r.status,
+    1,
+    `发布产物里的禁用表述必须拦下（期望退出码 1）\n${r.stdout}\n${r.stderr}`,
+  );
+  assert.match(r.stderr, /platform\/web\/dist\/index\.html/, '报告里必须指出是发布产物里的哪一行');
+  rmSync(sb.root, { recursive: true, force: true });
+});
+
+test('发布产物里的每一个文本文件都要过闸（含 src/domain、rules、seed 这类子目录）', () => {
+  // ⚠️ 目录形状对齐 Task 6 的 build-demo.js 产物：web/dist/ 根目录有 index.html，
+  //    另有 src/domain/（领域层拷贝）、rules/（规则拷贝）、seed/（种子数据）。
+  //    末位的 data/ 是「防回归」用的：源码目录的默认排除项里有 'data'，
+  //    发布产物那一趟若误用默认排除，data/ 下的文件就会被静默跳过 ——
+  //    那正是「发布闸有洞但报告全绿」的形状。
+  const sb = cliSandbox({
+    manifest: '禁用词Z\n',
+    distFiles: {
+      'index.html': '<html><body>这里有禁用词Z</body></html>\n',
+      'src/domain/scoring.js': '// 领域层\n// 禁用词Z\n',
+      'rules/points.json': '{ "note": "禁用词Z" }\n',
+      'seed/demo-data.json': '{ "note": "禁用词Z" }\n',
+      'data/notes.md': '禁用词Z\n',
+    },
+  });
+  const r = runCli(sb);
+  assert.equal(r.status, 1, `发布产物里的禁用表述必须拦下\n${r.stdout}\n${r.stderr}`);
+  for (const p of Object.keys({
+    'index.html': 1, 'src/domain/scoring.js': 1, 'rules/points.json': 1,
+    'seed/demo-data.json': 1, 'data/notes.md': 1,
+  })) {
+    assert.ok(
+      r.stderr.includes(`platform/web/dist/${p}`),
+      `发布产物里的 ${p} 必须过闸（报告里却没有它）\n${r.stderr}`,
+    );
+  }
+  rmSync(sb.root, { recursive: true, force: true });
+});
+
+test('清单里的 @skip-path 不能把发布产物那道闸关掉（清单自己不能关闸）', () => {
+  const sb = cliSandbox({
+    manifest: '@skip-path ^platform/web/dist/\n禁用词Z\n',
+    distFiles: { 'index.html': '禁用词Z\n' },
+  });
+  const r = runCli(sb);
+  assert.equal(
+    r.status,
+    1,
+    `清单不许把发布产物那道闸关掉（期望退出码 1）\n${r.stdout}\n${r.stderr}`,
+  );
+  rmSync(sb.root, { recursive: true, force: true });
+});
+
+test('发布产物不存在时按「存在才扫」处理，不报错（退出码 0）', () => {
+  const sb = cliSandbox({ manifest: '禁用词Z\n', files: { 'ok.md': '正常内容\n' } });
+  const r = runCli(sb);
+  assert.equal(r.status, 0, `发布产物不存在不该报错\n${r.stdout}\n${r.stderr}`);
+  assert.match(r.stdout, /发布产物 platform\/web\/dist：不存在/);
+  rmSync(sb.root, { recursive: true, force: true });
+});
+
+test('发布产物里的更正语境 → 不计违规，但必须进报告（豁免不静默）', () => {
+  const sb = cliSandbox({
+    manifest: 'CICC 四维各 25%|已更正|S7 §1.1|不是|六维\n',
+    distFiles: { 'spec.md': 'S7 §1.1 已更正：CICC 四维各 25% 的说法有误。\n' },
+    files: { 'ok.md': '正常内容\n' },
+  });
+  const r = runCli(sb);
+  assert.equal(r.status, 0, `更正语境不得被拦下\n${r.stdout}\n${r.stderr}`);
+  assert.match(r.stdout, /豁免命中 1 处/, '发布产物里的豁免也必须进报告（豁免不静默）');
+  rmSync(sb.root, { recursive: true, force: true });
+});
+
+test('--json 输出机器可读（含违规与发布产物信息）', () => {
+  const sb = cliSandbox({
+    manifest: '禁用词Z\n',
+    distFiles: { 'index.html': '禁用词Z\n' },
+    files: { 'ok.md': '正常内容\n' },
+  });
+  const r = runCli(sb, ['--json']);
+  assert.equal(r.status, 1, `JSON 模式下退出码语义不变\n${r.stdout}\n${r.stderr}`);
+  const data = JSON.parse(r.stdout);
+  assert.equal(data.terms, 1);
+  assert.equal(data.violations.length, 1);
+  assert.equal(data.violations[0].term, '禁用词Z');
+  assert.equal(data.releaseArtifacts.present, true);
+  assert.equal(data.releaseArtifacts.scannedFiles, 1);
+  rmSync(sb.root, { recursive: true, force: true });
+});
+
+test('未知参数 → 退出码 2（不许把参数当路径吞掉后「扫 0 个文件还报通过」）', () => {
+  const sb = cliSandbox({ manifest: '禁用词Z\n', files: { 'ok.md': '正常内容\n' } });
+  const r = runCli(sb, ['--jsonn']);
+  assert.equal(r.status, 2, `参数写错必须报错退出\n${r.stdout}\n${r.stderr}`);
+  assert.match(r.stderr, /未知参数/);
+  rmSync(sb.root, { recursive: true, force: true });
+});
+
+test('--forbidden 缺路径 → 退出码 2（不许静默回落默认清单）', () => {
+  const code = main(['--forbidden']);
+  assert.equal(code, 2, '--forbidden 少了路径不许回落默认清单（那等于用错清单）');
+});
+
+test('--forbidden 指定的清单为空 → 退出码 2（空清单 ≠ 已保护，与默认清单同规则）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hks-scan-empty-man-'));
+  const manifest = join(dir, 'forbidden.txt');
+  writeFileSync(manifest, '# 只有注释，没有词条\n', 'utf8');
+  const target = join(dir, 'a.md');
+  writeFileSync(target, '随便写点什么\n', 'utf8');
+  const code = main(['--forbidden', manifest, target]);
+  assert.equal(code, 2, '空清单必须报错退出，不许「扫了 0 个词就通过」');
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('一个文件都没扫到 → 退出码 2（静默的空产出比报错更危险）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hks-scan-empty-'));
+  const manifest = join(dir, 'forbidden.txt');
+  writeFileSync(manifest, '禁用词Z\n', 'utf8');
+  const empty = join(dir, 'empty');
+  mkdirSync(empty);
+  const code = main(['--forbidden', manifest, empty]);
+  assert.equal(code, 2, '扫了 0 个文件不许报通过');
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('evidence-chain 增强不可用（HOME 下没有该 skill）→ 闸结论不变，退出码 0 并打印一行说明', () => {
+  const sb = cliSandbox({ manifest: '禁用词Z\n', files: { 'ok.md': '正常内容\n' } });
+  const fakeHome = mkdtempSync(join(tmpdir(), 'hks-scan-home-'));
+  const r = runCli(sb, [], { HOME: fakeHome });
+  assert.equal(
+    r.status,
+    0,
+    `增强不可用不许把闸判成失败（平台必须能独立跑）\n${r.stdout}\n${r.stderr}`,
+  );
+  assert.match(r.stdout, /evidence-chain 增强不可用/);
+  rmSync(sb.root, { recursive: true, force: true });
+  rmSync(fakeHome, { recursive: true, force: true });
+});
+
+test('--evidence-chain 指向真实脚本 → 增强真的被调用（且闸结论不受它影响）', () => {
+  const sb = cliSandbox({ manifest: '禁用词Z\n', files: { 'bad.md': '这里有禁用词Z\n' } });
+  const marker = join(sb.root, 'marker.txt');
+  const fake = join(sb.root, 'fake-evidence.js');
+  writeFileSync(
+    fake,
+    `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(marker)}, 'called\\n');\n`,
+    'utf8',
+  );
+  const r = runCli(sb, ['--evidence-chain', fake]);
+  assert.ok(existsSync(marker), '增强脚本必须真的被执行（参数没被吞掉）');
+  assert.equal(r.status, 1, '闸结论只看禁用表述，不看增强脚本的输出');
+  rmSync(sb.root, { recursive: true, force: true });
+});
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -2325,8 +2564,24 @@ export function main(argv = []) {
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === '--json') { asJson = true; continue; }
-    if (a === '--forbidden') { manifestPath = argv[i + 1] || manifestPath; i += 1; continue; }
+    if (a === '--forbidden') {
+      // ⛔ 缺值不许静默回落默认清单：参数写错（漏了路径）时回落 = 用错清单 = 假绿。
+      const value = argv[i + 1];
+      if (!value || value.startsWith('--')) {
+        console.error('[audit-scan] --forbidden 后面必须跟清单路径');
+        return 2;
+      }
+      manifestPath = value;
+      i += 1;
+      continue;
+    }
     if (a === '--evidence-chain') { evidenceChainPath = argv[i + 1] || null; i += 1; continue; }
+    if (a.startsWith('--')) {
+      // ⛔ 未知参数不许当扫描路径吞掉（那等于「扫了 0 个文件还报通过」）。
+      console.error(`[audit-scan] 未知参数：${a}`);
+      console.error('[audit-scan] 用法：node scripts/audit-scan.js [--json] [--forbidden <path>] [--evidence-chain <path>] [root...]');
+      return 2;
+    }
     roots.push(a);
   }
 
@@ -2350,24 +2605,34 @@ export function main(argv = []) {
   // 发布产物单独扫一遍：
   // ⚠️ P4 的 DEFAULT_EXCLUDES 里有 'dist'，主扫描会把它当构建目录跳过 —— 但这里要扫的
   //    恰恰是【我们自己发布的静态站】，所以显式传 excludePaths: []（只扫我们自己产出的文件）。
+  // ⛔ skipPaths 固定为空：发布产物这道闸不许被清单里的 @skip-path 关掉
+  //    （清单自己就能把闸关掉 —— 与「空清单 ≠ 已保护」同一类病）。
+  const release = { dir: relative(repoRoot, distDir), present: false, scannedFiles: 0 };
   if (!roots.length && existsSync(distDir)) {
+    release.present = true;
     const distReport = scanRoots([distDir], {
       terms: parsed.terms,
-      skipPaths: parsed.skipPaths,
+      skipPaths: [],
       excludePaths: [],
     });
     report.violations.push(...distReport.violations);
     report.exempted.push(...distReport.exempted);
     report.scannedFiles.push(...distReport.scannedFiles);
     report.excludedPaths.push(...distReport.excludedPaths);
+    release.scannedFiles = distReport.scannedFiles.length;
   }
   const evidence = runEvidenceChain(evidenceChainPath, targets);
+
+  // ⛔ 静默的空产出比报错更危险：一份文件都没扫到 = 闸没生效 = 报错退出（退出码 2）。
+  const emptyScan = report.scannedFiles.length === 0;
 
   if (asJson) {
     console.log(JSON.stringify({
       manifest: manifestPath,
       terms: parsed.terms.length,
       scannedFiles: report.scannedFiles.length,
+      gateEffective: !emptyScan,
+      releaseArtifacts: release,
       violations: report.violations,
       exempted: report.exempted,
       excludedPaths: report.excludedPaths,
@@ -2375,6 +2640,9 @@ export function main(argv = []) {
     }, null, 2));
   } else {
     console.log(`[audit-scan] 词条 ${parsed.terms.length} 条｜扫描 ${report.scannedFiles.length} 个文件`);
+    console.log(release.present
+      ? `[audit-scan] 发布产物 ${release.dir}：扫描 ${release.scannedFiles} 个文件（发布产物本身也必须过闸）`
+      : `[audit-scan] 发布产物 ${release.dir}：不存在（构建之后才会有产物；发布产物本身也必须过闸）`);
     console.log(`[audit-scan] 排除 ${report.excludedPaths.length} 项（排除不静默）：`);
     for (const e of report.excludedPaths.slice(0, 50)) console.log(`  - ${e.path}（${e.reason}）`);
     if (report.exempted.length) {
@@ -2384,6 +2652,8 @@ export function main(argv = []) {
     if (report.violations.length) {
       console.error(`[audit-scan] ✗ 发现 ${report.violations.length} 处禁用表述：`);
       for (const v of report.violations) console.error(`  - ${v.file}:${v.line} 「${v.term}」 ${v.text}`);
+    } else if (emptyScan) {
+      console.error('[audit-scan] 扫描范围内没有任何可扫描的文件 —— 闸未生效（静默的空产出比报错更危险）');
     } else {
       console.log('[audit-scan] ✓ 未发现禁用表述');
     }
@@ -2395,7 +2665,12 @@ export function main(argv = []) {
     }
   }
 
-  return report.violations.length ? 1 : 0;
+  if (report.violations.length) return 1;
+  if (emptyScan) {
+    if (asJson) console.error('[audit-scan] 扫描范围内没有任何可扫描的文件 —— 闸未生效（静默的空产出比报错更危险）');
+    return 2;
+  }
+  return 0;
 }
 
 /**
@@ -2405,13 +2680,20 @@ export function main(argv = []) {
 function runEvidenceChain(scriptPath, targets) {
   const candidates = [
     scriptPath,
-    join(process.env.HOME || '', '.minimax', 'skills', 'evidence-chain', 'scripts', 'audit-evidence.js'),
+    process.env.HOME
+      ? join(process.env.HOME, '.minimax', 'skills', 'evidence-chain', 'scripts', 'audit-evidence.js')
+      : null,
   ].filter(Boolean);
   for (const p of candidates) {
     if (!existsSync(p)) continue;
     try {
       const res = spawnSync(process.execPath, [p, ...targets], { encoding: 'utf8' });
-      return { available: true, path: p, output: `${res.stdout || ''}${res.stderr || ''}` };
+      return {
+        available: true,
+        path: p,
+        status: res.status,
+        output: `${res.stdout || ''}${res.stderr || ''}`,
+      };
     } catch (err) {
       return { available: false, path: p, reason: `执行失败：${err.message}` };
     }
@@ -2426,22 +2708,30 @@ function runEvidenceChain(scriptPath, targets) {
 import { spawnSync } from 'node:child_process';
 ```
 
-- [ ] **Step 4: 修改 `scripts/forbidden.txt`（追加 P6 词条 + 修正 P4 词条的字面匹配问题）**
+- [ ] **Step 4: 修改 `scripts/forbidden.txt`（追加 P6 词条）**
 
 > **⚠️ 匹配语义（必须知道，否则清单写了也不生效）**
 > P4 的 `scanText()` 用的是 **`line.includes(term)` —— 字面串匹配，不是正则**。
 > 所以词条里写 `?` 或 `.*` **永远不会命中**（`四维各 ?25%` 匹配不到 `四维各 25%`）。
 > **本项目自带的 `platform/scripts/forbidden.txt` 的既有约定就是「空格变体各写一条」**
 > （`积分占决赛30%` 与 `积分占决赛 30%` 分两行列出）—— 本阶段沿用这个约定。
+>
+> ✅ **P4 定稿已经把带 `?` 的词条拆成空格变体了**（P4 的 `test/audit-scan.test.js` 有一条用例断言
+> 「仓库自带清单里没有「正则占位」写法」）—— `初赛企业确认权重20%` / `初赛企业确认权重 20%` /
+> `四维各25%` / `四维各 25%` 都已在 P4 的清单里。**本阶段【不改】P4 的这几条**（照规格再追加一遍
+> 会触发 `parseManifest` 的「清单里有重复词条」→ 退出码 2 → 闸永远打不开），只追加 P6 的词条。
 
-在 P4 已有的内容后面**追加**（不要删改 P4 的其它词条），并把 P4 里带 `?` 的两条**拆成空格变体**：
+在 P4 已有的内容后面**追加**（不要删改 P4 的其它词条）：
 
 ```text
 # ── P6 追加（部署与演示版）────────────────────────────────────
 #
 # 演示版种子数据与部署文档也必须过闸：发布产物 web/dist/ 会被一起扫描。
-# 生成目录不扫（它们是上面源文件的拷贝，扫源就够）。
-@skip-path ^platform/web/dist/
+# ⚠️ 这里【不】写 @skip-path ^platform/web/dist/：
+#    发布产物那道闸不许被清单自己关掉（清单里加一行就能把闸关掉 ——
+#    与「空清单 ≠ 已保护」同一类病）。审计扫描器对发布产物单独走一趟，
+#    那一趟固定 skipPaths: [] / excludePaths: []，清单的 @skip-path 管不到它。
+# 数据目录不扫（库文件是二进制，与文档无关）。
 @skip-path ^platform/data/
 #
 # 「CICC 四维各 25%」必须能在【更正语境】里出现（说明当初错在哪），
@@ -2455,35 +2745,33 @@ CICC 四维各 25%|已更正|S7 §1.1|不是|六维
 行为分算进总分|已更正|S10 §3.3|只做垫底排序
 ```
 
-同时把 P4 的两条带 `?` 的词条**替换成空格变体**（否则它们永远命中不了 = 闸形同虚设）：
+P4 定稿里这四条长什么样（**本阶段一个字不改**，列在这里是为了与 P4 的实际内容对齐）：
 
 ```text
-# P4 原文（带 ? 的字面串永远命中不了）→
-# 初赛企业确认权重 ?20%|C-01|冲突|裁决|已更正
-# w_E ?= ?20%.*初赛|C-01|冲突|裁决|已更正
-# 四维各 ?25%|原表述|有误|已更正|CICC[^，。]*已
-# ↓ P6 改为（字面串 + 空格变体各一条，豁免正则不变）：
 初赛企业确认权重20%|C-01|冲突|裁决|已更正
 初赛企业确认权重 20%|C-01|冲突|裁决|已更正
+# 四维各 25% 的旧表述（应为「创新 20% / 技术可行 20% / 完成度 25% / 协作 15%」等六维表）
 四维各25%|原表述|有误|已更正|CICC[^，。]*已
 四维各 25%|原表述|有误|已更正|CICC[^，。]*已
 ```
 
-> ⚠️ `w_E ?= ?20%.*初赛` 这一条**整条删掉**：它把正则片段（`.*`）写进了字面串，
-> 在字面匹配下没有意义；要覆盖「初赛 w_E 20%」这类表述，用上面两条
-> `初赛企业确认权重20%` / `初赛企业确认权重 20%` 已经够。
+> ⚠️ **清单里【不】写 `@skip-path ^platform/web/dist/`**：发布产物那道闸不许被清单自己关掉
+> （清单里加一行就能把闸关掉 —— 与「空清单 ≠ 已保护」同一类病）。
+> `audit-scan.js` 对发布产物单独走一趟，那一趟固定 `skipPaths: []` / `excludePaths: []`。
 > **改完后必须跑一次 `node scripts/audit-scan.js` 确认退出码仍是 0**（没有误伤）。
 
 - [ ] **Step 4b: 实跑一次扫描闸，确认改词条没有误伤**
 
 Run: `cd platform && node scripts/audit-scan.js`
-Expected: 输出 `[audit-scan] 词条 N 条｜扫描 M 个文件` … `[audit-scan] ✓ 未发现禁用表述`，退出码 0
-（若出现命中，多半是豁免正则的标记词（如「已更正」）没写在那行上 → 补标记或改词条，**不要**删掉词条）
+Expected: 输出 `[audit-scan] 词条 15 条｜扫描 140 个文件` … `[audit-scan] ✓ 未发现禁用表述`，退出码 0
+（本仓库的实测值；M 个文件随仓库增长变。**`web/dist/` 不存在时会打印「发布产物 platform/web/dist：不存在」**——
+Task 6 的构建产物落地后这一行会变成「扫描 N 个文件」。
+若出现命中，多半是豁免正则的标记词（如「已更正」）没写在那行上 → 补标记或改词条，**不要**删掉词条）
 
 - [ ] **Step 5: 运行测试确认通过**
 
 Run: `cd platform && node --test test/audit-scan-release.test.js`
-Expected: PASS（6 个测试全过：audit-scan-release.test.js 6）
+Expected: PASS（**19 个测试全过**：规格自带的 6 个 + 父代理预审追加的 13 个）
 
 Run: `cd platform && node scripts/audit-scan.js`
 Expected: 输出 `[audit-scan] 词条 N 条｜扫描 M 个文件` … `[audit-scan] ✓ 未发现禁用表述`，退出码 0
@@ -4855,7 +5143,7 @@ git commit -m "test(P6): 全链路验收 + 跨平台可移植性验收"
 | 6 | `INTERFACES.md` §1 的 P0 产出清单里没有 `scripts/backup.js` / `scripts/restore.js`（P6 §7 才有） | 一致，无偏差。`backupDatabase` / `restoreDatabase` / `checkServiceState` / `verifyBackupFile` 是 P6 **新增**导出，不覆盖任何既有签名。 |
 | 7 | `web/api.demo.js` 里的规则加载方式 | `INTERFACES.md` 未规定前端如何取规则。P6 用「按文件名逐个 `fetch` `rules/*.json`」的方式，**不新增 `rules/index.json` 这类聚合文件**（避免与 `src/config.js` 的 `RULE_FILES` 产生第二份真相），并由 `scripts/build-demo.js` 校验所需文件齐全。 |
 | 8 | **P6 的 `scripts/restore.js` 需要读 schema 版本** | `INTERFACES.md` §1 的 P0 产出清单里 `src/db/migrate.js` 只有 `applyMigrations` / `readMigrationFiles`。P6 **追加**一个导出 `currentVersion(db)`（P0 已建，本阶段只追加，**不改 `applyMigrations` 的签名与行为**），`scripts/restore.js` 改为 import 它。⚠️ **不能在 `scripts/` 里自己写 SQL** —— 全局约束「所有 SQL 收进 `src/db/repo/`」，而 `src/db/migrate.js` 是 `platform/test/sql-boundary.test.js` 守卫的**唯一豁免文件**（守卫扫描 `src/` **与 `scripts/`**）；照原写法（`db.prepare('SELECT MAX(version) …')`）**当场判违规**。见 C-5 修正记录 |
-| 9 | **P4 的 `scripts/forbidden.txt` 有三条词条永远命中不了** | P4 的 `scanText()` 用 **`line.includes(term)` 字面串匹配**，但 P4 清单里有 `四维各 ?25%` / `初赛企业确认权重 ?20%` / `w_E ?= ?20%.*初赛` —— `?` 与 `.*` 在字面匹配下没有意义，**这三条词条等于没写**（R-AUD-03 被架空）。P6 在「修改 `scripts/forbidden.txt`」这一步里把这几条**拆成空格变体**（沿用平台自带 `platform/scripts/forbidden.txt` 的既有约定：空格变体各写一条），P6 自己新增的词条也一律用字面串。**不改 `scanText` 的匹配语义**（P4 的行为与测试都不动）。 |
+| 9 | **P4 的 `scripts/forbidden.txt` 曾有三条词条永远命中不了** | P4 的 `scanText()` 用 **`line.includes(term)` 字面串匹配**，P4 初版清单里的 `四维各 ?25%` / `初赛企业确认权重 ?20%` / `w_E ?= ?20%.*初赛` 里的 `?` 与 `.*` 在字面匹配下没有意义（等于没写）。**P4 定稿已把这几条拆成空格变体**（`四维各25%` / `四维各 25%` / `初赛企业确认权重20%` / `初赛企业确认权重 20%`），并由 P4 自己的用例断言「清单里没有正则占位写法」。P6 **不再重复改**（照本条原写法再追加一遍会触发 `parseManifest` 的「重复词条」→ 退出码 2），只追加 P6 的新词条（P6 新增的一律字面串 + 空格变体各一条）。**不改 `scanText` 的匹配语义**（P4 的行为与测试都不动）。 |
 
 ### Task 2（部署资产）本轮偏差 —— 2026-10-21 预审
 
@@ -5091,3 +5379,136 @@ Node v22 的真实签名是**单对象** `{ totalPages, remainingPages }`（探�
    仍可能留下 `-wal`/`-shm`（这是 SQLite 的行为，不是本 Task 可控的）。
 6. **`backupDatabase` 打开源库用 `openDatabase`**（D-02）⇒ 备份动作会把源库切到 WAL 模式
    （对已经是 WAL 的库是 no-op，不取锁）。
+
+---
+
+## Task 3 实施台账（2026-10-21）
+
+> 本节是 Task 3（发布前扫描闸）的实施记录：**规格缺陷清单**、处置方式、逐字回写位置、实跑证据、变异测试。
+> 纪律：本计划 Task 3 的 **4 个代码块 = 最终实现的逐字副本**
+> （核验命令：`node /tmp/p3fix/plan-blocks.mjs docs/superpowers/plans/2026-10-20-platform-P6-deploy-demo.md platform`）。
+>
+> **本 Task 的灵魂**（规格第 2195–2203 行）：① **禁用清单必须真有词条，空清单 ≠ 已保护**；
+> ② **不能一刀切**（更正语境要能出现在文档里）；③ **平台自身必须能独立跑**
+> （`--evidence-chain` 只是可选增强，绝不影响本闸结论）。
+>
+> ⛔ **归属**：`scripts/audit-scan.js` 与 `scripts/forbidden.txt` 是 **P4 Task 7 建立的**，
+> 本阶段**不重建**（P0–P6 严格串行，两个 writer 写同一个路径必然冲突），
+> 只在 P4 的实现上**追加**发布相关能力；`parseManifest` / `scanText` / `scanRoots` / `main`
+> 的**签名一律不变**；P4 的 `test/audit-scan.test.js` **一个字不改**。
+
+### A. 实施方法（先跑后派）
+
+1. 把规格 Task 3 的代码块**原样抽到** `/tmp/p6-t3-scratch/spec/`（一个字节都没改）。
+2. 在 `/tmp/p6-t3-scratch/platform/`（P4 现状的整份拷贝）上跑规格自带用例 → **红**
+   （`# tests 6 / # pass 4 / # fail 2`：用例 4「仓库自带清单里必须有 CICC 条目」、
+   用例 6「--forbidden 未生效」）。
+3. 在拷贝上实现规格的 Step 3 / Step 4 → 规格的 6 个用例**全绿**；
+   再补 13 条判别性用例（规格的 6 条**逐字保留**）→ 19 条全绿；P4 的 20 条用例仍全绿。
+4. **落盘**到 worktree（`scripts/audit-scan.js` / `scripts/forbidden.txt` / 新建 `test/audit-scan-release.test.js`）。
+5. 落盘后做：全量测试、扫描闸实跑（0 / 2）、**逐字回写计划**、变异测试。
+
+### B. 规格缺陷清单
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| D-01 | **Critical** | 规格 Step 4 让清单写 `@skip-path ^platform/web/dist/`，与 Step 3 的「发布产物也扫」**互相抵消**：`scanRoots` 先查 `skipPaths` 再查 `excludePaths`，清单里这一行会把发布产物里的**每个文件**整条跳过 ⇒ 本 Task 的核心（发布产物过闸）**形同虚设**，而闸还报「✓ 未发现禁用表述」退出 0 | 探针 1（`/tmp/p6-t3-scratch/probe-defects.mjs`）：按规格原样（清单带那一行）+ `dist/index.html` 里有 `积分占决赛 30%` → **退出码 0**；报告里 `platform/web/dist/index.html` 出现在**排除段（@skip-path）**、**不在违规段**；同一份实现去掉那一行 → **退出码 1**（违规段点名 dist）。变异体 M01/M02/M03 是同一形状 | ① 清单里**不**写 `@skip-path ^platform/web/dist/`（并在清单里写明为什么）；② 发布产物那一趟固定 `skipPaths: []`（**清单关不掉它**）+ `excludePaths: []`（源码目录的默认排除项不套到发布产物上）；③ 追加 3 条判别性用例（发布产物必过闸 / 清单的 `@skip-path` 关不掉它 / 发布产物里每一个文本文件都要过闸） |
+| D-02 | **Important** | 规格 Step 4 的**前提过期**：它要求「把 P4 里带 `?` 的两条拆成空格变体」，但 **P4 定稿早已拆好**（P4 自己的用例断言「仓库自带清单里没有「正则占位」写法」）→ 照规格再追加一遍会触发 `parseManifest` 的「重复词条」→ 退出码 2 ⇒ **闸永远打不开** | 探针 5：`git show HEAD:platform/scripts/forbidden.txt` 里已有 `初赛企业确认权重20%` / `初赛企业确认权重 20%` / `四维各25%` / `四维各 25%`；把它再追加一遍 → `parseManifest` 报错 `["清单里有重复词条：四维各 25%"]` | **不改** P4 的词条，只追加 P6 的新词条；把计划里这一步的前提改正（Step 4 的说明 + 「与接口契约的偏差」第 9 条一并改写） |
+| D-03 | **Important** | 规格自带的用例 6 名为「发布产物目录也必须过闸」，实际测的是 `--forbidden` + **普通文件** ⇒ 规格最核心的一条（发布产物过闸）**没有任何用例覆盖** | 探针 2：把 Step 3 的「发布产物那一趟」整段删掉（= 变异体 M03）后，**规格自带的 6 个用例全部通过**（`not ok` = 0） | 规格的 6 个用例**逐字保留**；另加 4 条针对发布产物的用例（发布产物必过闸 / 每个文本文件都要过闸 / 清单的 `@skip-path` 关不掉它 / 发布产物不存在时按「存在才扫」处理） |
+| D-04 | **Important** | 规格的用例 5「增强不可用也不影响结论」在**参数还没实现时也会通过**（未识别的参数被当成扫描路径 → 扫 0 个文件 → 退出码 0）⇒ 假绿 | 在 **P4 的实现**上直接跑规格的 6 个用例：用例 5 **通过**（`--evidence-chain` 根本没被解析） | 追加 2 条用例：HOME 下没有该 skill 时退出码仍为 0 且打印一行说明 / `--evidence-chain` 指向真实脚本时该脚本**确实被调用**（写标记文件） |
+| D-05 | **Important** | 规格的 `main` 把**未知参数**当扫描路径吞掉（`roots.push(a)`）⇒ 参数写错（如 `--jsonn`）时扫 0 个文件并报「✓ 未发现禁用表述」，退出码 0 —— 静默放行 | 探针 3：按规格原样跑 `--jsonn` → **退出码 0**，输出「扫描 0 个文件」+「未发现禁用表述」 | 未知 `--` 参数 → 退出码 2 + 报「未知参数」+ 用法提示 |
+| D-06 | **Important** | 规格的 `--forbidden` 缺值时回落默认清单（`argv[i + 1] \|\| manifestPath`）⇒ 参数写错 = 用错清单 = 假绿 | 探针 4：按规格原样跑 `--forbidden`（缺路径）→ **退出码 0**（静默用了默认清单）；变异体 M07（照规格原写法改回去）→ 新增用例「--forbidden 缺路径 → 退出码 2」变红 | 缺值 → 退出码 2 + 报「--forbidden 后面必须跟清单路径」 |
+| D-07 | **Important** | 规格没有「扫到 0 个文件」的判定 ⇒ 扫描范围写错（路径拼错、目录搬走、参数被吞）时闸报「✓ 未发现禁用表述」并退出 0 —— 与全局约束「静默的空产出比报错更危险」相悖 | 变异体 M08 / M15 都是这个形状（扫 0 个文件还报通过） | 扫到 0 个文件 → 退出码 2（文本输出与 JSON 输出都报「闸未生效」，JSON 里另有 `gateEffective: false`） |
+| D-08 | **Minor** | 规格的 `runEvidenceChain` 用 `join(process.env.HOME \|\| '', ...)` ⇒ HOME 未设置时拼出**相对路径** `.minimax/skills/...`，会按当前工作目录去找（可能误命中） | 探针 6：HOME 为空时的候选路径 = `".minimax/skills/evidence-chain/scripts/audit-evidence.js"`（相对路径） | HOME 为空时该候选项直接置 `null` |
+| D-09 | **Minor** | 规格 Step 3 是「整体替换 P4 的 `main`」，但没给「不许削弱 P4 行为」的验收手段 | P4 的 `test/audit-scan.test.js`（20 例：CLI 退出码 2/1/0 三种语义、排除项打印、豁免打印、清单自检）在改造后**仍全绿** | P4 的测试文件一个字不改（本 Task 只新建 `test/audit-scan-release.test.js`）；P4 的 20 例 + 本 Task 的 19 例一起跑 |
+
+### C. 逐字回写位置（本轮改动的计划代码块）
+
+| 计划位置 | 改动 |
+|---|---|
+| Task 3 Step 1 的 `platform/test/audit-scan-release.test.js` 代码块 | 整体回写：规格的 6 个用例**逐字保留** + 追加 13 条（父代理预审）＝ 323 行 |
+| Task 3 Step 3 的 `scripts/audit-scan.js` 代码块 | 整体回写（158 行 ＝ 落地文件里 `main` + `runEvidenceChain` 区段的逐字副本） |
+| Task 3 Step 3 的 import 代码块 | 不变（逐字一致） |
+| Task 3 Step 4 的清单「P6 追加」代码块 | 整体回写（19 行 ＝ 落地清单里 P6 追加段的逐字副本） |
+| Task 3 Step 4 的清单「P4 定稿现状」代码块 | 整体回写（5 行 ＝ 落地清单里 P4 那几行的逐字片段） |
+| Task 3 Step 4 / 4b / 5 的说明与 Expected | 前提改正（D-02）+ 实跑数字（词条 15 条 / 扫描 140 个文件 / 19 例） |
+| 「与接口契约的偏差」第 9 条 | 改写（P4 已自行拆好空格变体，P6 不重复追加） |
+| 本台账 | 新增 |
+
+> 回写脚本：`/tmp/p6-t3-scratch/writeback.mjs` —— **按块在文档里的位置升序**处理，
+> 并逐块累计**长度偏移**（第一版漏了偏移，替换会错位到别的块上；已修，第二次回写才作数）。
+
+### D. 硬约束自证
+
+| 硬约束 | 怎么验的 | 证据 |
+|---|---|---|
+| ① **空清单 ≠ 已保护**（清单为空 / 不合规 → 非 0 退出） | ① `parseManifest` 对空清单报错「闸未生效」；② CLI 层：清空清单 → 退出码 2；③ `--forbidden` 指定的清单为空 → 同样 2；④ 清单文件缺失 → 2 | 实跑：清空 `scripts/forbidden.txt` → 退出码 **2**（stderr「禁用清单为空 —— 闸未生效」）；用例 16 变红（M05 / M06） |
+| ② **发布产物也过闸**（发布产物本身必须过闸） | ① 沙箱里造 `platform/web/dist/`，CLI 的**默认范围**必须拦下；② 清单里的 `@skip-path` 关不掉它；③ 产物里**每一个**文本文件都要过闸（含 `src/domain/`、`rules/`、`seed/` 这类子目录） | 用例 8 / 9 / 10 全过；变异体 M01 / M02 / M03 全被杀 |
+| ③ **更正语境豁免**（不能一刀切） | ① 仓库自带清单里的 CICC 词条带豁免正则；② **裸引用被拦**、**更正语境被放过且进报告**（用仓库自带清单实测，不只是构造清单） | 用例 3 / 4 / 7 全过；变异体 M10 / M19 / M20 / M21 / M22 全被杀 |
+| ④ **平台自身能独立跑**（不依赖用户机器上的 skill） | ① HOME 下没有该 skill 时退出码仍为 0 且打印一行说明；② skill 在时多跑一份报告，且**闸结论不变**（有违规仍是 1） | 用例 18 / 19 全过；变异体 M12 / M17 全被杀 |
+| ⑤ **零依赖 / `node --test`** | `package.json` 未新增任何 dependency；全部用例用 `node --test`（无参，cwd 发现） | `git diff platform/package.json` ＝ 空；全量 **956 例 / 955 通过 / 1 跳过 / 0 失败** |
+
+### E. 变异测试（脚本 `/tmp/p6-mutate/t3.mjs`，指向**已落地**的实现与测试）
+
+| 轮次 | 变异体总数 | KILLED | SURVIVED | 脚本错误（锚点失效/不唯一） | 处置 |
+|---|---|---|---|---|---|
+| 第 1 轮 | 22 | 20 | 2 | 0 | 存活体 **M01**（发布产物那一趟改回默认排除）/ **M07**（`--forbidden` 缺值回落默认清单）→ 补断言 |
+| 第 2 轮 | 22 | **22** | **0** | 0 | M01：新增用例「发布产物里的每一个文本文件都要过闸」；M07：把变异体改成**忠实复现规格原写法**（`manifestPath = value \|\| manifestPath`）——第一版的写法并不等价于规格（它落到 `undefined` ⇒ 清单「缺失」⇒ 退出码 2），改后才真正复现「静默回落默认清单」 |
+
+**最终：22 个变异体，22 个 KILLED，0 个存活，0 个脚本错误。**
+（变异体清单与每个变异体「改的是什么行为」见脚本里的 `MUTANTS` 数组；明细 JSON：`/tmp/p6-mutate/t3-results.json`。）
+
+> ⚠️ **方法说明（这一轮踩到的坑，写下来给后面的人）**：
+> ① 变异体**只改有效代码**（改的是行为，不是注释）；锚点命中数必须 === 1，
+>    命中 0 次报「锚点失效」、≥2 次报「锚点不唯一」——本轮 **0 次脚本错误**。
+> ② **必须先跑对照（未变异的假仓库）确认测试全绿，再看变异结果**：
+>    第一轮的控制组当时是**坏的**（`node --test test/` 在 Node 22 上不按目录扫描，
+>    误把 `test/` 当模块加载 → 38 个用例只跑出 1 个「失败」），
+>    那会把「22 个变异体全杀」变成**假象**（每个变异体都只是撞上同一个环境错误）。
+>    ⚠️ 这个坑**本仓已经踩过一次**（提交 `0a2d515 fix(P0): 修正测试命令 —— node --test test/ 在 Node 22 上不工作`，
+>    全局约束里现在写的是 `node --test` 无参）—— 本轮是**第二次**踩到，特此记下来。
+>    改成显式列出两个测试文件后，控制组 **39 例全绿**，才认这一轮的结论。
+> ③ 假仓库构造：`<root>/platform/{scripts,test}` + `<root>/docs/ok.md`
+>    （CLI 的仓库根 = `<root>`，相对路径可预期）。
+
+### F. 计划块逐字核验
+
+`node /tmp/p3fix/plan-blocks.mjs docs/superpowers/plans/2026-10-20-platform-P6-deploy-demo.md platform` →
+
+| 块 | 结果 |
+|---|---|
+| `test/audit-scan-release.test.js` | 整文件块 ✅ 一致（323 行） |
+| `scripts/audit-scan.js`（Step 3 的 `main` + `runEvidenceChain`） | 片段块 ✅（实现含此片段，158 行） |
+
+> `scripts/forbidden.txt` 的两个块**不在** `plan-blocks.mjs` 的扫描范围（它只认 js/html/css/sql/json），
+> 已单独核过：**两个块都是落地清单的逐字片段** ✅（19 行 / 5 行）。
+
+### G. 遗留 / 需上游注意
+
+1. **⚠️ 前端构建产物目录三处不一致（待 Task 6 拍板）** ——
+   - 计划 Task 6 规定产物在 **`platform/web/dist/`**；
+   - `deploy/nginx.conf` 的静态资源直出却指向 **`__APP_DIR__/web/assets/`**
+     （**没有任何 Task 会生成这个目录** —— Task 2 台账 D-13 已记过同一件事）；
+   - `deploy/install.sh` 的 rsync 又把 **`web/dist/` 排除**在拷贝之外
+     （`--exclude 'web/dist/'`）。
+   - ⇒ **本 Task 的扫描目标按计划走 `web/dist`**（`audit-scan.js` 里的 `distDir`），
+     ⛔ **不改 `deploy/nginx.conf` / `deploy/install.sh`**（那是 Task 2 的文件，且要等 Task 6 一起定）。
+   - **待 Task 6 拍板**：构建产物目录最终落在 `web/dist/` 还是 `web/assets/`？
+     若落在 `web/assets/`，本 Task 的发布产物扫描目标要跟着改
+     （`audit-scan.js` 的 `distDir` + 计划里的目录名 + 本条台账）。
+2. **`platform/web/dist/` 还不存在**（Task 6 的产物）⇒ 这一趟现在是「存在才扫」，
+   报告里打印「发布产物 platform/web/dist：不存在」；Task 6 落地后**必须重跑一次**
+   `node scripts/audit-scan.js`，确认产物自己也过闸（那时这一行会变成「扫描 N 个文件」）。
+3. **`--evidence-chain` 的增强脚本在本机是有的**
+   （`~/.minimax/skills/evidence-chain/scripts/audit-evidence.js`）⇒ 实跑时它会被调用并把报告打出来；
+   **它的退出码与输出都不影响本闸结论**（闸结论只看禁用表述），**本仓不依赖它**（用例 18 证明没有它也能跑）。
+4. **清单里的 `@skip-path ^platform/data/` 与 `DEFAULT_EXCLUDES` 的 `'data'` 重复**：
+   实测删掉它，**扫描文件数（140）与退出码都不变**（数据目录本来就被默认排除）
+   —— 保留它是为了**显式表达意图**（数据目录不扫），**不是功能必需**。哪天真要让数据目录参与扫描，
+   删掉这一行还不够，还要改 `DEFAULT_EXCLUDES`。
+5. **P4 的 `test/audit-scan.test.js` 一个字没改**（本 Task 只追加）：
+   P4 的 20 例与本 Task 的 19 例一起跑，全量 **956 例**。
+6. **`audit-scan.js` 现在有两个「逃逸口」要一起记着**：**未知参数 → 2**、**扫到 0 个文件 → 2**。
+   两者都是「静默的空产出比报错更危险」的直接落地；改这个文件时**别把它们一起删掉**。
+7. **本 Task 的退出码语义**（与 P4 一致，未变）：
+   **0 = 通过 / 1 = 有违规 / 2 = 清单为空、清单不合规、清单缺失、参数不认、扫了 0 个文件**。
