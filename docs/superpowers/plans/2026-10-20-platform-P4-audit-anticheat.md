@@ -5923,3 +5923,16 @@ git commit -m "test(P4): 端到端复算验收（改一个原始分 → diff 非
 > `src/db/repo/audit-log.js`、`src/db/repo/appeals.js`、`src/db/repo/idempotency.js`、
 > `src/errors.js`、`src/auth/permissions.js`、`src/audit/log.js` —— **一行未动**
 > （本阶段的 P4-T5-2 用**服务层单调化**规避了改仓储层 ORDER BY 的需要）。
+
+### 三、落地与提交
+
+| 项 | 内容 |
+|---|---|
+| 提交号 | **`0215701`**（分支 `feat/p4d-reviewstate`，基线 `672dd9a`） |
+| 提交文件 | `platform/src/services/review-state.js`（**新建**，263 行）<br>`platform/src/db/repo/tiers.js`（**追加** 13 行，含 1 空行；`git diff` 为纯追加，**无一行既有代码被改**）<br>`platform/test/review-state.test.js`（**新建**，620 行 / 27 例）<br>`docs/superpowers/plans/2026-10-20-platform-P4-audit-anticheat.md`（**回写**：Step 1 / Step 4 代码块逐字替换 + Step 5 数字订正 + 实施期修正说明 + §I 偏差表 + 本台账） |
+| Step 2 实跑 | `cd platform && node --test test/review-state.test.js`（服务文件尚未落地时）→ **exit≠0**，`# Error [ERR_MODULE_NOT_FOUND]: Cannot find module '.../src/services/review-state.js'` —— **与规格 Expected 一致** |
+| Step 5 实跑 | `cd platform && node --test test/review-state.test.js` → **exit=0**，`# tests 27 / # pass 27 / # fail 0`（规格 Expected 写的是 13，已订正为 27） |
+| Step 6 实跑 | `git add <4 个显式路径>` + `git commit -m "..." -- <4 个显式路径>`（`-m` 在 `--` 之前，未用 `-a`） |
+| 全量 | `cd platform && node --disable-warning=ExperimentalWarning --test` → **772/772**（745 基线 + 27 新增），连跑 4 次无抖动 |
+| 计划块逐字核验 | 独立脚本 `/tmp/p4-probe/verify-plan-blocks.mjs`（**重新**从计划抽块再比，不复用写回逻辑）→ **3/3 逐字一致**（字节数 27508 / 11175 / 774 全等），§I / 台账 / 修正说明三节**均在位** |
+
