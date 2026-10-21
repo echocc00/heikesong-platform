@@ -1,0 +1,35 @@
+name: 赛制口径确认
+description: 提一条规则口径变更或待裁决事项（需组委会确认）
+labels: [rule]
+body:
+  - type: textarea
+    id: rule
+    attributes:
+      label: 涉及的口径
+      description: 引用具体文档与条目（如 S10《积分与段位体系》§0.6）
+    validations:
+      required: true
+  - type: textarea
+    id: change
+    attributes:
+      label: 拟变更内容
+      description: 改哪一份 rules/*.json，改成什么
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: 影响面
+      description: 影响哪些接口、榜单、公示字段；是否有历史数据需要迁移
+    validations:
+      required: true
+  - type: dropdown
+    id: status
+    attributes:
+      label: 当前状态
+      options:
+        - 待组委会确认
+        - 已确认（附裁决记录链接）
+        - 已实现（附提交号）
+    validations:
+      required: true

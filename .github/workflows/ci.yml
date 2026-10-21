@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# 授权：只读即可，无需写权限
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: 测试（Node ${{ matrix.node }}）
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # package.json 的 engines 下限是 22.16.0（node:sqlite 免实验标志 + sqlite.backup() 的并集）
+        node: ['22.16.0', '22.x', '24.x']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      # 零第三方依赖 —— 不需要 npm install
+      - name: 迁移
+        working-directory: platform
+        run: node --disable-warning=ExperimentalWarning scripts/migrate.js
+
+      - name: 测试
+        working-directory: platform
+        run: node --disable-warning=ExperimentalWarning --test
+
+      - name: 构建演示站
+        working-directory: platform
+        run: node --disable-warning=ExperimentalWarning scripts/build-demo.js
+
+  plan-sync:
+    name: 计划块漂移闸
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+
+      # 计划块漂移审计：计划文档里的「已落地」必须与代码事实一致。
+      # 只卡 C-RW（内容被改写导致的真漂移）；C-EXT 是结构性现象（后续阶段追加），不断言。
+      - name: 计划块漂移审计
+        run: |
+          OUT="$(node docs/tools/plan-block-audit.mjs platform)"
+          echo "$OUT"
+          # 从汇总行里取 C-RW 计数，非 0 即失败（真漂移 ⇒ 计划块必须同步到当前实现）
+          RW="$(echo "$OUT" | grep -oE 'C-RW\(真重写·需同步\) [0-9]+' | grep -oE '[0-9]+$')"
+          if [ "${RW:-0}" != "0" ]; then
+            echo "::error::计划块真漂移 C-RW=$RW —— 计划块必须同步到当前实现"
+            exit 1
+          fi

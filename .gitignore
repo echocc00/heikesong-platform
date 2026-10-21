@@ -18,3 +18,7 @@ platform/web/dist/
 
 # 计划块同步工具的自动备份（docs/tools/plan-block-sync.mjs 每次同步前写一份 .bak）
 *.md.bak
+
+# 本地飞书取件/回传脚本 —— 内含飞书文档 token 与 folder-token，属凭证类，不入库
+fetch_docs.sh
+upload_all.sh
