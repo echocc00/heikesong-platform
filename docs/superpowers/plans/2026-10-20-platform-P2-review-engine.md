@@ -2130,15 +2130,46 @@ git commit -m "feat(P2): 去极值与席位加权分（评委席 P / 企业席 E
   - `applyEnterpriseRules({ confirmations, teams, judges, config })` → `{ seatE, weights, warnings, r4Substitute }`
   - `confirmations` 元素：`{ teamId, enterpriseId, dimension, rawScore, crossJudgeId, signatoryUserId, content }`
   - `teams` 元素：`{ teamId, packageEnterpriseId, isFreeBrief }`
-  - `seatE[teamId]` = 企业席分（0–100）；R4 生效时为 `null`（由评委的「需求真实性」分替代，由 `r4Substitute` 指明替代维度）
+  - `seatE[teamId]` = 企业席分（0–100）；**`null` 的唯一含义是「R4 生效，待评委维度替代」**，
+    由 `r4Substitute[teamId].dimension` 指明替代维度
+    （R1 命中时记 **0** 而不是 `null` —— 它的权重本已是 0，但形状要统一）
   - `weights[teamId]` = 该队**生效的维度权重**（R1/R4 调整后）
   - `r4Substitute[teamId]` = `{ dimension }`（R4：该队企业项改由哪个评委维度替代）
+- ⛔ **确认有效性的三层判定**（父代理预审修正）—— 任何一层不过，该确认**无效**：
+  1. **双签**：出题企业签字 + ≥1 名跨领域评委签字（R2 / R-JDG-06）
+  2. **内容**：`content` trim 后非空（R-JDG-14「企业签字必须有内容」）
+  3. **分数**：`rawScore` 是 0–100 的有限数（否则 `(1−w_E)×P + w_E×E` 会让**榜单总分破 100**）
+  ⚠️ 第 ② 层必须放在**领域层**：本函数会被 `computeStage` 从库里读数据时调用，
+  服务层的写入口校验挡不住历史数据与旁路写入。
+- ⚠️ **R1 与 R2 语义不同，别合并**：R1（非本赛道）→ **权重**降为 0；
+  R2（缺双签）→ **分数**按 0 计、权重保留。
+- ⚠️ **自由命题组的有效判定与 `packageEnterpriseId` 无关**（父代理预审修正）：
+  自由命题组本来就没有「本赛道企业」（`packageEnterpriseId` 为 null），
+  若按赛道过滤，它的企业确认**永远**无法被认定有效 → 永远触发 R4。
+  现在自由组按「三层判定」判有效。
+- ⚠️ **R4 只在「该队完全没有企业确认」时接管**；
+  确认存在但无效 → 按无效处理（走 R2 / R-JDG-14 / 分数越界），
+  **不是** R4 —— 否则一条坏确认会被 R4 悄悄盖掉。
+- ⛔ **fail-fast 抛错的三种情况**（父代理预审修正）：
+  ① 配置里没有 `dimensions` ② 配置里没有 `seat="enterprise"` 的维度
+  ③ **R4 触发但替代维度不可用**（`freeBrief.judgeDimension` 不在维度表里）
+  —— 第 ③ 种最危险：原实现会警告「改由评委打分」，但 `r4Substitute` 为空、
+  企业项按 0 分计 → **队伍被无故扣掉企业席权重，且没人知道为什么**。
+- ⚠️ **R3 封顶后权重总和会小于 1**（评委席权重不动，被封掉的那部分权重凭空消失）。
+  因为 `seatScore` 按 `Σw` 归一化，P 的**绝对值**不受影响；但**评委席的相对份额**变大了。
+  ⛔ Task 8 总装必须知道这条。
+- ⚠️ **同一企业多条有效确认 → 取平均**（库里有偏序唯一索引，正常不会发生；领域层防御性取平均）。
 
 - [ ] **Step 1: 写失败的测试**
 
 `platform/test/enterprise-seat.test.js`：
 
 ```javascript
+// platform/test/enterprise-seat.test.js —— 企业席 E 与 R1 / R2 / R3 / R4
+//
+// 依据：P2 计划 Task 4「企业席 E 与 R1 / R2 / R3 / R4」
+// 溯源需求：R-JDG-05（R1 分赛道）｜R-JDG-06（R2 双签）｜R-JDG-07（R3 权重封顶）
+//          ｜R-JDG-08（R4 自由命题组）｜R-JDG-14（签字必须有内容）
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { applyEnterpriseRules } from '../src/domain/enterprise-seat.js';
@@ -2172,6 +2203,13 @@ const CONFIRMATIONS = [
   // t4：非本赛道企业签字 → R1 权重降为 0
   { teamId: 't4', enterpriseId: 'E9', dimension: 'enterprise', rawScore: 60, crossJudgeId: 'j2', signatoryUserId: 'u_e9', content: '别家的题' },
 ];
+
+const oneTeam = (teamId, extra = {}) => ({
+  teamId,
+  packageEnterpriseId: 'E1',
+  isFreeBrief: false,
+  ...extra,
+});
 
 test('R1：非本赛道 → 该队企业项权重置 0，并记 warning', () => {
   const r = applyEnterpriseRules({ confirmations: CONFIRMATIONS, teams: TEAMS, judges: [], config: CONFIG });
@@ -2229,6 +2267,211 @@ test('没有企业确认记录 → 0 分 + warning（不静默当 0）', () => {
   assert.equal(r.seatE.t9, 0);
   assert.ok(r.warnings.some((w) => w.code === 'no_enterprise_confirmation' && w.teamId === 't9'));
 });
+
+// ── 父代理预审修正用例（2026-10-21）────────────────────────────────────
+// ⚠️ 规格自带的 6 条用例全绿，但下面的缺陷在它们**全都看不见**。
+
+test('R-JDG-14：签字内容为空或纯空白 → 该确认无效，按 0 分计 + warning', () => {
+  // ⚠️ 原实现**零校验** content —— 空白的签字照样计入分数。
+  //    领域层会被 computeStage 从库里读数据时调用，服务层的写入口校验挡不住
+  //    历史数据与旁路写入。
+  for (const content of ['', '   ', '\t\n']) {
+    const r = applyEnterpriseRules({
+      confirmations: [{ teamId: 't1', enterpriseId: 'E1', dimension: 'enterprise', rawScore: 80, crossJudgeId: 'j2', signatoryUserId: 'u_e1', content }],
+      teams: [oneTeam('t1')],
+      judges: [],
+      config: CONFIG,
+    });
+    assert.equal(r.seatE.t1, 0, `content=${JSON.stringify(content)} 必须判为无效`);
+    assert.ok(
+      r.warnings.some((w) => w.code === 'R_JDG14_missing_content' && w.teamId === 't1'),
+      `content=${JSON.stringify(content)} 必须告警`,
+    );
+  }
+});
+
+test('企业确认分越界 → 该确认无效（绝不让破 100 分的分进榜）', () => {
+  // ⚠️ 原实现零校验：rawScore = 1000 直接进企业席 →
+  //    总分公式 (1−w_E)×P + w_E×E 会让**榜单总分破 100**。
+  for (const rawScore of [1000, -1, NaN, Infinity]) {
+    const r = applyEnterpriseRules({
+      confirmations: [{ teamId: 't1', enterpriseId: 'E1', dimension: 'enterprise', rawScore, crossJudgeId: 'j2', signatoryUserId: 'u_e1', content: 'x' }],
+      teams: [oneTeam('t1')],
+      judges: [],
+      config: CONFIG,
+    });
+    assert.equal(r.seatE.t1, 0, `rawScore=${String(rawScore)} 必须判为无效`);
+    assert.ok(r.warnings.some((w) => w.code === 'enterprise_score_out_of_range'));
+  }
+});
+
+test('自由命题组有【有效】企业确认 → 用确认分，R4 不接管', () => {
+  // ⚠️ 原实现把自由组的有效性绑在 `packageEnterpriseId` 上 ——
+  //    自由命题组本来就**没有**「本赛道企业」（packageEnterpriseId 为 null），
+  //    于是它的企业确认**永远**无法被认定有效 → 永远触发 R4。
+  const r = applyEnterpriseRules({
+    confirmations: [{ teamId: 't3', enterpriseId: 'E1', dimension: 'enterprise', rawScore: 75, crossJudgeId: 'j2', signatoryUserId: 'u_e1', content: '由我方提供场景' }],
+    teams: [oneTeam('t3', { packageEnterpriseId: null, isFreeBrief: true })],
+    judges: [],
+    config: CONFIG,
+  });
+  assert.equal(r.seatE.t3, 75, '自由组的有效确认必须被采信');
+  assert.deepEqual(r.r4Substitute.t3, undefined, 'R4 不该接管');
+  assert.equal(
+    r.warnings.some((w) => w.code === 'R4_free_brief_judge_scored'),
+    false,
+  );
+});
+
+test('自由命题组【有确认但缺双签】→ 走 R2（不是 R4）', () => {
+  const r = applyEnterpriseRules({
+    confirmations: [{ teamId: 't3', enterpriseId: 'E1', dimension: 'enterprise', rawScore: 75, crossJudgeId: null, signatoryUserId: 'u_e1', content: 'x' }],
+    teams: [oneTeam('t3', { packageEnterpriseId: null, isFreeBrief: true })],
+    judges: [],
+    config: CONFIG,
+  });
+  assert.equal(r.seatE.t3, 0);
+  assert.ok(r.warnings.some((w) => w.code === 'R2_missing_dual_signature'));
+  assert.equal(r.warnings.some((w) => w.code === 'R4_free_brief_judge_scored'), false);
+});
+
+test('R4 生效时不发「没有企业确认」告警（自由组没有确认是预期状态）', () => {
+  const r = applyEnterpriseRules({
+    confirmations: [],
+    teams: [oneTeam('t3', { packageEnterpriseId: null, isFreeBrief: true })],
+    judges: [],
+    config: CONFIG,
+  });
+  assert.equal(
+    r.warnings.some((w) => w.code === 'no_enterprise_confirmation'),
+    false,
+    'R4 已经接管，再发「没有企业确认」是误导性告警',
+  );
+});
+
+test('R4 触发但替代维度不可用 → 响亮报错（规则静默失效最危险）', () => {
+  // ⚠️ 原实现：警告说「改由评委打分」，但 r4Substitute 为空、企业项按 0 分计
+  //    —— **队伍被无故扣掉企业席权重，且没人知道为什么**。
+  for (const cfg of [
+    { ...CONFIG, freeBrief: { judgeDimension: 'no_such_dim' } },
+    { ...CONFIG, freeBrief: undefined },
+  ]) {
+    assert.throws(
+      () => applyEnterpriseRules({
+        confirmations: [],
+        teams: [oneTeam('t3', { packageEnterpriseId: null, isFreeBrief: true })],
+        judges: [],
+        config: cfg,
+      }),
+      /R4|替代维度/,
+    );
+  }
+});
+
+test('配置里没有 enterprise 维度 → 响亮报错（不是静默丢分）', () => {
+  const cfg = { ...CONFIG, dimensions: CONFIG.dimensions.filter((d) => d.seat !== 'enterprise') };
+  assert.throws(
+    () => applyEnterpriseRules({
+      confirmations: [{ teamId: 't1', enterpriseId: 'E1', dimension: 'enterprise', rawScore: 80, crossJudgeId: 'j2', signatoryUserId: 'u_e1', content: 'x' }],
+      teams: [oneTeam('t1')],
+      judges: [],
+      config: cfg,
+    }),
+    /enterprise/,
+  );
+  assert.throws(
+    () => applyEnterpriseRules({ confirmations: [], teams: [oneTeam('t1')], judges: [], config: { ...CONFIG, dimensions: [] } }),
+    /dimensions/,
+  );
+});
+
+test('R1 命中时 seatE 记 0 而不是 null（null 的唯一含义留给 R4）', () => {
+  const r = applyEnterpriseRules({ confirmations: CONFIRMATIONS, teams: TEAMS, judges: [], config: CONFIG });
+  assert.equal(r.seatE.t4, 0, 'R1 时权重已归 0，分数记 0；null 只能表示「R4 待替代」');
+  assert.equal(r.seatE.t3, null, 'R4 才是 null');
+});
+
+test('wEnterprise 非法 → 响亮报错', () => {
+  for (const bad of ['x', NaN, -1, Infinity]) {
+    assert.throws(
+      () => applyEnterpriseRules({
+        confirmations: [],
+        teams: [oneTeam('t1')],
+        judges: [],
+        config: { ...CONFIG, wEnterprise: bad },
+      }),
+      /wEnterprise/,
+      `wEnterprise=${String(bad)} 必须报错`,
+    );
+  }
+});
+
+test('登记口径：R3 封顶后权重总和会小于 1（评委席权重不动）', () => {
+  // R3 只压企业席的权重，评委席不动 → 被封掉的那部分权重**凭空消失**。
+  // 因为 seatScore 按 Σw 归一化，P 的绝对值不受影响；但**评委席的相对份额**变大了。
+  const over = {
+    ...CONFIG,
+    wEnterprise: 0.25,
+    dimensions: [
+      { key: 'innovation', weight: 0.60, seat: 'judge' },
+      { key: 'enterprise', weight: 0.40, seat: 'enterprise' },
+    ],
+  };
+  const r = applyEnterpriseRules({
+    confirmations: [],
+    teams: [oneTeam('t1')],
+    judges: [],
+    config: over,
+  });
+  const sum = Object.values(r.weights.t1).reduce((a, b) => a + b, 0);
+  assert.ok(Math.abs(sum - 0.85) < 1e-12, `权重和应是 0.85，实际 ${sum}`);
+});
+
+test('登记口径：同一企业多条有效确认 → 取平均', () => {
+  const r = applyEnterpriseRules({
+    confirmations: [
+      { teamId: 't1', enterpriseId: 'E1', dimension: 'enterprise', rawScore: 80, crossJudgeId: 'j2', signatoryUserId: 'u_e1', content: 'a' },
+      { teamId: 't1', enterpriseId: 'E1', dimension: 'enterprise', rawScore: 60, crossJudgeId: 'j3', signatoryUserId: 'u_e1', content: 'b' },
+    ],
+    teams: [oneTeam('t1')],
+    judges: [],
+    config: CONFIG,
+  });
+  assert.equal(r.seatE.t1, 70, '(80+60)/2');
+});
+
+test('R4 的权重搬运：替代维度的权重真的搬到企业席了（两者不同时才验得出来）', () => {
+  // ⚠️ 默认配置里 `track_fit` 与 `enterprise` 的权重**恰好都是 0.10** ——
+  //    所以「搬了」与「没搬」的结果**完全一样**，这条规则从来没被真正验证过。
+  //    这里把两个权重拉开、并把 wEnterprise 提到不会被 R3 压回去，才能验出差别。
+  const cfg = {
+    ...CONFIG,
+    wEnterprise: 0.40,
+    dimensions: [
+      { key: 'track_fit', weight: 0.30, seat: 'judge' },
+      { key: 'enterprise', weight: 0.10, seat: 'enterprise' },
+    ],
+  };
+  const r = applyEnterpriseRules({
+    confirmations: [],
+    teams: [oneTeam('t3', { packageEnterpriseId: null, isFreeBrief: true })],
+    judges: [],
+    config: cfg,
+  });
+  assert.equal(r.weights.t3.track_fit, 0, '替代维度从评委席移出');
+  assert.equal(r.weights.t3.enterprise, 0.30, '替代维度的权重搬到企业席（不是原来的 0.10）');
+});
+
+test('只有企业维度的确认才算企业确认（其他维度的确认不参与）', () => {
+  const r = applyEnterpriseRules({
+    confirmations: [{ teamId: 't1', enterpriseId: 'E1', dimension: 'track_fit', rawScore: 80, crossJudgeId: 'j2', signatoryUserId: 'u_e1', content: 'x' }],
+    teams: [oneTeam('t1')],
+    judges: [],
+    config: CONFIG,
+  });
+  assert.equal(r.seatE.t1, 0, 'track_fit 维度的确认不是企业确认');
+  assert.ok(r.warnings.some((w) => w.code === 'no_enterprise_confirmation'));
+});
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -2242,7 +2485,7 @@ Expected: FAIL —— `Cannot find module '../src/domain/enterprise-seat.js'`
 // src/domain/enterprise-seat.js — 企业席得分 E 与 R1 / R2 / R3 / R4
 //
 // 依据：S7 §2.4 R1–R4（分赛道 / 双签 / 权重封顶 / 自由命题组）+ S7 §3.1 评分公式 + §4.1 签字内容。
-//   R-JDG-05 ← R1；R-JDG-06 ← R2；R-JDG-07 ← R3；R-JDG-08 ← R4。
+//   R-JDG-05 ← R1；R-JDG-06 ← R2；R-JDG-07 ← R3；R-JDG-08 ← R4；R-JDG-14（签字必须有内容）。
 //
 // ⚠️ R1 与 R2 的区别（本文件最容易做错的一处）：
 //   R1（非本赛道）→ 该队【企业项权重】降为 0（该项不参与该队加权，权重让给评委席）
@@ -2250,17 +2493,40 @@ Expected: FAIL —— `Cannot find module '../src/domain/enterprise-seat.js'`
 //   两者都是 S7 原文，语义不同，不要合并。
 //
 // 纯函数：无 IO、无 Date.now()、无 Math.random()。
+//
+// 【父代理预审修正 2026-10-21 —— 本文件有 8 处修正，读代码前先看这段】
+//   ① **R-JDG-14「签字必须有内容」零校验**：content 为空/纯空白的确认照样计入分数。
+//      领域层会被 `computeStage` 从库里读数据时调用 —— 服务层的写入口校验挡不住
+//      历史数据与旁路写入。现在内容不合规的确认**无效**。
+//   ② **确认分没有 0–100 区间校验**：rawScore = 1000 直接进企业席 →
+//      总分公式 (1−w_E)×P + w_E×E → 榜单破 100 分。现在越界的确认**无效**。
+//   ③ **自由命题组的有效判定错误地依赖 `packageEnterpriseId`** —— 自由命题组
+//      本来就没有「本赛道企业」（packageEnterpriseId 为 null），
+//      于是它的企业确认**永远**无法被认定有效 → 永远触发 R4，
+//      且同时发出「没有企业确认」的**误导性告警**（明明有确认记录）。
+//      现在自由组按「双签齐全 + 内容合规 + 分数合法」判有效，与赛道无关。
+//   ④ **R4 触发但替代维度不可用 → 规则静默失效**：demandKey 不在维度表里时，
+//      警告说「改由评委打分」，但 r4Substitute 为空、企业项按 0 分计
+//      —— **队伍被无故扣掉企业席权重，且没人知道为什么**。现在 fail-fast 抛错。
+//   ⑤ **R4 生效时仍发「没有企业确认」告警** → 误导（自由组没有企业确认是预期状态）。
+//   ⑥ **配置里没有 enterprise 维度 → 企业确认被完全忽略**，却告警说「没有有效的
+//      企业确认记录」—— 实为配置缺陷。现在 fail-fast 抛错。
+//   ⑦ **R1 命中时 seatE 是 `null`** —— 但计划只说「R4 生效时为 null」。
+//      现在 null 的**唯一含义**是「R4 待评委维度替代」，R1 记 0（其权重本已是 0）。
+//   ⑧ `wEnterprise` 非法（NaN / 字符串）→ 静默不封顶。现在 fail-fast 抛错。
 
 /**
  * @param {object} input
  * @param {Array} input.confirmations
  *   [{ teamId, enterpriseId, dimension, rawScore, crossJudgeId, signatoryUserId, content }]
  * @param {Array} input.teams [{ teamId, packageEnterpriseId, isFreeBrief }]
- * @param {Array} input.judges 评委池（当前仅用于留档口径，预留企业席归属校验）
+ * @param {Array} input.judges 评委池（**当前未使用**，预留企业席归属校验）
  * @param {object} input.config rules.scoring.initial | rules.scoring.final
  * @returns {{seatE:Object<string, number|null>, weights:Object<string,Object<string,number>>,
  *            warnings:Array<{code:string,message:string,teamId?:string}>,
  *            r4Substitute:Object<string,{dimension:string}>}}
+ *   `seatE[teamId] === null` 的**唯一**含义是「R4 生效，待评委维度替代」，
+ *   由 `r4Substitute[teamId].dimension` 指明替代维度。
  */
 export function applyEnterpriseRules({ confirmations = [], teams = [], judges = [], config = {} } = {}) {
   const warnings = [];
@@ -2271,8 +2537,24 @@ export function applyEnterpriseRules({ confirmations = [], teams = [], judges = 
   const dimensions = Array.isArray(config.dimensions) ? config.dimensions : [];
   const enterpriseKeys = dimensions.filter((d) => d.seat === 'enterprise').map((d) => d.key);
   const enterpriseKey = enterpriseKeys[0] ?? null;
+
+  // ── 配置 fail-fast（坏规则宁可炸掉，也不要静默算出错的 E） ─────────────
+  if (!dimensions.length) {
+    throw new TypeError('规则配置里没有 dimensions —— 无法计算企业席');
+  }
+  if (!enterpriseKeys.length) {
+    throw new TypeError(
+      '规则配置里没有 seat="enterprise" 的维度 —— 企业席是双席制的基本组成',
+    );
+  }
   const demandKey = config.freeBrief?.judgeDimension ?? null;
-  const wEnterprise = Number(config.wEnterprise ?? 0);
+  const rawWEnterprise = config.wEnterprise ?? 0;
+  if (typeof rawWEnterprise !== 'number' || !Number.isFinite(rawWEnterprise) || rawWEnterprise < 0) {
+    throw new TypeError(
+      `规则配置项 wEnterprise 非法：${JSON.stringify(rawWEnterprise)}（必须是 ≥0 的有限数）`,
+    );
+  }
+  const wEnterprise = rawWEnterprise;
 
   for (const team of teams) {
     const base = {};
@@ -2286,10 +2568,36 @@ export function applyEnterpriseRules({ confirmations = [], teams = [], judges = 
     const outOfTrack = team.isFreeBrief
       ? []
       : mine.filter((c) => c.enterpriseId !== team.packageEnterpriseId);
-    const inTrack = mine.filter((c) => c.enterpriseId === team.packageEnterpriseId);
-    // R2 双签：出题企业签字 + ≥1 名跨领域评委签字，缺任一即不成立
-    const valid = inTrack.filter((c) => c.crossJudgeId && c.signatoryUserId);
-    const r2Fail = inTrack.filter((c) => !(c.crossJudgeId && c.signatoryUserId));
+    // 自由命题组按「内容合规」判有效，与 packageEnterpriseId 无关（父代理预审修正 ③）
+    const inTrack = team.isFreeBrief
+      ? mine
+      : mine.filter((c) => c.enterpriseId === team.packageEnterpriseId);
+
+    // ── 有效性三层判定 ──────────────────────────────────────────────────
+    //   ① 双签：出题企业签字 + ≥1 名跨领域评委签字，缺任一即不成立（R2）
+    //   ② 内容：R-JDG-14「企业签字必须有内容」（解决哪个环节/落地时间/我方角色）
+    //   ③ 分数：必须在 0–100，否则企业席会算出破 100 分的总分
+    const classified = inTrack.map((c) => {
+      if (!c.crossJudgeId || !c.signatoryUserId) return { c, reason: 'dual_signature' };
+      if (typeof c.content !== 'string' || !c.content.trim()) return { c, reason: 'content' };
+      if (!Number.isFinite(c.rawScore) || c.rawScore < 0 || c.rawScore > 100) {
+        return { c, reason: 'score_range' };
+      }
+      return { c, reason: null };
+    });
+    const valid = classified.filter((x) => x.reason === null).map((x) => x.c);
+    const failed = classified.filter((x) => x.reason !== null);
+    const hasReason = (reason) => failed.some((x) => x.reason === reason);
+
+    // R4 只在「该队**完全没有**企业确认」时接管；确认存在但无效 → 按无效处理
+    const r4Candidate = Boolean(team.isFreeBrief) && inTrack.length === 0;
+    if (r4Candidate && (!demandKey || base[demandKey] == null)) {
+      // 规则要替代却替代不了 → 宁可炸掉，也不能「警告说替代、实际按 0 分计」
+      throw new TypeError(
+        `自由命题组 ${team.teamId} 触发 R4，但替代维度 ${JSON.stringify(demandKey)} 不在维度表里 —— `
+        + '规则无法执行（企业项既不能由企业打分，也没有评委维度可替代）',
+      );
+    }
 
     let score = null;
 
@@ -2298,12 +2606,12 @@ export function applyEnterpriseRules({ confirmations = [], teams = [], judges = 
       if (enterpriseKey) eff[enterpriseKey] = 0;
       warnings.push({
         code: 'R1_out_of_track',
-        message: '企业席评了非本赛道题目，该队「企业确认」权重降为 0',
+        message: '企业席评了非本企业题目，该队「企业确认」权重降为 0',
         teamId: team.teamId,
       });
     }
 
-    if (r2Fail.length) {
+    if (hasReason('dual_signature')) {
       // R2：缺双签 → 该项按 0 分计（权重保留）
       score = 0;
       warnings.push({
@@ -2311,9 +2619,25 @@ export function applyEnterpriseRules({ confirmations = [], teams = [], judges = 
         message: '企业确认缺双签（出题企业签字 / 跨领域评委签字），该项按 0 分计',
         teamId: team.teamId,
       });
+    } else if (hasReason('content')) {
+      // R-JDG-14：签字必须有内容
+      score = 0;
+      warnings.push({
+        code: 'R_JDG14_missing_content',
+        message: '企业确认缺签字内容（R-JDG-14 要求写明解决哪个环节 / 落地时间 / 我方角色），该项按 0 分计',
+        teamId: team.teamId,
+      });
+    } else if (hasReason('score_range')) {
+      // 分数越界 → 该项按 0 分计（绝不让破 100 分的分进榜）
+      score = 0;
+      warnings.push({
+        code: 'enterprise_score_out_of_range',
+        message: '企业确认分不在 0–100 区间，该项按 0 分计',
+        teamId: team.teamId,
+      });
     } else if (valid.length) {
       score = valid.reduce((acc, c) => acc + c.rawScore, 0) / valid.length;
-    } else if (!outOfTrack.length) {
+    } else if (!outOfTrack.length && !r4Candidate) {
       score = 0;
       warnings.push({
         code: 'no_enterprise_confirmation',
@@ -2322,14 +2646,16 @@ export function applyEnterpriseRules({ confirmations = [], teams = [], judges = 
       });
     }
 
-    // R4：自由命题组（is_free_brief=1）无企业签字 → 该项改由评委按「需求真实性的公开证据」打分
-    if (team.isFreeBrief && !valid.length) {
-      if (demandKey && base[demandKey] != null) {
-        eff[demandKey] = 0;                 // 替代维度从评委席移出，避免双重计分
-        if (enterpriseKey) eff[enterpriseKey] = base[demandKey]; // 权重搬到企业席
-        r4Substitute[team.teamId] = { dimension: demandKey };
-        score = null;                        // 具体分数由评分流水线用评委维度分填充
-      }
+    // R1：权重已归 0，分数无意义 —— 但记 0 而不是 null，
+    // 让 `seatE === null` 的唯一含义留给 R4（父代理预审修正 ⑦）
+    if (outOfTrack.length && score === null) score = 0;
+
+    // R4：自由命题组无企业签字 → 该项改由评委按「需求真实性的公开证据」打分
+    if (r4Candidate) {
+      eff[demandKey] = 0;                      // 替代维度从评委席移出，避免双重计分
+      if (enterpriseKey) eff[enterpriseKey] = base[demandKey]; // 权重搬到企业席
+      r4Substitute[team.teamId] = { dimension: demandKey };
+      score = null;                            // 具体分数由评分流水线用评委维度分填充
       warnings.push({
         code: 'R4_free_brief_judge_scored',
         message: '自由命题组无企业签字，「企业确认」项改由评委按需求真实性的公开证据打分',
@@ -2363,7 +2689,7 @@ export function applyEnterpriseRules({ confirmations = [], teams = [], judges = 
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cd platform && node --test test/enterprise-seat.test.js`
-Expected: PASS（6 个测试全过：enterprise-seat.test.js 6）
+Expected: PASS（19 个测试全过：enterprise-seat.test.js 19）
 
 - [ ] **Step 5: 提交**
 
@@ -5929,6 +6255,54 @@ git commit -m "feat(P2): SSE 评审进度推送（src/http/sse.js + GET /api/sta
 **Task 3 的测试条数口径**：trim **17**（规格自带 7 + 预审回归 6 + 变异补测 4）。
 
 **最终结果**：变异体 22 → **KILLED 21 / 等价变异体 1 / 有效缺口 0**；`trim.test.js` **17/17**；P2 全量 **359/359**。
+
+---
+
+## Task 4 父代理预审修正台账（2026-10-21）
+
+> Task 4 是 R1–R4 四条规则的引擎，**逻辑最密**，因此预审的探针覆盖了每条规则的分支组合。
+> 规格自带的 **6 条用例全绿** —— 但探针发现 **3 Critical + 3 Important + 2 Minor**，
+> 全部在实现里修掉后再补 **13 条回归用例**；
+> 实施完成后做**变异检验**，变异体一度出现 **2 条存活**，补完后 **25/25 杀灭**。
+
+### 一、预审发现的规格缺陷
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| **E-1** | **Critical** | **R4 触发但替代维度不可用 → 规则静默失效** —— `demandKey` 不在维度表里（或 `freeBrief` 段缺失）时，代码**发出**「改由评委按需求真实性打分」的警告，却**不产生** `r4Substitute`、企业项**按 0 分计** | 探针：`freeBrief.judgeDimension = 'no_such_dim'` → `{"seatE":{"t3":0},"w":["no_enterprise_confirmation","R4_free_brief_judge_scored"],"sub":{}}` —— **警告说替代、实际没替代，队伍被无故扣掉 10% 企业席权重，且没人知道为什么** | **fail-fast 抛错**：R4 触发但替代维度不可用 → 直接炸。规则要替代却替代不了，比算出错的 E 危险得多 |
+| **E-2** | **Critical** | **R-JDG-14「签字必须有内容」零校验** —— `content` 为空或纯空白的确认照样计入分数 | 探针：`content: ''` → `seatE = 80`、**零 warning**；`content: '   '` → 同样 | 纳入「确认有效性三层判定」。⚠️ 必须放在**领域层**：本函数会被 `computeStage` 从库里读数据时调用，服务层的写入口校验挡不住历史数据与旁路写入 |
+| **E-3** | **Critical** | **确认分没有 0–100 区间校验** | 探针：`rawScore: 1000` → `seatE = 1000` —— 总分公式 `(1−w_E)×P + w_E×E` → **榜单总分破 100** | 纳入三层判定；越界的确认**无效**（按 0 分计 + warning `enterprise_score_out_of_range`） |
+| **E-4** | **Important** | **自由命题组的有效判定错误地依赖 `packageEnterpriseId`** —— 自由组本来就没有「本赛道企业」（该值为 null），于是它的企业确认**永远**无法被认定有效 → **永远触发 R4**，且同时发出「没有企业确认」的**误导性告警**（明明有确认记录） | 探针：自由组 + 一条**双签齐全**的有效确认 → `seatE = null`（走了 R4）、warning 含 `no_enterprise_confirmation` | 自由组按「三层判定」判有效，与赛道无关。R4 改为只在「**完全没有**企业确认」时接管 |
+| **E-5** | **Important** | **R4 生效时仍发「没有企业确认」告警** → 误导（自由组没有企业确认是**预期状态**，不是漏签） | 探针：自由组无确认 → warning 列表同时含 `no_enterprise_confirmation` 与 `R4_free_brief_judge_scored` | R4 接管时**不发** `no_enterprise_confirmation` |
+| **E-6** | **Important** | **配置里没有 `seat="enterprise"` 的维度 → 企业确认被完全忽略**，却告警说「没有有效的企业确认记录」—— 实为**配置缺陷** | 探针：dimensions 去掉 enterprise 维度 → `seatE = 0`、warning = `no_enterprise_confirmation`、权重表里根本没有 enterprise 键 | fail-fast 抛错（`dimensions` 为空、`enterprise` 维度缺失都抛） |
+| **E-7** | Minor | **R1 命中时 `seatE` 是 `null`** —— 但计划只说「R4 生效时为 `null`」 | 探针：t4（R1）→ `seatE.t4 = null` | R1 时记 **0**（权重本已是 0），让 `null` 的**唯一含义**留给 R4 |
+| **E-8** | Minor | `wEnterprise` 非法（NaN / 字符串）→ `wEnterprise > 0` 恒 false → **静默不封顶** | 探针：`wEnterprise: 'x'` → 无 `R3_enterprise_weight_capped` 警告 | fail-fast 抛错 |
+
+### 二、变异检验发现的实现盲区
+
+> 变异体 **25** 个（R1 不置权重 / R1 判定失效 / R2 不按 0 分 / R2 判定失效 /
+> R3 不封顶 / R4 不移权重 / R4 不搬权重 / R4 不记 substitute / R4 不置 null /
+> 内容校验摘掉 / 区间校验摘掉 / 自由组绑回赛道 / 三处 fail-fast 摘掉 / 告警误发 …）。
+> 变异脚本：`/tmp/p2t4/mutate.mjs`。
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| **E-9** | **Important** | **R4 的「权重搬运」从来没被真正验证过** —— 默认配置里 `track_fit` 与 `enterprise` 的权重**恰好都是 0.10**，所以「搬了」与「没搬」的结果**完全一样** | 变异存活：删掉 `eff[enterpriseKey] = base[demandKey]` 后 19 条用例全绿 | 补用例：把两个权重**拉开**（0.30 / 0.10）并把 `wEnterprise` 提到 0.40（不被 R3 压回去），才能验出差别 |
+| **E-10** | Minor | **非企业维度的确认没被排除** —— `mine` 的过滤条件 `enterpriseKeys.includes(c.dimension)` 零覆盖 | 变异存活：删掉该过滤条件后 19 条用例全绿 | 补用例：一条 `dimension: 'track_fit'` 的确认 → 必须不参与企业席（`seatE = 0` + `no_enterprise_confirmation`） |
+
+### 三、刻意保持的行为（登记口径）
+
+| 行为 | 为什么这样 |
+|---|---|
+| **R3 封顶只压企业席，评委席权重不动** → 权重总和会 **< 1** | R3 的原文只约束「企业席合计权重」。因为 `seatScore` 按 `Σw` 归一化，P 的**绝对值**不受影响；但**评委席的相对份额**被放大。⛔ Task 8 总装必须知道 |
+| **R1 是「全体连坐」** —— 只要有**任何一家**外赛道企业签了字，该队企业项权重就归 0（哪怕本赛道企业的确认是好的） | S7 原文是「企业席评了非本企业题目 → 该队企业项权重自动降为 0」，没有「只罚那一家」的细分。⚠️ 这条**连坐口径**已用测试锁定，将来若要改成按企业分别处罚，改这里 |
+| **同一企业多条有效确认 → 取平均** | 库里有偏序唯一索引（`stage_id, team_id, dimension, enterprise_id WHERE deleted_at IS NULL`），正常不会发生；领域层防御性取平均 |
+| **`judges` 参数当前未使用** | 预留「企业席归属校验」；R1 目前靠 `packageEnterpriseId` 比对，不依赖评委名单 |
+| **R2 / R-JDG-14 / 分数越界 三类失效的优先级是「先到先判」** | 一条确认同时缺双签又没内容 → 只报 R2（先判到的那个）。⚠️ 登记口径：一条确认只报一个原因 |
+
+**Task 4 的测试条数口径**：enterprise-seat **19**（规格自带 6 + 预审回归 13）。
+
+**最终结果**：变异体 25 → **KILLED 25 / SURVIVED 0**；`enterprise-seat.test.js` **19/19**；P2 全量 **378/378**。
 
 ---
 
