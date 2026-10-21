@@ -415,27 +415,66 @@ test('public_tokens 表可存可查，且 token 是主键', () => {
 const CLAIM_WORKER_SRC = `
 import { parentPort, workerData } from 'node:worker_threads';
 import { openDatabase } from ${JSON.stringify(pathToFileURL(join(here, '..', 'src', 'db', 'sqlite.js')).href)};
+
 const { db, close } = openDatabase({ dataDir: workerData.dataDir });
 const ins = db.prepare(
   'INSERT INTO task_claims (id, task_id, team_id, user_id, claimed_at, released_at) VALUES (?, ?, ?, ?, ?, NULL)',
 );
-parentPort.postMessage({ ready: true });
+
+/**
+ * 共享屏障（Int32Array，三个槽位）：
+ *   [0] 已建立连接的 worker 数
+ *   [1] holder 已持有写锁并完成 INSERT
+ *   [2] waiter 已准备发起 INSERT（此刻它必然阻塞在写锁上）
+ */
 const barrier = new Int32Array(workerData.barrier);
+
+/** 等某个槽位变成 want；超时返回 false（用于把「卡住」变成可诊断的失败而不是挂死）。 */
+function waitUntil(idx, want, timeoutMs) {
+  const deadline = process.hrtime.bigint() + BigInt(timeoutMs) * 1000000n;
+  for (;;) {
+    if (Atomics.load(barrier, idx) === want) return true;
+    if (process.hrtime.bigint() > deadline) return false;
+    Atomics.wait(barrier, idx, Atomics.load(barrier, idx), 5);
+  }
+}
+
+parentPort.postMessage({ ready: true });
 Atomics.add(barrier, 0, 1);
-while (Atomics.load(barrier, 0) < 2) {
-  Atomics.wait(barrier, 0, Atomics.load(barrier, 0), 20);
+if (!waitUntil(0, 2, 10000)) {
+  parentPort.postMessage({ ok: false, message: '屏障超时：两个连接未能在 10s 内就绪', t0: 0, t1: 0 });
+  close();
+} else {
+  let outcome;
+  const t0 = Number(process.hrtime.bigint());
+  try {
+    if (workerData.role === 'holder') {
+      // holder：取写锁 → 插入 → 告诉 waiter「我持锁了」→ 等 waiter 准备发起 INSERT → 才提交
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        ins.run(workerData.claimId, workerData.taskId, workerData.teamId, workerData.userId, workerData.claimedAt);
+        Atomics.store(barrier, 1, 1);
+        waitUntil(2, 1, 10000);
+        db.exec('COMMIT');
+        outcome = { ok: true };
+      } catch (err) {
+        try { db.exec('ROLLBACK'); } catch { /* 事务可能已不在 */ }
+        outcome = { ok: false, message: String(err && err.message) };
+      }
+    } else {
+      // waiter：等 holder 持锁 → 宣告「我要发起了」（下一个语句必然阻塞在写锁上）→ 发起 INSERT
+      waitUntil(1, 1, 10000);
+      Atomics.store(barrier, 2, 1);
+      ins.run(workerData.claimId, workerData.taskId, workerData.teamId, workerData.userId, workerData.claimedAt);
+      outcome = { ok: true };
+    }
+  } catch (err) {
+    outcome = { ok: false, message: String(err && err.message) };
+  }
+  const t1 = Number(process.hrtime.bigint());
+  close();
+  parentPort.postMessage({ ...outcome, t0, t1 });
 }
-const t0 = Number(process.hrtime.bigint() / 1000000n);
-let outcome;
-try {
-  ins.run(workerData.claimId, workerData.taskId, workerData.teamId, workerData.userId, workerData.claimedAt);
-  outcome = { ok: true };
-} catch (err) {
-  outcome = { ok: false, message: String(err && err.message) };
-}
-const t1 = Number(process.hrtime.bigint() / 1000000n);
-close();
-parentPort.postMessage({ ...outcome, t0, t1 });
 `;
 
 function spawnClaimWorker(workerData) {
@@ -459,11 +498,12 @@ test('真并发：两个连接同时领取同一任务，数据库只放行一�
   // 先把主连接关掉：下面的并发由 worker 自己持有的两条连接完成
   close();
 
-  const barrier = new SharedArrayBuffer(4);
+  // 三个 Int32 槽位：[0] 已连接数 / [1] holder 持锁 / [2] waiter 准备发起 INSERT
+  const barrier = new SharedArrayBuffer(12);
   const base = { dataDir, barrier, taskId: 'tk_1', teamId: 'tm_1', claimedAt: '2026-10-03T00:00:00.000Z' };
-  const a = spawnClaimWorker({ ...base, claimId: 'tc_a', userId: 'u_cap' });
+  const a = spawnClaimWorker({ ...base, role: 'holder', claimId: 'tc_a', userId: 'u_cap' });
   await a.ready;                       // 连接 A 已建立
-  const b = spawnClaimWorker({ ...base, claimId: 'tc_b', userId: 'u_other' });
+  const b = spawnClaimWorker({ ...base, role: 'waiter', claimId: 'tc_b', userId: 'u_other' });
   await b.ready;                       // 连接 B 已建立（错开建立，避开 WAL PRAGMA 抢锁）
   const [ra, rb] = await Promise.all([a.done, b.done]);
 
@@ -473,10 +513,27 @@ test('真并发：两个连接同时领取同一任务，数据库只放行一�
   assert.equal(losers.length, 1, `恰好一条被拒，实际 ${JSON.stringify([ra, rb])}`);
   assert.match(losers[0].message, /UNIQUE constraint failed/, '被拒的一方必须由数据库的唯一索引拒绝');
 
-  // 证明这**确实是并发**而不是被测试串行化：两次 INSERT 的时间区间必须重叠
-  const earliest = Math.min(ra.t0, rb.t0);
-  const latest = Math.max(ra.t1, rb.t1);
-  assert.ok(earliest < latest, `两次 INSERT 必须重叠才叫并发，实际区间 ${earliest}~${latest}`);
+  // 证明这**确实是并发**而不是被测试串行化：两次 INSERT 的时间区间必须**真正重叠**。
+  //
+  // ⚠️⚠️ 谓词**不能**写成 `min(t0) < max(t1)`：
+  //   ① 那个写法在「A 完全在 B 之前」（串行）时也成立 ⇒ 会把**根本不是并发**的两次 INSERT 放过；
+  //   ② 而时间戳若截断到**毫秒**，两次 INSERT 全程落在同一毫秒时会得到 `min == max`
+  //      ⇒ 把**真并发**判成不并发（本机实测约 20% 概率偶发失败，见台账 PC-1）。
+  //  ⇒ 正确写法：时间戳保留**纳秒**（process.hrtime.bigint() 是 CLOCK_MONOTONIC，
+  //    同一进程内的多个 worker 线程**基点相同** ⇒ 可直接跨线程比较），
+  //    谓词用**区间真实重叠** `a0 < b1 && b0 < a1`。
+  //
+  // ⚠️ 仅有高精度时间戳**还不够**：两个 worker 从屏障放行到真正跑起来之间有**唤醒延迟**
+  //    （实测可达数毫秒）⇒ 两次 INSERT 可能**整体错开**、根本不重叠。
+  //    ⇒ 上面 worker 用**共享标志位**把顺序**结构化**：
+  //      holder 取写锁并插入 → 置标志 [1] → 等标志 [2] → 才提交；
+  //      waiter 等标志 [1] → 置标志 [2] → 才发起 INSERT（此刻必然阻塞在 holder 的写锁上）。
+  //    于是必然有 holder.t0 < waiter.t0 < holder.t1 且 waiter.t1 > holder.t1 ⇒ **重叠恒成立**。
+  const overlap = ra.t0 < rb.t1 && rb.t0 < ra.t1;
+  assert.ok(
+    overlap,
+    `两次 INSERT 的区间必须重叠才叫并发，实际 [${ra.t0},${ra.t1}] 与 [${rb.t0},${rb.t1}]`,
+  );
 
   // 库里的有效领取永远只有一条
   const { db: db2, close: close2 } = openDatabase({ dataDir });
@@ -8552,3 +8609,99 @@ test('computePersonalPoints：无 userId 的条目不参与累加；口径外的
 | `platform/web/app.js` | Modify（P0 建立，**本 Task 只追加**） | 1 行导入 + 2 行路由注册（`route('/tasks/:workflowId', (c) => renderTasks(c));`）；`render()` 的 `params`/`query` 透传**本轮未改**（P0 终态已具备） |
 | `platform/test/workflow-e2e.test.js` | **新建**（P5） | 12 例（后端闭环 1 + 视图纯函数 8 + 前端接线 3） |
 | `docs/superpowers/plans/2026-10-20-platform-P5-workflow-pools.md` | Modify | Task 6 代码块逐字回写 + Step 2/4/5/7 文字订正 + 三个核验锚点 + 本章台账 |
+## P5 并发用例修复轮（父代理，2026-10-21 · 长期偶发失败的根因定位与处置）
+
+> **背景**：本仓有一条**长期存在、多次排查未果**的偶发失败 —— 全量测试偶发红 1 例，
+> 早先几次连跑全绿、未能复现，一直被记为「未定位」。
+> 本轮把它**定位到了**（不是靠反复重跑碰运气，而是靠读断言 + 实跑观测数据），
+> 并做了**结构性**修复。
+>
+> **编号约定**：本计划已有 `T2-C*` / `T3-C*` / `T3R-C*` / `T4-C*` / `T5-C*` / `T6-C*` 六套前缀；
+> 本轮用 **`PC-*`**（Pools Concurrency），不与任何既有编号重号。
+
+### A. 症状
+
+```
+not ok 484 - 真并发：两个连接同时领取同一任务，数据库只放行一个（放行权在数据库，不在应用层）
+  error: '两次 INSERT 必须重叠才叫并发，实际区间 36170370~36170370'
+```
+
+复现条件：**负载相关**（本机空闲时连跑 20 轮不复发；8 个忙循环压满 CPU 时 30 轮复现 1 次）。
+
+### B. 根因（两层，缺一不可）
+
+**第一层：谓词写错了 —— 两个方向都错。**
+原断言是 `Math.min(ra.t0, rb.t0) < Math.max(ra.t1, rb.t1)`（「min < max ⇒ 区间重叠」）。
+这个写法**不蕴含重叠**：
+
+| 真实情形 | 期望 | 旧谓词 | 结论 |
+|---|---|---|---|
+| A 完全在 B 之前（**根本没并发**） | 不重叠 | **判为重叠** | ⛔ **假通过** —— 恰好放过了本用例要防的那件事 |
+| 真并发，但两次 INSERT 全程落在同一毫秒 | 重叠 | **判为不重叠** | ⛔ **假失败** —— 这就是现场那条 |
+| 真并发且纳秒级交错 | 重叠 | 重叠 | ✅ |
+| 真并发但两端相接 | 不重叠 | **判为重叠** | ⛔ 假通过 |
+
+⇒ 正确的**区间重叠**判定是 `a0 < b1 && b0 < a1`。
+
+**第二层：时间戳被截断到毫秒。**
+worker 里是 `Number(process.hrtime.bigint() / 1000000n)` ⇒ 纳秒被砍成毫秒整数。
+两次 INSERT 若快到落在同一毫秒（`t0 === t1 === 同一毫秒`），`min === max` ⇒ 断言必假。
+
+**第三层（实跑才暴露）：即使把时间戳换成纳秒，两次 INSERT 仍可能整体错开。**
+把时间戳改成纳秒后重跑，**40/40 必红**，现场数据是
+`[36479482064708, 36479482133750] 与 [36479474365916, 36479474591041]` ——
+B 整体比 A 早约 **7.7 ms**，两者**根本没重叠**。
+原因：`Atomics.wait` 放行屏障后，线程从「被唤醒」到「真正跑起来」有**调度延迟**，
+本机实测可达数毫秒 ⇒ 两个 worker 的 INSERT **不在同一时刻**发生。
+⇒ 「两次 INSERT 的区间重叠」这件事，**靠时间戳是保证不了的**，必须**靠结构**保证。
+
+### C. 处置（结构性改法，不是调参）
+
+把「并发」从「靠时钟证明」改成「**靠共享标志位排定顺序**」：
+
+```
+holder:  BEGIN IMMEDIATE（取写锁）→ INSERT（成功）→ 置标志[1]
+         → 等标志[2]（waiter 已准备发起 INSERT）→ 才 COMMIT
+waiter:  等标志[1]（holder 已持锁）→ 置标志[2] → 才发起 INSERT
+         ⇒ 此刻它必然**阻塞在 holder 的写锁上** → holder 提交后被唯一索引拒绝
+```
+
+于是恒有 `holder.t0 < waiter.t0 < holder.t1` 且 `waiter.t1 > holder.t1`
+⇒ **区间重叠由构造保证**，与操作系统调度无关。
+时间戳同时改成**纳秒**（`process.hrtime.bigint()` 是 `CLOCK_MONOTONIC`，
+同一进程内的多个 worker 线程**基点相同** ⇒ 可直接跨线程比较），
+谓词改成 `a0 < b1 && b0 < a1`。
+
+### D. 实跑证据
+
+| 对照 | 结果 |
+|---|---|
+| 旧实现 · CPU 负载下 30 轮 | **失败 1 轮**，错误信息 `实际区间 36977315~36977315`（与最初现场**完全一致**） |
+| 旧实现 · 空闲 20 轮 | 失败 0 轮（说明是**负载相关**的偶发，不是每次必错） |
+| 新实现 · CPU 负载下 30 轮 | **失败 0 轮** |
+| 新实现 · 空闲 25 轮 | **失败 0 轮** |
+| 谓词判别性探针（4 个构造区间） | 旧谓词判错 **3/4**；新谓词 **0/4** |
+
+### E. 变异检验（本轮改的测试代码也要有牙）
+
+| 变异体 | 内容 | 结果 |
+|---|---|---|
+| **M1**（产品侧） | 删掉 `006_pools.sql` 里的 `CREATE UNIQUE INDEX ux_task_claims_active` | **杀** —— 3 条用例红（本条 + 「部分唯一索引挡住重复有效领取」+ 「task-claims 仓储」） |
+| **M3**（测试侧） | 把重叠断言改成恒假 | **杀** —— 本条用例红 |
+
+⇒ 本用例不是「恒绿摆设」：它**真的**依赖数据库的唯一索引，也**真的**在检查并发。
+
+### F. 处置后剩余的诚实边界
+
+1. 本用例现在**确定性地**制造并发（holder 持写锁时 waiter 发起 INSERT），
+   比原来「靠屏障祈祷它们撞上」**更强**，不是更弱。
+2. ⚠️ **holder 恒为赢家、waiter 恒为输家** —— 这是构造决定的，不是「谁快谁赢」。
+   本用例要验的是「**放行权在数据库，不在应用层**」，这个性质与谁赢无关。
+3. 本轮**没有**改动任何产品代码 —— 缺陷全在**测试的断言与并发构造**里。
+
+### G. 与既有台账的关系
+
+- 本轮**不**改 P5 Task 2 的原始规格块语义（Task 2 建立的用例名与目的不变），
+  只把**实现**换成结构化并发 ⇒ 计划块已按「真重写」口径**逐字同步**回本计划。
+- P5 Task 5 / Task 6 的台账（`T5-*` / `T6-*`）与本轮**无交叉**。
+
