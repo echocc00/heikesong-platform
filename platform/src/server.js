@@ -8,7 +8,10 @@ import { openDatabase } from './db/sqlite.js';
 import { applyMigrations } from './db/migrate.js';
 import { loadRules, validateRules } from './config.js';
 import { createRouter } from './http/router.js';
-import { json, error } from './http/respond.js';
+import { json, error, text } from './http/respond.js';
+import { registerWorkflowRoutes } from './http/routes/workflow.js';
+import { registerPoolsRoutes } from './http/routes/pools.js';
+import { registerPublicRoutes } from './http/routes/public.js';
 import { readJsonBody } from './http/body.js';
 import { serveStatic } from './http/static.js';
 import { parseSsePath, openSseStream, sendSseEvent, sendSseComment, reviewEvents } from './http/sse.js';
@@ -181,6 +184,11 @@ export function createApp({ db, rules, webDir }) {
     return { user: toPublicUser(user) };
   });
 
+  // ── P5 路由 ────────────────────────────────────────────────
+  registerWorkflowRoutes(router, { db, rules });
+  registerPoolsRoutes(router, { db, rules });
+  registerPublicRoutes(router, { db, rules });
+
   // ⛔ 预审修正（I7-1）：P0 原本**没有登录接口** → README 宣称的「能登录的空系统」不成立，
   //    Task 5 产出的 createSession 也没有任何调用方。补上登录/登出。
   router.add('POST', '/api/auth/login', async ({ body }) => {
@@ -320,6 +328,11 @@ export function createApp({ db, rules, webDir }) {
           can: (capability, c) => can(user, capability, c, db),
         };
         const result = await match.handler(ctx);
+        // 原文响应（.ics 等）：P0 的 handler 统一 json() 序列化，这里走 text()
+        if (result && typeof result === 'object' && result.__rawText === true) {
+          text(res, 200, String(result.body ?? ''), result.contentType || 'text/plain; charset=utf-8');
+          return;
+        }
         // ⛔ 预审修正（I7-4）：handler 返回约定 ——
         //   undefined → 200（保持原行为）；{ status, body }（可选 headers）→ 按返回值应答。
         if (result && typeof result === 'object' && typeof result.status === 'number') {
