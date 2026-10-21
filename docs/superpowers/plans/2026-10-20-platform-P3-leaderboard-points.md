@@ -3093,8 +3093,10 @@ function seed(db) {
            ('u_d','D队队员','13800000004','x','other',NULL,0,1,'${NOW}'),
            ('u_c','C队队长','13800000005','x','mba',NULL,0,1,'${NOW}'),
            ('u_j1','跨领域评委','13800000006','x','mba',NULL,0,1,'${NOW}');
+    -- ⚠️ 结束日推到 2099：让「当届」解析（pickCurrentEdition 取尚未结束的最早一届）
+    --    与真实日期无关 —— 否则这条用例会随日历过期而红。
     INSERT INTO editions (id, name, city, starts_at, ends_at, created_at)
-    VALUES ('ed_1','第一届','上海','2026-10-01','2026-10-31','${NOW}');
+    VALUES ('ed_1','第一届','上海','2026-10-01','2099-12-31','${NOW}');
     INSERT INTO cities (id, name, edition_id) VALUES ('c_1','上海','ed_1');
     INSERT INTO task_packages (id, edition_id, enterprise_id, enterprise_name, title, pain_point,
       expected_delivery, acceptance_criteria, grade, status, solvability_score, solvability_grade,
@@ -3266,6 +3268,73 @@ test('★ 战绩卡：里程碑勾选式 + 企业签字标识，不显示签字�
   assert.equal(data.items[0].signed, true, '有企业签字 → 标识为已签');
   assert.equal(data.items[0].signatory, undefined);
   assert.ok(!res.body.includes('A队队长'));
+  close(); rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('★ 段位榜 API：C 段及以上公示队名与名次，D 段不公示（非成员看不到）', async () => {
+  const { db, close, dataDir, app } = setup();
+  const res = await call(app, 'GET', '/api/leaderboard/tier?editionId=ed_1');
+  assert.equal(res.status, 200);
+  const data = JSON.parse(res.body);
+  assert.equal(data.scope, 'tier');
+  // 种子：t_a = A 段、t_c = C 段；t_b（无段位记录）与 t_d = D 段 → 不公示
+  assert.deepEqual(data.rows.map((r) => r.teamId), ['t_a', 't_c']);
+  assert.deepEqual(data.rows.map((r) => r.tierRank), [1, 2]);
+  assert.deepEqual(data.rows.map((r) => r.tier), ['A', 'C']);
+  assert.ok(!res.body.includes('D队'), 'D 段队名不得公示');
+  assert.ok(data.selfProgress === undefined, '非成员不该拿到任何人的进度卡');
+  close(); rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('★ 段位榜 API：本人看得到自己的 D 段进度卡（无名次、无队名）', async () => {
+  const { db, close, dataDir, app } = setup();
+  // 给 t_d 加一个「未签字的里程碑」→ 它仍是 D 段（不算达成），但进度卡要列出这条里程碑
+  db.prepare("INSERT INTO milestones (id, team_id, stage_id, key, label, counts_toward_tier, fixed_at, requires_signoff, created_at) VALUES ('ms_9','t_d',NULL,'problem_confirmed','企业问题确认',1,'${NOW}',1,'${NOW}')").run();
+  const res = await call(app, 'GET', '/api/leaderboard/tier?editionId=ed_1', { cookie: sessionCookie(db, 'u_d') });
+  assert.equal(res.status, 200);
+  const data = JSON.parse(res.body);
+  assert.ok(data.selfProgress, '本人应有进度卡');
+  assert.equal(data.selfProgress.teamId, 't_d');
+  assert.equal(data.selfProgress.tier, 'D');
+  assert.equal(data.selfProgress.teamName, undefined, '进度卡不公示队名');
+  assert.equal(data.selfProgress.tierRank, undefined, '进度卡不含名次（C-02）');
+  assert.ok(data.selfProgress.progress, '进度卡要带里程碑进度');
+  assert.equal(data.selfProgress.progress.milestones.length, 1, '进度卡要列出该队的里程碑清单');
+  assert.equal(data.selfProgress.progress.milestones[0].label, '企业问题确认');
+  assert.ok(!data.rows.some((r) => r.teamId === 't_d'), 'D 段队伍不进入榜单');
+  close(); rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('★ 段位榜排序：同段位时里程碑多的在前；兜底键是 team_id 码位序', async () => {
+  const { db, close, dataDir, app } = setup();
+  try {
+    // 三支 A 段队伍，两条不同的次级口径分别被钉住：
+    //   t_0a（1 个里程碑）→ 同段位时【里程碑多的在前】占优（t_a 3 > t_0a 1）
+    //   t_x （3 个里程碑）→ 与 t_a 完全同分 → 【team_id 码位序】占优（'t_a' < 't_x'）
+    // ⚠️ 三支的 created_at 都【早于】种子里的队伍 —— 这样「按入库顺序」的错误实现
+    //    会给出不同的名次，数据集才判别得出来。
+    db.prepare("INSERT INTO teams (id, edition_id, name, captain_id, task_package_id, tier, status, created_at) VALUES ('t_0a','ed_1','零A队','u_cap','tp_1','A','active','2026-10-15T00:00:00.000Z'), ('t_x','ed_1','X队','u_cap','tp_1','A','active','2026-10-16T00:00:00.000Z')").run();
+    db.prepare("INSERT INTO tier_records (id, team_id, tier, milestone_count, business_signoff_count, reasons_json, computed_at, deleted_at) VALUES ('tr_0a','t_0a','A',1,0,'[]','${NOW}',NULL), ('tr_x','t_x','A',3,0,'[]','${NOW}',NULL)").run();
+
+    const res = await call(app, 'GET', '/api/leaderboard/tier?editionId=ed_1');
+    assert.equal(res.status, 200);
+    const rows = JSON.parse(res.body).rows;
+    // 正确序：t_a（3 个里程碑，码位序也最前）→ t_x（3 个，同分靠码位序）→ t_0a（1 个）
+    assert.deepEqual(rows.map((r) => r.teamId).slice(0, 3), ['t_a', 't_x', 't_0a'], '同段位先比里程碑数，再按 team_id 码位序');
+    assert.deepEqual(rows.map((r) => r.tierRank).slice(0, 3), [1, 2, 3]);
+  } finally {
+    close(); rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('★ 届期缺省取当届（不带 editionId 也能拿到榜单 / 段位榜；显式传错 → 404）', async () => {
+  const { db, close, dataDir, app } = setup();
+  const rolling = await call(app, 'GET', '/api/leaderboard/rolling');
+  assert.equal(rolling.status, 200, '滚动总榜：缺省取当届');
+  const tier = await call(app, 'GET', '/api/leaderboard/tier');
+  assert.equal(tier.status, 200, '段位榜：缺省取当届');
+  const bad = await call(app, 'GET', '/api/leaderboard/tier?editionId=ed_nope');
+  assert.equal(bad.status, 404, '显式传了不存在的届期 → 404（资源不存在）');
   close(); rmSync(dataDir, { recursive: true, force: true });
 });
 
@@ -4139,8 +4208,10 @@ export function getPerformanceCard({ db, teamId, viewer = null, rules = null }) 
 import { AppError } from '../errors.js';
 import { getDefaultRules } from '../config.js';
 import { cmpStr } from '../domain/util.js';
+import { applyVisibility } from '../domain/visibility.js';
 import { randomUUID } from 'node:crypto';
 import { computeTier, applyTierDemotion, classifyDepartment, isDataOrPrototypeMilestone } from '../domain/tier.js';
+import { listTeamRows } from '../db/repo/teams.js';
 import * as repo from '../db/repo/leaderboard.js';
 import * as tierRepo from '../db/repo/tiers.js';
 
@@ -4186,6 +4257,52 @@ function tierBoardRank(db, team, order) {
   });
   const idx = board.findIndex((t) => t.team_id === team.id);
   return idx < 0 ? null : idx + 1;
+}
+
+/**
+ * 段位榜：C 段及以上公示队名与名次；D 段只给本人进度卡（冲突裁决 C-02）。
+ * ⛔ 可见性在 API 层过滤：本函数产出**原始 payload**，过滤交给 applyVisibility(scope='tier')。
+ *    —— 这也是 applyVisibility 里 `scope==='tier'` 分支的**唯一生产调用方**
+ *    （Task 7 台账 W26 发现：该分支当时零调用方，`viewerTeamIds` 在榜单服务里是死接线）。
+ * @param editionId 届期 id（由调用方解析：缺省取当届）
+ */
+export function getTierBoard({ db, editionId, viewer = null, rules = null }) {
+  const R = rules || getDefaultRules();
+  const order = (R.ranks?.tiers || []).map((t) => t.key);
+  const teams = listTeamRows(db, { editionId });
+  const records = new Map(tierRepo.listLatestTiersByEdition(db, editionId).map((r) => [r.team_id, r]));
+  const rows = teams.map((t) => {
+    const rec = records.get(t.id);
+    const milestones = tierRepo.listMilestonesByTeam(db, t.id);
+    return {
+      teamId: t.id,
+      teamName: t.name,
+      tier: rec?.tier ?? 'D',                 // 没有段位记录 = D 段（兜底口径）
+      tierRank: null,
+      milestoneCount: rec?.milestone_count ?? 0,
+      progress: {
+        milestones: milestones.map((m) => ({ key: m.key, label: m.label })),
+        milestoneCount: rec?.milestone_count ?? 0,
+      },
+    };
+  }).sort((a, b) => {
+    const ia = order.indexOf(a.tier);
+    const ib = order.indexOf(b.tier);
+    if (ia !== ib) return ib - ia;                    // 段位高的在前
+    if (a.milestoneCount !== b.milestoneCount) return b.milestoneCount - a.milestoneCount;
+    return cmpStr(a.teamId, b.teamId);                // 确定性兜底（不用随机 id）
+  });
+  rows.forEach((r, i) => { r.tierRank = i + 1; });
+  return applyVisibility({
+    payload: { scope: 'tier', editionId, rows, warnings: [] },
+    viewer,
+    visibilityConfig: R.visibility,
+    context: {
+      scope: 'tier',
+      viewerTeamIds: repo.listTeamIdsByUser(db, viewer?.id),
+      tierOrder: order,
+    },
+  });
 }
 
 /**
@@ -4308,26 +4425,36 @@ export function computeTeamTier({ db, teamId, now, rules = null, record = true }
 
 顶部 import 区追加：
 
+> ⚠️ **【不要】再 import 一次 AppError** —— server.js 第 20 行已有
+> `import { appError, AppError } from './errors.js';`。重复声明会让**整个模块加载失败**
+> （SyntaxError: Identifier 'AppError' has already been declared）→ 平台全挂（P3-23）。
+> ⚠️ 同时把 P1 的 `import { registerRegistrationRoutes } from './http/routes/registration.js';`
+> 改成 `import { registerRegistrationRoutes, pickCurrentEdition } from './http/routes/registration.js';`
+> （届期缺省解析要用 `pickCurrentEdition` —— P1 已导出它，改的是**引用**不是新增导出）。
+
 ```javascript
-// ⚠️ 【不要】再 import 一次 AppError —— server.js 第 20 行已有
-//    `import { appError, AppError } from './errors.js';`。重复声明会让**整个模块加载失败**
-//    （SyntaxError: Identifier 'AppError' has already been declared）→ 平台全挂（P3-23）。
 import { getLeaderboard, getRollingLeaderboard } from './services/leaderboard.js';
 import { getPerformanceCard } from './services/performance-card.js';
-import { getTeamTier } from './services/tier.js';
+import { getTeamTier, getTierBoard } from './services/tier.js';
+import { listEditions, getEdition } from './db/repo/editions.js';
 ```
 
 `createApp` 内、`router.add('GET', '/api/me', ...)` 之后追加：
 
 ```javascript
   // ── P3 榜单与积分 ───────────────────────────────────────────
-  // ⚠️ 路由顺序由 P0 的 router 按「参数段数量降序」排序：
-  //    /api/leaderboard/rolling（0 参）先于 /api/leaderboard/:stageId（1 参）匹配，
-  //    所以 "rolling" 不会被当成 stageId。
+  // ⚠️ 路由优先级由 P0 的 router **逐段比较**决定：静态段胜参数段
+  //    （P0 终审 C4-1 修的就是「比参数段个数」那个错版）。
+  //    ⇒ '/api/leaderboard/rolling' 与 '/api/leaderboard/tier' 都不会被
+  //    '/api/leaderboard/:stageId' 劫持。
   router.add('GET', '/api/leaderboard/rolling', async (ctx) => {
-    const editionId = ctx.query.editionId;
-    if (!editionId) throw new AppError(400, 'MISSING_PARAM', '缺少 editionId');
+    const editionId = resolveEditionId(ctx.db, ctx.query.editionId);
     return getRollingLeaderboard({ db: ctx.db, editionId, viewer: ctx.user, rules: ctx.rules });
+  });
+  // ⚠️ 静态段 'tier' 优先于参数段 ':stageId'（router 逐段比较：静态胜参数）
+  router.add('GET', '/api/leaderboard/tier', async (ctx) => {
+    const editionId = resolveEditionId(ctx.db, ctx.query.editionId);
+    return getTierBoard({ db: ctx.db, editionId, viewer: ctx.user, rules: ctx.rules });
   });
   router.add('GET', '/api/leaderboard/:stageId', async (ctx) => {
     const scope = ctx.query.scope || 'rank';
@@ -4343,7 +4470,7 @@ import { getTeamTier } from './services/tier.js';
 
 - [ ] **Step 7: 运行测试确认通过**
 
-Run: `cd platform && node --test test/leaderboard-service.test.js` → Expected: PASS（**19** 个测试全过：leaderboard-service.test.js 19 —— 规格自带 8 + 变异检验补测 7 + 规格缺陷补测 4）
+Run: `cd platform && node --test test/leaderboard-service.test.js` → Expected: PASS（**23** 个测试全过：leaderboard-service.test.js 23 —— 规格自带 8 + 变异检验补测 7 + 规格缺陷补测 4 + Task 8 补测 4）
 
 - [ ] **Step 8: 提交**
 
@@ -4359,6 +4486,7 @@ git commit -m "feat(P3): 榜单服务、战绩卡与 4 个榜单 API"
 **Files:**
 - Create: `platform/web/views/leaderboard.js`、`platform/web/views/tier.js`、`platform/web/views/card.js`、`platform/test/leaderboard-web.test.js`
 - Modify: `platform/web/app.js`（注册路由 + query 透传）、`platform/web/api.demo.js`（演示版补 P3 接口）
+- Modify（Task 7 建立的，本 Task 只追加）：`platform/src/services/tier.js`（新增 `getTierBoard`）、`platform/src/server.js`（新增 `/api/leaderboard/tier` 路由 + 届期缺省解析）、`platform/test/leaderboard-service.test.js`（段位榜与届期解析的用例）
 
 **Interfaces:**
 - Consumes: Task 7 的 4 个 API
@@ -4372,6 +4500,12 @@ git commit -m "feat(P3): 榜单服务、战绩卡与 4 个榜单 API"
 `platform/test/leaderboard-web.test.js`：
 
 ```javascript
+// platform/test/leaderboard-web.test.js —— P3 前端三页的渲染行为
+//
+// 规则溯源：
+//   - 「前端只渲染，不做过滤」→ 可见性在 API 层完成（设计文档 §6.6 / 冲突裁决 C-02）
+//   - 「降级告警置顶」→ S-5 / C-05：降级状态必须显式展示，不静默
+//   - 「队名必须转义」→ 设计文档 §14.2 + P0 终审 I-2（innerHTML 插值 = 存储型 XSS）
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -4412,13 +4546,20 @@ test('榜单渲染并列名次与积分；队名必须转义', () => {
 
 test('★ 段位榜：D 段不出现在榜单里；本人进度卡单独展示', () => {
   const html = tierHtml({
-    rows: [{ teamId: 't_s', teamName: 'S队', tier: 'S', tierRank: 1 }, { teamId: 't_a', teamName: 'A队', tier: 'A', tierRank: 2 }],
+    rows: [
+      { teamId: 't_s', teamName: 'S队', tier: 'S', tierRank: 1 },
+      { teamId: 't_a', teamName: 'A队', tier: 'A', tierRank: 2 },
+      // ⚠️ 队名同样可能带 HTML → 段位榜也必须转义
+      { teamId: 't_x', teamName: '<img src=x onerror=alert(1)>', tier: 'B', tierRank: 3 },
+    ],
     selfProgress: { teamId: 't_d', tier: 'D', progress: { milestones: [{ key: 'k', label: '企业问题确认' }] } },
   });
   assert.ok(html.includes('S队'));
   assert.ok(html.includes('A队'));
   assert.ok(!html.includes('D队'), 'D 段队名不得出现在段位榜');
   assert.ok(html.includes('本人进度'), 'D 段只给本人进度卡');
+  assert.ok(!html.includes('<img src=x'), '段位榜队名必须转义');
+  assert.ok(html.includes('&lt;img'));
 });
 
 test('★ 战绩卡：里程碑勾选式 + 企业签字标识，不出现签字人字段', () => {
@@ -4427,6 +4568,8 @@ test('★ 战绩卡：里程碑勾选式 + 企业签字标识，不出现签字�
     items: [
       { key: 'problem_confirmed', label: '企业问题确认', achieved: true, signed: true },
       { key: 'data_connected', label: '真实数据接入', achieved: false, signed: false },
+      // ⚠️ 里程碑标签也可能来自企业自定义 → 同样必须转义
+      { key: 'x', label: '<img src=x onerror=alert(1)>', achieved: false, signed: false },
     ],
     benefits: ['辅导期名额候选'], neverUnlocks: ['奖金', '决赛名次'],
   });
@@ -4436,6 +4579,8 @@ test('★ 战绩卡：里程碑勾选式 + 企业签字标识，不出现签字�
   assert.ok(!html.includes('signatory'), '不得渲染签字人字段');
   assert.ok(!html.includes('签字人'));
   assert.ok(html.includes('辅导期名额候选'));
+  assert.ok(!html.includes('<img src=x'), '里程碑标签必须转义');
+  assert.ok(html.includes('&lt;img'));
 });
 
 test('前端不做过滤：渲染函数只输出 API 给的数据', () => {
@@ -4447,6 +4592,38 @@ test('app.js 注册了榜单 / 段位 / 战绩卡路由', () => {
   assert.ok(src.includes("route('/leaderboard"), '缺榜单路由');
   assert.ok(src.includes("route('/tier"), '缺段位路由');
   assert.ok(src.includes("route('/card/:teamId'"), '缺战绩卡路由');
+});
+
+test('★ app.js 必须把路由参数与 query 透传给视图', () => {
+  const src = readFileSync(join(here, '..', 'web', 'app.js'), 'utf8');
+  assert.ok(src.includes('params: found.params'), '视图拿不到路由参数（stageId / teamId）');
+  assert.ok(src.includes('query: currentQuery()'), '视图拿不到 query（scope / editionId）');
+  assert.ok(src.includes('function currentQuery()'), '必须自己解析 hash 上的 query');
+});
+
+test('★ 演示版适配器：段位榜分支必须排在赛段榜分支之前', async () => {
+  const store = new Map();
+  globalThis.localStorage = {
+    getItem: (k) => (store.has(k) ? store.get(k) : null),
+    setItem: (k, v) => store.set(k, v),
+  };
+  const { api } = await import('../web/api.demo.js');
+  const tier = await api.get('/api/leaderboard/tier');
+  assert.equal(tier.scope, 'tier', '段位榜不能被赛段榜分支吃掉');
+  const rolling = await api.get('/api/leaderboard/rolling');
+  assert.equal(rolling.scope, 'rolling');
+  const stage = await api.get('/api/leaderboard/st_1?scope=business');
+  assert.equal(stage.scope, 'business');
+  const card = await api.get('/api/teams/t_a/performance-card');
+  assert.ok(Array.isArray(card.items), '战绩卡要有 items');
+});
+
+test('★ 转义必须复用 web/escape.js（全站唯一入口），视图不得各写一份', () => {
+  for (const f of ['leaderboard.js', 'tier.js', 'card.js']) {
+    const src = readFileSync(join(here, '..', 'web', 'views', f), 'utf8');
+    assert.ok(src.includes("from '../escape.js'"), `${f} 必须复用 web/escape.js`);
+    assert.ok(!/export function escapeHtml/.test(src), `${f} 不得重复定义 escapeHtml（会与 P0 的实现漂移）`);
+  }
 });
 ```
 
@@ -4462,11 +4639,10 @@ Run: `cd platform && node --test test/leaderboard-web.test.js` → Expected: FAI
 // web/views/leaderboard.js — 榜单页（A 榜 / B 榜 / 个人榜 + 滚动总榜）
 // ⛔ 前端只渲染，不做过滤：可见性已在 API 层完成。
 // ⛔ 降级告警置顶：P2 计算出的 warnings 显式展示在最上方，不静默（S-5 / C-05）。
-export function escapeHtml(s) {
-  return String(s ?? '').replace(/[&<>"']/g, (c) => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-  }[c]));
-}
+//
+// ⚠️ 转义统一走 `web/escape.js`（P0 建立，全站唯一入口）——
+//    这里**不重复定义** escapeHtml：三个视图各写一份会漂移，且漏改一处就是一处 XSS。
+import { escapeHtml } from '../escape.js';
 
 function warningsHtml(warnings) {
   const list = Array.isArray(warnings) ? warnings : [];
@@ -4508,7 +4684,10 @@ export function leaderboardHtml(model) {
   const body = scope === 'business' ? businessRowsHtml(model?.rows || [])
     : scope === 'personal' ? personalRowsHtml(model?.rows || [])
       : rankRowsHtml(model?.rows || []);
-  const title = scope === 'business' ? 'B 榜 · 商业战绩' : scope === 'personal' ? '个人积分榜' : 'A 榜 · 赛段名次';
+  const title = scope === 'business' ? 'B 榜 · 商业战绩'
+    : scope === 'personal' ? '个人积分榜'
+      : scope === 'rolling' ? '滚动总榜 · 全赛段累计'
+        : 'A 榜 · 赛段名次';
   return `<section class="board-view">${warningsHtml(model?.warnings)}<h2>${title}</h2>${body}</section>`;
 }
 
@@ -4516,11 +4695,13 @@ export function leaderboardHtml(model) {
 export async function renderLeaderboard(ctx) {
   const wrap = document.createElement('div');
   wrap.className = 'card';
-  const stageId = ctx.params?.stageId || ctx.getState().stageId || '';
+  const stageId = ctx.params?.stageId || '';
   const scope = ctx.query?.scope || 'rank';
+  // ⚠️ 届期缺省取「当届」由服务端解析（resolveEditionId），前端不必先查届期
+  const edition = ctx.query?.editionId ? `?editionId=${encodeURIComponent(ctx.query.editionId)}` : '';
   const url = stageId
     ? `/api/leaderboard/${encodeURIComponent(stageId)}?scope=${encodeURIComponent(scope)}`
-    : `/api/leaderboard/rolling?editionId=${encodeURIComponent(ctx.query?.editionId || ctx.getState().editionId || '')}`;
+    : `/api/leaderboard/rolling${edition}`;
   try {
     const data = await ctx.api.get(url);
     wrap.innerHTML = leaderboardHtml({ ...data, scope: stageId ? scope : 'rolling' });
@@ -4537,11 +4718,8 @@ export async function renderLeaderboard(ctx) {
 // web/views/tier.js — 段位榜
 // 依据：冲突裁决 C-02 —— C 段及以上公示队名与名次；D 段不公示排名，只给本人进度卡。
 // ⛔ 前端不隐藏 D 段，而是【不渲染】它：D 段根本不会出现在 API 返回的 rows 里。
-export function escapeHtml(s) {
-  return String(s ?? '').replace(/[&<>"']/g, (c) => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-  }[c]));
-}
+// ⚠️ 转义统一走 `web/escape.js`（P0 建立，全站唯一入口）。
+import { escapeHtml } from '../escape.js';
 
 export function tierHtml(model) {
   const rows = Array.isArray(model?.rows) ? model.rows : [];
@@ -4562,8 +4740,10 @@ export function tierHtml(model) {
 export async function renderTier(ctx) {
   const wrap = document.createElement('div');
   wrap.className = 'card';
+  // ⚠️ 届期缺省取「当届」由服务端解析（resolveEditionId）
+  const edition = ctx.query?.editionId ? `?editionId=${encodeURIComponent(ctx.query.editionId)}` : '';
   try {
-    wrap.innerHTML = tierHtml(await ctx.api.get('/api/leaderboard/tier'));
+    wrap.innerHTML = tierHtml(await ctx.api.get(`/api/leaderboard/tier${edition}`));
   } catch (e) {
     wrap.innerHTML = `<section class="tier-view"><p class="err">${escapeHtml(e.message)}</p></section>`;
   }
@@ -4576,11 +4756,9 @@ export async function renderTier(ctx) {
 ```javascript
 // web/views/card.js — 项目商业战绩卡
 // 依据：设计文档 §9「7 类里程碑勾选式 + 企业签字标识 + 不显示签字人」
-export function escapeHtml(s) {
-  return String(s ?? '').replace(/[&<>"']/g, (c) => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-  }[c]));
-}
+// ⛔ 不渲染签字人字段（企业签字不公开，R-ENT-04 / S10 §0.3）。
+// ⚠️ 转义统一走 `web/escape.js`（P0 建立，全站唯一入口）。
+import { escapeHtml } from '../escape.js';
 
 export function cardHtml(model) {
   const items = Array.isArray(model?.items) ? model.items : [];
@@ -4608,6 +4786,52 @@ export async function renderCard(ctx) {
   return wrap;
 }
 ```
+
+- [ ] **Step 3b: 补后端缺口 —— 段位榜接口 `GET /api/leaderboard/tier` + 届期缺省解析**
+
+> ⛔ **本步是实施时补的**：规格的 `tier.js` 视图写的是 `ctx.api.get('/api/leaderboard/tier')`，
+> 但 **Task 7 只建了 4 个接口**（`/api/leaderboard/:stageId`、`/api/leaderboard/rolling`、
+> `/api/teams/:id/performance-card`、`/api/teams/:id/tier`）—— **没有段位榜这个列表接口**。
+> 按规格原样落地 ⇒ 段位榜页必然 404（`/api/leaderboard/tier` 会被 `:stageId` 当成赛段 id 吃掉 → `STAGE_NOT_FOUND`）。
+> 与 Task 1 偏差表 3c 的「指向不存在实现的活引用」同款病根。
+>
+> **代码折叠**：本步的三处新增已并入 Task 7 的两个整文件块（**逐字等于实现**，不在此重复维护）：
+> ① `src/services/tier.js` → `getTierBoard({ db, editionId, viewer, rules })`
+> ② `src/server.js` → `router.add('GET', '/api/leaderboard/tier', ...)`
+> ③ `src/server.js` → `resolveEditionId(db, editionId)`（届期缺省取当届）
+> 见 **Task 7 Step 7 的代码块**。
+
+本步新增的届期解析辅助函数（放在 `createApp` 之前）：
+
+```javascript
+/**
+ * 届期解析：显式传了 → 不存在就 404；没传 → 取【当届】（与 /api/registration-criteria 同一口径）。
+ * ⚠️ 「当届」= 尚未结束（ends_at >= 今天）的最早一届，都没有就退回最后一届（pickCurrentEdition）。
+ *    理由：榜单 / 段位榜都是「本届」视图，前端不必先查一遍届期再传进来。
+ */
+function resolveEditionId(db, editionId) {
+  if (editionId) {
+    if (!getEdition(db, editionId)) throw new AppError(404, 'EDITION_NOT_FOUND', '届期不存在');
+    return editionId;
+  }
+  const edition = pickCurrentEdition(listEditions(db));
+  if (!edition) throw new AppError(404, 'EDITION_NOT_FOUND', '尚无届期');
+  return edition.id;
+}
+```
+
+>
+> **三条口径**（写在这里，代码块只落实现）：
+> 1. **段位榜的数据源** = 该届**全部队伍**的最新段位记录（`tier_records`；没有记录 = D 段兜底），
+>    排序 = 段位高 → 里程碑多 → `team_id` 码位序（确定性兜底）。
+> 2. **可见性在 API 层**：段位榜走 `applyVisibility({ scope: 'tier' })` ——
+>    **C 段及以上公示队名与名次；D 段只给本人进度卡（无名次、无队名）**（冲突裁决 C-02）。
+>    ⛔ 这条同时**补上了 Task 7 台账 W26 的发现**：`applyVisibility` 里 `scope==='tier'` 分支
+>    此前**零生产调用方**，`viewerTeamIds` 在榜单服务里是死接线 —— 本步把它接上。
+> 3. **届期缺省取当届**：`resolveEditionId` —— 显式传了但不存在 → 404；没传 → `pickCurrentEdition`
+>    （与 `/api/registration-criteria` 同一口径：尚未结束的最早一届）。
+>    ⚠️ **「当届」解析与真实日期有关** ⇒ 测试里把种子届期的 `ends_at` 推到 2099，
+>    否则那条用例会随日历过期而红。
 
 - [ ] **Step 4: 修改 web/app.js（注册路由 + query 透传）**
 
@@ -4640,15 +4864,23 @@ route('/card/:teamId', (c) => renderCard(c));
 在 `api.get` 里，把原来的 `if (path.startsWith('/api/leaderboard')) { return { rows: db.leaderboard || [], demo: true }; }` 替换为：
 
 ```javascript
+    // ⚠️ 顺序要紧：'tier' 必须排在 '/api/leaderboard/' 之前，
+    //    否则段位榜会拿到赛段榜的形状（前端渲染成空段位列）。
     if (path.startsWith('/api/leaderboard/rolling')) {
       return { scope: 'rolling', rows: db.leaderboard || [], demo: true };
+    }
+    if (path.startsWith('/api/leaderboard/tier')) {
+      return { scope: 'tier', rows: db.tiers || [], demo: true };
     }
     if (path.startsWith('/api/leaderboard/')) {
       const scope = new URL(path, 'http://x').searchParams.get('scope') || 'rank';
       return { scope, rows: db.leaderboard || [], warnings: db.warnings || [], demo: true };
     }
     if (path.endsWith('/performance-card')) {
-      return { teamName: '演示战队', tier: 'A', items: db.milestones || [], benefits: [], neverUnlocks: ['奖金', '决赛名次'], demo: true };
+      return {
+        teamName: '演示战队', tier: 'A', items: db.milestones || [],
+        benefits: [], neverUnlocks: ['奖金', '决赛名次'], demo: true,
+      };
     }
     if (path.endsWith('/tier')) {
       return { rows: db.tiers || [], demo: true };
@@ -4657,17 +4889,17 @@ route('/card/:teamId', (c) => renderCard(c));
 
 - [ ] **Step 6: 运行测试确认通过**
 
-Run: `cd platform && node --test test/leaderboard-web.test.js` → Expected: PASS（6 个测试全过：leaderboard-web.test.js 6）
+Run: `cd platform && node --test test/leaderboard-web.test.js` → Expected: PASS（**9** 个测试全过：leaderboard-web.test.js 9 —— 规格自带 6 + 转义复用补测 1 + 透传/演示适配器补测 2）
 
 - [ ] **Step 7: 全量回归**
 
-Run: `cd platform && node --test` → Expected: 全部通过（P0–P3 的全部用例）
+Run: `cd platform && node --test` → Expected: 全部通过（P0–P3 的全部用例，**690/690**）
 Run: `cd platform && node scripts/migrate.js` → Expected: 输出 `迁移完成，当前版本 4`
 
 - [ ] **Step 8: 提交**
 
 ```bash
-cd platform && git add web test/leaderboard-web.test.js
+cd platform && git add web src/services/tier.js src/server.js test/leaderboard-web.test.js test/leaderboard-service.test.js
 git commit -m "feat(P3): 榜单页、段位榜与战绩卡前端"
 ```
 
@@ -5026,3 +5258,55 @@ points **27**（Task 3 的 24 + Task 7 补测 3）；leaderboard-migration **16*
 
 **最终结果**：变异体 40 → **KILLED 37 / 等价变异体 3 / 有效缺口 0**；
 `leaderboard-service.test.js` **19/19**、`points.test.js` **27/27**、`leaderboard-migration.test.js` **16/16**；P3 全量 **677/677**。
+
+---
+
+## Task 8 父代理预审修正台账（2026-10-21）
+
+> Task 8 是**前端三页**（榜单 / 段位榜 / 战绩卡）的落地，也是 P3 阶段的**回归验收**。
+> 实施前把规格的代码块抽到 `/tmp` 的独立工程实跑（**先跑后派**）——
+> 规格自带的**前端视图能跑，但段位榜页必然 404**：规格写的是 `ctx.api.get('/api/leaderboard/tier')`，
+> 而 Task 7 只建了 4 个接口，**没有段位榜这个列表接口**。
+> 变异体 **26** 个 → **KILLED 26 / 等价 0 / 有效缺口 0**。
+
+### 一、预审发现的规格缺陷
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| **P3-29** | **Critical** | **规格引用了一个【不存在的接口】** —— `web/views/tier.js` 写 `ctx.api.get('/api/leaderboard/tier')`，但 Task 7 只建了 4 个 API（`/api/leaderboard/:stageId`、`/api/leaderboard/rolling`、`/api/teams/:id/performance-card`、`/api/teams/:id/tier`）—— **没有段位榜列表接口**。按规格原样落地 ⇒ `/api/leaderboard/tier` 被 `/api/leaderboard/:stageId` 当成赛段 id 吃掉 → `404 STAGE_NOT_FOUND` ⇒ **段位榜页永远打不开** | 实跑：按规格落地后 `GET /api/leaderboard/tier` → **404**（`'tier'` 被当成 stageId）。与 Task 1 偏差表 3c 的「指向不存在实现的活引用」同款病根 —— **规格里的接口调用必须逐个对回 Task 7 的路由表** | 补三处：① 服务层 `getTierBoard({ db, editionId, viewer, rules })`（`src/services/tier.js`）；② 路由 `GET /api/leaderboard/tier`（静态段胜参数段 ⇒ 不会被 `:stageId` 劫持）；③ 届期缺省解析 `resolveEditionId`。**这一步同时补上了 Task 7 台账 W26 的发现** —— `applyVisibility` 的 `scope==='tier'` 分支此前**零生产调用方**，现在它是段位榜的唯一过滤入口 |
+| **P3-30** | **Important** | **三个视图各自重写一份 `escapeHtml`** —— 规格把 `escapeHtml` 的实现复制进 `leaderboard.js` / `tier.js` / `card.js` 三处，而 P0 早就建立了全站唯一的 `web/escape.js`（终审 I-2 就是为了收口转义） | 代码对照：`web/escape.js`（P0）vs 规格三份拷贝 —— 内容相同但**会漂移**：将来改一处漏两处就是两处 XSS | 三份拷贝全删，改成 `import { escapeHtml } from '../escape.js';`。补一条用例用**源码扫描**钉住「视图不得重复定义 escapeHtml」 |
+| **P3-31** | **Important** | **演示适配器的分支顺序有坑** —— 规格的 `api.demo.js` 只加了 `'/api/leaderboard/rolling'` 与 `'/api/leaderboard/'` 两个分支 ⇒ `GET /api/leaderboard/tier` 会落进**赛段榜**分支，返回 `{scope:'rank', rows: db.leaderboard}` ⇒ 段位榜渲染成空榜 | 实跑：按规格落地后演示版的段位榜拿到的是赛段榜数据 | 补 `'/api/leaderboard/tier'` 分支，**且必须排在 `'/api/leaderboard/'` 之前**（前缀匹配，顺序即语义）。补一条用例直接调演示适配器断言三个接口各自的 `scope` |
+| **P3-32** | Minor | **届期必填 ⇒ 前端得先查一遍届期** —— 规格的 `/api/leaderboard/rolling` 缺 `editionId` 就 400，而前端 store 里**根本没有 `editionId`**（`getState().editionId` 恒 `undefined`）⇒ 滚动总榜页永远 400 | 实跑：规格的 `renderLeaderboard` 取 `ctx.getState().editionId` —— store 只有 `user` 等字段 | ① 服务端加 `resolveEditionId`：显式传了但不存在 → **404**；没传 → **取当届**（`pickCurrentEdition`，与 `/api/registration-criteria` 同一口径）；② 滚动总榜与段位榜**都**改成缺省取当届；③ 前端不再需要知道届期。⚠️ **「当届」与真实日期有关** ⇒ 测试里把种子届期的 `ends_at` 推到 2099，否则那条用例会随日历过期而红 |
+| **P3-33** | Minor | **server.js 里的路由注释是过时的** —— 注释写「路由顺序由 P0 的 router 按『参数段数量降序』排序」，但 P0 的 router 早就在终审 C4-1 改成**逐段比较（静态段胜参数段）** | 代码对照：`src/http/router.js` 的注释与实现都是「逐段比较」 | 注释改成实际口径（并说明 `rolling` / `tier` 两个静态段为什么不会被 `:stageId` 劫持）。⚠️ **注释写错比不写更坏**：下一个人会照着错注释去推理路由优先级 |
+
+### 二、变异检验
+
+> 变异体 **26** 个（段位榜的段位来源 / 兜底口径 / 排序两级口径 / 可见性 scope / 本人队伍识别 /
+> 进度卡内容 / 名次赋值 / 段位榜路由 / 届期解析两项 / 三个视图的转义与置顶与空态与已签标识 /
+> app.js 的路由注册与参数透传 / 演示适配器的分支顺序与 scope 解析），
+> 在 `/tmp` 副本上跑 `leaderboard-web.test.js` + `leaderboard-service.test.js`，**测试必须失败才算杀灭**。
+> 变异脚本：`/tmp/p3t8/mutate.mjs`。
+
+**首轮 8 条存活 + 2 条构造失败**，三条根因：
+
+| 现象 | 根因 | 处置 |
+|---|---|---|
+| Y18/Y20/Y23/Y24/Y25/Y26 存活 | **变异脚本指向的是仓库里【没同步】的测试文件** —— 判别性断言只加在 `/tmp` 沙箱里，仓库的测试还是旧版 ⇒ 「存活」是假象 | 先把测试同步进仓库再复跑（Task 5 首轮踩过同款坑：*变异脚本必须指向已落地的测试文件*） |
+| Y04/Y05 存活 | **判别性数据造得不够狠** —— 「同段位比里程碑数」和「team_id 码位序兜底」两条口径，在「DB 入库顺序 == 正确顺序」时**结果一致** | 让三支 A 段队伍的 `created_at` **早于**种子队伍：`t_a`（3 个里程碑）、`t_x`（3 个，码位序在 `t_a` 之后）、`t_0a`（1 个）。正确序 = `t_a → t_x → t_0a`；去掉「比里程碑数」⇒ `t_x → t_a → t_0a`；去掉「码位序兜底」⇒ 同样变成 `t_x → t_a → t_0a`。**探针实证**（`/tmp/p3t8cmp-*`）：原始实现 `[t_a, t_x, t_0a]`，变异实现 `[t_x, t_a, t_0a]` —— 两条口径各被一条断言钉住 |
+| Y03/Y08 构造失败 | 锚点命中 2 次（`getTierBoard` 与旧的 `tierBoardRank` 里有**同文**的排序行） | 锚点加长到带下一行上下文（`if (a.milestoneCount !== ...)`），把两处区分开 |
+| Y08 存活（补测后） | 「进度卡不带里程碑清单」改成空数组后**形状没变**（还是数组），断言只查了类型 | 断言改成查**内容**：给 `t_d` 加一条未签字的里程碑（仍是 D 段，但清单里要有它）⇒ `milestones.length === 1` |
+
+**Task 8 的测试条数口径**：leaderboard-web **9**（规格自带 6 + 转义复用补测 1 + 透传/演示适配器补测 2）；
+leaderboard-service **23**（Task 7 的 19 + Task 8 补测 4）。
+
+**最终结果**：变异体 26 → **KILLED 26 / 等价变异体 0 / 有效缺口 0**；
+`leaderboard-web.test.js` **9/9**、`leaderboard-service.test.js` **23/23**；P3 全量 **690/690**；
+`node scripts/migrate.js` 输出 `迁移完成，当前版本 4`。
+
+### 三、已知限制（明确不在本阶段解决）
+
+| # | 限制 | 说明 |
+|---|---|---|
+| 1 | **赛段名册仍是届期级** | `stage_team` 表在 P3 建好了（Task 1 兑现 D-33），但**没有写入流程** —— 名册的登记时机（赛段开启时把该届参赛队登记进来）属 **P5 的工作流**。当前赛段榜按「该赛段有成绩的队」判定，外队理论上仍可能进榜 |
+| 2 | **段位榜不公示 D 段队伍的队名与名次** | 冲突裁决 C-02 的直接落地；D 段只有本人能看到进度卡。**段位公示的「谁在 D 段」信息不外泄** |
+| 3 | **滚动总榜与段位榜的届期缺省取「当届」** | 想看历史届期要显式传 `?editionId=`；显式传了不存在的届期 → 404 |

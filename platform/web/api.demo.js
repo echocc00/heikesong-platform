@@ -16,8 +16,26 @@ export const api = {
     if (path === '/api/me') {
       return db.me ? { user: db.me } : (() => { throw Object.assign(new Error('未登录'), { status: 401 }); })();
     }
-    if (path.startsWith('/api/leaderboard')) {
-      return { rows: db.leaderboard || [], demo: true };
+    // ⚠️ 顺序要紧：'tier' 必须排在 '/api/leaderboard/' 之前，
+    //    否则段位榜会拿到赛段榜的形状（前端渲染成空段位列）。
+    if (path.startsWith('/api/leaderboard/rolling')) {
+      return { scope: 'rolling', rows: db.leaderboard || [], demo: true };
+    }
+    if (path.startsWith('/api/leaderboard/tier')) {
+      return { scope: 'tier', rows: db.tiers || [], demo: true };
+    }
+    if (path.startsWith('/api/leaderboard/')) {
+      const scope = new URL(path, 'http://x').searchParams.get('scope') || 'rank';
+      return { scope, rows: db.leaderboard || [], warnings: db.warnings || [], demo: true };
+    }
+    if (path.endsWith('/performance-card')) {
+      return {
+        teamName: '演示战队', tier: 'A', items: db.milestones || [],
+        benefits: [], neverUnlocks: ['奖金', '决赛名次'], demo: true,
+      };
+    }
+    if (path.endsWith('/tier')) {
+      return { rows: db.tiers || [], demo: true };
     }
     throw Object.assign(new Error(`演示版未实现该接口：${path}`), { status: 404 });
   },

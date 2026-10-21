@@ -5,6 +5,9 @@ import { renderLogin } from './views/login.js';
 import { renderRegistration } from './views/registration.js';
 import { renderTeam } from './views/team.js';
 import { renderAdminRegistration } from './views/admin-registration.js';
+import { renderLeaderboard } from './views/leaderboard.js';
+import { renderTier } from './views/tier.js';
+import { renderCard } from './views/card.js';
 import { escapeHtml } from './escape.js';
 
 // 演示版：?demo=1 时用 localStorage 适配器；正式版走真实 API。
@@ -18,6 +21,13 @@ route('/logout', () => renderLogout());
 route('/apply', () => renderRegistration(ctx));
 route('/team', () => renderTeam(ctx));
 route('/admin/registration', () => renderAdminRegistration(ctx));
+// P3 三页：榜单（A 榜 / B 榜 / 个人榜 + 滚动总榜）/ 段位榜 / 战绩卡
+// ⚠️ 前端路由是**注册顺序**先匹配（不像服务端 router 那样排序），
+//    但 '/leaderboard' 与 '/leaderboard/:stageId' 的正则互斥，顺序不影响结果。
+route('/leaderboard', (c) => renderLeaderboard(c));
+route('/leaderboard/:stageId', (c) => renderLeaderboard(c));
+route('/tier', (c) => renderTier(c));
+route('/card/:teamId', (c) => renderCard(c));
 
 function renderHome() {
   const el = document.createElement('div');
@@ -63,6 +73,12 @@ async function restoreSession() {
   }
 }
 
+/** 当前 hash 上的 query（router.match 会把 '?xxx' 剥掉再匹配，所以要自己解析） */
+function currentQuery() {
+  const q = currentPath().split('?')[1] || '';
+  return Object.fromEntries(new URLSearchParams(q));
+}
+
 async function render() {
   const app = document.getElementById('app');
   const found = match(currentPath());
@@ -71,7 +87,10 @@ async function render() {
     return;
   }
   try {
-    const el = await found.view(ctx);
+    // ⚠️ 路由参数与 query 必须透传给视图：P3 的视图要靠 params.stageId / params.teamId
+    //    决定请求哪个赛段 / 哪支队伍，靠 query.scope / query.editionId 决定口径与届期。
+    //    P0 原来只传 ctx —— 视图拿不到参数（前端 router.match 会把 '?query' 剥掉再匹配）。
+    const el = await found.view({ ...ctx, params: found.params, query: currentQuery() });
     app.replaceChildren(el);
   } catch (e) {
     app.innerHTML = `<div class="card err">${escapeHtml(e.message)}</div>`;

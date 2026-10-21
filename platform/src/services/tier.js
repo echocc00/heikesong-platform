@@ -3,8 +3,10 @@
 import { AppError } from '../errors.js';
 import { getDefaultRules } from '../config.js';
 import { cmpStr } from '../domain/util.js';
+import { applyVisibility } from '../domain/visibility.js';
 import { randomUUID } from 'node:crypto';
 import { computeTier, applyTierDemotion, classifyDepartment, isDataOrPrototypeMilestone } from '../domain/tier.js';
+import { listTeamRows } from '../db/repo/teams.js';
 import * as repo from '../db/repo/leaderboard.js';
 import * as tierRepo from '../db/repo/tiers.js';
 
@@ -50,6 +52,52 @@ function tierBoardRank(db, team, order) {
   });
   const idx = board.findIndex((t) => t.team_id === team.id);
   return idx < 0 ? null : idx + 1;
+}
+
+/**
+ * 段位榜：C 段及以上公示队名与名次；D 段只给本人进度卡（冲突裁决 C-02）。
+ * ⛔ 可见性在 API 层过滤：本函数产出**原始 payload**，过滤交给 applyVisibility(scope='tier')。
+ *    —— 这也是 applyVisibility 里 `scope==='tier'` 分支的**唯一生产调用方**
+ *    （Task 7 台账 W26 发现：该分支当时零调用方，`viewerTeamIds` 在榜单服务里是死接线）。
+ * @param editionId 届期 id（由调用方解析：缺省取当届）
+ */
+export function getTierBoard({ db, editionId, viewer = null, rules = null }) {
+  const R = rules || getDefaultRules();
+  const order = (R.ranks?.tiers || []).map((t) => t.key);
+  const teams = listTeamRows(db, { editionId });
+  const records = new Map(tierRepo.listLatestTiersByEdition(db, editionId).map((r) => [r.team_id, r]));
+  const rows = teams.map((t) => {
+    const rec = records.get(t.id);
+    const milestones = tierRepo.listMilestonesByTeam(db, t.id);
+    return {
+      teamId: t.id,
+      teamName: t.name,
+      tier: rec?.tier ?? 'D',                 // 没有段位记录 = D 段（兜底口径）
+      tierRank: null,
+      milestoneCount: rec?.milestone_count ?? 0,
+      progress: {
+        milestones: milestones.map((m) => ({ key: m.key, label: m.label })),
+        milestoneCount: rec?.milestone_count ?? 0,
+      },
+    };
+  }).sort((a, b) => {
+    const ia = order.indexOf(a.tier);
+    const ib = order.indexOf(b.tier);
+    if (ia !== ib) return ib - ia;                    // 段位高的在前
+    if (a.milestoneCount !== b.milestoneCount) return b.milestoneCount - a.milestoneCount;
+    return cmpStr(a.teamId, b.teamId);                // 确定性兜底（不用随机 id）
+  });
+  rows.forEach((r, i) => { r.tierRank = i + 1; });
+  return applyVisibility({
+    payload: { scope: 'tier', editionId, rows, warnings: [] },
+    viewer,
+    visibilityConfig: R.visibility,
+    context: {
+      scope: 'tier',
+      viewerTeamIds: repo.listTeamIdsByUser(db, viewer?.id),
+      tierOrder: order,
+    },
+  });
 }
 
 /**

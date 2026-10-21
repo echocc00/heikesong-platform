@@ -26,8 +26,10 @@ function seed(db) {
            ('u_d','D队队员','13800000004','x','other',NULL,0,1,'${NOW}'),
            ('u_c','C队队长','13800000005','x','mba',NULL,0,1,'${NOW}'),
            ('u_j1','跨领域评委','13800000006','x','mba',NULL,0,1,'${NOW}');
+    -- ⚠️ 结束日推到 2099：让「当届」解析（pickCurrentEdition 取尚未结束的最早一届）
+    --    与真实日期无关 —— 否则这条用例会随日历过期而红。
     INSERT INTO editions (id, name, city, starts_at, ends_at, created_at)
-    VALUES ('ed_1','第一届','上海','2026-10-01','2026-10-31','${NOW}');
+    VALUES ('ed_1','第一届','上海','2026-10-01','2099-12-31','${NOW}');
     INSERT INTO cities (id, name, edition_id) VALUES ('c_1','上海','ed_1');
     INSERT INTO task_packages (id, edition_id, enterprise_id, enterprise_name, title, pain_point,
       expected_delivery, acceptance_criteria, grade, status, solvability_score, solvability_grade,
@@ -199,6 +201,73 @@ test('★ 战绩卡：里程碑勾选式 + 企业签字标识，不显示签字�
   assert.equal(data.items[0].signed, true, '有企业签字 → 标识为已签');
   assert.equal(data.items[0].signatory, undefined);
   assert.ok(!res.body.includes('A队队长'));
+  close(); rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('★ 段位榜 API：C 段及以上公示队名与名次，D 段不公示（非成员看不到）', async () => {
+  const { db, close, dataDir, app } = setup();
+  const res = await call(app, 'GET', '/api/leaderboard/tier?editionId=ed_1');
+  assert.equal(res.status, 200);
+  const data = JSON.parse(res.body);
+  assert.equal(data.scope, 'tier');
+  // 种子：t_a = A 段、t_c = C 段；t_b（无段位记录）与 t_d = D 段 → 不公示
+  assert.deepEqual(data.rows.map((r) => r.teamId), ['t_a', 't_c']);
+  assert.deepEqual(data.rows.map((r) => r.tierRank), [1, 2]);
+  assert.deepEqual(data.rows.map((r) => r.tier), ['A', 'C']);
+  assert.ok(!res.body.includes('D队'), 'D 段队名不得公示');
+  assert.ok(data.selfProgress === undefined, '非成员不该拿到任何人的进度卡');
+  close(); rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('★ 段位榜 API：本人看得到自己的 D 段进度卡（无名次、无队名）', async () => {
+  const { db, close, dataDir, app } = setup();
+  // 给 t_d 加一个「未签字的里程碑」→ 它仍是 D 段（不算达成），但进度卡要列出这条里程碑
+  db.prepare("INSERT INTO milestones (id, team_id, stage_id, key, label, counts_toward_tier, fixed_at, requires_signoff, created_at) VALUES ('ms_9','t_d',NULL,'problem_confirmed','企业问题确认',1,'${NOW}',1,'${NOW}')").run();
+  const res = await call(app, 'GET', '/api/leaderboard/tier?editionId=ed_1', { cookie: sessionCookie(db, 'u_d') });
+  assert.equal(res.status, 200);
+  const data = JSON.parse(res.body);
+  assert.ok(data.selfProgress, '本人应有进度卡');
+  assert.equal(data.selfProgress.teamId, 't_d');
+  assert.equal(data.selfProgress.tier, 'D');
+  assert.equal(data.selfProgress.teamName, undefined, '进度卡不公示队名');
+  assert.equal(data.selfProgress.tierRank, undefined, '进度卡不含名次（C-02）');
+  assert.ok(data.selfProgress.progress, '进度卡要带里程碑进度');
+  assert.equal(data.selfProgress.progress.milestones.length, 1, '进度卡要列出该队的里程碑清单');
+  assert.equal(data.selfProgress.progress.milestones[0].label, '企业问题确认');
+  assert.ok(!data.rows.some((r) => r.teamId === 't_d'), 'D 段队伍不进入榜单');
+  close(); rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('★ 段位榜排序：同段位时里程碑多的在前；兜底键是 team_id 码位序', async () => {
+  const { db, close, dataDir, app } = setup();
+  try {
+    // 三支 A 段队伍，两条不同的次级口径分别被钉住：
+    //   t_0a（1 个里程碑）→ 同段位时【里程碑多的在前】占优（t_a 3 > t_0a 1）
+    //   t_x （3 个里程碑）→ 与 t_a 完全同分 → 【team_id 码位序】占优（'t_a' < 't_x'）
+    // ⚠️ 三支的 created_at 都【早于】种子里的队伍 —— 这样「按入库顺序」的错误实现
+    //    会给出不同的名次，数据集才判别得出来。
+    db.prepare("INSERT INTO teams (id, edition_id, name, captain_id, task_package_id, tier, status, created_at) VALUES ('t_0a','ed_1','零A队','u_cap','tp_1','A','active','2026-10-15T00:00:00.000Z'), ('t_x','ed_1','X队','u_cap','tp_1','A','active','2026-10-16T00:00:00.000Z')").run();
+    db.prepare("INSERT INTO tier_records (id, team_id, tier, milestone_count, business_signoff_count, reasons_json, computed_at, deleted_at) VALUES ('tr_0a','t_0a','A',1,0,'[]','${NOW}',NULL), ('tr_x','t_x','A',3,0,'[]','${NOW}',NULL)").run();
+
+    const res = await call(app, 'GET', '/api/leaderboard/tier?editionId=ed_1');
+    assert.equal(res.status, 200);
+    const rows = JSON.parse(res.body).rows;
+    // 正确序：t_a（3 个里程碑，码位序也最前）→ t_x（3 个，同分靠码位序）→ t_0a（1 个）
+    assert.deepEqual(rows.map((r) => r.teamId).slice(0, 3), ['t_a', 't_x', 't_0a'], '同段位先比里程碑数，再按 team_id 码位序');
+    assert.deepEqual(rows.map((r) => r.tierRank).slice(0, 3), [1, 2, 3]);
+  } finally {
+    close(); rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('★ 届期缺省取当届（不带 editionId 也能拿到榜单 / 段位榜；显式传错 → 404）', async () => {
+  const { db, close, dataDir, app } = setup();
+  const rolling = await call(app, 'GET', '/api/leaderboard/rolling');
+  assert.equal(rolling.status, 200, '滚动总榜：缺省取当届');
+  const tier = await call(app, 'GET', '/api/leaderboard/tier');
+  assert.equal(tier.status, 200, '段位榜：缺省取当届');
+  const bad = await call(app, 'GET', '/api/leaderboard/tier?editionId=ed_nope');
+  assert.equal(bad.status, 404, '显式传了不存在的届期 → 404（资源不存在）');
   close(); rmSync(dataDir, { recursive: true, force: true });
 });
 

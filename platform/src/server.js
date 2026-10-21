@@ -18,13 +18,14 @@ import { verifyPassword, hashPassword } from './auth/password.js';
 import { getUserById, getCredentialsByPhone, toPublicUser } from './db/repo/users.js';
 import { getStage, getStageJudge } from './db/repo/stages.js';
 import { appError, AppError } from './errors.js';
-import { registerRegistrationRoutes } from './http/routes/registration.js';
+import { registerRegistrationRoutes, pickCurrentEdition } from './http/routes/registration.js';
 import { registerTaskPackageRoutes } from './http/routes/taskPackage.js';
 import { registerTeamRoutes } from './http/routes/team.js';
 import { registerReviewRoutes } from './http/routes/review.js';
 import { getLeaderboard, getRollingLeaderboard } from './services/leaderboard.js';
 import { getPerformanceCard } from './services/performance-card.js';
-import { getTeamTier } from './services/tier.js';
+import { getTeamTier, getTierBoard } from './services/tier.js';
+import { listEditions, getEdition } from './db/repo/editions.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -92,6 +93,21 @@ export function domainCode(err, fallback) {
   return fallback;
 }
 
+/**
+ * 届期解析：显式传了 → 不存在就 404；没传 → 取【当届】（与 /api/registration-criteria 同一口径）。
+ * ⚠️ 「当届」= 尚未结束（ends_at >= 今天）的最早一届，都没有就退回最后一届（pickCurrentEdition）。
+ *    理由：榜单 / 段位榜都是「本届」视图，前端不必先查一遍届期再传进来。
+ */
+function resolveEditionId(db, editionId) {
+  if (editionId) {
+    if (!getEdition(db, editionId)) throw new AppError(404, 'EDITION_NOT_FOUND', '届期不存在');
+    return editionId;
+  }
+  const edition = pickCurrentEdition(listEditions(db));
+  if (!edition) throw new AppError(404, 'EDITION_NOT_FOUND', '尚无届期');
+  return edition.id;
+}
+
 export function createApp({ db, rules, webDir }) {
   // ⛔ 评审修正（Important）：webDir 缺失必须在**构造期**就拒绝。
   //    原来它在第一个静态请求上才炸（serveStatic 在 try/catch 之外）→
@@ -121,13 +137,18 @@ export function createApp({ db, rules, webDir }) {
   router.add('GET', '/api/health', async () => ({ ok: true, at: new Date().toISOString() }));
 
   // ── P3 榜单与积分 ───────────────────────────────────────────
-  // ⚠️ 路由顺序由 P0 的 router 按「参数段数量降序」排序：
-  //    /api/leaderboard/rolling（0 参）先于 /api/leaderboard/:stageId（1 参）匹配，
-  //    所以 "rolling" 不会被当成 stageId。
+  // ⚠️ 路由优先级由 P0 的 router **逐段比较**决定：静态段胜参数段
+  //    （P0 终审 C4-1 修的就是「比参数段个数」那个错版）。
+  //    ⇒ '/api/leaderboard/rolling' 与 '/api/leaderboard/tier' 都不会被
+  //    '/api/leaderboard/:stageId' 劫持。
   router.add('GET', '/api/leaderboard/rolling', async (ctx) => {
-    const editionId = ctx.query.editionId;
-    if (!editionId) throw new AppError(400, 'MISSING_PARAM', '缺少 editionId');
+    const editionId = resolveEditionId(ctx.db, ctx.query.editionId);
     return getRollingLeaderboard({ db: ctx.db, editionId, viewer: ctx.user, rules: ctx.rules });
+  });
+  // ⚠️ 静态段 'tier' 优先于参数段 ':stageId'（router 逐段比较：静态胜参数）
+  router.add('GET', '/api/leaderboard/tier', async (ctx) => {
+    const editionId = resolveEditionId(ctx.db, ctx.query.editionId);
+    return getTierBoard({ db: ctx.db, editionId, viewer: ctx.user, rules: ctx.rules });
   });
   router.add('GET', '/api/leaderboard/:stageId', async (ctx) => {
     const scope = ctx.query.scope || 'rank';
