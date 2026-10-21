@@ -1,0 +1,31 @@
+{
+  "id": "points",
+  "version": "2026-10-20",
+  "source": "任务书 §七 + S10 §3.3",
+  "stagePoints": [10, 8, 5],
+  "stagePointsOnlyTopN": 3,
+  "mvp": { "stagesCounted": 4, "roadshowWeight": 1.0, "perPackage": 1 },
+  "personal": { "lifetime": true, "includeMvpVote": true },
+  "tieRankStyle": "1224",
+  "prizeStructure": {
+    "resourceToCashRatio": 1.55,
+    "source": "R-OPS-12：顶层文档 §3.1 S8「以试点合同/客户资源/现金为主，荣誉类边际效用低；资源:现金 ≈ 1:1.55（CICC 实测）」",
+    "note": "资源与现金的相对配比。⚠️ 具体金额未定（首届奖金总额由组委会拍板），此处只存配比与口径，金额由调用方传入 computePrizeShares 的 prizeTable。⛔ 段位权益【不解锁】任何现金（R-PTS-05）。"
+  },
+  "demoDayAudienceVote": {
+    "enabled": false,
+    "weight": null,
+    "status": "待组委会确认",
+    "source": "R-OPS-11：顶层文档 §3.1 S12「线上公开路演 + 企业/投资方在线 + 观众投票权重」",
+    "note": "⚠️ 观众票与评审分如何合成，S7 §3.1 的总分公式**没有**这一项 —— 权重取多少、观众票是否进 A 榜、是否只作参考分，目前【无规则依据】。因此本阶段【只占位不启用】：enabled=false 且 weight=null，代码路径存在但恒不生效。启用需要组委会先拍板权重口径，否则就是凭空加一条影响奖金的规则。"
+  },
+  "fallbackPolicy": {
+    "enabled": false,
+    "rule": "R-JDG-21",
+    "note": "权重回退方案：若首届发现企业给分虚高，企业确认权重回退 15%，差额补给完成度等维度。本阶段【不启用】，仅占位；启用需同时改 rules/scoring-*.json 并重算赛段。",
+    "enterpriseWeight": 0.15,
+    "redistributeTo": ["completeness"],
+    "appliesTo": "scoring.final",
+    "status": "首届后回测"
+  }
+}

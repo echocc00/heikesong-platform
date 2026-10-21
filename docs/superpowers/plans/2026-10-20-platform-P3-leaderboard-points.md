@@ -129,7 +129,7 @@ platform/
 
 ### Task 1: 榜单数据模型与迁移 `004_leaderboard.sql` + `rules/points.json`
 
-**Files:** Create `platform/db/migrations/004_leaderboard.sql`、`platform/rules/points.json`、`platform/rules/criteria.json`、`platform/test/leaderboard-migration.test.js`；Modify `platform/src/config.js`
+**Files:** Create `platform/db/migrations/004_leaderboard.sql`、`platform/rules/points.json`、`platform/rules/criteria.json`、`platform/src/db/repo/stage-teams.js`、`platform/test/leaderboard-migration.test.js`；Modify `platform/src/config.js`
 
 **Interfaces:**
 - Consumes: P0 的 `openDatabase` / `applyMigrations` / `loadRules`；P1 的 `editions` / `task_packages` / `teams` 表；P2 的 `stages` / `stage_results` / `computation_snapshots` 表
@@ -149,9 +149,15 @@ import { fileURLToPath } from 'node:url';
 import { openDatabase } from '../src/db/sqlite.js';
 import { applyMigrations } from '../src/db/migrate.js';
 import { loadRules, validateRules, getDefaultRules } from '../src/config.js';
+import { createEdition } from '../src/db/repo/editions.js';
+import { createUser } from '../src/db/repo/users.js';
+import { insertStage } from '../src/db/repo/stages.js';
+import { insertTeam } from '../src/db/repo/teams.js';
+import { registerStageTeams, listStageTeamIds, isTeamInStage, hasStageRoster } from '../src/db/repo/stage-teams.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const rulesDir = join(here, '..', 'rules');
+const NOW = '2026-10-20T12:00:00.000Z';
 
 function setup() {
   const dataDir = mkdtempSync(join(tmpdir(), 'hks-p3-'));
@@ -237,6 +243,112 @@ test('getDefaultRules 能独立读出 rules/ 目录（服务层无注入时的�
   const r = getDefaultRules();
   assert.deepEqual(r.points.stagePoints, [10, 8, 5]);
   assert.equal(r.tiebreak.chain.at(-1).key, 'team_id');
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 父代理变异检验追加的用例（2026-10-21）
+//   —— 下面这些行为在实现里是对的，但**没有用例钉住** → 变异体会存活。
+// ═══════════════════════════════════════════════════════════════════════════
+
+test('★ 004 迁移的引用型外键齐全（引用完整性不留裸列）', () => {
+  const { db, close, dataDir } = setup();
+  const fks = (t) => db.prepare(`PRAGMA foreign_key_list(${t})`).all()
+    .map((r) => `${r.from}->${r.table}`).sort();
+  assert.deepEqual(fks('points_ledger'),
+    ['edition_id->editions', 'stage_id->stages', 'team_id->teams', 'user_id->users']);
+  assert.deepEqual(fks('tier_records'), ['team_id->teams']);
+  assert.deepEqual(fks('behavior_events'), ['team_id->teams', 'user_id->users']);
+  assert.deepEqual(fks('leaderboard_snapshots'), ['edition_id->editions', 'stage_id->stages']);
+  assert.deepEqual(fks('milestones'), ['stage_id->stages', 'team_id->teams']);
+  assert.deepEqual(fks('milestone_signoffs'), ['milestone_id->milestones', 'signatory_user_id->users']);
+  close(); rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('004 迁移的 NOT NULL / DEFAULT / 类型约束符合契约', () => {
+  const { db, close, dataDir } = setup();
+  const col = (t, name) => db.prepare(`PRAGMA table_info(${t})`).all().find((r) => r.name === name);
+  // 积分流水：kind 必填、points 是数值（不是字符串）
+  assert.equal(col('points_ledger', 'kind').notnull, 1);
+  assert.equal(col('points_ledger', 'points').type, 'REAL');
+  // 榜单快照：scope 必填
+  assert.equal(col('leaderboard_snapshots', 'scope').notnull, 1);
+  // 里程碑：默认计入段位
+  assert.equal(col('milestones', 'counts_toward_tier').dflt_value, '1');
+  // 段位记录是软删除（必须有 deleted_at）
+  assert.ok(col('tier_records', 'deleted_at'), 'tier_records 必须有 deleted_at（软删除）');
+  close(); rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('★ stage_team 赛段名册表：字段 + 唯一约束 + 外键（P2 的 D-33 登记在 P3）', () => {
+  const { db, close, dataDir } = setup();
+  assert.deepEqual(cols(db, 'stage_team'), ['id', 'stage_id', 'team_id', 'registered_at']);
+  const fks = db.prepare('PRAGMA foreign_key_list(stage_team)').all()
+    .map((r) => `${r.from}->${r.table}`).sort();
+  assert.deepEqual(fks, ['stage_id->stages', 'team_id->teams']);
+  close(); rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('★ 赛段名册仓储：登记 / 判定 / 重复登记被唯一约束挡住', () => {
+  const { db, close, dataDir } = setup();
+  const edition = createEdition(db, {
+    name: '首届', city: '上海', startsAt: '2026-10-01', endsAt: '2026-10-31', now: NOW,
+  });
+  const stage = insertStage(db, {
+    editionId: edition.id, key: 's1', name: '初赛', kind: 'initial',
+    startsAt: '2026-10-01', endsAt: '2026-10-10', scoringConfigKey: 'initial', status: 'open', now: NOW,
+  });
+  const captain = createUser(db, { name: '队长', phone: '13800002001', password: 'pw123' });
+  const team = insertTeam(db, {
+    editionId: edition.id, name: '一队', captainId: captain.id, status: 'active', now: NOW,
+  });
+  const outsider = insertTeam(db, {
+    editionId: edition.id, name: '二队', captainId: captain.id, status: 'active', now: NOW,
+  });
+
+  assert.equal(isTeamInStage(db, stage.id, team.id), false, '未登记前不得判定为在册');
+  assert.equal(hasStageRoster(db, stage.id), false, '登记前名册为空');
+  const added = registerStageTeams(db, { stageId: stage.id, teamIds: [team.id], now: NOW });
+  assert.equal(added, 1);
+  assert.equal(hasStageRoster(db, stage.id), true, '登记后名册非空');
+  assert.equal(isTeamInStage(db, stage.id, team.id), true);
+  assert.equal(isTeamInStage(db, stage.id, outsider.id), false, '未登记的队伍不在赛段名册内');
+  assert.deepEqual(listStageTeamIds(db, stage.id), [team.id]);
+  // 重复登记必须被唯一约束挡住（幂等由服务层判定，仓储层不吞）
+  assert.throws(() => registerStageTeams(db, { stageId: stage.id, teamIds: [team.id], now: NOW }));
+  close(); rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('配置校验会拒绝非法 criteria 配置 / 缺 points / personal.lifetime 非布尔', () => {
+  const { rules } = loadRules(rulesDir);
+  const bad1 = structuredClone(rules);
+  bad1.criteria.tier = undefined;
+  assert.ok(validateRules(bad1).some((e) => e.includes('criteria.tier')));
+  const bad2 = structuredClone(rules);
+  bad2.criteria.tier.dataOrPrototypeMilestones = [];
+  assert.ok(validateRules(bad2).some((e) => e.includes('dataOrPrototypeMilestones')));
+  const bad3 = structuredClone(rules);
+  bad3.criteria.tier.businessDepartmentKeywords = [];
+  assert.ok(validateRules(bad3).some((e) => e.includes('businessDepartmentKeywords')));
+  const bad4 = structuredClone(rules);
+  bad4.points = undefined;
+  assert.ok(validateRules(bad4).some((e) => e.includes('points 缺失')));
+  const bad5 = structuredClone(rules);
+  bad5.points.personal.lifetime = 'yes';
+  assert.ok(validateRules(bad5).some((e) => e.includes('personal.lifetime')));
+});
+
+test('⛔ 占位策略不得被擅自启用（观众票 / 权重回退 / 未知部门口径 / 对接会时长）', () => {
+  const { rules } = loadRules(rulesDir);
+  // R-OPS-11 观众票：权重无规则依据，只占位不启用
+  assert.equal(rules.points.demoDayAudienceVote.enabled, false);
+  assert.equal(rules.points.demoDayAudienceVote.weight, null);
+  // R-JDG-21 权重回退：首届后回测
+  assert.equal(rules.points.fallbackPolicy.enabled, false);
+  // 签字部门写错**不得**默认算业务部门（S 档会凭空达标）
+  assert.equal(rules.criteria.tier.unknownDepartmentCountsAsBusiness, false);
+  // R-JDG-15 对接会：30 分钟 / 2 周内
+  assert.equal(rules.criteria.enterpriseCompliance.meetingDurationMinutes, 30);
+  assert.equal(rules.criteria.enterpriseCompliance.deadlineDays, 14);
 });
 ```
 
@@ -341,11 +453,107 @@ CREATE TABLE milestone_signoffs (
 );
 CREATE INDEX idx_milestone_signoffs_milestone ON milestone_signoffs(milestone_id);
 
+-- ── 赛段队伍名册（★ 赛段级队伍边界，P2 的 D-33 登记在 P3）────────
+-- ⛔ 没有这张表时，「某队属于本赛段」只能按**届期**判定 → **同届期另一赛段的队**
+--    也能被写进本赛段（评分 / 企业确认 / 行为分 / 里程碑签字都会记到一支
+--    「没在这个赛段参赛」的队头上）→ 外队进榜。届期级判定挡不住这种情况
+--    （同届期的队就是合法的），**只有赛段级名册能挡**。
+-- ⚠️ 登记的**触发时机**（赛段开启时把该届参赛队登记进来）属 P5 的工作流；
+--    本阶段提供「表 + 仓储 + 服务层接线」，不是一张没人写的死表。
+CREATE TABLE stage_team (
+  id            TEXT PRIMARY KEY,
+  stage_id      TEXT NOT NULL REFERENCES stages(id),
+  team_id       TEXT NOT NULL REFERENCES teams(id),
+  registered_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX idx_stage_team_unique ON stage_team(stage_id, team_id);
+CREATE INDEX idx_stage_team_team ON stage_team(team_id);
+
 -- ── 加时陈述（决赛同分才启用）──────────────────────────────────
 -- ⛔ tiebreak_round / tiebreak_votes 由 **P2 的 003_review.sql** 建，本迁移【不得重复建表】。
 --    重复 CREATE TABLE 会让迁移链在第二个文件直接报错中断（"table tiebreak_round already exists"），
 --    后面的 005/006 全部不执行。P3 只【消费】这两张表跑破同分链。
 --    表结构见 P2 计划 Task 7；本阶段若需加列，走 expand-contract（P4 迁移加列，不改这两张表）。
+```
+
+- [ ] **Step 3b: 创建 `src/db/repo/stage-teams.js`（赛段级队伍边界的仓储）**
+
+> **【2026-10-21 父代理补充 —— 兑现 P2 的 D-33 承诺】**
+> **原来错在哪**：P2 计划 D-33 的「已知限制」栏明写「赛段级队伍边界需要一张 `stage_team` 表 —— **登记在 P3**」，
+> 但 P3 计划的**全文**（`grep -c 'stage_team\|名册\|roster'` 全为 0）**一个字都没提** ——
+> 一条**指向不存在实现的活引用**，与 P0 终审发现的 SSE 那条（审计报告 I-6）**同一类病**。
+> **为什么不能拖到下一阶段**：届期级名册挡不住「**同届期另一赛段**的队」被写进本赛段 ——
+> 那支队在同届期里「合法」，届期级判定放行 → 评分 / 企业确认 / 行为分 / 里程碑签字
+> 全记到一支没在这个赛段参赛的队头上 → **外队进榜**。**只有赛段级名册能挡**。
+> **改成什么**：本阶段**建表 + 建仓储**（本 Step），**服务层接线**在 Task 7（`isTeamInStage` 用于
+> P3 自己的写入口：行为分事件 / 里程碑签字 / MVP 投票）；**名册的登记时机**（赛段开启时把该届
+> 参赛队登记进来）属 **P5 的工作流** —— 见偏差表 3c。
+>
+> ⚠️ **仓储层不吞异常**：重复登记会撞唯一约束 `(stage_id, team_id)` → **抛错**。
+>    幂等判定是**服务层**的事（它要先查再决定）；仓储层静默忽略 = 名册里出现两条同队记录。
+
+`platform/src/db/repo/stage-teams.js`：
+
+```javascript
+// src/db/repo/stage-teams.js — 赛段队伍名册（赛段级队伍边界）
+// 依据：P2 计划 D-33 的**已知限制**——「名册目前是**届期级**（stages → edition_id → teams），
+//   赛段级队伍边界需要一张 `stage_team` 表 —— 登记在 P3」。
+//   本文件是那条承诺的兑现：把「某队属于本赛段」从**届期粒度**落到**赛段粒度**。
+//
+// ⚠️ 为什么必须有这张表（不建的后果）：
+//   只有届期名册时，**同届期另一赛段的队伍**也能被写进本赛段 —— 评分 / 企业确认 /
+//   行为分 / 里程碑签字都会记到一支「没在这个赛段参赛」的队头上 → 外队进榜。
+//   届期级判定挡不住这种情况（同届期的队就是合法的），**只有赛段级名册能挡**。
+//
+// ⛔ 归属：本文件是 **P3 建立**（P2 计划 D-33 明确「登记在 P3」）。
+//    P2 的 `services/review.js` 的 `assertTeamInStage` 仍是**届期级**判定 ——
+//    切换到赛段级需要「名册有数据时优先赛段级、否则回落到届期级」的口径，
+//    属 P3 Task 7 的服务层接线范围（见 P3 计划偏差表 3c）。
+//
+// ⚠️ 登记的**触发时机**（赛段开启时把该届参赛队登记进来）属 **P5 的工作流**；
+//    本阶段只提供「表 + 仓储」，写入由后续流程调用 —— 表本身不是死表。
+import { randomUUID } from 'node:crypto';
+
+/**
+ * 把队伍登记进赛段名册。
+ * @returns {number} 实际登记的队数
+ * ⚠️ 重复登记会撞唯一约束（stage_id, team_id）→ **抛错**，不静默忽略。
+ *    幂等判定是**服务层**的事（它要先查再决定），仓储层不吞异常。
+ */
+export function registerStageTeams(db, { stageId, teamIds, now }) {
+  const ids = Array.isArray(teamIds) ? teamIds : [teamIds];
+  const stmt = db.prepare(
+    `INSERT INTO stage_team (id, stage_id, team_id, registered_at) VALUES (?, ?, ?, ?)`,
+  );
+  let n = 0;
+  for (const teamId of ids) {
+    stmt.run(randomUUID(), stageId, teamId, now);
+    n += 1;
+  }
+  return n;
+}
+
+/** 某赛段名册里的全部队伍 id（按登记时间、再按 id 排序 → 确定性）。 */
+export function listStageTeamIds(db, stageId) {
+  return db
+    .prepare('SELECT team_id FROM stage_team WHERE stage_id = ? ORDER BY registered_at ASC, id ASC')
+    .all(stageId)
+    .map((r) => r.team_id);
+}
+
+/** 该队是否在赛段名册内。 */
+export function isTeamInStage(db, stageId, teamId) {
+  const row = db
+    .prepare('SELECT 1 AS x FROM stage_team WHERE stage_id = ? AND team_id = ?')
+    .get(stageId, teamId);
+  return row != null;
+}
+
+/** 赛段名册是否已登记过任何队伍（区分「名册为空」与「名册未启用」）。 */
+export function hasStageRoster(db, stageId) {
+  const row = db.prepare('SELECT COUNT(*) AS n FROM stage_team WHERE stage_id = ?').get(stageId);
+  return Number(row?.n ?? 0) > 0;
+}
 ```
 
 - [ ] **Step 4: 创建 rules/points.json 与 rules/criteria.json**
@@ -503,15 +711,18 @@ export function getDefaultRules() {
 
 - [ ] **Step 6: 运行测试确认通过**
 
-Run: `cd platform && node --test test/leaderboard-migration.test.js` → Expected: PASS（8 个测试全过：leaderboard-migration.test.js 8）
-Run: `cd platform && node --test` → Expected: 全部通过（P0 的 `config.test.js` 仍通过——新增规则文件不影响既有断言）
+Run: `cd platform && node --test test/leaderboard-migration.test.js` → Expected: PASS（**14 个测试全过**：leaderboard-migration.test.js 14 —— 规格自带 8 + 变异检验补测 6）
+Run: `cd platform && node --test` → Expected: 全部通过（P2 全量 **551/551**；P0 的 `config.test.js` 仍通过——新增规则文件不影响既有断言）
 
 - [ ] **Step 7: 提交**
 
 ```bash
-cd platform && git add db/migrations/004_leaderboard.sql rules/points.json rules/criteria.json src/config.js test/leaderboard-migration.test.js
+cd platform && git add db/migrations/004_leaderboard.sql rules/points.json rules/criteria.json src/config.js src/db/repo/stage-teams.js test/leaderboard-migration.test.js
 git commit -m "feat(P3): 榜单数据模型 004 迁移与名次积分规则配置"
 ```
+
+> ⚠️ 计划文件本身也在本次提交范围内（仓库根的 `docs/superpowers/plans/…`）——
+> 「计划是规格」意味着**计划与实现必须同一次提交落盘**，否则规格与代码会分叉。
 
 ---
 
@@ -3225,6 +3436,7 @@ git commit -m "feat(P3): 榜单页、段位榜与战绩卡前端"
 | 2 | 新增 `rules/criteria.json` | P3 只列了 `rules/points.json` | 新增 `rules/criteria.json`，承载「A 段的数据接入/原型交付键」「业务/技术部门关键词」「行为分证据要求」「MVP 积分口径」 | 这些判定必须配置化（R-PTS-03 / R-PTS-10），但 `rules/ranks.json` 与 `rules/behavior-points.json` 是 P0 已定稿文件**不得修改**；域函数签名（`computeTier({milestones, signoffs, ranksConfig})` / `behaviorScore({events, behaviorConfig})`）已定死，无法再传入新参数，故由服务层把配置解析成标志位（`isDataOrPrototype` / `isBusinessDepartment` / `evidenceRequirements`）后注入 |
 | 3 | 迁移 `004_leaderboard.sql` 多 2 张表 | 只列 `points_ledger` / `tier_records` / `behavior_events` / `leaderboard_snapshots` | 追加 `milestones` / `milestone_signoffs` | 这 2 张表在设计文档 §5.2 有明确定义，但 INTERFACES 的 P0/P1/P2/P4 表清单都没有；本阶段的段位（R-PTS-01）与战绩卡（R-PTS-11）都依赖它们。字段按设计文档 §5.2 写，`milestones` 另加 `key`（设计文档只有 `title`，但 7 类里程碑的 key 是段位判定必需的） |
 | 3b | **`tiebreak_round` / `tiebreak_votes` 不在本迁移建** | 契约未指定归属 | **由 P2 的 `003_review.sql` 建，本迁移只消费** | ⚠️ 原写法是本迁移也建这两张表，与 P2 撞表 → 第二个迁移报 `table tiebreak_round already exists`，**整条迁移链（004/005/006）全部不执行**。归属裁决：**P2 拥有**（P2 的 Task 7 就是"互评、加时陈述与一票破同分"，投票入口在那儿）；P3 只在破同分链里读它。P2 的表结构含 `tiebreak_votes` 的 `PRIMARY KEY(tiebreak_round_id, voter_id, team_id)`（一人一票由数据库唯一约束保证），满足 C-03 第 2 级 |
+| 3c | **迁移 `004_leaderboard.sql` 多 1 张表 `stage_team` + 多 1 个仓储文件 `src/db/repo/stage-teams.js`** | 契约的 P3 表清单里没有 `stage_team` | 追加 `stage_team`（`stage_id` + `team_id` 唯一索引 + 双外键）与配套仓储 `registerStageTeams` / `listStageTeamIds` / `isTeamInStage` / `hasStageRoster` | **兑现 P2 计划 D-33 的承诺**（P2 的 D-33「已知限制」栏明写「赛段级队伍边界需要一张 `stage_team` 表 —— 登记在 P3」）。⚠️ 原 P3 计划**全文没有一处提到 `stage_team` / 名册**（`grep -c` 全为 0）→ 一条**指向不存在实现的活引用**，与 P0 终审发现的 SSE 那条（审计 I-6）同一类病。**不能拖**：届期级名册挡不住「**同届期另一赛段**的队」被写进本赛段 → 外队进榜，**只有赛段级名册能挡**。⚠️ **本阶段只建表 + 建仓储**；服务层接线在 **Task 7**（P3 自己的写入口：行为分事件 / 里程碑签字 / MVP 投票），**名册的登记时机**（赛段开启时把该届参赛队登记进来）属 **P5 的工作流** |
 | 4 | `src/services/leaderboard.js` 三个函数多了可选参数 `rules` | `getLeaderboard({ db, stageId, scope, viewer })` 等 | 追加可选的 `rules` 参数（原有参数逐字保留） | 服务层需要 `rules.tiebreak` / `rules.visibility` / `rules.points`，而契约签名里没有。调用方（HTTP 层）有 `ctx.rules` 直接注入；未注入时由 `getDefaultRules()` 从 `platform/rules/` 懒加载兜底，**不产生静默默认值** |
 | 5 | `src/domain/points.js` 新增 `computePrizeShares` | 未列 | 新增 `computePrizeShares({ ordered, prizeTable })` | R-JDG-20「并列共享奖金（总额不变）」需要一条可执行算法才能被验证；奖金表本身仍由调用方传入（目前无配置文件规定金额） |
 | 6 | `applyTiebreakChain` / `rankTeams` 的返回值是超集 | `{ ordered, applied }` / `{ ordered, tieGroups, rankStyle }` | 分别追加 `groups` / `warnings` / `applied` | `applied` 与 `groups` 是计算 1224 名次与「降级告警置顶」所必需的中间量；契约里已有的字段全部保留且语义不变 |
@@ -3243,6 +3455,45 @@ git commit -m "feat(P3): 榜单页、段位榜与战绩卡前端"
 | C | MVP 积分的数值口径 | **该队计入的 4 个赛段的名次积分之和** | `rules/points.json` 没有规定 mvp 数值 → 口径写在 `rules/criteria.json.mvp.awardPointsSource`，改配置即可，不改代码 |
 | D | 「连续 14 天零提交」的计时起点 | 取该队 `behavior_events` 的最新时间；从未提交过的队伍按 0 天计（不降级） | 「连续 14 天零提交」隐含已有提交历史；从未开始的新队不应因未提交被降级 |
 | E | D 段队伍的段位接口对外表现 | 非成员 → **404**；成员 → 本人进度卡（无名次） | 冲突裁决 C-02「D 段只公示个人进度，不公示排名」+ 三态语义「单条不满足 → 404」 |
+
+---
+
+## Task 1 父代理预审修正台账（2026-10-21）
+
+> Task 1 是 P3 的地基：**4 张榜单表 + 2 张补充表 + 2 份规则配置 + 配置校验**。
+> 实施前做了一次**独立工程实跑**（把规格的代码块抽到 `/tmp` 的副本里跑通再落盘 —— 「先跑后派」），
+> 规格自带 **8 条用例全绿**；实施完成后做**变异检验**，变异体一度出现 **12 条存活**，
+> 补完用例后 **46/47 杀灭**（另 1 条等价变异体）。
+
+### 一、预审发现的规格缺陷
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| **P3-1** | **Important** | **P2 的 D-33 承诺的 `stage_team` 表在本阶段一个字都没提** —— P2 的 D-33「已知限制」栏明写「赛段级队伍边界需要一张 `stage_team` 表 —— **登记在 P3**」，而 P3 计划全文 `grep -c 'stage_team\|名册\|roster'` **全为 0** | 静态核对：P3–P6 **四份计划**里 `stage_team` 只在 P2 的一句索引名里出现过；P3/P4/P5 的「名册 / roster / 赛段开启」**全部为 0** → 一条**指向不存在实现的活引用**，与 P0 终审发现的 SSE 那条（审计报告 I-6）**同一类病** | **本阶段建表 + 建仓储**（Task 1 Step 3 / Step 3b），服务层接线在 Task 7，登记时机归 P5。⚠️ **不能拖**：届期级名册挡不住「同届期**另一赛段**的队」被写进本赛段 → 外队进榜（见偏差表 3c） |
+
+### 二、变异检验发现的实现盲区
+
+> 变异体 **47** 个（外键摘除 / NOT NULL 与 DEFAULT 改写 / 列类型改写 / 规则值篡改 /
+> 校验段摘除 / 校验段挪位 / 名册仓储语义改写 …），在 `/tmp` 副本上跑
+> `leaderboard-migration.test.js` + `config.test.js` + `migrate.test.js` + `zero-deps.test.js`，
+> **测试必须失败才算杀灭**。变异脚本：`/tmp/p3t1/mutate.mjs`。
+>
+> ⚠️ 首轮变异跑出的 **12 条存活**里，有 **1 条是变异构造自身失效**（G11：只在原位插了个注释，
+> 代码块根本没挪动 → 被误判成「盲区」）。这正是纪律里点名的坑：**变异体必须真的改变行为**，
+> 否则会被算成测试的锅。修正构造后立即被杀灭。
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| **P3-2** | **Important** | **004 迁移的引用型外键零覆盖** —— 规格自带用例只断言**列名**，没断言外键 | 变异存活：`points_ledger` 的 4 条外键全部去掉 → 用例全绿 | 补「004 迁移的引用型外键齐全」用例：逐表断言 `PRAGMA foreign_key_list` 的 `列→父表` 映射（6 张表 12 条外键）。依据：P2 Task 1 的同一条纪律（38 条引用型外键） |
+| **P3-3** | **Important** | **NOT NULL / DEFAULT / 列类型零覆盖** —— `kind` 必填、`points` 是数值、`scope` 必填、`counts_toward_tier` 默认 1、`tier_records` 有 `deleted_at`，全都没有断言 | 变异存活：`points_ledger.points` 从 REAL 改成 TEXT、`kind` 的 NOT NULL 去掉、`milestones.counts_toward_tier` 默认值改 0 → 用例全绿 | 补「NOT NULL / DEFAULT / 类型约束符合契约」用例（用 `PRAGMA table_info` 的 `notnull` / `dflt_value` / `type`） |
+| **P3-4** | **Important** | **`stage_team` 名册仓储零覆盖** —— 建了表却没有写路径与判定路径的用例 | 变异存活：`isTeamInStage` 恒返回 true、`listStageTeamIds` 不过滤赛段 → 用例全绿 | 补「赛段名册仓储：登记 / 判定 / 重复登记被唯一约束挡住」用例 + 5 个 S 系列变异体 |
+| **P3-5** | Minor | **配置校验的 4 条分支零覆盖** —— `criteria.tier` 缺失 / `dataOrPrototypeMilestones` 为空 / `businessDepartmentKeywords` 为空 / `points` 整份缺失 / `personal.lifetime` 非布尔 | 变异存活：逐条摘掉对应校验分支 → 用例全绿 | 补「配置校验会拒绝非法 criteria 配置 / 缺 points / personal.lifetime 非布尔」用例（5 个断言） |
+| **P3-6** | Minor | **「占位策略不得被擅自启用」零覆盖** —— `demoDayAudienceVote.enabled` / `fallbackPolicy.enabled` / `unknownDepartmentCountsAsBusiness` / 企业对接会时长，全部没有断言 | 变异存活：观众票被擅自启用、未知部门默认算业务部门、对接会时长改 0 → 用例全绿 | 补「占位策略不得被擅自启用」用例（6 个断言）。⛔ 这几条都是**直接影响奖金与段位**的口子：观众票凭空进榜 = 凭空加一条没有规则依据的规则 |
+| — | — | **等价变异体 G08**（`getDefaultRules` 不再缓存，每次重读 `rules/`）：缓存与否只影响读盘次数，返回的规则对象内容完全相同 ⇒ 语义等价 | 变异存活（如标注） | **不是盲区**，标记为等价变异体、允许存活 |
+
+**Task 1 的测试条数口径**：leaderboard-migration **14**（规格自带 8 + 变异检验补测 6）。
+
+**最终结果**：变异体 47 → **KILLED 46 / 等价变异体 1 / 有效缺口 0**；`leaderboard-migration.test.js` **14/14**；P3 全量 **551/551**。
 
 ---
 

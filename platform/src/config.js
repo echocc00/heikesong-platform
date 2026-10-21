@@ -6,7 +6,8 @@
 //      "能读出 JSON" 不等于 "配置是对的"。漏检的那几份一旦写错，症状要到
 //      P2/P3 算分、算榜单时才爆出来 —— 而那时榜单可能已经发出去了。
 import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const FILES = {
   scoringInitial: 'scoring-initial.json',
@@ -21,6 +22,8 @@ const FILES = {
   teamFormation: 'team-formation.json',
   schedule: 'schedule.json',
   compliance: 'compliance.json',
+  points: 'points.json',
+  criteria: 'criteria.json',
 };
 
 function readJson(path) {
@@ -536,6 +539,35 @@ export function validateRules(rules, expectedCount = null) {
     }
   }
 
+  // ── 名次积分（P3）────────────────────────────────────────
+  const pts = rules.points;
+  if (!pts) {
+    errors.push('points 缺失');
+  } else {
+    if (!Array.isArray(pts.stagePoints) || !pts.stagePoints.length) {
+      errors.push('points.stagePoints 缺失或为空');
+    } else if (Number.isFinite(pts.stagePointsOnlyTopN)
+      && pts.stagePointsOnlyTopN !== pts.stagePoints.length) {
+      errors.push(`points.stagePointsOnlyTopN=${pts.stagePointsOnlyTopN} 与 stagePoints 长度 ${pts.stagePoints.length} 不一致`);
+    }
+    if (pts.tieRankStyle !== '1224') errors.push(`points.tieRankStyle 必须是 "1224"（当前 ${pts.tieRankStyle}）`);
+    if (!pts.mvp || pts.mvp.perPackage !== 1) errors.push('points.mvp.perPackage 必须是 1（每个任务包 1 个 MVP，任务书 §七）');
+    if (!pts.personal || typeof pts.personal.lifetime !== 'boolean') errors.push('points.personal.lifetime 必须是布尔值');
+  }
+
+  // ── 段位附加条件（P3）────────────────────────────────────
+  const crit = rules.criteria;
+  if (!crit?.tier) {
+    errors.push('criteria.tier 缺失');
+  } else {
+    if (!Array.isArray(crit.tier.dataOrPrototypeMilestones) || !crit.tier.dataOrPrototypeMilestones.length) {
+      errors.push('criteria.tier.dataOrPrototypeMilestones 缺失或为空');
+    }
+    if (!Array.isArray(crit.tier.businessDepartmentKeywords) || !crit.tier.businessDepartmentKeywords.length) {
+      errors.push('criteria.tier.businessDepartmentKeywords 缺失或为空');
+    }
+  }
+
   return errors;
 }
 
@@ -558,6 +590,8 @@ export function loadRules(rulesDir) {
     teamFormation: rules.teamFormation,
     schedule: rules.schedule,
     compliance: rules.compliance,
+    points: rules.points,
+    criteria: rules.criteria,
   };
 
   const errors = validateRules(grouped, Object.keys(FILES).length);
@@ -572,4 +606,17 @@ export function loadRules(rulesDir) {
   const version = versions.length ? versions[0] : 'unknown';
 
   return { rules: grouped, version };
+}
+
+// ── P3 追加：默认规则加载器 ────────────────────────────────────
+// 用途：服务层在调用方没有显式注入 rules 时用它，避免"静默用默认规则"的降级。
+// ⚠️ 只在没有注入时兜底；注入的 rules 优先（配置文件里的值永远是权威）。
+let defaultRulesCache = null;
+
+export function getDefaultRules() {
+  if (!defaultRulesCache) {
+    const dir = join(dirname(fileURLToPath(import.meta.url)), '..', 'rules');
+    defaultRulesCache = loadRules(dir).rules;
+  }
+  return defaultRulesCache;
 }
