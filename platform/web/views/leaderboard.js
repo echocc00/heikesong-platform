@@ -7,9 +7,14 @@
 import { escapeHtml } from '../escape.js';
 
 function warningsHtml(warnings) {
-  const list = Array.isArray(warnings) ? warnings : [];
+  const list = Array.isArray(warnings) ? warnings || [] : [];
   if (!list.length) return '';
-  const items = list.map((w) => `<li class="warn-item"><span class="warn-code">${escapeHtml(w.code || 'WARN')}</span> <span class="warn-msg">${escapeHtml(w.message || '')}</span></li>`).join('');
+  // ⚠️ 滚动总榜的告警来自【多个赛段】，必须标出是哪一段降级了（否则读者不知道该查哪段）。
+  //    赛段榜 / B 榜 / 个人榜的告警没有 stageName → 不渲染这一段（保持原样）。
+  const items = list.map((w) => {
+    const stage = w.stageName ? `<span class="warn-stage">${escapeHtml(w.stageName)}</span> ` : '';
+    return `<li class="warn-item"><span class="warn-code">${escapeHtml(w.code || 'WARN')}</span> ${stage}<span class="warn-msg">${escapeHtml(w.message || '')}</span></li>`;
+  }).join('');
   return `<div class="warnings" role="alert"><h3>⚠ 本轮降级提示（${list.length}）</h3><ul>${items}</ul></div>`;
 }
 

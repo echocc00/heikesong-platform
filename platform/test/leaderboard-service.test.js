@@ -10,7 +10,7 @@ import { loadRules } from '../src/config.js';
 import { createApp } from '../src/server.js';
 import { createSession } from '../src/auth/session.js';
 import { getLeaderboard, publishLeaderboard } from '../src/services/leaderboard.js';
-import { computeTeamTier } from '../src/services/tier.js';
+import { computeTeamTier, getTeamTier } from '../src/services/tier.js';
 import { getLatestTierRecord } from '../src/db/repo/tiers.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -461,7 +461,9 @@ test('★ MVP 的路演分要折算成路演名次积分再计入（判别性：
     // 路演 st_r：名次与赛段【完全相反】t_e 90 > t_b 70 > t_a 50
     db.prepare("INSERT INTO stage_results (id, stage_id, team_id, rank, total, seat_p, seat_e, tied_with, points, computation_id, created_at) VALUES ('sr_7','st_r','t_e',1,90,90,0,0,NULL,NULL,'${NOW}'), ('sr_8','st_r','t_b',2,70,70,0,0,NULL,NULL,'${NOW}'), ('sr_10','st_r','t_a',3,50,50,0,0,NULL,NULL,'${NOW}')").run();
 
-    const out = publishLeaderboard({ db, editionId: 'ed_1', stageId: 'st_1', actorId: 'u_admin', now: NOW });
+    // ★ MVP 只在【路演赛段】发榜时发放（终审 I-1）：路演评审综合分是 MVP 公式的最后一个输入，
+    //    在它之前发榜拿不到路演分 → MVP 金额偏小，而积分只增不改 ⇒ 补不回来。
+    const out = publishLeaderboard({ db, editionId: 'ed_1', stageId: 'st_r', actorId: 'u_admin', now: NOW });
     const tp1 = out.awarded.mvp.find((m) => m.packageId === 'tp_1');
     // 赛段名次积分 t_a 10 / t_b 8 / t_e 5；路演名次积分 t_e 10 / t_b 8 / t_a 5
     //   → 综合分 t_a 15 / t_b 16 / t_e 15 → t_b 拿 MVP
@@ -493,7 +495,7 @@ test('★ MVP 决胜口径是配置项（rules.criteria.mvp.tiebreak 说了算�
       ...rules,
       criteria: { ...rules.criteria, mvp: { ...rules.criteria.mvp, tiebreak: ['team_id'] } },
     };
-    const out = publishLeaderboard({ db, editionId: 'ed_1', stageId: 'st_1', actorId: 'u_admin', now: NOW, rules: custom });
+    const out = publishLeaderboard({ db, editionId: 'ed_1', stageId: 'st_r', actorId: 'u_admin', now: NOW, rules: custom });
     const tp1 = out.awarded.mvp.find((m) => m.packageId === 'tp_1');
     assert.equal(tp1.teamId, 't_a', '决胜口径由配置决定 → 改成 team_id 后并列时选 t_a');
   } finally {
@@ -510,7 +512,7 @@ test('★ 跨任务包队伍不得挤掉本任务包的 MVP（路演名次积分
     //   → 外队挤掉本包真冠军，且拿到的 MVP 积分是 0
     db.prepare("INSERT INTO stage_results (id, stage_id, team_id, rank, total, seat_p, seat_e, tied_with, points, computation_id, created_at) VALUES ('sr_7','st_r','t_b',1,90,90,0,0,NULL,NULL,'${NOW}'), ('sr_8','st_r','t_a',2,50,50,0,0,NULL,NULL,'${NOW}')").run();
 
-    const out = publishLeaderboard({ db, editionId: 'ed_1', stageId: 'st_1', actorId: 'u_admin', now: NOW });
+    const out = publishLeaderboard({ db, editionId: 'ed_1', stageId: 'st_r', actorId: 'u_admin', now: NOW });
     const tp2 = out.awarded.mvp.find((m) => m.packageId === 'tp_2');
     assert.ok(tp2, 'tp_2 要选出 MVP');
     assert.equal(tp2.teamId, 't_c', '本包真冠军是 t_c，不能被外队 t_b 挤掉');
@@ -529,13 +531,103 @@ test('★ MVP 综合分并列时按路演名次积分决胜（不许按队名字
     // ⚠️ 若按 team_id 码位序兜底会选 t_a（'t_a' < 't_b'）→ 数据集能区分两种兜底
     db.prepare("INSERT INTO stage_results (id, stage_id, team_id, rank, total, seat_p, seat_e, tied_with, points, computation_id, created_at) VALUES ('sr_7','st_r','t_b',1,90,90,0,0,NULL,NULL,'${NOW}'), ('sr_8','st_r','t_a',2,50,50,0,0,NULL,NULL,'${NOW}')").run();
 
-    const out = publishLeaderboard({ db, editionId: 'ed_1', stageId: 'st_1', actorId: 'u_admin', now: NOW });
+    const out = publishLeaderboard({ db, editionId: 'ed_1', stageId: 'st_r', actorId: 'u_admin', now: NOW });
     const tp1 = out.awarded.mvp.find((m) => m.packageId === 'tp_1');
     assert.equal(tp1.teamId, 't_b', '综合分并列由路演名次积分决出');
     const ledger = db.prepare("SELECT * FROM points_ledger WHERE kind = 'mvp'").all();
     const teams = new Set(ledger.map((r) => r.team_id));
     assert.ok(teams.has('t_b'), 'MVP 流水写给 t_b');
     assert.ok(!teams.has('t_a'), 't_a 只是并列，不能拿到 MVP');
+  } finally {
+    close(); rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('★ 个人积分榜端到端：仓储真实行 → 域函数 → API 必须有行（终审 C-1：曾恒为空）', async () => {
+  const { db, close, dataDir, app } = setup();
+  try {
+    publishLeaderboard({ db, editionId: 'ed_1', stageId: 'st_1', actorId: 'u_admin', now: NOW });
+    const ledger = db.prepare("SELECT * FROM points_ledger WHERE kind = 'stage_rank'").all();
+    assert.ok(ledger.length > 0, '名次积分要写进流水');
+    assert.ok(ledger.every((r) => r.user_id), '每条流水都要有归属人');
+
+    const res = await call(app, 'GET', '/api/leaderboard/st_1?scope=personal');
+    assert.equal(res.status, 200);
+    const data = JSON.parse(res.body);
+    assert.equal(data.scope, 'personal');
+    // ⚠️ 这条断言是本次修复的判别点：修复前仓储给的是 snake_case 行，域函数读 entry.userId
+    //    读不到 → 每一行都被当成「没有归属人」丢弃 → rows 恒为空（且不报任何错）。
+    assert.equal(data.rows.length, ledger.length, '个人积分榜的行数必须与流水条数一致');
+    const row = data.rows.find((r) => r.userId === 'u_cap');
+    assert.ok(row, 'u_cap 必须在榜上');
+    assert.equal(row.name, 'A队队长', '要有姓名，不是只有 id');
+    assert.equal(row.total, 10, 'u_cap 是 A 队队长，拿的是 A 队的名次积分 10');
+    assert.equal(row.rank, 1, '要有名次');
+    assert.deepEqual(row.byKind, { stage_rank: 10 }, '要能看出分项来源');
+  } finally {
+    close(); rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('★ MVP 只在路演赛段发榜时发放，且整届只发一次（终审 I-1：曾每赛段重复发）', () => {
+  const { db, close, dataDir } = setup();
+  try {
+    db.prepare("INSERT INTO stage_results (id, stage_id, team_id, rank, total, seat_p, seat_e, tied_with, points, computation_id, created_at) VALUES ('sr_7','st_r','t_b',1,90,90,0,0,NULL,NULL,'${NOW}'), ('sr_8','st_r','t_a',2,50,50,0,0,NULL,NULL,'${NOW}')").run();
+
+    // ① 非路演赛段发榜 → 不发 MVP（路演评审综合分是公式的最后一个输入，还没到）
+    const s1 = publishLeaderboard({ db, editionId: 'ed_1', stageId: 'st_1', actorId: 'u_admin', now: NOW });
+    assert.deepEqual(s1.awarded.mvp, [], '非路演赛段发榜不得发 MVP');
+    assert.equal(db.prepare("SELECT COUNT(*) AS n FROM points_ledger WHERE kind = 'mvp'").get().n, 0, '一条都不能写');
+
+    // ② 路演赛段发榜 → 发一次（两个任务包各选出一个 MVP）
+    const sr = publishLeaderboard({ db, editionId: 'ed_1', stageId: 'st_r', actorId: 'u_admin', now: NOW });
+    assert.equal(sr.awarded.mvp.length, 2, '两个任务包各选出一个 MVP');
+    const after1 = db.prepare("SELECT COUNT(*) AS n FROM points_ledger WHERE kind = 'mvp'").get().n;
+    assert.ok(after1 > 0, '路演赛段发榜要写 MVP 流水');
+
+    // ③ 再发别的赛段 → 不得重复发（幂等键是届期级，不是赛段级）
+    publishLeaderboard({ db, editionId: 'ed_1', stageId: 'st_1', actorId: 'u_admin', now: NOW });
+    assert.equal(db.prepare("SELECT COUNT(*) AS n FROM points_ledger WHERE kind = 'mvp'").get().n, after1,
+      '跨赛段重复发榜不得重复发 MVP 积分');
+
+    // ④ 再发一次路演赛段 → 同样不得重复发
+    publishLeaderboard({ db, editionId: 'ed_1', stageId: 'st_r', actorId: 'u_admin', now: NOW });
+    assert.equal(db.prepare("SELECT COUNT(*) AS n FROM points_ledger WHERE kind = 'mvp'").get().n, after1,
+      '同一路演赛段重复发榜也不得重复发');
+  } finally {
+    close(); rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('★ 滚动总榜必须汇总各赛段的降级告警（终审 I-2：曾静默丢弃全部告警）', async () => {
+  const { db, close, dataDir, app } = setup();
+  try {
+    const res = await call(app, 'GET', '/api/leaderboard/rolling?editionId=ed_1');
+    assert.equal(res.status, 200);
+    const data = JSON.parse(res.body);
+    assert.equal(data.scope, 'rolling');
+    // ⚠️ 判别点：st_1 的计算快照带 judge_sample_too_small —— 修复前滚动榜 warnings 恒为 []
+    assert.ok(data.warnings.length > 0, '滚动总榜不得把降级告警静默丢掉');
+    const w = data.warnings.find((x) => x.code === 'judge_sample_too_small');
+    assert.ok(w, 'st_1 的降级告警必须出现在滚动总榜上');
+    assert.equal(w.stageId, 'st_1', '告警要标注来源赛段');
+    assert.equal(w.stageKey, 'S1', '告警要标注赛段键');
+  } finally {
+    close(); rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('★ 段位记录的原因说明是脏数据时降级为空列表并显式告警，不得 500（终审 M-3）', async () => {
+  const { db, close, dataDir, app } = setup();
+  try {
+    db.prepare("UPDATE tier_records SET reasons_json = '{not json' WHERE team_id = 't_a'").run();
+    const out = getTeamTier({ db, teamId: 't_a', viewer: { id: 'u_cap' } });
+    assert.deepEqual(out.reasons, [], '脏 reasons_json 降级为空数组');
+    assert.ok(out.warnings.some((w) => w.code === 'REASONS_PARSE_FAILED'), '必须显式告警，不静默');
+    assert.equal(out.tier, 'A', '其它字段照常返回');
+    // 走一遍真实 HTTP：修复前这里会 500（INTERNAL）
+    const res = await call(app, 'GET', '/api/teams/t_a/tier', { cookie: sessionCookie(db, 'u_cap') });
+    assert.equal(res.status, 200, '脏数据不得让接口 500');
   } finally {
     close(); rmSync(dataDir, { recursive: true, force: true });
   }

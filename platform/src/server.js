@@ -22,6 +22,8 @@ import { registerRegistrationRoutes, pickCurrentEdition } from './http/routes/re
 import { registerTaskPackageRoutes } from './http/routes/taskPackage.js';
 import { registerTeamRoutes } from './http/routes/team.js';
 import { registerReviewRoutes } from './http/routes/review.js';
+import { registerMilestoneRoutes } from './http/routes/milestone.js';
+import { registerBehaviorRoutes } from './http/routes/behavior.js';
 import { getLeaderboard, getRollingLeaderboard } from './services/leaderboard.js';
 import { getPerformanceCard } from './services/performance-card.js';
 import { getTeamTier, getTierBoard } from './services/tier.js';
@@ -131,6 +133,9 @@ export function createApp({ db, rules, webDir }) {
   registerTeamRoutes({ router, db, rules });
   // P2 评审 API（报名/组队等 P1 路由由 P1 追加，不要互相覆盖）
   registerReviewRoutes(router);
+  // P3 写入路由（企业里程碑签字 / 行为分事件）
+  registerMilestoneRoutes(router);
+  registerBehaviorRoutes(router);
   // 生产环境 Cookie 加 Secure；开发环境不加（http://127.0.0.1 会被浏览器拒收）
   const secureCookies = process.env.NODE_ENV === 'production';
 

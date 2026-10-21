@@ -36,10 +36,10 @@ export function registerStageTeams(db, { stageId, teamIds, now }) {
   return n;
 }
 
-/** 某赛段名册里的全部队伍 id（按登记时间、再按 id 排序 → 确定性）。 */
+/** 某赛段名册里的全部队伍 id（按登记时间、再按登记顺序（rowid）排序 → 确定性）。 */
 export function listStageTeamIds(db, stageId) {
   return db
-    .prepare('SELECT team_id FROM stage_team WHERE stage_id = ? ORDER BY registered_at ASC, id ASC')
+    .prepare('SELECT team_id FROM stage_team WHERE stage_id = ? ORDER BY registered_at ASC, rowid ASC')
     .all(stageId)
     .map((r) => r.team_id);
 }

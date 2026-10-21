@@ -19,7 +19,7 @@ export const api = {
     // ⚠️ 顺序要紧：'tier' 必须排在 '/api/leaderboard/' 之前，
     //    否则段位榜会拿到赛段榜的形状（前端渲染成空段位列）。
     if (path.startsWith('/api/leaderboard/rolling')) {
-      return { scope: 'rolling', rows: db.leaderboard || [], demo: true };
+      return { scope: 'rolling', rows: db.leaderboard || [], warnings: db.warnings || [], demo: true };
     }
     if (path.startsWith('/api/leaderboard/tier')) {
       return { scope: 'tier', rows: db.tiers || [], demo: true };

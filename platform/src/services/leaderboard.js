@@ -21,10 +21,42 @@ import * as tierRepo from '../db/repo/tiers.js';
 const SCOPES = ['rank', 'business', 'personal'];
 const indexBy = (rows, k, v) => Object.fromEntries(rows.map((r) => [r[k], r[v]]));
 
+/**
+ * 仓储行（snake_case）→ 域函数契约（camelCase）。
+ * ⚠️ 终审 C-1 的根因就在这条缝上：`points_ledger` 的行是 snake_case（`user_id`），
+ *    而域函数 `computePersonalPoints` 的契约是 camelCase（`entry.userId`）。
+ *    两者对不上时，域函数里的 `if (!entry.userId) continue;` 会把**每一行**都当成
+ *    「这条流水没有归属人」**静默丢弃** ⇒ 个人积分榜恒为空（R-RNK-10 整条线生产上不可观测），
+ *    而且**不报任何错** —— 流水明明写进去了，只是永远读不出来。
+ *    仓储层统一返回原始行（与 leaderboard / teams / tiers 仓储同风格），
+ *    所以**翻译只在这一处发生一次**；`test/leaderboard-service.test.js` 有一条端到端用例
+ *    把「仓储真实行 → 域函数 → 榜单响应」三者绑住，防止再漂。
+ */
+function toLedgerEntry(row) {
+  return {
+    id: row.id,
+    editionId: row.edition_id,
+    stageId: row.stage_id,
+    teamId: row.team_id,
+    userId: row.user_id,
+    kind: row.kind,
+    points: row.points,
+    createdAt: row.created_at,
+  };
+}
+
 /** ★ 行为分独立通路：behavior_events → behaviorScore。绝不从 stage_results 派生。 */
 function behaviorScoresByTeam(db, teamIds, R) {
-  const out = {};
-  const events = pointsRepo.listBehaviorEventsByTeams(db, teamIds);
+  // ⚠️ 终审 I-3 的配套修正：「一条没提交」= 0 分，**不是**「没有可比较的值」。
+  //    行为分对每支队都有定义：提交了就按 rules/behavior-points.json 计分，没提交就是 0。
+  //    原实现只给「有事件」的队伍返回值，其余留 null → 破同分链读到 null 会判定
+  //    「本组缺少可比较的值」⇒ **整组都不用行为分**（warning: tiebreak_key_unusable）
+  //    ⇒ 提交过的队伍与没提交的队伍永远并列，行为分这一级形同虚设（正是 I-3 要修的东西）。
+  //    ⛔ 与 R-RNK-07 的口径区别：互评分「空交付队无记录」= 该维度**没被应用**（不可用）；
+  //    行为分「没提交」= 这一维度的值**就是 0**（可用）。两者不能混为一谈。
+  const ids = (Array.isArray(teamIds) ? teamIds : []).filter(Boolean);
+  const out = Object.fromEntries(ids.map((id) => [id, 0]));
+  const events = pointsRepo.listBehaviorEventsByTeams(db, ids);
   if (!events.length) return out;
   const byTeam = new Map();
   for (const e of events) {
@@ -152,7 +184,8 @@ function buildBusinessPayload({ db, stage }) {
 }
 
 function buildPersonalPayload({ db, stage, R }) {
-  const ledger = pointsRepo.listLedgerByEdition(db, stage.edition_id);
+  // ★ 必须过 toLedgerEntry：仓储给的是 snake_case 行，域函数认的是 camelCase（终审 C-1）
+  const ledger = pointsRepo.listLedgerByEdition(db, stage.edition_id).map(toLedgerEntry);
   const personal = computePersonalPoints({ ledger, pointsConfig: R.points });
   const names = repo.listUserNames(db, personal.rows.map((r) => r.userId));
   const rows = personal.rows.map((r) => ({
@@ -196,9 +229,18 @@ export function getRollingLeaderboard({ db, editionId, viewer = null, rules = nu
   const stages = repo.listEditionStages(db, editionId);
   const tiers = indexBy(tierRepo.listLatestTiersByEdition(db, editionId), 'team_id', 'tier');
   const totals = new Map();
+  // ★ 终审 I-2：滚动总榜原来把各赛段的降级告警**全部丢掉**（warnings 恒为 []），
+  //    而 `#/leaderboard`（不带 stageId）默认就走滚动总榜 ⇒ 用户看到的是一份「干净」的榜单，
+  //    底层计算其实已降级。违反 P3-9「降级告警置顶」与 R-AUD-05「静默的空产出比报错更危险」。
+  //    口径：滚动总榜汇总**每一届赛段**的告警，并标注来源赛段（stageId / stageKey / stageName），
+  //    让读者知道是哪一段降级了；前端按 stageName 渲染。
+  const warnings = [];
 
   for (const stage of stages) {
     const built = buildStageRanking({ db, stage, R });
+    for (const w of built.warnings) {
+      warnings.push({ ...w, stageId: stage.id, stageKey: stage.key, stageName: stage.name });
+    }
     if (!built.results.length) continue;
     for (const row of built.ranking.ordered) {
       const res = built.results.find((r) => r.team_id === row.teamId);
@@ -219,7 +261,7 @@ export function getRollingLeaderboard({ db, editionId, viewer = null, rules = nu
 
   return applyVisibility({
     payload: {
-      scope: 'rolling', editionId, rows, warnings: [],
+      scope: 'rolling', editionId, rows, warnings,
       stages: stages.map((s) => ({ id: s.id, key: s.key, name: s.name })),
     },
     viewer,
@@ -290,10 +332,31 @@ function awardStagePoints({ db, editionId, stageId, rules: R, createdAt }) {
   return awarded;
 }
 
-/** MVP：4 赛段总积分 + S4 路演评审综合，每任务包 1 个（写入个人积分流水） */
+/**
+ * MVP：4 赛段总积分 + S4 路演评审综合，每任务包 1 个（写入个人积分流水）
+ *
+ * ★ 终审 I-1 的修正：MVP 是【届期级】的最终奖项，而发榜是【赛段级】动作 ——
+ *    让赛段级动作产生届期级奖项是**层级错配**。
+ *    原实现每次发榜都算一遍 MVP，幂等键却按【当前发榜的赛段】查
+ *    ⇒ 每发一个赛段就再写一条同额流水（发 st_1 写一条、发 st_2 又写一条，金额还一样），
+ *    个人积分被重复累加；而且在路演赛段之前发榜时，MVP 金额缺了路演分而偏小，
+ *    积分只增不改 ⇒ 后面补不回来。
+ *    修正后的口径（两条，缺一不可）：
+ *      ① 【发放时机】只在【路演赛段】发榜时发放 —— 路演评审综合分是 MVP 公式的
+ *         最后一个输入（任务书 §七「4 赛段总积分 + S4 路演评审综合」）。
+ *      ② 【幂等键】(届期, 队伍) —— 同一支队的 MVP 整届只发一次，跨赛段发榜不再重发。
+ *    ⛔ 本届没有路演赛段、或路演赛段尚无评分结果 ⇒ **不发 MVP**
+ *       （公式缺最后一个输入，不做半个公式的奖 —— 见 P3 计划「已知限制」）。
+ */
 function awardMvp({ db, editionId, stageId, rules: R, createdAt }) {
   const stages = repo.listEditionStages(db, editionId);
   const roadshowStage = stages.find((s) => s.kind === 'roadshow');
+  // ① 发放时机：只有路演赛段发榜才发 MVP
+  if (!roadshowStage || roadshowStage.id !== stageId) return [];
+  const roadshowScores = repo.listStageResults(db, roadshowStage.id)
+    .map((r) => ({ teamId: r.team_id, score: r.total }));
+  if (!roadshowScores.length) return [];      // 路演还没评分 → 公式的最后一个输入缺失 → 不发
+
   const stagePoints = [];
   const packageOf = new Map();
   for (const stage of stages) {
@@ -307,9 +370,6 @@ function awardMvp({ db, editionId, stageId, rules: R, createdAt }) {
   }
   if (!stagePoints.length) return [];
 
-  const roadshowScores = roadshowStage
-    ? repo.listStageResults(db, roadshowStage.id).map((r) => ({ teamId: r.team_id, score: r.total }))
-    : [];
   // MVP 决胜口径在 criteria.json（P3 自有），computeMvp 只认 pointsConfig.mvp → 服务层合并注入
   const mvpPointsConfig = {
     ...R.points,
@@ -322,7 +382,12 @@ function awardMvp({ db, editionId, stageId, rules: R, createdAt }) {
     byPackage.get(key).push(p);
   }
 
-  const existing = new Set(pointsRepo.listLedgerByStage(db, stageId).map((r) => `${r.team_id}|${r.kind}`));
+  // ② 幂等键 = (届期, 队伍)：同一支队的 MVP 整届只发一次（跨赛段发榜不再重发）
+  const existing = new Set(
+    pointsRepo.listLedgerByEdition(db, editionId)
+      .filter((r) => r.kind === 'mvp')
+      .map((r) => r.team_id),
+  );
   const awarded = [];
   for (const [pkgId, points] of byPackage) {
     // ★ 路演名次积分是【包内第几名】→ 必须先按包过滤，否则外队会挤掉本包真冠军（P3-27）
@@ -334,7 +399,7 @@ function awardMvp({ db, editionId, stageId, rules: R, createdAt }) {
     if (!out.mvp) continue;
     const teamId = out.mvp.teamId;
     if (!pkgTeamIds.has(teamId)) continue;      // 防御：获奖队必须属于本任务包
-    if (existing.has(`${teamId}|mvp`)) continue;    // 幂等
+    if (existing.has(teamId)) continue;    // 幂等（届期级）
     // MVP 积分口径：rules/criteria.mvp.awardPointsSource = 'stage_points_sum'
     const awardPoints = points.filter((p) => p.teamId === teamId).reduce((s, p) => s + (Number(p.points) || 0), 0);
     for (const m of repo.listTeamMembers(db, teamId)) {

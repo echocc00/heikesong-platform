@@ -25,6 +25,16 @@ test('★ 降级告警置顶：warnings 出现在榜单之前', () => {
   assert.ok(html.indexOf('judge_sample_too_small') < html.indexOf('A队'), '告警必须排在榜单之前（置顶）');
 });
 
+test('★ 滚动总榜的告警要标出是哪一段降级（多赛段来源）', () => {
+  const html = leaderboardHtml({
+    scope: 'rolling',
+    warnings: [{ code: 'NO_COMPUTATION_SNAPSHOT', message: '本赛段尚无计算快照', stageId: 'st_2', stageKey: 'S2', stageName: '空赛段' }],
+    rows: [{ teamId: 't_a', teamName: 'A队', rank: 1, total: 90, points: 10, tier: 'A' }],
+  });
+  assert.ok(html.includes('空赛段'), '告警要标出来源赛段名');
+  assert.ok(html.indexOf('空赛段') < html.indexOf('A队'), '告警仍然置顶');
+});
+
 test('榜单渲染并列名次与积分；队名必须转义', () => {
   const html = leaderboardHtml({
     scope: 'rank', warnings: [],

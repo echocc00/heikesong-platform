@@ -28,10 +28,28 @@ export function getTeamTier({ db, teamId, viewer = null, rules = null }) {
     throw new AppError(404, 'NOT_FOUND', '战队不存在');
   }
   const milestones = tierRepo.listMilestonesByTeam(db, teamId);
+  // ★ 终审 M-3：`reasons_json` 解析加保护 —— 脏数据直接 JSON.parse 会抛错 → 接口 500。
+  //    口径与榜单侧一致（collectWarnings 对快照 JSON 解析有 try/catch）：解析失败降级为空数组，
+  //    并**显式带一条告警**（不静默 —— 静默的空产出比报错更危险，R-AUD-05）。
+  const warnings = [];
+  let reasons = [];
+  if (record?.reasons_json) {
+    try {
+      const parsed = JSON.parse(record.reasons_json);
+      reasons = Array.isArray(parsed) ? parsed : [];
+    } catch {
+      reasons = [];
+      warnings.push({
+        source: 'tier', code: 'REASONS_PARSE_FAILED',
+        message: '段位记录的原因说明无法解析，已降级为空列表，请人工核对',
+      });
+    }
+  }
   const out = {
     teamId, teamName: team.name, tier, tierName: tiers.find((t) => t.key === tier)?.name ?? tier,
     benefits: (R.ranks?.benefits || {})[tier] || [], neverUnlocks: R.ranks?.neverUnlocks || [],
-    reasons: record?.reasons_json ? JSON.parse(record.reasons_json) : [],
+    reasons,
+    warnings,
     progress: {
       milestones: milestones.map((m) => ({ key: m.key, label: m.label })),
       milestoneCount: record?.milestone_count ?? 0,
