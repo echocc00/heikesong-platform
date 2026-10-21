@@ -223,7 +223,21 @@ test('rules/criteria.json 承载段位附加条件与行为分证据要求', () 
   assert.ok(rules.criteria.tier.businessDepartmentKeywords.includes('业务'));
   assert.ok(rules.criteria.tier.technicalDepartmentKeywords.includes('技术'));
   assert.equal(rules.criteria.mvp.awardPointsSource, 'stage_points_sum');
+  assert.deepEqual(rules.criteria.mvp.tiebreak, ['roadshow_points', 'team_id'], 'MVP 决胜链默认以 team_id 收尾');
   assert.deepEqual(rules.criteria.behaviorEvidence.weekly_progress.required, ['repo', 'version']);
+});
+
+test('配置校验会拒绝非法 / 缺失的 MVP 决胜链', () => {
+  const { rules } = loadRules(rulesDir);
+  const bad = structuredClone(rules);
+  delete bad.criteria.mvp.tiebreak;                        // 缺决胜链 → 同分 MVP 由入参顺序决定
+  assert.ok(validateRules(bad).some((e) => e.includes('tiebreak')));
+  const bad2 = structuredClone(rules);
+  bad2.criteria.mvp.tiebreak = ['roadshow_points', 'lottery'];   // 未知决胜键
+  assert.ok(validateRules(bad2).some((e) => e.includes('lottery')));
+  const bad3 = structuredClone(rules);
+  bad3.criteria.mvp.tiebreak = ['roadshow_points'];        // 缺 team_id 收尾 → 非确定性兜底
+  assert.ok(validateRules(bad3).some((e) => e.includes('team_id')));
 });
 
 test('配置校验会拒绝非法的 points 配置', () => {
@@ -619,7 +633,9 @@ export function hasStageRoster(db, stageId) {
   },
   "mvp": {
     "awardPointsSource": "stage_points_sum",
-    "awardPointsNote": "MVP 积分 = 该队计入的 4 个赛段的名次积分之和。rules/points.json 未规定 mvp 数值，此为待组委会确认口径；改这里即可，不改代码。"
+    "awardPointsNote": "MVP 积分 = 该队计入的 4 个赛段的名次积分之和。rules/points.json 未规定 mvp 数值，此为待组委会确认口径；改这里即可，不改代码。",
+    "tiebreak": ["roadshow_points", "team_id"],
+    "tiebreakNote": "MVP 综合分并列时的决胜链（顺序即优先级）。⚠️ 任务书 §七 只给了「4 赛段总积分 + S4 路演评审综合」的加法公式，未写并列怎么办；S10 §0.3「互评的真正用途是破同分」+ §4「行为分用于同分垫底排序」确立了本赛事通则 —— 同分必须用实质依据决出，不许用字母序。故默认：路演名次积分高者胜（仍是评审实质依据）→ 仍并列则 team_id 码位序（确定性兜底，跨机器可复算）。**此为 P3 自有口径 · 待组委会确认**；改这里即可，不改代码。"
   },
   "behaviorEvidence": {
     "weekly_progress": { "required": ["repo", "version"], "oneOf": ["artifact", "blocker"] },
@@ -699,6 +715,22 @@ export function hasStageRoster(db, stageId) {
       errors.push('criteria.tier.businessDepartmentKeywords 缺失或为空');
     }
   }
+
+  // ── MVP 决胜链（P3）──────────────────────────────────────
+  // ⛔ 综合分并列时必须有决胜链，且必须以确定性键收尾 —— 否则同分 MVP 由输入顺序决定，
+  //    换台机器重算可能选出不同的 MVP。
+  if (!crit?.mvp || !Array.isArray(crit.mvp.tiebreak) || !crit.mvp.tiebreak.length) {
+    errors.push('criteria.mvp.tiebreak 缺失或为空');
+  } else {
+    const known = new Set(['roadshow_points', 'team_id']);
+    for (const k of crit.mvp.tiebreak) {
+      if (!known.has(k)) errors.push(`criteria.mvp.tiebreak 含未知决胜键：${k}`);
+    }
+    if (crit.mvp.tiebreak.at(-1) !== 'team_id') {
+      errors.push('criteria.mvp.tiebreak 必须以 team_id 收尾（确定性兜底）');
+    }
+  }
+
 ```
 
 文件末尾追加兜底加载器：
@@ -720,7 +752,7 @@ export function getDefaultRules() {
 
 - [ ] **Step 6: 运行测试确认通过**
 
-Run: `cd platform && node --test test/leaderboard-migration.test.js` → Expected: PASS（**14 个测试全过**：leaderboard-migration.test.js 14 —— 规格自带 8 + 变异检验补测 6）
+Run: `cd platform && node --test test/leaderboard-migration.test.js` → Expected: PASS（**16 个测试全过**：leaderboard-migration.test.js 16 —— 规格自带 8 + 变异检验补测 6 + Task 7 补测 2）
 Run: `cd platform && node --test` → Expected: 全部通过（P2 全量 **551/551**；P0 的 `config.test.js` 仍通过——新增规则文件不影响既有断言）
 
 - [ ] **Step 7: 提交**
@@ -1425,6 +1457,54 @@ test('computeMvp：stageId 为 null 的条目不算「带赛段」', () => {
   assert.equal(out.mvp.stageTotal, 10, 'stageId=null 的条目不参与赛段口径');
 });
 
+test('★ computeMvp：路演综合分先折算成路演名次积分再计入（判别性数据集）', () => {
+  const out = computeMvp({
+    stagePoints: [
+      { teamId: 't_a', stageId: 'S1', points: 10 },
+      { teamId: 't_b', stageId: 'S1', points: 8 },
+      { teamId: 't_c', stageId: 'S1', points: 5 },
+    ],
+    roadshowScores: [{ teamId: 't_a', score: 50 }, { teamId: 't_b', score: 70 }, { teamId: 't_c', score: 90 }],
+    packageId: 'tp_1',
+    pointsConfig: P,
+  });
+  // 路演名次积分：t_c 90 → 10、t_b 70 → 8、t_a 50 → 5（与赛段名次同一把尺子）
+  // 综合分：t_a 15 / t_b 16 / t_c 15 → t_b
+  assert.equal(out.mvp.teamId, 't_b');
+  assert.equal(out.ranked.find((r) => r.teamId === 't_b').roadshowPoints, 8);
+  assert.equal(out.ranked.find((r) => r.teamId === 't_c').roadshowPoints, 10);
+  // ⚠️ 这个数据集能区分三种实现：
+  //    ① 折算成名次积分（正确）→ t_b
+  //    ② 把路演原始 0–100 分直接相加 → t_c（5+90=95）
+  //    ③ 完全不计路演 → t_a（10）
+});
+
+test('★ computeMvp：综合分并列时按路演名次积分决出（不是 team_id 字母序）', () => {
+  const out = computeMvp({
+    stagePoints: [{ teamId: 't_a', stageId: 'S1', points: 10 }, { teamId: 't_b', stageId: 'S1', points: 8 }],
+    roadshowScores: [{ teamId: 't_b', score: 90 }, { teamId: 't_a', score: 50 }],
+    packageId: 'tp_1',
+    pointsConfig: P,
+  });
+  assert.equal(out.ranked[0].score, out.ranked[1].score, '综合分真并列（18 : 18）');
+  assert.equal(out.mvp.teamId, 't_b', '路演名次积分高者胜（按 team_id 码位序会选 t_a）');
+  assert.deepEqual(out.tiebreak, ['roadshow_points', 'team_id']);
+});
+
+test('computeMvp：决胜链可配置；未知键被剔除、缺 team_id 收尾时自动补上', () => {
+  const base = {
+    stagePoints: [{ teamId: 't_a', stageId: 'S1', points: 10 }, { teamId: 't_b', stageId: 'S1', points: 8 }],
+    roadshowScores: [{ teamId: 't_b', score: 90 }, { teamId: 't_a', score: 50 }],
+    packageId: 'tp_1',
+  };
+  const onlyTeam = computeMvp({ ...base, pointsConfig: { ...P, mvp: { ...P.mvp, tiebreak: ['team_id'] } } });
+  assert.equal(onlyTeam.mvp.teamId, 't_a', '决胜链配成只用 team_id → 按码位序');
+  const noTail = computeMvp({ ...base, pointsConfig: { ...P, mvp: { ...P.mvp, tiebreak: ['roadshow_points'] } } });
+  assert.deepEqual(noTail.tiebreak, ['roadshow_points', 'team_id'], '自动补上 team_id 收尾（确定性兜底）');
+  const bogus = computeMvp({ ...base, pointsConfig: { ...P, mvp: { ...P.mvp, tiebreak: ['lottery', 'roadshow_points'] } } });
+  assert.deepEqual(bogus.tiebreak, ['roadshow_points', 'team_id'], '未知决胜键被剔除');
+});
+
 test('computeMvp：roadshowWeight 配成 2 时路演积分按倍数计入', () => {
   const out = computeMvp({
     stagePoints: [{ teamId: 't_a', stageId: 'S1', points: 5 }],
@@ -1618,17 +1698,40 @@ export function computeStagePoints({ ordered, pointsConfig }) {
 }
 
 /**
+ * MVP 综合分并列时的决胜键（有序）。
+ * ⚠️ 口径来源：任务书 §七只给了「4 赛段总积分 + S4 路演评审综合」的**加法**公式，
+ *    没写综合分并列怎么办；但 S10 §0.3「互评的真正用途是破同分」+ §4「行为分用于同分垫底排序」
+ *    确立了本赛事的通则：**同分必须用实质依据决出，不许用字母序**。
+ *    因此默认决胜链 = 路演名次积分（高者胜，仍是评审实质依据）→ team_id 码位序（确定性兜底）。
+ *    可由 rules/criteria.json.mvp.tiebreak 配置（顺序即优先级）。
+ */
+export const MVP_TIEBREAK_KEYS = ['roadshow_points', 'team_id'];
+
+/** 决胜链规范化：只认已知键、去重、强制以 team_id 收尾（确定性兜底，跨机器可复算） */
+function normalizeTiebreak(raw) {
+  const out = [];
+  for (const k of Array.isArray(raw) ? raw : MVP_TIEBREAK_KEYS) {
+    if (MVP_TIEBREAK_KEYS.includes(k) && !out.includes(k)) out.push(k);
+  }
+  if (!out.includes('team_id')) out.push('team_id');
+  return out;
+}
+
+/**
  * MVP：4 赛段总积分 + S4 路演评审综合，每个任务包 1 个（任务书 §七 + 设计文档 §6.3 + R-RNK-09）。
  * - stagePoints: [{ teamId, stageId?, points }]，带 stageId 时只取前 stagesCounted 个赛段
  * - roadshowScores: [{ teamId, score }]，S4 路演评审综合分（0–100）
  * 路演综合分先折算成【路演名次积分】（与赛段名次同一 10/8/5 口径），再乘 roadshowWeight
  * 计入总分 —— 两部分量纲一致，不需要另造一套权重。
+ * ⚠️ 调用方必须只传【本任务包】的队伍：路演名次积分是「包内第几名」，
+ *    混进别的包的队伍会挤掉本包真冠军（P3-27）。
  */
 export function computeMvp({ stagePoints, roadshowScores, packageId, pointsConfig }) {
   const mvpCfg = pointsConfig?.mvp || {};
   const stagesCounted = Number.isFinite(mvpCfg.stagesCounted) ? mvpCfg.stagesCounted : 4;
   const roadshowWeight = Number.isFinite(mvpCfg.roadshowWeight) ? mvpCfg.roadshowWeight : 1;
   const perPackage = Number.isFinite(mvpCfg.perPackage) ? mvpCfg.perPackage : 1;
+  const tiebreak = normalizeTiebreak(mvpCfg.tiebreak);
 
   // ① 赛段积分聚合（只取前 stagesCounted 个赛段；赛段键按字典序，S1..S4 顺序稳定）
   const stageTotals = new Map();
@@ -1656,6 +1759,7 @@ export function computeMvp({ stagePoints, roadshowScores, packageId, pointsConfi
   roadRanked.forEach((r, i) => { roadPoints.set(r.teamId, stagePointsFor(i + 1, pointsConfig)); });
 
   // ③ 综合分 = 4 赛段总积分 + roadshowWeight × 路演积分
+  //    ⚠️ 候选集 = 赛段积分有分的队 ∪ 路演有分的队；调用方保证路演分只含本包队伍。
   const teamIds = new Set([...stageTotals.keys(), ...roadPoints.keys()]);
   const ranked = [...teamIds].map((teamId) => {
     const stageTotal = stageTotals.get(teamId) || 0;
@@ -1667,17 +1771,32 @@ export function computeMvp({ stagePoints, roadshowScores, packageId, pointsConfi
       roadshowContribution: roadshowWeight * road,
       score: stageTotal + roadshowWeight * road,
     };
-  }).sort((a, b) => b.score - a.score || cmpStr(a.teamId, b.teamId));
+  }).sort((a, b) => compareMvp(a, b, tiebreak));
 
   const winners = ranked.slice(0, Math.max(1, perPackage));
   return {
     packageId: packageId ?? null,
     stagesCounted,
     roadshowWeight,
+    tiebreak,
     mvp: winners[0] ?? null,
     mvpList: winners,
     ranked,
   };
+}
+
+/** MVP 排序比较：综合分降序 → 决胜链依次比较 → team_id 码位序 */
+function compareMvp(a, b, tiebreak) {
+  if (b.score !== a.score) return b.score - a.score;
+  for (const key of tiebreak) {
+    if (key === 'roadshow_points') {
+      if (b.roadshowPoints !== a.roadshowPoints) return b.roadshowPoints - a.roadshowPoints;
+    } else if (key === 'team_id') {
+      const c = cmpStr(a.teamId, b.teamId);
+      if (c !== 0) return c;
+    }
+  }
+  return 0;
 }
 
 /**
@@ -1763,7 +1882,7 @@ export function computePrizeShares({ ordered, prizeTable }) {
 
 - [ ] **Step 4: 运行测试确认通过**
 
-Run: `cd platform && node --test test/points.test.js` → Expected: PASS（**24** 个测试全过：points.test.js 24 —— 规格自带 7 + 预审补测 1 + 变异检验补测 16；变异体 45 → KILLED 43 / 等价 2 / 有效缺口 0）
+Run: `cd platform && node --test test/points.test.js` → Expected: PASS（**27** 个测试全过：points.test.js 27 —— 规格自带 7 + 预审补测 1 + 变异检验补测 16 + Task 7 补测 3；变异体 45 → KILLED 43 / 等价 2 / 有效缺口 0；Task 7 后追加 5 个变异体（W31–W35）→ 全部 KILLED）
 
 - [ ] **Step 5: 提交**
 
@@ -2934,10 +3053,12 @@ git commit -m "feat(P3): API 层可见性过滤与 C-02 段位公示裁决"
 - Create: `platform/src/db/repo/leaderboard.js`、`platform/src/db/repo/points.js`、`platform/src/db/repo/tiers.js`、`platform/src/services/leaderboard.js`、`platform/src/services/performance-card.js`、`platform/src/services/tier.js`、`platform/test/leaderboard-service.test.js`
 - Reuse: `platform/src/errors.js`（P0 已建，本阶段**只复用、一行不改**：已是 status-first 顺序 `AppError(status, code, message, detail)`；不新建 `errors/app-error.js`）
 - Modify: `platform/src/server.js`
+- Modify（Task 3 建立的，本 Task 只追加）：`platform/src/domain/points.js`（MVP 决胜链 P3-28）、`platform/test/points.test.js`
+- Modify（Task 1 建立的，本 Task 只追加）：`platform/rules/criteria.json`（`mvp.tiebreak` 决胜链 P3-28）、`platform/test/leaderboard-migration.test.js`（决胜链的 fail-fast 校验）
 
 **Interfaces:**
 - Consumes: `rankTeams` / `computeStagePoints` / `computeMvp` / `computePersonalPoints` / `behaviorScore` / `applyVisibility` / `computeTier`（Task 2–6）、P2 的 `stage_results` / `peer_reviews` / `enterprise_confirmations` / `computation_snapshots`、P1 的 `teams` / `team_members` / `task_packages`
-- Produces: `getLeaderboard({ db, stageId, scope, viewer })` → `{ scope, stageId, editionId, rows, warnings, ... }`（**已过滤**）；`getRollingLeaderboard({ db, editionId, viewer })` → 滚动总榜（已过滤）；`publishLeaderboard({ db, editionId, stageId, actorId, now })` → `{ editionId, stageId, snapshots, awarded, createdAt }`（写快照 + 审计 + 积分流水）；`getPerformanceCard({ db, teamId, viewer })` → 战绩卡（不含签字人）；`getTeamTier({ db, teamId, viewer })` → 段位与权益；API `GET /api/leaderboard/:stageId?scope=rank|business|personal`｜`GET /api/leaderboard/rolling?editionId=`｜`GET /api/teams/:id/performance-card`｜`GET /api/teams/:id/tier`
+- Produces: `getLeaderboard({ db, stageId, scope, viewer })` → `{ scope, stageId, editionId, rows, warnings, ... }`（**已过滤**）；`getRollingLeaderboard({ db, editionId, viewer })` → 滚动总榜（已过滤）；`publishLeaderboard({ db, editionId, stageId, actorId, now, rules? })` → `{ editionId, stageId, snapshots, awarded, createdAt }`（写快照 + 审计 + 积分流水；`rules` 缺省走 `getDefaultRules()`，**注入口只为让「配置说了算」可被观测**）；`getPerformanceCard({ db, teamId, viewer })` → 战绩卡（不含签字人）；`getTeamTier({ db, teamId, viewer })` → 段位与权益；API `GET /api/leaderboard/:stageId?scope=rank|business|personal`｜`GET /api/leaderboard/rolling?editionId=`｜`GET /api/teams/:id/performance-card`｜`GET /api/teams/:id/tier`
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -2956,6 +3077,8 @@ import { loadRules } from '../src/config.js';
 import { createApp } from '../src/server.js';
 import { createSession } from '../src/auth/session.js';
 import { getLeaderboard, publishLeaderboard } from '../src/services/leaderboard.js';
+import { computeTeamTier } from '../src/services/tier.js';
+import { getLatestTierRecord } from '../src/db/repo/tiers.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const NOW = '2026-10-20T00:00:00.000Z';
@@ -2965,23 +3088,27 @@ function seed(db) {
     INSERT INTO users (id, name, phone, password_hash, mba_status, org, is_superadmin, active, created_at)
     VALUES ('u_admin','组委会管理员','13800000000','x','mba',NULL,1,1,'${NOW}'),
            ('u_cap','A队队长','13800000001','x','mba',NULL,0,1,'${NOW}'),
+           ('u_b','B队队长','13800000002','x','mba',NULL,0,1,'${NOW}'),
            ('u_obs','观察员','13800000003','x','other',NULL,0,1,'${NOW}'),
-           ('u_d','D队队员','13800000004','x','other',NULL,0,1,'${NOW}');
+           ('u_d','D队队员','13800000004','x','other',NULL,0,1,'${NOW}'),
+           ('u_c','C队队长','13800000005','x','mba',NULL,0,1,'${NOW}'),
+           ('u_j1','跨领域评委','13800000006','x','mba',NULL,0,1,'${NOW}');
     INSERT INTO editions (id, name, city, starts_at, ends_at, created_at)
     VALUES ('ed_1','第一届','上海','2026-10-01','2026-10-31','${NOW}');
     INSERT INTO cities (id, name, edition_id) VALUES ('c_1','上海','ed_1');
     INSERT INTO task_packages (id, edition_id, enterprise_id, enterprise_name, title, pain_point,
       expected_delivery, acceptance_criteria, grade, status, solvability_score, solvability_grade,
-      commitment, agreement, is_free_brief, created_at)
-    VALUES ('tp_1','ed_1','e_1','某某公司','任务一','痛点一','交付物一','验收一','A','approved',10,'A','试点承诺','承诺书',0,'${NOW}'),
-           ('tp_2','ed_1','e_2','乙公司','任务二','痛点二','交付物二','验收二','A','approved',10,'A','试点承诺','承诺书',0,'${NOW}');
+      commitment, agreement, is_free_brief, submitted_by, submitted_at)
+    VALUES ('tp_1','ed_1','e_1','某某公司','任务一','痛点一','交付物一','验收一','A','approved',10,'A','试点承诺','承诺书',0,'u_cap','${NOW}'),
+           ('tp_2','ed_1','e_2','乙公司','任务二','痛点二','交付物二','验收二','A','approved',10,'A','试点承诺','承诺书',0,'u_cap','${NOW}');
     INSERT INTO teams (id, edition_id, name, captain_id, task_package_id, tier, status, created_at)
     VALUES ('t_a','ed_1','A队','u_cap','tp_1','A','active','${NOW}'),
-           ('t_b','ed_1','B队','u_cap','tp_1','A','active','${NOW}'),
-           ('t_c','ed_1','C队','u_cap','tp_2','C','active','${NOW}'),
+           ('t_b','ed_1','B队','u_b','tp_1','A','active','${NOW}'),
+           ('t_c','ed_1','C队','u_c','tp_2','C','active','${NOW}'),
            ('t_d','ed_1','D队','u_cap','tp_2','D','active','${NOW}');
-    INSERT INTO team_members (team_id, user_id, role, joined_at)
-    VALUES ('t_a','u_cap','captain','${NOW}'), ('t_d','u_d','captain','${NOW}');
+    INSERT INTO team_members (id, team_id, user_id, role, joined_at)
+    VALUES ('tm_1','t_a','u_cap','captain','${NOW}'), ('tm_2','t_d','u_d','captain','${NOW}'),
+           ('tm_3','t_b','u_b','captain','${NOW}'), ('tm_4','t_c','u_c','captain','${NOW}');
     INSERT INTO stages (id, edition_id, key, name, kind, starts_at, ends_at, freeze_at, scoring_config_key, status)
     VALUES ('st_1','ed_1','S1','调研赛段','initial','2026-10-01','2026-10-10','2026-10-11','initial','closed'),
            ('st_2','ed_1','S2','空赛段','initial','2026-10-10','2026-10-13','2026-10-14','initial','closed'),
@@ -2989,15 +3116,15 @@ function seed(db) {
     INSERT INTO stage_results (id, stage_id, team_id, rank, total, seat_p, seat_e, tied_with, points, computation_id, created_at)
     VALUES ('sr_1','st_1','t_a',1,90,88,95,0,10,NULL,'${NOW}'),
            ('sr_2','st_1','t_b',2,90,90,85,1,8,NULL,'${NOW}'),
-           ('sr_3','st_1','t_c',3,70,70,NULL,0,5,NULL,'${NOW}'),
-           ('sr_4','st_1','t_d',4,60,60,NULL,0,0,NULL,'${NOW}');
+           ('sr_3','st_1','t_c',3,70,70,0,0,5,NULL,'${NOW}'),
+           ('sr_4','st_1','t_d',4,60,60,0,0,0,NULL,'${NOW}');
     INSERT INTO peer_reviews (id, stage_id, from_team_id, to_team_id, score, request_id, created_at)
     VALUES ('pr_1','st_1','t_b','t_a',9,'rq_1','${NOW}'),
            ('pr_2','st_1','t_a','t_b',3,'rq_2','${NOW}');
     INSERT INTO enterprise_confirmations (id, stage_id, team_id, enterprise_id, dimension, raw_score,
       cross_judge_id, signatory_user_id, created_at, deleted_at)
-    VALUES ('ec_1','st_1','t_a','e_1','enterprise',80,'j_1','u_cap','${NOW}',NULL),
-           ('ec_2','st_1','t_b','e_2','enterprise',60,'j_1','u_cap','${NOW}',NULL);
+    VALUES ('ec_1','st_1','t_a','u_cap','enterprise',80,'u_j1','u_cap','${NOW}',NULL),
+           ('ec_2','st_1','t_b','u_cap','enterprise',60,'u_j1','u_cap','${NOW}',NULL);
     INSERT INTO computation_snapshots (id, kind, edition_id, stage_id, team_id, rule_version,
       input_json, output_json, trace_json, revision, created_at)
     VALUES ('cs_1','stage_score','ed_1','st_1',NULL,'scoring-initial@2026-10-20','{}',
@@ -3093,6 +3220,13 @@ test('★ 三态：列表不满足 → 200+空集；单条不满足 → 404；�
   broken.visibility.rank.public = false;
   const app2 = createApp({ db, rules: broken, webDir: join(here, '..', 'web') });
   assert.equal((await call(app2, 'GET', '/api/leaderboard/st_1?scope=rank')).status, 403);
+
+  // B 榜被关闭同样 403（不是 404 —— 是「规则禁用」不是「不存在」）
+  const brokenBiz = structuredClone(rules);
+  brokenBiz.visibility.business.milestoneProgressPublic = false;
+  const app3 = createApp({ db, rules: brokenBiz, webDir: join(here, '..', 'web') });
+  assert.equal((await call(app3, 'GET', '/api/leaderboard/st_1?scope=business')).status, 403,
+    'B 榜关闭 → 403');
   close(); rmSync(dataDir, { recursive: true, force: true });
 });
 
@@ -3147,9 +3281,12 @@ test('★ 观察员不能发榜（403）；发榜写快照+审计+积分流水�
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE action = 'leaderboard.publish'").get().n, 1);
   const ledger1 = db.prepare("SELECT COUNT(*) AS n FROM points_ledger WHERE kind = 'stage_rank'").get().n;
   assert.ok(ledger1 > 0, '名次积分要写进流水');
+  const mvp1 = db.prepare("SELECT COUNT(*) AS n FROM points_ledger WHERE kind = 'mvp'").get().n;
   publishLeaderboard({ db, editionId: 'ed_1', stageId: 'st_1', actorId: 'u_admin', now: NOW });
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM points_ledger WHERE kind = 'stage_rank'").get().n, ledger1,
     '重复发榜不得重复发分');
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM points_ledger WHERE kind = 'mvp'").get().n, mvp1,
+    '重复发榜不得重复发 MVP 积分');
   close(); rmSync(dataDir, { recursive: true, force: true });
 });
 
@@ -3161,6 +3298,225 @@ test('★ 服务层返回体不含互评来源与行为分明细', () => {
   assert.equal(row.behaviorScore, undefined);
   assert.equal(row.fromTeamId, undefined);
   close(); rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('★ P3-15：发榜时【重算】段位 —— 段位来自「里程碑 + 未撤回签字」，不是历史记录', () => {
+  const { db, close, dataDir } = setup();
+  try {
+    const before = db.prepare("SELECT * FROM tier_records WHERE team_id = 't_a' AND deleted_at IS NULL ORDER BY computed_at DESC, rowid DESC LIMIT 1").get();
+    assert.equal(before.tier, 'A', '种子里的历史记录是 A');
+
+    publishLeaderboard({ db, editionId: 'ed_1', stageId: 'st_1', actorId: 'u_admin', now: '2026-10-21T00:00:00.000Z' });
+
+    const after = db.prepare("SELECT * FROM tier_records WHERE team_id = 't_a' AND deleted_at IS NULL ORDER BY computed_at DESC, rowid DESC LIMIT 1").get();
+    assert.equal(after.tier, 'B', '3 个里程碑里只有 2 个有未撤回签字 → 2 个达成 → B 段');
+    assert.equal(after.milestone_count, 2, '没有签字的里程碑不算达成（R-PTS-01）');
+    assert.equal(after.business_signoff_count, 1, '技术部门的签字不算业务部门（R-PTS-03）');
+
+    const noMs = db.prepare("SELECT * FROM tier_records WHERE team_id = 't_b' AND deleted_at IS NULL ORDER BY computed_at DESC, rowid DESC LIMIT 1").get();
+    assert.equal(noMs.tier, 'D', '没有任何里程碑的队伍 → D 段');
+  } finally {
+    close(); rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('★ P3-15：连续 14 天零提交 → 降 1 档并公示（相对重算出的段位降，不叠加）', () => {
+  const { db, close, dataDir } = setup();
+  try {
+    // 20 天后再发榜 → 队伍「零提交」20 天 → 触发闲置降档
+    publishLeaderboard({ db, editionId: 'ed_1', stageId: 'st_1', actorId: 'u_admin', now: '2026-11-09T00:00:00.000Z' });
+    const after = db.prepare("SELECT * FROM tier_records WHERE team_id = 't_a' AND deleted_at IS NULL ORDER BY computed_at DESC, rowid DESC LIMIT 1").get();
+    assert.equal(after.tier, 'C', '重算出 B → 闲置降 1 档 → C');
+    const reasons = JSON.parse(after.reasons_json);
+    assert.ok(reasons.some((r) => String(r).includes('inactive_14days')), '降级原因要写进 reasons');
+  } finally {
+    close(); rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// 段位口径的边界（W01~W05 / W07 / W10~W13）
+// ═══════════════════════════════════════════════════════════════════
+
+test('★ 段位口径：未知部门不算业务签字、撤回的签字不计入、不计段位的里程碑不计数', () => {
+  const { db, close, dataDir } = setup();
+  try {
+    // ① 未知部门（法务部）的签字：不是业务部门 → 不算 S 段的那 1 个业务签字
+    db.prepare(`INSERT INTO milestone_signoffs (id, milestone_id, enterprise_id, signatory_user_id, department, content, signed_at, revoked_at)
+      VALUES ('sg_3','ms_1','e_1','u_cap','法务部','内容','${NOW}',NULL)`).run();
+    // ② 撤回的签字：对应里程碑不再算「已达成」
+    db.prepare(`INSERT INTO milestone_signoffs (id, milestone_id, enterprise_id, signatory_user_id, department, content, signed_at, revoked_at)
+      VALUES ('sg_4','ms_3','e_1','u_cap','业务部门','内容','${NOW}','${NOW}')`).run();
+    // ③ 不计段位的里程碑（counts_toward_tier = 0）
+    db.prepare(`INSERT INTO milestones (id, team_id, stage_id, key, label, counts_toward_tier, fixed_at, requires_signoff, created_at)
+      VALUES ('ms_5','t_a',NULL,'iterations','迭代','0','${NOW}',0,'${NOW}')`).run();
+
+    const out = computeTeamTier({ db, teamId: 't_a', now: '2026-10-21T00:00:00.000Z', record: false });
+    assert.equal(out.milestoneCount, 2, '撤回的签字与不计段位的里程碑都不算达成');
+    assert.equal(out.businessSignoffCount, 1, '只有业务部门的签字算业务签字（法务部 = unknown，不算）');
+    assert.equal(out.tier, 'B', '2 个达成 → B 段（撤回归档已由重算体现，不再叠加降档）');
+  } finally {
+    close(); rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('★ 降级后的段位名要跟着最终档位走（不能用降级前的名字）', () => {
+  const { db, close, dataDir } = setup();
+  try {
+    const out = computeTeamTier({ db, teamId: 't_a', now: '2026-11-09T00:00:00.000Z', record: false });
+    assert.equal(out.tier, 'C', '闲置 20 天 → B 降 C');
+    assert.equal(out.tierName, '立项', '段位名要跟着【最终】档位走（C 段 = 立项）');
+  } finally {
+    close(); rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('★ 「取最新一条段位记录」在 computed_at 并列时按 rowid（登记顺序），不用随机 id', () => {
+  const { db, close, dataDir } = setup();
+  try {
+    // 两条 computed_at 完全相同；id 的字典序与登记顺序【故意相反】
+    db.prepare(`INSERT INTO tier_records (id, team_id, tier, milestone_count, business_signoff_count, reasons_json, computed_at, deleted_at)
+      VALUES ('tr_z','t_b','C',1,0,'[]','${NOW}',NULL)`).run();
+    db.prepare(`INSERT INTO tier_records (id, team_id, tier, milestone_count, business_signoff_count, reasons_json, computed_at, deleted_at)
+      VALUES ('tr_a','t_b','B',2,0,'[]','${NOW}',NULL)`).run();
+    const latest = getLatestTierRecord(db, 't_b');
+    assert.equal(latest.id, 'tr_a', '后登记的那条才是最新的（id 是随机 UUID，不能用它兜底排序）');
+  } finally {
+    close(); rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('★ 「零提交」口径不含积分流水 —— 发榜不能给自己豁免降级', () => {
+  const { db, close, dataDir } = setup();
+  try {
+    // 第一次发榜会写 points_ledger
+    publishLeaderboard({ db, editionId: 'ed_1', stageId: 'st_1', actorId: 'u_admin', now: '2026-10-25T00:00:00.000Z' });
+    // 第二次发榜：距【队伍真实提交】(2026-10-20) 16 天 → 仍应降级；
+    // 若把积分流水当成「提交」，末次活动是 10-25 → 只隔 11 天 → 不会降级
+    publishLeaderboard({ db, editionId: 'ed_1', stageId: 'st_1', actorId: 'u_admin', now: '2026-11-05T00:00:00.000Z' });
+    const after = db.prepare("SELECT * FROM tier_records WHERE team_id='t_a' AND deleted_at IS NULL ORDER BY computed_at DESC, rowid DESC LIMIT 1").get();
+    assert.equal(after.tier, 'C', '积分流水不算「提交」→ 第二次发榜仍然降级');
+  } finally {
+    close(); rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// 行为分与 MVP 的数据通路（W27 / W28）
+// ═══════════════════════════════════════════════════════════════════
+
+test('★ 破同分时行为分只从独立表 behavior_events 来（分轨强制）', () => {
+  const { db, close, dataDir } = setup();
+  try {
+    // 新赛段：t_c 与 t_d 同分，peer / enterprise 都没有可比较的值
+    //   → 破同分链只能落到 behavior；若行为分不从 behavior_events 读，两人仍是并列
+    db.prepare("INSERT INTO stages (id, edition_id, \"key\", name, kind, starts_at, ends_at, freeze_at, scoring_config_key, status) VALUES ('st_3','ed_1','S3','行为分赛段','initial','2026-10-11','2026-10-12','2026-10-13','initial','closed')").run();
+    db.prepare("INSERT INTO stage_results (id, stage_id, team_id, rank, total, seat_p, seat_e, tied_with, points, computation_id, created_at) VALUES ('sr_5','st_3','t_c',1,70,70,0,0,NULL,NULL,'${NOW}'), ('sr_6','st_3','t_d',1,70,70,0,0,NULL,NULL,'${NOW}')").run();
+    db.prepare('INSERT INTO behavior_events (id, team_id, user_id, type, points, evidence, created_at) VALUES (?,?,?,?,?,?,?)')
+      .run('be_2', 't_c', 'u_cap', 'first_demo', 10, JSON.stringify({ artifact: 'demo.zip' }), NOW);
+    db.prepare('INSERT INTO behavior_events (id, team_id, user_id, type, points, evidence, created_at) VALUES (?,?,?,?,?,?,?)')
+      .run('be_3', 't_d', 'u_cap', 'weekly_progress', 2, JSON.stringify({ repo: 'git@x', version: 'v1', artifact: 'demo.zip' }), NOW);
+
+    const out = getLeaderboard({ db, stageId: 'st_3', scope: 'rank', viewer: null });
+    const rows = out.rows.filter((r) => r.teamId === 't_c' || r.teamId === 't_d');
+    assert.deepEqual(rows.map((r) => r.teamId), ['t_c', 't_d'], '行为分高者在前');
+    assert.deepEqual(rows.map((r) => r.rank), [1, 2], '行为分把并列拆开（不是仍然并列）');
+  } finally {
+    close(); rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('★ MVP 的路演分要折算成路演名次积分再计入（判别性：折算 / 不折算 / 不计路演 给出三个不同赢家）', () => {
+  const { db, close, dataDir } = setup();
+  try {
+    // tp_1 扩到 3 队（t_a / t_b / t_e）：两队时路演名次积分（10/8）与赛段名次积分（10/8）
+    // 恰好等量，合计永远并列，测不出「路演有没有真的计入」。
+    db.prepare("INSERT INTO users (id, name, phone, password_hash, mba_status, org, is_superadmin, active, created_at) VALUES ('u_e','E队队长','13800000007','x','mba',NULL,0,1,'${NOW}')").run();
+    db.prepare("INSERT INTO teams (id, edition_id, name, captain_id, task_package_id, tier, status, created_at) VALUES ('t_e','ed_1','E队','u_e','tp_1','D','active','${NOW}')").run();
+    db.prepare("INSERT INTO team_members (id, team_id, user_id, role, joined_at) VALUES ('tm_5','t_e','u_e','captain','${NOW}')").run();
+    // 赛段 st_1：t_a / t_b 同分 90（破同分链后 t_a 在前）、t_e 垫底 50
+    db.prepare("INSERT INTO stage_results (id, stage_id, team_id, rank, total, seat_p, seat_e, tied_with, points, computation_id, created_at) VALUES ('sr_9','st_1','t_e',5,50,50,0,0,NULL,NULL,'${NOW}')").run();
+    // 路演 st_r：名次与赛段【完全相反】t_e 90 > t_b 70 > t_a 50
+    db.prepare("INSERT INTO stage_results (id, stage_id, team_id, rank, total, seat_p, seat_e, tied_with, points, computation_id, created_at) VALUES ('sr_7','st_r','t_e',1,90,90,0,0,NULL,NULL,'${NOW}'), ('sr_8','st_r','t_b',2,70,70,0,0,NULL,NULL,'${NOW}'), ('sr_10','st_r','t_a',3,50,50,0,0,NULL,NULL,'${NOW}')").run();
+
+    const out = publishLeaderboard({ db, editionId: 'ed_1', stageId: 'st_1', actorId: 'u_admin', now: NOW });
+    const tp1 = out.awarded.mvp.find((m) => m.packageId === 'tp_1');
+    // 赛段名次积分 t_a 10 / t_b 8 / t_e 5；路演名次积分 t_e 10 / t_b 8 / t_a 5
+    //   → 综合分 t_a 15 / t_b 16 / t_e 15 → t_b 拿 MVP
+    // ⚠️ 三种错实现会给出三个不同赢家，数据集能区分：
+    //    ① 折算成路演名次积分（正确）→ t_b
+    //    ② 把路演原始 0–100 分直接相加 → t_e（95）
+    //    ③ 完全不计路演 → t_a（10）
+    assert.ok(tp1, 'tp_1 要选出 MVP');
+    assert.equal(tp1.teamId, 't_b', '路演名次积分要计入，并能反超赛段领先者');
+    assert.equal(tp1.points, 8, 'MVP 积分 = 该队计入的赛段名次积分之和（stage_points_sum）');
+
+    const ledger = db.prepare("SELECT * FROM points_ledger WHERE kind = 'mvp' AND team_id = 't_b'").all();
+    assert.equal(ledger.length, 1, 'MVP 积分要写进流水');
+    assert.equal(ledger[0].points, 8);
+    assert.equal(ledger[0].user_id, 'u_b', '写给队内成员');
+  } finally {
+    close(); rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('★ MVP 决胜口径是配置项（rules.criteria.mvp.tiebreak 说了算，不写死在代码里）', () => {
+  const { db, close, dataDir, rules } = setup();
+  try {
+    // tp_1 两队：赛段名次积分 t_a 10 / t_b 8；路演名次积分 t_b 10 / t_a 8 → 综合分 18 : 18 真并列
+    db.prepare("INSERT INTO stage_results (id, stage_id, team_id, rank, total, seat_p, seat_e, tied_with, points, computation_id, created_at) VALUES ('sr_7','st_r','t_b',1,90,90,0,0,NULL,NULL,'${NOW}'), ('sr_8','st_r','t_a',2,50,50,0,0,NULL,NULL,'${NOW}')").run();
+
+    // 注入一份把决胜链改成「只按 team_id」的规则 → 并列时选 t_a（码位序）
+    const custom = {
+      ...rules,
+      criteria: { ...rules.criteria, mvp: { ...rules.criteria.mvp, tiebreak: ['team_id'] } },
+    };
+    const out = publishLeaderboard({ db, editionId: 'ed_1', stageId: 'st_1', actorId: 'u_admin', now: NOW, rules: custom });
+    const tp1 = out.awarded.mvp.find((m) => m.packageId === 'tp_1');
+    assert.equal(tp1.teamId, 't_a', '决胜口径由配置决定 → 改成 team_id 后并列时选 t_a');
+  } finally {
+    close(); rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('★ 跨任务包队伍不得挤掉本任务包的 MVP（路演名次积分按包内排名）', () => {
+  const { db, close, dataDir } = setup();
+  try {
+    // tp_1 的 t_b 路演分最高（90）；tp_2 的 t_c / t_d 没有路演结果
+    //   若不按包过滤路演分：t_b 会带着「路演 10 分、赛段 0 分」进入 tp_2 的候选，
+    //   与 t_c 的「赛段 10 分」并列 10 : 10 → 旧的 team_id 兜底会让 t_b 赢（t_b < t_c）
+    //   → 外队挤掉本包真冠军，且拿到的 MVP 积分是 0
+    db.prepare("INSERT INTO stage_results (id, stage_id, team_id, rank, total, seat_p, seat_e, tied_with, points, computation_id, created_at) VALUES ('sr_7','st_r','t_b',1,90,90,0,0,NULL,NULL,'${NOW}'), ('sr_8','st_r','t_a',2,50,50,0,0,NULL,NULL,'${NOW}')").run();
+
+    const out = publishLeaderboard({ db, editionId: 'ed_1', stageId: 'st_1', actorId: 'u_admin', now: NOW });
+    const tp2 = out.awarded.mvp.find((m) => m.packageId === 'tp_2');
+    assert.ok(tp2, 'tp_2 要选出 MVP');
+    assert.equal(tp2.teamId, 't_c', '本包真冠军是 t_c，不能被外队 t_b 挤掉');
+    assert.equal(tp2.points, 10, 'MVP 积分按本包赛段名次积分计');
+    assert.ok(!out.awarded.mvp.some((m) => m.teamId === 't_b' && m.packageId === 'tp_2'), '外队不得出现在本包 MVP');
+  } finally {
+    close(); rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('★ MVP 综合分并列时按路演名次积分决胜（不许按队名字母序）', () => {
+  const { db, close, dataDir } = setup();
+  try {
+    // tp_1 两队：赛段名次积分 t_a 10 / t_b 8；路演名次积分 t_b 10 / t_a 8
+    //   → 综合分 18 : 18 真并列 → 决胜链 roadshow_points → t_b
+    // ⚠️ 若按 team_id 码位序兜底会选 t_a（'t_a' < 't_b'）→ 数据集能区分两种兜底
+    db.prepare("INSERT INTO stage_results (id, stage_id, team_id, rank, total, seat_p, seat_e, tied_with, points, computation_id, created_at) VALUES ('sr_7','st_r','t_b',1,90,90,0,0,NULL,NULL,'${NOW}'), ('sr_8','st_r','t_a',2,50,50,0,0,NULL,NULL,'${NOW}')").run();
+
+    const out = publishLeaderboard({ db, editionId: 'ed_1', stageId: 'st_1', actorId: 'u_admin', now: NOW });
+    const tp1 = out.awarded.mvp.find((m) => m.packageId === 'tp_1');
+    assert.equal(tp1.teamId, 't_b', '综合分并列由路演名次积分决出');
+    const ledger = db.prepare("SELECT * FROM points_ledger WHERE kind = 'mvp'").all();
+    const teams = new Set(ledger.map((r) => r.team_id));
+    assert.ok(teams.has('t_b'), 'MVP 流水写给 t_b');
+    assert.ok(!teams.has('t_a'), 't_a 只是并列，不能拿到 MVP');
+  } finally {
+    close(); rmSync(dataDir, { recursive: true, force: true });
+  }
 });
 ```
 
@@ -3327,13 +3683,13 @@ export function insertTierRecord(db, { id, teamId, tier, milestoneCount, busines
 
 export function getLatestTierRecord(db, teamId) {
   return db.prepare(`SELECT * FROM tier_records WHERE team_id = ? AND deleted_at IS NULL
-    ORDER BY computed_at DESC, id DESC LIMIT 1`).get(teamId) ?? null;
+    ORDER BY computed_at DESC, rowid DESC LIMIT 1`).get(teamId) ?? null;
 }
 
 /** 每支队伍最新的一条段位记录 */
 export function listLatestTiersByEdition(db, editionId) {
   const rows = db.prepare(`SELECT tr.* FROM tier_records tr JOIN teams t ON t.id = tr.team_id
-    WHERE t.edition_id = ? AND tr.deleted_at IS NULL ORDER BY tr.computed_at ASC, tr.id ASC`).all(editionId);
+    WHERE t.edition_id = ? AND tr.deleted_at IS NULL ORDER BY tr.computed_at ASC, tr.rowid ASC`).all(editionId);
   const latest = new Map();
   for (const r of rows) latest.set(r.team_id, r);
   return [...latest.values()];
@@ -3361,6 +3717,22 @@ export function listSignoffsByTeams(db, teamIds) {
   return db.prepare(`SELECT s.* FROM milestone_signoffs s JOIN milestones m ON m.id = s.milestone_id
     WHERE m.team_id IN (${ids.map(() => '?').join(',')}) ORDER BY s.signed_at ASC`).all(...ids);
 }
+
+/**
+ * 队伍最近一次「提交」的时间（R-PTS-04 降级规则里的「连续 N 天零提交」口径）。
+ * ⛔ 只算队伍**自己**的产出：行为分事件 / 里程碑固定 / 企业签字。
+ *    绝不算 points_ledger —— 发榜会写积分流水，算进去等于发榜把「零提交」刷新掉了，
+ *    降级规则就永远不触发（发榜自我豁免）。
+ */
+export function getTeamLastActivityAt(db, teamId) {
+  const row = db.prepare(`
+    SELECT MAX(t) AS last_at FROM (
+      SELECT MAX(created_at) AS t FROM behavior_events WHERE team_id = ?
+      UNION ALL SELECT MAX(fixed_at) FROM milestones WHERE team_id = ?
+      UNION ALL SELECT MAX(s.signed_at) FROM milestone_signoffs s JOIN milestones m ON s.milestone_id = m.id WHERE m.team_id = ?
+    )`).get(teamId, teamId, teamId);
+  return row?.last_at ?? null;
+}
 ```
 
 - [ ] **Step 4: 创建 src/services/leaderboard.js**
@@ -3380,6 +3752,7 @@ import { rankTeams } from '../domain/ranking.js';
 import { computeStagePoints, computeMvp, computePersonalPoints } from '../domain/points.js';
 import { behaviorScore } from '../domain/behavior.js';
 import { applyVisibility } from '../domain/visibility.js';
+import { computeTeamTier } from './tier.js';
 import { cmpStr } from '../domain/util.js';
 import * as repo from '../db/repo/leaderboard.js';
 import * as pointsRepo from '../db/repo/points.js';
@@ -3600,8 +3973,8 @@ export function getRollingLeaderboard({ db, editionId, viewer = null, rules = nu
 }
 
 /** 发榜：显式动作。写快照 + 审计日志 + 积分流水（追加式 + 幂等）。 */
-export function publishLeaderboard({ db, editionId, stageId, actorId, now }) {
-  const R = getDefaultRules();
+export function publishLeaderboard({ db, editionId, stageId, actorId, now, rules = null }) {
+  const R = rules || getDefaultRules();
   const user = getUserById(db, actorId);
   if (!can(user, 'stage:compute', { scopeType: 'edition', scopeId: editionId }, db)) {
     throw new AppError(403, 'FORBIDDEN', '无发榜权限');
@@ -3616,6 +3989,14 @@ export function publishLeaderboard({ db, editionId, stageId, actorId, now }) {
     const id = randomUUID();
     repo.insertSnapshot(db, { id, editionId, stageId, scope, payloadJson: JSON.stringify(payload), createdAt });
     snapshots[scope] = { id, scope, createdAt };
+  }
+
+  // ★ 发榜前重算段位：段位记录是榜单快照与段位公示的依据，
+  //    不重算就永远是兜底的 D 段（P3-15）。
+  const tierUpdates = [];
+  for (const row of repo.listStageResults(db, stageId)) {
+    if (tierUpdates.some((t) => t.teamId === row.team_id)) continue;
+    tierUpdates.push(computeTeamTier({ db, teamId: row.team_id, now: createdAt, rules: R }));
   }
 
   const awarded = {
@@ -3657,7 +4038,7 @@ function awardMvp({ db, editionId, stageId, rules: R, createdAt }) {
   const packageOf = new Map();
   for (const stage of stages) {
     if (stage.kind === 'roadshow') continue;
-    const built = buildStageRanking({ db, stage, rules: R });
+    const built = buildStageRanking({ db, stage, R });
     for (const row of built.ranking.ordered) {
       const res = built.results.find((r) => r.team_id === row.teamId);
       stagePoints.push({ teamId: row.teamId, stageId: stage.key, points: built.points[row.teamId] ?? 0 });
@@ -3669,6 +4050,11 @@ function awardMvp({ db, editionId, stageId, rules: R, createdAt }) {
   const roadshowScores = roadshowStage
     ? repo.listStageResults(db, roadshowStage.id).map((r) => ({ teamId: r.team_id, score: r.total }))
     : [];
+  // MVP 决胜口径在 criteria.json（P3 自有），computeMvp 只认 pointsConfig.mvp → 服务层合并注入
+  const mvpPointsConfig = {
+    ...R.points,
+    mvp: { ...R.points.mvp, tiebreak: R.criteria?.mvp?.tiebreak },
+  };
   const byPackage = new Map();
   for (const p of stagePoints) {
     const key = packageOf.get(p.teamId) ?? '__none__';
@@ -3679,9 +4065,15 @@ function awardMvp({ db, editionId, stageId, rules: R, createdAt }) {
   const existing = new Set(pointsRepo.listLedgerByStage(db, stageId).map((r) => `${r.team_id}|${r.kind}`));
   const awarded = [];
   for (const [pkgId, points] of byPackage) {
-    const out = computeMvp({ stagePoints: points, roadshowScores, packageId: pkgId, pointsConfig: rules.points });
+    // ★ 路演名次积分是【包内第几名】→ 必须先按包过滤，否则外队会挤掉本包真冠军（P3-27）
+    const pkgTeamIds = new Set(points.map((p) => p.teamId));
+    const pkgRoadshowScores = roadshowScores.filter((r) => pkgTeamIds.has(r.teamId));
+    const out = computeMvp({
+      stagePoints: points, roadshowScores: pkgRoadshowScores, packageId: pkgId, pointsConfig: mvpPointsConfig,
+    });
     if (!out.mvp) continue;
     const teamId = out.mvp.teamId;
+    if (!pkgTeamIds.has(teamId)) continue;      // 防御：获奖队必须属于本任务包
     if (existing.has(`${teamId}|mvp`)) continue;    // 幂等
     // MVP 积分口径：rules/criteria.mvp.awardPointsSource = 'stage_points_sum'
     const awardPoints = points.filter((p) => p.teamId === teamId).reduce((s, p) => s + (Number(p.points) || 0), 0);
@@ -3747,6 +4139,8 @@ export function getPerformanceCard({ db, teamId, viewer = null, rules = null }) 
 import { AppError } from '../errors.js';
 import { getDefaultRules } from '../config.js';
 import { cmpStr } from '../domain/util.js';
+import { randomUUID } from 'node:crypto';
+import { computeTier, applyTierDemotion, classifyDepartment, isDataOrPrototypeMilestone } from '../domain/tier.js';
 import * as repo from '../db/repo/leaderboard.js';
 import * as tierRepo from '../db/repo/tiers.js';
 
@@ -3793,54 +4187,7 @@ function tierBoardRank(db, team, order) {
   const idx = board.findIndex((t) => t.team_id === team.id);
   return idx < 0 ? null : idx + 1;
 }
-```
 
-- [ ] **Step 5b: 段位计算接线（P3-15 修复 —— 段位引擎不许是死代码）**
-
-> **【为什么有这一步】** Task 4 的 `computeTier` / `applyTierDemotion` / `classifyDepartment` /
-> `isDataOrPrototypeMilestone` 若只有测试调用方，**整套段位引擎就是死代码** ——
-> `tier_records` 永远没有生产写入路径，`getTeamTier` 只能回落到兜底的 `'D'`，
-> R-PTS-01/02/03/05 全部落空。这与 P2 终审的 **I-2**（`checkJudgePool` 零调用方）、
-> P1 Task 3 的 **A1** 同一类病根：**能力被建好却从不校验 / 从不被调用**。
-> 本步把「段位怎么被算出来」写成可执行规格，而不是留一句「Consumes: computeTier」的悬空承诺。
-
-**段位口径（必须按这个口径实现，不许各写各的）**
-
-| 概念 | 口径 | 依据 |
-|---|---|---|
-| 里程碑「已达成」 | `requires_signoff = 0` → 已固定即达成；`requires_signoff = 1` → **必须有未撤回的企业签字**才算达成 | R-PTS-01「工作室能刷打卡，刷不到企业签字」 |
-| 「企业业务部门签字」 | `classifyDepartment(department) === 'business'`；`unknown` 按 `criteria.tier.unknownDepartmentCountsAsBusiness` 决定（出厂 `false`） | R-PTS-03 + `unknownDepartmentCountsAsBusiness` 这个配置项**不许形同虚设** |
-| 「撤回签字 → 降回对应档」 | **由「按未撤回签字重算段位」实现**（该里程碑不再达成 → 门槛不够 → 自然落到低一档） | R-PTS-04 |
-| 「连续 14 天零提交 → 降 1 档」 | 由 `applyTierDemotion` 承担，**相对本次重算出的段位**降 | R-PTS-04 |
-| 「提交」的时间口径 | 队伍**自己**的产出：行为分事件 / 里程碑固定 / 企业签字。⛔ **不含 `points_ledger`** —— 发榜会写积分流水，若把它算作提交，发榜就把「零提交」刷新掉了，降级规则永远不触发 | 降级规则不能被发榜动作自我豁免 |
-| 降级不叠加 | 撤回归档与闲置降档同时命中时**只降 1 档** | `applyTierDemotion` 的 `Math.max` 口径 |
-
-> ⚠️ **不要把 `revokedSignoffs` 喂给 `applyTierDemotion`**：撤回签字的影响已经由「重算」体现，
-> 再喂一次会**重复降级**（S → A 之后再 A → B）。生产链路里 `applyTierDemotion` 只负责闲置降档。
-
-**① `src/db/repo/tiers.js` 追加一个函数**（追加，不改已有函数）：
-
-```javascript
-/**
- * 队伍最近一次「提交」的时间（R-PTS-04 降级规则里的「连续 N 天零提交」口径）。
- * ⛔ 只算队伍**自己**的产出：行为分事件 / 里程碑固定 / 企业签字。
- *    绝不算 points_ledger —— 发榜会写积分流水，算进去等于发榜把「零提交」刷新掉了，
- *    降级规则就永远不触发（发榜自我豁免）。
- */
-export function getTeamLastActivityAt(db, teamId) {
-  const row = db.prepare(`
-    SELECT MAX(t) AS last_at FROM (
-      SELECT MAX(created_at) AS t FROM behavior_events WHERE team_id = ?
-      UNION ALL SELECT MAX(fixed_at) FROM milestones WHERE team_id = ?
-      UNION ALL SELECT MAX(s.signed_at) FROM milestone_signoffs s JOIN milestones m ON s.milestone_id = m.id WHERE m.team_id = ?
-    )`).get(teamId, teamId, teamId);
-  return row?.last_at ?? null;
-}
-```
-
-**② `src/services/tier.js` 追加一个函数**（`getTeamTier` 保持不变；这是**新增**的写路径）：
-
-```javascript
 /**
  * ★ 段位计算（唯一的生产入口）：里程碑 + 企业签字 → 段位 → 写 tier_records。
  * ⚠️ 没有这个函数，Task 4 的整套段位引擎就只是死代码（队伍永远兜底 D 段）。
@@ -3905,36 +4252,66 @@ export function computeTeamTier({ db, teamId, now, rules = null, record = true }
       computedAt: at,
     });
   }
-  return { ...computed, tier, tierName: computed.tierName, demoted: demotion.demoted, demotionReason: demotion.reason, publish: demotion.publish };
+  const tierName = (R.ranks?.tiers || []).find((t) => t.key === tier)?.name ?? tier;
+  return {
+    ...computed, tier, tierName,
+    demoted: demotion.demoted, demotionReason: demotion.reason, publish: demotion.publish,
+  };
 }
 ```
 
-> ⚠️ 上面这段里的 `tierName` 必须取**最终档位**的名字（降级后档位可能变了）：
-> 落地时用 `R.ranks.tiers.find((t) => t.key === tier)?.name ?? tier`，
-> 不要直接透传 `computed.tierName`（那是降级**前**的名字）。
+- [ ] **Step 5b: 段位计算接线（P3-15 修复 —— 段位引擎不许是死代码）**
 
-**③ `src/services/leaderboard.js` 的 `publishLeaderboard` 里接入**（在 `const awarded = {` **之前**插入）：
+> **【为什么有这一步】** Task 4 的 `computeTier` / `applyTierDemotion` / `classifyDepartment` /
+> `isDataOrPrototypeMilestone` 若只有测试调用方，**整套段位引擎就是死代码** ——
+> `tier_records` 永远没有生产写入路径，`getTeamTier` 只能回落到兜底的 `'D'`，
+> R-PTS-01/02/03/05 全部落空。这与 P2 终审的 **I-2**（`checkJudgePool` 零调用方）、
+> P1 Task 3 的 **A1** 同一类病根：**能力被建好却从不校验 / 从不被调用**。
+> 本步把「段位怎么被算出来」写成可执行规格，而不是留一句「Consumes: computeTier」的悬空承诺。
 
-```javascript
-  // ★ 发榜前重算段位：段位记录是榜单快照与段位公示的依据，
-  //    不重算就永远是兜底的 D 段（P3-15）。
-  const tierUpdates = [];
-  for (const teamId of repo.listStageResultTeamIds(db, stageId)) {
-    tierUpdates.push(computeTeamTier({ db, teamId, now: createdAt, rules: R }));
-  }
-```
+**段位口径（必须按这个口径实现，不许各写各的）**
 
-> `repo.listStageResultTeamIds` 若仓储里没有，就用已有的 `repo.listStageResults(db, stageId)`
-> 取 `team_id` 去重（**不要为此新建一个仓储函数**：`listStageResults` 已经返回 `team_id`）。
-> `src/services/leaderboard.js` 顶部 import 区追加：
-> `import { computeTeamTier } from './tier.js';`
+| 概念 | 口径 | 依据 |
+|---|---|---|
+| 里程碑「已达成」 | `requires_signoff = 0` → 已固定即达成；`requires_signoff = 1` → **必须有未撤回的企业签字**才算达成 | R-PTS-01「工作室能刷打卡，刷不到企业签字」 |
+| 「企业业务部门签字」 | `classifyDepartment(department) === 'business'`；`unknown` 按 `criteria.tier.unknownDepartmentCountsAsBusiness` 决定（出厂 `false`） | R-PTS-03 + `unknownDepartmentCountsAsBusiness` 这个配置项**不许形同虚设** |
+| 「撤回签字 → 降回对应档」 | **由「按未撤回签字重算段位」实现**（该里程碑不再达成 → 门槛不够 → 自然落到低一档） | R-PTS-04 |
+| 「连续 14 天零提交 → 降 1 档」 | 由 `applyTierDemotion` 承担，**相对本次重算出的段位**降 | R-PTS-04 |
+| 「提交」的时间口径 | 队伍**自己**的产出：行为分事件 / 里程碑固定 / 企业签字。⛔ **不含 `points_ledger`** —— 发榜会写积分流水，若把它算作提交，发榜就把「零提交」刷新掉了，降级规则永远不触发 | 降级规则不能被发榜动作自我豁免 |
+| 降级不叠加 | 撤回归档与闲置降档同时命中时**只降 1 档** | `applyTierDemotion` 的 `Math.max` 口径 |
+
+> ⚠️ **不要把 `revokedSignoffs` 喂给 `applyTierDemotion`**：撤回签字的影响已经由「重算」体现，
+> 再喂一次会**重复降级**（S → A 之后再 A → B）。生产链路里 `applyTierDemotion` 只负责闲置降档。
+
+**实现位置**：本步的三段代码**已并入**下面三个**整文件块**（避免「片段块 + 整文件块」两处维护、
+以及 `/tmp/splice-plan.mjs` 把片段块覆盖成整文件的老坑）：
+
+- `src/db/repo/tiers.js` → 追加 `getTeamLastActivityAt`（**并把「取最新一条」的兜底排序键
+  从 `id DESC` 改成 `rowid DESC`** —— `tier_records.id` 是 `randomUUID()`，用它兜底等于
+  「取最新一条」顺序不可复现，与全局约定 #39 冲突）
+- `src/services/tier.js` → 追加 `computeTeamTier`（`getTeamTier` 保持不变，这是**新增**的写路径）
+- `src/services/leaderboard.js` → `publishLeaderboard` 里在 `const awarded = {` **之前**重算段位；
+  文件顶部追加 `import { computeTeamTier } from './tier.js';`
+
+> ⚠️ `computeTeamTier` 返回的 `tierName` 必须取**最终档位**（降级后档位可能变了）的中文名：
+> 用 `R.ranks.tiers.find((t) => t.key === tier)?.name ?? tier`，
+> **不要**直接透传 `computed.tierName`（那是降级**前**的名字）。
+
+**验收用例**（已含在 `test/leaderboard-service.test.js` 里）：
+
+| 用例 | 钉住什么 |
+|---|---|
+| 「发榜时【重算】段位」 | 种子里的 `tier_records` 是 A；发榜后 t_a 变成 **B**（3 个里程碑里只有 2 个有未撤回签字）、`business_signoff_count = 1`（技术部门签字不算业务部门）；没有里程碑的 t_b 是 D。**没有接线的话这条会红** —— 历史记录还是 A |
+| 「连续 14 天零提交 → 降 1 档并公示」 | 发榜时刻比队伍最后提交晚 20 天 → t_a 从 B 降到 **C**，且 `reasons_json` 里有 `inactive_14days` |
 
 - [ ] **Step 6: 修改 src/server.js（注册 4 个 P3 路由）**
 
 顶部 import 区追加：
 
 ```javascript
-import { AppError } from './errors.js';
+// ⚠️ 【不要】再 import 一次 AppError —— server.js 第 20 行已有
+//    `import { appError, AppError } from './errors.js';`。重复声明会让**整个模块加载失败**
+//    （SyntaxError: Identifier 'AppError' has already been declared）→ 平台全挂（P3-23）。
 import { getLeaderboard, getRollingLeaderboard } from './services/leaderboard.js';
 import { getPerformanceCard } from './services/performance-card.js';
 import { getTeamTier } from './services/tier.js';
@@ -3966,7 +4343,7 @@ import { getTeamTier } from './services/tier.js';
 
 - [ ] **Step 7: 运行测试确认通过**
 
-Run: `cd platform && node --test test/leaderboard-service.test.js` → Expected: PASS（8 个测试全过：leaderboard-service.test.js 8）
+Run: `cd platform && node --test test/leaderboard-service.test.js` → Expected: PASS（**19** 个测试全过：leaderboard-service.test.js 19 —— 规格自带 8 + 变异检验补测 7 + 规格缺陷补测 4）
 
 - [ ] **Step 8: 提交**
 
@@ -4373,6 +4750,8 @@ git commit -m "feat(P3): 榜单页、段位榜与战绩卡前端"
 | C | MVP 积分的数值口径 | **该队计入的 4 个赛段的名次积分之和** | `rules/points.json` 没有规定 mvp 数值 → 口径写在 `rules/criteria.json.mvp.awardPointsSource`，改配置即可，不改代码 |
 | D | 「连续 14 天零提交」的计时起点 | 取该队 `behavior_events` 的最新时间；从未提交过的队伍按 0 天计（不降级） | 「连续 14 天零提交」隐含已有提交历史；从未开始的新队不应因未提交被降级 |
 | E | D 段队伍的段位接口对外表现 | 非成员 → **404**；成员 → 本人进度卡（无名次） | 冲突裁决 C-02「D 段只公示个人进度，不公示排名」+ 三态语义「单条不满足 → 404」 |
+| F | **MVP 综合分并列时的决胜口径** | **`roadshow_points`（路演名次积分高者胜）→ `team_id` 码位序（确定性兜底）**，链在 `rules/criteria.json.mvp.tiebreak` 可配 | 任务书 §七 只给了「4 赛段总积分 + S4 路演评审综合」的**加法**公式，**没写并列怎么办**；S10 §0.3「互评的真正用途是破同分」+ §4「行为分用于同分垫底排序」确立了本赛事通则 —— **同分必须用实质依据决出，不许用字母序**。⚠️ 这不是边角：一个任务包只有 2 支队时，赛段名次积分与路演名次积分**都是 10/8**，量级相同 ⇒ 综合分**必然并列**。**属 P3 自有口径 · 待组委会确认**；**可改**：改 `rules/criteria.json.mvp.tiebreak` 一处即可（顺序即优先级），`config.js` 会对缺失/未知键/不以 `team_id` 收尾**拒绝启动** |
+| G | **MVP 路演名次积分的排名范围** | **任务包内**（与其它赛段同一把尺子） | 名次积分按任务包内排名发放（偏差表 B），路演是 S4 赛段 ⇒ 同一把尺子。⚠️ 若按全赛段名次折算，外包队伍会把路演前 3 名占满，本包队伍的路演贡献被压成 0 ⇒ **跨任务包不公平**，且会让外队挤掉本包真冠军（P3-27） |
 
 ---
 
@@ -4594,3 +4973,56 @@ git commit -m "feat(P3): 榜单页、段位榜与战绩卡前端"
 **Task 6 的测试条数口径**：visibility **9**（规格自带 5 + 变异检验补测 4）。
 
 **最终结果**：变异体 31 → **KILLED 31 / 等价变异体 0 / 有效缺口 0**；`visibility.test.js` **9/9**；P3 全量 **654/654**。
+
+---
+
+## Task 7 父代理预审修正台账（2026-10-21）
+
+> Task 7 是**榜单服务 + 战绩卡 + API** 的落地，也是 **Task 4 段位引擎的唯一生产调用方**（P3-15 兑现）。
+> 实施前把规格的代码块抽到 `/tmp` 的独立工程实跑（**先跑后派**）——
+> 规格自带的代码块在**发榜主路径**上有 4 处硬伤：其中 2 处让发榜必崩、1 处让**整个平台加载失败**、
+> 1 处让排序结果不可复现。落地后又用**变异检验**挖出 2 个真缺陷（跨包污染 + 并列决胜口径缺失）。
+> 变异体 **40** 个 → **KILLED 37 / 等价存活 3 / 有效缺口 0**。
+
+### 一、预审发现的规格缺陷（**规格自带代码块里的错**，不是实现跑偏）
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| **P3-22** | **Critical** | **`awardMvp` 里的 `buildStageRanking` 调用与函数签名不匹配** —— 签名是 `buildStageRanking({ db, stage, R })`，规格却写成 `buildStageRanking({ db, stage, rules: R })` ⇒ 解构出的 `R` 是 `undefined` ⇒ 函数内 `R.behavior` 抛 `TypeError` | **本轮复核实证**：把规格原写法还原进 `src/services/leaderboard.js` 后，`leaderboard-service.test.js` 有 **6 条用例红**（7 / 9 / 10 / 14 / 16 / 17），error 全是 `Cannot read properties of undefined (reading 'behavior')` —— **发榜主路径整条崩**（不只是 MVP，连段位重算、幂等校验一起挂） | 改成 `buildStageRanking({ db, stage, R })`。⚠️ 这类是**签名漂移**：同一个对象形参在规格里前后写了两套键名，靠通读代码块不会发现，只有实跑才会炸 |
+| **P3-23** | **Critical** | **`server.js` 的片段块重复 `import { AppError }`** —— 文件第 20 行已有 `import { appError, AppError } from './errors.js';`，片段块又 import 一次 ⇒ `SyntaxError: Identifier 'AppError' has already been declared` ⇒ **整个 server.js 加载失败 ⇒ 平台全挂**（不是单个接口挂，是全部路由挂） | 实跑：模块加载即 `SyntaxError`，`node --test` 里**所有走 server 的用例一起红** | 片段块里删掉那行 import，复用文件顶部已有的。⚠️ **片段块与整文件块混排时最容易出这种事故**：片段块的作者看不到文件顶部已经 import 过 |
+| **P3-24** | **Critical** | **`awardMvp` 里用了 `rules.points`** —— 该函数形参名是 `R`（`awardMvp({ db, editionId, stageId, rules: R, createdAt })`）⇒ 函数体里 `rules` 未定义 ⇒ `ReferenceError` | 实跑：`ReferenceError: rules is not defined` | 统一改成 `R.points` |
+| **P3-25** | **Critical** | **种子 SQL 与真实 schema 4 处不符** —— ① `task_packages` 写了 `created_at`，真实列是 `submitted_by` + `submitted_at`（**没有** `created_at`）；② `team_members` 缺 `id` 列（真实 schema 里 `id TEXT PRIMARY KEY` **NOT NULL**）；③ `stage_results.seat_e` 是 **NOT NULL**（P2 无企业席时写 0，不是 NULL）；④ `enterprise_confirmations` 的 `enterprise_id` / `cross_judge_id` 都是 `REFERENCES users(id)`，不能写 `e_1` 这种不存在的企业 id | 实跑：4 处**先后**报 `NOT NULL constraint failed` / `FOREIGN KEY constraint failed` —— 一次只暴露一处，必须逐条修 | 逐条对齐真实 schema（查 `sqlite_master` 的建表 SQL，不靠记忆）。⚠️ **种子里的一处错会掩盖后面所有错**，必须一条一条试出来 |
+| **P3-26** | **Important** | **`getLatestTierRecord` 用随机 id 兜底排序** —— `ORDER BY computed_at DESC, id DESC`：id 是随机 UUID ⇒ 两条 `computed_at` 相同时，**哪条是最新取决于 UUID 的字典序**，与登记顺序无关 ⇒ 段位可能取到旧记录 | 实跑：两条 `computed_at` 完全相同、id 的字典序与登记顺序**故意相反**时，取到的是**先登记**那条 | 改用 SQLite 隐式 **`rowid`**（登记顺序，确定性）。⚠️ 与 Task 2「破同分兜底必须确定性」是同一条纪律：**任何排序兜底都不能用随机 id** |
+| **P3-15 兑现** | **Important** | **Task 4 整套段位引擎零生产调用方** —— 引擎建好了，但没有一处调用它 ⇒ 队伍永远兜底 D 段 | 实跑：发榜前后 `tier_records` 一条没变 | `publishLeaderboard` 里对**本赛段有成绩的每支队**调 `computeTeamTier` 重算并落库；顺带把「段位公示」接上（`getTeamTier` 读最新记录）。⚠️ 段位口径（撤签降档、闲置降档、零提交口径）由 Task 4 台账的 Step 5b 写死，本 Task 只做**接线**，不改口径 |
+
+### 二、变异检验挖出的两个真缺陷（本 Task 新写代码里的漏洞）
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| **P3-27** | **Critical** | **MVP 的路演分没有按任务包过滤** —— `awardMvp` 把**全赛段**的路演结果原样喂给每个任务包的 `computeMvp` ⇒ 外包队伍带着「路演 10 分 + 赛段 0 分」进入本包候选 ⇒ 与本包真冠军「赛段 10 分」打平 10 : 10 ⇒ **旧的 team_id 兜底让外队 `t_b` 赢**（`'t_b' < 't_c'`）⇒ **外队挤掉本包真冠军，且它拿到的 MVP 积分是 0** | 探针（`/tmp/p3t7/debug-mvp.mjs`）：种子数据下 `awarded.mvp` = `[{t_a, tp_1, 10}, {t_b, tp_2, 0}]` —— **tp_2 的 MVP 是 tp_1 的队伍 `t_b`，积分 0** | 服务层按包过滤：`const pkgRoadshowScores = roadshowScores.filter((r) => pkgTeamIds.has(r.teamId));`。⚠️ 根因是**名次积分按任务包内排名发放**（设计文档 §6.3），而路演名次积分沿用了同一把尺子 —— **尺子必须和被量的对象同域**。补一条专门钉住跨包隔离的用例 |
+| **P3-28** | **Important** | **MVP 综合分并列时没有任何决胜口径** —— 任务书 §七 只给了「4 赛段总积分 + S4 路演评审综合」的**加法**公式；综合分并列时实现直接落到 `cmpStr(teamId)` ⇒ **MVP 由队名字母序决定**。这与 S10 §0.3「互评的真正用途是**破同分**」、§4「行为分用于同分垫底排序」确立的通则（**同分必须用实质依据决出，不许用字母序**）直接冲突 | 探针：两队赛段名次积分 10 / 8、路演名次积分 10 / 8 ⇒ 综合分 **18 : 18 真并列** ⇒ 旧实现选 `t_a`（纯字母序）。⚠️ **这不是罕见边界**：一个任务包只有 2 支队时，赛段名次积分与路演名次积分**都是 10 / 8**，量级完全相同 ⇒ 综合分**必然并列** ⇒ 「按字母序决出 MVP」是**常态路径**而非边角 | ① 新增配置项 `rules/criteria.json.mvp.tiebreak`（默认 `["roadshow_points", "team_id"]`）：综合分并列 → **路演名次积分高者胜**（仍是评审实质依据）→ 仍并列 → `team_id` 码位序（确定性兜底，跨机器可复算）。② `computeMvp` 支持有序决胜链并在返回值里带出 `tiebreak`（可追溯）。③ `normalizeTiebreak` 强制以 `team_id` 收尾 + 剔除未知键；④ `config.js` 对该段 **fail-fast**（缺失 / 未知键 / 不以 `team_id` 收尾 ⇒ 拒绝启动）。⑤ **不写进 `rules/points.json`** —— 该文件的 `mvp` 段被 `INTERFACES.md §4` 逐字钉死（`assert.deepEqual(rules.points.mvp, {...})`），P3 自有口径一律进 `criteria.json` |
+
+### 三、等价 / 不可观测变异体（**有探针差分实证**，不是凭推理放过）
+
+> 变异脚本：`/tmp/p3t7/mutate.mjs`（40 个变异体，覆盖段位接线 / 发榜幂等 / 可见性调用 / 仓储排序 /
+> MVP 按包过滤 / MVP 决胜链 / 配置 fail-fast）；探针：`/tmp/p3t7/probe.mjs`。
+
+| # | 级别 | 变异体 | 差分实证 | 结论 |
+|---|---|---|---|---|
+| **W10** | — | 没有最后活动时间的队伍按「闲置 999 天」处理 | 探针跑 4 支队伍：无活动的 2 支都是 **0 里程碑 ⇒ D 段 ⇒ 降档已到地板**（`order[max(0, idx-1)]` 仍是 D）⇒ **差异 0 处** | **不可观测**：无活动 ⟹ 0 里程碑 ⟹ D 段地板 ⟹ 闲置降档无对象。降级逻辑本身有覆盖（`inactive_14days` 用例），只是这条分支**在数据上不可达** |
+| **W26** | **Minor（真实发现）** | 榜单服务的 `viewerTeamIds` 传空 | 探针对 `rank` / `business` / `personal` / `rolling` **4 个可达 scope** 各跑一次「真实值 vs 空数组」，**差异 0 处** | **不可观测 —— 而且这是一条真实发现**：`applyVisibility` 里**唯一消费 `viewerTeamIds` 的是 `scope === 'tier'` 分支**，而榜单服务只传 rank/business/personal/rolling 四个 scope ⇒ **这根接线在榜单服务里是死的**。段位榜走的是 `services/tier.js` 自己的 `repo.isTeamMember` 判定（C-02 已实现、且有专门用例），**不走 `applyVisibility`**。⚠️ 与 P2 终审 I-2（`checkJudgePool` 零调用方）、Task 4 P3-15（段位引擎零调用方）同款病根：**能力建好了没接线**。**已知限制**：段位榜的「D 段只给本人进度卡」目前由 `services/tier.js` 单点保证，不在可见性模块内 —— Task 8 的段位榜前端要沿用这条链路，**不要另起一套过滤** |
+| **W40** | — | `awardMvp` 的「获奖队必须属于本任务包」防御闸门被摘掉 | 探针跑 30 组 `computeMvp` 输入，**获奖队落在输入队伍集合外的 0 组** | **不可观测**：候选集 = 赛段积分队 ∪ 路演队 ⊆ 输入队 ⇒ 闸门**不可达**（纯防御）。保留（不依赖它正确，但依赖它**出错时兜住**） |
+
+### 四、变异检验发现的其他盲区（已补测）
+
+| # | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|
+| — | **「MVP 的路演分要折算成路演名次积分再计入」这条用例原本身是坏的**：它假设「t_a / t_b 赛段积分同分」⇒ 但**名次积分按任务包内排名发放**（并列第一占第 1、2 席 ⇒ 10 与 8）⇒ **同包两队的赛段积分恒为 10 / 8，永远不同分** ⇒ 该用例的前提在结构上不成立 | 原用例实跑红；把它拆成**判别性数据集**后才测得出东西 | 重写为 3 条：① **判别性**（`tp_1` 扩到 3 队、路演名次与赛段名次**完全相反** ⇒ 折算 → `t_b` 胜；不折算 → `t_e` 胜；不计路演 → `t_a` 胜 ⇒ **三种错实现给出三个不同赢家**）；② **跨包隔离**（P3-27）；③ **并列决胜**（P3-28） |
+| — | **MVP 的决胜口径无法被观测** —— `publishLeaderboard` 硬编码 `getDefaultRules()` ⇒ 无法注入一份不同的决胜链来验证「配置说了算」 | 变异 W30（决胜口径不注入）**存活** | `publishLeaderboard` 增加 `rules` 注入口（默认仍走 `getDefaultRules()`）⇒ 补一条用例：注入 `tiebreak: ['team_id']` ⇒ 并列时改选 `t_a`。**变异 W30 随即被 KILLED** |
+| — | **`rules/criteria.json` 的出厂决胜链无人看守** | 变异 W38 / W39（出厂顺序颠倒 / 缺 team_id 收尾）虽被现有用例抓住，但抓它的是**别的**断言 | 补 `config.js` 的 fail-fast 校验 + `leaderboard-migration.test.js` 的专门用例（缺失 / 未知键 / 不以 `team_id` 收尾 三种非法配置） |
+
+**Task 7 的测试条数口径**：leaderboard-service **19**（规格自带 8 + 变异检验补测 7 + 规格缺陷补测 4）；
+points **27**（Task 3 的 24 + Task 7 补测 3）；leaderboard-migration **16**（Task 1 的 14 + Task 7 补测 2）。
+
+**最终结果**：变异体 40 → **KILLED 37 / 等价变异体 3 / 有效缺口 0**；
+`leaderboard-service.test.js` **19/19**、`points.test.js` **27/27**、`leaderboard-migration.test.js` **16/16**；P3 全量 **677/677**。

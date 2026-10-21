@@ -22,6 +22,9 @@ import { registerRegistrationRoutes } from './http/routes/registration.js';
 import { registerTaskPackageRoutes } from './http/routes/taskPackage.js';
 import { registerTeamRoutes } from './http/routes/team.js';
 import { registerReviewRoutes } from './http/routes/review.js';
+import { getLeaderboard, getRollingLeaderboard } from './services/leaderboard.js';
+import { getPerformanceCard } from './services/performance-card.js';
+import { getTeamTier } from './services/tier.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -117,6 +120,25 @@ export function createApp({ db, rules, webDir }) {
 
   router.add('GET', '/api/health', async () => ({ ok: true, at: new Date().toISOString() }));
 
+  // ── P3 榜单与积分 ───────────────────────────────────────────
+  // ⚠️ 路由顺序由 P0 的 router 按「参数段数量降序」排序：
+  //    /api/leaderboard/rolling（0 参）先于 /api/leaderboard/:stageId（1 参）匹配，
+  //    所以 "rolling" 不会被当成 stageId。
+  router.add('GET', '/api/leaderboard/rolling', async (ctx) => {
+    const editionId = ctx.query.editionId;
+    if (!editionId) throw new AppError(400, 'MISSING_PARAM', '缺少 editionId');
+    return getRollingLeaderboard({ db: ctx.db, editionId, viewer: ctx.user, rules: ctx.rules });
+  });
+  router.add('GET', '/api/leaderboard/:stageId', async (ctx) => {
+    const scope = ctx.query.scope || 'rank';
+    return getLeaderboard({ db: ctx.db, stageId: ctx.params.stageId, scope, viewer: ctx.user, rules: ctx.rules });
+  });
+  router.add('GET', '/api/teams/:id/performance-card', async (ctx) => {
+    return getPerformanceCard({ db: ctx.db, teamId: ctx.params.id, viewer: ctx.user, rules: ctx.rules });
+  });
+  router.add('GET', '/api/teams/:id/tier', async (ctx) => {
+    return getTeamTier({ db: ctx.db, teamId: ctx.params.id, viewer: ctx.user, rules: ctx.rules });
+  });
   router.add('GET', '/api/me', async ({ user }) => {
     if (!user) {
       // ⛔ 终审修正（Important，I-5）：领域错误必须走 AppError。

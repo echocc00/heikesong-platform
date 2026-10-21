@@ -576,6 +576,21 @@ export function validateRules(rules, expectedCount = null) {
     }
   }
 
+  // ── MVP 决胜链（P3）──────────────────────────────────────
+  // ⛔ 综合分并列时必须有决胜链，且必须以确定性键收尾 —— 否则同分 MVP 由输入顺序决定，
+  //    换台机器重算可能选出不同的 MVP。
+  if (!crit?.mvp || !Array.isArray(crit.mvp.tiebreak) || !crit.mvp.tiebreak.length) {
+    errors.push('criteria.mvp.tiebreak 缺失或为空');
+  } else {
+    const known = new Set(['roadshow_points', 'team_id']);
+    for (const k of crit.mvp.tiebreak) {
+      if (!known.has(k)) errors.push(`criteria.mvp.tiebreak 含未知决胜键：${k}`);
+    }
+    if (crit.mvp.tiebreak.at(-1) !== 'team_id') {
+      errors.push('criteria.mvp.tiebreak 必须以 team_id 收尾（确定性兜底）');
+    }
+  }
+
   return errors;
 }
 

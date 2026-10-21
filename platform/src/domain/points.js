@@ -37,17 +37,40 @@ export function computeStagePoints({ ordered, pointsConfig }) {
 }
 
 /**
+ * MVP 综合分并列时的决胜键（有序）。
+ * ⚠️ 口径来源：任务书 §七只给了「4 赛段总积分 + S4 路演评审综合」的**加法**公式，
+ *    没写综合分并列怎么办；但 S10 §0.3「互评的真正用途是破同分」+ §4「行为分用于同分垫底排序」
+ *    确立了本赛事的通则：**同分必须用实质依据决出，不许用字母序**。
+ *    因此默认决胜链 = 路演名次积分（高者胜，仍是评审实质依据）→ team_id 码位序（确定性兜底）。
+ *    可由 rules/criteria.json.mvp.tiebreak 配置（顺序即优先级）。
+ */
+export const MVP_TIEBREAK_KEYS = ['roadshow_points', 'team_id'];
+
+/** 决胜链规范化：只认已知键、去重、强制以 team_id 收尾（确定性兜底，跨机器可复算） */
+function normalizeTiebreak(raw) {
+  const out = [];
+  for (const k of Array.isArray(raw) ? raw : MVP_TIEBREAK_KEYS) {
+    if (MVP_TIEBREAK_KEYS.includes(k) && !out.includes(k)) out.push(k);
+  }
+  if (!out.includes('team_id')) out.push('team_id');
+  return out;
+}
+
+/**
  * MVP：4 赛段总积分 + S4 路演评审综合，每个任务包 1 个（任务书 §七 + 设计文档 §6.3 + R-RNK-09）。
  * - stagePoints: [{ teamId, stageId?, points }]，带 stageId 时只取前 stagesCounted 个赛段
  * - roadshowScores: [{ teamId, score }]，S4 路演评审综合分（0–100）
  * 路演综合分先折算成【路演名次积分】（与赛段名次同一 10/8/5 口径），再乘 roadshowWeight
  * 计入总分 —— 两部分量纲一致，不需要另造一套权重。
+ * ⚠️ 调用方必须只传【本任务包】的队伍：路演名次积分是「包内第几名」，
+ *    混进别的包的队伍会挤掉本包真冠军（P3-27）。
  */
 export function computeMvp({ stagePoints, roadshowScores, packageId, pointsConfig }) {
   const mvpCfg = pointsConfig?.mvp || {};
   const stagesCounted = Number.isFinite(mvpCfg.stagesCounted) ? mvpCfg.stagesCounted : 4;
   const roadshowWeight = Number.isFinite(mvpCfg.roadshowWeight) ? mvpCfg.roadshowWeight : 1;
   const perPackage = Number.isFinite(mvpCfg.perPackage) ? mvpCfg.perPackage : 1;
+  const tiebreak = normalizeTiebreak(mvpCfg.tiebreak);
 
   // ① 赛段积分聚合（只取前 stagesCounted 个赛段；赛段键按字典序，S1..S4 顺序稳定）
   const stageTotals = new Map();
@@ -75,6 +98,7 @@ export function computeMvp({ stagePoints, roadshowScores, packageId, pointsConfi
   roadRanked.forEach((r, i) => { roadPoints.set(r.teamId, stagePointsFor(i + 1, pointsConfig)); });
 
   // ③ 综合分 = 4 赛段总积分 + roadshowWeight × 路演积分
+  //    ⚠️ 候选集 = 赛段积分有分的队 ∪ 路演有分的队；调用方保证路演分只含本包队伍。
   const teamIds = new Set([...stageTotals.keys(), ...roadPoints.keys()]);
   const ranked = [...teamIds].map((teamId) => {
     const stageTotal = stageTotals.get(teamId) || 0;
@@ -86,17 +110,32 @@ export function computeMvp({ stagePoints, roadshowScores, packageId, pointsConfi
       roadshowContribution: roadshowWeight * road,
       score: stageTotal + roadshowWeight * road,
     };
-  }).sort((a, b) => b.score - a.score || cmpStr(a.teamId, b.teamId));
+  }).sort((a, b) => compareMvp(a, b, tiebreak));
 
   const winners = ranked.slice(0, Math.max(1, perPackage));
   return {
     packageId: packageId ?? null,
     stagesCounted,
     roadshowWeight,
+    tiebreak,
     mvp: winners[0] ?? null,
     mvpList: winners,
     ranked,
   };
+}
+
+/** MVP 排序比较：综合分降序 → 决胜链依次比较 → team_id 码位序 */
+function compareMvp(a, b, tiebreak) {
+  if (b.score !== a.score) return b.score - a.score;
+  for (const key of tiebreak) {
+    if (key === 'roadshow_points') {
+      if (b.roadshowPoints !== a.roadshowPoints) return b.roadshowPoints - a.roadshowPoints;
+    } else if (key === 'team_id') {
+      const c = cmpStr(a.teamId, b.teamId);
+      if (c !== 0) return c;
+    }
+  }
+  return 0;
 }
 
 /**

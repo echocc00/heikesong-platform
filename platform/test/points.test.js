@@ -190,6 +190,54 @@ test('computeMvp：stageId 为 null 的条目不算「带赛段」', () => {
   assert.equal(out.mvp.stageTotal, 10, 'stageId=null 的条目不参与赛段口径');
 });
 
+test('★ computeMvp：路演综合分先折算成路演名次积分再计入（判别性数据集）', () => {
+  const out = computeMvp({
+    stagePoints: [
+      { teamId: 't_a', stageId: 'S1', points: 10 },
+      { teamId: 't_b', stageId: 'S1', points: 8 },
+      { teamId: 't_c', stageId: 'S1', points: 5 },
+    ],
+    roadshowScores: [{ teamId: 't_a', score: 50 }, { teamId: 't_b', score: 70 }, { teamId: 't_c', score: 90 }],
+    packageId: 'tp_1',
+    pointsConfig: P,
+  });
+  // 路演名次积分：t_c 90 → 10、t_b 70 → 8、t_a 50 → 5（与赛段名次同一把尺子）
+  // 综合分：t_a 15 / t_b 16 / t_c 15 → t_b
+  assert.equal(out.mvp.teamId, 't_b');
+  assert.equal(out.ranked.find((r) => r.teamId === 't_b').roadshowPoints, 8);
+  assert.equal(out.ranked.find((r) => r.teamId === 't_c').roadshowPoints, 10);
+  // ⚠️ 这个数据集能区分三种实现：
+  //    ① 折算成名次积分（正确）→ t_b
+  //    ② 把路演原始 0–100 分直接相加 → t_c（5+90=95）
+  //    ③ 完全不计路演 → t_a（10）
+});
+
+test('★ computeMvp：综合分并列时按路演名次积分决出（不是 team_id 字母序）', () => {
+  const out = computeMvp({
+    stagePoints: [{ teamId: 't_a', stageId: 'S1', points: 10 }, { teamId: 't_b', stageId: 'S1', points: 8 }],
+    roadshowScores: [{ teamId: 't_b', score: 90 }, { teamId: 't_a', score: 50 }],
+    packageId: 'tp_1',
+    pointsConfig: P,
+  });
+  assert.equal(out.ranked[0].score, out.ranked[1].score, '综合分真并列（18 : 18）');
+  assert.equal(out.mvp.teamId, 't_b', '路演名次积分高者胜（按 team_id 码位序会选 t_a）');
+  assert.deepEqual(out.tiebreak, ['roadshow_points', 'team_id']);
+});
+
+test('computeMvp：决胜链可配置；未知键被剔除、缺 team_id 收尾时自动补上', () => {
+  const base = {
+    stagePoints: [{ teamId: 't_a', stageId: 'S1', points: 10 }, { teamId: 't_b', stageId: 'S1', points: 8 }],
+    roadshowScores: [{ teamId: 't_b', score: 90 }, { teamId: 't_a', score: 50 }],
+    packageId: 'tp_1',
+  };
+  const onlyTeam = computeMvp({ ...base, pointsConfig: { ...P, mvp: { ...P.mvp, tiebreak: ['team_id'] } } });
+  assert.equal(onlyTeam.mvp.teamId, 't_a', '决胜链配成只用 team_id → 按码位序');
+  const noTail = computeMvp({ ...base, pointsConfig: { ...P, mvp: { ...P.mvp, tiebreak: ['roadshow_points'] } } });
+  assert.deepEqual(noTail.tiebreak, ['roadshow_points', 'team_id'], '自动补上 team_id 收尾（确定性兜底）');
+  const bogus = computeMvp({ ...base, pointsConfig: { ...P, mvp: { ...P.mvp, tiebreak: ['lottery', 'roadshow_points'] } } });
+  assert.deepEqual(bogus.tiebreak, ['roadshow_points', 'team_id'], '未知决胜键被剔除');
+});
+
 test('computeMvp：roadshowWeight 配成 2 时路演积分按倍数计入', () => {
   const out = computeMvp({
     stagePoints: [{ teamId: 't_a', stageId: 'S1', points: 5 }],

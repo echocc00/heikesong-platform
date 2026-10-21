@@ -81,7 +81,21 @@ test('rules/criteria.json 承载段位附加条件与行为分证据要求', () 
   assert.ok(rules.criteria.tier.businessDepartmentKeywords.includes('业务'));
   assert.ok(rules.criteria.tier.technicalDepartmentKeywords.includes('技术'));
   assert.equal(rules.criteria.mvp.awardPointsSource, 'stage_points_sum');
+  assert.deepEqual(rules.criteria.mvp.tiebreak, ['roadshow_points', 'team_id'], 'MVP 决胜链默认以 team_id 收尾');
   assert.deepEqual(rules.criteria.behaviorEvidence.weekly_progress.required, ['repo', 'version']);
+});
+
+test('配置校验会拒绝非法 / 缺失的 MVP 决胜链', () => {
+  const { rules } = loadRules(rulesDir);
+  const bad = structuredClone(rules);
+  delete bad.criteria.mvp.tiebreak;                        // 缺决胜链 → 同分 MVP 由入参顺序决定
+  assert.ok(validateRules(bad).some((e) => e.includes('tiebreak')));
+  const bad2 = structuredClone(rules);
+  bad2.criteria.mvp.tiebreak = ['roadshow_points', 'lottery'];   // 未知决胜键
+  assert.ok(validateRules(bad2).some((e) => e.includes('lottery')));
+  const bad3 = structuredClone(rules);
+  bad3.criteria.mvp.tiebreak = ['roadshow_points'];        // 缺 team_id 收尾 → 非确定性兜底
+  assert.ok(validateRules(bad3).some((e) => e.includes('team_id')));
 });
 
 test('配置校验会拒绝非法的 points 配置', () => {
