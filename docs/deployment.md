@@ -751,9 +751,9 @@ heikesong-platform 启动于 http://127.0.0.1:8080（规则版本 2026-10-20）
 
 | # | 跑了什么 | 观察到 |
 |---|---|---|
-| E1 | `cd platform && node --disable-warning=ExperimentalWarning --test` | **1137 例 / 1136 通过 / 0 失败 / 1 跳过**（基线 981/981）<br>⚠️ 数字是**本轮提交时**的实况；后续阶段合入会变（用例数只增不减）⇒ 以实跑为准 |
-| E2 | `cd platform && node scripts/audit-scan.js` | **退出码 0**（词条 15 条、扫描 142 个文件、0 违规） |
-| E3 | `DATA_DIR=<tmp>/data node scripts/migrate.js` | `迁移完成，当前版本 5`（本次应用 001–005 五个迁移） |
+| E1 | `cd platform && node --disable-warning=ExperimentalWarning --test` | **1277 例 / 1276 通过 / 0 失败 / 1 跳过**（测于提交 `d8b6098`；基线 981/981）<br>⚠️ 数字是**测得时**的实况；后续阶段合入会变（用例数只增不减）⇒ **以实跑为准** |
+| E2 | `cd platform && node scripts/audit-scan.js` | **退出码 0**（词条 15 条、扫描 224 个文件、发布产物 `platform/web/dist` 另扫 60 个、0 违规） |
+| E3 | `DATA_DIR=<tmp>/data node scripts/migrate.js` | `迁移完成，当前版本 6`（本次应用 001–006 六个迁移） |
 | E4 | `node scripts/seed.js` 连跑两次 | 第一次「已创建管理员：13800000000」，第二次「管理员已存在」⇒ 幂等 |
 | E5 | `node scripts/backup.js` / `--out` / `--keep-days --keep-count` | 全部退出码 0；输出 `[backup] 完成：app-<UTC>.db（<字节> 字节，<页> 页）` |
 | E6 | `node scripts/restore.js`（活 pid / pid 文件坏 / 成功） | 活 pid ⇒ 拒绝；pid 不可解析 ⇒ **保守判为在跑并拒绝**；成功 ⇒ 旧库留存 + **删旧 `-wal`/`-shm`** + 新库就位 |

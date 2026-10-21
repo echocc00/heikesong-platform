@@ -768,12 +768,16 @@ WHERE EXISTS (SELECT 1 FROM assignment a
 
 ## 8. API 设计
 
-> ⚠️ **下面是实施后的真实 API 面**（**54 个端点**，逐条从代码里的 `router.add(...)` 抽出来的，
-> 不是设计期的手写清单）。复算：
+> ⚠️ **下面是实施后的真实 API 面**（**56 个端点** = router 里注册的 **55** 个
+> + **不挂 router** 的 SSE 流 **1** 个），逐条从代码里抽出来的，不是设计期的手写清单。复算：
 > `grep -rhoE "router\.add\('[A-Z]+',\s*'[^']+'" platform/src/ | sort -u`
+> ⇒ 55 个；SSE 那条在 `src/http/sse.js` 里按路径匹配（见下方「实时」段），
+> **不在 `router.add` 的输出里** —— 这是「SSE 不挂 router」的既定决策（它要长期持有连接，
+> 不能像普通 handler 那样「写完就结束响应」）。
 >
 > 变更史：本节原为设计期的 28 个端点；P0–P4 按计划实现，P5 追加了工作流 / 三池 / 公开榜
-> （+15），P4 追加了复核与申诉（+11）。**逐条需求的落点与验收**见
+> （+15）、P4 追加了复核与申诉（+11），P5 Task 5 追加了 iCal 日历订阅（+1）。
+> **逐条需求的落点与验收**见
 > [`../requirement-implementation-map.md`](../requirement-implementation-map.md)（机器生成）；
 > **跨阶段签名与表结构的唯一事实来源**是
 > [`../superpowers/plans/INTERFACES.md`](../superpowers/plans/INTERFACES.md)。
@@ -853,7 +857,11 @@ WHERE EXISTS (SELECT 1 FROM assignment a
   POST   /api/appeals/:id/decide             申诉裁决
 
 实时
-  GET    /api/events                         ★ SSE 实时事件流（**不带 judgeId**）
+  GET    /api/stages/:stageId/events     ★ SSE 实时事件流（**不带 judgeId**）
+       ⚠️ 路径**逐赛段**（不是设计期草稿里的 `/api/events`）——
+          评审进度是「某个赛段的」，事件流按赛段分流才不用在每个事件里重复带赛段号。
+       ⚠️ 这条**不挂 router**（`src/http/sse.js` 按路径匹配）⇒ 上面那个 `router.add`
+          复算命令**看不到它** —— 这是既定决策，不是漏实现。
 
 **【决策】`compute` 是显式动作，不自动触发**。发榜是一个有后果的动作（影响奖金），必须有明确的操作者与时间戳，自动触发会让"谁在什么时候改了什么"不可追。
 
@@ -1099,8 +1107,8 @@ proxy_buffering off;  proxy_read_timeout 360s;  add_header X-Accel-Buffering no;
 | **P2 评审引擎** | 评分界面、z-score、去极值、双签、回避、自评检测、互评、**归一化策略可切换** | portal 评审 schema 三件套；Hangar 加权算分；hack-the-back `crowd_bt.py`（备选策略）；ORA rubric 快照思路 | 能真实算分，且换归一化策略不改代码 | ✅ 已落地 |
 | **P3 榜单与积分** | 破同分链、加时陈述、A/B/个人榜、段位、行为分、战绩卡、可见性过滤 | hibiscus 并列名次 + 双列（**修 bug**）；CTFd 可见性分档 | 能真实发榜；行为分在 schema 层隔离 | ✅ 已落地 |
 | **P4 审计与防作弊** | 计算快照、trace 抽屉、审计日志、复算 diff、限频三层、幂等、复核状态机、扫描闸 | CTFd 限频三层；OpenReview 复核状态机 + 冲突申报 | 榜单可复算；刷分可拦截 | ✅ 已落地 |
-| **P5 工作流与三池** | 任务清单与领取、三池底座接口、公开榜单 API + iCal | dribdat 开放 API / iCal | 数据沉淀 | 🟡 Task 1–4 已落地（公开榜 + token 鉴权已合入）；Task 5/6（iCal / 任务清单页）进行中 |
-| **P6 部署与演示版** | 部署资产、备份恢复、演示版适配器、静态站发布 | —— | 公网 URL + 云主机就绪 | 🟡 Task 1–5 + 7 已落地（部署资产、备份恢复、扫描闸、种子、适配器、运维手册，并经两轮修复 + 独立复核）；Task 6（静态站构建）/ 8（端到端与跨平台）未完成；**公网发布**待云主机 + 用户确认 |
+| **P5 工作流与三池** | 任务清单与领取、三池底座接口、公开榜单 API + iCal | dribdat 开放 API / iCal | 数据沉淀 | ✅ **已全部落地**（Task 1–6：工作流 / 三池 / 公开榜 + token 鉴权 / iCal 日历导出 / 前端任务清单页） |
+| **P6 部署与演示版** | 部署资产、备份恢复、演示版适配器、静态站发布 | —— | 公网 URL + 云主机就绪 | ✅ **Task 1–8 全部落地**（部署资产、备份恢复、扫描闸、种子、适配器、静态站构建、运维手册、端到端与跨平台验收；部署资产经两轮修复 + 独立复核）；⏳ **只差公网发布**（需云主机 + 用户明确确认） |
 | **二期** | 组队 MILP 撮合、贝叶斯归一化主用 | dribdat `matching.py`（HiGHS） | — | ⬜ 未开始 |
 
 > **「实施状态」这一列是实况**（2026-10-21）：每个阶段的**缺陷台账 / 变异检验 / 计划块逐字核验**

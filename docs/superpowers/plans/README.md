@@ -12,29 +12,37 @@
 
 | 计划 | 阶段 | 交付物 | 依赖 | 计划文件 | 规模 |
 |---|---|---|---|---|---|
-| 1 | **P0 地基** | 能登录的空系统；配置改错则启动失败；权限骨架 | — | `2026-10-20-platform-P0-foundation.md` | 7 Task / 7969 行 |
-| 2 | **P1 报名与组队** | 报名→自动分级→组队→任务包认领 全链路 | P0 | `2026-10-20-platform-P1-registration-team.md` | 7 Task / 7425 行 |
-| 3 | **P2 评审引擎** | 能真实算分（z-score + 去极值 + 双签 + 回避 + 自评检测） | P1 | `2026-10-20-platform-P2-review-engine.md` | 10 Task / 10633 行 |
-| 4 | **P3 榜单与积分** | 能真实发榜（A/B/个人榜 + 段位 + 行为分隔离 + 战绩卡） | P2 | `2026-10-20-platform-P3-leaderboard-points.md` | 8 Task / 6421 行 |
-| 5 | **P4 审计与防作弊** | 榜单可复算（trace 抽屉 + 复算 diff）+ 限频 + 复核状态机 | P3 | `2026-10-20-platform-P4-audit-anticheat.md` | 8 Task / 8784 行 |
-| 6 | **P5 工作流与三池** | 任务清单与领取；三池底座接口；公开榜单 API + iCal | P4 | `2026-10-20-platform-P5-workflow-pools.md` | 6 Task / 7046 行 |
-| 7 | **P6 部署与演示版** | 云主机部署资产 + 公网演示 URL | P5 | `2026-10-20-platform-P6-deploy-demo.md` | 8 Task / 7420 行 |
+| 1 | **P0 地基** | 能登录的空系统；配置改错则启动失败；权限骨架 | — | `2026-10-20-platform-P0-foundation.md` | 7 Task / 8621 行 |
+| 2 | **P1 报名与组队** | 报名→自动分级→组队→任务包认领 全链路 | P0 | `2026-10-20-platform-P1-registration-team.md` | 7 Task / 7464 行 |
+| 3 | **P2 评审引擎** | 能真实算分（z-score + 去极值 + 双签 + 回避 + 自评检测） | P1 | `2026-10-20-platform-P2-review-engine.md` | 10 Task / 10744 行 |
+| 4 | **P3 榜单与积分** | 能真实发榜（A/B/个人榜 + 段位 + 行为分隔离 + 战绩卡） | P2 | `2026-10-20-platform-P3-leaderboard-points.md` | 8 Task / 6478 行 |
+| 5 | **P4 审计与防作弊** | 榜单可复算（trace 抽屉 + 复算 diff）+ 限频 + 复核状态机 | P3 | `2026-10-20-platform-P4-audit-anticheat.md` | 8 Task / 8815 行 |
+| 6 | **P5 工作流与三池** | 任务清单与领取；三池底座接口；公开榜单 API + iCal + 任务清单页 | P4 | `2026-10-20-platform-P5-workflow-pools.md` | 6 Task / 8707 行 |
+| 7 | **P6 部署与演示版** | 云主机部署资产 + 公网演示 URL + 端到端/跨平台验收 | P5 | `2026-10-20-platform-P6-deploy-demo.md` | 8 Task / 10001 行 |
 
-合计 **54 个 Task**、**55 698 行**计划文档。
+合计 **54 个 Task**、**60 830 行**计划文档。
 
 > 规模数字是**实施后**的实况（每份计划末尾都追加了父代理预审 / 修复轮 / 实施台账章节，所以比撰写期大）。
 > 复算：`wc -l docs/superpowers/plans/2026-10-20-platform-P*.md`。
+>
+> **实施状态**：P0–P6 的 **54 个 Task 全部落地并合回 main**（计划块漂移已归零，见
+> [`../../docs/tools/plan-block-audit.mjs`](../../docs/tools/plan-block-audit.mjs) 可复算）；
+> **只差公网发布**这一步（需云主机 + 用户明确确认）。
 
-**需求覆盖：96 条里 94 条已落地且能从代码反查** —— 逐条的「落在哪 / 怎么验」见
+**需求覆盖：96 条里 95 条已落地且能从代码反查** —— 逐条的「落在哪 / 怎么验」见
 [`../requirement-implementation-map.md`](../requirement-implementation-map.md)（**机器生成**，
 生成器 [`../tools/requirement-map.py`](../tools/requirement-map.py) 可复算；另有
 [`../requirements-traceability.md`](../requirements-traceability.md) 记「它从哪来」）。
-剩下 2 条：
+剩下 1 条：
 
 | 需求 | 状态 | 说明 |
 |---|---|---|
 | R-PTS-13 押金是负债不入营收 | ⚪ **平台不实现** | **财务科目口径**而非平台功能，且「中途不退部分去向」本身是规则空白。已在 `docs/requirements-traceability.md` 里显式声明**平台不实现**，并禁止任何人往平台里加「报名费 / 押金」字段或退费流程。**对空白规则写代码 = 凭空造规则**，所以这里留的是边界声明，不是待办 |
-| R-OPS-06 公网可访问 | ⬜ **计划中** | 部署资产（`deploy/`）、备份恢复、演示版静态站构建都已落地；**只差真机发布**这一步（需云主机 + 用户明确确认）。P6 计划与 `docs/deployment.md` 已把发布流程写全 |
+
+> ⚠️ **R-OPS-06（公网可访问）现在标的是「已落地」**：代码与部署资产都已就位
+> （演示站构建、nginx + systemd 部署资产、备份恢复、运维手册），
+> 但**发布到公网这一步还没做** —— 它需要云主机 + 用户明确确认。
+> 「代码就位」与「已上线」是两件事，这里只如实记前者。
 
 另有两个需求**只占位不启用**（代码路径存在但恒不生效，等组委会拍板口径）：
 
@@ -95,7 +103,7 @@ SQL 边界    所有 SQL 收进 src/db/repo/；handler 内禁止裸 SQL
 ```
 platform/
 ├── package.json            scripts: start / test / migrate / seed（四个都带 --disable-warning=ExperimentalWarning）
-├── rules/                  17 份声明式规则配置（各阶段追加自己的）
+├── rules/                  16 份声明式规则配置（各阶段追加自己的）
 ├── src/
 │   ├── server.js           进程入口
 │   ├── config.js           配置加载 + fail-fast 校验
@@ -103,23 +111,28 @@ platform/
 │   ├── http/               router respond body static sse
 │   ├── auth/               password session permissions
 │   ├── db/                 sqlite migrate tx + repo/
-│   ├── domain/             22 个纯函数模块（scoring ranking points visibility registration
-│   │                       solvability tier behavior normalization trim enterprise-seat …）
+│   ├── domain/             23 个纯函数模块（scoring ranking points visibility registration
+│   │                       solvability tier behavior normalization trim enterprise-seat
+│   │                       icalendar …）
 │   ├── services/           19 个服务层模块（registration team review leaderboard milestone
 │   │                       workflow pools compute audit …）
 │   ├── audit/              log snapshot
 │   └── runtime/            pidfile
 ├── web/                    index.html app router store api api.demo styles.css views/
+│                           views/ 含 tasks.js（任务清单页，P5 Task 6）
 ├── db/migrations/          001_init.sql 002_registration.sql 003_review.sql
 │                           004_leaderboard.sql 005_audit.sql 006_pools.sql
-├── test/                   *.test.js
+├── test/                   75 个 *.test.js
 ├── scripts/                migrate seed backup restore audit-scan forbidden.txt
+│                           build-demo.js serve-demo.js node-globals.txt
 └── deploy/                 heikesong.service nginx.conf nginx-http2-compat.sh
                             docker-compose.yml install.sh
 ```
 
-> 目录结构是**实施后**的实况。P6 Task 6 还会再加 `web/dist/`（构建产物目录，**不入库**）与
-> `scripts/build-demo.js` / `scripts/serve-demo.js`。
+> 目录结构是**实施后**的实况。
+> `web/dist/` 是 **P6 Task 6 的构建产物目录**（**不入库**，已 gitignore），
+> 由 `scripts/build-demo.js` 生成、`scripts/serve-demo.js` 本地预览；
+> `scripts/node-globals.txt` 是**领域层「Node 专属全局」禁用清单**（数据文件，理由见 P6 计划「演示版守卫修复轮」A-1）。
 
 ## 迁移版本号是全局唯一序位
 
@@ -147,6 +160,34 @@ feat(P<n>): <动词短语>
 ```
 
 **不要**在一个 Task 里混做两个阶段的事。Task 是最小可独立评审单元。
+
+## 实施期的机器闸（全部可复算）
+
+实施期不靠「自觉」，靠这几个可重跑的脚本：
+
+```bash
+# ① 全量测试（唯一命令形态：无参、cwd 发现）
+cd platform && node --disable-warning=ExperimentalWarning --test
+
+# ② 禁用表述扫描闸（发布前必过；发布产物 web/dist 本身也过）
+cd platform && node scripts/audit-scan.js ; echo "退出码=$?"
+
+# ③ 计划块漂移审计：代码块 = 该文件「当前实现」的逐字副本
+#    A=逐字一致 / C-EXT=良性扩展(记一句) / C-RW=真重写(必须同步) / D=无实现
+node docs/tools/plan-block-audit.mjs platform
+
+# ④ 计划块同步（定位与 --verify 同源，比外部脚本可靠）
+node docs/tools/plan-block-sync.mjs <plan> platform <文件...>
+node docs/tools/plan-block-sync.mjs --verify <plan> platform <文件...>
+
+# ⑤ 需求落地表重生成（96 条逐条「落在哪 / 怎么验」）
+python3 docs/tools/requirement-map.py --trees . --out docs/requirement-implementation-map.md
+```
+
+> **计划块漂移的口径**（本轮统一确立）：后续阶段按「最早建立者 owns、后续 Modify 追加不得重建」
+> 改了实现，owning 阶段的计划块就会漂移。
+> **真重写（C-RW）⇒ 必须逐字同步回 owning 阶段计划**；**良性扩展（C-EXT）⇒ 计划块保持原样，只在台账记一句**。
+> 当前状态：**C-RW 0 条**。
 
 ## 计划撰写期的验证记录
 

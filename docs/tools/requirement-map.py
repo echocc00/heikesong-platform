@@ -368,9 +368,14 @@ rows_json = rows
 
 landed = sum(1 for x in rows if x['land'] == 'landed')
 notrace = sum(1 for x in rows if x['land'] == 'landed-no-trace')
-planned = sum(1 for x in rows if x['land'] == 'planned')
-print('96 条需求 → ✅已落地(有溯源注释) %d｜🟡已落地但代码无溯源注释 %d｜⬜计划中 %d'
-      % (landed, notrace, planned))
+# ⚠️ 口径必须与表里的 `state_of()` **一致**：
+#    `land == 'planned'` 里还要再分「有 Task ⇒ ⬜ 计划中」与「无 Task ⇒ ⚪ 平台不实现」
+#    （R-PTS-13 押金口径：溯源表显式声明平台不实现，两边都没有 ⇒ ⚪，不是 ⬜）。
+#    早先这里把两者混在一起报成「⬜ 计划中 1」，与表里的「⬜ 0 / ⚪ 1」自相矛盾。
+planned = sum(1 for x in rows if x['land'] == 'planned' and x['tasks'])
+not_impl = sum(1 for x in rows if x['land'] == 'planned' and not x['tasks'])
+print('96 条需求 → ✅已落地(有溯源注释) %d｜🟡已落地但代码无溯源注释 %d｜⬜计划中 %d｜⚪平台不实现 %d'
+      % (landed, notrace, planned, not_impl))
 print('无溯源注释的已落地需求：', ', '.join(x['id'] for x in rows if x['land'] == 'landed-no-trace') or '（无）')
 print('有落地但没挂上验收标准的：%d 条'
       % sum(1 for x in rows if x['impls'] and not x['acc']))
