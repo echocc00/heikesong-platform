@@ -36,8 +36,11 @@ export function listFlagRows(db, {
   if (stageId) { where.push('stage_id = ?'); params.push(stageId); }
   const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const total = db.prepare(`SELECT COUNT(*) AS n FROM flagged_reviews ${clause}`).get(...params).n;
+  // ⛔ 确定性排序：破并列键用 SQLite 隐式 `rowid`，**不用 `id`** ——
+  //    `id` 是 randomUUID() ⇒ 同 `created_at` 的两条记录**次序随机**。
+  //    全局约束同 `src/db/repo/audit-log.js`（P4-13 根因修复）。
   const rows = db.prepare(
-    `SELECT * FROM flagged_reviews ${clause} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`,
+    `SELECT * FROM flagged_reviews ${clause} ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?`,
   ).all(...params, limit, offset);
   return { rows, total };
 }

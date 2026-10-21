@@ -46,10 +46,15 @@ function sleepSync(ms) {
  *
  * ⚠️ 为什么不能直接 `db.exec('PRAGMA journal_mode = WAL')`：
  *   1. 切 journal_mode 需要**独占锁**；此时库里有别的连接在写就拿不到。
- *   2. **SQLite 的 busy handler 不覆盖这一步** —— 实测（探针
- *      `probe-wal-lock-2.mjs` 实验 B）：持锁时执行该 PRAGMA 在 **0ms** 内就抛
+ *   2. **别的连接持有写事务（RESERVED 锁）时，SQLite 的 busy handler 不覆盖这一步**
+ *      —— 实测（探针 `probe-wal-lock-2.mjs` 实验 B）：持锁时执行该 PRAGMA 在 **0ms** 内就抛
  *      SQLITE_BUSY(errcode=5)；把 busy_timeout 设成 5000 也一样**立刻**失败，不等。
  *      ⇒ 「先设 busy_timeout 再切 WAL」**不够**，必须自己实现退避重试。
+ *      ⚠️ **限定条件**（P4 终审 Minor M-2 实测纠正，别再无条件地转述这句话）：
+ *      并非对所有锁型都如此 —— 别的连接持 **EXCLUSIVE** 锁时 busy handler **仍会**等待
+ *      （实测 busy_timeout=5000 时等 5485ms 才抛、=1000 时等 1129ms，随 busy_timeout 线性缩放）。
+ *      现实故障场景（并发写事务）落在 RESERVED 那一侧 ⇒ 本修法覆盖真实故障；
+ *      但「busy handler 一概不覆盖切 WAL」是**过度泛化**的说法。
  *   3. 危险窗口只有**数据库文件首次创建**的那一瞬间：WAL 模式持久化在文件头里，
  *      此后再次执行该 PRAGMA 是 no-op（不取锁，实测 0ms 成功）。
  *      所以「两条连接同时开同一个新库」必有一方撞上第 1 条 → "database is locked"。

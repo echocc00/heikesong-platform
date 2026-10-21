@@ -250,9 +250,11 @@ test('public_tokens 表可存可查，且 token 是主键', () => {
  * ⚠️ 屏障必须**两个 worker 都到达**才放行：worker 在连上库之后、
  *    真正发起 INSERT 之前才递增屏障计数 —— 因此「同时」的是 INSERT 本身，
  *    不是连接建立。
- * ⚠️ 两个连接必须**错开建立**：openDatabase() 第一条语句是 PRAGMA journal_mode = WAL，
- *    而 busy_timeout 在它之后才设 —— 两个连接同时执行这条 PRAGMA 会有一方
- *    立刻 "database is locked"（实测，见缺陷台账 C-2）。
+ * ⚠️ 两个连接必须**错开建立**：这是本 Task 落地时（2026-10-21）的**临时变通** ——
+ *    当时 openDatabase() 的第一条语句是 PRAGMA journal_mode = WAL，而 busy_timeout 在它之后才设，
+ *    两个连接同时执行这条 PRAGMA 会有一方立刻 "database is locked"（实测，见缺陷台账 **C-3**）。
+ *    ⚠️ **该缺陷已在上游修掉**（main `a6fd2db`：切 WAL 改成带退避重试，不再裸执行该 PRAGMA），
+ *    所以这个「错开建立」**已不再必要** —— 保留它只是为了让本用例专注于「并发领取」的仲裁语义。
  */
 const CLAIM_WORKER_SRC = `
 import { parentPort, workerData } from 'node:worker_threads';

@@ -24,6 +24,8 @@ const FILES = {
   compliance: 'compliance.json',
   points: 'points.json',
   criteria: 'criteria.json',
+  pools: 'pools.json',
+  audit: 'audit.json',                     // ← P4 新增
 };
 
 function readJson(path) {
@@ -591,6 +593,71 @@ export function validateRules(rules, expectedCount = null) {
     }
   }
 
+  // ── 审计与防作弊（P4）────────────────────────────────────
+  const audit = rules.audit;
+  if (!audit) {
+    errors.push('audit 缺失');
+  } else {
+    for (const [name, profile] of Object.entries(audit.rateLimit ?? {})) {
+      for (const layer of ['lock', 'sliding', 'perMinute', 'perHour']) {
+        const l = profile?.[layer];
+        if (!l) continue;
+        if (layer === 'lock' && !(Number.isInteger(l.seconds) && l.seconds > 0)) {
+          errors.push(`audit.rateLimit.${name}.lock.seconds 必须是正整数`);
+        }
+        if (layer !== 'lock' && !(Number.isInteger(l.max) && l.max > 0)) {
+          errors.push(`audit.rateLimit.${name}.${layer}.max 必须是正整数`);
+        }
+        // ⚠️ perMinute / perHour 的窗口长度是**结构决定的**（一分钟 / 一小时）——
+        //    服务层写死 60_000 / 3_600_000 毫秒，配置里没有、也**不该有** seconds：
+        //    配了也不会生效（配置说了不算 = 说谎）。
+        //    只有滑动窗口（sliding）的窗口长度与提交锁（lock）的持有时长是可配的。
+        if (layer === 'sliding' && !(Number.isInteger(l.seconds) && l.seconds > 0)) {
+          errors.push(`audit.rateLimit.${name}.sliding.seconds 必须是正整数`);
+        }
+      }
+    }
+    const lv = audit.antiCheat?.lowVariance;
+    if (!lv || !(Number.isFinite(lv.min) && Number.isFinite(lv.max)) || lv.min >= lv.max) {
+      errors.push('audit.antiCheat.lowVariance 必须满足 min < max');
+    }
+    if (!(Number.isInteger(audit.antiCheat?.identicalPeer?.minOverlap) && audit.antiCheat.identicalPeer.minOverlap >= 2)) {
+      errors.push('audit.antiCheat.identicalPeer.minOverlap 必须 ≥ 2（重叠项目太少没有判定力）');
+    }
+    if (!(Number.isInteger(audit.retention?.archiveMonths) && audit.retention.archiveMonths > 0)) {
+      errors.push('audit.retention.archiveMonths 必须是正整数（R-JDG-17 赛后 6 个月可查）');
+    }
+    if (!Array.isArray(audit.reviewState?.appealAllowedTiers) || audit.reviewState.appealAllowedTiers.length === 0) {
+      errors.push('audit.reviewState.appealAllowedTiers 不得为空');
+    }
+  }
+
+  // ── 三池与工作流（P5）────────────────────────────────────────────
+  const pools = rules.pools;
+  if (!pools) {
+    errors.push('pools 缺失');
+  } else {
+    // R-OPS-14：禁止岗位制——claimMode 只允许 self_claim_only，写别的值直接拒绝启动
+    if (pools.workflow?.claimMode !== 'self_claim_only') {
+      errors.push('pools.workflow.claimMode 必须是 self_claim_only（R-OPS-14 禁止岗位制，不允许其他取值）');
+    }
+    if (!Number.isInteger(pools.publicTokenTtlDays) || pools.publicTokenTtlDays <= 0) {
+      errors.push('pools.publicTokenTtlDays 必须是正整数');
+    }
+    if (!Array.isArray(pools.publicScopes) || !pools.publicScopes.includes('all')) {
+      errors.push('pools.publicScopes 必须包含 all');
+    }
+    const kinds = pools.talentPointKinds;
+    if (!kinds || !Array.isArray(kinds.atomic) || !kinds.atomic.length || !kinds.rollup) {
+      errors.push('pools.talentPointKinds 必须给出 atomic 数组与 rollup 名称');
+    }
+    if (pools.talentTotalScope !== 'lifetime') {
+      errors.push('pools.talentTotalScope 必须是 lifetime（R-RNK-10 个人积分终生上榜）');
+    }
+    if (!pools.taskEvidence?.requireRunnableOrBlocker) {
+      errors.push('pools.taskEvidence.requireRunnableOrBlocker 必须为 true（R-STG-04）');
+    }
+  }
   return errors;
 }
 
@@ -615,6 +682,8 @@ export function loadRules(rulesDir) {
     compliance: rules.compliance,
     points: rules.points,
     criteria: rules.criteria,
+    pools: rules.pools,
+    audit: rules.audit,                    // ← P4 新增
   };
 
   const errors = validateRules(grouped, Object.keys(FILES).length);

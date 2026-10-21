@@ -48,6 +48,8 @@ const CAPABILITIES = [
   ['behavior:write', '提交行为分记录（周进度 / workshop 产出 / 企业对接会）'],
   ['stage:compute', '触发计算发榜'],
   ['audit:read', '读取审计与计算快照'],
+  ['audit:write', '裁决复核项与申诉'],
+  ['appeal:write', '提交申诉'],
   ['pool:read', '读取三池'],
   ['pool:write', '维护三池'],
 ];
@@ -68,10 +70,10 @@ const EDITION_NAME = '首届 · 上海';
 const ROLE_CAPABILITIES = [
   ['admin', 'registration:review'], ['admin', 'team:read'], ['admin', 'team:manage'],
   ['admin', 'task_package:read'], ['admin', 'task_package:approve'], ['admin', 'score:read'],
-  ['admin', 'stage:compute'], ['admin', 'audit:read'], ['admin', 'pool:read'], ['admin', 'pool:write'],
+  ['admin', 'stage:compute'], ['admin', 'audit:read'], ['admin', 'audit:write'], ['admin', 'appeal:write'], ['admin', 'pool:read'], ['admin', 'pool:write'],
   ['captain', 'registration:write'], ['captain', 'team:create'], ['captain', 'team:read'], ['captain', 'behavior:write'],
   ['captain', 'team:manage'], ['captain', 'pool:read'], ['captain', 'task_package:read'],
-  ['captain', 'peer_review:write'], ['captain', 'self_review:write'],
+  ['captain', 'peer_review:write'], ['captain', 'self_review:write'], ['captain', 'appeal:write'],
   ['member', 'registration:write'], ['member', 'team:read'], ['member', 'pool:read'], ['member', 'behavior:write'],
   ['member', 'task_package:read'], ['member', 'peer_review:write'], ['member', 'self_review:write'],
   ['judge', 'score:write'], ['judge', 'score:read'], ['judge', 'peer_review:write'], ['judge', 'task_package:read'],

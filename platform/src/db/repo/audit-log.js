@@ -3,6 +3,7 @@
 // ⛔ 全局约束「所有 SQL 收在 src/db/repo/」—— 本文件是 audit_log 的 SQL 唯一归宿，
 //    P0 的 test/sql-boundary.test.js 会扫描 src/ 与 scripts/ 下**除 src/db/repo/ 外**的一切 .js。
 import { randomUUID } from 'node:crypto';
+import { appError } from '../../errors.js';
 
 export function insertAuditLogRow(db, {
   id = randomUUID(),
@@ -46,26 +47,37 @@ export function queryAuditLog(db, {
   if (until) { where.push('created_at <= ?'); params.push(until); }
   const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const total = db.prepare(`SELECT COUNT(*) AS n FROM audit_log ${clause}`).get(...params).n;
+  // ⛔ 父代理预审修正（Critical，P4-13）：同毫秒并列时用 `rowid` 破并列，**不用 `id`**。
+  //    `audit_log.id` 是 randomUUID() ⇒ 同 `created_at` 的两条日志**次序随机**
+  //    ⇒ 「取最后一条状态迁移」的结果随机 ⇒ 状态机随机报 409（Task 5 实跑：200 次里 135 次读到过期态）。
+  //    `rowid` 是 SQLite 的隐式插入序号 ⇒ 确定性，且「后插入的在前」正是「最后一次」想要的语义。
+  //    全局约束：确定性排序的兜底键一律用 SQLite 隐式 `rowid`（`localeCompare` / 随机 UUID 都不许）。
   const rows = db.prepare(
-    `SELECT * FROM audit_log ${clause} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`,
+    `SELECT * FROM audit_log ${clause} ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?`,
   ).all(...params, limit, offset);
   return { rows, total };
 }
 
 // 复核状态机的当前态：从最后一条迁移日志里取 to_state。
 // 依据：设计文档 §11.2「每次状态迁移写 audit_log(...)」——状态机的真值来源就是迁移日志。
+// ⚠️ 排序的破并列键同样是 `rowid`（不是 `id`）—— 见 queryAuditLog 的注释。
 export function findLatestTransition(db, entity, entityId) {
   const rows = db.prepare(
     `SELECT detail_json, created_at FROM audit_log
       WHERE entity = ? AND entity_id = ? AND action = 'review_state.transition'
-      ORDER BY created_at DESC, id DESC LIMIT 1`,
+      ORDER BY created_at DESC, rowid DESC LIMIT 1`,
   ).all(entity, entityId);
   if (!rows.length) return null;
-  let detail = {};
+  // ⚠️ 终审修正（Minor，M-6）：**解析失败必须 fail loud，不能静默降级成 {}**。
+  //    降级成 {} ⇒ detail 里没有 `to` ⇒ getSubjectState 返回 null ⇒
+  //    状态机把主体当成 'SUBMITTED' ⇒ **放行一次本应被拒的迁移**（静默降级到一个错的状态）。
+  //    「有迁移记录、但读不出来」= 数据损坏 = 必须显式报错
+  //    （HTTP 层会转成通用 500 文案，不外泄内部细节）。
+  let detail;
   try {
     detail = rows[0].detail_json ? JSON.parse(rows[0].detail_json) : {};
   } catch {
-    detail = {};
+    throw appError(500, 'AUDIT_LOG_CORRUPT', '审计日志内容损坏，无法读取状态迁移记录');
   }
   return { ...detail, at: rows[0].created_at };
 }

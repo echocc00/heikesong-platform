@@ -406,9 +406,11 @@ test('public_tokens 表可存可查，且 token 是主键', () => {
  * ⚠️ 屏障必须**两个 worker 都到达**才放行：worker 在连上库之后、
  *    真正发起 INSERT 之前才递增屏障计数 —— 因此「同时」的是 INSERT 本身，
  *    不是连接建立。
- * ⚠️ 两个连接必须**错开建立**：openDatabase() 第一条语句是 PRAGMA journal_mode = WAL，
- *    而 busy_timeout 在它之后才设 —— 两个连接同时执行这条 PRAGMA 会有一方
- *    立刻 "database is locked"（实测，见缺陷台账 C-2）。
+ * ⚠️ 两个连接必须**错开建立**：这是本 Task 落地时（2026-10-21）的**临时变通** ——
+ *    当时 openDatabase() 的第一条语句是 PRAGMA journal_mode = WAL，而 busy_timeout 在它之后才设，
+ *    两个连接同时执行这条 PRAGMA 会有一方立刻 "database is locked"（实测，见缺陷台账 **C-3**）。
+ *    ⚠️ **该缺陷已在上游修掉**（main `a6fd2db`：切 WAL 改成带退避重试，不再裸执行该 PRAGMA），
+ *    所以这个「错开建立」**已不再必要** —— 保留它只是为了让本用例专注于「并发领取」的仲裁语义。
  */
 const CLAIM_WORKER_SRC = `
 import { parentPort, workerData } from 'node:worker_threads';
@@ -2905,11 +2907,21 @@ import {
   syncPoolProjects, syncPoolTalents, syncPoolResources,
   listPoolProjects, listPoolTalents, listPoolResources,
 } from '../src/services/pools.js';
+import {
+  aggregatePersonalPoints, derivePoolProjects, derivePoolTalents, derivePoolResources,
+} from '../src/domain/pool-derive.js';
+import { loadRules, validateRules } from '../src/config.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrationsDir = join(here, '..', 'db', 'migrations');
+const rulesDir = join(here, '..', 'rules');
 
-function setup() {
+// 统一的注入时间：所有断言都基于它，时间口径才可复算
+const NOW = '2026-10-20T00:00:00.000Z';
+// 超管：读三池时不需要任何授权记录
+const SUPER = { id: 'u_a', is_superadmin: 1, active: 1 };
+
+function setup(extraSql = '') {
   const dataDir = mkdtempSync(join(tmpdir(), 'hks-p5pool-'));
   const { db, close } = openDatabase({ dataDir });
   applyMigrations(db, migrationsDir);
@@ -2962,6 +2974,7 @@ function setup() {
     VALUES ('rg_1', 'ed_1', 'u_a', '{}', '{"direction":5,"capability":4,"collaboration":5}', 80,
       'S', 'S', 'u_c', '2026-10-01T00:00:00.000Z', NULL, 'registered', '2026-10-01T00:00:00.000Z', NULL);
   `);
+  if (extraSql) db.exec(extraSql);
   return { db, close, dataDir };
 }
 
@@ -2978,15 +2991,21 @@ function snapshot(db) {
   };
 }
 
-function syncAll(db, now = '2026-10-20T00:00:00.000Z') {
+function syncAll(db, now = NOW) {
   syncPoolProjects({ db, editionId: 'ed_1', now });
   syncPoolTalents({ db, editionId: 'ed_1', now });
   syncPoolResources({ db, editionId: 'ed_1', now });
 }
 
+function counts(result) {
+  return {
+    inserted: result.inserted, updated: result.updated, removed: result.removed, total: result.total,
+  };
+}
+
 test('项目池从 teams + stage_results + tier_records 派生', () => {
   const { db, close, dataDir } = setup();
-  syncPoolProjects({ db, editionId: 'ed_1', now: '2026-10-20T00:00:00.000Z' });
+  syncPoolProjects({ db, editionId: 'ed_1', now: NOW });
   const rows = listPoolProjects({
     db, filter: { editionId: 'ed_1' }, viewer: { id: 'u_a', is_superadmin: 1, active: 1 },
   });
@@ -2997,15 +3016,17 @@ test('项目池从 teams + stage_results + tier_records 派生', () => {
   assert.equal(t1.tier, 'C', 'tier 取段位记录');
   assert.equal(t1.businessValue, 1, 'business_value 取企业业务签字数');
   assert.ok(String(t1.summary).includes('一队'));
+  assert.ok(String(t1.summary).includes('人工审批慢'), '摘要里带任务包痛点');
   const t2 = rows.find((r) => r.teamId === 'tm_2');
   assert.equal(t2.stageReached, 's1');
   assert.equal(t2.tier, 'D');
+  assert.equal(t2.businessValue, 0, 'business_value 原样取企业业务签字数（不是恒为 1）');
   cleanup(db, close, dataDir);
 });
 
 test('人才池从 points_ledger 聚合，且积分是终生累计（R-RNK-10）', () => {
   const { db, close, dataDir } = setup();
-  syncPoolTalents({ db, editionId: 'ed_1', now: '2026-10-20T00:00:00.000Z' });
+  syncPoolTalents({ db, editionId: 'ed_1', now: NOW });
   const rows = listPoolTalents({
     db, filter: { editionId: 'ed_1' }, viewer: { id: 'u_a', is_superadmin: 1, active: 1 },
   });
@@ -3015,13 +3036,20 @@ test('人才池从 points_ledger 聚合，且积分是终生累计（R-RNK-10）
   assert.equal(t.totalPoints, 23, '10 + 5 + 8（含第二届）= 终生累计 23');
   assert.equal(t.stagesJoined, 3, '参与过的赛段数按 distinct stage 算');
   assert.equal(t.skills.length, 3, '技能来自报名画像维度分');
+  assert.deepEqual(
+    t.skills.map((s) => s.key),
+    ['capability', 'collaboration', 'direction'],
+    '技能键按字典序（确定性排序）',
+  );
+  assert.equal(t.name, '甲', '档案名来自 users');
+  assert.equal(t.org, '学堂', '所属单位来自 users');
   assert.equal(t.mbaStatus, 'mba');
   cleanup(db, close, dataDir);
 });
 
 test('资源池从 task_packages 按（企业 × 类型）分组', () => {
   const { db, close, dataDir } = setup();
-  syncPoolResources({ db, editionId: 'ed_1', now: '2026-10-20T00:00:00.000Z' });
+  syncPoolResources({ db, editionId: 'ed_1', now: NOW });
   const rows = listPoolResources({
     db, filter: { editionId: 'ed_1' }, viewer: { id: 'u_a', is_superadmin: 1, active: 1 },
   });
@@ -3044,7 +3072,7 @@ test('同步是幂等重建：连跑两次，三池内容完全一致', () => {
 
 test('同步是重建不是累加：改了积分流水，重跑同步后积分按新值重算', () => {
   const { db, close, dataDir } = setup();
-  syncPoolTalents({ db, editionId: 'ed_1', now: '2026-10-20T00:00:00.000Z' });
+  syncPoolTalents({ db, editionId: 'ed_1', now: NOW });
   const before = db.prepare('SELECT total_points AS p FROM pool_talents WHERE user_id = ?').get('u_a').p;
   assert.equal(before, 23);
 
@@ -3058,7 +3086,7 @@ test('同步是重建不是累加：改了积分流水，重跑同步后积分�
 
 test('派生值唯一真源：库里的 total_points 与积分流水聚合一致', () => {
   const { db, close, dataDir } = setup();
-  syncPoolTalents({ db, editionId: 'ed_1', now: '2026-10-20T00:00:00.000Z' });
+  syncPoolTalents({ db, editionId: 'ed_1', now: NOW });
   const row = db.prepare('SELECT total_points AS p FROM pool_talents WHERE user_id = ?').get('u_a');
   const sum = db
     .prepare('SELECT COALESCE(SUM(points), 0) AS s FROM points_ledger WHERE user_id = ?')
@@ -3075,6 +3103,554 @@ test('没有 pool:read 能力的用户读到空数组（列表不满足 → 200 
   });
   assert.deepEqual(rows, []);
   cleanup(db, close, dataDir);
+});
+
+// ── 幂等重建的【判别性】用例 ────────────────────────────────────────
+// 期望值「恰好相同」区分不出两种算法 ⇒ 这里比的是**第二次同步的计数**与**行身份**：
+//   · 累加实现：第二次 inserted=0/updated=0，库里积分翻倍
+//   · 删了重建：内容相同但 inserted=2、行 id 全变
+//   · 真正的幂等重建：第二次 inserted=0/updated=N，行 id 不变，值不变
+
+test('幂等判别性：第二次同步是覆盖（inserted=0, updated=N），第三次与第二次完全一致', () => {
+  const { db, close, dataDir } = setup();
+  const first = syncPoolProjects({ db, editionId: 'ed_1', now: NOW });
+  assert.deepEqual(counts(first), { inserted: 2, updated: 0, removed: 0, total: 2 });
+  const second = syncPoolProjects({ db, editionId: 'ed_1', now: NOW });
+  assert.deepEqual(
+    counts(second),
+    { inserted: 0, updated: 2, removed: 0, total: 2 },
+    '第二次必须覆盖既有行，而不是再插一批',
+  );
+  const third = syncPoolProjects({ db, editionId: 'ed_1', now: NOW });
+  assert.deepEqual(counts(third), counts(second), '稳态：第三次与第二次的计数必须一致');
+  cleanup(db, close, dataDir);
+});
+
+test('幂等判别性：重复同步后行 id 不变（是覆盖同一行，不是删了重建）', () => {
+  const { db, close, dataDir } = setup();
+  syncAll(db);
+  const before = snapshot(db);
+  syncAll(db);
+  const after = snapshot(db);
+  assert.equal(after.projects.length, before.projects.length);
+  assert.deepEqual(
+    after.projects.map((r) => r.id),
+    before.projects.map((r) => r.id),
+    '项目池行 id 必须稳定',
+  );
+  assert.deepEqual(
+    after.talents.map((r) => r.id),
+    before.talents.map((r) => r.id),
+    '人才池行 id 必须稳定',
+  );
+  assert.deepEqual(
+    after.resources.map((r) => r.id),
+    before.resources.map((r) => r.id),
+    '资源池行 id 必须稳定',
+  );
+  cleanup(db, close, dataDir);
+});
+
+test('幂等判别性：重复同步后积分不变（重建不是累加，不会变成 23+23=46）', () => {
+  const { db, close, dataDir } = setup();
+  syncPoolTalents({ db, editionId: 'ed_1', now: NOW });
+  syncPoolTalents({ db, editionId: 'ed_1', now: NOW });
+  syncPoolTalents({ db, editionId: 'ed_1', now: NOW });
+  const row = db.prepare('SELECT total_points AS p FROM pool_talents WHERE user_id = ?').get('u_a');
+  assert.equal(row.p, 23, '跑三次仍是 23：增量累加会得到 69');
+  assert.equal(
+    db.prepare('SELECT COUNT(*) AS n FROM pool_talents').get().n,
+    1,
+    '跑三次仍只有一行',
+  );
+  cleanup(db, close, dataDir);
+});
+
+test('人才池幂等判别性：第二次同步 inserted=0 / updated=1，行数不增', () => {
+  const { db, close, dataDir } = setup();
+  const first = syncPoolTalents({ db, editionId: 'ed_1', now: NOW });
+  assert.deepEqual(counts(first), { inserted: 1, updated: 0, removed: 0, total: 1 });
+  const second = syncPoolTalents({ db, editionId: 'ed_1', now: NOW });
+  assert.deepEqual(counts(second), { inserted: 0, updated: 1, removed: 0, total: 1 });
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM pool_talents').get().n, 1);
+  cleanup(db, close, dataDir);
+});
+
+test('同步结果回显注入的 now 与 editionId（时间口径可复算）', () => {
+  const { db, close, dataDir } = setup();
+  const r = syncPoolProjects({ db, editionId: 'ed_1', now: '2026-10-20T00:00:00.000Z' });
+  assert.equal(r.at, '2026-10-20T00:00:00.000Z');
+  assert.equal(r.editionId, 'ed_1');
+  const t = syncPoolTalents({ db, editionId: 'ed_1', now: '2026-10-20T00:00:00.000Z' });
+  assert.equal(t.at, '2026-10-20T00:00:00.000Z');
+  const res = syncPoolResources({ db, editionId: 'ed_1', now: '2026-10-20T00:00:00.000Z' });
+  assert.equal(res.at, '2026-10-20T00:00:00.000Z');
+  cleanup(db, close, dataDir);
+});
+
+// ── 移除路径（派生源变了就重跑同步，不做增量修补）──────────────────
+
+test('派生源消失后重跑同步：该项目从项目池移除（removed 计数准确）', () => {
+  const { db, close, dataDir } = setup();
+  syncPoolProjects({ db, editionId: 'ed_1', now: NOW });
+  db.prepare('UPDATE teams SET deleted_at = ? WHERE id = ?').run('2026-10-19T00:00:00.000Z', 'tm_2');
+  const second = syncPoolProjects({ db, editionId: 'ed_1', now: NOW });
+  assert.deepEqual(counts(second), { inserted: 0, updated: 1, removed: 1, total: 1 });
+  assert.equal(
+    db.prepare('SELECT COUNT(*) AS n FROM pool_projects').get().n,
+    1,
+    '被软删的队伍对应的项目行必须消失',
+  );
+  cleanup(db, close, dataDir);
+});
+
+test('任务包被软删后重跑同步：资源池对应行被移除', () => {
+  const { db, close, dataDir } = setup();
+  syncPoolResources({ db, editionId: 'ed_1', now: NOW });
+  db.prepare('UPDATE task_packages SET deleted_at = ? WHERE id = ?').run('2026-10-19T00:00:00.000Z', 'tp_3');
+  const second = syncPoolResources({ db, editionId: 'ed_1', now: NOW });
+  assert.equal(second.removed, 1);
+  assert.equal(second.total, 2);
+  const rows = listPoolResources({ db, filter: { editionId: 'ed_1' }, viewer: SUPER });
+  assert.equal(rows.filter((r) => r.kind === 'free_brief').length, 0, '自由题资源行必须消失');
+  cleanup(db, close, dataDir);
+});
+
+test('积分流水被撤回后重跑同步：本人从本届人才池移除', () => {
+  const { db, close, dataDir } = setup();
+  syncPoolTalents({ db, editionId: 'ed_1', now: NOW });
+  db.prepare('DELETE FROM points_ledger WHERE id = ?').run('pl_1');
+  db.prepare('DELETE FROM points_ledger WHERE id = ?').run('pl_2');
+  const second = syncPoolTalents({ db, editionId: 'ed_1', now: NOW });
+  assert.equal(second.removed, 1);
+  assert.equal(second.total, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM pool_talents').get().n, 0);
+  cleanup(db, close, dataDir);
+});
+
+test('段位记录有多条时，取 computed_at 最新的一条', () => {
+  const { db, close, dataDir } = setup(`
+    INSERT INTO tier_records (id, team_id, tier, milestone_count, business_signoff_count, reasons_json, computed_at, deleted_at)
+    VALUES ('tr_3', 'tm_2', 'C', 3, 2, '[]', '2026-10-15T00:00:00.000Z', NULL);
+  `);
+  syncPoolProjects({ db, editionId: 'ed_1', now: NOW });
+  const row = db.prepare('SELECT tier, business_value FROM pool_projects WHERE team_id = ?').get('tm_2');
+  assert.equal(row.tier, 'C', '后算的段位记录覆盖先算的');
+  assert.equal(row.business_value, 2);
+  cleanup(db, close, dataDir);
+});
+
+test('报名记录被软删后重跑同步：技能仍取有效的那一条', () => {
+  const { db, close, dataDir } = setup(`
+    INSERT INTO registrations (id, edition_id, user_id, answers_json, dimension_scores_json, raw_score,
+      level, level_final, decided_by, decided_at, decision_note, status, created_at, deleted_at)
+    VALUES ('rg_2', 'ed_1', 'u_a', '{}', '{"zzz":1}', 10, 'S', 'S', 'u_c',
+      '2026-10-02T00:00:00.000Z', NULL, 'registered', '2026-10-02T00:00:00.000Z', '2026-10-03T00:00:00.000Z');
+  `);
+  syncPoolTalents({ db, editionId: 'ed_1', now: NOW });
+  const row = db.prepare('SELECT skills_json FROM pool_talents WHERE user_id = ?').get('u_a');
+  const skills = JSON.parse(row.skills_json);
+  assert.deepEqual(
+    skills.map((s) => s.key),
+    ['capability', 'collaboration', 'direction'],
+    '软删的报名画像不进技能',
+  );
+  cleanup(db, close, dataDir);
+});
+
+test('段位记录被软删后重跑同步：项目池回落到队伍自身的 tier', () => {
+  const { db, close, dataDir } = setup();
+  syncPoolProjects({ db, editionId: 'ed_1', now: NOW });
+  db.prepare('UPDATE tier_records SET deleted_at = ? WHERE id = ?').run('2026-10-19T00:00:00.000Z', 'tr_1');
+  syncPoolProjects({ db, editionId: 'ed_1', now: NOW });
+  const row = db.prepare('SELECT tier, business_value FROM pool_projects WHERE team_id = ?').get('tm_1');
+  assert.equal(row.tier, 'C', '软删段位记录后回落到 teams.tier');
+  assert.equal(row.business_value, null, '没有段位记录就没有商业签字数（不臆造）');
+  cleanup(db, close, dataDir);
+});
+
+// ── 届期隔离与终生口径 ──────────────────────────────────────────────
+
+test('同一人在两届都有行时，积分在两行上完全相同（终生累计，不做两份算法）', () => {
+  const { db, close, dataDir } = setup();
+  syncPoolTalents({ db, editionId: 'ed_2', now: NOW });
+  syncPoolTalents({ db, editionId: 'ed_1', now: NOW });
+  const rows = db.prepare('SELECT edition_id, total_points FROM pool_talents ORDER BY edition_id').all();
+  assert.equal(rows.length, 2);
+  assert.deepEqual(rows.map((r) => r.edition_id), ['ed_1', 'ed_2']);
+  assert.deepEqual(
+    rows.map((r) => r.total_points),
+    [23, 23],
+    '两届都是终生口径 23（若按届期算则是 15 与 8）',
+  );
+  cleanup(db, close, dataDir);
+});
+
+test('跨届期刷新：改了流水后只同步一届，同一人的另一届那行也必须跟着变', () => {
+  const { db, close, dataDir } = setup();
+  syncPoolTalents({ db, editionId: 'ed_2', now: NOW });
+  db.prepare('UPDATE points_ledger SET points = 20 WHERE id = ?').run('pl_3');
+  syncPoolTalents({ db, editionId: 'ed_1', now: NOW });
+  const rows = db.prepare('SELECT edition_id, total_points FROM pool_talents ORDER BY edition_id').all();
+  assert.deepEqual(
+    rows.map((r) => r.total_points),
+    [35, 35],
+    '同一人在任何一行里的积分都必须相同（不做两份算法：10+5+20=35）',
+  );
+  cleanup(db, close, dataDir);
+});
+
+test('届期隔离：同步一届不会动到另一届的资源池', () => {
+  const { db, close, dataDir } = setup();
+  syncPoolResources({ db, editionId: 'ed_1', now: NOW });
+  syncPoolResources({ db, editionId: 'ed_2', now: NOW });
+  assert.equal(
+    db.prepare('SELECT COUNT(*) AS n FROM pool_resources WHERE edition_id = ?').get('ed_1').n,
+    3,
+  );
+  assert.equal(
+    db.prepare('SELECT COUNT(*) AS n FROM pool_resources WHERE edition_id = ?').get('ed_2').n,
+    1,
+  );
+  // 再同步 ed_1：ed_2 的资源行一个都不能少
+  syncPoolResources({ db, editionId: 'ed_1', now: NOW });
+  assert.equal(
+    db.prepare('SELECT COUNT(*) AS n FROM pool_resources WHERE edition_id = ?').get('ed_2').n,
+    1,
+    '同步一届不能把另一届的资源行当成陈旧行删掉',
+  );
+  cleanup(db, close, dataDir);
+});
+
+test('届期隔离：同步一届不会动到另一届的项目池', () => {
+  const { db, close, dataDir } = setup();
+  syncPoolProjects({ db, editionId: 'ed_1', now: NOW });
+  const ed1Before = db.prepare('SELECT id, title FROM pool_projects WHERE edition_id = ?').all('ed_1');
+  syncPoolProjects({ db, editionId: 'ed_2', now: NOW });
+  const ed1After = db.prepare('SELECT id, title FROM pool_projects WHERE edition_id = ?').all('ed_1');
+  assert.deepEqual(ed1After, ed1Before, 'ed_1 的行一个都不该被 ed_2 的同步改到');
+  assert.equal(
+    db.prepare('SELECT COUNT(*) AS n FROM pool_projects WHERE edition_id = ?').get('ed_2').n,
+    1,
+    'ed_2 只有三队一个项目',
+  );
+  cleanup(db, close, dataDir);
+});
+
+// ── 可见性 / 过滤 ────────────────────────────────────────────────────
+
+test('有 edition 作用域授权的用户读得到本届时，读不到别届', () => {
+  const { db, close, dataDir } = setup(`
+    INSERT INTO capabilities (key, description) VALUES ('pool:read', '读取三池');
+    INSERT INTO assignments (id, user_id, capability, scope_type, scope_id, granted_by, created_at)
+    VALUES ('as_1', 'u_c', 'pool:read', 'edition', 'ed_1', 'u_a', '2026-10-01T00:00:00.000Z');
+  `);
+  syncAll(db);
+  const viewer = { id: 'u_c', is_superadmin: 0, active: 1 };
+  assert.equal(listPoolProjects({ db, filter: { editionId: 'ed_1' }, viewer }).length, 2);
+  assert.deepEqual(listPoolProjects({ db, filter: { editionId: 'ed_2' }, viewer }), []);
+  cleanup(db, close, dataDir);
+});
+
+test('被停用的用户读到空数组（列表不满足 → 空集，不给半截数据）', () => {
+  const { db, close, dataDir } = setup();
+  syncAll(db);
+  const rows = listPoolTalents({
+    db, filter: { editionId: 'ed_1' }, viewer: { id: 'u_a', is_superadmin: 1, active: 0 },
+  });
+  assert.deepEqual(rows, []);
+  cleanup(db, close, dataDir);
+});
+
+test('列表过滤：limit / userId / minPoints / enterpriseId / kind 生效', () => {
+  const { db, close, dataDir } = setup(`
+    INSERT INTO users (id, name, phone, password_hash, mba_status, org, is_superadmin, active, created_at)
+    VALUES ('u_d', '丁', '13900000024', 'x', 'other', '外单位', 0, 1, '2026-10-01T00:00:00.000Z');
+    INSERT INTO points_ledger (id, edition_id, stage_id, team_id, user_id, kind, points, created_at)
+    VALUES ('pl_4', 'ed_1', 'st_1', 'tm_2', 'u_d', 'stage_rank', 4, '2026-10-10T00:00:00.000Z');
+  `);
+  syncAll(db);
+  const all = listPoolTalents({ db, filter: { editionId: 'ed_1' }, viewer: SUPER });
+  assert.equal(all.length, 2);
+  assert.deepEqual(all.map((r) => r.userId), ['u_a', 'u_d'], '积分倒序');
+  assert.equal(listPoolTalents({ db, filter: { editionId: 'ed_1', limit: 1 }, viewer: SUPER }).length, 1);
+  assert.equal(listPoolProjects({ db, filter: { editionId: 'ed_1', limit: 1 }, viewer: SUPER }).length, 1);
+  assert.equal(listPoolResources({ db, filter: { editionId: 'ed_1', limit: 2 }, viewer: SUPER }).length, 2);
+  assert.deepEqual(
+    listPoolTalents({ db, filter: { editionId: 'ed_1', userId: 'u_d' }, viewer: SUPER }).map((r) => r.userId),
+    ['u_d'],
+  );
+  assert.deepEqual(
+    listPoolTalents({ db, filter: { editionId: 'ed_1', minPoints: 10 }, viewer: SUPER }).map((r) => r.userId),
+    ['u_a'],
+  );
+  assert.equal(
+    listPoolResources({ db, filter: { editionId: 'ed_1', enterpriseId: 'ent_1' }, viewer: SUPER }).length,
+    2,
+  );
+  assert.deepEqual(
+    listPoolResources({ db, filter: { editionId: 'ed_1', kind: 'free_brief' }, viewer: SUPER })
+      .map((r) => r.enterpriseId),
+    ['ent_1'],
+  );
+  cleanup(db, close, dataDir);
+});
+
+// ── 规则口径（rules/pools.json 才是口径的唯一来源）───────────────────
+
+test('规则口径：packageStatusFilter 只让白名单状态的任务包进资源池', () => {
+  const { db, close, dataDir } = setup(`
+    INSERT INTO task_packages (id, edition_id, enterprise_id, enterprise_name, title, pain_point,
+      expected_delivery, acceptance_criteria, grade, status, solvability_score, solvability_grade,
+      commitment, agreement, is_free_brief, submitted_by, submitted_at, deleted_at)
+    VALUES ('tp_5', 'ed_1', 'ent_3', '某保险', '理赔助手', '理赔慢', '可演示原型', '能跑', 'B',
+      'submitted', 8, 'B', '对标试点', '对标试点协议', 0, 'u_a', '2026-10-01T00:00:00.000Z', NULL);
+  `);
+  const unfiltered = syncPoolResources({ db, editionId: 'ed_1', now: NOW });
+  assert.equal(unfiltered.total, 4, '默认不过滤状态');
+  const filtered = syncPoolResources({
+    db, editionId: 'ed_1', now: NOW, rules: { pools: { packageStatusFilter: ['approved'] } },
+  });
+  assert.equal(filtered.total, 3);
+  assert.equal(filtered.removed, 1, '口径变了，被排除的行要移出去');
+  const rows = listPoolResources({ db, filter: { editionId: 'ed_1' }, viewer: SUPER });
+  assert.ok(!rows.some((r) => r.enterpriseId === 'ent_3'), '未审批的任务包不进资源池');
+  cleanup(db, close, dataDir);
+});
+
+test('规则口径：talentPointKinds 决定哪些 kind 计入积分', () => {
+  const { db, close, dataDir } = setup();
+  syncPoolTalents({
+    db,
+    editionId: 'ed_1',
+    now: NOW,
+    rules: { pools: { talentPointKinds: { atomic: ['stage_rank'], rollup: 'personal_rollup' } } },
+  });
+  const row = db.prepare('SELECT total_points AS p FROM pool_talents WHERE user_id = ?').get('u_a');
+  assert.equal(row.p, 18, '口径外只剩 stage_rank：10 + 8 = 18（默认口径是 23）');
+  cleanup(db, close, dataDir);
+});
+
+// ── 错误与写后自检 ───────────────────────────────────────────────────
+
+test('editionId 缺失 → AppError 400（EDITION_REQUIRED）', () => {
+  const { db, close, dataDir } = setup();
+  const check = (e) => e?.status === 400 && e?.code === 'EDITION_REQUIRED';
+  assert.throws(() => syncPoolProjects({ db, now: NOW }), check);
+  assert.throws(() => syncPoolTalents({ db, now: NOW }), check);
+  assert.throws(() => syncPoolResources({ db, now: NOW }), check);
+  cleanup(db, close, dataDir);
+});
+
+test('写后自检：库里的积分被改坏时，同步必须抛错（派生值只能有一个计算点）', () => {
+  const { db, close, dataDir } = setup();
+  syncPoolTalents({ db, editionId: 'ed_1', now: NOW });
+  // 用触发器模拟「写入路径与重算路径算出不同结果」——正常实现走不到这一步，
+  // 这里钉住的是：写完之后**确实**会用同一个纯函数重算比对，不一致就报错。
+  db.exec(`
+    CREATE TRIGGER trg_corrupt AFTER UPDATE ON pool_talents
+    BEGIN
+      UPDATE pool_talents SET total_points = total_points + 1 WHERE rowid = NEW.rowid;
+    END;
+  `);
+  assert.throws(
+    () => syncPoolTalents({ db, editionId: 'ed_1', now: NOW }),
+    (e) => e?.status === 500 && e?.code === 'POOL_TALENT_POINTS_MISMATCH',
+  );
+  cleanup(db, close, dataDir);
+});
+
+// ── 领域纯函数（唯一计算点本身）────────────────────────────────────
+
+test('领域纯函数：aggregatePersonalPoints 以 rollup 为准，并与 atomic 冲突时显式告警', () => {
+  const { byUser, warnings } = aggregatePersonalPoints({
+    ledger: [
+      { user_id: 'u_x', kind: 'stage_rank', points: 10, stage_id: 'st_1' },
+      { user_id: 'u_x', kind: 'personal_rollup', points: 12, stage_id: 'st_2' },
+    ],
+  });
+  assert.equal(byUser.u_x.total, 12, '有 rollup 行时以 rollup 为准');
+  assert.equal(byUser.u_x.breakdown.atomic, 10);
+  assert.equal(byUser.u_x.breakdown.rollup, 12);
+  assert.equal(byUser.u_x.stagesJoined, 2);
+  assert.ok(
+    warnings.some((w) => w.code === 'points_ledger_kind_conflict' && w.userId === 'u_x'),
+    '两种口径不一致必须显式告警，不能静默',
+  );
+});
+
+test('领域纯函数：未知 kind 被忽略并显式告警', () => {
+  const { byUser, warnings } = aggregatePersonalPoints({
+    ledger: [{ user_id: 'u_x', kind: 'weird_kind', points: 99 }],
+  });
+  assert.equal(byUser.u_x.total, 0, '口径外的 kind 不计入');
+  assert.ok(warnings.some((w) => w.code === 'points_kind_ignored' && w.kind === 'weird_kind'));
+});
+
+test('领域纯函数：没有赛段的流水不计入赛段数；数组型画像不算技能', () => {
+  const agg = aggregatePersonalPoints({
+    ledger: [
+      { user_id: 'u_x', kind: 'stage_rank', points: 5, stage_id: 'st_1' },
+      { user_id: 'u_x', kind: 'stage_rank', points: 3 },
+    ],
+  });
+  assert.equal(agg.byUser.u_x.stagesJoined, 1, '没有赛段的流水不占赛段数');
+  assert.equal(agg.byUser.u_x.total, 8, '积分照算');
+
+  const { rows } = derivePoolTalents({
+    users: [{ id: 'u_x', name: '甲', org: null, mba_status: 'other' }],
+    ledger: [{ user_id: 'u_x', kind: 'stage_rank', points: 5 }],
+    registrations: [{ user_id: 'u_x', dimension_scores_json: '[1,2]', created_at: '2026-10-01' }],
+  });
+  assert.deepEqual(rows[0].skills, [], '画像不是对象就没有技能');
+});
+
+test('领域纯函数：derivePoolTalents 对缺失用户与坏技能 JSON 显式告警', () => {
+  const { rows, warnings } = derivePoolTalents({
+    users: [{ id: 'u_y', name: '乙', org: null, mba_status: 'other' }],
+    ledger: [
+      { user_id: 'u_x', kind: 'stage_rank', points: 3 },
+      { user_id: 'u_y', kind: 'stage_rank', points: 4 },
+    ],
+    registrations: [
+      { user_id: 'u_y', dimension_scores_json: '{不是 JSON', created_at: '2026-10-01' },
+    ],
+  });
+  assert.equal(rows.length, 1, '查不到档案的人不进人才池');
+  assert.equal(rows[0].userId, 'u_y');
+  assert.deepEqual(rows[0].skills, [], '坏 JSON 不炸，技能为空');
+  assert.ok(warnings.some((w) => w.code === 'talent_user_missing' && w.userId === 'u_x'));
+  assert.ok(warnings.some((w) => w.code === 'skills_parse_failed' && w.userId === 'u_y'));
+});
+
+test('领域纯函数：derivePoolProjects 在任务包缺失时用队名兜底，最远赛段按 starts_at 定', () => {
+  const rows = derivePoolProjects({
+    teams: [{ id: 'tm_9', name: '九队', task_package_id: 'tp_missing', tier: 'C' }],
+    packages: [],
+    stageResults: [{ team_id: 'tm_9', stage_id: 'st_b' }, { team_id: 'tm_9', stage_id: 'st_a' }],
+    stages: [
+      { id: 'st_a', stage_key: 's1', starts_at: '2026-10-01' },
+      { id: 'st_b', stage_key: 's2', starts_at: '2026-10-10' },
+    ],
+    tierRecords: [],
+  });
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].title, '九队', '任务包缺失时用队名兜底');
+  assert.equal(rows[0].stageReached, 's2', '最远赛段按 starts_at 排序后取最远');
+  assert.equal(rows[0].tier, 'C', '没有段位记录时用队伍自身的 tier');
+  assert.equal(rows[0].businessValue, null);
+});
+
+test('领域纯函数：三个派生的排序都是确定性的（同一输入必得同一顺序）', () => {
+  const projects = derivePoolProjects({
+    teams: [
+      { id: 'tm_2', name: '二队', task_package_id: 'tp_2', tier: 'D' },
+      { id: 'tm_1', name: '一队', task_package_id: 'tp_1', tier: 'C' },
+    ],
+    packages: [],
+    stageResults: [],
+    stages: [],
+    tierRecords: [],
+  });
+  assert.deepEqual(projects.map((r) => r.teamId), ['tm_1', 'tm_2'], '项目池按 teamId 升序');
+
+  const talents = derivePoolTalents({
+    users: [
+      { id: 'u_b', name: '乙', org: null, mba_status: 'other' },
+      { id: 'u_a', name: '甲', org: null, mba_status: 'mba' },
+      { id: 'u_c', name: '丙', org: null, mba_status: 'other' },
+    ],
+    ledger: [
+      { user_id: 'u_b', kind: 'stage_rank', points: 5 },
+      { user_id: 'u_a', kind: 'stage_rank', points: 3 },
+      { user_id: 'u_c', kind: 'stage_rank', points: 5 },
+    ],
+    registrations: [],
+  });
+  assert.deepEqual(
+    talents.rows.map((r) => r.userId),
+    ['u_b', 'u_c', 'u_a'],
+    '先按积分倒序；积分相同时按 userId 升序（并列也必须可复算）',
+  );
+
+  const resources = derivePoolResources({
+    packages: [
+      { id: 'tp_9', enterprise_id: 'ent_2', enterprise_name: '某零售', title: 'B', pain_point: 'p', is_free_brief: 1 },
+      { id: 'tp_8', enterprise_id: 'ent_2', enterprise_name: '某零售', title: 'A', pain_point: 'p', is_free_brief: 0 },
+    ],
+  });
+  assert.deepEqual(
+    resources.map((r) => r.kind),
+    ['enterprise_brief', 'free_brief'],
+    '同一企业的两种类型按 kind 升序（与输入顺序无关）',
+  );
+});
+
+// ── 规则配置的 fail-fast（rules/pools.json 是口径的唯一来源）─────────
+
+test('仓库自带的 rules/pools.json 能通过 fail-fast 校验（配置本身是对的）', () => {
+  const { rules } = loadRules(rulesDir);
+  assert.equal(rules.pools.id, 'pools');
+  assert.equal(rules.pools.workflow.claimMode, 'self_claim_only');
+});
+
+test('规则校验：claimMode 不是 self_claim_only 会被拒绝启动（R-OPS-14 禁止岗位制）', () => {
+  const { rules } = loadRules(rulesDir);
+  const errors = validateRules({
+    ...rules,
+    pools: { ...rules.pools, workflow: { claimMode: 'by_role' } },
+  });
+  assert.ok(
+    errors.some((e) => e.includes('claimMode')),
+    `必须报错（实际 ${JSON.stringify(errors)}）`,
+  );
+});
+
+test('规则校验：publicTokenTtlDays / publicScopes / talentTotalScope / taskEvidence 不合规都拒绝启动', () => {
+  const { rules } = loadRules(rulesDir);
+  const bad = [
+    [{ ...rules.pools, publicTokenTtlDays: 0 }, 'publicTokenTtlDays'],
+    [{ ...rules.pools, publicScopes: ['leaderboard'] }, 'publicScopes'],
+    [{ ...rules.pools, talentTotalScope: 'edition' }, 'talentTotalScope'],
+    [{ ...rules.pools, taskEvidence: { ...rules.pools.taskEvidence, requireRunnableOrBlocker: false } }, 'requireRunnableOrBlocker'],
+    [{ ...rules.pools, talentPointKinds: { rollup: 'personal_rollup' } }, 'talentPointKinds'],
+  ];
+  for (const [pools, keyword] of bad) {
+    const errors = validateRules({ ...rules, pools });
+    assert.ok(
+      errors.some((e) => e.includes(keyword)),
+      `${keyword} 不合规必须报错（实际 ${JSON.stringify(errors)}）`,
+    );
+  }
+});
+
+test('领域纯函数：起始时间相同的赛段按 id 兜底定先后（与输入顺序无关）', () => {
+  const rows = derivePoolProjects({
+    teams: [{ id: 'tm_1', name: '一队', task_package_id: null, tier: 'C' }],
+    packages: [],
+    stageResults: [{ team_id: 'tm_1', stage_id: 'st_y' }, { team_id: 'tm_1', stage_id: 'st_x' }],
+    stages: [
+      { id: 'st_y', stage_key: 's9', starts_at: '2026-11-01' },
+      { id: 'st_x', stage_key: 's8', starts_at: '2026-11-01' },
+    ],
+    tierRecords: [],
+  });
+  assert.equal(rows[0].stageReached, 's9', '同起始时间时按赛段 id 定先后（st_x < st_y）');
+});
+
+test('领域纯函数：derivePoolResources 跳过软删的任务包', () => {
+  const rows = derivePoolResources({
+    packages: [
+      {
+        id: 'tp_1', enterprise_id: 'ent_1', enterprise_name: '某银行', title: 'A', pain_point: 'p1', is_free_brief: 0,
+      },
+      {
+        id: 'tp_2', enterprise_id: 'ent_1', enterprise_name: '某银行', title: 'B', pain_point: 'p2', is_free_brief: 0, deleted_at: '2026-10-02',
+      },
+    ],
+  });
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].packageCount, 1, '软删的任务包不计入资源池');
 });
 ```
 
@@ -3119,6 +3695,21 @@ export const ROLLUP_POINT_KIND = 'personal_rollup';
 
 function pick(row, camel, snake) {
   return row[camel] !== undefined ? row[camel] : row[snake];
+}
+
+/**
+ * 确定性字符串比较：按码位（code point）逐字符比。
+ *
+ * ⛔ 不用 localeCompare（Global Constraints「确定性排序」明确点名禁用）：
+ *    localeCompare 的结果依赖运行环境的 ICU 数据与 locale —— 同一份数据在两台
+ *    机器（或同一台机器的两个 locale）上可能排出**不同顺序** ⇒ 榜单不可复算。
+ *    这与「破同分链必须以确定性键收尾」是同一条纪律（设计文档 §6.7）。
+ */
+function compareIds(a, b) {
+  const x = String(a);
+  const y = String(b);
+  if (x === y) return 0;
+  return x < y ? -1 : 1;
 }
 
 /**
@@ -3195,7 +3786,7 @@ export function derivePoolProjects({ teams = [], packages = [], stageResults = [
   const orderedStages = [...stages].sort((a, b) => {
     const ax = String(a.startsAt ?? a.starts_at ?? '');
     const bx = String(b.startsAt ?? b.starts_at ?? '');
-    if (ax === bx) return String(a.id).localeCompare(String(b.id));
+    if (ax === bx) return compareIds(a.id, b.id);
     return ax < bx ? -1 : 1;
   });
   const stageOrder = new Map(orderedStages.map((s, i) => [s.id, i]));
@@ -3244,7 +3835,7 @@ export function derivePoolProjects({ teams = [], packages = [], stageResults = [
       summary,
     });
   }
-  rows.sort((a, b) => String(a.teamId).localeCompare(String(b.teamId)));
+  rows.sort((a, b) => compareIds(a.teamId, b.teamId));
   return rows;
 }
 
@@ -3282,7 +3873,7 @@ export function derivePoolTalents({ users = [], ledger = [], registrations = [],
       skills,
     });
   }
-  rows.sort((a, b) => b.totalPoints - a.totalPoints || String(a.userId).localeCompare(String(b.userId)));
+  rows.sort((a, b) => b.totalPoints - a.totalPoints || compareIds(a.userId, b.userId));
   return { rows, warnings };
 }
 
@@ -3322,7 +3913,7 @@ export function derivePoolResources({ packages = [] } = {}) {
       packageCount: g.titles.length,
     });
   }
-  rows.sort((a, b) => String(a.enterpriseId).localeCompare(String(b.enterpriseId)) || a.kind.localeCompare(b.kind));
+  rows.sort((a, b) => compareIds(a.enterpriseId, b.enterpriseId) || compareIds(a.kind, b.kind));
   return rows;
 }
 
@@ -3360,22 +3951,16 @@ import { can } from '../auth/permissions.js';
 import { derivePoolProjects, derivePoolTalents, derivePoolResources, aggregatePersonalPoints } from '../domain/pool-derive.js';
 import * as poolRepo from '../db/repo/pools.js';
 import * as srcRepo from '../db/repo/pool-sources.js';
+// ⛔ 事务助手复用 P4 的 withTransaction（src/db/tx.js，SAVEPOINT），**不再自建一份**：
+//    自建 BEGIN IMMEDIATE 的版本在「调用方已经开了事务」时会抛
+//    "cannot start a transaction within a transaction"，而 Task 4 的
+//    POST /api/pools/sync 极可能把同步包在别的事务里 —— 同一件事两处实现，
+//    正是「同一动作在两份材料里被标成一手与二手」的同构风险。
+//    依据：本计划偏差章节 F.2（P5 消费 P4 的 src/db/tx.js）；设计文档 §11「事务回滚，无部分写入」。
+import { withTransaction } from '../db/tx.js';
 
 function nowIso(now) {
   return now ?? new Date().toISOString();
-}
-
-/** 事务：单写者约束下，同步必须整体成功或整体回滚（设计文档 §11「事务回滚，无部分写入」）。 */
-function inTransaction(db, fn) {
-  db.exec('BEGIN IMMEDIATE');
-  try {
-    const out = fn();
-    db.exec('COMMIT');
-    return out;
-  } catch (err) {
-    try { db.exec('ROLLBACK'); } catch { /* 回滚失败时保留原始错误 */ }
-    throw err;
-  }
 }
 
 function requireEdition(editionId) {
@@ -3404,7 +3989,7 @@ export function syncPoolProjects({ db, editionId, now, rules }) {
   };
   const rows = derivePoolProjects(source);
 
-  return inTransaction(db, () => {
+  return withTransaction(db, () => {
     const existing = poolRepo.listPoolProjectRows(db, editionId);
     const byTeam = new Map(existing.map((r) => [r.team_id, r]));
     let inserted = 0;
@@ -3453,7 +4038,7 @@ export function syncPoolTalents({ db, editionId, now, rules }) {
     pointsConfig,
   });
 
-  const result = inTransaction(db, () => {
+  const result = withTransaction(db, () => {
     const allRows = poolRepo.listPoolTalentRows(db, null);
     const rowsOfUser = new Map();
     for (const r of allRows) {
@@ -3539,7 +4124,7 @@ export function syncPoolResources({ db, editionId, now, rules }) {
   const packages = srcRepo.listEditionPackages(db, editionId, { statuses: packageStatuses(rules) });
   const rows = derivePoolResources({ packages });
 
-  return inTransaction(db, () => {
+  return withTransaction(db, () => {
     const existing = poolRepo.listPoolResourceRows(db, editionId);
     const byKey = new Map(existing.map((r) => [`${r.enterprise_id}::${r.kind}`, r]));
     let inserted = 0;
@@ -3671,9 +4256,16 @@ function safeParse(raw) {
 > ③ `validateRules` 末尾追加 pools 的**内容**校验段。version 校验一个字都不动。
 > **⚠️ 硬前提**：`rules/pools.json` **必须带 `"id": "pools"`**（识别「一份配置」用的是 `id`
 > 而不是 `version`；`collectConfigObjects` 命中配置对象即 `return`，**嵌套对象里的 `id` 不算**）。
-> P5 落地时 `FILES` 为 **16** 份（P0 的 9 + P1 的 3 + P3 的 2 + P4 的 1 + P5 的 1），
-> 识别到的配置份数也必须是 16，否则报「规则配置应有 16 份，实际只识别到 N 份」→ **拒绝启动**。
-> **依据**：基线 `platform/src/config.js` + 漂移审计报告 I-2 与 D-3。
+> **份数以【本分支实测】为准**：P5 分支上 `FILES` 是 **15** 份
+> （P0 的 9 + P1 的 3 + P3 的 2 + P5 的 1）—— **P4 的 `rules.audit` 还没并进本分支**
+> （P4 只并进来了 `src/db/tx.js` 与反作弊检测器，`src/config.js` 的 `rules.audit` 命名空间
+> 与 `rules/audit.json` 留在 P4 分支上）。识别到的配置份数必须与 `Object.keys(FILES).length`
+> 一致（= 15），否则报「规则配置应有 15 份，实际只识别到 N 份」→ **拒绝启动**。
+> ⚠️ **份数是自动派生的**（`validateRules(rules, expectedCount)` 的 `expectedCount`
+> 来自 `Object.keys(FILES).length`）→ **P4 合回 main 时这里不需要改任何代码**，
+> 份数会自己从 15 变成 16。**不要把份数硬编码进本计划或代码。**
+> **依据**：基线 `platform/src/config.js` + 漂移审计报告 I-2 与 D-3 + 本分支实测
+> （`Object.keys(FILES).length` = 15）。
 
 在 `validateRules()` 的 `return errors;` 之前追加：
 
@@ -3728,11 +4320,12 @@ function safeParse(raw) {
 - [ ] **Step 7: 运行测试确认通过**
 
 Run: `cd platform && node --test test/pools-sync.test.js`
-Expected: PASS（7 个测试全过：pools-sync.test.js 7）
+Expected: PASS（**40** 个测试全过：pools-sync.test.js 40）
 
 Run: `cd platform && node --test test/config.test.js`
-Expected: PASS（23 个测试全过：config.test.js 23）——仓库自带的**全部 16 份**规则配置
-（P0 的 9 + P1 的 3 + P3 的 2 + P4 的 1 + P5 的 1）加上本阶段的 `pools.json` 一起通过校验
+Expected: PASS（**27** 个测试全过：config.test.js 27）——仓库自带的**全部 15 份**规则配置
+（P0 的 9 + P1 的 3 + P3 的 2 + P5 的 1；**P4 的 `rules.audit` 还没并进本分支**）
+加上本阶段的 `pools.json` 一起通过校验
 
 > **【2026-10-21 漂移审计修正 M-2】**
 > **原来错在哪**：这一行原来写的是
@@ -3752,6 +4345,12 @@ Expected: PASS（23 个测试全过：config.test.js 23）——仓库自带的*
 > 把份数算式一并订正（P3 = 14、P4 = 15、P5 = 16）。
 > **旁证**：P1 已把 `test/config.test.js` 里的「9 份」措辞泛化为「全部规则配置」
 > （3 处）—— 说明「份数」不该硬编码在测试名与文案里，本阶段沿用同一口径。
+>
+> **【2026-10-21 P5 Task 3 实跑修正】** 上面这段的**条数**是按**本分支实测**改写的：
+> `test/config.test.js` 实跑 **27** 条（不是 23），`FILES` 实测 **15** 份（不是 16，
+> 因为 **P4 的 `rules.audit` 命名空间与 `rules/audit.json` 还没并进 P5 分支**）。
+> **份数不写进代码**（`expectedCount` 由 `Object.keys(FILES).length` 派生），
+> 所以 P4 合回 main 时**这一段不需要改**，份数会自己变成 16。
 
 - [ ] **Step 8: 提交**
 
@@ -5378,7 +5977,7 @@ git commit -m "feat(P5): 任务清单前端页 + 端到端验收（工作流→�
 |---|---|---|---|---|
 | C-1 | Important | Task 1 的测试块**只覆盖迁移层**：本 Task 新建的 5 个仓储文件与 `teamMembers.js` 的两个追加函数**零覆盖** | 把 `getActiveClaim` 的 `AND released_at IS NULL` 删掉后，计划原测试**仍全绿** → 仓储层变异体全部存活 | 已补：测试 5 例 → 13 例（仓储层 6 例 + 约束矩阵 1 例 + 真并发 1 例） |
 | C-2 | Important | 计划里的「并发」用例**是串行的**（同一连接先后两次 insert） | 串行的第二次必然撞唯一索引 —— 证明不了「并发下由数据库仲裁」 | 已补：真并发用例（两个 worker 线程 + 两条独立连接 + `SharedArrayBuffer` 屏障），并断言两次 INSERT 的时间区间**重叠**（实测重叠 11–16 ms，8/8 次） |
-| C-3 | Important | 两条连接**同时**建立会撞 `PRAGMA journal_mode = WAL`（`busy_timeout` 在它**之后**才设） | 实测 `Error: database is locked`（errcode 261）于 `src/db/sqlite.js:25` | 测试里改「握手式错开建立」（A 连接 ready 后才起 B）。⛔ **未改 `src/db/sqlite.js`**（P0 的文件，不在本 Task 范围）→ 登记为**上游建议**（把 `busy_timeout` 提到 `journal_mode` 之前） |
+| C-3 | Important | 两条连接**同时**建立会撞 `PRAGMA journal_mode = WAL`（当时 `busy_timeout` 在它**之后**才设） | 实测 `Error: database is locked`（errcode 261）于 `src/db/sqlite.js:25` | **【已修 —— 上游，main `a6fd2db`】** 父代理在 P5 报出后定位到根因并修在 main：**切 journal_mode 需要独占锁，而别的连接持有写事务（RESERVED 锁）时 SQLite 的 busy handler 不覆盖这一步**（实测 0ms 即抛 SQLITE_BUSY，busy_timeout 对它无效 ⇒ 「只把 `busy_timeout` 提前」**不够**）。修法：busy_timeout 提前 + 切 WAL 改成「已是 `wal` 直接返回（no-op）→ 否则带**退避重试**地切」+ 预算耗尽 fail-fast。回归 4 例（`platform/test/db-concurrency.test.js`），对旧实现**有牙**。⚠️ 限定条件（P4 终审 M-2 实测纠正）：持 **EXCLUSIVE** 锁时 busy handler **仍会**等待 —— 「busy handler 一概不覆盖切 WAL」是过度泛化的说法。本 Task 当时的「握手式错开建立」变通**已不再必要**（可去掉，但保留也无害） |
 | C-4 | Minor | Step 10 写「PASS（5 个测试全过）」，与补测后不符 | 实跑 13 例 | 已回写 Step 10 |
 | C-5 | Minor | DDL 注释引用的「偏差章节 **D-2 / D-7**」**指向空**（偏差章节实际用 A–H 编号） | 全篇 grep：`D-2` / `D-7` 只出现在引用处，无对应条目 | 登记为知悉项；**未改 DDL 注释**（避免无意义 churn，且注释是计划原文） |
 | C-6 | Minor | `TEXT PRIMARY KEY` 在 SQLite 里**允许 NULL**（历史行为）→ `public_tokens.token` **没有** NOT NULL 防线 | 实测：插入 `token = NULL` 成功、不报 NOT NULL；P0–P4 的 id 列全是同一写法 | 已在测试里**钉住**该行为 + 注释说明；沿用 P0–P4 约定，**不在本迁移单点偏离** → 登记为**上游知悉项**（建议全项目统一补 `NOT NULL`） |
@@ -5461,17 +6060,17 @@ git commit -m "feat(P5): 任务清单前端页 + 端到端验收（工作流→�
 
 | # | 级别 | 缺陷 | 实跑证据 | 处置 |
 |---|---|---|---|---|
-| C-1 | Important | 计划 Task 2 的 Files 段要求「Modify: `platform/src/db/repo/teamMembers.js`（本阶段只**追加** `hasActiveMembership` / `listMemberTeams`）」——但**这两个函数已经存在**（P5 Task 1 的 worker 就加好了） | 实跑：`grep -n 'hasActiveMembership\|listMemberTeams' platform/src/db/repo/teamMembers.js` → 第 76 行 / 第 85 行**已存在**。若照计划再实现一次 → 同一张 `team_members` 出现两个定义，且会与 Task 1 的版本**逐字不一致**（「P5 认为在队、P1 认为已离队」的数据分歧） | 以现状为准：**不重建、不重复实现**。Files 段已改写为「Task 1 已追加到位，本阶段不需改」；本 Task **未触碰** `teamMembers.js` |
-| C-2 | Important | 计划 Task 2 的测试块**判别力不足**：多处期望值「恰好相同」区分不出两种实现；且 403/404/409 的**细分分支**、并发兜底、`behavior_events` 边界**零覆盖** | 实跑（变异探针）：把 `canViewWorkflow` 里 `listTeamRows` 的 `taskPackageId` 过滤删掉（变异 W12）、把 `canViewWorkflow` 的超管分支删掉（W11）、把 `resolveTeam` 的成员校验删掉（W25）—— **计划原 12 例全绿** | 已补：测试 **12 例 → 49 例**（领域纯函数 8 + 建工作流/建任务 7 + 列任务 5 + 领取 8 + 释放 2 + 完成 5 + 两条红线 2 + 真实写入方 1 + 既有 12） |
-| C-3 | Important | 计划的「完成任务不加分」用例只断言 `points_ledger` 行数不变，**没有断言 `behavior_events`** —— 而红线 ② 写的是「⛔ **不写 `points_ledger`、不写 `behavior_events`**、不产生任何分数」 | 实跑（变异探针）：让 `completeTask` 额外写一条 `behavior_events`（变异 W43）→ **计划原 12 例全绿**（因为它压根不看这张表） | 已补：断言 `points_ledger` / `behavior_events` / `tier_records` **三张表**行数都不变；且**先用真实写入方**（`insertLedgerEntry` / `insertBehaviorEvent`）造出既存行 —— 否则「行数不变」是恒真断言（没有既存行时永远成立） |
-| C-4 | Minor | 计划的测试种子是**手写 INSERT**，与**真实写入方**的形状不同：`teams.status` 手写成 `'active'`（真实 `insertTeam` 默认 `'forming'`）、`task_packages.status` 手写成 `'approved'`（真实 `createTaskPackage` 产出 `'submitted'`）、`team_members` **不写 `id`**（真实 `insertTeamMember` 写 randomUUID） | 实跑：新增用例里显式断言真实写入方产出的 `teams.status === 'forming'`、`task_packages.status === 'submitted'`。一份偷偷按 `status='active'` 过滤的实现，在计划原种子里**照样绿** —— 这正是本项目踩过的坑：**手造的 input 会让「一致」变成假象** | 已补：「真实写入方的数据照样跑通全链路」用例 —— 全部用仓储层真实写入函数（`createUser` / `createEdition` / `createTaskPackage` / `insertTeam` / `insertTeamMember` / `insertStage` / `insertLedgerEntry` / `insertBehaviorEvent`）造数据，并显式断言前提（forming / submitted） |
-| C-5 | Minor | 计划原种子让 `team_members.id` 为 NULL（`TEXT PRIMARY KEY` 在 SQLite 里允许 NULL —— Task 1 台账 C-6 已登记同一现象） | 实跑：插入成功；且同一人在两支队的写法会被 P1 的 `idx_team_members_active` 挡下 | 新增用例改用真实写入方 `insertTeamMember`（写真实 UUID）。计划原 12 例的种子**保持原样**（不改动规格既有块） |
-| C-6 | Minor | 计划的 Step 6 写「Expected: PASS（12 个测试全过：workflow-service.test.js 12）」，补测后与实际不符 | 实跑 **49** 例 | 已回写 Step 6 |
-| C-7 | Minor | 计划的 Step 7 提交命令没有 `-- <显式路径…>` | 本项目提交纪律：先 `git add <paths…>`，再 `git commit -m "…" -- <paths…>` | 已回写 Step 7 |
-| C-8 | Minor | 计划的 Files 段把 `teamMembers.js` 列成本 Task 的 Modify 对象，实际不需改 | 见 C-1 | 已回写 Files 段 |
-| C-9 | Important | 计划原「禁止岗位制」用例用 `src.includes('R-OPS-14')` 断言溯源注释 —— 但**任何一处**出现都满足它，规格要求的「这行注释必须留着」没被钉住 | 实跑（变异 `W44`）：删掉 `// R-OPS-14：禁止岗位制，任务只能自主领取。` 这一行后，**计划原 12 例全绿**（文件里还有另外 3 处提到 R-OPS-14） | 已补：断言**整行**注释逐字存在（`src.includes('// R-OPS-14：禁止岗位制，任务只能自主领取')`）→ 复跑 `W44` **KILLED** |
-| C-10 | Important | 领域校验里「**缺** artifactUrl」与「artifactUrl **形态不对**」是**两条不同的错误**（提示语不同），但计划原用例只断言 `field === 'artifactUrl'` → 两者混同测不出来 | 实跑（变异 `E07`）：把「缺产物」分支短路后（改由「形态不对」分支报错，字段仍是 `artifactUrl`），**计划原 12 例全绿** | 已补：分别断言提示语（缺 → 「必须给出可运行产物」；形态不对 → 「必须是 http(s) 链接」）→ 复跑 `E07` **KILLED** |
-| C-11 | Important | 可见性的 `editionId` 过滤在**干净数据**上**不可观测** —— `task_package_id` 已经把队限定住了，正常的「跨届期队」本来就带着别的包，漏掉 `editionId` 过滤也看不出来 | 实跑（变异 `W13`）：删掉 `editionId` 过滤后，补测前的用例**仍全绿** | 已补：造一条**刻意的脏数据** —— 「挂在 ed_2 却指向 ed_1 任务包 tp_1 的队」（DDL 允许：`teams.edition_id` 与 `task_packages.edition_id` 之间没有一致性约束，真实写入方 `insertTeam` 也照样写得出来）→ 复跑 `W13` **KILLED** |
+| T2-C1 | Important | 计划 Task 2 的 Files 段要求「Modify: `platform/src/db/repo/teamMembers.js`（本阶段只**追加** `hasActiveMembership` / `listMemberTeams`）」——但**这两个函数已经存在**（P5 Task 1 的 worker 就加好了） | 实跑：`grep -n 'hasActiveMembership\|listMemberTeams' platform/src/db/repo/teamMembers.js` → 第 76 行 / 第 85 行**已存在**。若照计划再实现一次 → 同一张 `team_members` 出现两个定义，且会与 Task 1 的版本**逐字不一致**（「P5 认为在队、P1 认为已离队」的数据分歧） | 以现状为准：**不重建、不重复实现**。Files 段已改写为「Task 1 已追加到位，本阶段不需改」；本 Task **未触碰** `teamMembers.js` |
+| T2-C2 | Important | 计划 Task 2 的测试块**判别力不足**：多处期望值「恰好相同」区分不出两种实现；且 403/404/409 的**细分分支**、并发兜底、`behavior_events` 边界**零覆盖** | 实跑（变异探针）：把 `canViewWorkflow` 里 `listTeamRows` 的 `taskPackageId` 过滤删掉（变异 W12）、把 `canViewWorkflow` 的超管分支删掉（W11）、把 `resolveTeam` 的成员校验删掉（W25）—— **计划原 12 例全绿** | 已补：测试 **12 例 → 49 例**（领域纯函数 8 + 建工作流/建任务 7 + 列任务 5 + 领取 8 + 释放 2 + 完成 5 + 两条红线 2 + 真实写入方 1 + 既有 12） |
+| T2-C3 | Important | 计划的「完成任务不加分」用例只断言 `points_ledger` 行数不变，**没有断言 `behavior_events`** —— 而红线 ② 写的是「⛔ **不写 `points_ledger`、不写 `behavior_events`**、不产生任何分数」 | 实跑（变异探针）：让 `completeTask` 额外写一条 `behavior_events`（变异 W43）→ **计划原 12 例全绿**（因为它压根不看这张表） | 已补：断言 `points_ledger` / `behavior_events` / `tier_records` **三张表**行数都不变；且**先用真实写入方**（`insertLedgerEntry` / `insertBehaviorEvent`）造出既存行 —— 否则「行数不变」是恒真断言（没有既存行时永远成立） |
+| T2-C4 | Minor | 计划的测试种子是**手写 INSERT**，与**真实写入方**的形状不同：`teams.status` 手写成 `'active'`（真实 `insertTeam` 默认 `'forming'`）、`task_packages.status` 手写成 `'approved'`（真实 `createTaskPackage` 产出 `'submitted'`）、`team_members` **不写 `id`**（真实 `insertTeamMember` 写 randomUUID） | 实跑：新增用例里显式断言真实写入方产出的 `teams.status === 'forming'`、`task_packages.status === 'submitted'`。一份偷偷按 `status='active'` 过滤的实现，在计划原种子里**照样绿** —— 这正是本项目踩过的坑：**手造的 input 会让「一致」变成假象** | 已补：「真实写入方的数据照样跑通全链路」用例 —— 全部用仓储层真实写入函数（`createUser` / `createEdition` / `createTaskPackage` / `insertTeam` / `insertTeamMember` / `insertStage` / `insertLedgerEntry` / `insertBehaviorEvent`）造数据，并显式断言前提（forming / submitted） |
+| T2-C5 | Minor | 计划原种子让 `team_members.id` 为 NULL（`TEXT PRIMARY KEY` 在 SQLite 里允许 NULL —— Task 1 台账 C-6 已登记同一现象） | 实跑：插入成功；且同一人在两支队的写法会被 P1 的 `idx_team_members_active` 挡下 | 新增用例改用真实写入方 `insertTeamMember`（写真实 UUID）。计划原 12 例的种子**保持原样**（不改动规格既有块） |
+| T2-C6 | Minor | 计划的 Step 6 写「Expected: PASS（12 个测试全过：workflow-service.test.js 12）」，补测后与实际不符 | 实跑 **49** 例 | 已回写 Step 6 |
+| T2-C7 | Minor | 计划的 Step 7 提交命令没有 `-- <显式路径…>` | 本项目提交纪律：先 `git add <paths…>`，再 `git commit -m "…" -- <paths…>` | 已回写 Step 7 |
+| T2-C8 | Minor | 计划的 Files 段把 `teamMembers.js` 列成本 Task 的 Modify 对象，实际不需改 | 见 T2-C1 | 已回写 Files 段 |
+| T2-C9 | Important | 计划原「禁止岗位制」用例用 `src.includes('R-OPS-14')` 断言溯源注释 —— 但**任何一处**出现都满足它，规格要求的「这行注释必须留着」没被钉住 | 实跑（变异 `W44`）：删掉 `// R-OPS-14：禁止岗位制，任务只能自主领取。` 这一行后，**计划原 12 例全绿**（文件里还有另外 3 处提到 R-OPS-14） | 已补：断言**整行**注释逐字存在（`src.includes('// R-OPS-14：禁止岗位制，任务只能自主领取')`）→ 复跑 `W44` **KILLED** |
+| T2-C10 | Important | 领域校验里「**缺** artifactUrl」与「artifactUrl **形态不对**」是**两条不同的错误**（提示语不同），但计划原用例只断言 `field === 'artifactUrl'` → 两者混同测不出来 | 实跑（变异 `E07`）：把「缺产物」分支短路后（改由「形态不对」分支报错，字段仍是 `artifactUrl`），**计划原 12 例全绿** | 已补：分别断言提示语（缺 → 「必须给出可运行产物」；形态不对 → 「必须是 http(s) 链接」）→ 复跑 `E07` **KILLED** |
+| T2-C11 | Important | 可见性的 `editionId` 过滤在**干净数据**上**不可观测** —— `task_package_id` 已经把队限定住了，正常的「跨届期队」本来就带着别的包，漏掉 `editionId` 过滤也看不出来 | 实跑（变异 `W13`）：删掉 `editionId` 过滤后，补测前的用例**仍全绿** | 已补：造一条**刻意的脏数据** —— 「挂在 ed_2 却指向 ed_1 任务包 tp_1 的队」（DDL 允许：`teams.edition_id` 与 `task_packages.edition_id` 之间没有一致性约束，真实写入方 `insertTeam` 也照样写得出来）→ 复跑 `W13` **KILLED** |
 
 ### T2-2 变异检验与测试数字
 
@@ -5523,3 +6122,97 @@ git commit -m "feat(P5): 任务清单前端页 + 端到端验收（工作流→�
 
 > 注：`src/domain/task-evidence.js` 与 `src/services/workflow.js` **一个字都没改** ——
 > 计划里的代码块直接就是实现（这两块不需要回写）。唯一被回写的是**测试块**（12 → 49 例）。
+---
+
+## Task 3 父代理预审修正台账（2026-10-21）
+
+> 执行者：P5 Task 3 实现 Agent。**规格 = 本计划 Task 3 章节**（唯一权威）。
+> 本台账记三件事：① 实跑发现的规格缺陷与处置；② 与 `INTERFACES.md` §6 的逐条核对结论；
+> ③ 变异检验与测试数字。**落盘文件与本计划 Task 3 的代码块逐字一致**（核验脚本见 T3-4）。
+
+### T3-1 实跑发现的规格缺陷与处置
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| T3-C1 | **Important** | **原计划的 7 例测试盖不住实现的绝大部分行为**：inserted/updated/removed 三个计数、移除路径、列表过滤、规则口径、跨届期刷新、写后自检、rollup 口径分支、告警、`config.js` 的 pools 校验段 —— 全都零覆盖 | 用同一套 94 个变异体跑**原计划那 7 例**：**只杀掉 35 个**，**41 个存活且探针差分非空**（= 真实缺口）。例：`D18 人才池不按积分倒序`、`S05 项目池的陈旧行不删`、`S18 不同届期的同一人的行不再一起刷新`、`D01 rollup 优先被破坏` 全部存活 | **已补**：测试 7 例 → **40 例**（补的是**判别性**用例，不是"再测一遍"）。补完后同一套变异体 **88 杀 / 6 等价 / 0 缺口**（见 T3-3） |
+| T3-C2 | Minor | **原计划代码块与 Global Constraints #9 自相矛盾**：约束写明「确定性排序……不用 `localeCompare`」，而 Task 3 的三个派生排序（项目池 teamId、人才池 userId、资源池 enterpriseId+kind）**全都用了 `localeCompare`** | `localeCompare` 的结果依赖运行环境的 ICU/locale —— 同一份数据在两台机器上可能排出不同顺序 ⇒ 榜单不可复算（与「破同分链必须以确定性键收尾」同一条纪律，设计文档 §6.7） | **已改**：三个排序统一走新加的 `compareIds()`（按码位逐字符比，不依赖 locale）。代码块已回写 |
+| T3-C3 | Minor | **原计划代码块自建了一个事务助手 `inTransaction`（`BEGIN IMMEDIATE`），而同一份计划的偏差章节 F.2 明写「P5 消费 P4 的 `src/db/tx.js`（`withTransaction`）」** —— 同一件事两处实现 | `BEGIN IMMEDIATE` 在「调用方已经开了事务」时会抛 `cannot start a transaction within a transaction`；Task 4 的 `POST /api/pools/sync` 极可能把同步包在别的事务里。P4 的 `withTransaction` 用 SAVEPOINT（可嵌套） | **已改**：删掉自建版本，直接用 P4 的 `withTransaction`（偏差章节 F.2 的口径）。代码块已回写 |
+| T3-C4 | Minor | Step 6/Step 7 的**份数与条数是按 P4 已合入 main 写的**，本分支上对不上：Step 6 说 `FILES` = 16、Step 7 说 `config.test.js` 23 条 | 本分支实测：`Object.keys(FILES).length` = **15**（P4 的 `rules.audit` 命名空间与 `rules/audit.json` **还没并进 P5 分支**）；`node --test test/config.test.js` = **27** 条 | **已回写** Step 6/Step 7 的实测数（15 份 / 27 条 / 40 条）。**份数不写进代码**（`expectedCount` 由 `Object.keys(FILES).length` 派生）⇒ P4 合回 main 时这段**不需要改** |
+| T3-C5 | Minor | **写后自检（`POOL_TALENT_POINTS_MISMATCH`）在正确实现下不可达** ⇒ 原计划没给它任何测试 ⇒ 「派生值只能有一个计算点」这条本 Task 的灵魂**没有被验证过** | 可达性分析：写入用 `aggregatePersonalPoints(ledger)`，自检用**同一个**纯函数 + **同一份** ledger ⇒ 除非实现自身不一致，否则恒相等 | **已补**：用 SQLite 触发器模拟「写入路径与重算路径算出不同结果」（`AFTER UPDATE` 触发器把 `total_points` 加 1）⇒ 断言同步**抛 `POOL_TALENT_POINTS_MISMATCH`（500）**。变异体 `S20 自检被摘掉` 被这条用例杀掉 |
+| T3-C6 | Minor | **原计划的幂等用例断言的是「内容一致」，而「内容一致」区分不出「重建」与「什么也不做」** —— 同步若整体退化成空操作，幂等用例照样绿 | 原计划第 4 例只 `deepEqual(snapshot)`；变异体「同步不写任何行」在该用例下**不可见** | **已补**：幂等用例改成**判别性**断言 —— 比对**第二次同步的 inserted/updated/removed 计数**、**行 id 是否稳定**、**积分是否翻倍**（23 不是 69）。「空操作」这种变异体现在会红 |
+| T3-C7 | Info | `derivePoolResources` 算出了 `packageCount`，但 `pool_resources` **没有这一列**（契约的列清单如此）⇒ 该值算完即丢 | 契约 §6 的 `pool_resources` 列清单 + `006_pools.sql` 的 DDL + `insertPoolResource` 的参数表 | **保持现状**（契约的列清单优先），登记为**已知的信息损失**：`packageCount` 只能从 `detail` 里数，不单独成列 |
+| T3-C8 | Minor | **确定性缺口（上游，未修）**：`listEditionTierRecords`（Task 1 的文件）排序是 `ORDER BY tr.team_id, tr.computed_at`，**没有 `tr.id` 兜底** ⇒ 同一支队若出现**同刻**的两条段位记录，取哪条取决于 SQLite 排序的稳定性（**不保证稳定**） | 变异体 `D32`（`at >= prev.at` → `at > prev.at`）在探针数据下**不可观测**（探针里没有同刻记录，差分为空）⇒ 等价/不可观测；但**同刻记录一旦出现，结果就不确定** | **未修**（`pool-sources.js` 是 Task 1 的文件，不在本 Task 范围）⇒ 登记为**上游建议**（给 `ORDER BY` 补 `tr.id`）。同 Task 1 台账 C-3 的处理方式 |
+| T3-C9 | Minor | `points_ledger.user_id` 是 `NOT NULL` ⇒ 领域函数里 `if (!userId) continue;` 这道防线**在真实数据上永不触发** | 变异体 `D09`（去掉该防线）探针差分为空 | **保持现状**（纯函数不假设上游一定干净，防线留着）；标注为**不可观测（schema 约束）** |
+| T3-C10 | Minor | `task_packages.pain_point` 是 `NOT NULL` ⇒ `derivePoolResources` 里 `titles.length` 与 `details.length` **恒相等**（除非痛点写成空串） | 变异体 `D34`（`packageCount` 换口径）探针差分为空 | **保持现状**；标注为**等价（schema 约束）** |
+
+### T3-2 与 `INTERFACES.md` §6 的逐条核对结论
+
+| 契约签名 | 本 Task 的实现 | 结论 |
+|---|---|---|
+| `syncPoolProjects({ db, editionId, now })` | 同名同参，**追加可选** `rules`（计划 B 节已登记的可选扩展） | 一致 |
+| `syncPoolTalents({ db, editionId, now })` | 同上 | 一致 |
+| `syncPoolResources({ db, editionId, now })` | 同上 | 一致 |
+| `listPoolProjects({ db, filter, viewer })` → `project[]` | 同名同参；`filter` 追加 `limit`（计划 B 节已登记） | 一致 |
+| `listPoolTalents({ db, filter, viewer })` → `talent[]` | 同上 | 一致 |
+| `listPoolResources({ db, filter, viewer })` → `resource[]` | 同上 | 一致 |
+| 领域纯函数 `derivePoolProjects / derivePoolTalents / derivePoolResources / aggregatePersonalPoints` | 落在 `src/domain/pool-derive.js`（计划 A 节已登记的新增模块） | 一致 |
+| 返回结构 `{ editionId, inserted, updated, removed, total, at }` | 三个 sync 全部一致（人才池**多一个** `warnings` —— 计划已声明的告警通道） | 一致 |
+| 表结构 | **本 Task 一列未动**（三张池表的 DDL 属 Task 1） | 一致 |
+
+**唯一真源自检**：写入后用**同一个** `aggregatePersonalPoints` 重算比对，不一致抛
+`POOL_TALENT_POINTS_MISMATCH`（500）。**这条路径有测试**（触发器制造不一致，见 T3-C5）。
+
+### T3-3 变异检验与测试数字
+
+脚本：`/tmp/p5-mutate/t3.mjs`（指向**已落地**的 `platform/test/pools-sync.test.js`）；
+探针：`/tmp/p5-mutate/t3-dump.mjs`（把三池表内容 + 同步计数 + 只读列表 + 领域纯函数输出
+打成一个**确定性** JSON 快照；随机 UUID 先归一化成「首次出现序号」，否则差分全是噪声）。
+判定三态：`KILLED`（测试红）/ `SURVIVED-EQUIV`（测试绿 **且** 探针差分为空 ⇒ 等价）/
+`SURVIVED-GAP`（测试绿 **但** 探针差分非空 ⇒ 有效缺口）。
+
+| 项 | 数 |
+|---|---|
+| 变异体总数 | **94**（`pool-derive.js` 40 + `services/pools.js` 46 + `config.js` 8） |
+| KILLED（测试变红） | **88** |
+| 等价 / 不可观测 | **6** |
+| **有效缺口** | **0** |
+| 锚点问题（命中数 ≠ 1） | **0** |
+| 对照：同一套变异体跑**原计划的 7 例** | 35 杀 / 18 等价 / **41 缺口** |
+
+**6 个存活变异体的等价实证**（探针差分逐字节为空，非推理）：
+
+| 变异体 | 为什么等价 | 探针差分 |
+|---|---|---|
+| `D09` 去掉 `if (!userId) continue;` | `points_ledger.user_id` 是 `NOT NULL` ⇒ 真实数据上永不触发 | 空 |
+| `D25` 技能分不兜底 0（`Number(x) \|\| 0` → `Number(x)`） | 画像分是数值：`0 \|\| 0 = 0 = Number(0)`，对任意数值两者相等 | 空 |
+| `D32` 同刻的段位记录取先到的那条 | 探针数据里没有同刻记录 ⇒ 不可观测（**残余风险见 T3-C8**） | 空 |
+| `D33` 同刻的报名记录取先到的那条 | `registrations` 有部分唯一索引 `(user_id, edition_id) WHERE deleted_at IS NULL` ⇒ 同一人同一届**最多一条有效报名**，比较永远只有一个候选 | 空 |
+| `D34` 资源池 `packageCount` 换口径 | `task_packages.pain_point` 是 `NOT NULL` ⇒ `titles.length === details.length` | 空 |
+| `S45` 可见性判定不再挡空 viewer | `can()` 自身第一行就是 `if (!user) return false` ⇒ 两道防线等价 | 空 |
+
+| 项 | 数 |
+|---|---|
+| 新测试文件用例数 | **40**（`test/pools-sync.test.js`；原计划 7 例 + 补测 33 例） |
+| 全量用例数 | **862**（基线 822 + 40），**0 红** |
+| `test/config.test.js` | **27** 条，0 红 |
+| 规则配置份数 | **15** 份（`Object.keys(FILES).length`；P4 的 `rules.audit` 未并入本分支） |
+
+### T3-4 计划块逐字核验
+
+核验脚本 `/tmp/p5-mutate/verify-plan-t3.mjs`（另用 `/tmp/p3fix/plan-blocks.mjs` 复核）：
+把本计划 Task 3 的每个围栏代码块与**落盘文件**逐字比对
+（`whole` 判定整个文件 = 计划块 + 一个结尾换行；片段块要求在目标文件里**恰好命中 1 次**；
+块的位置在 Task 3 章节内**自动枚举**，不写死行号 ⇒ 计划改动后仍可复验）。
+
+实跑结果：**7 / 7 个块逐字一致，不一致 0 个**。
+
+| 块 | 目标文件 | 判定 |
+|---|---|---|
+| 0（javascript） | `platform/test/pools-sync.test.js` | 整个文件 = 计划块 + 结尾换行 |
+| 1（json） | `platform/rules/pools.json` | 整个文件 = 计划块 + 结尾换行 |
+| 2（javascript） | `platform/src/domain/pool-derive.js` | 整个文件 = 计划块 + 结尾换行 |
+| 3（javascript） | `platform/src/services/pools.js` | 整个文件 = 计划块 + 结尾换行 |
+| 4（javascript） | `platform/src/config.js` 的 `FILES` 行 | 片段：在 `src/config.js` 里恰好命中 1 次 |
+| 5（javascript） | `platform/src/config.js` 的 `grouped` 行 | 片段：恰好命中 1 次 |
+| 6（javascript） | `platform/src/config.js` 的 `validateRules` 段 | 片段：恰好命中 1 次 |
+
