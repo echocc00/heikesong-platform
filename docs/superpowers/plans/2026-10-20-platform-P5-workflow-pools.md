@@ -6673,9 +6673,20 @@ git commit -m "feat(P5): iCal 日历导出（手写 RFC 5545，零依赖）
 `platform/test/workflow-e2e.test.js`：
 
 ```javascript
+// platform/test/workflow-e2e.test.js —— P5 Task 6 端到端验收 + 前端任务清单页
+//
+// 规则溯源：
+//   - R-OPS-13 任务清单工作流拆解：任务包 → 工作流 → 任务清单 → 队员自主领取任务完成
+//   - R-OPS-14 禁止岗位制：任务**只能自主领取**（⛔ 页面不得出现指派 / 按岗位分工的控件）
+//   - 「前端只渲染，不做过滤」→ 可见性在 API 层完成（设计文档 §6.6）——前端隐藏 = 数据已泄露
+//
+// ⚠️ 本文件覆盖**三块**（计划原块只覆盖第 ① 块）：
+//   ① 后端闭环：建工作流 → 建任务 → 领取 → 完成 → 同步三池 → 公开 API 拉榜
+//   ② 前端视图的**纯函数**：三段分类 / 可用操作 / 行内容（P1 的 web/views/*.js 同款做法）
+//   ③ 前端**接线**：web/app.js 注册了 /tasks/:workflowId 且把路由参数透传给视图
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -6685,6 +6696,11 @@ import { loadRules } from '../src/config.js';
 import { createSession } from '../src/auth/session.js';
 import { createApp } from '../src/server.js';
 import { createPublicToken } from '../src/services/public-api.js';
+import { call } from '../test-helpers/http-call.js';
+import { stripComments } from '../test-helpers/strip-comments.js';
+import {
+  classifyTasks, taskMode, taskActions, buildTaskItem, buildTaskSections,
+} from '../web/views/tasks.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrationsDir = join(here, '..', 'db', 'migrations');
@@ -6736,35 +6752,6 @@ function setup() {
 function cleanup(db, close, dataDir) {
   close();
   rmSync(dataDir, { recursive: true, force: true });
-}
-
-function call(app, method, path, { token = null, body = null } = {}) {
-  return new Promise((resolve) => {
-    const chunks = body ? [Buffer.from(JSON.stringify(body))] : [];
-    const headers = {};
-    if (token) headers.cookie = `hk_session=${token}`;
-    if (body) headers['content-type'] = 'application/json';
-    const req = {
-      method,
-      url: path,
-      headers,
-      async *[Symbol.asyncIterator]() {
-        for (const c of chunks) yield c;
-      },
-      on() {},
-    };
-    const res = {
-      statusCode: 200,
-      headers: {},
-      body: '',
-      writeHead(status, h) { this.statusCode = status; this.headers = h || {}; },
-      end(payload) {
-        if (payload) this.body = payload.toString();
-        resolve({ status: this.statusCode, headers: this.headers, body: this.body });
-      },
-    };
-    app.handle(req, res);
-  });
 }
 
 test('端到端：工作流 → 任务 → 领取 → 完成 → 同步三池 → 公开 API 拉榜单', async () => {
@@ -6861,6 +6848,192 @@ test('端到端：工作流 → 任务 → 领取 → 完成 → 同步三池 �
 
   cleanup(db, close, dataDir);
 });
+
+// ── 以下为 P5 Task 6 实跑后补齐的用例（计划原块只覆盖后端闭环，
+//    前端任务清单页与 web/app.js 的接线**零覆盖**）──
+
+const TASKS = [
+  { id: 't1', title: '没人领的任务', detail: '', status: 'todo', claim: null },
+  { id: 't2', title: '我领的', detail: '细节', status: 'in_progress', claim: { userId: 'u_a', teamId: 'tm_1' } },
+  { id: 't3', title: '别人领的', detail: '', status: 'in_progress', claim: { userId: 'u_b', teamId: 'tm_2' } },
+  { id: 't4', title: '做完了', detail: '', status: 'done', claim: { userId: 'u_a', teamId: 'tm_1' }, completedAt: '2026-10-12T00:00:00.000Z' },
+];
+
+test('★ 三段分类：可领取的 / 我领取的 / 已完成的', () => {
+  const s = classifyTasks(TASKS, 'u_a');
+  assert.deepEqual(s.claimable.map((t) => t.id), ['t1']);
+  assert.deepEqual(s.mine.map((t) => t.id), ['t2', 't3']);
+  assert.deepEqual(s.done.map((t) => t.id), ['t4']);
+});
+
+test('★ 前端不做可见性过滤：每个任务都落进且只落进一段，一个都不丢', () => {
+  // ⛔ 「前端隐藏 = 数据已泄露」—— 可见性在 API 层完成。
+  //    前端只能**重新分桶**，不能少给一条：少给一条 = 用户看不到自己有权看的任务。
+  const s = classifyTasks(TASKS, 'u_a');
+  assert.equal(s.claimable.length + s.mine.length + s.done.length, TASKS.length);
+  const ids = [...s.claimable, ...s.mine, ...s.done].map((t) => t.id).sort();
+  assert.deepEqual(ids, TASKS.map((t) => t.id).sort());
+  // 换个登录人，分桶跟着变，但**条数不变**
+  const other = classifyTasks(TASKS, 'u_b');
+  assert.equal(other.claimable.length + other.mine.length + other.done.length, TASKS.length);
+});
+
+test('★ 任务模式：未领=可领取 / 本人领=mine / 他人领=taken / 已完成=done', () => {
+  assert.equal(taskMode(TASKS[0], 'u_a'), 'claimable');
+  assert.equal(taskMode(TASKS[1], 'u_a'), 'mine');
+  assert.equal(taskMode(TASKS[2], 'u_a'), 'taken');
+  assert.equal(taskMode(TASKS[3], 'u_a'), 'done');
+  assert.equal(taskMode(TASKS[2], 'u_b'), 'mine', '同一个人看自己的任务就是 mine');
+});
+
+test('★ R-OPS-14：任务只有一个入口 —— 自主领取；⛔ 没有任何指派 / 按岗位分工的操作', () => {
+  assert.deepEqual(taskActions(TASKS[0], 'u_a'), ['claim'], '未领取的任务只有「自主领取」');
+  assert.deepEqual(taskActions(TASKS[1], 'u_a'), ['complete', 'release'], '本人领的：可提交完成 / 可释放');
+  assert.deepEqual(taskActions(TASKS[2], 'u_a'), [], '别人领的：不可动');
+  assert.deepEqual(taskActions(TASKS[3], 'u_a'), [], '已完成的：不可动');
+  // ⛔ 白名单：任何模式下都不得出现「指派 / 按岗位」类操作
+  const allowed = new Set(['claim', 'complete', 'release']);
+  for (const t of TASKS) {
+    for (const me of ['u_a', 'u_b', null]) {
+      for (const a of taskActions(t, me)) {
+        assert.ok(allowed.has(a), `出现了计划外的操作「${a}」`);
+      }
+    }
+  }
+});
+
+test('★ 视图源码里没有任何指派 / 岗位控件（剥掉注释后扫）', () => {
+  const src = stripComments(readFileSync(join(here, '..', 'web', 'views', 'tasks.js'), 'utf8'));
+  for (const word of ['指派', 'assign', 'Assign', '岗位分工', '<select', 'role=']) {
+    assert.equal(
+      src.includes(word),
+      false,
+      `任务清单页不得出现「${word}」（R-OPS-14：任务只能自主领取）`,
+    );
+  }
+});
+
+test('★ 行内容：标题与详情必须转义（innerHTML 插值 = 存储型 XSS）', () => {
+  const evil = '<img src=x onerror=alert(1)>';
+  const html = buildTaskItem({ id: 't', title: evil, detail: evil, status: 'todo', claim: null }, 'u_a');
+  assert.equal(html.includes(evil), false, `原始 payload 不得出现在 HTML 里：${html}`);
+  assert.equal(/<img/i.test(html), false, `不得出现真实的 <img> 标签：${html}`);
+  assert.ok(html.includes('&lt;img'), `payload 必须被转义：${html}`);
+});
+
+test('★ 行内容：已完成的任务显示完成时间；无人领取的显示「无人领取」', () => {
+  const doneHtml = buildTaskItem(TASKS[3], 'u_a');
+  assert.ok(doneHtml.includes('完成于'), doneHtml);
+  assert.ok(doneHtml.includes('2026-10-12T00:00:00.000Z'), doneHtml);
+  const freeHtml = buildTaskItem(TASKS[0], 'u_a');
+  assert.ok(freeHtml.includes('无人领取'), freeHtml);
+  const takenHtml = buildTaskItem(TASKS[2], 'u_a');
+  assert.ok(takenHtml.includes('领取人：u_b'), takenHtml);
+});
+
+test('★ 三段的行内容由同一套纯函数产出（视图与断言不会各写一套）', () => {
+  const sections = buildTaskSections(TASKS, 'u_a');
+  assert.ok(sections.claimable.includes('没人领的任务'), sections.claimable);
+  assert.ok(sections.mine.includes('我领的'), sections.mine);
+  assert.ok(sections.mine.includes('别人领的'), sections.mine);
+  assert.ok(sections.done.includes('做完了'), sections.done);
+  assert.equal(sections.claimable.includes('做完了'), false, '已完成的任务不得出现在「可领取的」里');
+});
+
+// ── 前端接线：web/app.js 注册了 /tasks/:workflowId 且把路由参数透传给视图 ──
+
+/** 最小 DOM 桩（同 test/web.test.js 的做法）：够 web/app.js + 任务清单页跑起来 */
+function installDom(hash, tasks = []) {
+  const calls = [];
+  const makeEl = (tag = 'div') => {
+    const el = {
+      tagName: tag,
+      className: '',
+      innerHTML: '',
+      textContent: '',
+      value: '',
+      placeholder: '',
+      id: '',
+      children: [],
+      listeners: {},
+      appendChild(child) { el.children.push(child); return child; },
+      replaceChildren(...kids) { el.children = kids; },
+      addEventListener(evt, fn) { el.listeners[evt] = fn; },
+      querySelector(sel) {
+        el.__sels = el.__sels ?? {};
+        if (!el.__sels[sel]) el.__sels[sel] = makeEl();
+        return el.__sels[sel];
+      },
+      querySelectorAll() { return []; },
+    };
+    return el;
+  };
+  const appEl = makeEl('div');
+  globalThis.window = {
+    location: { search: '', hash },
+    addEventListener: () => {},
+  };
+  globalThis.document = {
+    createElement: (tag) => makeEl(tag),
+    getElementById: () => appEl,
+  };
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url, method: init?.method ?? 'GET', body: init?.body });
+    const body = url === '/api/me'
+      ? { user: { id: 'u_a', name: '甲' } }
+      : { tasks };
+    return { ok: true, status: 200, text: async () => JSON.stringify(body) };
+  };
+  return { calls, appEl };
+}
+
+test('★ web/app.js 注册了 /tasks/:workflowId 且把 workflowId 透传给视图', async () => {
+  const { calls, appEl } = installDom('#/tasks/wf_123');
+  // ?v=tag → 每个用例一个独立的 app.js 模块实例（ESM 只求值一次）
+  await import(`../web/app.js?v=taskroute`);
+  await new Promise((r) => setTimeout(r, 30));
+  assert.ok(
+    calls.some((c) => c.url === '/api/workflows/wf_123/tasks'),
+    `路由必须把 workflowId 透传给视图，实际请求：${JSON.stringify(calls)}`,
+  );
+  // 页面骨架：三段标题都在
+  const html = appEl.children?.[0]?.innerHTML ?? '';
+  assert.ok(html.includes('可领取的'), `页面必须有「可领取的」段：${html}`);
+  assert.ok(html.includes('我领取的'), `页面必须有「我领取的」段：${html}`);
+  assert.ok(html.includes('已完成的'), `页面必须有「已完成的」段：${html}`);
+});
+
+test('★ 任务清单页的 DOM 接线：无人领取的任务挂「自主领取」按钮，点它发 POST /api/tasks/<id>/claim', async () => {
+  const { calls, appEl } = installDom('#/tasks/wf_123', [
+    { id: 't1', title: '没人领的任务', detail: '', status: 'todo', claim: null },
+  ]);
+  await import(`../web/app.js?v=claimbtn`);
+  await new Promise((r) => setTimeout(r, 30));
+  const wrap = appEl.children?.[0];
+  const list = wrap?.querySelector('#task-claimable');
+  const li = list?.children?.[0];
+  assert.ok(li, '「可领取的」段里应有任务行');
+  const btn = li.children.find((c) => c.textContent === '自主领取');
+  assert.ok(
+    btn,
+    `任务行里应有「自主领取」按钮，实际子节点：${JSON.stringify(li.children.map((c) => c.textContent))}`,
+  );
+  await btn.listeners.click();
+  const post = calls.find((c) => c.method === 'POST');
+  assert.ok(post, `点「自主领取」必须发 POST，实际调用：${JSON.stringify(calls)}`);
+  assert.equal(post.url, '/api/tasks/t1/claim');
+});
+
+test('★ 没有登记 /tasks/:workflowId 的路由 → 渲染「页面不存在」（反向对照：上面的用例不是恒绿）', async () => {
+  const { calls } = installDom('#/no-such-page');
+  await import(`../web/app.js?v=notasks`);
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(
+    calls.some((c) => c.url.includes('/api/workflows/')),
+    false,
+    `未知路由不得触发任务清单请求，实际请求：${JSON.stringify(calls)}`,
+  );
+});
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -6872,9 +7045,92 @@ Expected: FAIL —— `POST /api/workflows` 返回 404（`src/http/routes/workfl
 
 ```javascript
 // web/views/tasks.js — 任务清单页
-// 依据：设计文档 §9 前端信息架构「赛段与任务清单 + 自主领取任务」；R-OPS-13 / R-OPS-14
-// R-OPS-14：页面只有「自主领取」一个入口，⛔ 不出现"指派给某人""按岗位分工"这类控件。
-// ⚠️ 前端不做可见性过滤：过滤在 API 层完成（前端隐藏 = 数据已泄露）。
+// 依据：设计文档 §9 前端信息架构「赛段与任务清单 + 自主领取任务」；INTERFACES.md §6 的 P5 API 清单
+// 溯源：R-OPS-13（任务清单工作流拆解：任务包 → 工作流 → 任务清单 → 队员自主领取任务完成）
+// 溯源：R-OPS-14（禁止岗位制：严禁按岗位和身份分工，任务只能自主领取）
+//
+// ⛔ R-OPS-14：页面上任务**只有「自主领取」一个入口** —— 不出现「指派给某人」「按岗位分工」这类控件。
+//    这是【刻意的功能缺失】，不是遗漏（探月黑客松因岗位制失败：忙的忙死、闲的闲死、最后一个人说了算）。
+//    唯一的取任务路径：POST /api/tasks/:id/claim（自主领取）。
+//
+// ⚠️ 前端**不做任何可见性过滤**：过滤在 API 层完成 —— 前端隐藏 = 数据已泄露。
+//    ⇒ 本视图把 API 返回的任务**原样分桶**呈现，一个都不丢（见 classifyTasks 的分桶恒等式）。
+//
+// ⚠️ 为什么把分类与操作抽成**纯函数**（与 web/views/team.js 的 buildTeamCards 同款做法）：
+//    如果「三段怎么分」「这个任务能做什么」只写在 DOM 回调里，
+//    就没有任何东西能断言「页面没有指派控件」—— 把分类逻辑改掉，全量测试照样全绿。
+//    抽成纯函数后，这两条**渲染路径**能被直接断言（见 test/workflow-e2e.test.js）。
+import { escapeHtml } from '../escape.js';
+
+/**
+ * 任务的展示模式（纯函数）。
+ * - claimable：无人领取 → 可自主领取
+ * - mine：本人领取 → 可提交完成 / 可释放
+ * - taken：他人领取 → 不可动
+ * - done：已完成
+ */
+export function taskMode(t, me) {
+  if (!t) return 'claimable';
+  if (t.status === 'done') return 'done';
+  if (!t.claim) return 'claimable';
+  return t.claim.userId === me ? 'mine' : 'taken';
+}
+
+/**
+ * 三段分类（纯函数）：可领取的 / 我领取的 / 已完成的。
+ *
+ * ⚠️ **分桶恒等**：每个任务恰好落进一段，一个都不丢 ——
+ *    这是「前端不做可见性过滤」的**可断言形式**：前端只重新分桶，不隐藏任何一条。
+ */
+export function classifyTasks(tasks, me) {
+  const out = { claimable: [], mine: [], done: [] };
+  for (const t of tasks ?? []) {
+    const mode = taskMode(t, me);
+    if (mode === 'done') out.done.push(t);
+    else if (mode === 'claimable') out.claimable.push(t);
+    else out.mine.push(t);
+  }
+  return out;
+}
+
+/**
+ * 某个任务当前**允许的操作**（纯函数）。
+ * ⛔ 只有三种：自主领取 / 提交完成 / 释放。**没有**指派、按岗位分配之类的操作。
+ */
+export function taskActions(t, me) {
+  const mode = taskMode(t, me);
+  if (mode === 'claimable') return ['claim'];
+  if (mode === 'mine') return ['complete', 'release'];
+  return [];
+}
+
+/**
+ * 单行任务的静态内容 HTML（纯函数，不碰 document）。
+ * ⚠️ 服务端返回的标题/详情必须转义 —— innerHTML 插值 = 存储型 XSS（设计文档 §14.2 / P0 终审 I-2）。
+ */
+export function buildTaskItem(t, me) {
+  const mode = taskMode(t, me);
+  const who = t?.claim ? `领取人：${t.claim.userId}` : '无人领取';
+  const parts = [
+    `<span class="task-title">${escapeHtml(t?.title)}</span>`,
+    `<span class="task-meta">${escapeHtml(t?.detail || '')} · ${escapeHtml(who)} · 状态 ${escapeHtml(t?.status)}</span>`,
+  ];
+  if (mode === 'done') {
+    parts.push(`<span class="task-meta">完成于 ${escapeHtml(t?.completedAt || '')}</span>`);
+  }
+  return parts.join('');
+}
+
+/**
+ * 三段的行内容 HTML（纯函数）：{ claimable, mine, done }。
+ * 段标题写死在 renderTasks 的骨架里（可领取的 / 我领取的 / 已完成的）。
+ */
+export function buildTaskSections(tasks, me) {
+  const s = classifyTasks(tasks, me);
+  const rows = (list) => list.map((t) => buildTaskItem(t, me)).join('');
+  return { claimable: rows(s.claimable), mine: rows(s.mine), done: rows(s.done) };
+}
+
 export function renderTasks(ctx) {
   const { api } = ctx;
   const wrap = document.createElement('div');
@@ -6908,111 +7164,87 @@ export function renderTasks(ctx) {
     errBox.textContent = message || '';
   }
 
-  function reload() {
-    return load();
-  }
-
   async function load() {
     showError('');
     try {
       const res = await api.get(`/api/workflows/${encodeURIComponent(workflowId)}/tasks`);
       const tasks = res.tasks ?? [];
       const me = ctx.getState?.().user?.id ?? null;
+      const sections = classifyTasks(tasks, me);
       listClaimable.replaceChildren();
       listMine.replaceChildren();
       listDone.replaceChildren();
-
-      for (const t of tasks) {
-        if (t.status === 'done') {
-          listDone.appendChild(renderTask(t, 'done', me));
-        } else if (t.claim && t.claim.userId === me) {
-          listMine.appendChild(renderTask(t, 'mine', me));
-        } else if (!t.claim) {
-          listClaimable.appendChild(renderTask(t, 'claimable', me));
-        } else {
-          listMine.appendChild(renderTask(t, 'taken', me));
-        }
-      }
+      for (const t of sections.claimable) listClaimable.appendChild(renderTask(t, me));
+      for (const t of sections.mine) listMine.appendChild(renderTask(t, me));
+      for (const t of sections.done) listDone.appendChild(renderTask(t, me));
     } catch (e) {
       showError(e.message || '加载任务清单失败');
     }
   }
 
-  function renderTask(t, mode, me) {
+  function renderTask(t, me) {
     const li = document.createElement('li');
-    li.className = `task task-${mode}`;
-    const who = t.claim ? `领取人：${t.claim.userId}` : '无人领取';
-    li.innerHTML = `
-      <span class="task-title">${escapeHtml(t.title)}</span>
-      <span class="task-meta">${escapeHtml(t.detail || '')} · ${escapeHtml(who)} · 状态 ${escapeHtml(t.status)}</span>
-    `;
+    li.className = `task task-${taskMode(t, me)}`;
+    li.innerHTML = buildTaskItem(t, me);
 
-    if (mode === 'claimable') {
-      const btn = document.createElement('button');
-      btn.textContent = '自主领取';
-      btn.addEventListener('click', async () => {
-        try {
-          await api.post(`/api/tasks/${encodeURIComponent(t.id)}/claim`, {});
-          await reload();
-        } catch (e) {
-          showError(e.message || '领取失败');
-        }
-      });
-      li.appendChild(btn);
-    }
+    // ⛔ 只按 taskActions 给控件 —— 没有任何指派/岗位类操作可加
+    for (const action of taskActions(t, me)) {
+      if (action === 'claim') {
+        const btn = document.createElement('button');
+        btn.textContent = '自主领取';
+        btn.addEventListener('click', async () => {
+          try {
+            await api.post(`/api/tasks/${encodeURIComponent(t.id)}/claim`, {});
+            await load();
+          } catch (e) {
+            showError(e.message || '领取失败');
+          }
+        });
+        li.appendChild(btn);
+      }
 
-    if (mode === 'mine') {
-      const url = document.createElement('input');
-      url.placeholder = '可运行产物链接（如仓库地址）';
-      const ver = document.createElement('input');
-      ver.placeholder = '版本号（如 v0.1）';
-      const done = document.createElement('button');
-      done.textContent = '提交完成状态';
-      done.addEventListener('click', async () => {
-        try {
-          await api.post(`/api/tasks/${encodeURIComponent(t.id)}/complete`, {
-            evidence: {
-              kind: 'runnable',
-              summary: url.value.trim() ? `已提交可运行版本 ${ver.value.trim() || '未标注版本'}` : '已提交可运行版本',
-              artifactUrl: url.value.trim(),
-              version: ver.value.trim(),
-            },
-          });
-          await reload();
-        } catch (e) {
-          showError(e.message || '提交失败');
-        }
-      });
-      const release = document.createElement('button');
-      release.textContent = '释放任务';
-      release.addEventListener('click', async () => {
-        try {
-          await api.post(`/api/tasks/${encodeURIComponent(t.id)}/release`, {});
-          await reload();
-        } catch (e) {
-          showError(e.message || '释放失败');
-        }
-      });
-      li.appendChild(url);
-      li.appendChild(ver);
-      li.appendChild(done);
-      li.appendChild(release);
-    }
-
-    if (mode === 'done') {
-      const at = document.createElement('span');
-      at.className = 'task-meta';
-      at.textContent = `完成于 ${t.completedAt || ''}`;
-      li.appendChild(at);
+      if (action === 'complete') {
+        const url = document.createElement('input');
+        url.placeholder = '可运行产物链接（如仓库地址）';
+        const ver = document.createElement('input');
+        ver.placeholder = '版本号（如 v0.1）';
+        const done = document.createElement('button');
+        done.textContent = '提交完成状态';
+        done.addEventListener('click', async () => {
+          try {
+            await api.post(`/api/tasks/${encodeURIComponent(t.id)}/complete`, {
+              evidence: {
+                kind: 'runnable',
+                summary: url.value.trim()
+                  ? `已提交可运行版本 ${ver.value.trim() || '未标注版本'}`
+                  : '已提交可运行版本',
+                artifactUrl: url.value.trim(),
+                version: ver.value.trim(),
+              },
+            });
+            await load();
+          } catch (e) {
+            showError(e.message || '提交失败');
+          }
+        });
+        const release = document.createElement('button');
+        release.textContent = '释放任务';
+        release.addEventListener('click', async () => {
+          try {
+            await api.post(`/api/tasks/${encodeURIComponent(t.id)}/release`, {});
+            await load();
+          } catch (e) {
+            showError(e.message || '释放失败');
+          }
+        });
+        li.appendChild(url);
+        li.appendChild(ver);
+        li.appendChild(done);
+        li.appendChild(release);
+      }
     }
 
     return li;
-  }
-
-  function escapeHtml(value) {
-    return String(value ?? '').replace(/[&<>"']/g, (c) => ({
-      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-    }[c]));
   }
 
   load();
@@ -7024,29 +7256,38 @@ export function renderTasks(ctx) {
 
 在导入区加一行：
 
+`web/app.js`（导入行 · 核验锚点）
+
 ```javascript
 import { renderTasks } from './views/tasks.js';
 ```
 
-在 `route('/', ...)` 附近加一行：
+在既有路由注册之后追加一行（⛔ 必须在文件末尾的 `render()` **之前** —— 否则首屏路由匹配不到，
+页面会先渲染一次「页面不存在」）：
+
+`web/app.js`（路由注册行 · 核验锚点）
 
 ```javascript
-route('/tasks/:workflowId', (ctx) => renderTasks(ctx));
+route('/tasks/:workflowId', (c) => renderTasks(c));
 ```
 
-把 `const el = await found.view(ctx);` 改成：
+⚠️ **这一步 P0 终态已经做过了**：`web/app.js` 的 `render()` 里**已经**是
+`found.view({ ...ctx, params: found.params, query: currentQuery() })` —— 路由参数 `params` 与 `query` 都已透传。
+**本步不需要再改这一行**；下面这行是**核验用**（实现里必须逐字是它）：
+
+`web/app.js`（render() 透传行 · 核验锚点）
 
 ```javascript
-      const el = await found.view({ ...ctx, params: found.params });
+    const el = await found.view({ ...ctx, params: found.params, query: currentQuery() });
 ```
 
 - [ ] **Step 5: 运行测试确认通过**
 
-Run: `cd platform && node --test test/workflow-e2e.test.js`
-Expected: PASS（1 个端到端用例通过）
+Run: `cd platform && node --disable-warning=ExperimentalWarning --test test/workflow-e2e.test.js`
+Expected: PASS（**12** 个用例全过：workflow-e2e.test.js 12）
 
 Run: `cd platform && node --disable-warning=ExperimentalWarning --test`
-Expected: 全部通过（P0–P5 累计：**1101** 例 / 通过 1100 / 失败 0 / 跳过 1）
+Expected: 全部通过（P0–P5 累计：**1119** 例 / 通过 1118 / 失败 0 / 跳过 1）
 
 - [ ] **Step 6: 人工验收任务清单页**
 
@@ -7059,12 +7300,13 @@ Expected: 页面分三段显示「可领取的 / 我领取的 / 已完成的」�
 - [ ] **Step 7: 提交**
 
 ```bash
-cd platform && git add web/views/tasks.js web/app.js test/workflow-e2e.test.js
+git add platform/web/views/tasks.js platform/web/app.js platform/test/workflow-e2e.test.js
 git commit -m "feat(P5): 任务清单前端页 + 端到端验收（工作流→任务→领取→完成→同步→公开榜）
 
 对应 R-OPS-13 / R-OPS-14 / R-POOL-01~04 / R-RNK-10：
 - 页面只有自主领取入口，无任何按岗位指派的控件
-- 端到端跑通公开 API 拉榜，D 段队伍不公示"
+- 端到端跑通公开 API 拉榜，D 段队伍不公示" -- \
+  platform/web/views/tasks.js platform/web/app.js platform/test/workflow-e2e.test.js
 ```
 
 ---
@@ -8202,3 +8444,111 @@ test('computePersonalPoints：无 userId 的条目不参与累加；口径外的
 | `platform/src/http/routes/public.js` | Modify（Task 4 建立，**本 Task 只追加**） | 追加 `GET /api/public/calendar.ics`（token 鉴权 + `__rawText` 原文响应）；导入行按 T5-C1 修正深度 |
 | `platform/test/icalendar.test.js` | **新建**（P5） | 31 例（领域层 15 + 服务层 3 + HTTP 层 13） |
 | `docs/superpowers/plans/2026-10-20-platform-P5-workflow-pools.md` | Modify | Task 5 代码块逐字回写 + Task 4 两处整文件块同步为终态 + 本章台账 |
+
+---
+
+## P5 Task 6 实施台账（2026-10-21）
+
+> 执行者：P5 Task 6 实现 Agent。**规格 = 本计划 Task 6 章节**（唯一权威）。
+> 本台账记七件事：① 实施方法（先跑后派）；② 规格缺陷与处置；③ 逐字回写位置；
+> ④ 实跑证据；⑤ 变异检验；⑥ 计划块逐字核验；⑦ 遗留需上游注意；⑧ 改动文件清单。
+> **落盘文件与本计划 Task 6 的代码块逐字一致**（核验脚本见 T6-F）。
+>
+> **溯源**：`R-OPS-13`（任务清单工作流拆解：任务包 → 工作流 → 任务清单 → 队员自主领取任务完成）
+> ＋ `R-OPS-14`（禁止岗位制：严禁按岗位和身份分工，任务只能自主领取）。
+
+### T6-A 实施方法（先跑后派：规格改动必须先在独立工程实跑通过）
+
+| 步骤 | 动作 | 证据 |
+|---|---|---|
+| A-1 | 把 Task 6 的 **6 个围栏代码块**抽到独立工程 `/tmp/p5-t6/`（`extract.mjs` 按块号落盘，保留计划行号） | `/tmp/p5-t6/blocks/00..05-*.txt` |
+| A-2 | 独立工程 = `cp -R` worktree 的 `platform/` ⇒ `/tmp/p5-t6/platform`（**不在仓库里试错**） | — |
+| A-3 | **Step 2 期望失败实跑**：只落测试块 → `node --disable-warning=ExperimentalWarning --test test/workflow-e2e.test.js` | ⚠️ **没有失败 —— 当场通过（1/1 绿）**：Task 4 已把 workflow 路由挂进 `src/server.js` ⇒ 计划写的 Expected（「`POST /api/workflows` 返回 404」）**不成立**（见 T6-C1） |
+| A-4 | 落 4 个实现块（视图 / app.js 导入 / app.js 路由注册 / app.js 透传） | 见 T6-B 的实跑缺陷 |
+| A-5 | 规格缺陷**先在独立工程里修好并跑通**，再把修正内容**逐字回写**计划对应代码块 | T6-C |
+| A-6 | 独立工程全量绿（1118 例 / 失败 0）后，才把文件落进 worktree | `/tmp/p5-t6/platform` → worktree |
+| A-7 | 变异检验在 **`cp -R` 副本** `/tmp/p5-mutate/t6work` 上跑；变异脚本**不进仓库** | `/tmp/p5-mutate/t6.mjs` |
+
+### T6-B 规格缺陷清单
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| T6-C1 | **Important** | **Step 2 的「期望失败」不成立**：计划写「`POST /api/workflows` 返回 404（`src/http/routes/workflow.js` 未在 `src/server.js` 挂载，或视图文件不存在）」—— 但 Task 4 已经把 `registerWorkflowRoutes` 挂进 `src/server.js`（`src/server.js:187`）⇒ 只落测试块就**当场通过** | 实跑：`# tests 1 / # pass 1 / # fail 0`（计划 Expected 与实跑**相反**） | 回写 Step 2 的 Expected；**更重要的是这个「假失败」暴露了真问题** ⇒ 见 T6-C2 |
+| T6-C2 | **Important** | 计划的测试块**只覆盖后端闭环**（1 例）⇒ **前端交付物零覆盖**：`web/views/tasks.js` 的三段渲染、「无任何指派/岗位控件」、`web/app.js` 注册路由并把 `params` 透传给视图 —— 全都没有测试。与 Task 4 的 T4-C2 / Task 5 的 T5-C2 **同款病根**（机制写下来了，测试却没接线） | P5-10 的判据有两半（「`web/views/tasks.js` 渲染三段」+「端到端闭环」），计划只覆盖了后端那一半 | 补测：测试块 **1 → 12 例**（后端闭环 1 + 视图纯函数 8 + 前端接线 3） |
+| T6-C3 | **Important** | 计划的 `web/views/tasks.js` **只导出 `renderTasks(ctx)`**（依赖 `document`）⇒ 无法测试。本仓前端惯例是「视图导出**纯函数**，DOM 只做接线」—— P1 的 `web/views/team.js` 就导出 `summarizeTeam` / `canLeaveTeam` / `buildTeamCards`（其注释明写「抽成纯函数后，这条**渲染路径**能被直接断言」） | P1 的 `test/p1-frontend.test.js` 直接 import 视图的纯函数断言；计划的视图没有任何可 import 的纯函数 | 抽出 5 个纯函数：`taskMode` / `classifyTasks` / `taskActions` / `buildTaskItem` / `buildTaskSections`；`renderTasks` 只做 DOM 接线（与 `buildTeamCards` 同款做法） |
+| T6-C4 | Minor | 计划的视图里**自建**了一个局部 `escapeHtml` ⇒ 与 `web/escape.js` 重复。该文件头明确写「把转义收成一个工具，所有插值统一走它」 | `web/escape.js:10` | 改为 `import { escapeHtml } from '../escape.js';`（删掉局部副本） |
+| T6-C5 | Minor | Step 4 的第三处改动（「把 `const el = await found.view(ctx);` 改成 `{ ...ctx, params: found.params }`」）**已经是 P0 终态** —— 实际是 `{ ...ctx, params: found.params, query: currentQuery() }` ⇒ 计划块与实现**不一致**（这就是 `plan-blocks.mjs` 长期报 `web/app.js` `整文件块❌不一致` 的那一处；Task 4 台账 T4-D 已记「本 Task 之前就已存在」） | `plan-blocks.mjs` 报 `行 7027 | web/app.js | 整文件块❌不一致`；Task 4 台账 T4-D 明确记了它与 Task 4 无关 | 回写该块为**实现里的真实那一行**（含 `query`），并把 Step 4 的文字从「改成」改为「**已经是终态，本步不用改；下面是核验用**」⇒ **全计划 60 个块现在零不一致** |
+| T6-C6 | Minor | 计划的路由注册写成 `route('/tasks/:workflowId', (ctx) => renderTasks(ctx));` —— 形参 `ctx` **遮蔽**模块级的 `const ctx`（能跑，但与既有 `route('/flags', (c) => renderFlags(c));` 的写法不一致）；且**追加位置**有坑：追加到文件**末尾**（`render()` 之后）⇒ 首屏渲染时路由还没注册 ⇒ 先渲染一次「页面不存在」 | 既有 `web/app.js` 的 9 条路由一律用 `(c) => renderX(c)` | 改为 `route('/tasks/:workflowId', (c) => renderTasks(c));`，并追加在**既有路由注册之后、末尾 `render()` 之前** |
+| T6-C7 | Minor | 计划的测试块**逐字抄了一份** `call`（进程内 HTTP 调用器）⇒ 与 `test-helpers/http-call.js` 重复。该文件头明写「此前在三个 API 测试文件里各抄了一份（**逐字相同**）—— 改一处要改三处，必然漂移」 | `test-helpers/http-call.js:9-16` | 删掉本地副本，改用共享 helper `import { call } from '../test-helpers/http-call.js';` |
+| T6-C8 | Minor | Step 5 的 Expected 写「1 个端到端用例通过」；且 **Task 6 Step 5 的全量数字被本轮早先的 Task 5 回写误改成 1101**（那是 Task 5 独立工程当时的数字，不是全量） | `grep` 计划文档：`Expected: 全部通过（P0–P5 累计：**1101** 例 …）` 出现在 Task 6 Step 5 | 两处一起订正为 `12` 例 / 全量 `1119` 例 |
+| T6-C9 | Minor | Step 7 的提交命令**没有 `-- <paths…>` 显式路径**，且 `git add` 给的是 `platform/` 下的相对路径 | 本项目提交纪律（见 T1-1 C-8 / T4-C3 / T5-C4） | 改为从仓库根执行的逐文件显式路径 + `--` |
+
+> **编号说明**：本 Task 的台账条目一律用 `T6-C*` 前缀（Task 1 用裸 `C-*`、Task 2 用 `T2-C*`、
+> Task 3 用 `T3-C*`、Task 3 修复轮用 `T3R-C*`、Task 4 用 `T4-C*`、Task 5 用 `T5-C*`）⇒ **不重号**。
+
+### T6-C 逐字回写位置（计划文档 → 实际文件）
+
+| 计划的代码块 | 实际文件 | 回写内容 |
+|---|---|---|
+| Task 6 Step 1 的测试块（计划行 6675 起） | `platform/test/workflow-e2e.test.js` | 整块替换为 12 例（计划原 1 例的**断言逐字保留** + 11 例新增）；删掉本地 `call` 副本（T6-C7） |
+| Task 6 Step 3 的视图块（计划行 7046 起） | `platform/web/views/tasks.js` | 整块替换：**抽出 5 个纯函数**（T6-C3）+ 改用共享 `escapeHtml`（T6-C4）+ 补 `R-OPS-13`/`R-OPS-14` 溯源注释 |
+| Task 6 Step 4 的导入块（计划行 7261 起） | `platform/web/app.js` | **逐字未改**（`import { renderTasks } from './views/tasks.js';`） |
+| Task 6 Step 4 的路由块（计划行 7270 起） | `platform/web/app.js` | 形参 `(ctx)` → `(c)`（T6-C6） |
+| Task 6 Step 4 的 `found.view` 块（计划行 7280 起） | `platform/web/app.js` | 回写为**实现里的真实那一行**（4 空格缩进 + 带 `query`）⇒ 消掉全计划唯一的 `❌`（T6-C5） |
+| Task 6 Step 2 / Step 4 / Step 5 / Step 7 的文字 | 计划正文 | Step 2 的 Expected 订正；Step 4 的三处核验锚点 + 文字；Step 5 的 Expected 数字；Step 7 的提交命令补 `--` 与显式路径 |
+| **核验锚点**（`web/app.js` 的 3 个片段块） | 计划正文 | `fragment-check.mjs` 的 hint 启发式只认「`**Step N: 修改 `path``」或「**行首**就是 `` `path` ``」两种形状 ⇒ 在三个块前各加一行行首锚点（`` `web/app.js`（…行 · 核验锚点） ``）⇒ 三个块**全部**纳入机器核验 |
+
+### T6-D 实跑证据
+
+| 环节 | 命令 | 结果 |
+|---|---|---|
+| Step 2 期望失败 | `cd platform && node --disable-warning=ExperimentalWarning --test test/workflow-e2e.test.js` | ⚠️ **当场通过（1/1）**，计划 Expected 不成立（T6-C1）；实跑证据本身就是缺陷证据 |
+| 本 Task 单文件 | `cd platform && node --disable-warning=ExperimentalWarning --test test/workflow-e2e.test.js` | **12 例 / 通过 12 / 失败 0 / 跳过 0** |
+| **全量** | `cd platform && node --disable-warning=ExperimentalWarning --test` | **1119 例 / 通过 1118 / 失败 0 / 跳过 1**（跳过的 1 例是 P0–P4 既有的） |
+| 禁用表述扫描 | `cd platform && node scripts/audit-scan.js; echo "退出码=$?"` | **退出码 0** |
+| 计划块核验 | `node /tmp/p3fix/plan-blocks.mjs <计划> platform` | **全计划 60 个块零不一致**（Task 6 的 2 个整文件块 ✅ + `web/app.js` 的 3 个片段块 ✅）；**Task 5 之前就存在的那一处 `web/app.js` ❌ 一并消除** |
+| 片段核验 | `node /tmp/p4-proof/fragment-check.mjs <计划> platform web/views/tasks.js web/app.js test/workflow-e2e.test.js` | `核验 5 个片段块，不一致 0 个`（退出码 0） |
+| 按路径核验 | `node /tmp/p3fix/block-by-path.mjs <计划> platform web/views/tasks.js test/workflow-e2e.test.js` | `共核验 2 个文件，不一致 0 个`（退出码 0） |
+| 接线判别性自检 | 手工把 `web/app.js` 的路由注册删掉 / 把 `params` 透传删掉，各跑一次 | 两次都让「★ web/app.js 注册了 /tasks/:workflowId 且把 workflowId 透传给视图」**当场变红**（10/11 → 11/11）⇒ 该用例**不是恒绿** |
+
+### T6-E 变异检验（`/tmp/p5-mutate/t6.mjs`，**不进仓库**）
+
+**23 个变异体 → 杀 23 / 真等价 0 / 不可观测 0 / 缺口 0**（锚点命中异常 0 个：每个锚点都恰好命中 1 次）。
+
+| 类别 | 编号 | 覆盖 |
+|---|---|---|
+| **杀死**（23） | T6-M01…M23 全体 | 模式判定（done / claimable / mine vs taken）/ 三段分类的每一条分支（落错段）/ **前端丢任务**（可见性过滤的同款病根）/ 可用操作（自主领取入口消失 / 提交完成消失 / **冒出一个「指派」操作**）/ 标题与详情的转义（存储型 XSS）/ 完成时间与领取人显示 / 路由参数取错 / 请求路径写错 / 「自主领取」按钮不挂上 / 按钮文案被改 / 领取请求打错接口 / app.js 不注册路由 / 路由参数被吃掉 / 不导入 `renderTasks` / `render()` 不透传 `params` |
+
+**探针差分方法**（`/tmp/p5-mutate/t6.mjs` 内置 `PROBE`）：快照 = 5 个纯函数在 3 个登录人身份下的输出
+（分类 / 操作 / 模式 / 行 HTML / 三段 HTML）**+** 起一个最小 DOM 桩跑**真实前端**后的
+（请求序列 / 页面骨架 HTML / 任务行的 class 与子节点文案）。
+⚠️ **第一版探针只覆盖纯函数** ⇒ 会漏掉「DOM 接线」层的变异（`T6-M17`…`T6-M19`）；
+已把探针扩到**真实 DOM 行为**，并据此补了 3 条接线用例（按钮存在 / 按钮文案 / 点击后发对接口）。
+**本轮 23 个变异体**全部被杀 ⇒ 纯函数层与 DOM 接线层**都**有判别力。
+
+### T6-F 计划块逐字核验
+
+| 文件 | 核验结果 |
+|---|---|
+| `platform/test/workflow-e2e.test.js` | 整文件块 ✅一致（361 行） |
+| `platform/web/views/tasks.js` | 整文件块 ✅一致（206 行） |
+| `platform/web/app.js` | 片段块 ×3 全部 ✅一致（导入行 / 路由注册行 / `render()` 透传行） |
+
+### T6-G 遗留需上游注意
+
+| # | 事项 | 说明 |
+|---|---|---|
+| G-1 | **「我领取的」段里会混入他人已领的任务** | 计划的分类只有三段（可领取的 / 我领取的 / 已完成的），且**他人已领**的任务既不属于「可领取」也不属于「已完成」⇒ 只能落进第二段（渲染上标记为 `task-taken`、**不给任何操作按钮**）。这是**计划原设计**，本轮未改（改了就是三段变四段，与 P5-10 的判据冲突）。若上游觉得语义别扭，须先改判据再改实现 |
+| G-2 | **完成任务的证据表单在前端是「可运行版本」默认值** | 计划原设计：`kind: 'runnable'` + 产物链接 + 版本号。⛔ 前端**不提供** `kind: 'blocked'`（明确阻塞点）的入口 —— 但服务端 `completeTask` 支持 `kind='blocked'`（R-STG-04 要求「可运行状态**或**明确阻塞点」）。⇒ **「被卡住」的任务在前端无法提交**。本轮未改（超出计划范围），**建议上游补一个 blocked 入口** |
+| G-3 | **`web/app.js` 与 P6 Task 6 冲突** | P6 Task 6 也改 `web/app.js`（两边在**不同分支**上）。本轮改动**最小且靠后**：只加了 1 行导入 + 2 行路由注册（`git diff --stat` = `3 insertions(+)`，**零删除、零重排**）⇒ 合并冲突面只有这 3 行 |
+| G-4 | **前端路由用 hash（`#/tasks/<workflowId>`）** | 与既有 P0–P4 前端一致（`web/router.js` 是哈希路由）⇒ 部署时无需服务端 rewrite；计划 Step 6 的 `http://127.0.0.1:8080/#/tasks/<workflowId>` 写法正确 |
+| G-5 | **任务的可见性完全在 API 层** | `GET /api/workflows/:id/tasks` 对无权者返回**空集**（200 + 空数组，三态状态码）⇒ 前端拿到空列表 ⇒ 页面三段都空。视图**不做任何过滤**（分桶恒等式：每个任务恰好落进一段，一个都不丢） |
+
+### T6-H 本 Task 改动的文件清单
+
+| 文件 | 性质 | 说明 |
+|---|---|---|
+| `platform/web/views/tasks.js` | **新建**（P5） | 任务清单页：5 个纯函数（`taskMode` / `classifyTasks` / `taskActions` / `buildTaskItem` / `buildTaskSections`）+ `renderTasks(ctx)` 的 DOM 接线；⛔ 无指派/岗位控件（R-OPS-14）；⛔ 无前端过滤 |
+| `platform/web/app.js` | Modify（P0 建立，**本 Task 只追加**） | 1 行导入 + 2 行路由注册（`route('/tasks/:workflowId', (c) => renderTasks(c));`）；`render()` 的 `params`/`query` 透传**本轮未改**（P0 终态已具备） |
+| `platform/test/workflow-e2e.test.js` | **新建**（P5） | 12 例（后端闭环 1 + 视图纯函数 8 + 前端接线 3） |
+| `docs/superpowers/plans/2026-10-20-platform-P5-workflow-pools.md` | Modify | Task 6 代码块逐字回写 + Step 2/4/5/7 文字订正 + 三个核验锚点 + 本章台账 |

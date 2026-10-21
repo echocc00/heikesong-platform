@@ -10,6 +10,7 @@ import { renderTier } from './views/tier.js';
 import { renderCard } from './views/card.js';
 import { renderAudit } from './views/audit.js';
 import { renderFlags } from './views/flags.js';
+import { renderTasks } from './views/tasks.js';
 import { escapeHtml } from './escape.js';
 
 // 演示版：?demo=1 时用 localStorage 适配器；正式版走真实 API。
@@ -35,6 +36,8 @@ route('/card/:teamId', (c) => renderCard(c));
 //    决定拉哪份快照 —— 只传模块级 ctx 会把 params 丢掉，抽屉永远拿不到 computationId。
 route('/audit/:computationId', (c) => renderAudit(c));
 route('/flags', (c) => renderFlags(c));
+// P5 Task 6：任务清单页（只有「自主领取」一个入口，R-OPS-14 禁止岗位制）
+route('/tasks/:workflowId', (c) => renderTasks(c));
 
 function renderHome() {
   const el = document.createElement('div');
