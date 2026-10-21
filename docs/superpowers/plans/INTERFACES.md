@@ -33,7 +33,11 @@
 
 ```js
 // src/db/sqlite.js
-openDatabase({ dataDir, filename })      // → { db, close() }，已开 WAL + foreign_keys + busy_timeout=5000
+openDatabase({ dataDir, filename, walRetryBudgetMs? })  // → { db, close() }，已开 WAL + foreign_keys + busy_timeout=5000
+//   walRetryBudgetMs：切 WAL 时的**重试预算**（毫秒，默认 5000）。可选 —— 不传即原语义。
+//   ⚠️ 切 journal_mode 需要**独占锁**，而 SQLite 的 busy handler **不覆盖这一步**
+//      （实测：持锁时该 PRAGMA 0ms 即抛 SQLITE_BUSY，busy_timeout 对它无效）
+//      ⇒ 连接层必须自实现退避重试，否则「两条连接同时首开同一个新库」必有一方失败。
 
 // src/db/migrate.js
 applyMigrations(db, migrationsDir)       // → { applied: string[], version: number }
