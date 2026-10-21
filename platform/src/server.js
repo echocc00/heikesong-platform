@@ -18,10 +18,16 @@ import { verifyPassword, hashPassword } from './auth/password.js';
 import { getUserById, getCredentialsByPhone, toPublicUser } from './db/repo/users.js';
 import { getStage, getStageJudge } from './db/repo/stages.js';
 import { appError, AppError } from './errors.js';
-import { registerRegistrationRoutes } from './http/routes/registration.js';
+import { registerRegistrationRoutes, pickCurrentEdition } from './http/routes/registration.js';
 import { registerTaskPackageRoutes } from './http/routes/taskPackage.js';
 import { registerTeamRoutes } from './http/routes/team.js';
 import { registerReviewRoutes } from './http/routes/review.js';
+import { registerMilestoneRoutes } from './http/routes/milestone.js';
+import { registerBehaviorRoutes } from './http/routes/behavior.js';
+import { getLeaderboard, getRollingLeaderboard } from './services/leaderboard.js';
+import { getPerformanceCard } from './services/performance-card.js';
+import { getTeamTier, getTierBoard } from './services/tier.js';
+import { listEditions, getEdition } from './db/repo/editions.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -89,6 +95,21 @@ export function domainCode(err, fallback) {
   return fallback;
 }
 
+/**
+ * 届期解析：显式传了 → 不存在就 404；没传 → 取【当届】（与 /api/registration-criteria 同一口径）。
+ * ⚠️ 「当届」= 尚未结束（ends_at >= 今天）的最早一届，都没有就退回最后一届（pickCurrentEdition）。
+ *    理由：榜单 / 段位榜都是「本届」视图，前端不必先查一遍届期再传进来。
+ */
+function resolveEditionId(db, editionId) {
+  if (editionId) {
+    if (!getEdition(db, editionId)) throw new AppError(404, 'EDITION_NOT_FOUND', '届期不存在');
+    return editionId;
+  }
+  const edition = pickCurrentEdition(listEditions(db));
+  if (!edition) throw new AppError(404, 'EDITION_NOT_FOUND', '尚无届期');
+  return edition.id;
+}
+
 export function createApp({ db, rules, webDir }) {
   // ⛔ 评审修正（Important）：webDir 缺失必须在**构造期**就拒绝。
   //    原来它在第一个静态请求上才炸（serveStatic 在 try/catch 之外）→
@@ -112,11 +133,38 @@ export function createApp({ db, rules, webDir }) {
   registerTeamRoutes({ router, db, rules });
   // P2 评审 API（报名/组队等 P1 路由由 P1 追加，不要互相覆盖）
   registerReviewRoutes(router);
+  // P3 写入路由（企业里程碑签字 / 行为分事件）
+  registerMilestoneRoutes(router);
+  registerBehaviorRoutes(router);
   // 生产环境 Cookie 加 Secure；开发环境不加（http://127.0.0.1 会被浏览器拒收）
   const secureCookies = process.env.NODE_ENV === 'production';
 
   router.add('GET', '/api/health', async () => ({ ok: true, at: new Date().toISOString() }));
 
+  // ── P3 榜单与积分 ───────────────────────────────────────────
+  // ⚠️ 路由优先级由 P0 的 router **逐段比较**决定：静态段胜参数段
+  //    （P0 终审 C4-1 修的就是「比参数段个数」那个错版）。
+  //    ⇒ '/api/leaderboard/rolling' 与 '/api/leaderboard/tier' 都不会被
+  //    '/api/leaderboard/:stageId' 劫持。
+  router.add('GET', '/api/leaderboard/rolling', async (ctx) => {
+    const editionId = resolveEditionId(ctx.db, ctx.query.editionId);
+    return getRollingLeaderboard({ db: ctx.db, editionId, viewer: ctx.user, rules: ctx.rules });
+  });
+  // ⚠️ 静态段 'tier' 优先于参数段 ':stageId'（router 逐段比较：静态胜参数）
+  router.add('GET', '/api/leaderboard/tier', async (ctx) => {
+    const editionId = resolveEditionId(ctx.db, ctx.query.editionId);
+    return getTierBoard({ db: ctx.db, editionId, viewer: ctx.user, rules: ctx.rules });
+  });
+  router.add('GET', '/api/leaderboard/:stageId', async (ctx) => {
+    const scope = ctx.query.scope || 'rank';
+    return getLeaderboard({ db: ctx.db, stageId: ctx.params.stageId, scope, viewer: ctx.user, rules: ctx.rules });
+  });
+  router.add('GET', '/api/teams/:id/performance-card', async (ctx) => {
+    return getPerformanceCard({ db: ctx.db, teamId: ctx.params.id, viewer: ctx.user, rules: ctx.rules });
+  });
+  router.add('GET', '/api/teams/:id/tier', async (ctx) => {
+    return getTeamTier({ db: ctx.db, teamId: ctx.params.id, viewer: ctx.user, rules: ctx.rules });
+  });
   router.add('GET', '/api/me', async ({ user }) => {
     if (!user) {
       // ⛔ 终审修正（Important，I-5）：领域错误必须走 AppError。

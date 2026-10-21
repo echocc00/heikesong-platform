@@ -6,7 +6,8 @@
 //      "能读出 JSON" 不等于 "配置是对的"。漏检的那几份一旦写错，症状要到
 //      P2/P3 算分、算榜单时才爆出来 —— 而那时榜单可能已经发出去了。
 import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const FILES = {
   scoringInitial: 'scoring-initial.json',
@@ -21,6 +22,8 @@ const FILES = {
   teamFormation: 'team-formation.json',
   schedule: 'schedule.json',
   compliance: 'compliance.json',
+  points: 'points.json',
+  criteria: 'criteria.json',
 };
 
 function readJson(path) {
@@ -375,6 +378,14 @@ export function validateRules(rules, expectedCount = null) {
       || behavior.completionThreshold < 0 || behavior.completionThreshold > 100) {
       push('behavior.completionThreshold 必须在 0..100');
     }
+    // ⚠️ sortUse **不是可配置项**，它是 R-PTS-08 的硬保证：行为分只能做破同分，
+    //    绝不能变成主评分（决赛名次 0% / 奖金 0%）。
+    //    链不变量里的那处检查（assertChainInvariants）在生产链路上【拿不到 behaviorConfig】，
+    //    属于「建好却从不校验」的同款病根 —— 所以必须在这里 fail-fast：
+    //    配置被改成 'primary' 之类的值时**拒绝启动**，而不是带着违规口径上线。
+    if (behavior.sortUse !== 'tiebreak_only') {
+      push('behavior.sortUse 必须是 tiebreak_only（R-PTS-08：行为分只做破同分，不进总分/奖金）');
+    }
     if (!Array.isArray(behavior.events) || behavior.events.length === 0) {
       push('behavior.events 缺失或为空');
     } else if (hasBadItem(behavior.events)) {
@@ -536,6 +547,50 @@ export function validateRules(rules, expectedCount = null) {
     }
   }
 
+  // ── 名次积分（P3）────────────────────────────────────────
+  const pts = rules.points;
+  if (!pts) {
+    errors.push('points 缺失');
+  } else {
+    if (!Array.isArray(pts.stagePoints) || !pts.stagePoints.length) {
+      errors.push('points.stagePoints 缺失或为空');
+    } else if (Number.isFinite(pts.stagePointsOnlyTopN)
+      && pts.stagePointsOnlyTopN !== pts.stagePoints.length) {
+      errors.push(`points.stagePointsOnlyTopN=${pts.stagePointsOnlyTopN} 与 stagePoints 长度 ${pts.stagePoints.length} 不一致`);
+    }
+    if (pts.tieRankStyle !== '1224') errors.push(`points.tieRankStyle 必须是 "1224"（当前 ${pts.tieRankStyle}）`);
+    if (!pts.mvp || pts.mvp.perPackage !== 1) errors.push('points.mvp.perPackage 必须是 1（每个任务包 1 个 MVP，任务书 §七）');
+    if (!pts.personal || typeof pts.personal.lifetime !== 'boolean') errors.push('points.personal.lifetime 必须是布尔值');
+  }
+
+  // ── 段位附加条件（P3）────────────────────────────────────
+  const crit = rules.criteria;
+  if (!crit?.tier) {
+    errors.push('criteria.tier 缺失');
+  } else {
+    if (!Array.isArray(crit.tier.dataOrPrototypeMilestones) || !crit.tier.dataOrPrototypeMilestones.length) {
+      errors.push('criteria.tier.dataOrPrototypeMilestones 缺失或为空');
+    }
+    if (!Array.isArray(crit.tier.businessDepartmentKeywords) || !crit.tier.businessDepartmentKeywords.length) {
+      errors.push('criteria.tier.businessDepartmentKeywords 缺失或为空');
+    }
+  }
+
+  // ── MVP 决胜链（P3）──────────────────────────────────────
+  // ⛔ 综合分并列时必须有决胜链，且必须以确定性键收尾 —— 否则同分 MVP 由输入顺序决定，
+  //    换台机器重算可能选出不同的 MVP。
+  if (!crit?.mvp || !Array.isArray(crit.mvp.tiebreak) || !crit.mvp.tiebreak.length) {
+    errors.push('criteria.mvp.tiebreak 缺失或为空');
+  } else {
+    const known = new Set(['roadshow_points', 'team_id']);
+    for (const k of crit.mvp.tiebreak) {
+      if (!known.has(k)) errors.push(`criteria.mvp.tiebreak 含未知决胜键：${k}`);
+    }
+    if (crit.mvp.tiebreak.at(-1) !== 'team_id') {
+      errors.push('criteria.mvp.tiebreak 必须以 team_id 收尾（确定性兜底）');
+    }
+  }
+
   return errors;
 }
 
@@ -558,6 +613,8 @@ export function loadRules(rulesDir) {
     teamFormation: rules.teamFormation,
     schedule: rules.schedule,
     compliance: rules.compliance,
+    points: rules.points,
+    criteria: rules.criteria,
   };
 
   const errors = validateRules(grouped, Object.keys(FILES).length);
@@ -572,4 +629,17 @@ export function loadRules(rulesDir) {
   const version = versions.length ? versions[0] : 'unknown';
 
   return { rules: grouped, version };
+}
+
+// ── P3 追加：默认规则加载器 ────────────────────────────────────
+// 用途：服务层在调用方没有显式注入 rules 时用它，避免"静默用默认规则"的降级。
+// ⚠️ 只在没有注入时兜底；注入的 rules 优先（配置文件里的值永远是权威）。
+let defaultRulesCache = null;
+
+export function getDefaultRules() {
+  if (!defaultRulesCache) {
+    const dir = join(dirname(fileURLToPath(import.meta.url)), '..', 'rules');
+    defaultRulesCache = loadRules(dir).rules;
+  }
+  return defaultRulesCache;
 }

@@ -1,0 +1,32 @@
+{
+  "id": "criteria",
+  "version": "2026-10-20",
+  "source": "S10 §2.2 段位表附加条件 + R-PTS-03 + R-STG-04 + R-PTS-10 + 任务书 §七（MVP 口径待确认）",
+  "tier": {
+    "dataOrPrototypeMilestones": ["data_connected", "demo_ready"],
+    "businessDepartmentKeywords": ["业务", "商务", "市场", "销售", "运营", "客户", "business", "commercial"],
+    "technicalDepartmentKeywords": ["技术", "研发", "工程", "算法", "架构", "tech", "engineering"],
+    "unknownDepartmentCountsAsBusiness": false,
+    "businessSignoffRequiresContent": true
+  },
+  "mvp": {
+    "awardPointsSource": "stage_points_sum",
+    "awardPointsNote": "MVP 积分 = 该队计入的 4 个赛段的名次积分之和。rules/points.json 未规定 mvp 数值，此为待组委会确认口径；改这里即可，不改代码。",
+    "tiebreak": ["roadshow_points", "team_id"],
+    "tiebreakNote": "MVP 综合分并列时的决胜链（顺序即优先级）。⚠️ 任务书 §七 只给了「4 赛段总积分 + S4 路演评审综合」的加法公式，未写并列怎么办；S10 §0.3「互评的真正用途是破同分」+ §4「行为分用于同分垫底排序」确立了本赛事通则 —— 同分必须用实质依据决出，不许用字母序。故默认：路演名次积分高者胜（仍是评审实质依据）→ 仍并列则 team_id 码位序（确定性兜底，跨机器可复算）。**此为 P3 自有口径 · 待组委会确认**；改这里即可，不改代码。"
+  },
+  "behaviorEvidence": {
+    "weekly_progress": { "required": ["repo", "version"], "oneOf": ["artifact", "blocker"] },
+    "workshop_output": { "required": ["output"], "oneOf": [] },
+    "enterprise_meeting": { "required": ["enterpriseConfirmationId"], "oneOf": [] }
+  },
+  "enterpriseCompliance": {
+    "source": "R-JDG-15（S7 §4.1「签字有成本」）：进入 TOP 名单后企业须 2 周内召开 30 分钟需求对接会，不配合则下届降权/取消席位",
+    "meetingDurationMinutes": 30,
+    "deadlineDays": 14,
+    "appliesTo": "top_list",
+    "penaltyScope": "next_edition",
+    "penaltyNote": "⚠️ 处罚只作用于【下届席位权重/取消席位】，不影响本届名次与奖金。因此本平台【只负责记录与暴露】：对接会是否完成、何时完成。⛔ 不得据此在本届直接扣分或改榜 —— 那会凭空加一条源文档没有的规则。下届降权的执行不在本平台范围内（无届期间的席位权重数据模型）。",
+    "evidenceFields": ["enterpriseId", "teamId", "meetingAt", "durationMinutes", "attendees"]
+  }
+}

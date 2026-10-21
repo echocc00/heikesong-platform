@@ -19,6 +19,7 @@ import {
   insertTeamMember, listActiveMembers, listMemberHistory, markMemberLeft,
   countActiveMembers, findActiveMembershipByUser, lastLeaveAt,
 } from '../db/repo/teamMembers.js';
+import { insertMilestones } from '../db/repo/tiers.js';
 import { can } from '../auth/permissions.js';
 
 /**
@@ -166,6 +167,9 @@ export function createTeam({
     now,
   });
   insertTeamMember(db, { teamId: team.id, userId, role: 'captain', now });
+  // R-STG-03 / R-PTS-10：里程碑清单在【组队时】固定 —— 同时落成 P3 的 milestones 表行。
+  //   （P3 的段位引擎与 B 榜只读这张表；清单本身仍来自 teams.milestones_json，两处同源。）
+  insertMilestones(db, { teamId: team.id, items: milestones.items, now });
   return teamView(db, team.id, rules);
 }
 
