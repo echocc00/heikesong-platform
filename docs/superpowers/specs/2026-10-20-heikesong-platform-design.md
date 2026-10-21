@@ -74,7 +74,11 @@
 
 ## 2. 需求溯源（索引）
 
-完整溯源表见 [`docs/requirements-traceability.md`](../../requirements-traceability.md)。此处只给结论：
+完整溯源表见 [`docs/requirements-traceability.md`](../../requirements-traceability.md)。
+**逐条落地对照**（每条需求落在哪个阶段的哪个 Task、哪个文件、由哪条验收标准钉住）见
+[`docs/requirement-implementation-map.md`](../../requirement-implementation-map.md) —— 该表的每一格都由
+**代码里的溯源注释**与各阶段计划的验收标准表机器抽取生成，可重跑复核。
+此处只给结论：
 
 **分母声明**：需求全集 = **96 条**｜来源 = 任务书 2.0 + S7 + S10 + SABC + 顶层文档 + 项目自身复盘（6 类一手文档）｜独立源数 = 6（**同一作者体系，非独立互证**）
 
