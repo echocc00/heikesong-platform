@@ -8,6 +8,8 @@ import { renderAdminRegistration } from './views/admin-registration.js';
 import { renderLeaderboard } from './views/leaderboard.js';
 import { renderTier } from './views/tier.js';
 import { renderCard } from './views/card.js';
+import { renderAudit } from './views/audit.js';
+import { renderFlags } from './views/flags.js';
 import { escapeHtml } from './escape.js';
 
 // 演示版：?demo=1 时用 localStorage 适配器；正式版走真实 API。
@@ -28,6 +30,11 @@ route('/leaderboard', (c) => renderLeaderboard(c));
 route('/leaderboard/:stageId', (c) => renderLeaderboard(c));
 route('/tier', (c) => renderTier(c));
 route('/card/:teamId', (c) => renderCard(c));
+// P4 两页：计算留痕 trace 抽屉（从发榜页点队伍进入）/ 复核队列
+// ⚠️ 必须透传路由参数（c = {...ctx, params, query}）：trace 抽屉靠 params.computationId
+//    决定拉哪份快照 —— 只传模块级 ctx 会把 params 丢掉，抽屉永远拿不到 computationId。
+route('/audit/:computationId', (c) => renderAudit(c));
+route('/flags', (c) => renderFlags(c));
 
 function renderHome() {
   const el = document.createElement('div');
@@ -39,6 +46,7 @@ function renderHome() {
     <nav>
       <a href="#/login">登录</a>
       <a href="#/leaderboard">榜单</a>
+      <a href="#/flags">复核队列</a>
       <a href="#/apply">报名</a>
       <a href="#/team">我的战队</a>
       <a href="#/admin/registration">筛选台</a>
