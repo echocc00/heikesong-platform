@@ -146,6 +146,13 @@ platform/web/app.js                 注册 /audit 与 /flags 路由 + 导航入�
 `platform/test/audit-repo.test.js`：
 
 ```javascript
+// platform/test/audit-repo.test.js —— P4 审计数据模型与仓储层
+//
+// 规则溯源：
+//   - 限频计数必须落库（只在内存计数 = 进程重启即失效 = 等于没有限频）→ 全局约束「限频落库」
+//   - 幂等键唯一约束必须在数据库层，不能靠「先查再插」→ 设计文档 §11.1
+//   - 只增不改：重算走 revision + 1，旧 revision 保留供复盘 → 设计文档 §11.1
+//   - 检测 ≠ 处罚：flagged_reviews 只记录「有疑问」→ 设计文档 §11.1
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -162,9 +169,9 @@ import {
   countBucket, incrementBucket, slidingWindowCount, slidingWindowEvents, acquireLock,
 } from '../src/db/repo/rate-limit.js';
 import { insertAppeal, getAppeal, listAppealRows, updateAppeal } from '../src/db/repo/appeals.js';
-import { insertComputation, getComputationRow, nextRevision } from '../src/db/repo/computations.js';
+import { insertSnapshot, getSnapshot, nextRevision, listComputationRows } from '../src/db/repo/computations.js';
 import { withTransaction } from '../src/db/tx.js';
-import { appError } from '../src/errors.js';
+import { appError, AppError, badRequest, unauthenticated, forbidden, notFound, conflict, rateLimited } from '../src/errors.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrationsDir = join(here, '..', 'db', 'migrations');
@@ -173,7 +180,29 @@ function setup() {
   const dataDir = mkdtempSync(join(tmpdir(), 'hks-p4repo-'));
   const { db, close } = openDatabase({ dataDir });
   applyMigrations(db, migrationsDir);
+  seedRefs(db);
   return { db, close, dataDir };
+}
+
+/**
+ * 造出被外键引用的行。
+ * ⚠️ 规格原写法直接用 'u_admin' / 'st1' 写审计日志与计算快照，
+ *    但 audit_log.actor_id REFERENCES users(id)、computation_snapshots.stage_id
+ *    REFERENCES stages(id) —— **不建被引用的行就会 FOREIGN KEY constraint failed**。
+ *    这不是测试写得随意，是规格自带缺陷：照抄必然红。
+ */
+function seedRefs(db) {
+  db.exec(`
+    INSERT INTO users (id, name, phone, password_hash, mba_status, org, is_superadmin, active, created_at)
+    VALUES ('u_admin','组委会','13900000999','x','mba',NULL,1,1,'2026-10-20T00:00:00.000Z');
+    INSERT INTO editions (id, name, city, starts_at, ends_at, created_at)
+    VALUES ('ed_1','第一届','上海','2026-10-01','2099-12-31','2026-10-20T00:00:00.000Z');
+    INSERT INTO stages (id, edition_id, "key", name, kind, starts_at, ends_at, freeze_at, scoring_config_key, status)
+    VALUES ('st1','ed_1','S1','调研赛段','initial','2026-10-01','2026-10-10','2026-10-11','initial','closed');
+    INSERT INTO teams (id, edition_id, name, captain_id, tier, status, created_at)
+    VALUES ('t1','ed_1','甲队','u_admin','D','active','2026-10-20T00:00:00.000Z'),
+           ('t2','ed_1','乙队','u_admin','D','active','2026-10-20T00:00:00.000Z');
+  `);
 }
 
 function tableNames(db) {
@@ -255,22 +284,48 @@ test('幂等键：同一 (key, scope) 只能插入一次，第二次返回 false
   rmSync(dataDir, { recursive: true, force: true });
 });
 
+test('★ 幂等键的兜底只认「唯一约束」：其它约束错必须继续往上抛（不得被当成「重复请求」）', () => {
+  const { db, close, dataDir } = setup();
+  // ⚠️ 若用 `INSERT OR IGNORE`，NOT NULL 违规会被静默吞掉 → 返回 false（=「重复请求」）
+  //    → 调用方以为写成功了，实际一条都没落库（P1 的 T-7 踩过同款坑）。
+  assert.throws(
+    () => insertIdempotency(db, { key: null, scope: 'review.submit', now: '2026-10-20T00:00:00.000Z' }),
+    /NOT NULL/i,
+    'NOT NULL 违规不得被当成「重复请求」',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
 test('限频计数落库：同一 bucket 递增，滑动窗口只数窗口内的', () => {
   const { db, close, dataDir } = setup();
-  incrementBucket(db, { subjectKey: 'judge:u1', rule: 'sliding:reviewSubmit', bucket: 's:100', now: '2026-10-20T00:00:00.000Z' });
-  incrementBucket(db, { subjectKey: 'judge:u1', rule: 'sliding:reviewSubmit', bucket: 's:100', now: '2026-10-20T00:00:00.000Z' });
+  // ⚠️ 判别性数据集：**两个 bucket 必须落在窗口内外两侧**。
+  //    规格原写法给两个 bucket 传了同一个 now（都在窗口外），
+  //    那样「滑动窗口计数」与「全量计数」结果相同 → 测不出窗口过滤有没有生效。
+  //    这里：s:100 在窗口内（count 2）、s:050 在窗口外（count 1）。
+  incrementBucket(db, { subjectKey: 'judge:u1', rule: 'sliding:reviewSubmit', bucket: 's:100', now: '2026-10-20T00:01:00.000Z' });
+  incrementBucket(db, { subjectKey: 'judge:u1', rule: 'sliding:reviewSubmit', bucket: 's:100', now: '2026-10-20T00:01:00.000Z' });
   assert.equal(countBucket(db, { subjectKey: 'judge:u1', rule: 'sliding:reviewSubmit', bucket: 's:100' }), 2);
 
   incrementBucket(db, { subjectKey: 'judge:u1', rule: 'sliding:reviewSubmit', bucket: 's:050', now: '2026-10-20T00:00:00.000Z' });
-  // 窗口 60 秒：now=00:00:20 时，00:00:50 这一桶还在窗口内，00:00:00 之前的不算
+  // 窗口 60 秒：now=00:01:20 → 窗口 = [00:00:20, 00:01:20]
+  //   → s:100（00:01:00 起，2 次）在窗口内；s:050（00:00:00 起，1 次）在窗口外
   const n = slidingWindowCount(db, {
     subjectKey: 'judge:u1', rule: 'sliding:reviewSubmit', now: '2026-10-20T00:01:20.000Z', windowSeconds: 60,
   });
-  assert.equal(n, 2, '只有 00:00:50 起的 2 次在窗口内');
+  assert.equal(n, 2, '只有窗口内的 2 次算数（窗口外的 1 次必须被排除）');
   const events = slidingWindowEvents(db, {
     subjectKey: 'judge:u1', rule: 'sliding:reviewSubmit', now: '2026-10-20T00:01:20.000Z', windowSeconds: 60,
   });
-  assert.equal(events.length, 1);
+  assert.equal(events.length, 1, '窗口外的事件不出现在事件列表里');
+  assert.equal(events[0].bucket, 's:100');
+  // 全量口径（不做窗口过滤）应当是 3 —— 与窗口口径 2 不同 ⇒ 数据集有判别力
+  assert.equal(
+    countBucket(db, { subjectKey: 'judge:u1', rule: 'sliding:reviewSubmit', bucket: 's:100' })
+    + countBucket(db, { subjectKey: 'judge:u1', rule: 'sliding:reviewSubmit', bucket: 's:050' }),
+    3,
+    '窗口内 2 + 窗口外 1 = 3（若实现不按窗口过滤，这里与上面的 2 无法区分）',
+  );
   close();
   rmSync(dataDir, { recursive: true, force: true });
 });
@@ -298,9 +353,21 @@ test('flagged_reviews：可建、可按 kind+维度查未决、可裁决', () =>
   assert.equal(open.id, id);
   assert.equal(open.status, 'open');
   assert.equal(resolveFlagRow(db, { id, status: 'confirmed', reviewedBy: 'u_admin', reviewedAt: '2026-10-20T01:00:00.000Z' }), 1);
-  const after = listFlagRows(db, { status: 'confirmed' });
-  assert.equal(after.length, 1);
-  assert.equal(after[0].reviewed_by, 'u_admin');
+  // ⚠️ 判别性数据集：库里同时存在**一条未决**与**一条已裁决**的 flag。
+  //    只放一条的话，「按 status 过滤」与「不过滤」结果相同 ⇒ 测不出过滤有没有生效。
+  const otherId = createFlag(db, {
+    stageId: 'st1', teamId: 't2', judgeId: 'j2', kind: 'low_variance',
+    detail: { judgeId: 'j2', dimension: 'innovation', stdev: 0.4 }, now: '2026-10-20T02:00:00.000Z',
+  });
+  const { rows } = listFlagRows(db, { status: 'confirmed' });
+  assert.equal(rows.length, 1, '按 status 过滤后只剩已裁决的那一条');
+  assert.equal(rows[0].reviewed_by, 'u_admin');
+  assert.equal(rows[0].id, id);
+  // 已裁决的 flag 不得再被「未决查询」找到（否则同一个问题会被重复送审）
+  const stillOpen = findOpenFlag(db, { kind: 'low_variance', stageId: 'st1', teamId: 't1', judgeId: 'j1' });
+  assert.equal(stillOpen, null, '已裁决的 flag 不再是 open');
+  const otherOpen = findOpenFlag(db, { kind: 'low_variance', stageId: 'st1', teamId: 't2', judgeId: 'j2' });
+  assert.equal(otherOpen?.id, otherId, '未裁决的那一条仍应能被查到');
   close();
   rmSync(dataDir, { recursive: true, force: true });
 });
@@ -318,7 +385,7 @@ test('appeals：建档 → 查 → 裁决', () => {
   const after = getAppeal(db, id);
   assert.equal(after.status, 'accepted');
   assert.equal(after.decision_note, '成立，重算');
-  assert.equal(listAppealRows(db, { status: 'accepted' }).length, 1);
+  assert.equal(listAppealRows(db, { status: 'accepted' }).rows.length, 1);
   close();
   rmSync(dataDir, { recursive: true, force: true });
 });
@@ -326,17 +393,106 @@ test('appeals：建档 → 查 → 裁决', () => {
 test('computation_snapshots：revision 递增，旧 revision 保留（不覆盖历史）', () => {
   const { db, close, dataDir } = setup();
   assert.equal(nextRevision(db, { kind: 'stage_score', stageId: 'st1' }), 1);
-  insertComputation(db, {
+  insertSnapshot(db, {
     id: 'c1', kind: 'stage_score', stageId: 'st1', ruleVersion: 'scoring.final@2026-10-20',
     input: { a: 1 }, output: { total: 80 }, trace: {}, revision: 1, now: '2026-10-20T00:00:00.000Z',
   });
   assert.equal(nextRevision(db, { kind: 'stage_score', stageId: 'st1' }), 2);
-  insertComputation(db, {
+  insertSnapshot(db, {
     id: 'c2', kind: 'stage_score', stageId: 'st1', ruleVersion: 'scoring.final@2026-10-20',
     input: { a: 2 }, output: { total: 81 }, trace: {}, revision: 2, now: '2026-10-20T01:00:00.000Z',
   });
-  assert.equal(getComputationRow(db, 'c1').revision, 1, '旧 revision 必须保留供复盘');
-  assert.equal(getComputationRow(db, 'c2').revision, 2);
+  assert.equal(getSnapshot(db, 'c1').revision, 1, '旧 revision 必须保留供复盘');
+  assert.equal(getSnapshot(db, 'c2').revision, 2);
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('★ nextRevision 传 teamId 时按队伍收窄，不传时行为与 P2 一致（不得重定义 P2 的函数）', () => {
+  const { db, close, dataDir } = setup();
+  // ⚠️ 判别性数据集：两支队的 revision **必须不对称**。
+  //    若两队都是 1，则「按队伍收窄」与「赛段级」算出的下一轮都是 2 ⇒ 测不出差异。
+  insertSnapshot(db, {
+    id: 'c1', kind: 'stage_score', stageId: 'st1', teamId: 't1', ruleVersion: 'v1',
+    input: {}, output: {}, trace: {}, revision: 3, now: '2026-10-20T00:00:00.000Z',
+  });
+  insertSnapshot(db, {
+    id: 'c2', kind: 'stage_score', stageId: 'st1', teamId: 't2', ruleVersion: 'v1',
+    input: {}, output: {}, trace: {}, revision: 1, now: '2026-10-20T00:00:01.000Z',
+  });
+  assert.equal(nextRevision(db, { kind: 'stage_score', stageId: 'st1', teamId: 't1' }), 4, 't1 自己的下一轮是 4');
+  assert.equal(nextRevision(db, { kind: 'stage_score', stageId: 'st1', teamId: 't2' }), 2, 't2 自己的下一轮是 2（不受 t1 影响）');
+  assert.equal(nextRevision(db, { kind: 'stage_score', stageId: 'st1' }), 4, '不传 teamId → 赛段级口径（P2 原样）');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('★ listComputationRows：按 kind/stageId 过滤 + 最近优先 + 带总数', () => {
+  const { db, close, dataDir } = setup();
+  insertSnapshot(db, {
+    id: 'c1', kind: 'stage_score', stageId: 'st1', ruleVersion: 'v1',
+    input: {}, output: {}, trace: {}, revision: 1, now: '2026-10-20T00:00:00.000Z',
+  });
+  insertSnapshot(db, {
+    id: 'c2', kind: 'stage_score', stageId: 'st1', ruleVersion: 'v1',
+    input: {}, output: {}, trace: {}, revision: 2, now: '2026-10-20T01:00:00.000Z',
+  });
+  insertSnapshot(db, {
+    id: 'c3', kind: 'recompute', stageId: 'st1', ruleVersion: 'v1',
+    input: {}, output: {}, trace: {}, revision: 1, now: '2026-10-20T02:00:00.000Z',
+  });
+  const all = listComputationRows(db, {});
+  assert.equal(all.total, 3);
+  assert.equal(all.rows.length, 3);
+  assert.deepEqual(all.rows.map((r) => r.id), ['c3', 'c2', 'c1'], '必须最近优先（倒序）');
+  const byKind = listComputationRows(db, { kind: 'stage_score' });
+  assert.equal(byKind.total, 2, '按 kind 过滤');
+  const byStage = listComputationRows(db, { stageId: 'st1' });
+  assert.equal(byStage.total, 3);
+  const paged = listComputationRows(db, { limit: 1 });
+  assert.equal(paged.total, 3, '总数不受 limit 影响');
+  assert.equal(paged.rows.length, 1, '但行数受 limit 限制');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('★ 错误快捷函数的状态码必须逐个正确（notFound=404 / badRequest=400 / conflict=409 / rateLimited=429 …）', () => {
+  assert.equal(notFound('没有').status, 404);
+  assert.equal(notFound('没有').code, 'NOT_FOUND');
+  assert.equal(badRequest('不合法').status, 400);
+  assert.equal(forbidden('不许').status, 403);
+  assert.equal(conflict('冲突').status, 409);
+  assert.equal(rateLimited('太快').status, 429);
+  assert.equal(unauthenticated().status, 401);
+  assert.equal(unauthenticated().message, '未登录');
+  // 快捷函数必须返回 AppError 实例（下游 e instanceof AppError 分支才有效）
+  assert.ok(notFound('没有') instanceof AppError, '必须是 AppError 实例');
+  assert.equal(notFound('没有', { id: 'x' }).detail.id, 'x', 'detail 必须透传');
+});
+
+test('★ 005 迁移的 NOT NULL / DEFAULT 符合契约（kind 与 status 必填，status 有默认值）', () => {
+  const { db, close, dataDir } = setup();
+  const cols = (table) => Object.fromEntries(
+    db.prepare(`PRAGMA table_info(${table})`).all().map((c) => [c.name, c]),
+  );
+  const flags = cols('flagged_reviews');
+  assert.equal(flags.kind.notnull, 1, 'flagged_reviews.kind 必须 NOT NULL');
+  assert.equal(flags.status.notnull, 1, 'flagged_reviews.status 必须 NOT NULL');
+  assert.equal(flags.status.dflt_value, "'open'", "flagged_reviews.status 默认 'open'");
+  assert.equal(flags.detail_json.notnull, 0, 'detail_json 可空');
+
+  const appeals = cols('appeals');
+  assert.equal(appeals.status.notnull, 1, 'appeals.status 必须 NOT NULL');
+  assert.equal(appeals.status.dflt_value, "'submitted'", "appeals.status 默认 'submitted'");
+  assert.equal(appeals.reason.notnull, 1, 'appeals.reason 必须 NOT NULL');
+
+  const idem = cols('idempotency_keys');
+  assert.equal(idem.key.notnull, 1, 'idempotency_keys.key 必须 NOT NULL');
+  assert.equal(idem.scope.notnull, 1, 'idempotency_keys.scope 必须 NOT NULL');
+
+  const rl = cols('rate_limit_events');
+  assert.equal(rl.count.notnull, 1, 'rate_limit_events.count 必须 NOT NULL');
+  assert.equal(rl.count.dflt_value, '0', 'rate_limit_events.count 默认 0');
   close();
   rmSync(dataDir, { recursive: true, force: true });
 });
@@ -348,7 +504,9 @@ test('withTransaction 抛错时整体回滚，不留半写', () => {
       writeAuditLog(db, { action: 'x', entity: 'e', entityId: '1', now: '2026-10-20T00:00:00.000Z' });
       throw appError(500, 'BOOM', '中途失败');
     }),
-    /BOOM/,
+    // ⚠️ 规格原写法断言 /BOOM/（匹配 message），但 AppError 的 message 是「中途失败」、
+    //    code 才是 'BOOM' ⇒ 照抄必然红。改为按 **code** 断言。
+    (err) => err.code === 'BOOM' && err.status === 500,
   );
   const { total } = queryAuditLog(db, { action: 'x' });
   assert.equal(total, 0, '失败事务里的写入必须全部回滚');
@@ -443,19 +601,17 @@ CREATE INDEX idx_appeals_status ON appeals(status);
 `platform/src/errors.js`：
 
 ```javascript
-// src/errors.js — 统一错误类型（**P0 已建，本阶段只追加快捷函数**）
-// 依据：跨阶段接口契约 §0「错误：抛 AppError（status + code + message + detail，**status-first**）」
+// ── P4 追加：快捷构造函数 ─────────────────────────────────────────────
+// 依据：跨阶段接口契约 §0「错误：抛 AppError（status + code + message + detail，status-first）」
 //
 // ⚠️ 本文件由 **P0 的 Task 4 建立**（`export class AppError extends Error`，
-//    构造签名 `AppError(status, code, message, detail)`），本阶段【只追加快捷函数】。
+//    构造签名 `AppError(status, code, message, detail)`），P4 **只追加快捷函数**。
 //    ⛔ 不要在这里重写 AppError 类，也不要**重新定义 appError**：
 //       P3 的 12 处 `new AppError(...)` 调用按 **status-first** 顺序写死，
 //       重写成别的签名会让 err.status / err.code 互换；
 //       而 `appError` 若被重新定义成「返回普通 Error 而非 AppError 实例」，
 //       就破坏了 P0-8「全部领域错误都经 AppError 抛出」这条验收标准
 //       （下游 `e instanceof AppError` 分支会失效）。
-//    ✅ 下面这段直接【追加到 P0 已建的 src/errors.js 末尾】，
-//       **沿用已有的 appError**，不重复定义。
 
 export function badRequest(message, detail) {
   return appError(400, 'INVALID_REQUEST', message, detail);
@@ -480,6 +636,7 @@ export function conflict(message, detail) {
 export function rateLimited(message, detail) {
   return appError(429, 'RATE_LIMITED', message, detail);
 }
+
 ```
 
 `platform/src/db/tx.js`：
@@ -526,7 +683,7 @@ export function withTransaction(db, fn) {
 P2 已有的 `insertAuditLogRow` / `queryAuditLogRows` 保持不动、签名一个字都不改）：
 
 ```javascript
-// src/db/repo/audit-log.js —— 【追加】到 P2 已建的文件里
+// ── P4 追加：带过滤条件的分页查询 + 取最后一次状态迁移 ────────────────
 // 依据：设计文档 §12（可复算）+ §11.2（迁移日志）；表由 P0 的 001_init.sql 建好。
 // ⚠️ P2 已建 insertAuditLogRow / queryAuditLogRows（写入 + 按 entity 列表）。
 //    本阶段只补两个**只读查询**：带过滤条件的分页查询 + 取最后一次状态迁移。
@@ -566,6 +723,7 @@ export function findLatestTransition(db, entity, entityId) {
   }
   return { ...detail, at: rows[0].created_at };
 }
+
 ```
 
 > **【2026-10-21 漂移审计修正 I-8（与 C-3 联动）】**
@@ -593,54 +751,60 @@ export function findLatestTransition(db, entity, entityId) {
 > （`src/db/repo/audit-log.js` 导出 `insertAuditLogRow` / `queryAuditLogRows`，
 > `src/audit/log.js` 是薄门面）。
 
-`platform/src/db/repo/computations.js`（**P2 Task 6 已建**；本阶段**追加** `nextRevision` / `listComputationRows`，**不要重建文件**、不要改 P2 已有的函数签名）：
+`platform/src/db/repo/computations.js`（**P2 Task 6 已建**；本阶段**只改** `nextRevision`（加可选 `teamId`）
+与 `insertSnapshot`（加可选 `id`）**+ 追加** `listComputationRows`，
+**不要重建文件、不要重定义已有函数**）：
+
+> ⚠️ **本文件由 P2 建立**（nextRevision / insertSnapshot / getSnapshot /
+> getSnapshotInStage / listSnapshots / resetStageResults / upsertStageResult）。
+> P4 **只改下面这两个已有函数 + 追加一个**，其余一个字都不动。
+>
+> ⛔ **绝不在本文件里再定义一个 nextRevision** —— 同名导出重复声明会让整个模块抛
+> SyntaxError，`src/services/compute.js` 连带**整个平台**都加载不了。
+> （P4 计划原写法是「重定义」⇒ 已实跑三种字面读法，**全部**让平台加载失败，见台账 P4-1。）
 
 ```javascript
-// src/db/repo/computations.js — 计算快照仓储
-// 依据：设计文档 §12「每次计算产出三件套 rule_version / input / output / trace」
-//   表由 P2 的 003_review.sql 建好；P2 的 computeStage 复用本仓储。
-//   ⛔ 重算走 revision + 1，旧 revision 保留（设计文档 §11.1「事后篡改」防护）。
-//   ⚠️ 本文件由 P2 建立。本阶段【追加】下面两个函数，P2 已有的 insertComputation /
-//      getComputationRow 保持不动（签名一个字都不改）。
-import { randomUUID } from 'node:crypto';
-
-export function nextRevision(db, { kind, stageId = null, teamId = null }) {
-  const row = db.prepare(
-    `SELECT MAX(revision) AS r FROM computation_snapshots
-      WHERE kind = ? AND IFNULL(stage_id, '') = ? AND IFNULL(team_id, '') = ?`,
-  ).get(kind, stageId ?? '', teamId ?? '');
-  return (row?.r ?? 0) + 1;
+export function nextRevision(db, { stageId, kind, teamId = null }) {
+  // ⚠️ **P4 扩展**（本函数由 P2 建立）：P4 需要「同一赛段内按队伍各自编号」，
+  //    所以加了一个**可选**的 teamId 收窄条件。
+  //    ⛔ 不传 teamId 时**行为与 P2 一字不差**（P2 的调用点
+  //       `nextRevision(db, { stageId, kind })` 不受影响）。
+  //    ⛔ 绝不在本文件里**再定义一个 nextRevision** —— 同名导出重复声明会让整个
+  //       模块抛 SyntaxError，`src/services/compute.js` 连带**整个平台**都加载不了。
+  const where = ['stage_id = ?', 'kind = ?'];
+  const params = [stageId, kind];
+  if (teamId != null) { where.push('team_id = ?'); params.push(teamId); }
+  const row = db
+    .prepare(`SELECT MAX(revision) AS rev FROM computation_snapshots WHERE ${where.join(' AND ')}`)
+    .get(...params);
+  return (row?.rev ?? 0) + 1;
 }
 
-export function insertComputation(db, {
-  id = randomUUID(), kind, editionId = null, stageId = null, teamId = null,
-  ruleVersion, input, output, trace, revision, now = new Date().toISOString(),
-}) {
+export function insertSnapshot(db, { kind, editionId = null, stageId = null, teamId = null, ruleVersion, input, output, trace, revision, now, id = randomUUID() }) {
+  // ⚠️ **P4 扩展**：加了可选的 `id`（默认仍是随机 UUID）——
+  //    P4 的审计留痕需要「自己指定 id 以便测试与外部引用」。
+  //    不传 id 时行为与 P2 一字不差。
   db.prepare(
     `INSERT INTO computation_snapshots
        (id, kind, edition_id, stage_id, team_id, rule_version, input_json, output_json, trace_json, revision, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    id, kind, editionId, stageId, teamId, ruleVersion,
-    JSON.stringify(input), JSON.stringify(output), JSON.stringify(trace), revision, now,
-  );
+  ).run(id, kind, editionId, stageId, teamId, ruleVersion, JSON.stringify(input), JSON.stringify(output), JSON.stringify(trace), revision, now);
   return id;
 }
 
-export function getComputationRow(db, id) {
-  return db.prepare('SELECT * FROM computation_snapshots WHERE id = ?').get(id) ?? null;
-}
-
-export function listComputationRows(db, { kind = null, stageId = null, limit = 50 } = {}) {
+export function listComputationRows(db, { kind = null, stageId = null, limit = 50, offset = 0 } = {}) {
   const where = [];
   const params = [];
   if (kind) { where.push('kind = ?'); params.push(kind); }
   if (stageId) { where.push('stage_id = ?'); params.push(stageId); }
   const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
-  return db.prepare(
-    `SELECT * FROM computation_snapshots ${clause} ORDER BY created_at DESC LIMIT ?`,
-  ).all(...params, limit);
+  const total = db.prepare(`SELECT COUNT(*) AS n FROM computation_snapshots ${clause}`).get(...params).n;
+  const rows = db.prepare(
+    `SELECT * FROM computation_snapshots ${clause} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`,
+  ).all(...params, limit, offset);
+  return { rows, total };
 }
+
 ```
 
 `platform/src/db/repo/flags.js`：
@@ -716,11 +880,22 @@ export function findIdempotency(db, { key, scope }) {
 export function insertIdempotency(db, {
   key, scope, requestId = null, response = null, now = new Date().toISOString(),
 }) {
-  const res = db.prepare(
-    `INSERT OR IGNORE INTO idempotency_keys (key, scope, request_id, response_json, created_at)
-     VALUES (?, ?, ?, ?, ?)`,
-  ).run(key, scope, requestId, response === null ? null : JSON.stringify(response), now);
-  return res.changes === 1;
+  try {
+    db.prepare(
+      `INSERT INTO idempotency_keys (key, scope, request_id, response_json, created_at)
+       VALUES (?, ?, ?, ?, ?)`,
+    ).run(key, scope, requestId, response === null ? null : JSON.stringify(response), now);
+    return true;
+  } catch (err) {
+    // ⚠️ 只认「唯一约束」这一种失败 —— 其他错误必须继续往上抛。
+    //    ⛔ 不用 `INSERT OR IGNORE`：那会把**所有**约束冲突（含 NOT NULL 违规、
+    //    磁盘写满）一并吞掉 → 调用方把「写失败」误判成「重复请求」，
+    //    客户端以为提交成功了，实际一条都没落库。
+    //    P1 的 T-7 踩过一次同样的坑（registrations 的兜底正则被收紧），
+    //    P2 的 `claimRequestKey` 也是同款实现 —— 这里与全项目口径保持一致。
+    if (/UNIQUE constraint failed: idempotency_keys/i.test(String(err.message))) return false;
+    throw err;
+  }
 }
 ```
 
@@ -864,7 +1039,7 @@ git commit -m "feat(P4): 审计数据模型（005_audit.sql）、仓储层与错
 - Test: `platform/test/audit-snapshot.test.js`
 
 **Interfaces:**
-- Consumes: Task 1 的 `insertComputation` / `getComputationRow` / `nextRevision` / `writeAuditLog` / `queryAuditLog`；P2 的 `scoreStage`（`src/domain/scoring.js`）
+- Consumes: **P2 的** `insertSnapshot` / `getSnapshot`（`computation_snapshots` 表的写入方与读取方 —— 规格写的 `insertComputation` / `getComputationRow` **不存在**，见偏差表 §G 第 1 行 / §H 第 1 行）+ **P4 Task 1 的** `nextRevision` / `writeAuditLog` / `queryAuditLog`；P2 的 `scoreStage`（`src/domain/scoring.js`）
 - Produces:
   - `diffValues(before, after, opts?)` → `[{ path, before, after, note? }]`（纯函数，path 可定位到具体字段）
   - `recordComputation({ db, kind, editionId, stageId, teamId, ruleVersion, input, output, trace, actorId?, now? })` → `{ id, revision }`
@@ -899,13 +1074,52 @@ function setup() {
   const dataDir = mkdtempSync(join(tmpdir(), 'hks-p4snap-'));
   const { db, close } = openDatabase({ dataDir });
   applyMigrations(db, migrationsDir);
+  seedRefs(db);
   return { db, close, dataDir };
+}
+
+/**
+ * 造出被外键引用的行。
+ * ⚠️ 规格原写法直接用 'u_admin' 写审计日志，但 audit_log.actor_id REFERENCES users(id)
+ *    —— 不建被引用的行就会 FOREIGN KEY constraint failed。这是规格自带缺陷。
+ *
+ * ⚠️ 规格还用了 stageId: 'st1'，而 computation_snapshots.stage_id REFERENCES stages(id)，
+ *    stages.edition_id 又 REFERENCES editions(id) —— 外键链三级，全建。
+ *    PRAGMA foreign_keys = ON（src/db/sqlite.js），这条链缺一环就必然炸。
+ */
+function seedRefs(db) {
+  db.exec(`
+    INSERT INTO users (id, name, phone, password_hash, mba_status, org, is_superadmin, active, created_at)
+    VALUES ('u_admin','组委会','13900000998','x','mba',NULL,1,1,'2026-10-20T00:00:00.000Z'),
+           ('u_judge','评委','13900000997','x','mba',NULL,0,1,'2026-10-20T00:00:00.000Z');
+    INSERT INTO editions (id, name, city, starts_at, ends_at, created_at)
+    VALUES ('e1','2026 华东区','上海','2026-01-01T00:00:00.000Z','2026-12-31T00:00:00.000Z','2026-10-20T00:00:00.000Z');
+    INSERT INTO stages (id, edition_id, "key", name, kind, starts_at, ends_at, scoring_config_key, status)
+    VALUES ('st1','e1','s1','初赛','initial','2026-01-01T00:00:00.000Z','2026-02-01T00:00:00.000Z','scoring.final','open');
+    INSERT INTO teams (id, edition_id, name, captain_id, created_at)
+    VALUES ('tm1','e1','一队','u_admin','2026-10-20T00:00:00.000Z'),
+           ('tm2','e1','二队','u_admin','2026-10-20T00:00:00.000Z');
+  `);
 }
 
 // 注入用的确定性引擎：让 diff 机制的断言不依赖 P2 的内部实现细节。
 function stubEngine(input) {
   return {
     teams: input.submissions.map((s) => ({ teamId: s.teamId, total: s.rawScore, seatP: s.rawScore, seatE: 0 })),
+    warnings: [],
+    trace: { steps: [] },
+  };
+}
+
+// 判别性引擎：**真的用 config 参与计算**。
+// ⛔ stubEngine 完全不看 config —— 于是「用当前规则复算」与「用快照规则复算」算出来的
+//    结果一模一样，测不出当前规则到底有没有真的参与复算。期望值恰好相同 ⇒ 测不出差别。
+function configSensitiveEngine(input) {
+  const weight = input.config?.dimensions?.[0]?.weight ?? 0;
+  return {
+    teams: input.submissions.map((s) => ({
+      teamId: s.teamId, total: s.rawScore * weight, seatP: s.rawScore * weight, seatE: 0,
+    })),
     warnings: [],
     trace: { steps: [] },
   };
@@ -1010,6 +1224,7 @@ test('快照被改动后复算必须报错出具体 diff，而不是静默通过
   const paths = r.diff.map((d) => d.path);
   assert.ok(paths.includes('teams[t1].total'), `diff 必须能定位到具体 path，实际：${JSON.stringify(paths)}`);
   assert.ok(r.warnings.some((w) => w.code === 'strict_replay_failed'), '必须显式说明"当时的计算已不可复算"');
+  assert.ok(r.warnings.some((w) => w.code === 'output_mismatch'), '同一规则版本下不一致也必须显式告警');
   close();
   rmSync(dataDir, { recursive: true, force: true });
 });
@@ -1069,6 +1284,126 @@ test('listAuditLog 有权时返回行，并带上 6 个月留档窗口', () => {
   assert.equal(r.rows[0].action, 'x');
   assert.equal(r.retention.archiveMonths, 6);
   assert.equal(r.retention.queryableSince, '2026-04-20T00:00:00.000Z');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+// ── 父代理预审补测（变异检验暴露的三处「有效缺口」）────────────────────────
+// ① 对象分支只取 before 的键 → after 新增的键会被静默吞掉
+test('diffValues 能报出 after 里新增的键（否则新增的一条会被静默吞掉）', () => {
+  const before = { teams: [{ teamId: 't1', total: 80 }] };
+  const after = { teams: [{ teamId: 't1', total: 80 }], extra: 'added' };
+  const diff = diffValues(before, after);
+  assert.equal(diff.length, 1);
+  assert.equal(diff[0].path, 'extra');
+  assert.equal(diff[0].before, null);
+  assert.equal(diff[0].after, 'added');
+});
+
+// ② recordComputation 的 kind / input 校验没有任何用例 → 校验可被无声删掉
+test('recordComputation 缺 kind / 缺 input 都必须报错（缺任何一件套 = 不可复算）', () => {
+  const { db, close, dataDir } = setup();
+  assert.throws(
+    () => recordComputation({ db, kind: '', ruleVersion: BASE_INPUT.ruleVersion, input: BASE_INPUT, output: {}, trace: {} }),
+    /kind/,
+  );
+  assert.throws(
+    () => recordComputation({ db, kind: 'stage_score', ruleVersion: BASE_INPUT.ruleVersion, output: {}, trace: {} }),
+    /input/,
+  );
+  assert.throws(
+    () => recordComputation({ db, kind: 'stage_score', ruleVersion: BASE_INPUT.ruleVersion, input: BASE_INPUT, trace: {} }),
+    /output/,
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+// ③ 服务层没把 teamId 透传给 nextRevision → 同赛段不同队伍的 revision 互相污染
+test('recordComputation 传 teamId 时 revision 按队伍各自编号（不同队伍互不干扰）', () => {
+  const { db, close, dataDir } = setup();
+  const a1 = recordComputation({ db, kind: 'stage_score', stageId: 'st1', teamId: 'tm1', ruleVersion: BASE_INPUT.ruleVersion, input: BASE_INPUT, output: stubEngine(BASE_INPUT), trace: {} });
+  const a2 = recordComputation({ db, kind: 'stage_score', stageId: 'st1', teamId: 'tm1', ruleVersion: BASE_INPUT.ruleVersion, input: BASE_INPUT, output: stubEngine(BASE_INPUT), trace: {} });
+  const b1 = recordComputation({ db, kind: 'stage_score', stageId: 'st1', teamId: 'tm2', ruleVersion: BASE_INPUT.ruleVersion, input: BASE_INPUT, output: stubEngine(BASE_INPUT), trace: {} });
+  assert.equal(a1.revision, 1);
+  assert.equal(a2.revision, 2);
+  assert.equal(b1.revision, 1, '不同队伍的 revision 必须各编各的');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+// ⑥ 两侧同为 null = 没有变化，不得产生假差异（否则会把"没变"误报成"被改过"）
+test('diffValues 对两侧同为 null 的字段不产生假差异（null = 没有值，不是变化）', () => {
+  assert.equal(diffValues({ x: null }, { x: null }).length, 0);
+});
+
+// ⑦ live 模式：用当前库里的数据重建输入（不传 liveInput 就只重放快照，两条路都得通）
+test('复算可走 live 模式：用当前数据重建输入，差异必须显式报出', () => {
+  const { db, close, dataDir } = setup();
+  const output = stubEngine(BASE_INPUT);
+  const { id } = recordComputation({
+    db, kind: 'stage_score', stageId: 'st1', ruleVersion: BASE_INPUT.ruleVersion,
+    input: BASE_INPUT, output, trace: output.trace,
+  });
+  const liveInput = {
+    ...BASE_INPUT,
+    submissions: [
+      { judgeId: 'j1', teamId: 't1', dimension: 'innovation', rawScore: 70 },
+      { judgeId: 'j1', teamId: 't2', dimension: 'innovation', rawScore: 90 },
+    ],
+  };
+  const r = recomputeAndDiff({ db, id, actorId: 'u_admin', now: '2026-10-20T01:00:00.000Z', liveInput, engine: stubEngine });
+  assert.equal(r.identical, false);
+  assert.ok(
+    r.diff.some((d) => d.path === 'teams[t1].total'),
+    `live 模式必须报出当前数据算出的差异，实际：${JSON.stringify(r.diff.map((d) => d.path))}`,
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+// ⑧ 当前规则必须真的参与复算（规则改了权重，复算出来的总分必须跟着变）
+test('当前规则必须真的参与复算（权重变了总分必须跟着变，不能仍用快照里的旧规则）', () => {
+  const { db, close, dataDir } = setup();
+  const output = configSensitiveEngine(BASE_INPUT);
+  const { id } = recordComputation({
+    db, kind: 'stage_score', stageId: 'st1', ruleVersion: BASE_INPUT.ruleVersion,
+    input: BASE_INPUT, output, trace: output.trace,
+  });
+  const rules = { scoring: { final: { version: '2026-10-21', dimensions: [{ key: 'innovation', weight: 0.5 }] } } };
+  const r = recomputeAndDiff({
+    db, id, actorId: 'u_admin', now: '2026-10-20T01:00:00.000Z', rules, engine: configSensitiveEngine,
+  });
+  assert.equal(r.identical, false, '权重变了却报 identical=true = 当前规则没参与复算');
+  assert.ok(
+    r.diff.some((d) => d.path === 'teams[t1].total'),
+    `权重变了，总分必须跟着变，实际 diff：${JSON.stringify(r.diff.map((d) => d.path))}`,
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+// ⑨ 没有留档规则时 retention 必须是 null（不凭空猜一个窗口出来）
+test('没有留档规则时 retention 为 null（不凭空猜一个留档窗口出来）', () => {
+  const { db, close, dataDir } = setup();
+  const r = listAuditLog({ db, filter: {}, viewer: VIEWER, now: '2026-10-20T00:00:00.000Z' });
+  assert.equal(r.retention, null);
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+// ⑩ 记录计算时的审计日志必须带上规则版本（事后查得到当时用的是哪一版规则）
+test('记录计算时审计日志必须带上规则版本（事后查得到当时用的是哪一版规则）', () => {
+  const { db, close, dataDir } = setup();
+  recordComputation({
+    db, kind: 'stage_score', stageId: 'st1', ruleVersion: BASE_INPUT.ruleVersion,
+    input: BASE_INPUT, output: stubEngine(BASE_INPUT), trace: {},
+  });
+  const { rows } = queryAuditLog(db, { action: 'computation.record' });
+  assert.equal(rows.length, 1);
+  const detail = JSON.parse(rows[0].detail_json);
+  assert.equal(detail.ruleVersion, BASE_INPUT.ruleVersion, '审计日志里必须能查到当时的规则版本');
+  assert.equal(detail.revision, 1);
   close();
   rmSync(dataDir, { recursive: true, force: true });
 });
@@ -1179,7 +1514,7 @@ function walk(before, after, path, depth, maxDepth, out) {
 //    · 规则版本已变更 → warnings 里显式说明"无法严格复算"，不静默当作 identical=true。
 import { scoreStage } from '../domain/scoring.js';
 import { diffValues } from '../domain/diff.js';
-import { insertComputation, getComputationRow, nextRevision } from '../db/repo/computations.js';
+import { insertSnapshot, getSnapshot, nextRevision } from '../db/repo/computations.js';
 import { queryAuditLog } from '../db/repo/audit-log.js';
 import { writeAuditLog } from '../audit/log.js';
 import { can } from '../auth/permissions.js';
@@ -1200,7 +1535,7 @@ export function recordComputation({
 
   // revision + 1：重算不覆盖历史，旧 revision 保留供复盘（设计文档 §11.1 事后篡改防护）
   const revision = nextRevision(db, { kind, stageId, teamId });
-  const id = insertComputation(db, {
+  const id = insertSnapshot(db, {
     kind, editionId, stageId, teamId, ruleVersion, input, output, trace, revision, now,
   });
   writeAuditLog(db, {
@@ -1218,7 +1553,7 @@ export function recordComputation({
  * 读取一份计算快照。单条不满足 → 404（不泄露记录是否存在）。
  */
 export function getComputation({ db, id, viewer = null }) {
-  const row = getComputationRow(db, id);
+  const row = getSnapshot(db, id);
   if (!row) throw notFound(`计算快照不存在: ${id}`);
   if (viewer && !can(viewer, 'audit:read', null, db)) throw notFound(`计算快照不存在: ${id}`);
   return {
@@ -1269,7 +1604,7 @@ export function recomputeAndDiff({
   db, id, actorId = null, now = new Date().toISOString(),
   rules = null, liveInput = null, engine = scoreStage,
 }) {
-  const row = getComputationRow(db, id);
+  const row = getSnapshot(db, id);
   if (!row) throw notFound(`计算快照不存在: ${id}`);
 
   const snapshotInput = JSON.parse(row.input_json);
@@ -1400,7 +1735,7 @@ function monthsAgoIso(nowIso, months) {
 - [ ] **Step 5: 运行测试确认通过**
 
 Run: `cd platform && node --test test/audit-snapshot.test.js`
-Expected: PASS（11 个测试全过：audit-snapshot.test.js 11）
+Expected: PASS（19 个测试全过：audit-snapshot.test.js 19 —— 规格自带 11 + 父代理预审补测 8，详见「Task 2 父代理预审修正台账」）
 
 - [ ] **Step 6: 提交**
 
@@ -4995,6 +5330,116 @@ git commit -m "test(P4): 端到端复算验收（改一个原始分 → diff 非
   - **读取类列表**（`GET /api/audit/log`、`GET /api/audit/flags`、`GET /api/appeals`）→ 仍按三态返回 `200 + 空集`（不暴露"有但不给看"）。
   - **批量写入 / 批处理类**（批量评分、批量提交、申诉提交、复算、扫描）→ 返回空必须 4xx。本阶段的落点：申诉理由为空 → 400、证据缺列 → 400、禁用清单为空 → 退出码 2、复算输入缺失 → 抛错、限频未配置 → 500。
 
+### G. Task 1 实施后的偏差（与 `INTERFACES.md` 的文件归属表对齐）
+
+| # | 偏差 | `INTERFACES.md` 的写法 | 本阶段的写法 | 理由 |
+|---|---|---|---|---|
+| 1 | **`src/db/repo/computations.js` 的 `nextRevision` / `insertSnapshot` 被**扩展**而非重定义** | 文件归属表写「`src/db/repo/computations.js` = **P2**，P4 **追加** `nextRevision` / `listComputationRows`」 | P4 **扩展** P2 已有的 `nextRevision`（加可选 `teamId`）与 `insertSnapshot`（加可选 `id`），**只新增** `listComputationRows`；**不建** `insertComputation` / `getComputationRow` 这对与 P2 近义的函数 | ① P2 的 `nextRevision` **已经存在**（`src/services/compute.js:204` 在用），契约那行「P4 追加 `nextRevision`」是**照 P2 落地前的设想写的**，实际落地时 P2 已建 —— 照字面「追加」= 同名导出重复声明 = **整个平台加载不了**（已实跑三种读法全部失败）。② 契约同表明写「计算快照表由 P2 的 `003_review.sql` 建，写入方是 P2 的 `computeStage`」⇒ P4 不该另起一条写路径。③ `listComputationRows` 与 P2 的 `listSnapshots` **语义不同**（最近优先 + 分页 vs 赛段内按 revision 升序），不是同一件事的第二个名字 |
+| 2 | **`insertIdempotency` 用「try + 只认唯一约束」而不是 `INSERT OR IGNORE`** | 契约只给了 `idempotency_keys(key, scope, request_id, response_json, created_at, PRIMARY KEY(key, scope))` 的表结构，**未规定实现** | try INSERT + 兜底正则只认 `UNIQUE constraint failed: idempotency_keys`，其它错误照抛 | `INSERT OR IGNORE` 会把**所有**约束冲突（含 NOT NULL 违规、磁盘写满）一并吞掉 ⇒ 返回 `false`（=「重复请求」）⇒ **调用方以为写成功了，实际一条都没落库**。这正是 P1 的 T-7 踩过的坑，P2 的 `claimRequestKey` 也是同款实现 ⇒ 与全项目口径一致 |
+
+### H. Task 2 实施后的偏差
+
+| # | 偏差 | 规格的写法 | 本阶段的写法 | 理由 |
+|---|---|---|---|---|
+| 1 | **`src/services/audit.js` 复用 P2 的 `insertSnapshot` / `getSnapshot`** | 规格调 `insertComputation` / `getComputationRow` | 改成 `insertSnapshot` / `getSnapshot`（P2 已建，`src/services/compute.js` 在用） | 与 §G 第 1 行**同款裁决**：P2 已建这两个函数；另起近义名 = 同一张表两条写路径 + 同名导出重复声明的风险。**依据**：`INTERFACES.md` 文件归属表「`src/db/repo/computations.js` = **P2**，P4 追加」 |
+| 2 | **测试补 `seedRefs(db)` 外键夹具** | 规格用例直接用 `'u_admin'` / `'st1'` | 加 `seedRefs(db)`：建 `users` / `editions` / `stages` / `teams` 四类被引用的行 | `PRAGMA foreign_keys = ON`（`src/db/sqlite.js`）；不建被引用的行必然 `FOREIGN KEY constraint failed`（与 P4-5 同款） |
+| 3 | **测试补 8 例** | 规格自带 11 例 | 19 例 | 变异检验暴露的**有效缺口**（详见「Task 2 父代理预审修正台账」二）；补测**只加断言不改语义** |
+
 ---
 
 *配套：`../specs/2026-10-20-heikesong-platform-design.md`｜`../requirements-traceability.md`｜`../rule-decisions.md`｜`../`*
+
+---
+
+## Task 1 父代理预审修正台账（2026-10-21）
+
+> Task 1 是 P4 的地基：**4 张新表 + 仓储层 + 事务/错误基础设施**。
+> 实施前做了一次**独立工程实跑**（把规格的代码块抽到 `/tmp` 的副本里跑通再落盘 —— 「先跑后派」），
+> **实证了 5 处规格自带缺陷**；实施完成后做**变异检验**，变异体 **20** 个，
+> 首轮 **8 条存活**，补完用例后 **20/20 杀灭**。
+
+### 一、预审发现的规格缺陷（**规格自带代码块里的错**，不是实现跑偏）
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| **P4-1** | **Critical** | **`src/db/repo/computations.js` 的写法会让**整个平台无法加载**。P2 的 Task 6 已经建了这个文件里的 `nextRevision`（`src/services/compute.js:204` 在用它），而规格的代码块**又定义了一遍** `nextRevision` / `insertComputation` / `getComputationRow` —— 同名导出重复声明 ⇒ `SyntaxError` ⇒ 模块加载失败 ⇒ **平台全挂** | 沙箱实跑三种字面读法：**读法 A**（片段当整文件覆盖）→ `AppError`/`appError` 被抹、`audit_log` 的 P2 写入口消失 → `src/audit/log.js` 导入失败；**读法 B**（片段按追加）→ `nextRevision` 重复导出 + `randomUUID` 重复 import → SyntaxError；**读法 C**（整文件覆盖）→ P2 的 `insertSnapshot`/`getSnapshot`/`getSnapshotInStage`/`upsertStageResult`/`resetStageResults` 全被抹 → `src/services/compute.js` 导入失败。**三种读法都让 `server.js` 加载不了** | **不重定义 P2 的函数**：`nextRevision` **加可选 `teamId`**（不传时行为与 P2 一字不差）、`insertSnapshot` **加可选 `id`**（默认仍是随机 UUID）；P4 **直接复用** P2 的 `insertSnapshot` / `getSnapshot`，**只新增** `listComputationRows`（语义与 P2 的 `listSnapshots` 不同：最近优先 + 分页，给审计列表用）。**依据**：`INTERFACES.md` 的文件归属表「`src/db/repo/computations.js` = **P2**，P4 追加」 |
+| **P4-2** | **Critical** | **`src/errors.js` 与 `src/db/repo/audit-log.js` 是「追加型片段」**，规格却把它们写成整文件代码块。照抄即**抹掉 P0 的 `AppError`/`appError` 与 P2 的 `insertAuditLogRow`/`queryAuditLogRows`** | 同上「读法 A」的实跑输出 | 两个块改成「**追加段**」：计划里放的正是实现相对上游**多出来的那一段**（逐字），并在块首写明「P0/P2 已建，本阶段只追加」 |
+| **P4-3** | **Important** | **`insertIdempotency` 用 `INSERT OR IGNORE`** —— 那会把**所有**约束冲突（含 NOT NULL 违规、磁盘写满）一并吞掉 ⇒ 返回 `false`（=「重复请求」）⇒ 调用方以为写成功了，实际一条都没落库。**这正是 P1 的 T-7 踩过的坑**（registrations 的兜底正则被收紧） | 变异 M17（兜底放宽成「所有错误都返回 false」）→ 存活：没有用例能区分「重复请求」与「写失败」 | 改成 **P2 `claimRequestKey` 同款**：try INSERT + **只认** `UNIQUE constraint failed: idempotency_keys` 的兜底正则，其它错误照抛；并补一条「NOT NULL 违规必须继续往上抛」的用例 |
+| **P4-4** | **Important** | **规格自带的用例本身有三处与实现矛盾**（照抄必然红） | ① `listFlagRows` / `listAppealRows` 规格实现返回 `{rows, total}`，但用例按数组用（`after.length` / `after[0].reviewed_by`）—— 而 Task 4/5 的代码块（`const { rows, total } = listFlagRows(...)`）证明**对象形状才是正确口径**，是这三条用例写错了；② `assert.throws(..., /BOOM/)` 匹配的是 `message`，而 `appError(500,'BOOM','中途失败')` 的 `message` 是「中途失败」、`code` 才是 `BOOM`；③ 限频用例给两个 bucket 传了**同一个 `now`**，但注释与断言描述的是「一个在窗口内、一个在窗口外」 | 跑规格自带用例 → 4 条红（2 条 FOREIGN KEY + 1 条 `/BOOM/` + 1 条限频计数 0≠2） | ① 用例改成解构 `{ rows }`；② 改成按 **`code`** 断言；③ 限频数据集改成**两个 bucket 落在窗口内外两侧**（s:100 在窗口内 count 2、s:050 在窗口外 count 1），并补一条「全量口径 3 ≠ 窗口口径 2」的判别性断言 |
+| **P4-5** | **Important** | **规格的测试没有建被外键引用的行** —— `audit_log.actor_id REFERENCES users(id)`、`computation_snapshots.stage_id REFERENCES stages(id)`、`team_id REFERENCES teams(id)` ⇒ 照抄用例直接 `FOREIGN KEY constraint failed` | 跑规格自带用例 → 4 条红 | 测试加一个 `seedRefs(db)`：`u_admin` / `ed_1` / `st1` / `t1` / `t2` |
+
+### 二、变异检验发现的实现盲区
+
+> 变异体 **20** 个（迁移的表/列/约束改写 / 错误函数状态码改写 / 事务回滚摘除 /
+> 审计查询的过滤与排序改写 / revision 编号与 teamId 收窄摘除 / 快照 id 与排序摘除 /
+> flag 的 open 过滤与 status 过滤与 reviewed_by 写入摘除 / 幂等兜底放宽 /
+> 滑动窗口放宽 / 锁过期判断摘除 / 申诉裁决字段摘除），
+> 在 `/tmp/p4t1/work` 的副本上跑 `test/audit-repo.test.js`，**测试必须失败才算杀灭**。
+> 变异脚本：`/tmp/p4-mutate/t1.mjs`。
+
+**首轮 8 条存活**，根因分三类：
+
+| 现象 | 根因 | 处置 |
+|---|---|---|
+| M02 / M05 存活 | **NOT NULL / DEFAULT 零覆盖** —— `flagged_reviews.status`、`appeals.status` 的必填与默认值没有任何断言 | 补「005 迁移的 NOT NULL / DEFAULT 符合契约」用例（`PRAGMA table_info` 逐列断言） |
+| M06 存活 | **错误快捷函数零覆盖** —— 用例只测了 `appError` 本身，六个快捷函数的状态码一个都没断言（`notFound` 改成 400 也没人发现） | 补「错误快捷函数的状态码必须逐个正确」用例（含 `instanceof AppError` 与 `detail` 透传） |
+| M13 存活 | **`listComputationRows` 零覆盖** —— 仓储里加了函数却没有任何用例 | 补用例：倒序 + kind/stageId 过滤 + total 不受 limit 影响 |
+| M14 / M15 存活 | **数据集不判别** —— 库里只有 1 条 flag ⇒「按 status 过滤」与「不过滤」结果相同；`findOpenFlag` 也从没查过「已裁决的 flag 还在不在 open 集合里」 | 补第二条 flag（一条 open、一条 confirmed），并断言「已裁决的不再被未决查询找到」 |
+| M10 存活 | **数据集不判别** —— 两支队的 revision 都是 1 ⇒「按队伍收窄」与「赛段级」算出的下一轮都是 2 | 两队的 revision 改成**不对称**（t1=3、t2=1）⇒ 收窄口径 4/2、赛段口径 4，三者互不相同 |
+| M12 构造失效 | 变异锚点写成 `}).run(id, ...`，实现里是 `).run(id, ...` | 锚点修正后立即被杀灭 |
+
+**Task 1 的测试条数口径**：audit-repo **17**（规格自带 12 + 变异检验补测 5）。
+
+**最终结果**：变异体 20 → **KILLED 20 / 等价变异体 0 / 有效缺口 0**；
+`audit-repo.test.js` **17/17**；P4 全量 **726/726**（P3 的 709 + P4 的 17）
+> ⚠️ **数字订正（2026-10-21 复核）**：此处原写「723/723」，**实测为 726/726** ——
+> `git worktree add --detach 0345ccd` 的纯净态跑 `node --test` 得到的真实数字是 726。
+> 订正依据：P4 Task 7 的 worker 与 Task 2 的父代理**各自独立实测**，结论一致（726）。以实测为准。
+`node scripts/migrate.js` 连跑两次 → 第二次「本次无新迁移」，输出 `迁移完成，当前版本 5`。
+---
+
+## Task 2 父代理预审修正台账（2026-10-21）
+
+> Task 2 = **计算快照与复算 diff**（`src/domain/diff.js` + `src/services/audit.js` + `test/audit-snapshot.test.js`）。
+> 实施前做了一次**独立工程实跑**（把规格的代码块抽到副本里跑通再落盘 —— 「先跑后派」），
+> **实证了 3 处规格自带缺陷**；实施完成后做**变异检验**，变异体 **28** 个，分 **4 轮**，
+> 最终 **28/28 杀灭**（等价变异体 0、有效缺口 0）。
+
+### 一、预审发现的规格缺陷（**规格自带代码块里的错**，不是实现跑偏）
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| **P4-T2-1** | **Critical** | 规格的 `src/services/audit.js` 调 `insertComputation` / `getComputationRow` —— 这两个函数**不存在**。P2 已建的是 `insertSnapshot` / `getSnapshot`（同款近义名） | 落地首跑：`TypeError: insertComputation is not a function` | 改成**复用 P2 的 `insertSnapshot` / `getSnapshot`**（§H 第 1 行；与 P4-1 同款裁决：**不重定义 P2 的函数**） |
+| **P4-T2-2** | **Critical** | 规格的 `src/services/audit.js` 里 `getComputationRow` 出现**两次**（`getComputation` 与 `recomputeAndDiff` 各一处）—— 只替换首个会漏掉第二处 | 首轮替换后残留一处旧名 ⇒ 脚本的「还有没换掉的旧名字」断言拦下 | 改成**全局替换**（`split/join`），并保留「旧名一个都不能剩」的断言 |
+| **P4-T2-3** | **Important** | 规格的测试**没有建被外键引用的行** —— `audit_log.actor_id → users(id)`、`computation_snapshots.stage_id → stages(id) → editions(id)`、`team_id → teams(id)`；而 `PRAGMA foreign_keys = ON` | 跑规格自带用例 → **7 条红**（`FOREIGN KEY constraint failed`） | 测试加 `seedRefs(db)`：`u_admin`/`u_judge` + `editions(e1)` + `stages(st1)` + `teams(tm1,tm2)` |
+
+### 二、变异检验发现的实现盲区
+
+> 变异体 **28** 个（diff 的 epsilon / 数组 path 主键 / 新增键 / 同值短路 / 数字分支 /
+> audit 的四项入参校验 / teamId 透传 / 权限判定 / input·output 原样返回 /
+> 规则版本识别与入 diff / 当前规则参与复算 / 严格重放比对 / 两条告警 / identical 取值 /
+> 审计 action / live 模式 / 可见性过滤 / 留档窗口 / 自然月回推 / detail 记规则版本），
+> 在 `/tmp/p4t2/work` 的副本上跑 `test/audit-snapshot.test.js`，**测试必须失败才算杀灭**。
+> 变异脚本：`/tmp/p4-mutate/t2.mjs`。
+
+| 轮次 | 存活 | 根因 | 处置 |
+|---|---|---|---|
+| 第 1 轮 | M04 / M08 / M09 / M10 / M18 / M20 / M23 / M25 | **有效缺口** —— 用例没覆盖「after 新增的键」「缺 kind」「缺 input」「缺 output」「teamId 透传」「live 模式」「留档兜底」「`output_mismatch` 告警」 | 补 7 例（用例 12/13/14/16/18）+ 2 条断言（用例 7 的 `output_mismatch`、用例 13 的缺 output） |
+| 第 2 轮 | M05 / M18 / M20 / M24 | **有效缺口**（续）—— 「null 同值不得假差异」「当前规则真参与复算」「留档兜底为 null」「审计 detail 记规则版本」 | 补用例 15/17/19，并引入**判别性引擎** `configSensitiveEngine` |
+| 第 3 轮 | M28 | 变异锚点写成 6 空格缩进，实现是 4 空格 ⇒ 锚点没命中 | 锚点修正后立即被杀灭 |
+| 第 4 轮 | — | — | **28/28 全杀** |
+
+**⭐ 判别性数据集的一处关键教训（与 P3 终审 M-1/M-2 同源）**：
+规格自带的 `stubEngine` **完全不看 `config`** —— 于是「用当前规则复算」与「用快照规则复算」算出来的结果
+**恰好相同**，期望值相同 ⇒ 测不出「当前规则到底有没有真的参与复算」（M18 首轮存活）。
+处置：新增 `configSensitiveEngine`（`total = rawScore × config.dimensions[0].weight`），
+并用「权重 0.2 → 0.5」的**不对称数据集** —— 只有当前规则真的参与，`teams[t1].total` 才会变。
+
+**Task 2 的测试条数口径**：audit-snapshot **19**（规格自带 11 + 父代理预审补测 8）。
+
+**最终结果**：变异体 28 → **KILLED 28 / 等价变异体 0 / 有效缺口 0**；
+`audit-snapshot.test.js` **19/19**；P4 全量 **745/745**（Task 1 后的 726 + Task 2 的 19）。
+
+> **关于全量基线数字**：Task 1 台账原写「723/723」，**实测为 726/726**
+> （`git worktree add --detach 0345ccd` 纯净态实跑；P4 Task 7 的 worker 独立实测结论一致）。
+> 本阶段起一律**以实跑数字为准**。
