@@ -1,0 +1,80 @@
+# deploy/docker-compose.yml — 单容器编排
+#
+# 依据：设计文档 §14.2「deploy/docker-compose.yml（单容器编排）」
+#
+# ⛔ 单写者约束：这里的 command 里【绝不】加多 worker 进程 / 多进程集群启动参数，
+#    也不要用 compose 的 scale 扩副本。
+#    SQLite 官方：There can only be a single writer at a time。
+#    多个 Node 进程同时写同一个 .db 文件是 SQLITE_BUSY 的真正来源。
+#    ⚠️ 本文件【不】写出多进程参数的具体名字：规格 test/deploy-assets.test.js
+#       按字面扫全文（注释里出现同样判违规），参数名见 P6 计划 Task 2 章节。
+# ✅ 扩容只能加「读」：静态资源交给 nginx 直出。
+# ⚠️ WAL 要求所有进程在同一台主机；要多机部署必须换 Postgres，没有第三条路。
+#
+# ⚠️ 本文件在 platform/deploy/ 下，compose 的相对路径以本文件所在目录为基准
+#    （compose 的 project directory = 第一个 compose 文件所在目录）。
+#    运行： cd platform && docker compose -f deploy/docker-compose.yml up -d
+#    ⇒ 挂载源 `..` = platform/，代码进容器，升级靠替换宿主机目录。
+#
+# ⚠️ 网络口径（照实写：src/server.js 只绑回环）：
+#    src/server.js 的 server.listen(port, '127.0.0.1') —— 进程只听回环。
+#    ⇒ 若用 ports 端口映射，宿主机的 127.0.0.1:8080 会被转发到容器的 eth0 地址，
+#      而进程不听那里 → 连接被拒（容器 healthy，但宿主机 curl 不通、静默失败）。
+#    ⇒ 因此这里用 network_mode: host：容器与宿主机共享网络栈，
+#      进程绑的 127.0.0.1:8080 就是宿主机的 127.0.0.1:8080 ——
+#      nginx 的反代目标（127.0.0.1:8080）不用改，Node 也不会暴露到公网。
+#    ⚠️ host 网络只保证 Linux 宿主机的语义；Docker Desktop（macOS/Windows）上
+#       容器拿到的是 Linux 虚拟机的网络栈，宿主机 127.0.0.1:8080 仍不通。
+#    （若日后把 src/server.js 改成可绑 0.0.0.0，这里可换回 ports 映射。）
+
+name: heikesong
+
+services:
+  app:
+    image: node:24-alpine
+    container_name: heikesong-app
+    working_dir: /app
+    # ⛔ 不要改成多进程启动参数，也不要加多 worker 进程
+    command: ["node", "src/server.js"]
+    restart: always
+    environment:
+      PORT: "8080"
+      DATA_DIR: "/data"
+      NODE_ENV: "production"
+      # ⛔⛔ **绝对不要打开 DEMO_MODE**（2026-10-21 漂移审计修正 I-5）：
+      #    DEMO_MODE 一旦打开，会把 /src/domain/* 与 /rules/* 挂到 HTTP 上 ——
+      #    那是**领域层算法源码**与**全部规则配置**。生产部署下必须一律 404。
+      #    这道门只给本地预览（scripts/serve-demo.js）与开发服务器用。
+    # 只绑回环：Node 自己 listen 127.0.0.1（src/server.js 的实际行为），
+    # 宿主机侧即 127.0.0.1:8080，对外仍由 nginx 反代。
+    network_mode: host
+    volumes:
+      # platform/ 只读挂载：代码不进容器，升级靠替换宿主机目录
+      - ..:/app:ro
+      # 数据目录持久化（备份与恢复都在这个卷里）
+      - app_data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8080/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  app_data:

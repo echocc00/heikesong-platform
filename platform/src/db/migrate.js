@@ -115,6 +115,18 @@ export function applyMigrations(db, migrationsDir) {
     }
   }
 
+  return { applied, version: currentVersion(db) ?? 0 };
+}
+
+// src/db/migrate.js —— 【追加】到 P0 已建的文件里
+//
+// 读当前已应用的 schema 版本（迁移表里的 MAX(version)）。
+// 依据：运维脚本（backup / restore）需要知道「这个备份对应哪个 schema 版本」，
+//   但**不能自己写 SQL** —— 全局约束「所有 SQL 收在 src/db/repo/」，
+//   而 src/db/migrate.js 是该守卫**唯一豁免的文件**（见 platform/test/sql-boundary.test.js
+//   的豁免清单与「迁移执行器确实执行 SQL」那条断言）。
+// @returns {number|null} 一次迁移都没应用过时返回 null
+export function currentVersion(db) {
   const row = db.prepare('SELECT MAX(version) AS v FROM schema_migrations').get();
-  return { applied, version: row?.v ?? 0 };
+  return row?.v ?? null;
 }

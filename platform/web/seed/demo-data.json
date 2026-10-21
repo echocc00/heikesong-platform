@@ -1,0 +1,110 @@
+{
+  "meta": {
+    "id": "demo-2026-10-20",
+    "title": "演示数据 · 一字 AI 商业黑客松",
+    "ruleVersion": "2026-10-20",
+    "note": "演示数据不跨人共享（各自浏览器独立）。每条 trace 分支都有对应数据，见 expectations。"
+  },
+  "edition": { "id": "ed_demo", "name": "2026 一字 AI 商业黑客松（演示）", "city": "杭州" },
+  "users": [
+    { "id": "mba_captain", "name": "演示队长（MBA）", "mbaStatus": "mba" },
+    { "id": "mba_captain2", "name": "演示队长乙（MBA）", "mbaStatus": "mba" },
+    { "id": "demo_member_1", "name": "演示组员甲", "mbaStatus": "member" },
+    { "id": "demo_member_2", "name": "演示组员乙", "mbaStatus": "member" },
+    { "id": "demo_member_3", "name": "演示组员丙", "mbaStatus": "other" }
+  ],
+  "taskPackages": [
+    { "id": "tp_retail", "title": "门店缺货预测与补货建议", "enterpriseId": "ent_demo_retail", "enterpriseName": "演示零售集团", "isFreeBrief": false, "grade": "A", "commitment": "试点承诺" },
+    { "id": "tp_manu", "title": "质检工单智能分派", "enterpriseId": "ent_demo_mfg", "enterpriseName": "演示制造集团", "isFreeBrief": false, "grade": "B", "commitment": "对标试点" },
+    { "id": "tp_free", "title": "自由命题 · 社区助餐排班", "enterpriseId": null, "enterpriseName": null, "isFreeBrief": true, "grade": null, "commitment": "无" }
+  ],
+  "judges": [
+    { "id": "j_lenient", "name": "评委甲（宽松）", "seat": "expert" },
+    { "id": "j_strict", "name": "评委乙（严格）", "seat": "expert" },
+    { "id": "j_mid1", "name": "评委丙", "seat": "expert" },
+    { "id": "j_mid2", "name": "评委丁", "seat": "expert" },
+    { "id": "j_cross", "name": "评委戊（跨领域）", "seat": "expert" },
+    { "id": "j_partial", "name": "评委己（只交了一份打分）", "seat": "expert" }
+  ],
+  "teams": [
+    { "id": "t_alpha", "name": "拾光队", "packageId": "tp_retail", "captainId": "mba_captain", "memberIds": ["mba_captain", "demo_member_1", "demo_member_2"] },
+    { "id": "t_beta", "name": "回声队", "packageId": "tp_retail", "captainId": "mba_captain2", "memberIds": ["mba_captain2", "demo_member_3"] },
+    { "id": "t_gamma", "name": "北斗队", "packageId": "tp_manu", "captainId": "mba_captain", "memberIds": ["mba_captain", "demo_member_1"] },
+    { "id": "t_delta", "name": "风信子队", "packageId": "tp_manu", "captainId": "mba_captain2", "memberIds": ["mba_captain2", "demo_member_2", "demo_member_3"] },
+    { "id": "t_epsilon", "name": "自由花队", "packageId": "tp_free", "captainId": "mba_captain", "memberIds": ["mba_captain", "demo_member_1"] }
+  ],
+  "reviews": {
+    "j_lenient": { "t_alpha": { "innovation": 88, "feasibility": 84, "completeness": 85, "collaboration": 90 }, "t_beta": { "innovation": 88, "feasibility": 84, "completeness": 85, "collaboration": 90 }, "t_gamma": { "innovation": 70, "feasibility": 78, "completeness": 72, "collaboration": 75 }, "t_delta": { "innovation": 82, "feasibility": 79, "completeness": 81, "collaboration": 78 }, "t_epsilon": { "innovation": 66, "feasibility": 72, "completeness": 68, "collaboration": 70 } },
+    "j_strict": { "t_alpha": { "innovation": 74, "feasibility": 70, "completeness": 73, "collaboration": 75 }, "t_beta": { "innovation": 74, "feasibility": 70, "completeness": 73, "collaboration": 75 }, "t_gamma": { "innovation": 58, "feasibility": 64, "completeness": 61, "collaboration": 62 }, "t_delta": { "innovation": 68, "feasibility": 63, "completeness": 65, "collaboration": 64 }, "t_epsilon": { "innovation": 52, "feasibility": 58, "completeness": 55, "collaboration": 57 } },
+    "j_mid1": { "t_alpha": { "innovation": 81, "feasibility": 77, "completeness": 79, "collaboration": 83 }, "t_beta": { "innovation": 81, "feasibility": 77, "completeness": 79, "collaboration": 83 }, "t_gamma": { "innovation": 65, "feasibility": 70, "completeness": 66, "collaboration": 69 }, "t_delta": { "innovation": 76, "feasibility": 72, "completeness": 75, "collaboration": 71 }, "t_epsilon": { "innovation": 60, "feasibility": 65, "completeness": 61, "collaboration": 64 } },
+    "j_mid2": { "t_alpha": { "innovation": 79, "feasibility": 76, "completeness": 77, "collaboration": 81 }, "t_beta": { "innovation": 79, "feasibility": 76, "completeness": 77, "collaboration": 81 }, "t_gamma": { "innovation": 64, "feasibility": 69, "completeness": 67, "collaboration": 68 }, "t_delta": { "innovation": 75, "feasibility": 71, "completeness": 74, "collaboration": 70 }, "t_epsilon": { "innovation": 59, "feasibility": 64, "completeness": 60, "collaboration": 63 } },
+    "j_cross": { "t_alpha": { "innovation": 83, "feasibility": 80, "completeness": 81, "collaboration": 85 }, "t_beta": { "innovation": 83, "feasibility": 80, "completeness": 81, "collaboration": 85 }, "t_gamma": { "innovation": 69, "feasibility": 73, "completeness": 70, "collaboration": 72 }, "t_delta": { "innovation": 79, "feasibility": 75, "completeness": 78, "collaboration": 76 }, "t_epsilon": { "innovation": 63, "feasibility": 67, "completeness": 65, "collaboration": 67 } },
+    "j_partial": { "t_gamma": { "feasibility": 90 } }
+  },
+  "enterpriseConfirmations": [
+    { "id": "ec_alpha", "teamId": "t_alpha", "enterpriseId": "ent_demo_retail", "dimension": "enterprise", "rawScore": 82, "crossJudgeId": "j_cross", "signatoryUserId": "u_ent_retail", "content": "解决门店缺货预测环节，预计 2 周内接入试点，我方投入数据接口" },
+    { "id": "ec_beta", "teamId": "t_beta", "enterpriseId": "ent_demo_retail", "dimension": "enterprise", "rawScore": 82, "crossJudgeId": "j_cross", "signatoryUserId": "u_ent_retail", "content": "解决门店缺货预测环节，预计 2 周内接入试点，我方投入数据接口" },
+    { "id": "ec_gamma", "teamId": "t_gamma", "enterpriseId": "ent_demo_mfg", "dimension": "enterprise", "rawScore": 75, "crossJudgeId": null, "signatoryUserId": "u_ent_mfg", "content": "解决质检工单分派环节，预计 4 周内对标试点" },
+    { "id": "ec_delta", "teamId": "t_delta", "enterpriseId": "ent_demo_mfg", "dimension": "enterprise", "rawScore": 80, "crossJudgeId": "j_cross", "signatoryUserId": "u_ent_mfg", "content": "解决质检工单分派环节，预计 4 周内对标试点" }
+  ],
+  "peerReviews": [
+    { "fromTeamId": "t_gamma", "toTeamId": "t_alpha", "score": 70 },
+    { "fromTeamId": "t_delta", "toTeamId": "t_alpha", "score": 72 },
+    { "fromTeamId": "t_gamma", "toTeamId": "t_beta", "score": 60 },
+    { "fromTeamId": "t_delta", "toTeamId": "t_beta", "score": 58 },
+    { "fromTeamId": "t_alpha", "toTeamId": "t_gamma", "score": 65 },
+    { "fromTeamId": "t_beta", "toTeamId": "t_gamma", "score": 66 },
+    { "fromTeamId": "t_alpha", "toTeamId": "t_delta", "score": 68 },
+    { "fromTeamId": "t_epsilon", "toTeamId": "t_delta", "score": 67 },
+    { "fromTeamId": "t_alpha", "toTeamId": "t_epsilon", "score": 60 },
+    { "fromTeamId": "t_beta", "toTeamId": "t_epsilon", "score": 61 }
+  ],
+  "selfReviews": [
+    { "teamId": "t_alpha", "dimension": "innovation", "rawScore": 85 },
+    { "teamId": "t_beta", "dimension": "innovation", "rawScore": 85 },
+    { "teamId": "t_gamma", "dimension": "innovation", "rawScore": 50 },
+    { "teamId": "t_delta", "dimension": "innovation", "rawScore": 95 }
+  ],
+  "milestones": [
+    { "teamId": "t_alpha", "key": "problem_confirmed", "achieved": true, "countsTowardTier": true, "isDataOrPrototype": false },
+    { "teamId": "t_alpha", "key": "data_connected", "achieved": true, "countsTowardTier": true, "isDataOrPrototype": true },
+    { "teamId": "t_beta", "key": "problem_confirmed", "achieved": true, "countsTowardTier": true, "isDataOrPrototype": false },
+    { "teamId": "t_gamma", "key": "problem_confirmed", "achieved": true, "countsTowardTier": true, "isDataOrPrototype": false },
+    { "teamId": "t_gamma", "key": "data_connected", "achieved": true, "countsTowardTier": true, "isDataOrPrototype": true },
+    { "teamId": "t_gamma", "key": "demo_ready", "achieved": true, "countsTowardTier": true, "isDataOrPrototype": true },
+    { "teamId": "t_delta", "key": "problem_confirmed", "achieved": true, "countsTowardTier": true, "isDataOrPrototype": false },
+    { "teamId": "t_delta", "key": "data_connected", "achieved": true, "countsTowardTier": true, "isDataOrPrototype": true },
+    { "teamId": "t_delta", "key": "demo_ready", "achieved": true, "countsTowardTier": true, "isDataOrPrototype": true },
+    { "teamId": "t_delta", "key": "pilot_contract", "achieved": true, "countsTowardTier": true, "isDataOrPrototype": false },
+    { "teamId": "t_delta", "key": "iterations", "achieved": true, "countsTowardTier": true, "isDataOrPrototype": false }
+  ],
+  "signoffs": [
+    { "teamId": "t_delta", "milestoneKey": "pilot_contract", "department": "业务部", "revokedAt": null, "isBusinessDepartment": true },
+    { "teamId": "t_gamma", "milestoneKey": "problem_confirmed", "department": "技术部", "revokedAt": null, "isBusinessDepartment": false }
+  ],
+  "behaviorEvents": [
+    { "id": "be_1", "teamId": "t_alpha", "type": "weekly_progress", "evidence": "{\"repo\":\"https://demo.local/alpha\",\"version\":\"v0.1\",\"artifact\":\"第 1 周进度截图\"}", "created_at": "2026-10-12T10:00:00Z" },
+    { "id": "be_2", "teamId": "t_alpha", "type": "weekly_progress", "evidence": "{\"repo\":\"https://demo.local/alpha\",\"version\":\"v0.2\",\"artifact\":\"第 2 周进度截图\"}", "created_at": "2026-10-19T10:00:00Z" },
+    { "id": "be_3", "teamId": "t_alpha", "type": "workshop_output", "evidence": "{\"output\":\"workshop 课后产出：缺货预测 Demo\"}", "created_at": "2026-10-19T12:00:00Z" },
+    { "id": "be_4", "teamId": "t_alpha", "type": "first_demo", "evidence": "{\"version\":\"v0.3\",\"artifact\":\"首次可运行 Demo\"}", "created_at": "2026-10-20T09:00:00Z" },
+    { "id": "be_5", "teamId": "t_beta", "type": "weekly_progress", "evidence": "{\"repo\":\"https://demo.local/beta\",\"version\":\"v0.1\",\"artifact\":\"第 1 周进度截图\"}", "created_at": "2026-10-12T10:00:00Z" },
+    { "id": "be_6", "teamId": "t_delta", "type": "weekly_progress", "evidence": "{\"repo\":\"https://demo.local/delta\",\"version\":\"v0.1\",\"artifact\":\"第 1 周进度截图\"}", "created_at": "2026-10-12T10:00:00Z" },
+    { "id": "be_7", "teamId": "t_delta", "type": "milestone_on_time", "evidence": "{\"milestone\":\"pilot_contract\",\"onTime\":true}", "created_at": "2026-10-18T10:00:00Z" },
+    { "id": "be_8", "teamId": "t_gamma", "type": "enterprise_meeting", "evidence": "{\"enterpriseConfirmationId\":\"ec_gamma\"}", "created_at": "2026-10-17T10:00:00Z" }
+  ],
+  "expectations": {
+    "tiedTeams": ["t_alpha", "t_beta"],
+    "tiebreakSeparatedBy": "peer",
+    "unnormalizedDimension": "feasibility",
+    "unnormalizedJudge": "j_partial",
+    "missingDualSignatureTeam": "t_gamma",
+    "freeBriefTeam": "t_epsilon",
+    "selfEvalWrittenExplanationTeam": "t_delta",
+    "selfEvalJudgeQuestionTeam": "t_gamma",
+    "selfEvalWithinThresholdTeams": ["t_alpha", "t_beta"],
+    "missingSelfEvalTeam": "t_epsilon",
+    "trimmedDimensions": ["innovation", "feasibility", "completeness", "collaboration"],
+    "behaviorScores": { "t_alpha": 17, "t_beta": 2, "t_gamma": 5, "t_delta": 7, "t_epsilon": 0 },
+    "tiers": { "t_alpha": "B", "t_beta": "C", "t_gamma": "A", "t_delta": "S", "t_epsilon": "D" }
+  }
+}

@@ -1,0 +1,72 @@
+# deploy/heikesong.service — systemd 守护单元
+#
+# 依据：设计文档 §14.2「deploy/heikesong.service（systemd 守护）」
+#
+# ⚠️ 占位符说明（由 deploy/install.sh 自动替换，也可手工替换后 cp 到 /etc/systemd/system/）：
+#   __APP_DIR__   程序目录（默认 /opt/heikesong/platform）
+#   __DATA_DIR__  数据目录（默认 /var/lib/heikesong/data）
+#   __RUN_USER__  运行用户（默认 heikesong）
+#
+# ⛔ 单写者约束：这里【绝不】加「多 worker 进程」或「多进程集群」启动参数。
+#    SQLite 官方：There can only be a single writer at a time。
+#    多个 Node worker 进程同时写同一个 .db 文件是 SQLITE_BUSY 的真正来源。
+#    R-OPS-03（可扩容）：**扩容只能加「读」** —— 静态资源交给 nginx 直出，几百并发静态请求
+#    根本不进 Node 进程；本单元**永远只起一个** Node 进程（见下方 ExecStart 与下面的断言）。
+#    ⚠️ 本文件【不】写出多进程参数的具体名字：规格 test/deploy-assets.test.js
+#       按字面扫全文（注释里出现同样判违规），参数名见 P6 计划 Task 2 章节。
+# ✅ 扩容只能加「读」：静态资源交给 nginx 直出，几百并发静态请求根本不进 Node 进程。
+# ⚠️ WAL 要求所有进程在同一台主机；要多机部署必须换 Postgres，没有第三条路。
+
+[Unit]
+Description=Heikesong Platform (单进程 Node · 单写者 SQLite)
+Documentation=file:__APP_DIR__/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__RUN_USER__
+Group=__RUN_USER__
+WorkingDirectory=__APP_DIR__
+
+# 环境文件：PORT / DATA_DIR / SESSION_TTL_DAYS / SESSION_ABSOLUTE_TTL_DAYS / NODE_ENV
+# ⛔ 这里不放任何口令：口令只在初始化管理员时用一次，不落盘。
+EnvironmentFile=-/etc/heikesong/platform.env
+
+ExecStart=/usr/bin/env node __APP_DIR__/src/server.js
+
+# 崩溃自动拉起
+Restart=always
+RestartSec=3
+# 优雅停机：先 SIGTERM 等它关库，再 SIGKILL
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# 日志走 journald： journalctl -u heikesong -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=heikesong
+
+# 环境默认值（EnvironmentFile 里的同名变量优先）
+Environment=PORT=8080
+Environment=DATA_DIR=__DATA_DIR__
+Environment=NODE_ENV=production
+# ⛔⛔ **绝对不要打开 DEMO_MODE**（2026-10-21 漂移审计修正 I-5）：
+#    DEMO_MODE 一旦打开，会把 /src/domain/* 与 /rules/* 挂到 HTTP 上 ——
+#    那是**领域层算法源码**（打分 / 破同分 / 防作弊判定）与**全部规则配置**
+#    （权重表、破同分链、行为分、段位表）。生产部署下必须一律 404。
+#    这道门只给本地预览（scripts/serve-demo.js）与开发服务器用。
+
+# 资源与安全
+LimitNOFILE=65535
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=__DATA_DIR__
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

@@ -180,6 +180,13 @@ platform/package.json               scripts 增加 backup / restore / build:demo
 - Test: `platform/test/backup.test.js`
 - Test: `platform/test/restore.test.js`
 
+> **【2026-10-21 实施补记】** 规格自带的 **8 个用例逐字保留**；实施阶段**追加 10 个判别性用例**
+> （保留策略的「份数 ∪ 天数」语义、`backupDatabase` 自己套用策略、命令行入口可执行、
+> `-wal`/`-shm` 恢复后**立刻**清理、旧库必须真留在磁盘、临时文件必须清干净、
+> 「能打开但完整性不通过」的备份、pid 文件内容损坏、pid 文件指向已退出进程、
+> 服务启动/退出写删 pid 文件、真实生产 schema 备份往返）。
+> 逐条理由与实跑证据见文末「Task 1 实施台账（2026-10-21）」。
+
 **Interfaces:**
 - Consumes: `openDatabase({ dataDir, filename })`（P0 `src/db/sqlite.js`）
 - Produces:
@@ -204,14 +211,28 @@ platform/package.json               scripts 增加 backup / restore / build:demo
 `platform/test/backup.test.js`：
 
 ```javascript
+// platform/test/backup.test.js —— 备份脚本（sqlite.backup() API，不用 cp）
+//
+// 规则溯源：
+//   - 「备份用 sqlite.backup() API，不用 cp」→ 设计文档 §14.2【决策】+ SQLite 官方 backup.html
+//   - 「保留最近 keepCount 份 且 保留 keepDays 天内的」→ P6 计划 Global Constraints「保留策略」
+//   - 「备份文件名 = app-<UTC 时间戳>.db」→ 同上
+//
+// ⚠️ 本文件的核心用例是「WAL 模式下备份包含已提交但未 checkpoint 的事务」：
+//    它**同时**断言正反两面 —— backup() 拷到了那笔事务，而只 cp .db 的副本没拷到。
+//    只断言正面会退化成「跑通即算」；只断言反面则证明不了 backup() 做对了。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, existsSync, statSync, copyFileSync, writeFileSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import { openDatabase } from '../src/db/sqlite.js';
 import { backupDatabase, listBackups, pruneBackups, backupFileName } from '../scripts/backup.js';
+
+const here = dirname(fileURLToPath(import.meta.url));
 
 function tempDir(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -311,23 +332,144 @@ test('备份文件名按 UTC 时间戳命名，可按字典序排序（跨时区
   assert.ok(a < b, '文件名必须可字典序排序');
   assert.equal(backupFileName(new Date('2026-10-20T09:00:00Z')), 'app-20261020T090000Z.db');
 });
+
+// ── 判别性补充用例 ────────────────────────────────────────────
+// ⚠️ 上一条保留策略用例**区分不出两种算法**：
+//    「只按 keepCount 保留」与「keepCount ∪ keepDays 保留」在它那份数据上给出**完全相同**的结果
+//    （超期的 2 份同时也超份数；未超期的 3 份本来就在前 10 份里）。
+//    ⇒ 下面这条用「两种算法结果不同」的数据集，把语义钉死。
+test('保留策略是「份数 ∪ 天数」：没超天数的旧备份即使超出份数也必须保留', () => {
+  const dir = tempDir('hks-prune2-');
+  const now = new Date('2026-10-20T12:00:00Z');
+  const names = [];
+  // 3 份全部在 keepDays=7 之内，但 keepCount=1 ⇒ 只有「份数 ∪ 天数」才会全保留
+  for (let i = 0; i < 3; i += 1) {
+    const name = backupFileName(new Date(now.getTime() - i * 3600_000));
+    const p = join(dir, name);
+    writeFileSync(p, 'x');
+    const t = (now.getTime() - (i + 1) * 3600_000) / 1000;
+    utimesSync(p, t, t);
+    names.push(name);
+  }
+
+  const removed = pruneBackups(dir, { keepDays: 7, keepCount: 1, now });
+  assert.deepEqual(removed, [], '未超保留天数的备份一律保留（keepCount 只是下限，不是上限）');
+  assert.equal(listBackups(dir).length, 3, '三份都必须还在');
+
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('backupDatabase 自己套用保留策略，并报告页数与被清理的文件', async () => {
+  const dataDir = tempDir('hks-bkprune-');
+  const { db, close } = openDatabase({ dataDir });
+  db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)');
+  // ⚠️ 造一个**多轮迭代**的库（> 100 页 = backup() 的默认 rate），
+  //    否则 progress 回调一次都不触发，测不出「页数报的是总量还是剩余量」。
+  db.exec(`WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 2000)
+          INSERT INTO t (v) SELECT hex(randomblob(500)) FROM c`);
+  const pageCount = db.prepare('PRAGMA page_count').get().page_count;
+  assert.ok(pageCount > 100, `前置条件：库必须大于 100 页（实际 ${pageCount}）`);
+  close();
+
+  const backupDir = join(dataDir, 'backups');
+  const now = new Date();
+  // 第一份：20 天前（超 keepDays=7）→ 应被清掉
+  const old = await backupDatabase({
+    dataDir,
+    backupDir,
+    now: new Date(now.getTime() - 20 * 86400_000),
+  });
+  const t = (now.getTime() - 20 * 86400_000) / 1000;
+  utimesSync(old.path, t, t);
+  // 第二份：1 天前（未超天数，但会超出 keepCount=1）→ 必须保留
+  const recent = await backupDatabase({
+    dataDir,
+    backupDir,
+    now: new Date(now.getTime() - 86400_000),
+  });
+  const t2 = (now.getTime() - 86400_000) / 1000;
+  utimesSync(recent.path, t2, t2);
+
+  // 第三份触发清理
+  const third = await backupDatabase({
+    dataDir,
+    backupDir,
+    now,
+    keepCount: 1,
+    keepDays: 7,
+  });
+  assert.deepEqual(third.removed, [old.file], '超天数且超份数的旧备份必须被清掉');
+  assert.equal(existsSync(old.path), false, '旧备份文件必须已删除');
+  assert.equal(existsSync(recent.path), true, '未超天数的备份必须保留（哪怕超出份数）');
+  assert.equal(third.pages, pageCount, '备份必须报告源库的总页数（不是剩余页数）');
+  assert.ok(third.bytes > 0, '备份文件必须有内容');
+
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('命令行入口可执行：node scripts/backup.js 真的备份并打出完成信息', () => {
+  const dataDir = tempDir('hks-bk-cli-');
+  const { db, close } = openDatabase({ dataDir });
+  db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)');
+  close();
+
+  // ⚠️ 这条守住「脚本被当库 import 时不跑、但当命令跑时要真跑」这条边界：
+  //    isMain 判定一旦写错（例如 realpathSync 吃了 file:// URL 而抛 ENOENT），
+  //    命令行会**静默什么都不干、退出码 0** —— 没有这条用例就查不出来。
+  const res = spawnSync(
+    process.execPath,
+    ['--disable-warning=ExperimentalWarning', join(here, '..', 'scripts', 'backup.js')],
+    { encoding: 'utf8', env: { ...process.env, DATA_DIR: dataDir } },
+  );
+  assert.equal(res.status, 0, `备份脚本必须以 0 退出，实际输出：${res.stdout}${res.stderr}`);
+  assert.match(res.stdout, /\[backup\] 完成：app-\d{8}T\d{6}Z\.db/, `备份脚本必须打出完成信息，实际：${res.stdout}`);
+  const made = listBackups(join(dataDir, 'backups'));
+  assert.equal(made.length, 1, '命令行必须真的产出备份文件');
+
+  rmSync(dataDir, { recursive: true, force: true });
+});
 ```
 
 `platform/test/restore.test.js`：
 
 ```javascript
+// platform/test/restore.test.js —— 恢复脚本（先停服务 → 验完整性 → 换库 → 清 -wal/-shm）
+//
+// 规则溯源：
+//   - 「恢复前必须先停服务：脚本用 pid 文件 + systemd 探测，服务在跑 → 拒绝执行」
+//     → P6 计划 Global Constraints「恢复前置」+ 设计文档 §14.2
+//   - 「恢复后必须删掉旧的 -wal / -shm（它们属于旧库，留着会污染新库）」→ 同上
+//   - 「备份文件名 = app-<UTC 时间戳>.db」→ P6 计划 Global Constraints「保留策略」
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, existsSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, writeFileSync, readFileSync, readdirSync, openSync, writeSync, closeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { spawn, spawnSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import { openDatabase } from '../src/db/sqlite.js';
+import { applyMigrations, currentVersion } from '../src/db/migrate.js';
+import { createUser } from '../src/db/repo/users.js';
 import { backupDatabase } from '../scripts/backup.js';
 import { checkServiceState, verifyBackupFile, restoreDatabase } from '../scripts/restore.js';
 
+const here = dirname(fileURLToPath(import.meta.url));
+const migrationsDir = join(here, '..', 'db', 'migrations');
+
 function tempDir(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
+}
+
+/** 轮询直到条件成立或超时；返回条件的结果（超时返回 null）。 */
+async function waitFor(fn, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const v = await fn();
+    if (v) return v;
+    if (Date.now() > deadline) return null;
+    await new Promise((r) => setTimeout(r, 50));
+  }
 }
 
 async function makeBackup(dataDir) {
@@ -372,6 +514,14 @@ test('恢复后数据与备份一致，且旧的 -wal / -shm 被清掉', async (
   const result = restoreDatabase({ dataDir, backupFile: backup.path, now: new Date('2026-10-20T13:00:00Z') });
   assert.equal(result.ok, true, result.error ?? '');
 
+  // ⚠️ 判别性断言必须**紧接恢复之后**做：
+  //    规格里那条断言放在「新库打开并关闭之后」——可 SQLite 自己会在
+  //    打开时重建 -wal、关闭时删掉 -wal/-shm ⇒ 就算恢复**没删**旧 sidecar，
+  //    这条断言照样绿（实测：变异体 M18 存活）。放在恢复返回后立刻断言才判别。
+  assert.equal(existsSync(join(dataDir, 'app.db-wal')), false, '恢复后必须立刻删掉旧 -wal（它属于旧库）');
+  assert.equal(existsSync(join(dataDir, 'app.db-shm')), false, '恢复后必须立刻删掉旧 -shm（它属于旧库）');
+  assert.equal(existsSync(join(dataDir, 'app.db.restore.tmp')), false, '恢复成功后不得留下临时文件');
+
   const after = new DatabaseSync(join(dataDir, 'app.db'));
   const rows = after.prepare('SELECT v FROM t').all();
   after.close();
@@ -411,6 +561,182 @@ test('恢复前会留一份 .before-restore-<时间戳> 的旧库', async () => 
     result.steps.some((s) => s.includes('.before-restore-')),
     `恢复步骤里必须记录旧库留存，实际：${result.steps.join(' | ')}`,
   );
+  // ⚠️ 只看 steps 不够：步骤文本与磁盘上的文件是**两件事**。
+  //    变异体 M19（把 rename 换成 unlink）保留了步骤文本 ⇒ 只断言 steps 会漏。
+  const kept = readdirSync(dataDir).filter((f) => f.startsWith('app.db.before-restore-'));
+  assert.equal(kept.length, 1, `旧库必须以 .before-restore-<时间戳> 留在磁盘上，实际：${readdirSync(dataDir).join(', ')}`);
+  assert.ok(existsSync(join(dataDir, kept[0])), '留存的旧库必须真的有内容');
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+// ── 判别性补充：能打开 ≠ 完好 ────────────────────────────────
+// ⚠️ 规格里那条「备份文件损坏时拒绝恢复」用的是**根本不是 sqlite 的文件**——
+//    它在**打开**阶段就被拒 ⇒ 跳不跳过 integrity_check 都一样拒 ⇒ 不判别。
+//    这条用「能打开但页已损坏」的库，逼出 integrity_check 真的在干活。
+test('备份文件能打开但完整性检查不通过时也拒绝恢复（不能只看「打得开」）', async () => {
+  const dataDir = tempDir('hks-rs-corrupt-');
+  const p = join(dataDir, 'corrupt.db');
+  const db = new DatabaseSync(p);
+  db.exec('PRAGMA journal_mode = DELETE');
+  db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)');
+  db.exec(`WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 800)
+          INSERT INTO t (v) SELECT hex(randomblob(300)) FROM c`);
+  db.close();
+
+  // 把第 3 页整页清零：页头完好 ⇒ 文件**仍能打开**，但 integrity_check 报出坏页
+  const fd = openSync(p, 'r+');
+  writeSync(fd, Buffer.alloc(4096), 0, 4096, 4096 * 2);
+  closeSync(fd);
+
+  const opens = new DatabaseSync(p, { readOnly: true });
+  opens.close();
+
+  const check = verifyBackupFile(p);
+  assert.equal(check.ok, false, '完整性检查不通过必须判为不可用');
+  assert.notEqual(check.integrity, 'ok', 'integrity 字段必须如实报告检查结果');
+  assert.ok(check.error, '必须给出错误原因');
+
+  const result = restoreDatabase({ dataDir, backupFile: p, now: new Date('2026-10-20T13:00:00Z') });
+  assert.equal(result.ok, false, '有损坏的备份必须拒绝恢复');
+  assert.ok(result.error.includes('完整性') || result.error.includes('损坏') || result.error.includes('integrity'));
+
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+// ── 判别性 / 稳健性补充用例 ──────────────────────────────────
+test('校验备份文件后不在旁边留下 -wal / -shm 残留', async () => {
+  const dataDir = tempDir('hks-rs-side-');
+  const backup = await makeBackup(dataDir);
+  const check = verifyBackupFile(backup.path);
+  assert.equal(check.ok, true, check.error ?? '');
+  // ⚠️ 只读打开一个 WAL 标志的库，SQLite 会在文件旁建出 -wal / -shm 且关库后不删
+  //    （sqlite.org/wal.html）。保留策略只认 *.db ⇒ 这些残留永不被清理 ⇒ 备份目录无限膨胀。
+  assert.equal(existsSync(`${backup.path}-wal`), false, '校验不得在备份目录留下 -wal 残留');
+  assert.equal(existsSync(`${backup.path}-shm`), false, '校验不得在备份目录留下 -shm 残留');
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('pid 文件内容损坏时也拒绝恢复（拿不到「服务已停」的证据就保守拒绝）', async () => {
+  const dataDir = tempDir('hks-rs-badpid-');
+  const backup = await makeBackup(dataDir);
+  writeFileSync(join(dataDir, 'app.pid'), 'not-a-pid', 'utf8');
+  const state = checkServiceState({ dataDir });
+  assert.equal(state.running, true, 'pid 文件存在但内容不可解析 → 无法确认服务已停 → 必须判为在跑');
+  const result = restoreDatabase({ dataDir, backupFile: backup.path, now: new Date('2026-10-20T13:00:00Z') });
+  assert.equal(result.ok, false, '拿不到停服证据时必须拒绝恢复');
+  assert.ok(result.error.includes('服务'), `错误信息必须点明原因，实际：${result.error}`);
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('pid 文件指向已退出的进程时视为「服务未在跑」（陈旧残留不阻塞恢复）', async () => {
+  const dataDir = tempDir('hks-rs-stale-');
+  const backup = await makeBackup(dataDir);
+  // 起一个立刻退出的子进程，拿到一个**确定已死**的 pid
+  const dead = spawnSync(process.execPath, ['-e', 'process.exit(0)']);
+  assert.ok(dead.pid, '拿不到已退出子进程的 pid');
+  writeFileSync(join(dataDir, 'app.pid'), String(dead.pid), 'utf8');
+
+  const state = checkServiceState({ dataDir });
+  assert.equal(state.running, false, '进程已退出 → 不得判为在跑');
+  assert.equal(state.stale, true, '必须标记为陈旧残留');
+  assert.ok(state.reason.includes('pid'), '必须说明为什么判定服务没在跑');
+
+  const result = restoreDatabase({ dataDir, backupFile: backup.path, now: new Date('2026-10-20T13:00:00Z') });
+  assert.equal(result.ok, true, `陈旧 pid 不该阻塞恢复：${result.error ?? ''}`);
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('服务启动时写 pid 文件、收到 SIGTERM 后删除（restore 的停服探测靠它）', async () => {
+  const dataDir = tempDir('hks-rs-pid-');
+  const serverPath = join(here, '..', 'src', 'server.js');
+  let out = '';
+  const child = spawn(process.execPath, ['--disable-warning=ExperimentalWarning', serverPath], {
+    env: { ...process.env, DATA_DIR: dataDir, PORT: '0' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  child.stdout.on('data', (d) => { out += d.toString(); });
+  child.stderr.on('data', (d) => { out += d.toString(); });
+  try {
+    // ⚠️ 必须等到**真正开始监听**再往下走：
+    //    pid 文件是在 openDatabase 之后立刻写的（早于迁移与 listen），
+    //    若此时就发 SIGTERM，server.close() 可能落在 listen 之前 → 子进程以
+    //    ERR_SERVER_NOT_RUNNING 崩掉 → pid 文件不删 → 本用例变成随机失败。
+    const ready = await waitFor(() => out.includes('启动于'), 20000);
+    assert.ok(ready, `服务必须能启动（子进程输出：${out}）`);
+
+    const pidPath = join(dataDir, 'app.pid');
+    assert.ok(existsSync(pidPath), `服务启动后必须写 pid 文件（子进程输出：${out}）`);
+    const content = readFileSync(pidPath, 'utf8');
+    assert.equal(Number(content.trim()), child.pid, 'pid 文件必须写当前进程 pid');
+
+    const state = checkServiceState({ dataDir });
+    assert.equal(state.running, true, '服务在跑时必须判为在跑');
+
+    child.kill('SIGTERM');
+    await waitFor(() => child.exitCode !== null || child.signalCode !== null, 20000);
+    const gone = await waitFor(() => !existsSync(pidPath), 5000);
+    assert.ok(gone, `退出后必须删掉 pid 文件（子进程输出：${out}）`);
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+  }
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('真实生产 schema 的备份能往返：恢复后数据与 schema 版本都不变', async () => {
+  const dataDir = tempDir('hks-rs-real-');
+  // 用真实的迁移脚本建库（形状 = 真实写入方写出来的库）
+  const { db, close } = openDatabase({ dataDir });
+  applyMigrations(db, migrationsDir);
+  const version = currentVersion(db);
+  assert.ok(version > 0, '真实 schema 必须有版本号');
+  const created = createUser(db, { name: '备份测试', phone: '13800000001', password: 'pw-for-backup-test' });
+  close();
+
+  const backup = await backupDatabase({
+    dataDir,
+    backupDir: join(dataDir, 'backups'),
+    now: new Date('2026-10-20T12:00:00Z'),
+  });
+  const check = verifyBackupFile(backup.path);
+  assert.equal(check.ok, true, check.error ?? '');
+  assert.equal(check.schemaVersion, version, '备份必须带出真实 schema 版本（走 migrate.js 的 currentVersion）');
+
+  // 改库 → 再恢复
+  const again = openDatabase({ dataDir });
+  again.db.exec('DELETE FROM users');
+  again.close();
+
+  const result = restoreDatabase({ dataDir, backupFile: backup.path, now: new Date('2026-10-20T13:00:00Z') });
+  assert.equal(result.ok, true, result.error ?? '');
+
+  const after = openDatabase({ dataDir });
+  const user = after.db.prepare('SELECT name, phone FROM users WHERE id = ?').get(created.id);
+  const afterVersion = currentVersion(after.db);
+  after.close();
+  assert.ok(user, '恢复后真实用户必须还在');
+  assert.equal(user.phone, '13800000001');
+  assert.equal(afterVersion, version, '恢复后 schema 版本必须不变');
+
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('命令行入口可执行：node scripts/restore.js 真的恢复并打出成功信息', async () => {
+  const dataDir = tempDir('hks-rs-cli-');
+  const backup = await makeBackup(dataDir);
+
+  // ⚠️ 守住 isMain 判定这条边界：判定写错时命令会**静默什么都不干、退出码 0**。
+  const res = spawnSync(
+    process.execPath,
+    ['--disable-warning=ExperimentalWarning', join(here, '..', 'scripts', 'restore.js')],
+    { encoding: 'utf8', env: { ...process.env, DATA_DIR: dataDir } },
+  );
+  assert.equal(res.status, 0, `恢复脚本必须以 0 退出，实际输出：${res.stdout}${res.stderr}`);
+  assert.match(res.stdout, /\[restore\] 成功/, `恢复脚本必须打出成功信息，实际：${res.stdout}`);
+  assert.ok(
+    readdirSync(dataDir).some((f) => f.startsWith('app.db.before-restore-')),
+    '命令行恢复也必须留存旧库',
+  );
+
   rmSync(dataDir, { recursive: true, force: true });
 });
 ```
@@ -482,11 +808,11 @@ export function isProcessAlive(pid) {
 // ⚠️ WAL 模式下只 cp .db 不 cp -wal 会丢数据：已提交但未 checkpoint 的事务还在 WAL 文件里。
 //   backup() 拷贝的是【逻辑库】的页，所以这些事务会被包含进去。
 // ✅ 可以在服务运行中执行（只加读锁，不阻塞写入）。
-import { DatabaseSync, backup } from 'node:sqlite';
-import { mkdirSync, readdirSync, statSync, unlinkSync, existsSync } from 'node:fs';
-import { join, basename } from 'node:path';
+import { backup } from 'node:sqlite';
+import { mkdirSync, readdirSync, statSync, unlinkSync, existsSync, realpathSync } from 'node:fs';
+import { join, basename, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { dirname } from 'node:path';
+import { openDatabase } from '../src/db/sqlite.js';
 
 export const BACKUP_PREFIX = 'app-';
 export const BACKUP_SUFFIX = '.db';
@@ -551,15 +877,26 @@ export async function backupDatabase({
   if (!existsSync(sourcePath)) throw new Error(`源库不存在：${sourcePath}`);
 
   const target = join(outDir, backupFileName(now));
-  const source = new DatabaseSync(sourcePath);
+  // ⚠️ 走 openDatabase 而不是裸 new DatabaseSync：
+  //   ① 本 Task 的接口契约写明「Consumes: openDatabase({ dataDir, filename })」；
+  //   ② openDatabase 带 busy_timeout=5000 —— 服务运行中备份时对 SQLITE_BUSY 有退避
+  //      （WAL 下读者不阻塞写者，但取锁仍可能撞上 SQLITE_BUSY）。
+  const { db, close } = openDatabase({ dataDir, filename });
   let pages = 0;
   try {
-    await backup(source, target, {
+    // ⚠️ progress 回调的真实签名是**一个对象** { totalPages, remainingPages }
+    //   （Node v22 的 node:sqlite 实测），不是 (db, copied)；
+    //   而且它只在【多轮迭代】时触发 —— 库小到一次迭代就拷完时根本不触发。
+    //   ⇒ 取 totalPages 当页数；一次都没触发时回落到源库 PRAGMA page_count。
+    await backup(db, target, {
       rate: 100,
-      progress: (_db, copied) => { pages = copied; },
+      progress: (info) => { pages = info.totalPages; },
     });
+    if (!pages) {
+      pages = db.prepare('PRAGMA page_count').get().page_count;
+    }
   } finally {
-    source.close();
+    close();
   }
 
   const st = statSync(target);
@@ -586,7 +923,20 @@ function parseArgs(argv) {
 
 const here = dirname(fileURLToPath(import.meta.url));
 
-const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+// ⚠️ 符号链接入口：Node 会把主入口 realpath 化，import.meta.url 是**真实路径**，
+//    而 process.argv[1] 是**链接路径** → 字符串全等为假 → 脚本静默不执行、退出码 0。
+//    与 src/server.js 的同一处判定保持一致（两边都 realpath 再比）。
+//    ⚠️ realpathSync 吃的是**路径**，不是 file:// URL —— 必须先 fileURLToPath
+//    （实测：直接 realpathSync(import.meta.url) 抛 ENOENT ⇒ isMain 恒假 ⇒
+//      命令行跑起来什么都不干、退出码 0）。
+const isMain = (() => {
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+})();
 if (isMain) {
   const args = parseArgs(process.argv.slice(2));
   const dataDir = args['data-dir'] || process.env.DATA_DIR || join(here, '..', 'data');
@@ -674,11 +1024,13 @@ export function currentVersion(db) {
 //    本脚本用【pid 文件 + systemd 探测】把这条约束变成机器检查。
 // ⚠️ 恢复后必须删掉旧的 -wal / -shm：它们属于旧库，留着会污染新库。
 import { DatabaseSync } from 'node:sqlite';
-import { copyFileSync, existsSync, renameSync, unlinkSync, readdirSync } from 'node:fs';
+import {
+  copyFileSync, existsSync, renameSync, unlinkSync, readdirSync, mkdirSync, realpathSync,
+} from 'node:fs';
 import { join, basename, dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { readPidFile, isProcessAlive } from '../src/runtime/pidfile.js';
+import { readPidFile, pidFilePath, isProcessAlive } from '../src/runtime/pidfile.js';
 import { currentVersion } from '../src/db/migrate.js';
 
 /** 列出备份文件（新 → 旧）：文件名是 UTC 时间戳，字典序倒排即时间倒序。 */
@@ -692,13 +1044,20 @@ function listBackupFiles(dir) {
 }
 
 /** 服务是否还在跑。优先看 pid 文件（跨平台），Linux 上再兜底 systemd。 */
-export function checkServiceState({ dataDir, serviceName = 'heikesong' } = {}) {
+export function checkServiceState({ dataDir = './data', serviceName = 'heikesong' } = {}) {
   const pid = readPidFile(dataDir);
   if (pid && isProcessAlive(pid)) {
     return { running: true, reason: `pid 文件显示进程 ${pid} 仍在运行`, pid };
   }
   if (pid) {
     return { running: false, reason: `pid 文件存在但进程 ${pid} 已退出（可能是异常终止的残留）`, pid, stale: true };
+  }
+  // ⚠️ pid 文件在，但内容不是合法 pid（写坏了）→ 证明不了服务已停 → 保守判为「还在跑」。
+  //    依据：设计文档 §14.2【决策】恢复前必须先停服务 —— 这条是**安全闸**，
+  //    拿不到证据时必须拒绝，而不是当成「服务没在跑」。
+  //    运维确认服务确实停了，删掉这个 pid 文件即可继续。
+  if (existsSync(pidFilePath(dataDir))) {
+    return { running: true, reason: 'pid 文件存在但内容无法解析，无法确认服务已停止' };
   }
   if (process.platform === 'linux' && existsSync('/run/systemd/system')) {
     try {
@@ -713,9 +1072,22 @@ export function checkServiceState({ dataDir, serviceName = 'heikesong' } = {}) {
   return { running: false, reason: '未发现运行中的服务进程' };
 }
 
-/** 校验备份文件：能不能打开 + 完整性检查。 */
+/**
+ * 校验备份文件：能不能打开 + 完整性检查。
+ *
+ * ⚠️ 只读打开一个 WAL 标志的库时，SQLite 会在文件旁建出 `-wal` 与 `-shm`
+ *   （sqlite.org/wal.html：只读 WAL 库靠 wal-index 读，索引文件建在库文件旁）。
+ *   实测：readOnly 打开备份产物 → 留下 `xxx.db-wal`(0B) 与 `xxx.db-shm`(32KB)，
+ *   且关库后**不删**。而保留策略只认 `*.db` → 这些残留永不被清理 → 备份目录无限膨胀。
+ *   ⇒ 记下「打开前有没有」，关库后把【本次自己造出来的】删掉；
+ *     打开前就存在的 -wal（可能带真实数据）一律保留不动。
+ */
 export function verifyBackupFile(path) {
   if (!existsSync(path)) return { ok: false, integrity: 'missing', schemaVersion: null, error: `备份文件不存在：${path}` };
+  const walPath = `${path}-wal`;
+  const shmPath = `${path}-shm`;
+  const walBefore = existsSync(walPath);
+  const shmBefore = existsSync(shmPath);
   let db;
   try {
     db = new DatabaseSync(path, { readOnly: true });
@@ -727,6 +1099,7 @@ export function verifyBackupFile(path) {
       schemaVersion = null; // 备份里没有迁移表（还没 migrate 过）——不算损坏
     }
     db.close();
+    db = null;
     if (integrity !== 'ok') {
       return { ok: false, integrity: String(integrity), schemaVersion, error: `备份完整性检查未通过：${integrity}` };
     }
@@ -734,6 +1107,10 @@ export function verifyBackupFile(path) {
   } catch (err) {
     try { db?.close(); } catch { /* ignore */ }
     return { ok: false, integrity: 'unopenable', schemaVersion: null, error: `备份文件无法打开：${err.message}` };
+  } finally {
+    // 只删「本次打开造出来的」sidecar，绝不碰打开前就存在的 -wal（可能带真实数据）
+    if (!walBefore) { try { if (existsSync(walPath)) unlinkSync(walPath); } catch { /* ignore */ } }
+    if (!shmBefore) { try { if (existsSync(shmPath)) unlinkSync(shmPath); } catch { /* ignore */ } }
   }
 }
 
@@ -775,6 +1152,7 @@ export function restoreDatabase({
   // 4. 落到临时文件并再验一次
   const dbPath = join(dataDir, filename);
   const tmpPath = `${dbPath}.restore.tmp`;
+  mkdirSync(dataDir, { recursive: true });
   copyFileSync(backupPath, tmpPath);
   const tmpCheck = verifyBackupFile(tmpPath);
   if (!tmpCheck.ok) {
@@ -806,7 +1184,20 @@ export function restoreDatabase({
 
 const here = dirname(fileURLToPath(import.meta.url));
 
-const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+// ⚠️ 符号链接入口：与 src/server.js 同一处判定（两边都 realpath 再比）——
+//    见 src/server.js 的注释：Node 会把主入口 realpath 化，
+//    而 process.argv[1] 保留链接路径 → 字符串全等为假 → 脚本静默不执行。
+// ⚠️ realpathSync 吃的是**路径**，不是 file:// URL —— 必须先 fileURLToPath
+//    （实测：直接 realpathSync(import.meta.url) 抛 ENOENT ⇒ isMain 恒假 ⇒
+//      命令行跑起来什么都不干、退出码 0）。
+const isMain = (() => {
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+})();
 if (isMain) {
   const args = process.argv.slice(2);
   const dataDir = process.env.DATA_DIR || join(here, '..', 'data');
@@ -823,25 +1214,56 @@ if (isMain) {
 
 - [ ] **Step 7: 修改 `src/server.js`（写 pid 文件）**
 
-在 `src/server.js` 的 `isMain` 分支里，`openDatabase` 之后加：
+在 `src/server.js` 里加三处（**每处都是 `src/server.js` 里的连续片段**，可逐字 diff）：
+
+`src/server.js` —— ① 顶部 import（与其它 import 放在一起）：
 
 ```javascript
 import { writePidFile, removePidFile } from './runtime/pidfile.js';
-// …（在 openDatabase 之后）
-  writePidFile(dataDir);
-// …（在 SIGINT / SIGTERM 处理里，close() 之前）
-  removePidFile(dataDir);
 ```
+
+`src/server.js` —— ② `isMain` 分支里，`openDatabase` 之后（**写 pid 文件**：让「恢复前先停服务」可被机器检查）：
+
+```javascript
+  const { db, close } = openDatabase({ dataDir });
+  // ── P6：写 pid 文件 ──────────────────────────────────────────
+  // 用途：让「恢复前必须先停服务」这条约束**可被机器检查**（scripts/restore.js 读它）。
+  // 依据：设计文档 §14.2【决策】恢复前置约束。
+  writePidFile(dataDir);
+  // ────────────────────────────────────────────────────────────
+  applyMigrations(db, migrationsDir);
+```
+
+`src/server.js` —— ③ `SIGINT` / `SIGTERM` 处理里，`close()` 之前（**删 pid 文件**：否则留下陈旧 pid）：
+
+```javascript
+      server.close(() => {
+        // ── P6：退出前删 pid 文件（否则留下陈旧 pid）─────────────
+        removePidFile(dataDir);
+        // ────────────────────────────────────────────────────────
+        close();
+        process.exit(0);
+      });
+```
+
+> ⚠️ **这三处刻意写成彼此独立、可分离的小改动**：`src/server.js` 在 P4 阶段还有审计路由的改动，
+> 两边将来合并时会在同一文件冲突。三处都带 `── P6：… ──` 注释边界，冲突时按边界取即可。
 
 - [ ] **Step 8: 运行测试确认通过**
 
 Run: `cd platform && node --test test/backup.test.js test/restore.test.js`
-Expected: PASS（backup 4 个用例 + restore 4 个用例全过）
+Expected: PASS（backup **7** 个用例 + restore **11** 个用例 = **18** 个全过）
+
+> 规格自带的 8 个用例**逐字保留**；另追加 10 个判别性用例（理由见文末 Task 1 实施台账 D-05）。
 
 - [ ] **Step 9: 实跑一次备份与恢复**
 
-Run: `cd platform && node scripts/migrate.js && node scripts/seed.js && node scripts/backup.js`
+Run: `cd platform && node scripts/migrate.js && ADMIN_PASSWORD='<你的口令>' node scripts/seed.js && node scripts/backup.js`
 Expected: 输出 `[backup] 完成：app-<时间戳>.db（… 字节，… 页）`，且 `data/backups/` 下出现一个 `.db` 文件
+
+> ⚠️ 规格原命令 `node scripts/seed.js` **不带 `ADMIN_PASSWORD` 会 fail-fast 拒绝**
+> （`scripts/seed.js` 明写「不提供默认口令」）→ 整条 `&&` 链在此中断，后面的备份根本没跑。
+> 实跑证据见文末 Task 1 实施台账 D-06。
 
 Run: `cd platform && node scripts/restore.js && node -e "const{DatabaseSync}=require('node:sqlite');const db=new DatabaseSync('./data/app.db');console.log(db.prepare('SELECT COUNT(*) n FROM users').get().n);db.close();"`
 Expected: 输出一个正整数（恢复后库可正常打开读表）
@@ -849,9 +1271,12 @@ Expected: 输出一个正整数（恢复后库可正常打开读表）
 - [ ] **Step 10: 提交**
 
 ```bash
-cd platform && git add src/runtime scripts/backup.js scripts/restore.js src/db/migrate.js src/server.js test/backup.test.js test/restore.test.js
-git commit -m "feat(P6): 一致性备份与恢复脚本（sqlite.backup() API + 停服务前置检查）"
+cd platform && git add src/runtime/pidfile.js scripts/backup.js scripts/restore.js src/db/migrate.js src/server.js test/backup.test.js test/restore.test.js
+git commit -m "feat(P6): 一致性备份与恢复脚本（sqlite.backup() API + 停服务前置检查）" -- src/runtime/pidfile.js scripts/backup.js scripts/restore.js src/db/migrate.js src/server.js test/backup.test.js test/restore.test.js
 ```
+
+> ⚠️ 规格原命令的 `git commit` **不带 `-- <paths>`** —— 违反「先 `git add <paths>`，
+> 再 `git commit -m "…" -- <paths>`」这条纪律（`-m` 必须在 `--` 之前）。已按纪律补上。
 
 ---
 
@@ -862,6 +1287,7 @@ git commit -m "feat(P6): 一致性备份与恢复脚本（sqlite.backup() API + 
 - Create: `platform/deploy/nginx.conf`
 - Create: `platform/deploy/docker-compose.yml`
 - Create: `platform/deploy/install.sh`
+- Create: `platform/deploy/nginx-http2-compat.sh`
 - Test: `platform/test/deploy-assets.test.js`
 
 **Interfaces:**
@@ -871,6 +1297,7 @@ git commit -m "feat(P6): 一致性备份与恢复脚本（sqlite.backup() API + 
   - `deploy/nginx.conf` → nginx 站点，占位符 `__SERVER_NAME__` / `__CERT_PATH__` / `__KEY_PATH__` / `__APP_DIR__`
   - `deploy/docker-compose.yml` → 单容器编排（⛔ 无 `--workers` / `cluster`）
   - `deploy/install.sh` → 一键部署（幂等；口令从 `ADMIN_PASSWORD` 环境变量或交互读取，⛔ 不硬编码）
+  - `deploy/nginx-http2-compat.sh` → HTTP/2 语法兼容层（按目标机 nginx 版本决定保留 `http2 on;` 还是降级成 `listen ... ssl http2;`）
 
 > **⚠️ 本 Task 的三条硬约束**
 > ① **单写者**：⛔ 禁止多 Node worker 进程同时写同一个 SQLite 文件（SQLite 官方：single writer at a time）——这是 `SQLITE_BUSY` 的真正来源。✅ 扩容只能加**读**（静态资源交给 nginx 直出，几百并发静态请求根本不进 Node 进程）。⚠️ WAL 要求所有进程**在同一台主机**；**一旦要多机部署，必须换 Postgres，没有第三条路**。
@@ -884,16 +1311,52 @@ git commit -m "feat(P6): 一致性备份与恢复脚本（sqlite.backup() API + 
 ```javascript
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync, mkdtempSync, rmSync, mkdirSync, writeFileSync, chmodSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { tmpdir } from 'node:os';
+import { execFileSync } from 'node:child_process';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const deployDir = join(here, '..', 'deploy');
+const srcDir = join(here, '..', 'src');
 
 function read(name) {
   return readFileSync(join(deployDir, name), 'utf8');
 }
+
+function readSrc(name) {
+  return readFileSync(join(srcDir, name), 'utf8');
+}
+
+/**
+ * 去掉整行注释，只留**真正参与配置语义**的行。
+ * systemd 的 '#' 与 YAML 的 '#' 都从行首起，shell 的 '#' 同理。
+ * 为什么要这一步：注释里写「默认值 /opt/heikesong/platform」是**文档**，
+ * 不是「把部署路径写死在配置里」；两件事必须分开断言，
+ * 否则断言会把有用的注释也一起禁掉（→ 假红 / 假绿）。
+ */
+function effective(text) {
+  return String(text).split(/\r?\n/).filter((line) => !/^\s*#/.test(line)).join('\n');
+}
+
+// ── 真实代码里的口径（部署资产必须与它一致，不能各写各的）────────────────
+const serverSrc = readSrc(join('server.js'));
+const sessionSrc = readSrc(join('auth', 'session.js'));
+const pkg = JSON.parse(readFileSync(join(here, '..', 'package.json'), 'utf8'));
+
+/** 应用真实默认端口：src/server.js 的 `process.env.PORT || <数字>` */
+const APP_PORT = (serverSrc.match(/process\.env\.PORT\s*\|\|\s*(\d+)/) || [])[1];
+/** 应用真实的数据目录环境变量名 */
+const APP_DATA_DIR_VAR = (serverSrc.match(/process\.env\.([A-Z_]*DATA_DIR)/) || [])[1];
+/** 应用真实的会话有效期环境变量名 */
+const APP_SESSION_TTL_VAR = (sessionSrc.match(/process\.env\.([A-Z_]*SESSION_TTL_DAYS)/) || [])[1];
+/** 应用真实的健康检查路径 */
+const APP_HEALTH_PATH = (serverSrc.match(/router\.add\('GET',\s*'([^']+)'/) || [])[1];
+/** package.json engines.node 的主版本与次版本（部署脚本的下限必须与它一致） */
+const ENGINE = (pkg.engines.node || '').match(/(\d+)\.(\d+)/) || [];
+const APP_ENGINE_MAJOR = Number(ENGINE[1]);
+const APP_ENGINE_MINOR = Number(ENGINE[2]);
 
 test('systemd 单元：常驻守护 + 工作目录 + 环境文件 + journald 日志 + 非 root 运行', () => {
   const unit = read('heikesong.service');
@@ -964,6 +1427,303 @@ test('install.sh：占位符与被替换的资产一一对应', () => {
     assert.ok(sh.includes(ph), `install.sh 必须替换占位符 ${ph}`);
   }
 });
+
+// ── 以下为预审追加：把「字面扫一遍」升级成「对配置本身断言」──────────────
+
+test('systemd 单元：只起【一个】Node 进程 + 入口是真实入口 + ⛔ 不得设 DEMO_MODE=1', () => {
+  const unit = read('heikesong.service');
+  const eff = effective(unit);
+  const execStarts = eff.match(/^ExecStart=.*$/gm) || [];
+  assert.equal(execStarts.length, 1, '⛔ 只能有一条 ExecStart（多进程 = 多写者 = SQLITE_BUSY）');
+  assert.match(execStarts[0], /src\/server\.js$/, '入口必须是应用真实入口 src/server.js');
+  assert.doesNotMatch(execStarts[0], /--worker|--cluster|-c\s*\d/i, '⛔ ExecStart 不得带多进程参数');
+  assert.doesNotMatch(eff, /DEMO_MODE\s*=\s*1/, '⛔ 生产部署绝对不得设 DEMO_MODE=1（会挂出 /src/domain/* 与 /rules/*）');
+  assert.doesNotMatch(eff, /\/opt\/heikesong\/platform/, '⛔ 部署路径必须走占位符，不得硬编码');
+  assert.match(eff, /^Documentation=file:__APP_DIR__\/README\.md$/m, '文档路径也要走占位符');
+});
+
+test('nginx：正式形态（域名 + TLS）+ 上游只绑回环 + 端口与真实默认一致', () => {
+  const conf = read('nginx.conf');
+  assert.ok(APP_PORT, '读不到 src/server.js 的默认端口，测试本身失效');
+  assert.match(conf, /listen 443 ssl;/, '正式形态必须是 443 + TLS（备案域名的硬要求）');
+  assert.match(conf, /ssl_certificate\s+__CERT_PATH__;/, '必须挂证书');
+  assert.match(conf, /ssl_certificate_key\s+__KEY_PATH__;/, '必须挂私钥');
+  const upstream = (conf.match(/server\s+([\d.]+):(\d+);/) || []);
+  assert.equal(upstream[1], '127.0.0.1', '⛔ 上游必须只绑回环（Node 不直接暴露到公网）');
+  assert.equal(upstream[2], APP_PORT, '上游端口必须与应用真实默认端口一致');
+  assert.doesNotMatch(conf, /server\s+0\.0\.0\.0/, '⛔ 上游不得绑 0.0.0.0');
+});
+
+test('docker-compose：⛔ 不扩副本 + 只绑回环 + ⛔ 不得设 DEMO_MODE=1 + 容器网络可达', () => {
+  const yml = read('docker-compose.yml');
+  const eff = effective(yml);
+  assert.doesNotMatch(eff, /^\s*replicas\s*:/m, '⛔ 禁止 compose 扩副本（多写者）');
+  assert.doesNotMatch(eff, /^\s*scale\b/m, '⛔ 禁止 compose scale');
+  assert.doesNotMatch(eff, /^\s*deploy\s*:/m, '⛔ 禁止用 deploy.replicas 扩副本');
+  assert.doesNotMatch(eff, /DEMO_MODE\s*:\s*"?1"?/, '⛔ 生产部署绝对不得设 DEMO_MODE=1');
+  assert.doesNotMatch(eff, /"0\.0\.0\.0:/, '⛔ 端口发布不得绑 0.0.0.0');
+  // src/server.js 只绑 127.0.0.1 ⇒ 容器必须与宿主机共享网络栈，
+  // 否则宿主机侧 127.0.0.1:8080 连不上（容器 healthy 但宿主 curl 不通）。
+  assert.match(eff, /network_mode:\s*host/, 'Node 只绑回环 ⇒ 容器网络必须用 host，否则宿主机反代连不上');
+  const health = (eff.match(/http:\/\/127\.0\.0\.1:\d+(\/[^\s'"]*)/) || [])[1];
+  assert.equal(health, APP_HEALTH_PATH, '健康检查路径必须是应用真实健康检查路径');
+  // 容器里的 Node 必须满足 package.json 的 engines（node:sqlite.backup() 要 22.16.0）
+  const imageMajor = Number((eff.match(/image:\s*node:(\d+)/) || [])[1]);
+  assert.ok(imageMajor >= APP_ENGINE_MAJOR, `⛔ 容器镜像的 Node 主版本 ${imageMajor} 低于 engines 要求的 ${APP_ENGINE_MAJOR}`);
+  // 代码挂载必须只读（代码不进容器，升级靠替换宿主机目录）
+  const codeMounts = eff.match(/-\s*\.\.:\/app:\w+/g) || [];
+  assert.equal(codeMounts.length, 1, '⛔ 代码只能挂一次（多挂一份 = 多一份可写副本）');
+  assert.ok(codeMounts[0].endsWith(':ro'), '⛔ 代码挂载必须只读（:ro）');
+  // 容器加固：根文件系统只读 + 丢掉全部 capability
+  assert.match(eff, /read_only:\s*true/, '⛔ 容器根文件系统必须只读');
+  assert.match(eff, /cap_drop:\s*\n\s*-\s*ALL/, '⛔ 容器必须丢掉全部 capability');
+});
+
+test('install.sh：环境文件不落口令 + 幂等守卫齐备 + 口令只能来自环境变量或交互', () => {
+  const sh = read('install.sh');
+  const envBlock = effective(sh.slice(sh.indexOf('write_env_file()'), sh.indexOf('as_service_user()')));
+  assert.ok(envBlock.length > 0, '找不到 write_env_file 函数');
+  assert.doesNotMatch(envBlock, /PASSWORD/i, '⛔ 环境文件里绝不能出现口令（口令只用一次、不落盘）');
+  assert.doesNotMatch(envBlock, /ADMIN_PHONE/, '环境文件里不写管理员手机号');
+  // 幂等守卫：每一条都对应「重复执行不炸」的一种具体机制
+  assert.match(sh, /id -u "\$RUN_USER"/, '用户已存在 ⇒ 跳过（不能重复创建）');
+  assert.match(sh, /install -d/, '目录已存在 ⇒ install -d 不报错');
+  assert.match(sh, /ln -sfn/, '软链已存在 ⇒ ln -sfn 不报错');
+  assert.match(sh, /systemctl enable/, 'systemd enable 可重复执行');
+  assert.match(sh, /read -rs/, '没有 ADMIN_PASSWORD 时必须交互读取（不回显）');
+  assert.match(sh, /\[ -n "\$password" \] \|\| die/, '⛔ 口令读不到时必须明确报错退出（不能带空口令继续）');
+});
+
+test('nginx / install.sh：注释不能掩盖配置错误（必须对**有效配置**断言）', () => {
+  const conf = effective(read('nginx.conf'));
+  const sh = effective(read('install.sh'));
+  // 规格的用例 3/6 是「全文扫一遍」：把真指令注释掉，注释里那份文字仍会被扫到 ⇒ 假绿。
+  // 这里对**去掉整行注释后**的配置再断言一遍，堵住这个洞。
+  assert.match(conf, /proxy_buffering off;/, '⛔ SSE 必须关缓冲（有效配置里不能被注释掉）');
+  assert.match(conf, /add_header X-Accel-Buffering no;/, '⛔ SSE 必须关掉 nginx 缓冲（有效配置里不能被注释掉）');
+  assert.match(conf, /proxy_read_timeout 360s;/, '⛔ SSE 长连接超时（有效配置里不能被注释掉）');
+  assert.match(conf, /proxy_set_header Connection '';/, '⛔ Connection 头必须清空（有效配置里不能被注释掉）');
+  assert.match(conf, /proxy_http_version 1\.1;/, '⛔ 必须 HTTP/1.1（有效配置里不能被注释掉）');
+  assert.match(sh, /systemctl daemon-reload/, '⛔ 必须 reload systemd（有效配置里不能被注释掉）');
+  assert.match(sh, /nginx -t/, '⛔ 必须先 nginx -t 再 reload（有效配置里不能被注释掉）');
+  // 静态资源的两个缓存头必须一致：expires N 天 ≡ max-age N*86400 秒
+  const expDays = (conf.match(/expires (\d+)d;/) || [])[1];
+  const maxAge = (conf.match(/max-age=(\d+)/) || [])[1];
+  assert.ok(expDays && maxAge, '读不到 expires / max-age，测试本身失效');
+  assert.equal(Number(maxAge), Number(expDays) * 86400, '⛔ expires 与 Cache-Control max-age 必须一致');
+  // 每一处 X-Real-IP 都必须透传 $remote_addr（有一处被置空，审计里就是空 IP）
+  const realIpTotal = (conf.match(/proxy_set_header X-Real-IP/g) || []).length;
+  const realIpOk = (conf.match(/proxy_set_header X-Real-IP \$remote_addr;/g) || []).length;
+  assert.equal(realIpOk, realIpTotal, '⛔ 每一处 X-Real-IP 都必须是 $remote_addr（审计要真实客户端 IP）');
+});
+
+test('install.sh：Node 下限 / 环境文件权限 / umask / 占位符映射 / locale 安全展开', () => {
+  const sh = read('install.sh');
+  // ① Node 版本下限必须与 package.json engines 一致（22.16.0 = sqlite.backup() 引入版本）
+  assert.ok(APP_ENGINE_MAJOR, '读不到 package.json engines，测试本身失效');
+  assert.match(sh, new RegExp(`MIN_NODE_MAJOR=${APP_ENGINE_MAJOR}\\b`), '⛔ Node 主版本下限必须与 engines 一致');
+  assert.match(sh, new RegExp(`MIN_NODE_MINOR=${APP_ENGINE_MINOR}\\b`), '⛔ Node 次版本下限必须与 engines 一致');
+  // ② 环境文件必须组可读（systemd 以 root 读，但服务组要能读到；0600 会让环境变量全丢）
+  assert.match(sh, /chmod 0640 "\$ENV_FILE"/, '⛔ 环境文件权限必须是 0640（组可读）');
+  // ③ umask 必须存取成对（不恢复的话，后面的 nginx 站点文件会被建成 600）
+  assert.match(sh, /old_umask="\$\(umask\)"/, '⛔ 写环境文件前必须先存 umask');
+  assert.match(effective(sh), /umask "\$old_umask"/, '⛔ 写完必须恢复 umask（否则后面的站点文件权限被带偏）');
+  // ④ 占位符 → 变量必须一一对应（不能把 __DATA_DIR__ 替换成程序目录），且**每一处**替换值都必须转义
+  const appSites = (sh.match(/s\|__APP_DIR__\|/g) || []).length;
+  const appEscaped = (sh.match(/s\|__APP_DIR__\|.*sed_escape "\$APP_DIR"/g) || []).length;
+  assert.ok(appSites > 0, '读不到 __APP_DIR__ 的替换点，测试本身失效');
+  assert.equal(appEscaped, appSites, '⛔ 每一处 __APP_DIR__ 替换都必须走 sed_escape（路径含 & 或 | 时 sed 会写坏）');
+  const dataSites = (sh.match(/s\|__DATA_DIR__\|/g) || []).length;
+  const dataEscaped = (sh.match(/s\|__DATA_DIR__\|.*sed_escape "\$DATA_DIR"/g) || []).length;
+  assert.ok(dataSites > 0, '读不到 __DATA_DIR__ 的替换点，测试本身失效');
+  assert.equal(dataEscaped, dataSites, '⛔ 每一处 __DATA_DIR__ 替换都必须走 sed_escape（且必须是数据目录，不是程序目录）');
+  // ⑤ locale 安全：$变量 紧跟非 ASCII 字符时，bash 在 C/C.UTF-8 locale 下会把高位字节
+  //    并进变量名 → set -u 下直接 unbound variable 崩掉（必须写成 ${变量}）
+  const unsafe = [...sh.matchAll(/\$[A-Za-z_][A-Za-z0-9_]*([^\x00-\x7F])/g)].map((m) => m[0]);
+  assert.deepEqual(unsafe, [], `⛔ $变量 紧跟非 ASCII 字符会炸（bash 会把高位字节并进变量名）：${unsafe.join(' ')}`);
+  // ⑥ 交互读口令必须被保护（read 失败时不能被 set -e 静默打断）
+  assert.match(sh, /read -rs password \|\| true/, '⛔ 交互读口令失败必须被显式处理');
+});
+
+test('跨资产口径一致：端口 / 数据目录变量 / 会话变量 / 入口 / 健康检查必须与应用真实代码一致', () => {
+  const unit = read('heikesong.service');
+  const conf = read('nginx.conf');
+  const yml = read('docker-compose.yml');
+  const sh = read('install.sh');
+  assert.ok(APP_PORT, '读不到 src/server.js 的默认端口，测试本身失效');
+  assert.ok(APP_DATA_DIR_VAR, '读不到 src/server.js 的数据目录变量，测试本身失效');
+  assert.ok(APP_SESSION_TTL_VAR, '读不到 src/auth/session.js 的会话变量，测试本身失效');
+  assert.ok(APP_HEALTH_PATH, '读不到 src/server.js 的健康检查路径，测试本身失效');
+
+  // 端口四处同口径
+  assert.match(unit, new RegExp(`^Environment=PORT=${APP_PORT}$`, 'm'), 'systemd 端口必须与真实默认一致');
+  assert.match(conf, new RegExp(`server 127\\.0\\.0\\.1:${APP_PORT};`), 'nginx 上游端口必须与真实默认一致');
+  assert.match(yml, new RegExp(`PORT:\\s*"${APP_PORT}"`), 'compose 端口必须与真实默认一致');
+  assert.match(sh, new RegExp(`printf 'PORT=${APP_PORT}`), 'install.sh 写的环境文件端口必须与真实默认一致');
+
+  // 数据目录变量名四处同口径
+  assert.match(unit, new RegExp(`^Environment=${APP_DATA_DIR_VAR}=__DATA_DIR__$`, 'm'), 'systemd 数据目录变量名必须与真实代码一致');
+  assert.match(yml, new RegExp(`${APP_DATA_DIR_VAR}:\\s*"/data"`), 'compose 数据目录变量名必须与真实代码一致');
+  assert.match(sh, new RegExp(`printf '${APP_DATA_DIR_VAR}=%s`), 'install.sh 写的环境文件数据目录变量名必须与真实代码一致');
+
+  // 会话有效期变量名
+  assert.match(sh, new RegExp(`${APP_SESSION_TTL_VAR}=`), '环境文件必须写会话有效期变量');
+
+  // 入口与健康检查路径
+  assert.match(unit, /src\/server\.js/, 'systemd 入口必须与应用真实入口一致');
+  assert.match(yml, new RegExp(APP_HEALTH_PATH.replace(/\//g, '\\/')), 'compose 健康检查路径必须与应用真实健康检查路径一致');
+});
+
+// ── P6 部署资产修复轮（父代理）：F-1~F-4 的回归用例 ──────────────────────
+// 这四条缺口都不是「样式问题」，每一条都能让一次真实的云主机部署**装到一半**：
+//   F-1 前端产物目录三处口径不一致（计划 web/dist/ vs nginx web/assets/ vs install.sh 排除项）
+//   F-2 nginx 是最后一步且不检查装没装 ⇒ 前面全都装完了才炸，还留一份坏配置在 sites-enabled
+//   F-3 systemd/环境文件漏 SESSION_ABSOLUTE_TTL_DAYS ⇒ 实际生效值与配置对不上
+//   F-4 nginx ≥ 1.25.1 才有 `http2 on;`，而 Ubuntu 22.04=1.18 / 24.04=1.24 都没有
+//
+// ⚠️ 本组用例的断言必须**判别**：把修复改回去（挪顺序 / 删回滚 / 改回降级）必须变红。
+
+test('install.sh：⛔ nginx 必须【在动任何东西之前】检查（否则装到一半才炸）', () => {
+  const sh = read('install.sh');
+  assert.match(sh, /command -v nginx/, '必须探测 nginx 是否安装');
+  assert.match(sh, /require_nginx\(\)\s*\{/, '必须有独立的 nginx 前置检查函数');
+  // 顺序断言：main() 里 require_nginx 必须排在所有「会改变机器状态」的调用之前。
+  // ⚠️ 这条是判别性的：把 require_nginx 挪到 copy_app 之后 → 立刻变红。
+  const mainIdx = sh.indexOf('\nmain() {');
+  assert.ok(mainIdx > 0, '找不到 main()，测试本身失效');
+  const mainBody = sh.slice(mainIdx);
+  const requireIdx = mainBody.indexOf('require_nginx');
+  assert.ok(requireIdx > 0, 'main() 里必须调用 require_nginx');
+  for (const mutating of [
+    'create_service_user', 'prepare_dirs', 'copy_app', 'write_env_file',
+    'init_database', 'write_systemd_unit', 'start_service', 'write_nginx_site',
+  ]) {
+    const idx = mainBody.indexOf(mutating);
+    assert.ok(idx > 0, `找不到 ${mutating} 调用，测试本身失效`);
+    assert.ok(requireIdx < idx, `⛔ require_nginx 必须排在 ${mutating} 之前（先查前置条件，再动手）`);
+  }
+});
+
+test('install.sh：nginx -t 失败必须回滚（坏配置绝不能留在 sites-enabled）', () => {
+  const sh = read('install.sh');
+  // 裸 `nginx -t` + set -e ⇒ 失败即退出，**来不及回滚** ⇒ 必须放在 if 保护下
+  assert.match(sh, /if ! nginx -t; then/, 'nginx -t 必须在 if 保护下，失败分支才能做回滚');
+  assert.match(sh, /cp -p "\$NGINX_SITE" "\$backup"/, '写新配置前必须先备份旧配置（否则回滚无源可回）');
+  const guardIdx = sh.indexOf('if ! nginx -t; then');
+  assert.ok(guardIdx > 0, '找不到 nginx -t 保护块，测试本身失效');
+  const guardEnd = sh.indexOf('\n  fi', guardIdx);
+  assert.ok(guardEnd > guardIdx, '找不到 nginx -t 保护块的结尾，测试本身失效');
+  const block = sh.slice(guardIdx, guardEnd);
+  assert.match(block, /mv -f "\$backup" "\$NGINX_SITE"/, '失败时必须还原上一版站点配置');
+  assert.match(block, /rm -f "\$NGINX_SITE" "\$NGINX_LINK"/, '没有旧配置时必须撤销站点文件与软链');
+});
+
+test('会话有效期：环境文件必须写绝对过期变量，且默认值与真实代码一致', () => {
+  const sh = read('install.sh');
+  const unit = read('heikesong.service');
+  // 变量名从真实代码里取，不写死（代码改名时这条测试必须跟着变）
+  const absVar = (sessionSrc.match(/process\.env\.([A-Z_]*ABSOLUTE_TTL_DAYS)/) || [])[1];
+  assert.ok(absVar, '读不到 src/auth/session.js 的绝对过期变量名，测试本身失效');
+  assert.match(sh, new RegExp(`printf '${absVar}=%s`), `环境文件必须写 ${absVar}（不写就静默用代码默认值）`);
+  assert.match(unit, new RegExp(absVar), `systemd 单元的环境文件注释必须列出 ${absVar}`);
+  // 默认值必须与代码里的默认值一致
+  const codeDefault = (sessionSrc.match(/DEFAULT_ABSOLUTE_TTL_DAYS\s*=\s*(\d+)/) || [])[1];
+  assert.ok(codeDefault, '读不到代码里的默认绝对过期天数，测试本身失效');
+  assert.match(
+    sh,
+    new RegExp(`${absVar}="\\$\\{${absVar}:-${codeDefault}\\}"`),
+    `默认值必须与代码一致（${codeDefault} 天），否则「文件里写的」≠「生效的」`,
+  );
+  // 非法值必须 fail-fast（代码对非法值是**静默**回退到默认值 ⇒ 环境文件写错没人会发现）
+  assert.match(sh, /validate_session_ttls/, '必须有会话天数的合法性校验');
+  assert.match(sh, /validate_session_ttls\n/, 'main() 必须真的调用它');
+});
+
+test('nginx HTTP/2 兼容：旧版本自动降级、新版本保留（真跑脚本，不看注释）', () => {
+  const compatPath = join(deployDir, 'nginx-http2-compat.sh');
+  assert.ok(existsSync(compatPath), '必须存在 deploy/nginx-http2-compat.sh');
+  const tmp = mkdtempSync(join(tmpdir(), 'heikesong-nginx-'));
+  try {
+    const run = (version) => {
+      const out = join(tmp, `conf-${version}`);
+      execFileSync('bash', [compatPath, join(deployDir, 'nginx.conf'), out], {
+        env: { ...process.env, NGINX_VERSION: version },
+        encoding: 'utf8',
+      });
+      return readFileSync(out, 'utf8');
+    };
+    // 旧版（Ubuntu 24.04 = nginx 1.24.0）：必须降级
+    const old = run('1.24.0');
+    assert.match(old, /^\s*listen 443 ssl http2;$/m, '旧版 nginx 必须降级成 listen ... ssl http2;');
+    assert.match(old, /^\s*listen \[::\]:443 ssl http2;$/m, 'IPv6 那一支也必须降级');
+    assert.doesNotMatch(old, /^\s*http2 on;$/m, '⛔ 旧版 nginx 不认 `http2 on;`，残留就是必然 nginx -t 失败');
+    // 临界前一版：1.25.1 才引入该指令，1.25.0 一样不认
+    const justUnder = run('1.25.0');
+    assert.doesNotMatch(justUnder, /^\s*http2 on;$/m, '1.25.0 仍不认 `http2 on;`（该指令 1.25.1 引入）');
+    assert.match(justUnder, /^\s*listen 443 ssl http2;$/m, '1.25.0 必须降级');
+    // 新版：保留原写法
+    const neu = run('1.25.1');
+    assert.match(neu, /^\s*http2 on;$/m, '≥ 1.25.1 必须保留 `http2 on;`');
+    assert.match(neu, /^\s*listen 443 ssl;$/m, '≥ 1.25.1 不应改动 listen 行');
+    // 端口 80 的 listen 不能被误改（降级只针对 443）
+    const old80 = run('1.24.0');
+    assert.match(old80, /^\s*listen 80;$/m, '80 端口的 listen 不能被降级脚本改掉');
+    assert.match(old80, /^\s*listen \[::\]:80;$/m, '80 端口的 IPv6 listen 不能被降级脚本改掉');
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+  // install.sh 必须真的调用它（否则兼容脚本只是一份没人用的文档）
+  assert.match(read('install.sh'), /nginx-http2-compat\.sh/, 'install.sh 必须调用兼容脚本');
+});
+
+test('前端产物目录口径：唯一构建产物目录是 web/dist/，nginx 的 web/assets/ 是预留位', () => {
+  const conf = read('nginx.conf');
+  const sh = read('install.sh');
+  // ⛔ nginx 不得再声称 web/assets/ 是「前端构建产物目录」—— 那个目录是 web/dist/
+  assert.doesNotMatch(
+    conf,
+    /web\/assets\/[^\n]*是【前端构建产物目录】/,
+    '⛔ web/assets/ 不是构建产物目录（构建产物在 web/dist/）',
+  );
+  assert.match(conf, /web\/dist/, 'nginx.conf 必须写明真正的构建产物目录是 web/dist/');
+  assert.match(sh, /--exclude 'web\/dist\/'/, 'install.sh 必须排除构建产物目录（它是发布物，不随程序同步）');
+  assert.match(sh, /--exclude 'web\/assets\/'/, 'install.sh 必须排除预留的静态资源目录');
+});
+
+test('nginx HTTP/2 兼容：自动探测必须认得 nginx 真实输出格式（回归 D7-4）', () => {
+  const compatPath = join(deployDir, 'nginx-http2-compat.sh');
+  const tmp = mkdtempSync(join(tmpdir(), 'heikesong-nginxver-'));
+  try {
+    // 造一个假 nginx：`-v` 把版本号打在 **stderr**，格式与官方构建一致
+    // （`nginx version: nginx/1.24.0 (Ubuntu)` —— 版本号前有 `nginx/` 前缀）。
+    const fakeBin = join(tmp, 'bin');
+    mkdirSync(fakeBin, { recursive: true });
+
+    // ⚠️ 版本号要**烤进**假脚本里：真 nginx 是 `nginx -v` 被调用（**无参数**），
+    //    假脚本若写 `nginx/$1` 会输出成 `nginx version: nginx/ (Ubuntu)` —— 那是假失败。
+    const run = (version) => {
+      const fakeNginx = join(fakeBin, 'nginx');
+      writeFileSync(fakeNginx, `#!/bin/sh\necho "nginx version: nginx/${version} (Ubuntu)" >&2\nexit 0\n`);
+      chmodSync(fakeNginx, 0o755);
+      const out = join(tmp, `auto-${version}`);
+      const env = { ...process.env, PATH: `${fakeBin}:${process.env.PATH}` };
+      delete env.NGINX_VERSION;            // ⛔ 不给覆盖 ⇒ 走**自动探测**这条真实路径
+      execFileSync('bash', [compatPath, join(deployDir, 'nginx.conf'), out], { env, encoding: 'utf8' });
+      return readFileSync(out, 'utf8');
+    };
+
+    // 旧版：必须被**探测到**并降级（不是靠「探测不到 ⇒ 保守降级」蒙对）
+    const old = run('1.24.0');
+    assert.match(old, /^\s*listen 443 ssl http2;$/m, '探测到 1.24.0 必须降级');
+    assert.doesNotMatch(old, /^\s*http2 on;$/m, '1.24.0 不认 `http2 on;`');
+    // 新版：必须被**探测到**并保留（这条最关键 —— 探测失败会误降级）
+    const neu = run('1.25.1');
+    assert.match(neu, /^\s*http2 on;$/m, '探测到 1.25.1 必须保留 `http2 on;`（探测失败会误降级）');
+    assert.match(neu, /^\s*listen 443 ssl;$/m, '探测到 1.25.1 不应改动 listen 行');
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -971,9 +1731,15 @@ test('install.sh：占位符与被替换的资产一一对应', () => {
 Run: `cd platform && node --test test/deploy-assets.test.js`
 Expected: FAIL —— `ENOENT: no such file or directory, open 'platform/deploy/heikesong.service'`
 
+> ⚠️ **2026-10-21 预审补记（Task 2）**：本步只证明了「文件不存在」。预审把**规格自己的**
+> 四个资产文件原样抽到 `/tmp` 再跑同一条命令，**7 个用例里 3 个仍然红** ——
+> 规格的资产文件与规格的验收用例**互相矛盾**（注释里写了被禁词、`$0` 定位写法对不上、
+> 口令示例被自己的正则判成硬编码口令）。
+> 逐条缺陷与证据见本文件末尾「Task 2 父代理预审修正台账（2026-10-21）」。
+
 - [ ] **Step 3: 创建 `deploy/heikesong.service`**
 
-```ini
+```systemd
 # deploy/heikesong.service — systemd 守护单元
 #
 # 依据：设计文档 §14.2「deploy/heikesong.service（systemd 守护）」
@@ -983,15 +1749,19 @@ Expected: FAIL —— `ENOENT: no such file or directory, open 'platform/deploy/
 #   __DATA_DIR__  数据目录（默认 /var/lib/heikesong/data）
 #   __RUN_USER__  运行用户（默认 heikesong）
 #
-# ⛔ 单写者约束：这里【绝不】加 --workers=N 或 cluster 模式。
+# ⛔ 单写者约束：这里【绝不】加「多 worker 进程」或「多进程集群」启动参数。
 #    SQLite 官方：There can only be a single writer at a time。
 #    多个 Node worker 进程同时写同一个 .db 文件是 SQLITE_BUSY 的真正来源。
+#    R-OPS-03（可扩容）：**扩容只能加「读」** —— 静态资源交给 nginx 直出，几百并发静态请求
+#    根本不进 Node 进程；本单元**永远只起一个** Node 进程（见下方 ExecStart 与下面的断言）。
+#    ⚠️ 本文件【不】写出多进程参数的具体名字：规格 test/deploy-assets.test.js
+#       按字面扫全文（注释里出现同样判违规），参数名见 P6 计划 Task 2 章节。
 # ✅ 扩容只能加「读」：静态资源交给 nginx 直出，几百并发静态请求根本不进 Node 进程。
 # ⚠️ WAL 要求所有进程在同一台主机；要多机部署必须换 Postgres，没有第三条路。
 
 [Unit]
 Description=Heikesong Platform (单进程 Node · 单写者 SQLite)
-Documentation=file:/opt/heikesong/platform/README.md
+Documentation=file:__APP_DIR__/README.md
 After=network-online.target
 Wants=network-online.target
 
@@ -1001,7 +1771,7 @@ User=__RUN_USER__
 Group=__RUN_USER__
 WorkingDirectory=__APP_DIR__
 
-# 环境文件：PORT / DATA_DIR / SESSION_TTL_DAYS
+# 环境文件：PORT / DATA_DIR / SESSION_TTL_DAYS / SESSION_ABSOLUTE_TTL_DAYS / NODE_ENV
 # ⛔ 这里不放任何口令：口令只在初始化管理员时用一次，不落盘。
 EnvironmentFile=-/etc/heikesong/platform.env
 
@@ -1023,8 +1793,8 @@ SyslogIdentifier=heikesong
 Environment=PORT=8080
 Environment=DATA_DIR=__DATA_DIR__
 Environment=NODE_ENV=production
-# ⛔⛔ **绝对不要设 DEMO_MODE=1**（2026-10-21 漂移审计修正 I-5）：
-#    DEMO_MODE=1 会把 /src/domain/* 与 /rules/* 挂到 HTTP 上 ——
+# ⛔⛔ **绝对不要打开 DEMO_MODE**（2026-10-21 漂移审计修正 I-5）：
+#    DEMO_MODE 一旦打开，会把 /src/domain/* 与 /rules/* 挂到 HTTP 上 ——
 #    那是**领域层算法源码**（打分 / 破同分 / 防作弊判定）与**全部规则配置**
 #    （权重表、破同分链、行为分、段位表）。生产部署下必须一律 404。
 #    这道门只给本地预览（scripts/serve-demo.js）与开发服务器用。
@@ -1067,6 +1837,13 @@ WantedBy=multi-user.target
 #
 # ⚠️ nginx 需要 ≥ 1.25.1（用 `http2 on;` 语法）。更低版本请把
 #    `http2 on;` 换成 `listen 443 ssl http2;`。
+#    ✅ 不用手工改：deploy/install.sh 会先跑 deploy/nginx-http2-compat.sh，
+#    它按**目标机**的 nginx 版本自动决定：≥ 1.25.1 保留本写法，
+#    < 1.25.1（Ubuntu 22.04=1.18 / 24.04=1.24 都是）自动降级成
+#    `listen 443 ssl http2;`（这个写法在**所有** nginx 版本上都合法）。
+#
+# ⚠️ 端口口径：上游固定 127.0.0.1:8080，与 systemd 单元 / 环境文件 / compose
+#    的 PORT=8080 是同一口径。改端口要三处一起改，否则反代连不上。
 
 upstream heikesong_app {
     # ⛔ 只能起【一个】后端进程（单写者）。要加读能力就加 nginx 副本，不要加 Node 副本。
@@ -1114,6 +1891,11 @@ server {
 
     # ── 静态资源直出（不进 Node 进程）────────────────────────
     # ✅ 这是「扩容只能加读」的落点：几百并发静态请求根本不进 Node。
+    # ⚠️ web/assets/ 是【预留】的静态资源目录（带内容哈希、可长期缓存的版本位）：
+    #    **本仓库当前没有任何构建步骤产出它**（演示版静态站的产物在
+    #    platform/web/dist/，走**独立发布通道**，不经本 nginx）。
+    #    目录不存在时本段对 /assets/ 请求返 404，不影响其它路径。
+    #    ⚠️ 别把它和「前端构建产物目录」混为一谈 —— 那个目录是 platform/web/dist/。
     location /assets/ {
         alias __APP_DIR__/web/assets/;
         expires 7d;
@@ -1156,6 +1938,156 @@ server {
 }
 ```
 
+同时创建 `deploy/nginx-http2-compat.sh`（HTTP/2 版本兼容脚本）——
+`http2 on;` 这个指令要 nginx **≥ 1.25.1** 才认识，而 Ubuntu 22.04(1.18) /
+24.04(1.24) 都没有 ⇒ 旧版本自动降级成 `listen ... ssl http2;`（所有版本都合法）：
+
+```bash
+#!/usr/bin/env bash
+# deploy/nginx-http2-compat.sh — HTTP/2 指令的 nginx 版本兼容层
+#
+# 背景：deploy/nginx.conf 用的是 `http2 on;`，**nginx ≥ 1.25.1** 才认识这个指令；
+#   1.25.1 之前只认 `listen 443 ssl http2;` 这一种写法。
+#   发行版现状：Ubuntu 22.04 = nginx 1.18.x、Ubuntu 24.04 = nginx 1.24.0
+#   —— 都 < 1.25.1。直接用本仓库的 nginx.conf，`nginx -t` 会报
+#   "unknown directive \"http2\""，而这一步在 install.sh 的**最后**，
+#   于是部署变成「装完了才炸」，还把一份坏配置留在 sites-enabled 里
+#   （那会毒化这台机器上**下一次**任何 nginx reload）。
+#   本脚本按**目标机**的 nginx 版本把配置改写成该版本认识的语法。
+#
+# 用法：
+#   nginx-http2-compat.sh <输入 conf> <输出 conf>
+#   两种走法：
+#     · 版本够新（≥ 1.25.1）⇒ 原样拷贝（保留 `http2 on;`）
+#     · 版本偏旧         ⇒ 降级：删掉独立的 `http2 on;` 行，
+#                          并把 `listen ... 443 ssl;` 改成 `listen ... 443 ssl http2;`
+#                          （旧语法在**所有** nginx 版本上都合法 ⇒ 降级永远安全）
+#
+# 环境变量：
+#   NGINX_VERSION  覆盖探测到的版本（形如 1.24.0）。默认用 `nginx -v` 探测；
+#                  探测不到时按「需要降级」处理（保守：降级后的语法处处合法）。
+#                  显式给出这个变量的另一个用途是「在没装 nginx 的机器上预演渲染结果」。
+#
+# 退出码：0 成功；2 用法错 / 输入文件不存在 / 降级后仍残留 `http2 on;`。
+set -euo pipefail
+
+# `http2 on;` 的引入版本：nginx 1.25.1
+MIN_NGINX_MAJOR=1
+MIN_NGINX_MINOR=25
+MIN_NGINX_PATCH=1
+
+usage() {
+  printf '用法：nginx-http2-compat.sh <输入 conf> <输出 conf>\n' >&2
+}
+
+if [ "$#" -ne 2 ]; then
+  usage
+  exit 2
+fi
+
+IN_CONF="$1"
+OUT_CONF="$2"
+
+if [ ! -f "$IN_CONF" ]; then
+  printf '[nginx-compat] 错误：输入文件不存在：%s\n' "$IN_CONF" >&2
+  exit 2
+fi
+
+# ── 探测版本 ────────────────────────────────────────────────────────────
+detect_version() {
+  if [ -n "${NGINX_VERSION:-}" ]; then
+    printf '%s' "$NGINX_VERSION"
+    return 0
+  fi
+  if command -v nginx >/dev/null 2>&1; then
+    # nginx -v 把版本号打在 **stderr**。
+    # ⚠️ 真实输出是 `nginx version: nginx/1.24.0 (Ubuntu)` —— 版本号前有 `nginx/` 前缀
+    #    （官方构建的 VERSION 串就是 "nginx/" + 版本号）。只写 `nginx version: 1.24.0`
+    #    的正则**匹配不到** ⇒ 真机上永远探测失败、永远走保守降级。
+    #    ⇒ 这里两种形态都要吃下（用 POSIX BRE 的 \{0,1\}，BSD sed（macOS）也认）。
+    nginx -v 2>&1 | sed -n 's|^nginx version: *\(nginx/\)\{0,1\}\([0-9][0-9.]*\).*|\2|p' | head -n 1
+    return 0
+  fi
+  printf ''
+}
+
+VERSION="$(detect_version)"
+
+version_supports_http2_on() {
+  # $1 = 版本号（形如 1.24.0 / 1.25.1）；空 = 探测不到 ⇒ 判「不支持」⇒ 降级
+  local v="$1" major minor patch
+  [ -n "$v" ] || return 1
+  major="${v%%.*}"
+  local rest="${v#*.}"
+  minor="${rest%%.*}"
+  local rest2="${rest#*.}"
+  case "$rest2" in
+    ''|*[!0-9]*) patch=0 ;;
+    *) patch="${rest2%%.*}" ;;
+  esac
+  case "$major" in ''|*[!0-9]*) return 1 ;; esac
+  case "$minor" in ''|*[!0-9]*) return 1 ;; esac
+  if [ "$major" -ne "$MIN_NGINX_MAJOR" ]; then
+    [ "$major" -gt "$MIN_NGINX_MAJOR" ]
+    return
+  fi
+  if [ "$minor" -ne "$MIN_NGINX_MINOR" ]; then
+    [ "$minor" -gt "$MIN_NGINX_MINOR" ]
+    return
+  fi
+  [ "$patch" -ge "$MIN_NGINX_PATCH" ]
+}
+
+# ── 渲染 ────────────────────────────────────────────────────────────────
+# 先记住输入里**独立成行**的 `http2 on;` 有没有（注释里提到的不算）
+had_http2_on=0
+if grep -qE '^[[:space:]]*http2[[:space:]]+on;[[:space:]]*$' "$IN_CONF"; then
+  had_http2_on=1
+fi
+
+if version_supports_http2_on "$VERSION"; then
+  cp "$IN_CONF" "$OUT_CONF"
+  printf '[nginx-compat] nginx %s ≥ %s.%s.%s：保留 `http2 on;` 写法\n' \
+    "$VERSION" "$MIN_NGINX_MAJOR" "$MIN_NGINX_MINOR" "$MIN_NGINX_PATCH"
+  # 保持路径的自检：输入有 `http2 on;` ⇒ 输出必须也有（不能被悄悄改掉）
+  out_http2_on=0
+  if grep -qE '^[[:space:]]*http2[[:space:]]+on;[[:space:]]*$' "$OUT_CONF"; then
+    out_http2_on=1
+  fi
+  if [ "$had_http2_on" -ne "$out_http2_on" ]; then
+    printf '[nginx-compat] 错误：保持路径下 `http2 on;` 指令丢失（输入有=%s，输出有=%s）\n' \
+      "$had_http2_on" "$out_http2_on" >&2
+    exit 2
+  fi
+else
+  # 用 awk 而不是 sed：sed 的 BRE 扩展（\+ / \d）在 BSD sed（macOS）上不通用，
+  # 而本脚本要在 macOS 上被测试实跑，必须可移植。
+  awk '
+    # 删掉独立的 `http2 on;` 行（前后允许空白）
+    /^[[:space:]]*http2[[:space:]]+on;[[:space:]]*$/ { next }
+    {
+      line = $0
+      # 把 `listen [::]:443 ssl;` / `listen 443 ssl;` 改成 `... ssl http2;`
+      # ⚠️ IPv6 那一支是 `[::]:443` —— `]` 后面还有一个 `:`，正则必须带上它
+      if (line ~ /^[[:space:]]*listen[[:space:]]+(\[[^]]*\]:[[:space:]]*)?443[[:space:]]+ssl;[[:space:]]*$/) {
+        sub(/;[[:space:]]*$/, " http2;", line)
+        changed = 1
+      }
+      print line
+    }
+  ' "$IN_CONF" > "$OUT_CONF"
+  printf '[nginx-compat] nginx %s < %s.%s.%s：已降级为 `listen ... ssl http2;`（旧语法在所有版本都合法）\n' \
+    "${VERSION:-未探测到（按需降级处理）}" "$MIN_NGINX_MAJOR" "$MIN_NGINX_MINOR" "$MIN_NGINX_PATCH"
+  # 降级路径的自检：**绝不能**还残留独立的 `http2 on;`（否则 nginx -t 必然失败）
+  if grep -qE '^[[:space:]]*http2[[:space:]]+on;[[:space:]]*$' "$OUT_CONF"; then
+    printf '[nginx-compat] 错误：输出里仍残留独立的 `http2 on;`，该 nginx 版本不认这个指令\n' >&2
+    exit 2
+  fi
+fi
+
+exit 0
+```
+
 - [ ] **Step 5: 创建 `deploy/docker-compose.yml`**
 
 ```yaml
@@ -1163,15 +2095,30 @@ server {
 #
 # 依据：设计文档 §14.2「deploy/docker-compose.yml（单容器编排）」
 #
-# ⛔ 单写者约束：这里的 command 里【绝不】加 --workers=N，也不要用 compose 的 scale 扩副本。
+# ⛔ 单写者约束：这里的 command 里【绝不】加多 worker 进程 / 多进程集群启动参数，
+#    也不要用 compose 的 scale 扩副本。
 #    SQLite 官方：There can only be a single writer at a time。
 #    多个 Node 进程同时写同一个 .db 文件是 SQLITE_BUSY 的真正来源。
+#    ⚠️ 本文件【不】写出多进程参数的具体名字：规格 test/deploy-assets.test.js
+#       按字面扫全文（注释里出现同样判违规），参数名见 P6 计划 Task 2 章节。
 # ✅ 扩容只能加「读」：静态资源交给 nginx 直出。
 # ⚠️ WAL 要求所有进程在同一台主机；要多机部署必须换 Postgres，没有第三条路。
 #
-# ⚠️ 本文件在 platform/deploy/ 下，compose 的相对路径以本文件所在目录为基准。
+# ⚠️ 本文件在 platform/deploy/ 下，compose 的相对路径以本文件所在目录为基准
+#    （compose 的 project directory = 第一个 compose 文件所在目录）。
 #    运行： cd platform && docker compose -f deploy/docker-compose.yml up -d
-#    宿主机 127.0.0.1:8080 出来，Node 不直接暴露到公网，由 nginx 反代。
+#    ⇒ 挂载源 `..` = platform/，代码进容器，升级靠替换宿主机目录。
+#
+# ⚠️ 网络口径（照实写：src/server.js 只绑回环）：
+#    src/server.js 的 server.listen(port, '127.0.0.1') —— 进程只听回环。
+#    ⇒ 若用 ports 端口映射，宿主机的 127.0.0.1:8080 会被转发到容器的 eth0 地址，
+#      而进程不听那里 → 连接被拒（容器 healthy，但宿主机 curl 不通、静默失败）。
+#    ⇒ 因此这里用 network_mode: host：容器与宿主机共享网络栈，
+#      进程绑的 127.0.0.1:8080 就是宿主机的 127.0.0.1:8080 ——
+#      nginx 的反代目标（127.0.0.1:8080）不用改，Node 也不会暴露到公网。
+#    ⚠️ host 网络只保证 Linux 宿主机的语义；Docker Desktop（macOS/Windows）上
+#       容器拿到的是 Linux 虚拟机的网络栈，宿主机 127.0.0.1:8080 仍不通。
+#    （若日后把 src/server.js 改成可绑 0.0.0.0，这里可换回 ports 映射。）
 
 name: heikesong
 
@@ -1180,20 +2127,20 @@ services:
     image: node:24-alpine
     container_name: heikesong-app
     working_dir: /app
-    # ⛔ 不要改成 ["node", "--cluster", "src/server.js"] 或加 --workers
+    # ⛔ 不要改成多进程启动参数，也不要加多 worker 进程
     command: ["node", "src/server.js"]
     restart: always
     environment:
       PORT: "8080"
       DATA_DIR: "/data"
       NODE_ENV: "production"
-      # ⛔⛔ **绝对不要设 DEMO_MODE=1**（2026-10-21 漂移审计修正 I-5）：
-      #    DEMO_MODE=1 会把 /src/domain/* 与 /rules/* 挂到 HTTP 上 ——
+      # ⛔⛔ **绝对不要打开 DEMO_MODE**（2026-10-21 漂移审计修正 I-5）：
+      #    DEMO_MODE 一旦打开，会把 /src/domain/* 与 /rules/* 挂到 HTTP 上 ——
       #    那是**领域层算法源码**与**全部规则配置**。生产部署下必须一律 404。
       #    这道门只给本地预览（scripts/serve-demo.js）与开发服务器用。
-    ports:
-      # 只绑回环：对外由 nginx 反代
-      - "127.0.0.1:8080:8080"
+    # 只绑回环：Node 自己 listen 127.0.0.1（src/server.js 的实际行为），
+    # 宿主机侧即 127.0.0.1:8080，对外仍由 nginx 反代。
+    network_mode: host
     volumes:
       # platform/ 只读挂载：代码不进容器，升级靠替换宿主机目录
       - ..:/app:ro
@@ -1233,16 +2180,23 @@ volumes:
 # deploy/install.sh — 一键部署（幂等）
 #
 # 依据：设计文档 §14.2「deploy/install.sh（一键：装 Node → 写 service → 配 nginx → 建库 → 初始化管理员账号）」
+#   R-OPS-05（云主机部署）：后期部署到云主机，需要「一键部署 + 备份恢复」⇒ 本脚本就是一键部署；
+#     备份/恢复在 scripts/backup.js 与 scripts/restore.js（走 sqlite.backup() API，不用 cp）。
+#   R-OPS-01（可移植）：脚本只依赖 POSIX 工具与 Node 内置，**不联网安装 npm 包**；
+#     路径一律用 $(dirname "$0") 定位，不依赖当前工作目录 ⇒ 同一份脚本在 Linux/macOS 都能跑。
 #
 # ✅ 幂等：可重复执行不炸（用户/目录/文件已存在 → 跳过或覆盖，不报错）。
 # ⛔ 不硬编码任何口令：管理员口令来自环境变量 ADMIN_PASSWORD，或交互读取（不回显）。
 #    环境文件 /etc/heikesong/platform.env 里【不放口令】——口令只用于初始化那一次。
 #
-# 用法：
+# 用法（【不要】把口令写进本文件，也不要提交进仓库）：
 #   sudo SERVER_NAME=heikesong.example.com \
 #        CERT_PATH=/etc/letsencrypt/live/heikesong.example.com/fullchain.pem \
 #        KEY_PATH=/etc/letsencrypt/live/heikesong.example.com/privkey.pem \
-#        ADMIN_PASSWORD='...' ./deploy/install.sh
+#        ./deploy/install.sh
+#   → 不给 ADMIN_PASSWORD 时，脚本会交互读取口令（不回显，仅用于这一次初始化）。
+#   → 想免交互：在你自己的 shell 里 export ADMIN_PASSWORD（值当场填，
+#     【不要】写进本文件 / 仓库 / 命令历史），再用 sudo -E 调用本脚本。
 #
 # 全部变量（都有默认值，见下）：
 #   APP_DIR       程序目录            默认 /opt/heikesong/platform
@@ -1254,9 +2208,23 @@ volumes:
 #   KEY_PATH      私钥路径            默认 /etc/letsencrypt/live/<域名>/privkey.pem
 #   ADMIN_PHONE   管理员手机号         默认 13800000000
 #   ADMIN_PASSWORD 管理员口令          默认空（空 = 交互读取）
+#   ENV_FILE      环境文件路径         默认 /etc/heikesong/platform.env
+#   NGINX_SITE    nginx 站点文件       默认 /etc/nginx/sites-available/heikesong.conf
+#   NGINX_LINK    nginx 站点软链       默认 /etc/nginx/sites-enabled/heikesong.conf
+#   SYSTEMD_UNIT_DIR systemd 单元目录  默认 /etc/systemd/system
+#   SESSION_TTL_DAYS 会话滑动有效期（天）默认 7（与 src/auth/session.js 的默认值一致）
+#   SESSION_ABSOLUTE_TTL_DAYS 会话绝对过期上限（天）默认 30（同上）
+#
+# ⚠️ 端口口径：8080 是**写死**的口径（与 deploy/nginx.conf 的 upstream、
+#    systemd 单元的 Environment=PORT、docker-compose 的 PORT 同一套）。
+#    要换端口必须四处一起改 —— 本脚本不提供 PORT 变量，避免只改一处连不上。
+#
+# ⚠️ 绝对过期上限**可以**小于滑动有效期（那是「更严」的合法配置：到期必须重登）。
+#    本脚本不禁止这种组合 —— 只校验两者都是正整数。
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"     # platform/ 根目录
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"     # platform/ 根目录
 APP_DIR="${APP_DIR:-/opt/heikesong/platform}"
 DATA_DIR="${DATA_DIR:-/var/lib/heikesong/data}"
 SERVICE_NAME="${SERVICE_NAME:-heikesong}"
@@ -1265,8 +2233,16 @@ SERVER_NAME="${SERVER_NAME:-}"
 ENV_FILE="${ENV_FILE:-/etc/heikesong/platform.env}"
 NGINX_SITE="${NGINX_SITE:-/etc/nginx/sites-available/heikesong.conf}"
 NGINX_LINK="${NGINX_LINK:-/etc/nginx/sites-enabled/heikesong.conf}"
+SYSTEMD_UNIT_DIR="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
+SESSION_TTL_DAYS="${SESSION_TTL_DAYS:-7}"
+SESSION_ABSOLUTE_TTL_DAYS="${SESSION_ABSOLUTE_TTL_DAYS:-30}"
+# nginx HTTP/2 兼容脚本：`http2 on;` 要 nginx ≥ 1.25.1，Ubuntu 22.04(1.18) /
+# 24.04(1.24) 都没有 ⇒ 旧版本自动降级成 `listen ... ssl http2;`（所有版本都合法）。
+NGINX_COMPAT_SCRIPT="$SCRIPT_DIR/nginx-http2-compat.sh"
+# ⛔ Node 下限 = 22.16.0（package.json engines）。22.16.0 是 node:sqlite.backup()
+#    的引入版本 —— 备份脚本（P6 Task 1）依赖它，低版本装了也跑不了备份。
 MIN_NODE_MAJOR=22
-MIN_NODE_MINOR=5
+MIN_NODE_MINOR=16
 
 log() { printf '[install] %s\n' "$*"; }
 die() { printf '[install] 错误：%s\n' "$*" >&2; exit 1; }
@@ -1287,6 +2263,43 @@ node_version_ok() {
   if [ "$major" -lt "$MIN_NODE_MAJOR" ]; then return 1; fi
   if [ "$major" -eq "$MIN_NODE_MAJOR" ] && [ "$minor" -lt "$MIN_NODE_MINOR" ]; then return 1; fi
   return 0
+}
+
+# sed 替换文本转义：反斜杠 / & / | 在替换文本里必须转义，
+# 否则路径里的特殊字符会被 sed 当成自己的语法（& = 整个匹配）。
+sed_escape() {
+  printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'
+}
+
+# ⛔ nginx 必须**在做任何改动之前**就检查完。
+#    为什么：nginx 步骤在流程末尾（要等程序装好、库建好、服务起好才轮到它）。
+#    如果 nginx 没装，等发现时机器上已经是一个「装了一半」的部署 —— 服务在跑、
+#    但没有反代，域名单独访问是 502；脚本还在最后一步以
+#    "nginx: command not found" 这种看不懂的错退出。
+#    ⇒ 缺 nginx 必须在**动任何东西之前**就明确拒绝。
+require_nginx() {
+  if [ -z "$SERVER_NAME" ]; then
+    return 0    # 未设 SERVER_NAME ⇒ 本次不配 nginx，跳过
+  fi
+  if ! command -v nginx >/dev/null 2>&1; then
+    die "未检测到 nginx，但设置了 SERVER_NAME=${SERVER_NAME}。请先安装 nginx（Debian/Ubuntu: apt-get install -y nginx；RHEL/CentOS: dnf install -y nginx；Alpine: apk add --no-cache nginx），或去掉 SERVER_NAME 变量以跳过 nginx 配置。"
+  fi
+  log "已检测到 nginx：$(nginx -v 2>&1 | head -n 1)"
+}
+
+# 会话有效期相关的两个天数必须是**正整数**。
+# 为什么要在这里 fail-fast：src/auth/session.js 对非法值是**静默回退到默认值**
+# （"SESSION_TTL_DAYS=abc" ⇒ 悄悄用 7 天）—— 环境文件里写错却没有任何提示，
+# 运维会以为改了其实没改。配置非法就报错，不静默兜底。
+validate_session_ttls() {
+  case "$SESSION_TTL_DAYS" in
+    ''|*[!0-9]*) die "SESSION_TTL_DAYS 必须是正整数（当前：'$SESSION_TTL_DAYS'）" ;;
+  esac
+  case "$SESSION_ABSOLUTE_TTL_DAYS" in
+    ''|*[!0-9]*) die "SESSION_ABSOLUTE_TTL_DAYS 必须是正整数（当前：'$SESSION_ABSOLUTE_TTL_DAYS'）" ;;
+  esac
+  [ "$SESSION_TTL_DAYS" -gt 0 ] || die "SESSION_TTL_DAYS 必须 > 0（当前：${SESSION_TTL_DAYS}）"
+  [ "$SESSION_ABSOLUTE_TTL_DAYS" -gt 0 ] || die "SESSION_ABSOLUTE_TTL_DAYS 必须 > 0（当前：${SESSION_ABSOLUTE_TTL_DAYS}）"
 }
 
 install_node() {
@@ -1318,23 +2331,38 @@ create_service_user() {
   fi
   log "创建系统用户 $RUN_USER"
   if command -v useradd >/dev/null 2>&1; then
-    useradd --system --home-dir /var/lib/heikesong --shell /usr/sbin/nologin "$RUN_USER"
+    useradd --system --home-dir "$(dirname "$DATA_DIR")" --shell /usr/sbin/nologin "$RUN_USER"
   else
-    adduser -S -D -H -h /var/lib/heikesong -s /sbin/nologin "$RUN_USER"
+    adduser -S -D -H -h "$(dirname "$DATA_DIR")" -s /sbin/nologin "$RUN_USER"
   fi
 }
 
+# 运行用户的主组：落盘时用它，而不是「与用户名同名的组」——
+# 同名组是 Debian/RHEL 上 useradd 的默认行为，但不是通用假设
+# （例如 macOS 的主组是 staff，install -g <用户名> 会直接报 unknown group）。
+run_group() {
+  id -gn "$RUN_USER" 2>/dev/null || printf '%s' "$RUN_USER"
+}
+
 prepare_dirs() {
+  local group
+  group="$(run_group)"
   install -d -m 0755 "$APP_DIR"
-  install -d -m 0750 -o "$RUN_USER" -g "$RUN_USER" "$DATA_DIR"
-  install -d -m 0750 -o "$RUN_USER" -g "$RUN_USER" "$DATA_DIR/backups"
+  install -d -m 0750 -o "$RUN_USER" -g "$group" "$DATA_DIR"
+  install -d -m 0750 -o "$RUN_USER" -g "$group" "$DATA_DIR/backups"
 }
 
 copy_app() {
   log "同步程序到 $APP_DIR"
   if command -v rsync >/dev/null 2>&1; then
+    # ⚠️ 排除 web/dist/：那是**演示版静态站的构建产物**（P6 Task 6 的
+    #    `scripts/build-demo.js` 产出），走**独立发布通道**，不随程序同步到服务器。
+    #    ⚠️ 排除 web/assets/：那是 nginx `location /assets/` 指向的**预留**目录
+    #    （带哈希的生产静态资源位），本仓库**没有任何构建步骤**产出它。
+    #    两者与「前端产物目录」的口径以 P6 计划 Task 6 为准。
     rsync -a --delete \
-      --exclude 'data/' --exclude 'node_modules/' --exclude '.git/' --exclude 'web/dist/' \
+      --exclude 'data/' --exclude 'node_modules/' --exclude '.git/' \
+      --exclude 'web/dist/' --exclude 'web/assets/' \
       "$ROOT/" "$APP_DIR/"
   else
     # 没有 rsync 时的兜底：先删后拷（不删 data/）
@@ -1346,14 +2374,29 @@ copy_app() {
 write_env_file() {
   log "写环境文件 $ENV_FILE"
   install -d -m 0750 "$(dirname "$ENV_FILE")"
+  # umask 收窄到 077 再写文件，写完恢复 —— 否则 umask 会漏到后面的
+  # nginx 站点文件上（那个文件 nginx 主进程以 root 读，但 600 的配置
+  # 会让「非 root 的配置检查工具」读不了）。
+  local old_umask
+  old_umask="$(umask)"
   umask 077
   {
     printf 'PORT=8080\n'
     printf 'DATA_DIR=%s\n' "$DATA_DIR"
-    printf 'SESSION_TTL_DAYS=7\n'
+    printf 'SESSION_TTL_DAYS=%s\n' "$SESSION_TTL_DAYS"
+    # ⚠️ 绝对过期上限：src/auth/session.js 读 SESSION_ABSOLUTE_TTL_DAYS（默认 30 天）。
+    #    不写这个变量时应用会**静默**用 30 天默认值 —— 环境文件与实际生效值就对不上了，
+    #    排障时无从查证。显式写出来，让「文件里写的」＝「生效的」。
+    printf 'SESSION_ABSOLUTE_TTL_DAYS=%s\n' "$SESSION_ABSOLUTE_TTL_DAYS"
+    # ⚠️ NODE_ENV=production 会让登录 Cookie 带 Secure 标记
+    #    （src/server.js: secureCookies = NODE_ENV === 'production'）——
+    #    「IP + 端口 + 纯 HTTP」的调试形态下浏览器会直接拒收 Cookie → 登录失效。
+    #    那种形态请用 NODE_ENV=development 调用本脚本。
+    printf 'NODE_ENV=%s\n' "${NODE_ENV:-production}"
   } > "$ENV_FILE"
+  umask "$old_umask"
   chmod 0640 "$ENV_FILE"
-  chown root:"$RUN_USER" "$ENV_FILE" 2>/dev/null || true
+  chown root:"$(run_group)" "$ENV_FILE" 2>/dev/null || true
   # ⛔ 这里【不写】任何口令：口令只在初始化管理员时用一次，不落盘。
 }
 
@@ -1375,21 +2418,26 @@ init_database() {
   local password="${ADMIN_PASSWORD:-}"
   if [ -z "$password" ]; then
     printf '请输入管理员口令（不回显，仅用于本次初始化，不写入任何文件）：'
-    read -rs password
+    # ⚠️ 读不到（stdin 不是终端 / 已关闭）时 read 返回非 0 ——
+    #    在 set -e 下会让脚本直接死掉，报错信息还很难懂，所以吞掉退出码，
+    #    交给下面的空值检查给出人话。
+    read -rs password || true
     printf '\n'
   fi
   [ -n "$password" ] || die "未提供管理员口令（ADMIN_PASSWORD 环境变量或交互输入）"
-  log "初始化能力点 / 角色 / 管理员账号（手机号 $phone）"
+  log "初始化能力点 / 角色 / 管理员账号（手机号 ${phone}）"
   ( cd "$APP_DIR" && as_service_user env DATA_DIR="$DATA_DIR" ADMIN_PHONE="$phone" ADMIN_PASSWORD="$password" node scripts/seed.js )
   unset password
 }
 
 write_systemd_unit() {
   log "写 systemd 单元 $SERVICE_NAME"
-  sed -e "s|__APP_DIR__|$APP_DIR|g" \
-      -e "s|__DATA_DIR__|$DATA_DIR|g" \
-      -e "s|__RUN_USER__|$RUN_USER|g" \
-      "$ROOT/deploy/heikesong.service" > "/etc/systemd/system/$SERVICE_NAME.service"
+  install -d -m 0755 "$SYSTEMD_UNIT_DIR"
+  sed -e "s|__APP_DIR__|$(sed_escape "$APP_DIR")|g" \
+      -e "s|__DATA_DIR__|$(sed_escape "$DATA_DIR")|g" \
+      -e "s|__RUN_USER__|$(sed_escape "$RUN_USER")|g" \
+      -e "s|/etc/heikesong/platform.env|$(sed_escape "$ENV_FILE")|g" \
+      "$ROOT/deploy/heikesong.service" > "$SYSTEMD_UNIT_DIR/$SERVICE_NAME.service"
   systemctl daemon-reload
   systemctl enable "$SERVICE_NAME"
 }
@@ -1399,17 +2447,54 @@ write_nginx_site() {
     log "跳过 nginx：未设置 SERVER_NAME（正式对外域名）"
     return 0
   fi
+  [ -f "$NGINX_COMPAT_SCRIPT" ] || die "缺少 ${NGINX_COMPAT_SCRIPT}（HTTP/2 兼容脚本）"
   log "写 nginx 站点配置 $NGINX_SITE"
   install -d -m 0755 "$(dirname "$NGINX_SITE")" "$(dirname "$NGINX_LINK")"
   local cert="${CERT_PATH:-/etc/letsencrypt/live/$SERVER_NAME/fullchain.pem}"
   local key="${KEY_PATH:-/etc/letsencrypt/live/$SERVER_NAME/privkey.pem}"
-  sed -e "s|__SERVER_NAME__|$SERVER_NAME|g" \
-      -e "s|__CERT_PATH__|$cert|g" \
-      -e "s|__KEY_PATH__|$key|g" \
-      -e "s|__APP_DIR__|$APP_DIR|g" \
-      "$ROOT/deploy/nginx.conf" > "$NGINX_SITE"
+
+  # ① 先做 HTTP/2 语法兼容：`http2 on;` 只有 nginx ≥ 1.25.1 认识，
+  #    Ubuntu 22.04(1.18) / 24.04(1.24) 都没有 ⇒ 旧版本自动降级成
+  #    `listen ... ssl http2;`（这个写法在所有版本上都合法）。
+  #    不做这一步的话，nginx -t 会报 unknown directive "http2"，
+  #    而那已经是整个部署的最后一步了。
+  local rendered
+  rendered="$(mktemp)"
+  if ! bash "$NGINX_COMPAT_SCRIPT" "$ROOT/deploy/nginx.conf" "$rendered"; then
+    rm -f "$rendered"
+    die "nginx HTTP/2 兼容处理失败（见上面的 [nginx-compat] 输出）"
+  fi
+
+  # ② 备份旧站点文件：nginx -t 失败时要**回滚**，不能把一份坏配置留在
+  #    sites-enabled 里 —— 那会毒化这台机器上**下一次**任何 nginx reload
+  #    （哪怕是别人触发的、跟这次部署无关的 reload）。
+  local backup=""
+  if [ -f "$NGINX_SITE" ]; then
+    backup="$(mktemp "${TMPDIR:-/tmp}/heikesong-nginx-site.XXXXXX")"
+    cp -p "$NGINX_SITE" "$backup"
+  fi
+
+  sed -e "s|__SERVER_NAME__|$(sed_escape "$SERVER_NAME")|g" \
+      -e "s|__CERT_PATH__|$(sed_escape "$cert")|g" \
+      -e "s|__KEY_PATH__|$(sed_escape "$key")|g" \
+      -e "s|__APP_DIR__|$(sed_escape "$APP_DIR")|g" \
+      "$rendered" > "$NGINX_SITE"
+  rm -f "$rendered"
   ln -sfn "$NGINX_SITE" "$NGINX_LINK"
-  nginx -t                 # ⛔ 先验配置再 reload：配置错了不炸线上
+
+  # ⛔ 先验配置再 reload：配置错了不炸线上。
+  if ! nginx -t; then
+    if [ -n "$backup" ] && [ -f "$backup" ]; then
+      mv -f "$backup" "$NGINX_SITE"
+      log "已回滚到上一版 nginx 站点配置"
+    else
+      rm -f "$NGINX_SITE" "$NGINX_LINK"
+      log "已撤销本次 nginx 站点配置（此前没有旧配置）"
+    fi
+    die "nginx 配置校验失败（nginx -t 返回非 0）——已回滚，请按上面的 nginx -t 输出修正后重跑本脚本"
+  fi
+  if [ -n "$backup" ]; then rm -f "$backup"; fi
+
   if systemctl reload nginx 2>/dev/null; then
     log "nginx 已 reload"
   else
@@ -1432,10 +2517,18 @@ start_service() {
 
 main() {
   need_root
+  # ⛔ 先查前置条件，再动任何东西：
+  #    nginx 缺失 / 会话天数写错，都必须在「用户/目录/库/服务」被创建之前拒绝，
+  #    否则会留下一个装了一半的机器（服务在跑、但反代没配），排查成本极高。
+  require_nginx
+  validate_session_ttls
   if ! node_version_ok; then
     install_node
   fi
   node_version_ok || die "Node 版本仍不满足要求（需要 >= ${MIN_NODE_MAJOR}.${MIN_NODE_MINOR}）"
+
+  [ -f "$ROOT/deploy/heikesong.service" ] || die "缺少 $ROOT/deploy/heikesong.service（脚本必须在 platform/deploy/ 下）"
+  [ -f "$ROOT/deploy/nginx.conf" ] || die "缺少 $ROOT/deploy/nginx.conf（脚本必须在 platform/deploy/ 下）"
 
   create_service_user
   prepare_dirs
@@ -1449,7 +2542,10 @@ main() {
   log "部署完成。"
   log "  程序目录：$APP_DIR"
   log "  数据目录：$DATA_DIR"
-  log "  备份命令： cd $APP_DIR && DATA_DIR=$DATA_DIR node scripts/backup.js"
+  # 备份脚本是 P6 Task 1 的产物：还没落地就不打印这条命令，免得给出跑不通的提示。
+  if [ -f "$APP_DIR/scripts/backup.js" ]; then
+    log "  备份命令： cd $APP_DIR && DATA_DIR=$DATA_DIR node scripts/backup.js"
+  fi
   log "  查看日志： journalctl -u $SERVICE_NAME -f"
 }
 
@@ -1459,15 +2555,25 @@ main "$@"
 - [ ] **Step 7: 运行测试确认通过**
 
 Run: `cd platform && node --test test/deploy-assets.test.js`
-Expected: PASS（7 个测试全过：deploy-assets.test.js 7）
+Expected: PASS（14 个测试全过：deploy-assets.test.js 14）
+
+> ⚠️ **2026-10-21 预审补记（Task 2）**：规格原写「7 个测试」。规格自带的 7 个用例**逐字保留**；
+> 预审**追加 7 个**「对配置本身断言」的用例（单进程 / DEMO_MODE 禁令 / 正式形态 TLS /
+> 上游只绑回环 / 不扩副本 / 端口与真实代码同口径 / 环境文件不落口令 / 幂等守卫 /
+> 「注释不能掩盖配置错误」），理由见台账 D-11 与 D-15。
 
 - [ ] **Step 8: 语法自检（不执行）**
 
 Run: `cd platform && bash -n deploy/install.sh && echo "install.sh 语法 OK"`
 Expected: `install.sh 语法 OK`
 
-Run: `cd platform && sh -c 'grep -c "proxy_buffering off;" deploy/nginx.conf'`
+Run: `cd platform && sh -c 'grep -v "^[[:space:]]*#" deploy/nginx.conf | grep -c "proxy_buffering off;"'`
 Expected: `1`
+
+> ⚠️ **2026-10-21 预审补记（Task 2）**：规格原命令是 `grep -c "proxy_buffering off;"`（不过滤注释），
+> 期望值写 `1` —— 但**规格自己的 nginx.conf 头部注释里就写了一遍** `proxy_buffering off;`，
+> 所以原命令在原文件上实测是 **2**（注释 1 处 + 真指令 1 处）。
+> 真指令本来就只有 1 处，所以改成「去掉整行注释再计数」，期望值 `1` 成立且能真正抓到重复指令。
 
 - [ ] **Step 9: 提交**
 
@@ -1513,10 +2619,11 @@ git commit -m "feat(P6): 部署资产（systemd / nginx / docker-compose / 幂�
 ```javascript
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { readFileSync, mkdtempSync, writeFileSync, rmSync, mkdirSync, copyFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
 import { parseManifest, scanText, main } from '../scripts/audit-scan.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -1595,6 +2702,244 @@ test('发布产物目录也必须过闸（--forbidden 可指定别的清单）',
   assert.equal(code, 1, '命中禁用词必须返回非 0（发布中止）');
   rmSync(dir, { recursive: true, force: true });
 });
+
+// ── 父代理预审追加用例（2026-10-21）────────────────────────────────────
+// 规格自带的 6 个用例盖不住「闸根本没生效」这一类失败：
+//   ① 规格用例 6 名字叫「发布产物目录也必须过闸」，实际测的是 --forbidden + 普通文件，
+//      并没有真的测「platform/web/dist/ 这一趟」；
+//   ② 规格用例 5 在参数还没实现时也会「通过」（未识别的参数被当成扫描路径 → 扫 0 个文件 →
+//      退出码 0），属于假绿。
+// 下面这批用例的期望值在「实现正确」与「实现被改坏」两种情况下必须不同（判别性）。
+
+const PLATFORM_DIR = join(here, '..');
+const SCRIPT = join(PLATFORM_DIR, 'scripts', 'audit-scan.js');
+
+/**
+ * 造一个「能跑 CLI」的临时工程：<root>/platform/scripts/audit-scan.js（脚本副本）+
+ * <root>/platform/scripts/forbidden.txt（清单）+ <root>/docs/（被扫的文件）+
+ * 可选的 <root>/platform/web/dist/（发布产物）。
+ * CLI 里的仓库根 = <root>，所以相对路径可预期（platform/web/dist/index.html）。
+ */
+function cliSandbox({ manifest = '禁用词\n', files = {}, distFiles = null } = {}) {
+  const root = mkdtempSync(join(tmpdir(), 'hks-scan-rel-'));
+  const scriptsDir = join(root, 'platform', 'scripts');
+  mkdirSync(scriptsDir, { recursive: true });
+  mkdirSync(join(root, 'docs'), { recursive: true });
+  copyFileSync(SCRIPT, join(scriptsDir, 'audit-scan.js'));
+  writeFileSync(join(scriptsDir, 'forbidden.txt'), manifest, 'utf8');
+  for (const [name, content] of Object.entries(files)) {
+    writeFileSync(join(root, 'docs', name), content, 'utf8');
+  }
+  if (distFiles) {
+    for (const [name, content] of Object.entries(distFiles)) {
+      const abs = join(root, 'platform', 'web', 'dist', name);
+      mkdirSync(dirname(abs), { recursive: true });
+      writeFileSync(abs, content, 'utf8');
+    }
+  }
+  return { root, scriptsDir };
+}
+
+function runCli(sandbox, args = [], env = undefined) {
+  return spawnSync(process.execPath, [join(sandbox.scriptsDir, 'audit-scan.js'), ...args], {
+    encoding: 'utf8',
+    env: env ? { ...process.env, ...env } : process.env,
+  });
+}
+
+test('仓库自带清单真的能拦住裸引用、放过更正语境（CICC 四维各 25% / 行为分进入总分）', () => {
+  const parsed = parseManifest(readFileSync(join(here, '..', 'scripts', 'forbidden.txt'), 'utf8'));
+
+  // 裸引用（当作现行规则写）→ 必须拦下
+  const bare = scanText('CICC 四维各 25% 是行业通行做法。\n', parsed.terms, { file: 'docs/x.md' });
+  assert.ok(
+    bare.violations.some((v) => v.term.includes('CICC')),
+    '裸引用「CICC 四维各 25%」必须被仓库自带清单拦下',
+  );
+  const bareScore = scanText('行为分进入总分，按 10% 计入。\n', parsed.terms, { file: 'docs/x.md' });
+  assert.ok(
+    bareScore.violations.some((v) => v.term === '行为分进入总分'),
+    '裸引用「行为分进入总分」必须被仓库自带清单拦下',
+  );
+
+  // 更正语境（引用并纠正原始错误表述）→ 不计违规，但要进报告
+  const correction = 'S7 §1.1 已更正：CICC 四维各 25% 的说法有误，本平台改为六维权重表。\n';
+  const ok = scanText(correction, parsed.terms, { file: 'docs/x.md' });
+  assert.ok(
+    !ok.violations.some((v) => v.term.includes('CICC')),
+    '更正语境不得被拦下',
+  );
+  assert.ok(
+    ok.exempted.some((e) => e.term.includes('CICC')),
+    '更正语境必须进报告（豁免不静默）',
+  );
+  const correctionScore = 'S10 §3.3 已更正：行为分进入总分的说法有误，行为分只做垫底排序。\n';
+  const okScore = scanText(correctionScore, parsed.terms, { file: 'docs/x.md' });
+  assert.ok(
+    !okScore.violations.some((v) => v.term === '行为分进入总分'),
+    '更正语境不得被拦下',
+  );
+});
+
+test('发布产物目录（platform/web/dist/）本身必须过闸（发布产物也扫）', () => {
+  const sb = cliSandbox({
+    manifest: '禁用词Z\n',
+    distFiles: { 'index.html': '<html><body>这里有禁用词Z</body></html>\n' },
+  });
+  const r = runCli(sb);
+  assert.equal(
+    r.status,
+    1,
+    `发布产物里的禁用表述必须拦下（期望退出码 1）\n${r.stdout}\n${r.stderr}`,
+  );
+  assert.match(r.stderr, /platform\/web\/dist\/index\.html/, '报告里必须指出是发布产物里的哪一行');
+  rmSync(sb.root, { recursive: true, force: true });
+});
+
+test('发布产物里的每一个文本文件都要过闸（含 src/domain、rules、seed 这类子目录）', () => {
+  // ⚠️ 目录形状对齐 Task 6 的 build-demo.js 产物：web/dist/ 根目录有 index.html，
+  //    另有 src/domain/（领域层拷贝）、rules/（规则拷贝）、seed/（种子数据）。
+  //    末位的 data/ 是「防回归」用的：源码目录的默认排除项里有 'data'，
+  //    发布产物那一趟若误用默认排除，data/ 下的文件就会被静默跳过 ——
+  //    那正是「发布闸有洞但报告全绿」的形状。
+  const sb = cliSandbox({
+    manifest: '禁用词Z\n',
+    distFiles: {
+      'index.html': '<html><body>这里有禁用词Z</body></html>\n',
+      'src/domain/scoring.js': '// 领域层\n// 禁用词Z\n',
+      'rules/points.json': '{ "note": "禁用词Z" }\n',
+      'seed/demo-data.json': '{ "note": "禁用词Z" }\n',
+      'data/notes.md': '禁用词Z\n',
+    },
+  });
+  const r = runCli(sb);
+  assert.equal(r.status, 1, `发布产物里的禁用表述必须拦下\n${r.stdout}\n${r.stderr}`);
+  for (const p of Object.keys({
+    'index.html': 1, 'src/domain/scoring.js': 1, 'rules/points.json': 1,
+    'seed/demo-data.json': 1, 'data/notes.md': 1,
+  })) {
+    assert.ok(
+      r.stderr.includes(`platform/web/dist/${p}`),
+      `发布产物里的 ${p} 必须过闸（报告里却没有它）\n${r.stderr}`,
+    );
+  }
+  rmSync(sb.root, { recursive: true, force: true });
+});
+
+test('清单里的 @skip-path 不能把发布产物那道闸关掉（清单自己不能关闸）', () => {
+  const sb = cliSandbox({
+    manifest: '@skip-path ^platform/web/dist/\n禁用词Z\n',
+    distFiles: { 'index.html': '禁用词Z\n' },
+  });
+  const r = runCli(sb);
+  assert.equal(
+    r.status,
+    1,
+    `清单不许把发布产物那道闸关掉（期望退出码 1）\n${r.stdout}\n${r.stderr}`,
+  );
+  rmSync(sb.root, { recursive: true, force: true });
+});
+
+test('发布产物不存在时按「存在才扫」处理，不报错（退出码 0）', () => {
+  const sb = cliSandbox({ manifest: '禁用词Z\n', files: { 'ok.md': '正常内容\n' } });
+  const r = runCli(sb);
+  assert.equal(r.status, 0, `发布产物不存在不该报错\n${r.stdout}\n${r.stderr}`);
+  assert.match(r.stdout, /发布产物 platform\/web\/dist：不存在/);
+  rmSync(sb.root, { recursive: true, force: true });
+});
+
+test('发布产物里的更正语境 → 不计违规，但必须进报告（豁免不静默）', () => {
+  const sb = cliSandbox({
+    manifest: 'CICC 四维各 25%|已更正|S7 §1.1|不是|六维\n',
+    distFiles: { 'spec.md': 'S7 §1.1 已更正：CICC 四维各 25% 的说法有误。\n' },
+    files: { 'ok.md': '正常内容\n' },
+  });
+  const r = runCli(sb);
+  assert.equal(r.status, 0, `更正语境不得被拦下\n${r.stdout}\n${r.stderr}`);
+  assert.match(r.stdout, /豁免命中 1 处/, '发布产物里的豁免也必须进报告（豁免不静默）');
+  rmSync(sb.root, { recursive: true, force: true });
+});
+
+test('--json 输出机器可读（含违规与发布产物信息）', () => {
+  const sb = cliSandbox({
+    manifest: '禁用词Z\n',
+    distFiles: { 'index.html': '禁用词Z\n' },
+    files: { 'ok.md': '正常内容\n' },
+  });
+  const r = runCli(sb, ['--json']);
+  assert.equal(r.status, 1, `JSON 模式下退出码语义不变\n${r.stdout}\n${r.stderr}`);
+  const data = JSON.parse(r.stdout);
+  assert.equal(data.terms, 1);
+  assert.equal(data.violations.length, 1);
+  assert.equal(data.violations[0].term, '禁用词Z');
+  assert.equal(data.releaseArtifacts.present, true);
+  assert.equal(data.releaseArtifacts.scannedFiles, 1);
+  rmSync(sb.root, { recursive: true, force: true });
+});
+
+test('未知参数 → 退出码 2（不许把参数当路径吞掉后「扫 0 个文件还报通过」）', () => {
+  const sb = cliSandbox({ manifest: '禁用词Z\n', files: { 'ok.md': '正常内容\n' } });
+  const r = runCli(sb, ['--jsonn']);
+  assert.equal(r.status, 2, `参数写错必须报错退出\n${r.stdout}\n${r.stderr}`);
+  assert.match(r.stderr, /未知参数/);
+  rmSync(sb.root, { recursive: true, force: true });
+});
+
+test('--forbidden 缺路径 → 退出码 2（不许静默回落默认清单）', () => {
+  const code = main(['--forbidden']);
+  assert.equal(code, 2, '--forbidden 少了路径不许回落默认清单（那等于用错清单）');
+});
+
+test('--forbidden 指定的清单为空 → 退出码 2（空清单 ≠ 已保护，与默认清单同规则）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hks-scan-empty-man-'));
+  const manifest = join(dir, 'forbidden.txt');
+  writeFileSync(manifest, '# 只有注释，没有词条\n', 'utf8');
+  const target = join(dir, 'a.md');
+  writeFileSync(target, '随便写点什么\n', 'utf8');
+  const code = main(['--forbidden', manifest, target]);
+  assert.equal(code, 2, '空清单必须报错退出，不许「扫了 0 个词就通过」');
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('一个文件都没扫到 → 退出码 2（静默的空产出比报错更危险）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hks-scan-empty-'));
+  const manifest = join(dir, 'forbidden.txt');
+  writeFileSync(manifest, '禁用词Z\n', 'utf8');
+  const empty = join(dir, 'empty');
+  mkdirSync(empty);
+  const code = main(['--forbidden', manifest, empty]);
+  assert.equal(code, 2, '扫了 0 个文件不许报通过');
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('evidence-chain 增强不可用（HOME 下没有该 skill）→ 闸结论不变，退出码 0 并打印一行说明', () => {
+  const sb = cliSandbox({ manifest: '禁用词Z\n', files: { 'ok.md': '正常内容\n' } });
+  const fakeHome = mkdtempSync(join(tmpdir(), 'hks-scan-home-'));
+  const r = runCli(sb, [], { HOME: fakeHome });
+  assert.equal(
+    r.status,
+    0,
+    `增强不可用不许把闸判成失败（平台必须能独立跑）\n${r.stdout}\n${r.stderr}`,
+  );
+  assert.match(r.stdout, /evidence-chain 增强不可用/);
+  rmSync(sb.root, { recursive: true, force: true });
+  rmSync(fakeHome, { recursive: true, force: true });
+});
+
+test('--evidence-chain 指向真实脚本 → 增强真的被调用（且闸结论不受它影响）', () => {
+  const sb = cliSandbox({ manifest: '禁用词Z\n', files: { 'bad.md': '这里有禁用词Z\n' } });
+  const marker = join(sb.root, 'marker.txt');
+  const fake = join(sb.root, 'fake-evidence.js');
+  writeFileSync(
+    fake,
+    `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(marker)}, 'called\\n');\n`,
+    'utf8',
+  );
+  const r = runCli(sb, ['--evidence-chain', fake]);
+  assert.ok(existsSync(marker), '增强脚本必须真的被执行（参数没被吞掉）');
+  assert.equal(r.status, 1, '闸结论只看禁用表述，不看增强脚本的输出');
+  rmSync(sb.root, { recursive: true, force: true });
+});
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -1629,8 +2974,24 @@ export function main(argv = []) {
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === '--json') { asJson = true; continue; }
-    if (a === '--forbidden') { manifestPath = argv[i + 1] || manifestPath; i += 1; continue; }
+    if (a === '--forbidden') {
+      // ⛔ 缺值不许静默回落默认清单：参数写错（漏了路径）时回落 = 用错清单 = 假绿。
+      const value = argv[i + 1];
+      if (!value || value.startsWith('--')) {
+        console.error('[audit-scan] --forbidden 后面必须跟清单路径');
+        return 2;
+      }
+      manifestPath = value;
+      i += 1;
+      continue;
+    }
     if (a === '--evidence-chain') { evidenceChainPath = argv[i + 1] || null; i += 1; continue; }
+    if (a.startsWith('--')) {
+      // ⛔ 未知参数不许当扫描路径吞掉（那等于「扫了 0 个文件还报通过」）。
+      console.error(`[audit-scan] 未知参数：${a}`);
+      console.error('[audit-scan] 用法：node scripts/audit-scan.js [--json] [--forbidden <path>] [--evidence-chain <path>] [root...]');
+      return 2;
+    }
     roots.push(a);
   }
 
@@ -1654,24 +3015,34 @@ export function main(argv = []) {
   // 发布产物单独扫一遍：
   // ⚠️ P4 的 DEFAULT_EXCLUDES 里有 'dist'，主扫描会把它当构建目录跳过 —— 但这里要扫的
   //    恰恰是【我们自己发布的静态站】，所以显式传 excludePaths: []（只扫我们自己产出的文件）。
+  // ⛔ skipPaths 固定为空：发布产物这道闸不许被清单里的 @skip-path 关掉
+  //    （清单自己就能把闸关掉 —— 与「空清单 ≠ 已保护」同一类病）。
+  const release = { dir: relative(repoRoot, distDir), present: false, scannedFiles: 0 };
   if (!roots.length && existsSync(distDir)) {
+    release.present = true;
     const distReport = scanRoots([distDir], {
       terms: parsed.terms,
-      skipPaths: parsed.skipPaths,
+      skipPaths: [],
       excludePaths: [],
     });
     report.violations.push(...distReport.violations);
     report.exempted.push(...distReport.exempted);
     report.scannedFiles.push(...distReport.scannedFiles);
     report.excludedPaths.push(...distReport.excludedPaths);
+    release.scannedFiles = distReport.scannedFiles.length;
   }
   const evidence = runEvidenceChain(evidenceChainPath, targets);
+
+  // ⛔ 静默的空产出比报错更危险：一份文件都没扫到 = 闸没生效 = 报错退出（退出码 2）。
+  const emptyScan = report.scannedFiles.length === 0;
 
   if (asJson) {
     console.log(JSON.stringify({
       manifest: manifestPath,
       terms: parsed.terms.length,
       scannedFiles: report.scannedFiles.length,
+      gateEffective: !emptyScan,
+      releaseArtifacts: release,
       violations: report.violations,
       exempted: report.exempted,
       excludedPaths: report.excludedPaths,
@@ -1679,6 +3050,9 @@ export function main(argv = []) {
     }, null, 2));
   } else {
     console.log(`[audit-scan] 词条 ${parsed.terms.length} 条｜扫描 ${report.scannedFiles.length} 个文件`);
+    console.log(release.present
+      ? `[audit-scan] 发布产物 ${release.dir}：扫描 ${release.scannedFiles} 个文件（发布产物本身也必须过闸）`
+      : `[audit-scan] 发布产物 ${release.dir}：不存在（构建之后才会有产物；发布产物本身也必须过闸）`);
     console.log(`[audit-scan] 排除 ${report.excludedPaths.length} 项（排除不静默）：`);
     for (const e of report.excludedPaths.slice(0, 50)) console.log(`  - ${e.path}（${e.reason}）`);
     if (report.exempted.length) {
@@ -1688,6 +3062,8 @@ export function main(argv = []) {
     if (report.violations.length) {
       console.error(`[audit-scan] ✗ 发现 ${report.violations.length} 处禁用表述：`);
       for (const v of report.violations) console.error(`  - ${v.file}:${v.line} 「${v.term}」 ${v.text}`);
+    } else if (emptyScan) {
+      console.error('[audit-scan] 扫描范围内没有任何可扫描的文件 —— 闸未生效（静默的空产出比报错更危险）');
     } else {
       console.log('[audit-scan] ✓ 未发现禁用表述');
     }
@@ -1699,7 +3075,12 @@ export function main(argv = []) {
     }
   }
 
-  return report.violations.length ? 1 : 0;
+  if (report.violations.length) return 1;
+  if (emptyScan) {
+    if (asJson) console.error('[audit-scan] 扫描范围内没有任何可扫描的文件 —— 闸未生效（静默的空产出比报错更危险）');
+    return 2;
+  }
+  return 0;
 }
 
 /**
@@ -1709,13 +3090,20 @@ export function main(argv = []) {
 function runEvidenceChain(scriptPath, targets) {
   const candidates = [
     scriptPath,
-    join(process.env.HOME || '', '.minimax', 'skills', 'evidence-chain', 'scripts', 'audit-evidence.js'),
+    process.env.HOME
+      ? join(process.env.HOME, '.minimax', 'skills', 'evidence-chain', 'scripts', 'audit-evidence.js')
+      : null,
   ].filter(Boolean);
   for (const p of candidates) {
     if (!existsSync(p)) continue;
     try {
       const res = spawnSync(process.execPath, [p, ...targets], { encoding: 'utf8' });
-      return { available: true, path: p, output: `${res.stdout || ''}${res.stderr || ''}` };
+      return {
+        available: true,
+        path: p,
+        status: res.status,
+        output: `${res.stdout || ''}${res.stderr || ''}`,
+      };
     } catch (err) {
       return { available: false, path: p, reason: `执行失败：${err.message}` };
     }
@@ -1730,22 +3118,30 @@ function runEvidenceChain(scriptPath, targets) {
 import { spawnSync } from 'node:child_process';
 ```
 
-- [ ] **Step 4: 修改 `scripts/forbidden.txt`（追加 P6 词条 + 修正 P4 词条的字面匹配问题）**
+- [ ] **Step 4: 修改 `scripts/forbidden.txt`（追加 P6 词条）**
 
 > **⚠️ 匹配语义（必须知道，否则清单写了也不生效）**
 > P4 的 `scanText()` 用的是 **`line.includes(term)` —— 字面串匹配，不是正则**。
 > 所以词条里写 `?` 或 `.*` **永远不会命中**（`四维各 ?25%` 匹配不到 `四维各 25%`）。
 > **本项目自带的 `platform/scripts/forbidden.txt` 的既有约定就是「空格变体各写一条」**
 > （`积分占决赛30%` 与 `积分占决赛 30%` 分两行列出）—— 本阶段沿用这个约定。
+>
+> ✅ **P4 定稿已经把带 `?` 的词条拆成空格变体了**（P4 的 `test/audit-scan.test.js` 有一条用例断言
+> 「仓库自带清单里没有「正则占位」写法」）—— `初赛企业确认权重20%` / `初赛企业确认权重 20%` /
+> `四维各25%` / `四维各 25%` 都已在 P4 的清单里。**本阶段【不改】P4 的这几条**（照规格再追加一遍
+> 会触发 `parseManifest` 的「清单里有重复词条」→ 退出码 2 → 闸永远打不开），只追加 P6 的词条。
 
-在 P4 已有的内容后面**追加**（不要删改 P4 的其它词条），并把 P4 里带 `?` 的两条**拆成空格变体**：
+在 P4 已有的内容后面**追加**（不要删改 P4 的其它词条）：
 
 ```text
 # ── P6 追加（部署与演示版）────────────────────────────────────
 #
 # 演示版种子数据与部署文档也必须过闸：发布产物 web/dist/ 会被一起扫描。
-# 生成目录不扫（它们是上面源文件的拷贝，扫源就够）。
-@skip-path ^platform/web/dist/
+# ⚠️ 这里【不】写 @skip-path ^platform/web/dist/：
+#    发布产物那道闸不许被清单自己关掉（清单里加一行就能把闸关掉 ——
+#    与「空清单 ≠ 已保护」同一类病）。审计扫描器对发布产物单独走一趟，
+#    那一趟固定 skipPaths: [] / excludePaths: []，清单的 @skip-path 管不到它。
+# 数据目录不扫（库文件是二进制，与文档无关）。
 @skip-path ^platform/data/
 #
 # 「CICC 四维各 25%」必须能在【更正语境】里出现（说明当初错在哪），
@@ -1759,35 +3155,33 @@ CICC 四维各 25%|已更正|S7 §1.1|不是|六维
 行为分算进总分|已更正|S10 §3.3|只做垫底排序
 ```
 
-同时把 P4 的两条带 `?` 的词条**替换成空格变体**（否则它们永远命中不了 = 闸形同虚设）：
+P4 定稿里这四条长什么样（**本阶段一个字不改**，列在这里是为了与 P4 的实际内容对齐）：
 
 ```text
-# P4 原文（带 ? 的字面串永远命中不了）→
-# 初赛企业确认权重 ?20%|C-01|冲突|裁决|已更正
-# w_E ?= ?20%.*初赛|C-01|冲突|裁决|已更正
-# 四维各 ?25%|原表述|有误|已更正|CICC[^，。]*已
-# ↓ P6 改为（字面串 + 空格变体各一条，豁免正则不变）：
 初赛企业确认权重20%|C-01|冲突|裁决|已更正
 初赛企业确认权重 20%|C-01|冲突|裁决|已更正
+# 四维各 25% 的旧表述（应为「创新 20% / 技术可行 20% / 完成度 25% / 协作 15%」等六维表）
 四维各25%|原表述|有误|已更正|CICC[^，。]*已
 四维各 25%|原表述|有误|已更正|CICC[^，。]*已
 ```
 
-> ⚠️ `w_E ?= ?20%.*初赛` 这一条**整条删掉**：它把正则片段（`.*`）写进了字面串，
-> 在字面匹配下没有意义；要覆盖「初赛 w_E 20%」这类表述，用上面两条
-> `初赛企业确认权重20%` / `初赛企业确认权重 20%` 已经够。
+> ⚠️ **清单里【不】写 `@skip-path ^platform/web/dist/`**：发布产物那道闸不许被清单自己关掉
+> （清单里加一行就能把闸关掉 —— 与「空清单 ≠ 已保护」同一类病）。
+> `audit-scan.js` 对发布产物单独走一趟，那一趟固定 `skipPaths: []` / `excludePaths: []`。
 > **改完后必须跑一次 `node scripts/audit-scan.js` 确认退出码仍是 0**（没有误伤）。
 
 - [ ] **Step 4b: 实跑一次扫描闸，确认改词条没有误伤**
 
 Run: `cd platform && node scripts/audit-scan.js`
-Expected: 输出 `[audit-scan] 词条 N 条｜扫描 M 个文件` … `[audit-scan] ✓ 未发现禁用表述`，退出码 0
-（若出现命中，多半是豁免正则的标记词（如「已更正」）没写在那行上 → 补标记或改词条，**不要**删掉词条）
+Expected: 输出 `[audit-scan] 词条 15 条｜扫描 140 个文件` … `[audit-scan] ✓ 未发现禁用表述`，退出码 0
+（本仓库的实测值；M 个文件随仓库增长变。**`web/dist/` 不存在时会打印「发布产物 platform/web/dist：不存在」**——
+Task 6 的构建产物落地后这一行会变成「扫描 N 个文件」。
+若出现命中，多半是豁免正则的标记词（如「已更正」）没写在那行上 → 补标记或改词条，**不要**删掉词条）
 
 - [ ] **Step 5: 运行测试确认通过**
 
 Run: `cd platform && node --test test/audit-scan-release.test.js`
-Expected: PASS（6 个测试全过：audit-scan-release.test.js 6）
+Expected: PASS（**19 个测试全过**：规格自带的 6 个 + 父代理预审追加的 13 个）
 
 Run: `cd platform && node scripts/audit-scan.js`
 Expected: 输出 `[audit-scan] 词条 N 条｜扫描 M 个文件` … `[audit-scan] ✓ 未发现禁用表述`，退出码 0
@@ -1806,6 +3200,13 @@ git commit -m "feat(P6): 发布前扫描闸接发布产物 + 更正语境豁免 
 **Files:**
 - Create: `platform/web/seed/demo-data.json`
 - Test: `platform/test/demo-seed.test.js`
+
+> **【2026-10-21 实施补记 · Task 4】** 规格的 **9 个用例逐字保留**（文件头追加 4 行领域层
+> import + 溯源注释）；另**追加 11 个判别性用例** —— 规格的 9 个用例全是**静态**检查
+> （结构、维度名、原始分相等、样本数、缺双签、自由命题、互评、expectations 齐不齐），
+> 它们证明「数据摆对了形状」，**证明不了「点一下计算，这条数据真的触发了那条分支」**。
+> 而本 Task 的灵魂恰恰是后者 ⇒ 追加的用例把种子喂给**真实领域层引擎**（`src/domain/*`），
+> 断言分支真的发生了。逐条理由、实跑证据与变异结果见文末「Task 4 实施台账（2026-10-21）」。
 
 **Interfaces:**
 - Consumes: 无（纯数据）
@@ -1841,12 +3242,33 @@ git commit -m "feat(P6): 发布前扫描闸接发布产物 + 更正语境豁免 
 `platform/test/demo-seed.test.js`：
 
 ```javascript
+// platform/test/demo-seed.test.js —— 演示版种子数据（web/seed/demo-data.json）
+//
+// 规则溯源：
+//   - 「种子 = 每条 trace 分支的触发器」→ P6 计划 Task 4【本 Task 的灵魂】+ 设计文档 §12（trace 三件套）
+//   - 「z-score 宽严归一化 / 样本不足降级」→ S7 §3.1 + 设计文档 §6.2 Step 2 + 冲突裁决 C-05
+//   - 「去极值（该维度评委数 ≥5）」→ S7 §3.2 + 设计文档 §6.2 Step 3
+//   - 「R1 分赛道 / R2 双签 / R3 权重封顶 / R4 自由命题」→ S7 §2.4 + 设计文档 §6.2 Step 5
+//   - 「自评差异（高 → 书面说明 / 低 → 评委提问，阈值 10）」→ S7 §4.3 + R-JDG-13
+//   - 「破同分链（total → 加时陈述 → 互评 → 企业原始分 → 行为分 → 队伍编号）」→ S7 §3.3 + 冲突裁决 C-03
+//   - 「段位（里程碑计数 + 数据/原型 + 业务部门签字）」→ S10 §2.2 + S10 §2.1 + R-PTS-01~04
+//   - 「行为分只做垫底排序、不进总分」→ S10 §3.3 + R-PTS-08 + 设计文档 §11.1
+//
+// ⚠️ 本文件的核心用例是「同分队伍在引擎里总分【严格相等】」：
+//    规格原种子把两支队伍设计为同分，但**自评席**把它们拉开了（自评 95 触发「书面说明」
+//    → 对齐到评委分 81.28，另一支自评 81 不触发 → 保持 81）⇒ 总分差 0.0139 ⇒ 根本不同分。
+//    本文件断言的是**引擎算出来的总分**，不是种子里的自述 —— 种子说同分不算数，引擎算出来同分才算。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadRules } from '../src/config.js';
+// ── 实施补记 2026-10-21：追加的判别性用例要把种子喂给【真实领域层引擎】才断言得了分支 ──
+import { scoreStage } from '../src/domain/scoring.js';
+import { rankTeams } from '../src/domain/ranking.js';
+import { behaviorScore } from '../src/domain/behavior.js';
+import { computeTier } from '../src/domain/tier.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const seed = JSON.parse(readFileSync(join(here, '..', 'web', 'seed', 'demo-data.json'), 'utf8'));
@@ -1937,6 +3359,248 @@ test('expectations 覆盖了全部要演示的 trace 分支', () => {
   assert.equal(e.tiedTeams.length, 2, '必须正好是两支同分队伍');
   assert.deepEqual(Object.keys(e.tiers).sort(), seed.teams.map((t) => t.id).sort());
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 【实施补记 2026-10-21】规格的 9 个用例【逐字保留】+ 追加 11 个判别性用例。
+//
+// 为什么必须追加：规格的 9 个用例全是**静态**检查（结构、维度名、原始分相等、
+// 样本数、缺双签、自由命题、互评、expectations 齐不齐）—— 它们证明的是
+// 「数据摆对了形状」，**证明不了**「点一下计算，这条数据真的触发了那条分支」。
+// 而本 Task 的灵魂恰恰是后者：种子 = 每条 trace 分支的**触发器**。
+//
+// 追加的用例把种子喂给【真实的领域层引擎】（src/domain/*，纯函数、无 IO、无 Node 内置模块），
+// 断言分支真的发生了 —— 这样 Task 5 的 demo-engine.test.js 逐条断言 expectations 时，
+// 断言的是**引擎的输出**，不是种子里的一句自述。
+//
+// ⚠️ 输入构造（expandSubmissions / roster）与 Task 5 的 web/api.demo.js 同形；
+//    两边若漂移，Task 5 的 demo-parity.test.js 会当场判出来（那里比的是
+//    「演示适配器 vs 直接调 scoreStage」的一致性）。
+// ─────────────────────────────────────────────────────────────────────────────
+
+function expandSubmissions(s) {
+  const out = [];
+  for (const [judgeId, byTeam] of Object.entries(s.reviews ?? {})) {
+    for (const [teamId, byDim] of Object.entries(byTeam ?? {})) {
+      for (const [dimension, rawScore] of Object.entries(byDim ?? {})) {
+        out.push({ judgeId, teamId, dimension, rawScore: Number(rawScore) });
+      }
+    }
+  }
+  return out;
+}
+
+function roster(s) {
+  const pkgById = new Map((s.taskPackages ?? []).map((p) => [p.id, p]));
+  return (s.teams ?? []).map((t) => {
+    const pkg = pkgById.get(t.packageId) ?? {};
+    return {
+      teamId: t.id,
+      packageEnterpriseId: pkg.enterpriseId ?? null,
+      isFreeBrief: pkg.isFreeBrief === true,
+    };
+  });
+}
+
+function compute(s = seed) {
+  return scoreStage({
+    config: rules.scoring.final,
+    judges: (s.judges ?? []).map((j) => ({ judgeId: j.id, seat: j.seat })),
+    submissions: expandSubmissions(s),
+    enterpriseConfirmations: s.enterpriseConfirmations ?? [],
+    peerReviews: s.peerReviews ?? [],
+    teams: roster(s),
+    selfReviews: s.selfReviews ?? [],
+  });
+}
+
+function behaviorOf(s, teamId) {
+  return behaviorScore({
+    events: (s.behaviorEvents ?? []).filter((e) => e.teamId === teamId),
+    behaviorConfig: rules.behavior,
+  });
+}
+
+test('追加·同分队伍在引擎里总分严格相等（构造保证，不靠手算）', () => {
+  const out = compute();
+  const [a, b] = seed.expectations.tiedTeams;
+  const ta = out.teams.find((t) => t.teamId === a);
+  const tb = out.teams.find((t) => t.teamId === b);
+  assert.ok(ta && tb, '两支队伍都必须参与计算');
+  assert.equal(ta.total, tb.total, '同分队伍的总分必须完全相等');
+  assert.equal(ta.seatP, tb.seatP, '同分队伍的评委席分必须完全相等');
+  assert.equal(ta.seatE, tb.seatE, '同分队伍的企业席分必须完全相等');
+  // ⛔ 反例守卫：同分不能只看评委席 —— 自评席也算一席，
+  //    自评不一样就会把「同分」拉开（规格原种子就踩了这个坑）。
+  for (const d of Object.keys(ta.perDimension)) {
+    assert.equal(ta.perDimension[d].mean, tb.perDimension[d].mean, `维度 ${d} 的分必须相等`);
+  }
+});
+
+test('追加·破同分链真的在 peer 级把同分队伍分开（互评高者在前）', () => {
+  const out = compute();
+  const [a, b] = seed.expectations.tiedTeams;
+  const byTeam = {};
+  for (const row of out.teams) {
+    const peer = (seed.peerReviews ?? []).filter((p) => p.toTeamId === row.teamId);
+    const conf = (seed.enterpriseConfirmations ?? []).filter((c) => c.teamId === row.teamId);
+    byTeam[row.teamId] = {
+      peerScore: peer.length ? peer.reduce((s, p) => s + Number(p.score || 0), 0) / peer.length : undefined,
+      enterpriseRaw: conf.length ? conf.reduce((s, c) => s + Number(c.rawScore || 0), 0) / conf.length : undefined,
+      behaviorScore: behaviorOf(seed, row.teamId).total,
+    };
+  }
+  const ranked = rankTeams({
+    teams: out.teams.map((row) => ({
+      teamId: row.teamId, total: row.total, seatP: row.seatP, seatE: row.seatE,
+      peerScore: byTeam[row.teamId].peerScore,
+      enterpriseRaw: byTeam[row.teamId].enterpriseRaw,
+      behaviorScore: byTeam[row.teamId].behaviorScore,
+    })),
+    tiebreakChain: rules.tiebreak.chain,
+    tiebreakData: { isFinal: true, byTeam },
+    pointsConfig: rules.points,
+  });
+  const ra = ranked.ordered.find((r) => r.teamId === a);
+  const rb = ranked.ordered.find((r) => r.teamId === b);
+  assert.notEqual(ra.rank, rb.rank, '同分队伍必须被破同分链分开');
+  assert.ok(ra.rank < rb.rank, '互评分高的一方名次在前');
+  const used = ranked.applied.find((c) => c.key === seed.expectations.tiebreakSeparatedBy);
+  assert.ok(used, `破同分链里必须用到 ${seed.expectations.tiebreakSeparatedBy} 这一级`);
+  assert.ok(used.usedBy.includes(a) && used.usedBy.includes(b), '分开它们的那一级必须同时用到两支队伍');
+});
+
+test('追加·归一化降级真的发生（告警指向期望的维度与评委）', () => {
+  const out = compute();
+  const dim = seed.expectations.unnormalizedDimension;
+  const judge = seed.expectations.unnormalizedJudge;
+  const hit = out.warnings.find((w) => w.code === 'normalization_fallback' && w.dimension === dim);
+  assert.ok(hit, `必须出现维度 ${dim} 的归一化降级告警，实际告警：${JSON.stringify(out.warnings.map((w) => w.code))}`);
+  assert.ok(String(hit.message).includes(judge), `告警必须点名评委 ${judge}：${hit.message}`);
+  const agg = out.trace.normalization[dim];
+  assert.equal(agg.normalized, false, '该维度的归一化状态必须是「已降级」');
+  assert.ok(agg.judgeSampleSizes[judge] < rules.scoring.final.minSamplesForJudgeNormalization,
+    `评委 ${judge} 的样本数必须小于阈值`);
+  assert.equal(agg.judgeReasons[judge], 'judge_sample_too_small', '降级原因必须是样本不足');
+});
+
+test('追加·去极值真的发生（期望的维度上每个单元都 trimmed）', () => {
+  const out = compute();
+  const dims = new Set(seed.expectations.trimmedDimensions);
+  const steps = out.trace.steps.filter((s) => dims.has(s.dimension));
+  assert.ok(steps.length > 0, 'trace 里必须有去极值步骤');
+  for (const s of steps) {
+    assert.equal(s.trimmed, true, `${s.teamId} 的 ${s.dimension} 必须真的去极值`);
+    assert.ok(s.removed.max && s.removed.min, '必须记录被去掉的最高分与最低分评委');
+  }
+});
+
+test('追加·缺双签真的触发 R2 告警且该项按 0 分计', () => {
+  const out = compute();
+  const teamId = seed.expectations.missingDualSignatureTeam;
+  const hit = out.warnings.find((w) => w.code === 'R2_missing_dual_signature');
+  assert.ok(hit, '必须出现 R2_missing_dual_signature 告警');
+  assert.equal(hit.teamId, teamId, `告警必须指向 ${teamId}`);
+  const row = out.teams.find((t) => t.teamId === teamId);
+  assert.equal(row.seatE, 0, '缺双签的企业席分必须按 0 分计（权重保留）');
+});
+
+test('追加·自由命题真的触发 R4（企业项由评委「需求真实性」维度替代）', () => {
+  const out = compute();
+  const teamId = seed.expectations.freeBriefTeam;
+  const hit = out.warnings.find((w) => w.code === 'R4_free_brief_judge_scored');
+  assert.ok(hit, '必须出现 R4_free_brief_judge_scored 告警');
+  assert.equal(hit.teamId, teamId, `告警必须指向 ${teamId}`);
+  const row = out.teams.find((t) => t.teamId === teamId);
+  const substituteDim = rules.scoring.final.freeBrief.judgeDimension;
+  assert.ok(Number.isFinite(row.seatE) && row.seatE > 0, 'R4 生效时企业席分由评委维度替代，不能是 0');
+  assert.ok(
+    Math.abs(row.seatE - row.perDimension[substituteDim].mean) < 1e-9,
+    '企业席分必须等于替代维度的评委分',
+  );
+  assert.ok(
+    !out.warnings.some((w) => w.code === 'R4_substitute_no_scores'),
+    '替代维度有评委分，不应出现「替代维度无分」的告警',
+  );
+});
+
+test('追加·自评差异三条分流真的发生（书面说明 / 评委提问 / 阈值内不告警）', () => {
+  const out = compute();
+  const byCode = (code) => out.warnings.filter((w) => w.code === code);
+  const hi = byCode('self_eval_written_explanation');
+  const lo = byCode('self_eval_judge_question');
+  assert.equal(hi.length, 1, `「书面说明」分支必须恰好一支队（实际 ${hi.length}）`);
+  assert.equal(lo.length, 1, `「评委提问」分支必须恰好一支队（实际 ${lo.length}）`);
+  assert.equal(hi[0].teamId, seed.expectations.selfEvalWrittenExplanationTeam);
+  assert.equal(lo[0].teamId, seed.expectations.selfEvalJudgeQuestionTeam);
+  for (const t of seed.expectations.selfEvalWithinThresholdTeams) {
+    assert.ok(
+      !hi.some((w) => w.teamId === t) && !lo.some((w) => w.teamId === t),
+      `${t} 的自评与评委分差异在阈值内，不该告警`,
+    );
+  }
+});
+
+test('追加·自评对齐不加分：书面说明那支队的自评席分 = 评委席分（不是自评原分）', () => {
+  const out = compute();
+  const teamId = seed.expectations.selfEvalWrittenExplanationTeam;
+  const row = out.teams.find((t) => t.teamId === teamId);
+  const self = seed.selfReviews.find((r) => r.teamId === teamId);
+  assert.ok(self, `${teamId} 必须有自评记录`);
+  const selfSeat = row.perDimension.self_eval;
+  const judgeSide = row.perDimension[self.dimension];
+  assert.notEqual(selfSeat.mean, self.rawScore, '自评席分不能是自评原分（那样就变成加分项了）');
+  assert.equal(selfSeat.mean, judgeSide.mean, '自评席分必须对齐到评委席该维度的分');
+  assert.ok(selfSeat.mean < self.rawScore, '对齐只会把自评拉低，绝不会拉高（自评不得变成加分项）');
+});
+
+test('追加·缺自评的队伍：self_eval 维度没有分并告警（不静默当 0）', () => {
+  const out = compute();
+  const teamId = seed.expectations.missingSelfEvalTeam;
+  const hit = out.warnings.find((w) => w.code === 'dimension_no_scores' && w.teamId === teamId);
+  assert.ok(hit, `必须出现 ${teamId} 的缺分告警`);
+  assert.equal(hit.dimension, 'self_eval');
+  const row = out.teams.find((t) => t.teamId === teamId);
+  assert.equal(row.perDimension.self_eval.mean, null, '该维度没有分');
+  // 缺分维度必须被【剔除出分母】，而不是【静默当 0 分】（设计文档 §13 降级表）
+  let num = 0; let denAll = 0; let denPresent = 0;
+  for (const [key, v] of Object.entries(row.perDimension)) {
+    if (key === 'enterprise') continue;
+    denAll += v.weight;
+    if (v.mean != null) { num += v.weight * v.mean; denPresent += v.weight; }
+  }
+  assert.ok(Math.abs(row.seatP - num / denPresent) < 1e-9, '缺分维度必须被剔除出分母');
+  assert.ok(Math.abs(row.seatP - num / denAll) > 1e-9, '缺分维度不能被静默当 0 分');
+});
+
+test('追加·段位与 expectations.tiers 逐条一致（用 computeTier 复算）', () => {
+  for (const [teamId, tier] of Object.entries(seed.expectations.tiers)) {
+    const milestones = (seed.milestones ?? []).filter((m) => m.teamId === teamId);
+    const signoffs = (seed.signoffs ?? []).filter((s) => s.teamId === teamId);
+    const info = computeTier({ milestones, signoffs, ranksConfig: rules.ranks });
+    assert.equal(info.tier, tier, `${teamId} 的段位应为 ${tier}，实际 ${info.tier}`);
+  }
+});
+
+test('追加·行为分：证据合规才算分，且分值与 expectations 一致', () => {
+  for (const [teamId, expected] of Object.entries(seed.expectations.behaviorScores)) {
+    const b = behaviorOf(seed, teamId);
+    assert.equal(b.total, expected, `${teamId} 的行为分应为 ${expected}，实际 ${b.total}`);
+  }
+  const counted = seed.behaviorEvents.some((e) => behaviorOf(seed, e.teamId).items
+    .some((i) => i.type === e.type && i.counted));
+  assert.ok(counted, '至少要有一条行为事件真的拿到分（否则行为分支不可观测）');
+});
+
+test('追加·行为分不进入总分（分轨在算法层，不靠人的自觉）', () => {
+  const before = compute();
+  const bumped = {
+    ...seed,
+    behaviorEvents: seed.behaviorEvents.map((e) => ({ ...e, evidence: '{"repo":"r","version":"v","artifact":"a"}' })),
+  };
+  const after = compute(bumped);
+  const sum = (out) => out.teams.map((t) => `${t.teamId}:${t.total}`).sort();
+  assert.deepEqual(sum(after), sum(before), '行为分变化不得影响任何队伍的总分');
+});
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -1983,11 +3647,11 @@ Expected: FAIL —— `ENOENT: no such file or directory, open 'platform/web/see
     { "id": "t_epsilon", "name": "自由花队", "packageId": "tp_free", "captainId": "mba_captain", "memberIds": ["mba_captain", "demo_member_1"] }
   ],
   "reviews": {
-    "j_lenient": { "t_alpha": { "track_fit": 86, "innovation": 88, "feasibility": 84, "completeness": 85, "collaboration": 90 }, "t_beta": { "track_fit": 86, "innovation": 88, "feasibility": 84, "completeness": 85, "collaboration": 90 }, "t_gamma": { "track_fit": 74, "innovation": 70, "feasibility": 78, "completeness": 72, "collaboration": 75 }, "t_delta": { "track_fit": 80, "innovation": 82, "feasibility": 79, "completeness": 81, "collaboration": 78 }, "t_epsilon": { "track_fit": 70, "innovation": 66, "feasibility": 72, "completeness": 68, "collaboration": 70 } },
-    "j_strict": { "t_alpha": { "track_fit": 72, "innovation": 74, "feasibility": 70, "completeness": 73, "collaboration": 75 }, "t_beta": { "track_fit": 72, "innovation": 74, "feasibility": 70, "completeness": 73, "collaboration": 75 }, "t_gamma": { "track_fit": 60, "innovation": 58, "feasibility": 64, "completeness": 61, "collaboration": 62 }, "t_delta": { "track_fit": 66, "innovation": 68, "feasibility": 63, "completeness": 65, "collaboration": 64 }, "t_epsilon": { "track_fit": 56, "innovation": 52, "feasibility": 58, "completeness": 55, "collaboration": 57 } },
-    "j_mid1": { "t_alpha": { "track_fit": 80, "innovation": 81, "feasibility": 77, "completeness": 79, "collaboration": 83 }, "t_beta": { "track_fit": 80, "innovation": 81, "feasibility": 77, "completeness": 79, "collaboration": 83 }, "t_gamma": { "track_fit": 68, "innovation": 65, "feasibility": 70, "completeness": 66, "collaboration": 69 }, "t_delta": { "track_fit": 74, "innovation": 76, "feasibility": 72, "completeness": 75, "collaboration": 71 }, "t_epsilon": { "track_fit": 63, "innovation": 60, "feasibility": 65, "completeness": 61, "collaboration": 64 } },
-    "j_mid2": { "t_alpha": { "track_fit": 78, "innovation": 79, "feasibility": 76, "completeness": 77, "collaboration": 81 }, "t_beta": { "track_fit": 78, "innovation": 79, "feasibility": 76, "completeness": 77, "collaboration": 81 }, "t_gamma": { "track_fit": 67, "innovation": 64, "feasibility": 69, "completeness": 67, "collaboration": 68 }, "t_delta": { "track_fit": 73, "innovation": 75, "feasibility": 71, "completeness": 74, "collaboration": 70 }, "t_epsilon": { "track_fit": 62, "innovation": 59, "feasibility": 64, "completeness": 60, "collaboration": 63 } },
-    "j_cross": { "t_alpha": { "track_fit": 82, "innovation": 83, "feasibility": 80, "completeness": 81, "collaboration": 85 }, "t_beta": { "track_fit": 82, "innovation": 83, "feasibility": 80, "completeness": 81, "collaboration": 85 }, "t_gamma": { "track_fit": 71, "innovation": 69, "feasibility": 73, "completeness": 70, "collaboration": 72 }, "t_delta": { "track_fit": 77, "innovation": 79, "feasibility": 75, "completeness": 78, "collaboration": 76 }, "t_epsilon": { "track_fit": 66, "innovation": 63, "feasibility": 67, "completeness": 65, "collaboration": 67 } },
+    "j_lenient": { "t_alpha": { "innovation": 88, "feasibility": 84, "completeness": 85, "collaboration": 90 }, "t_beta": { "innovation": 88, "feasibility": 84, "completeness": 85, "collaboration": 90 }, "t_gamma": { "innovation": 70, "feasibility": 78, "completeness": 72, "collaboration": 75 }, "t_delta": { "innovation": 82, "feasibility": 79, "completeness": 81, "collaboration": 78 }, "t_epsilon": { "innovation": 66, "feasibility": 72, "completeness": 68, "collaboration": 70 } },
+    "j_strict": { "t_alpha": { "innovation": 74, "feasibility": 70, "completeness": 73, "collaboration": 75 }, "t_beta": { "innovation": 74, "feasibility": 70, "completeness": 73, "collaboration": 75 }, "t_gamma": { "innovation": 58, "feasibility": 64, "completeness": 61, "collaboration": 62 }, "t_delta": { "innovation": 68, "feasibility": 63, "completeness": 65, "collaboration": 64 }, "t_epsilon": { "innovation": 52, "feasibility": 58, "completeness": 55, "collaboration": 57 } },
+    "j_mid1": { "t_alpha": { "innovation": 81, "feasibility": 77, "completeness": 79, "collaboration": 83 }, "t_beta": { "innovation": 81, "feasibility": 77, "completeness": 79, "collaboration": 83 }, "t_gamma": { "innovation": 65, "feasibility": 70, "completeness": 66, "collaboration": 69 }, "t_delta": { "innovation": 76, "feasibility": 72, "completeness": 75, "collaboration": 71 }, "t_epsilon": { "innovation": 60, "feasibility": 65, "completeness": 61, "collaboration": 64 } },
+    "j_mid2": { "t_alpha": { "innovation": 79, "feasibility": 76, "completeness": 77, "collaboration": 81 }, "t_beta": { "innovation": 79, "feasibility": 76, "completeness": 77, "collaboration": 81 }, "t_gamma": { "innovation": 64, "feasibility": 69, "completeness": 67, "collaboration": 68 }, "t_delta": { "innovation": 75, "feasibility": 71, "completeness": 74, "collaboration": 70 }, "t_epsilon": { "innovation": 59, "feasibility": 64, "completeness": 60, "collaboration": 63 } },
+    "j_cross": { "t_alpha": { "innovation": 83, "feasibility": 80, "completeness": 81, "collaboration": 85 }, "t_beta": { "innovation": 83, "feasibility": 80, "completeness": 81, "collaboration": 85 }, "t_gamma": { "innovation": 69, "feasibility": 73, "completeness": 70, "collaboration": 72 }, "t_delta": { "innovation": 79, "feasibility": 75, "completeness": 78, "collaboration": 76 }, "t_epsilon": { "innovation": 63, "feasibility": 67, "completeness": 65, "collaboration": 67 } },
     "j_partial": { "t_gamma": { "feasibility": 90 } }
   },
   "enterpriseConfirmations": [
@@ -2009,9 +3673,10 @@ Expected: FAIL —— `ENOENT: no such file or directory, open 'platform/web/see
     { "fromTeamId": "t_beta", "toTeamId": "t_epsilon", "score": 61 }
   ],
   "selfReviews": [
-    { "teamId": "t_alpha", "dimension": "innovation", "rawScore": 95 },
+    { "teamId": "t_alpha", "dimension": "innovation", "rawScore": 85 },
+    { "teamId": "t_beta", "dimension": "innovation", "rawScore": 85 },
     { "teamId": "t_gamma", "dimension": "innovation", "rawScore": 50 },
-    { "teamId": "t_beta", "dimension": "innovation", "rawScore": 81 }
+    { "teamId": "t_delta", "dimension": "innovation", "rawScore": 95 }
   ],
   "milestones": [
     { "teamId": "t_alpha", "key": "problem_confirmed", "achieved": true, "countsTowardTier": true, "isDataOrPrototype": false },
@@ -2031,14 +3696,14 @@ Expected: FAIL —— `ENOENT: no such file or directory, open 'platform/web/see
     { "teamId": "t_gamma", "milestoneKey": "problem_confirmed", "department": "技术部", "revokedAt": null, "isBusinessDepartment": false }
   ],
   "behaviorEvents": [
-    { "id": "be_1", "teamId": "t_alpha", "type": "weekly_progress", "evidence": "第 1 周进度", "created_at": "2026-10-12T10:00:00Z" },
-    { "id": "be_2", "teamId": "t_alpha", "type": "weekly_progress", "evidence": "第 2 周进度", "created_at": "2026-10-19T10:00:00Z" },
-    { "id": "be_3", "teamId": "t_alpha", "type": "workshop_output", "evidence": "workshop 课后产出", "created_at": "2026-10-19T12:00:00Z" },
-    { "id": "be_4", "teamId": "t_alpha", "type": "first_demo", "evidence": "首次可运行 Demo", "created_at": "2026-10-20T09:00:00Z" },
-    { "id": "be_5", "teamId": "t_beta", "type": "weekly_progress", "evidence": "第 1 周进度", "created_at": "2026-10-12T10:00:00Z" },
-    { "id": "be_6", "teamId": "t_delta", "type": "weekly_progress", "evidence": "第 1 周进度", "created_at": "2026-10-12T10:00:00Z" },
-    { "id": "be_7", "teamId": "t_delta", "type": "milestone_on_time", "evidence": "按时交付里程碑", "created_at": "2026-10-18T10:00:00Z" },
-    { "id": "be_8", "teamId": "t_gamma", "type": "enterprise_meeting", "evidence": "完成一次企业对接会", "created_at": "2026-10-17T10:00:00Z" }
+    { "id": "be_1", "teamId": "t_alpha", "type": "weekly_progress", "evidence": "{\"repo\":\"https://demo.local/alpha\",\"version\":\"v0.1\",\"artifact\":\"第 1 周进度截图\"}", "created_at": "2026-10-12T10:00:00Z" },
+    { "id": "be_2", "teamId": "t_alpha", "type": "weekly_progress", "evidence": "{\"repo\":\"https://demo.local/alpha\",\"version\":\"v0.2\",\"artifact\":\"第 2 周进度截图\"}", "created_at": "2026-10-19T10:00:00Z" },
+    { "id": "be_3", "teamId": "t_alpha", "type": "workshop_output", "evidence": "{\"output\":\"workshop 课后产出：缺货预测 Demo\"}", "created_at": "2026-10-19T12:00:00Z" },
+    { "id": "be_4", "teamId": "t_alpha", "type": "first_demo", "evidence": "{\"version\":\"v0.3\",\"artifact\":\"首次可运行 Demo\"}", "created_at": "2026-10-20T09:00:00Z" },
+    { "id": "be_5", "teamId": "t_beta", "type": "weekly_progress", "evidence": "{\"repo\":\"https://demo.local/beta\",\"version\":\"v0.1\",\"artifact\":\"第 1 周进度截图\"}", "created_at": "2026-10-12T10:00:00Z" },
+    { "id": "be_6", "teamId": "t_delta", "type": "weekly_progress", "evidence": "{\"repo\":\"https://demo.local/delta\",\"version\":\"v0.1\",\"artifact\":\"第 1 周进度截图\"}", "created_at": "2026-10-12T10:00:00Z" },
+    { "id": "be_7", "teamId": "t_delta", "type": "milestone_on_time", "evidence": "{\"milestone\":\"pilot_contract\",\"onTime\":true}", "created_at": "2026-10-18T10:00:00Z" },
+    { "id": "be_8", "teamId": "t_gamma", "type": "enterprise_meeting", "evidence": "{\"enterpriseConfirmationId\":\"ec_gamma\"}", "created_at": "2026-10-17T10:00:00Z" }
   ],
   "expectations": {
     "tiedTeams": ["t_alpha", "t_beta"],
@@ -2047,8 +3712,12 @@ Expected: FAIL —— `ENOENT: no such file or directory, open 'platform/web/see
     "unnormalizedJudge": "j_partial",
     "missingDualSignatureTeam": "t_gamma",
     "freeBriefTeam": "t_epsilon",
-    "selfEvalWrittenExplanationTeam": "t_alpha",
+    "selfEvalWrittenExplanationTeam": "t_delta",
     "selfEvalJudgeQuestionTeam": "t_gamma",
+    "selfEvalWithinThresholdTeams": ["t_alpha", "t_beta"],
+    "missingSelfEvalTeam": "t_epsilon",
+    "trimmedDimensions": ["innovation", "feasibility", "completeness", "collaboration"],
+    "behaviorScores": { "t_alpha": 17, "t_beta": 2, "t_gamma": 5, "t_delta": 7, "t_epsilon": 0 },
     "tiers": { "t_alpha": "B", "t_beta": "C", "t_gamma": "A", "t_delta": "S", "t_epsilon": "D" }
   }
 }
@@ -2057,7 +3726,7 @@ Expected: FAIL —— `ENOENT: no such file or directory, open 'platform/web/see
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cd platform && node --test test/demo-seed.test.js`
-Expected: PASS（8 个测试全过：demo-seed.test.js 8）
+Expected: PASS（20 个测试全过：demo-seed.test.js 20）
 
 > **【2026-10-21 漂移审计修正 M-1】** **原来错在哪**：本计划一处「Expected: PASS」的条数声明
 > 与代码块里实际的 `test(` 数量不符 —— `demo-seed.test.js` 声明 **7** 实为 **8**。
@@ -2073,7 +3742,7 @@ Expected: PASS（8 个测试全过：demo-seed.test.js 8）
 
 ```bash
 cd platform && git add web/seed test/demo-seed.test.js
-git commit -m "feat(P6): 演示种子数据（每条 trace 分支都有触发器 + expectations 断言块）"
+git commit -m "feat(P6): 演示种子数据（每条 trace 分支都有触发器 + expectations 断言块）" -- web/seed test/demo-seed.test.js
 ```
 
 ---
@@ -4159,9 +5828,685 @@ git commit -m "test(P6): 全链路验收 + 跨平台可移植性验收"
 | 6 | `INTERFACES.md` §1 的 P0 产出清单里没有 `scripts/backup.js` / `scripts/restore.js`（P6 §7 才有） | 一致，无偏差。`backupDatabase` / `restoreDatabase` / `checkServiceState` / `verifyBackupFile` 是 P6 **新增**导出，不覆盖任何既有签名。 |
 | 7 | `web/api.demo.js` 里的规则加载方式 | `INTERFACES.md` 未规定前端如何取规则。P6 用「按文件名逐个 `fetch` `rules/*.json`」的方式，**不新增 `rules/index.json` 这类聚合文件**（避免与 `src/config.js` 的 `RULE_FILES` 产生第二份真相），并由 `scripts/build-demo.js` 校验所需文件齐全。 |
 | 8 | **P6 的 `scripts/restore.js` 需要读 schema 版本** | `INTERFACES.md` §1 的 P0 产出清单里 `src/db/migrate.js` 只有 `applyMigrations` / `readMigrationFiles`。P6 **追加**一个导出 `currentVersion(db)`（P0 已建，本阶段只追加，**不改 `applyMigrations` 的签名与行为**），`scripts/restore.js` 改为 import 它。⚠️ **不能在 `scripts/` 里自己写 SQL** —— 全局约束「所有 SQL 收进 `src/db/repo/`」，而 `src/db/migrate.js` 是 `platform/test/sql-boundary.test.js` 守卫的**唯一豁免文件**（守卫扫描 `src/` **与 `scripts/`**）；照原写法（`db.prepare('SELECT MAX(version) …')`）**当场判违规**。见 C-5 修正记录 |
-| 9 | **P4 的 `scripts/forbidden.txt` 有三条词条永远命中不了** | P4 的 `scanText()` 用 **`line.includes(term)` 字面串匹配**，但 P4 清单里有 `四维各 ?25%` / `初赛企业确认权重 ?20%` / `w_E ?= ?20%.*初赛` —— `?` 与 `.*` 在字面匹配下没有意义，**这三条词条等于没写**（R-AUD-03 被架空）。P6 在「修改 `scripts/forbidden.txt`」这一步里把这几条**拆成空格变体**（沿用平台自带 `platform/scripts/forbidden.txt` 的既有约定：空格变体各写一条），P6 自己新增的词条也一律用字面串。**不改 `scanText` 的匹配语义**（P4 的行为与测试都不动）。 |
+| 9 | **P4 的 `scripts/forbidden.txt` 曾有三条词条永远命中不了** | P4 的 `scanText()` 用 **`line.includes(term)` 字面串匹配**，P4 初版清单里的 `四维各 ?25%` / `初赛企业确认权重 ?20%` / `w_E ?= ?20%.*初赛` 里的 `?` 与 `.*` 在字面匹配下没有意义（等于没写）。**P4 定稿已把这几条拆成空格变体**（`四维各25%` / `四维各 25%` / `初赛企业确认权重20%` / `初赛企业确认权重 20%`），并由 P4 自己的用例断言「清单里没有正则占位写法」。P6 **不再重复改**（照本条原写法再追加一遍会触发 `parseManifest` 的「重复词条」→ 退出码 2），只追加 P6 的新词条（P6 新增的一律字面串 + 空格变体各一条）。**不改 `scanText` 的匹配语义**（P4 的行为与测试都不动）。 |
+
+### Task 2（部署资产）本轮偏差 —— 2026-10-21 预审
+
+> `INTERFACES.md` §7 对 P6 部署资产只规定了**文件名与职责**（`deploy/heikesong.service` /
+> `nginx.conf` / `docker-compose.yml` / `install.sh`）与三条禁令（`DEMO_MODE=1`、单写者、
+> 不硬编码口令），**没有规定具体内容**。因此下表记的是「本 Task 的实现 vs 计划正文原写法」的偏差，
+> 以及**是否触碰 `INTERFACES.md` 的契约**。
+
+| # | 偏差 | 是否触碰 INTERFACES.md 契约 | 处理 |
+|---|---|---|---|
+| T2-1 | `deploy/docker-compose.yml` 原来用 `ports: "127.0.0.1:8080:8080"`，改为 `network_mode: host`（去掉 `ports`） | ❌ 不触碰（文件名/职责不变） | `src/server.js` 实测**只绑 127.0.0.1**（`lsof`：`TCP 127.0.0.1:8080 (LISTEN)`，非回环 IP 不可达）。容器里用 `ports` 转发到容器 eth0，而进程不听那里 ⇒ 连接被拒（容器 healthy 但宿主 curl 不通）。`network_mode: host` 让「进程绑的 127.0.0.1:8080」= 宿主机的 127.0.0.1:8080，与 `nginx` 反代目标一致、也不暴露公网。**上游另一条路**：`src/server.js` 改成可绑 0.0.0.0（不在本 Task 归属内），届时可换回 `ports`。 |
+| T2-2 | `deploy/install.sh` 的 Node 版本下限由 `22.5` 改为 `22.16.0` | ❌ 不触碰 | `package.json` engines 写 `>=22.16.0`；`sqlite.backup()`（P6 Task 1 的备份脚本依赖）也是 22.16.0 引入的。22.5 会装上跑不了备份的 Node。 |
+| T2-3 | `deploy/heikesong.service` 的 `Documentation=` 由硬编码 `/opt/heikesong/platform/README.md` 改为 `__APP_DIR__/README.md` | ❌ 不触碰 | 违反「部署路径不硬编码」；占位符集合仍是规格声明的 `__APP_DIR__` / `__DATA_DIR__` / `__RUN_USER__`，**没有新增占位符**。 |
+| T2-4 | `deploy/install.sh` 新增 `SYSTEMD_UNIT_DIR` 变量（默认 `/etc/systemd/system`） | ❌ 不触碰 | 原写法把 `/etc/systemd/system/` 写死在函数里 → 干跑（临时目录）必然写到真机。做成变量后默认值不变，行为不变。 |
+| T2-5 | `deploy/install.sh` 的 `ENV_FILE` 变量原本**形同虚设**（单元里写死了 `/etc/heikesong/platform.env`），现改为 sed 替换该字面路径 | ❌ 不触碰（占位符集合不变） | 修「改了变量不生效」的静默失效。 |
+| T2-6 | `deploy/install.sh` 新增 `NODE_ENV` 变量（默认 `production`）写进环境文件 | ❌ 不触碰 | 落实计划「临时调试形态」D-2：`NODE_ENV=production` 会让 Cookie 带 `Secure`，`http://` 下浏览器拒收 → 登录失效。`EnvironmentFile` 优先于 `Environment=`，所以环境文件里的值生效。 |
+| T2-7 | `deploy/install.sh` 的落盘属组由「与用户名同名的组」改为**运行用户的主组**（`id -gn`） | ❌ 不触碰 | `install -d -g <用户名>` 假设存在同名组（Debian/RHEL 的 `useradd` 默认行为，但不是通用假设；macOS 主组是 `staff`，实测直接报 `unknown group`）。systemd 单元的 `Group=__RUN_USER__` 保持不变（占位符集合不变），在目标平台（Linux）两者一致。 |
+| T2-8 | `deploy/nginx.conf` 增补 3 处注释（端口口径、`web/assets/` 目录现状、占位符替换说明） | ❌ 不触碰 | 只加注释，不改任何指令。 |
+| T2-9 | `platform/test/deploy-assets.test.js` 由 7 个用例扩到 14 个 | ❌ 不触碰（测试文件不在 `INTERFACES.md` 契约内） | 规格的 7 个用例**逐字保留**；追加 7 个「对有效配置断言」的用例（见台账 D-11 / D-15）。 |
+| T2-10 | 计划 Task 2 的 Step 8 第二条命令改为「去掉整行注释再计数」 | ❌ 不触碰 | 规格原命令在**规格自己的文件**上实测是 2（注释里写了一遍），期望值 1 与文件不符。 |
 
 ---
 
 *配套：`../specs/2026-10-20-heikesong-platform-design.md`｜`../requirements-traceability.md`｜`../rule-decisions.md`｜`../`*
 
+---
+
+## Task 2 父代理预审修正台账（2026-10-21）
+
+> 本节是 Task 2（部署资产）的预审记录：**规格缺陷清单**、处置方式、逐字回写位置、硬约束自证。
+> 纪律：本计划 Task 2 的 5 个代码块 = 最终实现的**逐字副本**
+> （核验脚本 `platform/test/plan-assets-match.test.js` 之外的独立核验见下「D2-13」）。
+
+### A. 预审方法（先跑后派）
+
+1. 把规格 Task 2 的 5 个代码块**原样抽到** `/tmp/p6-t2/spec/`（一个字节都没改）。
+2. 在该副本上跑规格自带用例 → **红**（真实输出见 D2-01）。
+3. 逐条定位根因 → 改实现 → 再跑 → 全绿 → 才落盘到 `platform/deploy/` 与 `platform/test/`。
+4. 落盘后做：幂等干跑（连续两次执行）、YAML 解析、nginx 结构检查（含反证）、全量测试、
+   发布扫描、变异测试。
+
+### B. 规格缺陷清单
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| D2-01 | **Critical** | **规格的资产文件与规格自己的验收用例互相矛盾**：systemd 单元与 compose 的**注释里**写了被禁字面量（`--workers` / `cluster`），而规格的用例是 `doesNotMatch(全文)` → 注释里出现同样判红 | 规格副本上跑自带用例：`# tests 7 / # pass 4 / # fail 3`；逐条断言探针：`12/18 断言通过，6 条失败` | 资产文件的注释改写为不含被禁字面量（保留语义与指向计划的指引）。**不改用例**（用例的意图是对的：文件里就不该出现这些字面量）。 |
+| D2-02 | **Critical** | `install.sh` 的 `ROOT="$(cd "$(dirname "$0")/.." && pwd)"` **对不上**规格用例的正则 `\$\(cd "\$\(dirname "\$0\)" && pwd\)`（少一个 `/..`） | 同上探针：`FAIL [sh] match /\$\(cd "\$\(dirname "\$0\)" && pwd\)/` | 拆成两行：`SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"`（**正是全局约束写的那个写法**）+ `ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"`。用例与全局约束同时满足。 |
+| D2-03 | **Critical** | `install.sh` 的用法注释里 `ADMIN_PASSWORD='...'` **被规格自己的「不许硬编码口令」正则判成硬编码口令**（`'...'` 里第一个字符不是 `$`） | 同上探针：`FAIL [sh] doesNotMatch /PASSWORD\s*=\s*["'][^"'$][^"']*["']/`（大小写不敏感那条同样红） | 用法注释改成**不出现任何带引号的口令字面量**（口令值当场填、且不落盘）。口令来源仍是 `ADMIN_PASSWORD` 环境变量或交互读取。 |
+| D2-04 | **Critical** | `install.sh` 里 `log "…（手机号 $phone）"` 的 `$phone` **紧跟全角括号** → bash 在 `C` / `C.UTF-8` locale 下把高位字节并进变量名 → `set -u` 下直接 **unbound variable 崩掉**（种子步骤之后全流程中断） | 干跑实测：`/tmp/…/install.sh: line 195: phone?: unbound variable`（本机 locale = `C.UTF-8`）。最小复现：`LANG=C.UTF-8 bash -c 'phone=123; echo "手机号 $phone）"'` → 输出乱码而非 `123` | 改成 `${phone}`（显式界定变量名）。全文件扫了一遍「`$VAR` 紧跟非 ASCII 字节」= **仅此 1 处**。 |
+| D2-05 | **Critical** | `docker-compose.yml` 用 `ports: "127.0.0.1:8080:8080"`，但 `src/server.js` **只绑 127.0.0.1** → 容器里端口映射转发到容器 eth0，进程不听那里 ⇒ **连接被拒**（容器 healthy、宿主机 curl 不通，**静默失败**） | 实跑取证：`node src/server.js` 后 `lsof` → `TCP 127.0.0.1:8080 (LISTEN)`；`curl http://127.0.0.1:8080/api/health` → `{"ok":true,…}`；`curl http://192.168.2.27:8080/api/health` → 不可达 | 改用 `network_mode: host`（容器与宿主机共享网络栈 ⇒ 进程绑的 127.0.0.1:8080 就是宿主机的 127.0.0.1:8080，与 `nginx` 反代目标一致，也不暴露公网）。同时在文件里写清「若上游把 `src/server.js` 改成可绑 0.0.0.0，可换回 `ports`」。见「与接口契约的偏差」T2-1。 |
+| D2-06 | Important | `install.sh` 的 Node 版本下限 `MIN_NODE_MINOR=5` 低于项目真实下限 | `package.json` → `"engines": { "node": ">=22.16.0" }`；`src/db/sqlite.js` 注释：备份 API `sqlite.backup()` 是 22.16.0 引入 | 改为 `22 / 16`（与 engines 逐字一致），错误提示同步。 |
+| D2-07 | Important | systemd 单元的 `Documentation=file:/opt/heikesong/platform/README.md` **硬编码部署路径** | 与单元里其它路径都用 `__APP_DIR__` 不一致 | 改为 `Documentation=file:__APP_DIR__/README.md`（占位符集合不变）。 |
+| D2-08 | Important | `install.sh` 的 `ENV_FILE` 变量**形同虚设**：单元里写死 `EnvironmentFile=-/etc/heikesong/platform.env`，改了 `ENV_FILE` 服务读不到 | 代码走查；干跑时 `ENV_FILE` 指向临时路径，而单元里仍是 `/etc/heikesong/platform.env` | sed 替换该字面路径（`s|/etc/heikesong/platform.env|$ENV_FILE|g`），**不新增占位符**。干跑产物核对：单元里 `EnvironmentFile=-/tmp/…/etc/heikesong/platform.env` ✓。 |
+| D2-09 | Important | `write_env_file` 里的 `umask 077` **泄漏**到后面的函数 → nginx 站点文件会被建成 `600` | 代码走查（`umask` 不是函数局部） | `umask` 存取成对（写完恢复）。干跑产物核对：环境文件 `0640`、nginx 站点 `644` ✓。 |
+| D2-10 | Minor | `install -d -g "$RUN_USER"` 假设存在**与用户名同名的组** | 干跑实测：`install: unknown group mac`（macOS 主组是 `staff`） | 落盘属组改用运行用户的**主组**（`id -gn`），并保留同名组作为兜底。 |
+| D2-11 | Important | 规格的 7 个用例全是**字面扫一遍**：改掉注释就红、但把**配置本身**改坏（上游绑 `0.0.0.0`、compose 扩副本、`DEMO_MODE=1`、端口漂移、单元里写口令）**全都测不出来** | 变异测试第 1 轮：这些变异体在规格的 7 个用例下**全部存活**（见台账 E） | **规格的 7 个用例逐字保留**，另**追加 7 个**用例（单进程 / `DEMO_MODE` 禁令 / 正式形态 TLS / 上游只绑回环 / 不扩副本 / 端口与真实代码同口径 / 环境文件不落口令 / 幂等守卫），并引入 `effective()`（去掉整行注释）**只对有效配置断言** —— 注释里的「默认值说明」是文档，不是配置。 |
+| D2-12 | Minor | 规格 Step 8 第二条命令的**期望值与规格自己的文件不符** | `sh -c 'grep -c "proxy_buffering off;" deploy/nginx.conf'` → 实测 **2**（头部注释里写了一遍 + 真指令 1 处），规格写 `1` | 命令改为「去掉整行注释再计数」→ 实测 `1`（真指令本来就只有 1 处），且能真正抓到重复指令。 |
+| D2-13 | Minor | `nginx.conf` 的 `location /assets/ { alias __APP_DIR__/web/assets/; }` 指向的目录**当前不存在** | `ls platform/web/assets` → `No such file or directory`（现有静态文件在 `web/` 根下） | 保留规格形态（`R-OPS-04` 要求「`location /assets/` + 缓存策略存在」），但在文件里写清「`web/assets/` 是前端构建产物目录，现在还没有；目录不存在时该前缀返 404，不影响其它路径」。**不擅自改静态目录结构**（那是 Task 6 的范围）。 |
+| D2-14 | Minor | `install.sh` 结尾无条件打印「备份命令：… node scripts/backup.js」，但 `scripts/backup.js` 是 **P6 Task 1** 的产物（另一个 worktree 在写） | `ls platform/scripts/` → 只有 `audit-scan.js` / `forbidden.txt` / `migrate.js` / `seed.js` | 改成「文件存在才打印」，避免给出跑不通的命令提示。 |
+| D2-15 | Important | 规格的用例是**全文扫一遍** ⇒ **把真指令注释掉也扫得到**（假绿）。第 1 轮变异实测：`systemctl daemon-reload` 与 `nginx -t` 被注释掉后，规格用例 6 **仍然全绿** | 变异体 M28 / M29 在第 1 轮 **SURVIVED**（规格用例 6 仍绿）；M11 / M16 同理（SSE 指令被改/被删，规格用例 3 仍绿 —— 头部注释里写着同样的字面量） | 新增用例 12「注释不能掩盖配置错误」：对**去掉整行注释后的有效配置**再断言一遍（`effective()`）。规格的 7 个用例仍逐字保留（不削弱它们），只是补上「有效配置」这一层。 |
+
+### C. 逐字回写位置（本轮改动的计划代码块）
+
+| 计划位置 | 改动 |
+|---|---|
+| Task 2 Step 1 的 `platform/test/deploy-assets.test.js` 代码块 | 规格 7 个用例**逐字保留** + 追加 5 个用例（整体回写） |
+| Task 2 Step 3 的 `deploy/heikesong.service` 代码块 | 整体回写（D2-01 注释改写、D2-07 `Documentation` 占位符） |
+| Task 2 Step 4 的 `deploy/nginx.conf` 代码块 | 整体回写（D2-13 注释增补） |
+| Task 2 Step 5 的 `deploy/docker-compose.yml` 代码块 | 整体回写（D2-01 注释改写、D2-05 `network_mode: host`） |
+| Task 2 Step 6 的 `deploy/install.sh` 代码块 | 整体回写（D2-02/D2-03/D2-04/D2-06/D2-08/D2-09/D2-10/D2-14） |
+| Task 2 Step 2 / Step 7 / Step 8 的 Expected 与命令 | 见上表 D2-11 / D2-12 |
+
+### D. 硬约束自证
+
+| 硬约束 | 怎么验的 | 证据 |
+|---|---|---|
+| ① **单写者**（⛔ 多 worker 写同一 SQLite） | ① 资产文件全文不含 `--workers` / `cluster` 字面量（规格用例 2/5）；② 用例 8 断言单元**只有一条 `ExecStart`** 且不带多进程参数；③ 用例 10 断言 compose 无 `replicas` / `scale` / `deploy:` 键；④ `src/server.js` 实测单进程单写者 | 用例 2/5/8/10 全过；变异测试里「加 `--workers=4`」「加 `deploy.replicas: 2`」两个变异体**被杀** |
+| ② **不硬编码口令 / 域名 / 证书路径** | ① 规格用例 6 的两条正则（口令）；② 用例 11 断言**环境文件写入块**里不出现 `PASSWORD`；③ 域名/证书/私钥全是 `__SERVER_NAME__` / `__CERT_PATH__` / `__KEY_PATH__` 占位符，`install.sh` 逐个 sed 替换；④ 干跑产物核对：**口令没有落盘** | 干跑：`grep -rq "$ADMIN_PASSWORD" out/etc` → 「✅ 口令没有落盘」；环境文件内容只有 `PORT` / `DATA_DIR` / `SESSION_TTL_DAYS` / `NODE_ENV` 四行 |
+| ③ **`install.sh` 幂等** | 临时目录 + 系统命令打桩（`systemctl` / `nginx` / `id` / `runuser`），**连续跑两次** | 两次退出码均 **0**；第 2 次的 `migrate` 输出「本次无新迁移」、`seed` 输出「管理员已存在：13800000000」；`ln -sfn` 软链复用；`systemctl enable` 可重复 |
+
+### E. 变异测试（三轮，脚本 `/tmp/p6-mutate/t2.mjs`，指向**已落地**的测试文件）
+
+| 轮次 | 变异体总数 | KILLED | SURVIVED | 脚本错误（锚点失效/不唯一） | 处置 |
+|---|---|---|---|---|---|
+| 第 1 轮 | 38 | 24 | 13 | 1（M12 锚点命中 2 次） | 13 个存活体**逐个补断言**（补的都是真实不变量：注释不能掩盖配置、expires 与 max-age 必须一致、镜像 Node 主版本、代码挂载只读、Node 下限与 engines 一致、环境文件 0640、umask 存取成对、占位符→变量映射、locale 安全展开）；M12 锚点加长上下文 |
+| 第 2 轮 | 38 | 35 | 3 | 0 | 3 个存活体（M12 在另一处 location / M24 多挂一份可写副本 / M38 umask 不恢复）**补断言**（X-Real-IP 每一处都必须是 `$remote_addr`；代码只挂一次且 `:ro`；umask 恢复要在**有效配置**里找） |
+| 第 3 轮 | 42 | **42** | **0** | 0 | 追加 4 个变异体（M39 `read_only` / M40 `cap_drop` / M41 环境文件 0644 / M42 sed 值不转义）并补对应断言；最后 3 个存活体（M12 / M24 / M38）被新断言杀掉 |
+
+**最终：42 个变异体，42 个 KILLED，0 个存活，0 个脚本错误。**
+（变异体清单与每个变异体「改的是什么行为」见脚本里的 `MUTANTS` 数组；明细 JSON：`/tmp/p6-mutate/results.json`。）
+
+> ⚠️ **方法说明**：变异体**只**改「有效配置 / 有效脚本」，注释行会被 `effective()` 过滤掉，
+> 所以每个变异体都**真的改变行为**（不是改注释）。锚点命中数必须 === 1，
+> 命中 0 次报「锚点失效」、命中 ≥2 次报「锚点不唯一」并要求加长上下文 —— 脚本不放过含糊。
+
+### F. 计划块逐字核验
+
+`platform/deploy/*` 与 `platform/test/deploy-assets.test.js` 落地后，逐字比对本计划 Task 2 的 5 个代码块
+（核验脚本：把计划文件里的围栏块抽出来与落地文件 `diff`）—— 结果 **5/5 逐字一致**。
+
+### G. 遗留 / 需上游注意
+
+1. **`scripts/backup.js` 尚未落地**（P6 Task 1 另一个 worktree 在写）。`install.sh` 已改成「文件存在才打印备份命令」，
+   但**备份命令的可用性**要等 Task 1 落地后再验一次。
+2. **`src/server.js` 只绑 127.0.0.1** 是 compose 路径的根因（D2-05）。若上游愿意把绑定做成可配置
+   （如 `HOST` 环境变量），compose 可以换回更常见的 `ports` 映射；**本 Task 不改 `src/server.js`**（不在归属内）。
+3. **`web/assets/` 目录尚不存在**（D2-13）：`location /assets/` 现在是「给前端构建产物预留」的位置。
+   Task 6 的静态站构建落地后，这里才有实际内容。
+4. **`Group=__RUN_USER__` 假设存在与用户名同名的组**（Debian/RHEL `useradd` 默认行为）。
+   `install.sh` 落盘时用主组（`id -gn`），两者在目标平台一致；若将来换到用户名与组名不同的系统，
+   单元里的 `Group=` 需要单独处理。
+5. **上海机调试形态**（计划「临时调试形态」D2-1～D2-4）**不在本 Task 的四个文件里**：那需要另开一套
+   `listen 8080`、无 TLS、无 `server_name` 的 nginx server 块。本 Task 的 `nginx.conf` 是**正式形态**
+   （域名 + TLS + 443），与计划「部署目标决策登记」一致。
+
+
+---
+
+## Task 1 实施台账（2026-10-21）
+
+> 本节是 Task 1（备份与恢复脚本）的实施记录：**规格缺陷清单**、处置方式、逐字回写位置、实跑证据、变异测试。
+> 纪律：本计划 Task 1 的 **6 个代码块 = 最终实现的逐字副本**
+> （核验命令：`node /tmp/p3fix/plan-blocks.mjs <plan> <platformDir>`）。
+>
+> **本 Task 的灵魂**（规格第 195–200 行）：备份用 `sqlite.backup()` API，**不用 `cp`**。
+> 测试**同时**证明两件事：① `backup()` 拷到的备份里**有**那笔「已提交但未 checkpoint」的事务；
+> ② 只 `cp .db` 的副本里**没有**。两条都是真断言（不是「跑通即算」）。
+
+### A. 实施方法（先跑后落盘）
+
+1. 把规格 Task 1 的代码块**原样抽到** `/tmp/p6-t1-scratch/platform`（一个字节都没改）。
+2. 先做 **node:sqlite `backup()` API 探针**（`/tmp/p6-t1-scratch/probe1..5.mjs`）—— 摸清四件事：
+   `progress` 回调的真实签名、`readOnly` 打开 WAL 库的副作用、`backup()` 对并发写者的容忍度、
+   「能打开但页已损坏」的库在 `integrity_check` 下的表现。
+3. 在副本上写实现 + 用例 → 全绿 → 才落盘到 `platform/`。
+4. 落盘后：全量测试、**规格原样实现对照**（缺陷实证）、变异测试、计划块逐字回写与核验、Step 9 实跑。
+
+### B. 规格缺陷清单
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| D1-01 | **Important** | `backup()` 的 `progress` 回调**签名写错**：规格写 `(_db, copied)`，Node v22 的真实签名是**一个对象** `{ totalPages, remainingPages }`；而且该回调**只在多轮迭代时触发**（库小到一次迭代就拷完时根本不触发）→ 规格原样实跑 `pages` 恒为 **0** | 探针 `probe2.mjs`：回调收到 `[{totalPages:52,remainingPages:51}]`（`args.length===1`，参数类型 `object`）；探针 `probe1.mjs`（52 页 / `rate:100`）→ **回调 0 次触发**；规格原样实现的探针：`PROBE_PAGES=0 type=number` | 按真实签名取 `totalPages`；回调一次都没触发时回落到源库 `PRAGMA page_count`。规格原样的 `pages=0` 由此修掉 |
+| D1-02 | **Important** | Task 1 的 **Interfaces 段明写**「Consumes: `openDatabase({ dataDir, filename })`（P0 `src/db/sqlite.js`）」，Step 4 的代码块却用 `new DatabaseSync(sourcePath)` 直连 —— **同一 Task 内自相矛盾**，且丢掉 `openDatabase` 提供的 `busy_timeout=5000`（服务运行中备份时对 `SQLITE_BUSY` 没有退避） | 计划原文：Task 1「**Interfaces:** - Consumes: `openDatabase({ dataDir, filename })`」 vs Step 4 代码块 `const source = new DatabaseSync(sourcePath);` | 改用 `openDatabase({ dataDir, filename })`，与 Interfaces 段对齐。⚠️ **这一条没有测试能区分**（两条路径在本 Task 覆盖的场景里行为等价）—— 属**接口契约对齐**而非行为修复，已在变异结果里显式标注 |
+| D1-03 | **Important** | `verifyBackupFile` 用 `readOnly: true` 打开 WAL 标志的库时，SQLite **会在文件旁建出** `-wal`(0B) 与 `-shm`(32KB)，且**关库后不删** → 备份目录每次校验多两个文件；保留策略只认 `*.db` ⇒ 这些残留**永不被清理** ⇒ 备份目录无限膨胀；`restoreDatabase` 的临时文件旁也会留 `app.db.restore.tmp-wal/-shm` | 探针 `probe4.mjs`：`readOnly 打开备份后: out.db(8192B) out.db-shm(32768B) out.db-wal(0B)`；规格原样实现的探针：`BEFORE=app-….db` → `AFTER=app-….db,app-….db-shm,app-….db-wal` | `verifyBackupFile` 记下「打开前 sidecar 存不存在」，关库后只删**本次自己造出来的**（打开前就存在的 `-wal` 可能带真实数据，一律不动） |
+| D1-04 | **Important** | `checkServiceState` 把「pid 文件存在但内容不是合法 pid」当成「服务没在跑」→ **拿不到「服务已停」的证据却放行恢复**，与「恢复前必须先停服务」这条安全闸的 fail-safe 意图相反 | `readPidFile` 对非法内容返回 `null`（规格原样），`checkServiceState` 随即落到「未发现运行中的服务进程」 | 补一条：pid 文件在但内容不可解析 ⇒ `running: true`（保守拒绝），错误信息点明原因。运维确认服务已停后删掉该 pid 文件即可继续 |
+| D1-05 | **Important** | 规格自带的 8 个用例里有 **3 条不判别**（把实现改坏它们照样绿）：① 「恢复后旧 `-wal`/`-shm` 被清掉」的断言放在**新库打开并关闭之后** —— 可 SQLite 自己会在打开时重建 `-wal`、关闭时删掉 `-wal`/`-shm` ⇒ 就算恢复**根本没删**也照样绿；② 「恢复前会留一份 `.before-restore-`」只断言 `steps` **文本**、不查**磁盘**（把 `rename` 换成 `unlink` 也照样绿）；③ 「备份文件损坏时拒绝恢复」用的是**根本不是 sqlite 的文件** ⇒ 它在**打开**阶段就被拒 ⇒ 跳不跳过 `integrity_check` 都一样拒 | 变异实测：M18（不删 `-wal`/`-shm`）**存活**、M19（不留存旧库）**存活**、M21（跳过 `integrity_check`）**存活** | 规格的 8 个用例**逐字保留**；另**追加 10 个判别性用例**：`-wal`/`-shm` **紧接恢复后**就断言、旧库必须**真在磁盘上**、临时文件必须清干净、**能打开但页已损坏**的备份（清零第 3 页 → `integrity_check` 报 `btreeInitPage() returns error code 11` 而**不抛错**，见探针 `probe5.mjs` 策略 A）、命令行入口可执行、保留策略的「份数 ∪ 天数」语义、真实生产 schema 往返等。三个存活体由此被杀 |
+| D1-06 | Minor | Step 9 的实跑命令 `node scripts/seed.js` **不带 `ADMIN_PASSWORD`** → `scripts/seed.js` fail-fast 拒绝（「不提供默认口令」）→ 整条 `&&` 链在此中断，**备份根本没跑** | 实跑输出：`缺少环境变量 ADMIN_PASSWORD，拒绝创建管理员账号（不提供默认口令）。` | Step 9 的命令补上 `ADMIN_PASSWORD='<你的口令>'` 并写明原因。⚠️ 种子脚本的 fail-fast 设计**不改**（不提供默认口令是对的） |
+| D1-07 | Minor | Step 10 的 `git commit` **不带 `-- <paths>`** —— 违反「先 `git add <paths>`，再 `git commit -m "…" -- <paths>`」这条纪律 | 计划 Step 10 原文 | 补上 `-- <paths>`（`-m` 仍在 `--` 之前） |
+| D1-08 | Minor | 两个脚本的 `isMain` 判定照抄「`fileURLToPath(import.meta.url) === process.argv[1]`」：**符号链接入口会静默不执行、退出码 0**（`src/server.js` 的注释里已记录这个坑并改用 realpath 判定） | `src/server.js` 注释原文：「Node 会把主入口 realpath 化，import.meta.url 是真实路径，而 process.argv[1] 是链接路径 → 字符串全等为假 → 服务器静默不启动、退出码 0」 | 沿用 `src/server.js` 的 realpath 判定。⚠️ 实施时**第一版漏了 `fileURLToPath`** —— `realpathSync()` 吃的是**路径**不是 `file://` URL，直接传 `import.meta.url` 会抛 ENOENT ⇒ `isMain` 恒假 ⇒ **命令行跑起来什么都不干、退出码 0**。是 Step 9 实跑抓到的（`[backup] 完成：…` 一行都没打、`data/backups/` 没生成）。已修，并补两条「命令行入口可执行」的用例守住（M25/M26/M27 三个变异体被杀） |
+| D1-09 | Minor | `restoreDatabase` 在 `dataDir` 不存在时 `copyFileSync` 抛 ENOENT（**恢复到新机器**的典型场景） | 代码走查 | 换库前 `mkdirSync(dataDir, { recursive: true })` |
+| D1-10 | Minor | `checkServiceState({ dataDir })` 不传 `dataDir` 时 `join(undefined, 'app.pid')` 抛 TypeError | 代码走查 | 补默认值 `dataDir = './data'`（与 `restoreDatabase` 一致） |
+
+### C. 逐字回写位置（本轮改动的计划代码块）
+
+| 计划位置 | 改动 |
+|---|---|
+| Task 1 Files 段的 Test 两行之后 | 追加「实施补记」（8 个用例逐字保留 + 追加 10 个判别性用例） |
+| Task 1 Step 1 的 `platform/test/backup.test.js` 代码块 | 整体回写（规格 4 个用例逐字保留 + 追加 3 个判别性用例） |
+| Task 1 Step 1 的 `platform/test/restore.test.js` 代码块 | 整体回写（规格 4 个用例逐字保留 + 追加 7 个判别性用例） |
+| Task 1 Step 3 的 `src/runtime/pidfile.js` 代码块 | **未改**（与实现逐字一致） |
+| Task 1 Step 4 的 `scripts/backup.js` 代码块 | 整体回写（D1-01 progress 签名、D1-02 openDatabase） |
+| Task 1 Step 5 的 `src/db/migrate.js` 片段 | **未改**（追加块与实现逐字一致） |
+| Task 1 Step 6 的 `scripts/restore.js` 代码块 | 整体回写（D1-03 sidecar、D1-04 pid 坏内容、D1-09/D1-10） |
+| Task 1 Step 7 的 `src/server.js` 三处片段 | 整体回写（D1-08 realpath 判定；写成三处独立可分离的小改动） |
+| Task 1 Step 8 的 Expected | 改成实跑数字（backup 7 + restore 11 = 18） |
+| Task 1 Step 9 的命令 | 补 `ADMIN_PASSWORD`（D1-06） |
+| Task 1 Step 10 的命令 | 补 `-- <paths>`（D1-07） |
+
+### D. 实跑证据
+
+| 项 | 结果 |
+|---|---|
+| 全量测试（`node --disable-warning=ExperimentalWarning --test`，cwd 发现） | **841 / 841 全绿**（基线 823 + 本 Task 新增 18） |
+| 单文件（`--test test/backup.test.js test/restore.test.js`） | **18 / 18 全绿**（backup 7 + restore 11） |
+| Step 9 实跑（migrate → seed → backup → restore → 读表） | `[backup] 完成：app-20261021T070553Z.db（630784 字节，154 页）` → `[restore] 成功。请重新启动服务： systemctl restart heikesong` → `users = 6`（正整数） |
+| 规格原样实现对照（`/tmp/p6-mutate/t1-spec-baseline.mjs`：把计划里的代码块逐字装进副本，跑本次的用例） | **13 绿 / 3 红** —— 3 条红正是 D1-01（页数）、D1-03（sidecar 残留）、D1-04（pid 坏内容）的判别点 |
+| 本 Task 的灵魂用例 | 「WAL 模式下备份包含已提交但未 checkpoint 的事务（而只 cp .db 会丢）」**同时**断言反例（只 cp `.db` 的副本 `COUNT=0`）与正例（`backup()` 的副本 `COUNT=1`） |
+
+### E. 变异测试（脚本 `/tmp/p6-mutate/t1.mjs`，指向**已落地**的测试文件）
+
+| 轮次 | 变异体总数 | KILLED | SURVIVED | 处置 |
+|---|---|---|---|---|
+| 第 1 轮 | 18 | 13 | 5 | 5 个存活体逐个定位为「**用例不判别**」（D1-05）：M18/M19/M20/M21 + M02。逐个补判别性断言（`-wal`/`-shm` 紧接恢复后断言、旧库查磁盘、临时文件查磁盘、能打开但损坏的备份） |
+| 第 2 轮 | **27** | **26** | **1** | 追加 9 个变异体（M19/M20/M21 改锚点后重杀 + M22..M27：schema 版本、sidecar 清理、`currentVersion`、三个命令行入口），第 1 轮的 4 个存活体同时被杀 |
+
+**最终：27 个变异体，26 个 KILLED，1 个存活，0 个脚本错误（锚点全部唯一命中）。**
+
+**存活者 M02（规格原样的 `progress: (_db, copied)`）= 等价变异体**：
+本实现有 `PRAGMA page_count` 兜底 ⇒ 回调写错**不改变可观测结果**。**探针差分实证**：
+Node v22 的真实签名是**单对象** `{ totalPages, remainingPages }`（探针 `probe2.mjs` 输出
+`args.length 集合: [1]`、参数类型 `["object"]`）；而**规格原样实现**（无兜底）的实跑结果是
+`pages = 0`（探针 `PROBE_PAGES=0 type=number`）⇒ **缺陷 D1-01 真实存在**，只是在本实现里被兜底掩盖。
+
+> ⚠️ 方法说明：每个变异体都**真的改变行为**（改的是有效代码，不是注释）；锚点命中数必须 `=== 1`，
+> 命中 0 次报「锚点失效」、命中 ≥2 次报「锚点不唯一」并要求加长上下文 —— 脚本不放过含糊。
+> 变异体清单见脚本里的 `MUTANTS` 数组。
+
+### F. 计划块逐字核验
+
+`node /tmp/p3fix/plan-blocks.mjs docs/superpowers/plans/2026-10-20-platform-P6-deploy-demo.md platform` →
+**Task 1 的 6 个块全部一致**：
+
+| 块 | 结果 |
+|---|---|
+| `test/backup.test.js` | 整文件块 ✅ 一致（217 行） |
+| `test/restore.test.js` | 整文件块 ✅ 一致（306 行） |
+| `src/runtime/pidfile.js` | 整文件块 ✅ 一致（43 行） |
+| `scripts/backup.js` | 整文件块 ✅ 一致（152 行） |
+| `scripts/restore.js` | 整文件块 ✅ 一致（193 行） |
+| `src/db/migrate.js`（Step 5 的追加片段） | 片段块 ✅（实现含此片段，12 行） |
+| `src/server.js`（Step 7 的三处 pid 片段） | 片段块 ✅ ×3（1 行 / 7 行 / 6 行） |
+
+> （同一次运行里 `scripts/audit-scan.js` / `web/index.html` / `web/app.js` 报「❌不一致 / 无实现」——
+> 那是 **Task 3/4/5/6** 的块，**在本 Task 之前就已经这样**，与本次改动无关。）
+
+### G. 遗留 / 需上游注意
+
+1. **`src/server.js` 的 P4 合并冲突面**：P4 阶段在同一文件加了审计路由 → 将来合并会冲突。
+   本 Task 的改动刻意写成**三处独立、带 `── P6：… ──` 注释边界**的小改动
+   （顶部 import 一行 / `openDatabase` 之后的 `writePidFile(dataDir)` 一行 /
+   `SIGINT`/`SIGTERM` 处理里的 `removePidFile(dataDir)` 一行），
+   冲突时**按边界取**即可。**本 Task 没有重建 `server.js`**（只在既有文件上追加）。
+2. **`package.json` 的 `backup` / `restore` npm scripts 未加**：计划的 File Structure 段列了
+   「package.json scripts 增加 backup / restore / build:demo / serve:demo」，但 **Task 1 的 Files 清单不含
+   package.json**（`build:demo` / `serve:demo` 属 Task 5/6）→ 为避免与别的 Task 抢同一个 JSON 对象，
+   本 Task **不动 package.json**。功能入口仍是 `node scripts/backup.js` / `node scripts/restore.js`
+   （`deploy/install.sh` 打印的正是这条命令）。
+3. **Task 2 台账 G-1「`scripts/backup.js` 尚未落地」已由本 Task 解除**：
+   `install.sh` 里那条备份命令现在真的可执行（Step 9 实跑已验）。
+4. **`restoreDatabase` 不接受 `serviceName` 参数**（接口契约里没有）→ systemd 探测固定用 `heikesong`；
+   若将来服务改名，需要扩接口。
+5. **备份目录的 sidecar 清理依赖 `verifyBackupFile` 的兜底**：若有人绕过本脚本直接用别的工具打开备份文件，
+   仍可能留下 `-wal`/`-shm`（这是 SQLite 的行为，不是本 Task 可控的）。
+6. **`backupDatabase` 打开源库用 `openDatabase`**（D1-02）⇒ 备份动作会把源库切到 WAL 模式
+   （对已经是 WAL 的库是 no-op，不取锁）。
+
+---
+
+## Task 3 实施台账（2026-10-21）
+
+> 本节是 Task 3（发布前扫描闸）的实施记录：**规格缺陷清单**、处置方式、逐字回写位置、实跑证据、变异测试。
+> 纪律：本计划 Task 3 的 **4 个代码块 = 最终实现的逐字副本**
+> （核验命令：`node /tmp/p3fix/plan-blocks.mjs docs/superpowers/plans/2026-10-20-platform-P6-deploy-demo.md platform`）。
+>
+> **本 Task 的灵魂**（规格第 2195–2203 行）：① **禁用清单必须真有词条，空清单 ≠ 已保护**；
+> ② **不能一刀切**（更正语境要能出现在文档里）；③ **平台自身必须能独立跑**
+> （`--evidence-chain` 只是可选增强，绝不影响本闸结论）。
+>
+> ⛔ **归属**：`scripts/audit-scan.js` 与 `scripts/forbidden.txt` 是 **P4 Task 7 建立的**，
+> 本阶段**不重建**（P0–P6 严格串行，两个 writer 写同一个路径必然冲突），
+> 只在 P4 的实现上**追加**发布相关能力；`parseManifest` / `scanText` / `scanRoots` / `main`
+> 的**签名一律不变**；P4 的 `test/audit-scan.test.js` **一个字不改**。
+
+### A. 实施方法（先跑后派）
+
+1. 把规格 Task 3 的代码块**原样抽到** `/tmp/p6-t3-scratch/spec/`（一个字节都没改）。
+2. 在 `/tmp/p6-t3-scratch/platform/`（P4 现状的整份拷贝）上跑规格自带用例 → **红**
+   （`# tests 6 / # pass 4 / # fail 2`：用例 4「仓库自带清单里必须有 CICC 条目」、
+   用例 6「--forbidden 未生效」）。
+3. 在拷贝上实现规格的 Step 3 / Step 4 → 规格的 6 个用例**全绿**；
+   再补 13 条判别性用例（规格的 6 条**逐字保留**）→ 19 条全绿；P4 的 20 条用例仍全绿。
+4. **落盘**到 worktree（`scripts/audit-scan.js` / `scripts/forbidden.txt` / 新建 `test/audit-scan-release.test.js`）。
+5. 落盘后做：全量测试、扫描闸实跑（0 / 2）、**逐字回写计划**、变异测试。
+
+### B. 规格缺陷清单
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| D3-01 | **Critical** | 规格 Step 4 让清单写 `@skip-path ^platform/web/dist/`，与 Step 3 的「发布产物也扫」**互相抵消**：`scanRoots` 先查 `skipPaths` 再查 `excludePaths`，清单里这一行会把发布产物里的**每个文件**整条跳过 ⇒ 本 Task 的核心（发布产物过闸）**形同虚设**，而闸还报「✓ 未发现禁用表述」退出 0 | 探针 1（`/tmp/p6-t3-scratch/probe-defects.mjs`）：按规格原样（清单带那一行）+ `dist/index.html` 里有 `积分占决赛 30%` → **退出码 0**；报告里 `platform/web/dist/index.html` 出现在**排除段（@skip-path）**、**不在违规段**；同一份实现去掉那一行 → **退出码 1**（违规段点名 dist）。变异体 M01/M02/M03 是同一形状 | ① 清单里**不**写 `@skip-path ^platform/web/dist/`（并在清单里写明为什么）；② 发布产物那一趟固定 `skipPaths: []`（**清单关不掉它**）+ `excludePaths: []`（源码目录的默认排除项不套到发布产物上）；③ 追加 3 条判别性用例（发布产物必过闸 / 清单的 `@skip-path` 关不掉它 / 发布产物里每一个文本文件都要过闸） |
+| D3-02 | **Important** | 规格 Step 4 的**前提过期**：它要求「把 P4 里带 `?` 的两条拆成空格变体」，但 **P4 定稿早已拆好**（P4 自己的用例断言「仓库自带清单里没有「正则占位」写法」）→ 照规格再追加一遍会触发 `parseManifest` 的「重复词条」→ 退出码 2 ⇒ **闸永远打不开** | 探针 5：`git show HEAD:platform/scripts/forbidden.txt` 里已有 `初赛企业确认权重20%` / `初赛企业确认权重 20%` / `四维各25%` / `四维各 25%`；把它再追加一遍 → `parseManifest` 报错 `["清单里有重复词条：四维各 25%"]` | **不改** P4 的词条，只追加 P6 的新词条；把计划里这一步的前提改正（Step 4 的说明 + 「与接口契约的偏差」第 9 条一并改写） |
+| D3-03 | **Important** | 规格自带的用例 6 名为「发布产物目录也必须过闸」，实际测的是 `--forbidden` + **普通文件** ⇒ 规格最核心的一条（发布产物过闸）**没有任何用例覆盖** | 探针 2：把 Step 3 的「发布产物那一趟」整段删掉（= 变异体 M03）后，**规格自带的 6 个用例全部通过**（`not ok` = 0） | 规格的 6 个用例**逐字保留**；另加 4 条针对发布产物的用例（发布产物必过闸 / 每个文本文件都要过闸 / 清单的 `@skip-path` 关不掉它 / 发布产物不存在时按「存在才扫」处理） |
+| D3-04 | **Important** | 规格的用例 5「增强不可用也不影响结论」在**参数还没实现时也会通过**（未识别的参数被当成扫描路径 → 扫 0 个文件 → 退出码 0）⇒ 假绿 | 在 **P4 的实现**上直接跑规格的 6 个用例：用例 5 **通过**（`--evidence-chain` 根本没被解析） | 追加 2 条用例：HOME 下没有该 skill 时退出码仍为 0 且打印一行说明 / `--evidence-chain` 指向真实脚本时该脚本**确实被调用**（写标记文件） |
+| D3-05 | **Important** | 规格的 `main` 把**未知参数**当扫描路径吞掉（`roots.push(a)`）⇒ 参数写错（如 `--jsonn`）时扫 0 个文件并报「✓ 未发现禁用表述」，退出码 0 —— 静默放行 | 探针 3：按规格原样跑 `--jsonn` → **退出码 0**，输出「扫描 0 个文件」+「未发现禁用表述」 | 未知 `--` 参数 → 退出码 2 + 报「未知参数」+ 用法提示 |
+| D3-06 | **Important** | 规格的 `--forbidden` 缺值时回落默认清单（`argv[i + 1] \|\| manifestPath`）⇒ 参数写错 = 用错清单 = 假绿 | 探针 4：按规格原样跑 `--forbidden`（缺路径）→ **退出码 0**（静默用了默认清单）；变异体 M07（照规格原写法改回去）→ 新增用例「--forbidden 缺路径 → 退出码 2」变红 | 缺值 → 退出码 2 + 报「--forbidden 后面必须跟清单路径」 |
+| D3-07 | **Important** | 规格没有「扫到 0 个文件」的判定 ⇒ 扫描范围写错（路径拼错、目录搬走、参数被吞）时闸报「✓ 未发现禁用表述」并退出 0 —— 与全局约束「静默的空产出比报错更危险」相悖 | 变异体 M08 / M15 都是这个形状（扫 0 个文件还报通过） | 扫到 0 个文件 → 退出码 2（文本输出与 JSON 输出都报「闸未生效」，JSON 里另有 `gateEffective: false`） |
+| D3-08 | **Minor** | 规格的 `runEvidenceChain` 用 `join(process.env.HOME \|\| '', ...)` ⇒ HOME 未设置时拼出**相对路径** `.minimax/skills/...`，会按当前工作目录去找（可能误命中） | 探针 6：HOME 为空时的候选路径 = `".minimax/skills/evidence-chain/scripts/audit-evidence.js"`（相对路径） | HOME 为空时该候选项直接置 `null` |
+| D3-09 | **Minor** | 规格 Step 3 是「整体替换 P4 的 `main`」，但没给「不许削弱 P4 行为」的验收手段 | P4 的 `test/audit-scan.test.js`（20 例：CLI 退出码 2/1/0 三种语义、排除项打印、豁免打印、清单自检）在改造后**仍全绿** | P4 的测试文件一个字不改（本 Task 只新建 `test/audit-scan-release.test.js`）；P4 的 20 例 + 本 Task 的 19 例一起跑 |
+
+### C. 逐字回写位置（本轮改动的计划代码块）
+
+| 计划位置 | 改动 |
+|---|---|
+| Task 3 Step 1 的 `platform/test/audit-scan-release.test.js` 代码块 | 整体回写：规格的 6 个用例**逐字保留** + 追加 13 条（父代理预审）＝ 323 行 |
+| Task 3 Step 3 的 `scripts/audit-scan.js` 代码块 | 整体回写（158 行 ＝ 落地文件里 `main` + `runEvidenceChain` 区段的逐字副本） |
+| Task 3 Step 3 的 import 代码块 | 不变（逐字一致） |
+| Task 3 Step 4 的清单「P6 追加」代码块 | 整体回写（19 行 ＝ 落地清单里 P6 追加段的逐字副本） |
+| Task 3 Step 4 的清单「P4 定稿现状」代码块 | 整体回写（5 行 ＝ 落地清单里 P4 那几行的逐字片段） |
+| Task 3 Step 4 / 4b / 5 的说明与 Expected | 前提改正（D3-02）+ 实跑数字（词条 15 条 / 扫描 140 个文件 / 19 例） |
+| 「与接口契约的偏差」第 9 条 | 改写（P4 已自行拆好空格变体，P6 不重复追加） |
+| 本台账 | 新增 |
+
+> 回写脚本：`/tmp/p6-t3-scratch/writeback.mjs` —— **按块在文档里的位置升序**处理，
+> 并逐块累计**长度偏移**（第一版漏了偏移，替换会错位到别的块上；已修，第二次回写才作数）。
+
+### D. 硬约束自证
+
+| 硬约束 | 怎么验的 | 证据 |
+|---|---|---|
+| ① **空清单 ≠ 已保护**（清单为空 / 不合规 → 非 0 退出） | ① `parseManifest` 对空清单报错「闸未生效」；② CLI 层：清空清单 → 退出码 2；③ `--forbidden` 指定的清单为空 → 同样 2；④ 清单文件缺失 → 2 | 实跑：清空 `scripts/forbidden.txt` → 退出码 **2**（stderr「禁用清单为空 —— 闸未生效」）；用例 16 变红（M05 / M06） |
+| ② **发布产物也过闸**（发布产物本身必须过闸） | ① 沙箱里造 `platform/web/dist/`，CLI 的**默认范围**必须拦下；② 清单里的 `@skip-path` 关不掉它；③ 产物里**每一个**文本文件都要过闸（含 `src/domain/`、`rules/`、`seed/` 这类子目录） | 用例 8 / 9 / 10 全过；变异体 M01 / M02 / M03 全被杀 |
+| ③ **更正语境豁免**（不能一刀切） | ① 仓库自带清单里的 CICC 词条带豁免正则；② **裸引用被拦**、**更正语境被放过且进报告**（用仓库自带清单实测，不只是构造清单） | 用例 3 / 4 / 7 全过；变异体 M10 / M19 / M20 / M21 / M22 全被杀 |
+| ④ **平台自身能独立跑**（不依赖用户机器上的 skill） | ① HOME 下没有该 skill 时退出码仍为 0 且打印一行说明；② skill 在时多跑一份报告，且**闸结论不变**（有违规仍是 1） | 用例 18 / 19 全过；变异体 M12 / M17 全被杀 |
+| ⑤ **零依赖 / `node --test`** | `package.json` 未新增任何 dependency；全部用例用 `node --test`（无参，cwd 发现） | `git diff platform/package.json` ＝ 空；全量 **956 例 / 955 通过 / 1 跳过 / 0 失败** |
+
+### E. 变异测试（脚本 `/tmp/p6-mutate/t3.mjs`，指向**已落地**的实现与测试）
+
+| 轮次 | 变异体总数 | KILLED | SURVIVED | 脚本错误（锚点失效/不唯一） | 处置 |
+|---|---|---|---|---|---|
+| 第 1 轮 | 22 | 20 | 2 | 0 | 存活体 **M01**（发布产物那一趟改回默认排除）/ **M07**（`--forbidden` 缺值回落默认清单）→ 补断言 |
+| 第 2 轮 | 22 | **22** | **0** | 0 | M01：新增用例「发布产物里的每一个文本文件都要过闸」；M07：把变异体改成**忠实复现规格原写法**（`manifestPath = value \|\| manifestPath`）——第一版的写法并不等价于规格（它落到 `undefined` ⇒ 清单「缺失」⇒ 退出码 2），改后才真正复现「静默回落默认清单」 |
+
+**最终：22 个变异体，22 个 KILLED，0 个存活，0 个脚本错误。**
+（变异体清单与每个变异体「改的是什么行为」见脚本里的 `MUTANTS` 数组；明细 JSON：`/tmp/p6-mutate/t3-results.json`。）
+
+> ⚠️ **方法说明（这一轮踩到的坑，写下来给后面的人）**：
+> ① 变异体**只改有效代码**（改的是行为，不是注释）；锚点命中数必须 === 1，
+>    命中 0 次报「锚点失效」、≥2 次报「锚点不唯一」——本轮 **0 次脚本错误**。
+> ② **必须先跑对照（未变异的假仓库）确认测试全绿，再看变异结果**：
+>    第一轮的控制组当时是**坏的**（`node --test test/` 在 Node 22 上不按目录扫描，
+>    误把 `test/` 当模块加载 → 38 个用例只跑出 1 个「失败」），
+>    那会把「22 个变异体全杀」变成**假象**（每个变异体都只是撞上同一个环境错误）。
+>    ⚠️ 这个坑**本仓已经踩过一次**（提交 `0a2d515 fix(P0): 修正测试命令 —— node --test test/ 在 Node 22 上不工作`，
+>    全局约束里现在写的是 `node --test` 无参）—— 本轮是**第二次**踩到，特此记下来。
+>    改成显式列出两个测试文件后，控制组 **39 例全绿**，才认这一轮的结论。
+> ③ 假仓库构造：`<root>/platform/{scripts,test}` + `<root>/docs/ok.md`
+>    （CLI 的仓库根 = `<root>`，相对路径可预期）。
+
+### F. 计划块逐字核验
+
+`node /tmp/p3fix/plan-blocks.mjs docs/superpowers/plans/2026-10-20-platform-P6-deploy-demo.md platform` →
+
+| 块 | 结果 |
+|---|---|
+| `test/audit-scan-release.test.js` | 整文件块 ✅ 一致（323 行） |
+| `scripts/audit-scan.js`（Step 3 的 `main` + `runEvidenceChain`） | 片段块 ✅（实现含此片段，158 行） |
+
+> `scripts/forbidden.txt` 的两个块**不在** `plan-blocks.mjs` 的扫描范围（它只认 js/html/css/sql/json），
+> 已单独核过：**两个块都是落地清单的逐字片段** ✅（19 行 / 5 行）。
+
+### G. 遗留 / 需上游注意
+
+1. **⚠️ 前端构建产物目录三处不一致（待 Task 6 拍板）** ——
+   - 计划 Task 6 规定产物在 **`platform/web/dist/`**；
+   - `deploy/nginx.conf` 的静态资源直出却指向 **`__APP_DIR__/web/assets/`**
+     （**没有任何 Task 会生成这个目录** —— Task 2 台账 D2-13 已记过同一件事）；
+   - `deploy/install.sh` 的 rsync 又把 **`web/dist/` 排除**在拷贝之外
+     （`--exclude 'web/dist/'`）。
+   - ⇒ **本 Task 的扫描目标按计划走 `web/dist`**（`audit-scan.js` 里的 `distDir`），
+     ⛔ **不改 `deploy/nginx.conf` / `deploy/install.sh`**（那是 Task 2 的文件，且要等 Task 6 一起定）。
+   - **待 Task 6 拍板**：构建产物目录最终落在 `web/dist/` 还是 `web/assets/`？
+     若落在 `web/assets/`，本 Task 的发布产物扫描目标要跟着改
+     （`audit-scan.js` 的 `distDir` + 计划里的目录名 + 本条台账）。
+2. **`platform/web/dist/` 还不存在**（Task 6 的产物）⇒ 这一趟现在是「存在才扫」，
+   报告里打印「发布产物 platform/web/dist：不存在」；Task 6 落地后**必须重跑一次**
+   `node scripts/audit-scan.js`，确认产物自己也过闸（那时这一行会变成「扫描 N 个文件」）。
+3. **`--evidence-chain` 的增强脚本在本机是有的**
+   （`~/.minimax/skills/evidence-chain/scripts/audit-evidence.js`）⇒ 实跑时它会被调用并把报告打出来；
+   **它的退出码与输出都不影响本闸结论**（闸结论只看禁用表述），**本仓不依赖它**（用例 18 证明没有它也能跑）。
+4. **清单里的 `@skip-path ^platform/data/` 与 `DEFAULT_EXCLUDES` 的 `'data'` 重复**：
+   实测删掉它，**扫描文件数（140）与退出码都不变**（数据目录本来就被默认排除）
+   —— 保留它是为了**显式表达意图**（数据目录不扫），**不是功能必需**。哪天真要让数据目录参与扫描，
+   删掉这一行还不够，还要改 `DEFAULT_EXCLUDES`。
+5. **P4 的 `test/audit-scan.test.js` 一个字没改**（本 Task 只追加）：
+   P4 的 20 例与本 Task 的 19 例一起跑，全量 **956 例**。
+6. **`audit-scan.js` 现在有两个「逃逸口」要一起记着**：**未知参数 → 2**、**扫到 0 个文件 → 2**。
+   两者都是「静默的空产出比报错更危险」的直接落地；改这个文件时**别把它们一起删掉**。
+7. **本 Task 的退出码语义**（与 P4 一致，未变）：
+   **0 = 通过 / 1 = 有违规 / 2 = 清单为空、清单不合规、清单缺失、参数不认、扫了 0 个文件**。
+
+
+
+---
+
+## Task 4 实施台账（2026-10-21）
+
+> 本节是 Task 4（演示版种子数据）的实施记录：**规格缺陷清单**、处置方式、逐字回写位置、实跑证据、变异测试、
+> 以及**种子覆盖了哪些分支**的逐条清单。
+> 纪律：本计划 Task 4 的 **2 个代码块 = 最终实现的逐字副本**
+> （核验命令：`node /tmp/p6-mutate/t4-verify-blocks.mjs`）。
+>
+> **本 Task 的灵魂**（规格第 2510–2514 行）：种子不是「好看的假数据」，而是**每一条 trace 分支的触发器** ——
+> 所以「种子里摆了一条数据」**不算数**，必须是**引擎真的因此触发了那条分支**才算数。
+> ⇒ 本 Task 的测试不只做静态检查，还要把种子喂给**真实领域层引擎**（`src/domain/*`），
+> 断言引擎的输出（总分 / 告警 / 破同分链 / 段位 / 行为分）。
+
+### A. 实施方法（先跑后落盘）
+
+1. 把规格 Task 4 的两个代码块**原样抽到** `/tmp/p6-t4/spec/`（一个字节都没改）。
+2. 在 `/tmp/p6-t4-scratch/platform`（platform 整树副本）上跑**规格自带用例** → 红 1 条（D4-01 的实证）。
+3. 写引擎探针 `/tmp/p6-t4/probe.mjs`（输入构造复刻 Task 5 的 `runDemoCompute`）→ 把 D4-02 / D4-03 的
+   后果**量化**（同分两队总分差 0.0139、破同分链走不到 `peer`、行为分全 0）。
+4. 改种子 → 探针转绿（总分差 `0.0000000000`、`peer` 级分开、行为分 17/2/5/7/0）→ **才落盘**到 worktree。
+5. 落盘后：单文件 → 全量 → 变异测试 → 计划块回写与逐字核验。
+
+### B. 规格缺陷清单
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| D4-01 | **Critical** | 种子的打分矩阵用了 `track_fit` —— 那是**初赛**维度（只在 `rules/scoring-initial.json` 里）；**规格自己的用例**却断言「维度必须在 `rules.scoring.final` 里」⇒ **规格的种子与规格自己的用例互相矛盾** | 规格原样副本上跑自带用例：`# tests 8 / # pass 7 / # fail 1`，红的那条是 `维度 track_fit 不在 rules.scoring.final 里（评委 j_lenient 队 t_alpha）`；引擎探针另证：`track_fit` 在 `trace.normalization` 里有、但在 `perDimension` 里**没有席位**（决赛根本不计这一维）⇒ 演示版会白展示一整维原始分 | 从种子里**删掉 `track_fit` 这一维**（其余 4 维原始分一字不动）⇒ 决赛 4 个评委席维度全部有数据、每维 5 个样本（= `minSamplesForJudgeNormalization`）⇒ 归一化不降级。**不改 `rules/scoring-final.json`**（权重表是 P1 定稿的规则，不属本 Task） |
+| D4-02 | **Critical** | 规格声称 `tiedTeams: ["t_alpha","t_beta"]` 同分，但**引擎算出来根本不同分**：**自评席**把差距拉开了 —— `t_alpha` 自评 95（比评委 81 高 14 → 触发「书面说明」→ 自评分**对齐**到评委分 81.2788），`t_beta` 自评 81（d=0 → 不触发 → 自评席保留原分 81）⇒ 总分差 **0.0139378046** ⇒ 破同分链在**第一级 `total`** 就把它们分开，**永远走不到 `peer`** ⇒ 演示版最想展示的「同分 → 互评破同分」根本没发生 | 引擎探针（规格原样种子）：`t_alpha total=81.089336` / `t_beta total=81.075398`，`total 差 = 0.0139378046`；逐维差**只在** `self_eval`：`81.27875609118963 vs 80.99999999999999`；破同分链 `applied` 只有 `{"key":"total",…,"separated":true}`，**没有 `peer` 这一级** | 让两支同分队的**自评席完全一致**（都取阈值内的 85，d=+4 不告警）⇒ 六个席位分全相等 ⇒ 总分**严格相等**（差 `0.0000000000`）⇒ 破同分链在 `peer` 级分开（alpha 互评 71 > beta 59）。**「书面说明」分支改由 `t_delta` 承担**（自评 95 vs 评委 76，d=+19）⇒ `expectations.selfEvalWrittenExplanationTeam` 的**值**由 `t_alpha` 改为 `t_delta`（键名与结构未动） |
+| D4-03 | **Important** | `behaviorEvents[].evidence` 是**纯文字**（"第 1 周进度"）—— ① 领域层 `parseEvidence` 只认 JSON 对象 ⇒ 纯文字一律 0 分（`evidence_not_json`）⇒ 行为分**全是 0**、行为分支不可观测；② 这种形状**真实写入方根本产不出来**：`src/services/behavior.js` 先用域函数校验证据，不合规直接 400 `EVIDENCE_REJECTED` 拒收 | 引擎探针（规格原样种子）：`t_alpha items=["weekly_progress:0(evidence_not_json)","weekly_progress:0(evidence_not_json)","workshop_output:0(evidence_not_json)","first_demo:10"]`；`src/services/behavior.js:40-47`（写入前校验）+ `:50`（`JSON.stringify` 落库） | 证据改成**合规的 JSON 串**（形状与真实写入方落库一致：TEXT 列里存 JSON 串），逐条满足 `rules/criteria.json` 的 `behaviorEvidence`（weekly_progress 要 `repo`+`version`+`artifact\|blocker`、workshop_output 要 `output`、enterprise_meeting 要 `enterpriseConfirmationId`）⇒ 行为分 17/2/5/7/0，并写进 `expectations.behaviorScores` 供机器校验 |
+| D4-04 | Minor | 规格的 Step 5 提交命令**不带 `-- <paths>`** —— 违反「先 `git add <paths>`，再 `git commit -m "…" -- <paths>`」这条纪律 | 计划 Step 5 原文 | 补上 `-- web/seed test/demo-seed.test.js`（`-m` 仍在 `--` 之前） |
+| D4-05 | Minor | 种子里的 `signatoryUserId`（`u_ent_retail` / `u_ent_mfg`）**在 `users` 列表里不存在** —— 企业签字人是企业侧身份，而种子的 `users` 结构表（`[{id,name,mbaStatus}]`）没有 org/role 字段可放 | 结构表原文 + 种子内容 | **不改**（登记为已知边界）：塞进 `users` 会被误当成平台用户（`mbaStatus` 只能是 mba/member/other），而 `users` 的用途是**组长硬门槛判定**；企业席只校验签字人 id **非空**（`enterprise-seat.js` 的 `!c.crossJudgeId \|\| !c.signatoryUserId`）⇒ 规则上成立 |
+| D4-06 | Minor | `tp_free` 任务包下只有 1 支队伍，而 `rules/team-formation.json` 的 `teamsPerPackage.min = 2` | 种子 teams + 规则原文 | **不改**（登记为已知边界）：该门槛是**组队/认领任务包时**的闸，种子是「组队之后」的快照；且凑成 2 支要多一支队伍 ⇒ 连带改 `expectations.tiers`、互评、自评，收益远小于风险 |
+| D4-07 | Minor | 共享核验脚本 `/tmp/p3fix/plan-blocks.mjs` 的 hint 正则 `(?:js\|html\|css\|sql\|json)` 里 `js` 排在 `json` 前面 ⇒ `web/seed/demo-data.json` 的 hint 被截成 `web/seed/demo-data.js` ⇒ 该块永远显示「无实现」 | `node /tmp/p3fix/plan-blocks.mjs <plan> <platform>` 输出：`行 3020 \| web/seed/demo-data.js \| 无实现` | 本 Task 另用 `/tmp/p6-mutate/t4-verify-blocks.mjs`（按**块正文内容锚点**定位，不靠 hint 猜文件名）逐字核验两个块 ⇒ 均 ✅。**共享脚本本身不动**（它是 P1/P3 的既有工具，不在本 Task 归属内） |
+
+### C. 逐字回写位置（本轮改动的计划代码块）
+
+| 计划位置 | 改动 |
+|---|---|
+| Task 4 Files 段 | 追加「实施补记」（规格 9 个用例逐字保留 + 追加 11 个判别性用例） |
+| Task 4 Step 1 的 `platform/test/demo-seed.test.js` 代码块 | **整体回写**（规格 9 个用例逐字保留 + 追加 11 个 + 文件头 4 行领域层 import 与溯源注释） |
+| Task 4 Step 3 的 `web/seed/demo-data.json` 代码块 | **整体回写**（D4-01 删 `track_fit`、D4-02 自评席对齐、D4-03 证据合规、expectations 增补 4 键） |
+| Task 4 Step 4 的 Expected | `8` → **20**（实跑值） |
+| Task 4 Step 5 的命令 | 补 `-- <paths>`（D4-04） |
+
+> 回写脚本 `/tmp/p6-mutate/t4-plan-rewrite.mjs`：**按块在文档里的位置升序**处理，
+> 锚点用**块正文内容**（不是行号猜测）定位，命中数必须 === 1，否则报错退出。
+
+### D. 实跑证据
+
+| 项 | 结果 |
+|---|---|
+| 基线全量（实施前，本 worktree） | **937 / 937**（936 通过 + 1 跳过 + 0 失败） |
+| 规格原样种子 + 规格自带用例 | **8 个用例：7 通过 / 1 失败**（红的那条即 D4-01） |
+| 规格原样种子的引擎探针 | 同分两队总分差 **0.0139378046**；破同分链只到 `total` 级（**没有 `peer`**）；行为分全 0（D4-02 / D4-03） |
+| 修正后种子的引擎探针 | 同分两队总分差 **0.0000000000**（六个席位分逐维相等）；破同分链 `total` → **`peer`**（`usedBy:["t_alpha","t_beta"]`）；行为分 17 / 2 / 5 / 7 / 0 |
+| 单文件 `node --test test/demo-seed.test.js` | **20 / 20 全绿** |
+| 全量 `node --test` | **957 / 957**（956 通过 + 1 跳过 + 0 失败；基线 937 + 本 Task 20） |
+
+### E. 变异测试（脚本 `/tmp/p6-mutate/t4.mjs`，指向**已落地**的测试文件）
+
+| 轮次 | 变异体总数 | KILLED | SURVIVED | 脚本错误 | 处置 |
+|---|---|---|---|---|---|
+| 第 1 轮 | 22 | 21 | 1 | 0 | 存活者 M19「行为分事件被删光」**其实没改到行为**（把 `first_demo` 证据里的 `artifact` 字段删掉，而该类型**没有证据要求** ⇒ 仍计 10 分）⇒ 改成**真删掉那条事件**后重杀 |
+| 第 2 轮 | **24** | **24** | **0** | 0 | M19 改成**真删事件**（重杀）；M14 换成「同分两队的企业确认分不同」（原来那个没改到行为）；追加 M23（自由命题队改挂赛道）/ M24（某队没有互评） |
+
+**最终：24 个变异体，24 个 KILLED，0 个存活，0 个脚本错误（锚点全部唯一命中）。**
+
+> ⚠️ 方法说明：变异体**只改「某个分支的触发数据」**（种子是本 Task 的产物），
+> 每个变异体都**真的改变引擎行为**（改完后的总分 / 告警 / 破同分 / 段位 / 行为分至少有一项不同），
+> 且**只改有效数据**（不改注释）。锚点命中数必须 `=== 1`，命中 0 次报「锚点失效」、
+> 命中 ≥2 次报「锚点不唯一」—— 脚本不放过含糊。变异体清单见脚本里的 `MUTANTS` 数组，
+> 明细 JSON：`/tmp/p6-mutate/t4-results.json`。
+
+### F. 计划块逐字核验
+
+`node /tmp/p6-mutate/t4-verify-blocks.mjs` → **2/2 逐字一致**：
+
+| 块 | 结果 |
+|---|---|
+| `test/demo-seed.test.js` | 整文件块 ✅ 一致（359 行） |
+| `web/seed/demo-data.json` | 整文件块 ✅ 一致（110 行） |
+
+### G. 种子覆盖的分支清单（本 Task 的核心交付）
+
+| # | 分支（规则出处） | 种子里的哪条数据触发它 | `expectations` 里写了什么 | 引擎里的可观测结果（实跑） |
+|---|---|---|---|---|
+| 1 | **z-score 宽严归一化降级**（S7 §3.1 + C-05） | `j_partial` 只给 `t_gamma` 打了 `feasibility` 一项（样本数 1 < `minSamplesForJudgeNormalization`=5） | `unnormalizedDimension: "feasibility"`、`unnormalizedJudge: "j_partial"` | 告警 `normalization_fallback`（点名 `j_partial:judge_sample_too_small`）+ `trace.normalization.feasibility.normalized=false` |
+| 2 | **去极值**（S7 §3.2，评委数 ≥5） | 每个维度 5 位评委各交 5 队分（≥ `minJudgesForTrim`=5） | `trimmedDimensions: ["innovation","feasibility","completeness","collaboration"]` | `trace.steps` 里 20/20 个 (队,维度) 单元 `trimmed=true`，并记录被去掉的最高/最低分评委 |
+| 3 | **R2 缺双签 → 企业项按 0 分计**（S7 §2.4 R2） | `ec_gamma`（t_gamma）的 `crossJudgeId: null` | `missingDualSignatureTeam: "t_gamma"` | 告警 `R2_missing_dual_signature`；`t_gamma.seatE === 0`（权重保留） |
+| 4 | **R4 自由命题 → 企业项改由评委「需求真实性」维度替代**（S7 §2.4 R4） | `tp_free` 任务包 `isFreeBrief: true`，`t_epsilon` 挂在其下且**没有**企业确认 | `freeBriefTeam: "t_epsilon"` | 告警 `R4_free_brief_judge_scored`；`t_epsilon.seatE` = `feasibility` 维评委分（62.5537），且**无** `R4_substitute_no_scores` |
+| 5 | **破同分链在 `peer` 级分开**（S7 §3.3 + C-03） | `t_alpha` 收到的互评 70/72（均值 71）> `t_beta` 的 60/58（均值 59） | `tiedTeams: ["t_alpha","t_beta"]`、`tiebreakSeparatedBy: "peer"` | 两队总分**严格相等**（差 `0.0000000000`）→ 破同分链 `applied` 含 `{"key":"peer","usedBy":["t_alpha","t_beta"],"separated":true}` → alpha 第 1、beta 第 2 |
+| 6 | **破同分键不可用 ⇒ 显式告警，不静默当 0**（ranking.js 设计） | 种子没有 `tiebreakExtra` 字段（结构表里没这个键）⇒ 「加时陈述复议分」这一级不可用 | （无独立键；由 `tiebreakSeparatedBy: "peer"` 间接约束） | 告警 `tiebreak_key_unusable`（本组不用该键），链继续走到 `peer` |
+| 7 | **自评差异 · 高 → 书面说明且对齐不加分**（S7 §4.3 + R-JDG-13） | `t_delta` 自评 `innovation` 95（评委均分 76，d=+19 > 10） | `selfEvalWrittenExplanationTeam: "t_delta"` | 告警 `self_eval_written_explanation`（**恰好 1 支队**）；`t_delta` 的 `self_eval` 席分 = 评委该维分 76.1602（**不是**自评原分 95 ⇒ 不是加分项） |
+| 8 | **自评差异 · 低 → 评委提问（只提问不改分）**（S7 §4.3） | `t_gamma` 自评 `innovation` 50（评委均分 65.2，d=−15.2 < −10） | `selfEvalJudgeQuestionTeam: "t_gamma"` | 告警 `self_eval_judge_question`（**恰好 1 支队**） |
+| 9 | **自评差异在阈值内 → 不告警、不影响** | `t_alpha` / `t_beta` 自评 85（评委均分 81，d=+4 ≤ 10） | `selfEvalWithinThresholdTeams: ["t_alpha","t_beta"]` | 两队均**不**出现在两类自评告警里；且两队自评席分相同（85）⇒ 这是它们能严格同分的前提 |
+| 10 | **某维度无人打分 → 权重记 0 + 告警，不静默当 0**（设计文档 §13 降级表） | `t_epsilon` **没有**自评记录 ⇒ `self_eval` 维度无分 | `missingSelfEvalTeam: "t_epsilon"` | 告警 `dimension_no_scores`（维度 `self_eval`）；`perDimension.self_eval.mean === null`，且 `seatP` 的分母**剔除了**该维度（与「静默当 0」的结果不同） |
+| 11 | **段位判定（里程碑计数 + 数据/原型 + 业务部门签字）**（S10 §2.2 + R-PTS-01~04） | 5 支队伍的 `milestones` 分别是 2/1/3/5/0 个；`t_delta` 的 `pilot_contract` 有 `业务部` 签字（`isBusinessDepartment: true`） | `tiers: {t_alpha:B, t_beta:C, t_gamma:A, t_delta:S, t_epsilon:D}` | `computeTier` 复算 5 支全中（`milestones=5` + `business_signoff=1` ⇒ `t_delta` 落 S 段） |
+| 12 | **行为分：证据合规才计分**（S10 §3.1 + R-STG-04 + R-PTS-10） | 8 条 `behaviorEvents`，`evidence` 逐条满足 `criteria.behaviorEvidence` | `behaviorScores: {t_alpha:17, t_beta:2, t_gamma:5, t_delta:7, t_epsilon:0}` | `behaviorScore` 复算 5 支全中；`first_demo`（`once:true`）只计一次 |
+| 13 | **行为分不进入总分（分轨在算法层）**（S10 §3.3 + R-PTS-08） | 改动全部行为事件的证据后重算 | （由「行为分不进入总分」用例守住） | 改行为事件前后 5 支队伍的总分**逐字相同** |
+| 14 | **评委席宽严差异被归一化抵消**（S7 §2.1 机制归因） | `j_lenient` 普遍给高分、`j_strict` 普遍给低分（同一队的两档评委差 14 分） | （无独立键；由「同分两队总分严格相等」间接守住） | `t_alpha` / `t_beta` 的四个评委席维度分**逐维相等**（81.2788 / 80.2047 / 79.3845 / 83.5182） |
+
+### H. 遗留 / 需上游注意
+
+1. **Task 5 读种子必须按「决赛维度表」读**：`reviews` 里只可能出现 `rules.scoring.final.dimensions` 的
+   评委席 key（`innovation` / `feasibility` / `completeness` / `collaboration`）；
+   `enterprise` 维度走 `enterpriseConfirmations`，`self_eval` 维度走 `selfReviews`。
+   **不要**再往种子里加 `track_fit`（那是初赛维度，决赛不计分）。
+2. **`expectations` 增补了 4 个键**：`selfEvalWithinThresholdTeams` / `missingSelfEvalTeam` /
+   `trimmedDimensions` / `behaviorScores`。规格原有的 **9 个键一个没动**，
+   只有 `selfEvalWrittenExplanationTeam` 的**值**由 `t_alpha` 改为 `t_delta`（理由见 D4-02）。
+3. **破同分链在 `tiebreak_extra`（加时陈述复议分）这一级会出一条 `tiebreak_key_unusable` 告警** ——
+   种子没有 `tiebreakExtra` 字段（结构表里没有这个键）⇒ 该级不可用、**不静默当 0**（引擎的正确行为）。
+   演示时应当显式展示这条告警，它正好说明「链上每一级都要有可比较的值」。
+4. **行为分达标线 60 分没有任何一支队达到**（最高的 `t_alpha` 也只有 17）⇒ 演示里「完赛认定」恒为 false。
+   这是数据的真实状态，不是 bug；要演示该分支需要更多行为事件（`weekly_progress` 每次只 2 分）。
+5. **`t_alpha` / `t_beta` 的同分是「构造出来的」**：`reviews` 逐维相同 + 企业确认同分 + 自评同分 + 同一个任务包。
+   少任何一样都会被某一张席拉开 —— 这正是 D4-02 的教训，演示时可以顺带讲这一条。
+
+## P6 部署资产修复轮（父代理，2026-10-21）
+
+> 触发：父代理对 P6 部署资产的独立核对（`/tmp/p6-proof/deploy-assets-review.md`）查出 F-1~F-4 四条缺口。
+> 这四条都不是「样式问题」，每一条都能让一次**真实的云主机部署**装到一半或直接失败。
+> 本轮改动**只碰** Task 2 的文件（`platform/deploy/*`）与 `platform/test/deploy-assets.test.js`，
+> **不重建**任何既有文件；Task 3 已登记的 §G-1「遗留 / 需上游注意」由本轮**裁决并落地**。
+
+### F-1 前端构建产物目录「三处不一致」—— 裁决：唯一产物目录是 `platform/web/dist/`
+
+| 位置 | 原状 | 裁决后 |
+|---|---|---|
+| P6 计划 Task 6 | `platform/web/dist/`（`build-demo.js --out web/dist`、`.gitignore`、扫描闸 `distDir`、验收 P6-11/P6-12） | **保持不变 —— 它就是唯一口径** |
+| `deploy/nginx.conf` | `location /assets/ { alias __APP_DIR__/web/assets/; }`，注释声称「web/assets/ 是【前端构建产物目录】」 | **保留该 location**（R-OPS-04 要求它存在），但**订正注释**：web/assets/ 是**预留**的带哈希静态资源位，本仓库**没有任何构建步骤产出它**；真正的构建产物目录是 `web/dist/` |
+| `deploy/install.sh` | rsync `--exclude 'web/dist/'` | **保持**，并**追加** `--exclude 'web/assets/'`；注释写明两者各自的性质 |
+
+**为什么这么定**：① 演示版静态站是**自包含**的（`web/dist/` 里有 `index.html` + `src/domain/` + `rules/` + `seed/`），
+它走的是**独立发布通道**（静态站发布工具），**不经** `deploy/nginx.conf` 这个「应用反代」——
+后者服务的是 Node 应用自己的 `web/` 目录（`location /` 转给 Node）。
+② nginx 里的 `/assets/` 是一块**前瞻位**：正式部署时静态资源要带内容哈希并长期缓存，
+但**一期没有**对应的构建步骤。留着它并在注释里说清现状，比删掉更诚实，也不违反 R-OPS-04。
+③ 若将来要让 nginx 直出演示版静态站，需要**独立的 server block 或独立端口**（不能与 `location /` 抢 `/`），
+那属于部署形态变更，**不在一期**范围内。
+
+### F-2 nginx 是最后一步且不检查装没装 ⇒ 半成品部署 —— 已修
+
+**原状**：`main()` 的顺序是 `建用户 → 建目录 → 同步程序 → 写环境文件 → 建库 → 写 systemd → 启服务 → 写 nginx`。
+nginx 在**最后**。机器上没装 nginx 时，脚本会先把上面**全部**做完，然后在最后一步以
+`nginx: command not found` 退出 —— 留下一个「服务在跑、但没有反代、域名单独访问 502」的半成品部署。
+更糟的是 `nginx -t` 失败时**站点文件与软链已经写进去了**（`ln -sfn` 在 `nginx -t` 之前），
+坏配置留在 `sites-enabled` 里，会**毒化这台机器上下一次任何 nginx reload**（哪怕是别人触发的）。
+
+**修法**：
+① 新增 `require_nginx()`，在 `main()` 里**排在所有会改变机器状态的调用之前**执行 ——
+   没装 nginx 就**当场明确拒绝**，不让前面半截部署发生。
+② `write_nginx_site()` 写新配置前先 `cp -p` 备份旧站点文件；
+   `nginx -t` 失败时**回滚**：有旧配置就 `mv` 还原，没有就 `rm -f` 掉站点文件与软链，然后才报错退出。
+③ `nginx -t` 必须写在 `if ! nginx -t; then` 保护下（裸调用 + `set -e` 会直接退出，**来不及回滚**）。
+
+### F-3 systemd / 环境文件漏 `SESSION_ABSOLUTE_TTL_DAYS` —— 已修
+
+**原状**：`src/auth/session.js` 读 `SESSION_ABSOLUTE_TTL_DAYS`（默认 30 天），
+但 `write_env_file()` 只写了 `SESSION_TTL_DAYS=7`，systemd 单元的环境文件注释也只列了三个变量。
+⇒ 不写这个变量时应用**静默**用 30 天默认值，**「环境文件里写的」≠「实际生效的」**，排障时无从查证。
+
+**修法**：① 环境文件显式写 `SESSION_ABSOLUTE_TTL_DAYS`（默认 30，与代码里的
+`DEFAULT_ABSOLUTE_TTL_DAYS` 同源）；② systemd 单元的环境文件注释补上这个变量名；
+③ 新增 `validate_session_ttls()`：两个天数**必须是正整数**，否则 fail-fast ——
+因为 `session.js` 对非法值是**静默回退**到默认值（`"abc"` ⇒ 悄悄用 7 天），环境文件写错却毫无提示。
+④ ⚠️ **绝对上限可以小于滑动有效期**（那是「更严」的合法配置：到期必须重登）——
+   本轮**不**禁止这种组合，只校验正整数。**不擅自加规则。**
+
+### F-4 nginx 版本 ≥ 1.25.1 未校验 —— 已修（自动降级）
+
+**原状**：`deploy/nginx.conf` 用 `http2 on;`，该指令 **nginx 1.25.1 才引入**；
+而 Ubuntu 22.04 = nginx 1.18、Ubuntu 24.04 = nginx 1.24.0 —— **都 < 1.25.1**。
+`nginx -t` 会报 `unknown directive "http2"`，而这一步在流程**最后** ⇒ 同样是「装到一半才炸」。
+（nginx.conf 的注释里写了「更低版本请把 `http2 on;` 换成 `listen 443 ssl http2;`」，
+但那是**要人手工做**的事，脚本不会替你做。）
+
+**修法**：新增 `platform/deploy/nginx-http2-compat.sh` —— 按**目标机**的 nginx 版本
+（`nginx -v`，或环境变量 `NGINX_VERSION` 覆盖）决定：
+- ≥ 1.25.1 ⇒ 原样保留 `http2 on;`；
+- < 1.25.1 ⇒ 删掉独立的 `http2 on;` 行，并把 `listen 443 ssl;` 与 `listen [::]:443 ssl;`
+  改成 `listen ... ssl http2;`（**这个写法在所有 nginx 版本上都合法** ⇒ 降级永远安全）；
+- 探测不到版本 ⇒ 按「需要降级」处理（保守）。
+
+`install.sh` 在渲染站点配置**之前**先跑这个脚本。脚本用 `awk` 而非 `sed` ——
+`sed` 的 BRE 扩展（`\+` / `\d`）在 BSD sed（macOS）上不通用，而它要在 macOS 上被测试**实跑**。
+脚本自带两道自检：保持路径下 `http2 on;` 不许丢、降级路径下 `http2 on;` 不许留。
+
+### 变异检验（`/tmp/p6-mutate/t2fix.mjs`）
+
+**11 个变异体 / 11 KILLED / 0 存活 / 0 无效 / 0 锚点异常**；对照组（未改动副本）**19/19 全绿**。
+变异体逐个把本轮的修复改回去：挪 `require_nginx` 的位置、把 `nginx -t` 改回裸调用、
+去掉回滚、不写 `SESSION_ABSOLUTE_TTL_DAYS`、改默认值、去掉合法性校验、
+兼容脚本不降级、阈值放宽到 1.24.0、漏改 IPv6 那一支、改回「web/assets/ 是构建产物目录」的注释、
+不排除 `web/dist/` —— **每一个都让对应的新用例变红**。
+
+### 实跑数字
+
+- 单文件 `test/deploy-assets.test.js`：**19 例 / 19 通过**（原 14 + 本轮 5）
+- 全量 `node --test`：**961 例 / 960 通过 / 1 跳过 / 0 失败**（基线 956）
+- `bash -n` 语法自检：`install.sh` 与 `nginx-http2-compat.sh` 均通过
+- 隔离实证：PATH 里没有 nginx 时 `require_nginx` **当场拒绝**（不进入后续步骤）；
+  有 nginx 时打印版本并放行
+- 兼容脚本实跑：1.24.0 / 1.25.0 ⇒ 双 listen 行都降级；1.25.1 / 2.0.0 ⇒ 保留 `http2 on;`；
+  端口 80 的 listen **不受影响**
+
+### 偏离与遗留
+
+- 本轮**新增**了一个文件 `platform/deploy/nginx-http2-compat.sh`（Task 2 的 Files 段已补）。
+- Task 3 台账 §G-1 登记的「产物目录三处不一致」由本轮**裁决并落地**（见 F-1），不再作为遗留。
+- ⚠️ **Task 3 与 Task 4 的缺陷台账编号都用了 `D-01` 起的裸编号**（分属两个 Task 的台账），
+  合并 P6 Task 4 分支时需要重编号（Task 3 → `D3-*`、Task 4 → `D4-*`）——
+  这是**合并时要处理的事**，本轮不动（Task 4 的台账在另一个分支上）。
+---
+
+## Task 7 实施台账（2026-10-21）
+
+> 本节是 **P6 Task 7（部署与运维文档 `docs/deployment.md`）** 的实施记录：
+> 规格缺陷清单与处置、实跑证据、手册与 **F-1 ~ F-4** 的逐条对账结果、**未覆盖的项与理由**。
+>
+> **编号约定**：本计划已有四个台账用过 `D-` 开头且已重编号为 `D1-*`（Task 1）/ `D2-*`（Task 2 预审）/
+> `D3-*`（Task 3）/ `D4-*`（Task 4）；**本轮用 `D7-*`**。
+> 手册 `docs/deployment.md` 内部的「未覆盖项」表用 `U-*` 编号（`U-1` ~ `U-7`），
+> **与本台账的 `D7-*` 是两套编号，不要混用**。
+>
+> **产出边界**：本 Task **只创建 `docs/deployment.md`**（+ 追加本台账）。
+> **没有碰** `platform/` 下的任何代码、部署资产、测试。
+
+### A. 规格缺陷清单与处置
+
+| # | 级别 | 规格缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| D7-1 | **Important** | **计划 Task 7 的骨架把 §5 的演示版构建命令写成了「现在就能跑」** —— 但 `scripts/build-demo.js` / `scripts/serve-demo.js` 是 **P6 Task 6** 的产物，此刻**尚未落地** | `ls platform/scripts/build-demo.js` → `No such file or directory`；`scripts/serve-demo.js` 同样不存在；`ls -d platform/web/dist platform/web/assets` → 两个都不存在 | **计划代码块逐字保留**（不改规格），但手册顶部加「**阅读须知**」明确声明：§5 的两条命令**此刻跑不通**，§8.5 写全了 Task 6 落地后的**构建 / 产物位置 / 本地预览 / 扫描闸 / 发布**流程 + 一张状态声明表 |
+| D7-2 | **Important** | **计划 §2.2 的 `install.sh` 步骤清单没有反映 F-2 / F-3 / F-4 修复后的行为**（清单里没有 nginx 前置检查、没有失败回滚、没有版本自动降级、没有绝对过期天数字段） | 逐条对读 `platform/deploy/install.sh`：`require_nginx` 在 `main()` **最前**（第 341 行）→ `validate_session_ttls`（342）→ … → `write_nginx_site`（358）先跑兼容脚本、再备份旧站点、再 `if ! nginx -t` | 计划代码块逐字保留；手册 **§8.1 – §8.4** 逐条写清修复后的真实行为，**每条都带实跑输出** |
+| D7-3 | **Important** | **计划 §1 的环境变量清单不全** —— 只列 `PORT` / `DATA_DIR` / `SESSION_TTL_DAYS`，漏了 `SESSION_ABSOLUTE_TTL_DAYS` | `src/auth/session.js` 第 23 行 `DEFAULT_ABSOLUTE_TTL_DAYS = 30`，第 36 行读 `process.env.SESSION_ABSOLUTE_TTL_DAYS`；F-3 后 `install.sh` 的 `write_env_file()` 也显式写它 | 计划代码块逐字保留；手册 **§10** 给出完整速查表（**9 个变量** + 「改了怎么生效」列 + 端口 8080 的「四处同一口径」清单） |
+| D7-4 | **Critical（后果安全）** | **`nginx-http2-compat.sh` 的 `detect_version()` 解析不了真实 nginx 的版本输出** —— 脚本用 `sed -n 's\|^nginx version: \([0-9][0-9.]*\).*\|\1\|p'`，要求版本号**紧跟** `nginx version: ` 后是一个数字；而 nginx 的**真实输出**是 `nginx version: nginx/1.24.0`（版本号前带 `nginx/` 前缀）⇒ **匹配不到** | `printf 'nginx version: nginx/1.24.0\n' \| sed -n 's\|^nginx version: \([0-9][0-9.]*\).*\|\1\|p'` → **空**；沙箱里跑完整 `install.sh`，兼容脚本打印「**[nginx-compat] nginx 未探测到（按需降级处理）** < 1.25.1：已降级为 `listen ... ssl http2;`」 | 手册 **§8.1 如实写明**：真机上自动探测**总是失败** ⇒ 总是走保守降级；**后果安全**（`listen ... ssl http2;` 在**所有**版本都合法，部署不会因此失败）；但「≥ 1.25.1 保留 `http2 on;`」这条分支在真机上**只有显式给 `NGINX_VERSION` 才走得到**。**本 Task 不修**（`platform/` 不在本 Task 归属内）—— 一行修法写进手册 §8.1 与本台账 E 节，供上游处理 | ⛔ **后续（2026-10-21，父代理修复轮）已修**：解析式改为 `s\|^nginx version: *\(nginx/\)\{0,1\}\([0-9][0-9.]*\).*\|\2\|p`（POSIX BRE，BSD/GNU sed 都认），并补了走**真实自动探测路径**的回归用例（假 `nginx` 放 `PATH`、输出官方格式版本号、不给 `NGINX_VERSION`）—— 变异体 M12（把解析式改回旧写法）被该用例杀掉 |
+| D7-5 | Minor | **计划 §2.4 没提 `network_mode: host` 在 Docker Desktop（macOS / Windows）上宿主仍不通** | `deploy/docker-compose.yml` 第 26–27 行自己写明「host 网络只保证 Linux 宿主机的语义；Docker Desktop（macOS/Windows）上容器拿到的是 Linux 虚拟机的网络栈，宿主机 127.0.0.1:8080 仍不通」 | 计划代码块逐字保留；手册 §13 **U-2** 登记为边界（本 Task 环境无 Docker daemon，未实跑） |
+| D7-6 | Minor | **计划 Task 7 Step 2 的期望值 `backup()` = 2 与最终文件实际 3 不符** | `grep -c "single writer at a time" docs/deployment.md` → `1`；`grep -c "proxy_buffering off"` → `1`；`grep -c "backup()"` → `3` | 计划写的是「三个数字都 ≥ 1」，`3 ≥ 1` **通过**。**不为了凑「2」而删内容**（第三个 `backup()` 出现在 §8.1/§12 的实跑证据上下文里） |
+| D7-7 | — | **计划 Task 7 的代码块与最终文件的对应关系需要写清** | 程序化核验：计划第 5259–5470 行（`markdown` 围栏内）在 `docs/deployment.md` 里是**逐字连续**的片段（起始字节下标 **963**）；§0 段（`## 0.` → `## 1.`）单独核验同样**逐字包含** | **不改计划规格**（计划块原样保留）；补写内容**全部**落在手册 §8 – §14。计划文档本身只**追加**了本台账一章，**未改动** Task 7 的代码块 |
+
+### B. 实跑证据（2026-10-21）
+
+> 全部在**临时目录**（`mktemp -d`）里做，不碰工作树的库文件。
+> 环境：macOS（darwin 27.0.0 arm64）、Node **v22.23.2**、**本机没装 nginx**
+> （正好用来验证降级路径与「探测不到版本」的保守路径）。
+
+| # | 跑了什么 | 观察到 |
+|---|---|---|
+| E1 | `cd platform && node --disable-warning=ExperimentalWarning --test` | **981 例 / 980 通过 / 0 失败 / 1 跳过**（基线 981/981） |
+| E2 | `cd platform && node scripts/audit-scan.js` | **退出码 0**（词条 15 条、扫描 142 个文件、0 违规） |
+| E3 | `DATA_DIR=<tmp>/data node scripts/migrate.js` | `迁移完成，当前版本 5`（本次应用 001–005 五个迁移） |
+| E4 | `node scripts/seed.js` 连跑两次 | 第一次「已创建管理员：13800000000」，第二次「管理员已存在」⇒ 幂等 |
+| E5 | `node scripts/backup.js` / `--out` / `--keep-days --keep-count` | 全部退出码 0；输出 `[backup] 完成：app-<UTC>.db（<字节> 字节，<页> 页）` |
+| E6 | `node scripts/restore.js`（活 pid / pid 文件坏 / 成功） | 活 pid ⇒ **拒绝**（`服务仍在运行，拒绝恢复（pid 文件显示进程 N 仍在运行）`）；pid 不可解析 ⇒ **保守判为在跑并拒绝**（`pid 文件存在但内容无法解析，无法确认服务已停止`）；成功 ⇒ 旧库留存 + **删旧 `-wal` / `-shm`** + 新库就位 |
+| E7 | `node src/server.js` + `curl -s http://127.0.0.1:8080/api/health` | `{"ok":true,"at":"2026-10-21T08:04:57.542Z"}`；启动日志 `heikesong-platform 启动于 http://127.0.0.1:8080（规则版本 2026-10-20）` |
+| E8 | `bash deploy/nginx-http2-compat.sh` × 4 个 `NGINX_VERSION` + 不探测 | 1.18.0 / 1.24.0 ⇒ **双 listen 行都降级**；1.25.1 / 2.0.0 ⇒ **保留 `http2 on;`**；不探测 ⇒ 降级（**端口 80 的 listen 不受影响**） |
+| E9 | 沙箱 `install.sh`：**PATH 里没有 nginx** + 设了 `SERVER_NAME` | 退出码 **1**，错误信息明确，**沙箱目录零改动**（`find` 结果为空）⇒ F-2 前置检查**在动任何东西之前**就拒绝 |
+| E10 | 沙箱 `install.sh`：`SESSION_TTL_DAYS=abc` / `SESSION_ABSOLUTE_TTL_DAYS=0` / `SESSION_TTL_DAYS=3.5` | 三次都退出码 **1**、**沙箱目录零改动** ⇒ F-3 的 fail-fast **在动任何东西之前**就拒绝 |
+| E11 | 沙箱 `install.sh`：**完整部署**（nginx 桩 = 1.24.0） | 退出码 **0**；环境文件 = `PORT` / `DATA_DIR` / `SESSION_TTL_DAYS=7` / **`SESSION_ABSOLUTE_TTL_DAYS=30`** / `NODE_ENV=production`；站点配置**自动降级**成 `listen 443 ssl http2;` + `listen [::]:443 ssl http2;`；`alias .../web/assets/` 是**预留位** |
+| E12 | 沙箱 `install.sh`：**连跑两次** | 两次退出码 **0**；第二次「本次无新迁移」「管理员已存在：13800000000」⇒ **幂等** |
+| E13 | 沙箱 `install.sh`：`nginx -t` 失败（**有旧配置** / **无旧配置**） | 有旧 ⇒ `已回滚到上一版 nginx 站点配置` 且站点文件内容回到部署前；无旧 ⇒ `已撤销本次 nginx 站点配置（此前没有旧配置）` 且**站点文件与软链都不存在**、`sites-enabled/` 为空 |
+
+> 沙箱做法：`PATH` 里放 `id`（`id -u` 返回 0，模拟 root）/ `nginx` / `systemctl` / `useradd` / `runuser` 五个**桩命令**，
+> 并把 `APP_DIR` / `DATA_DIR` / `ENV_FILE` / `NGINX_SITE` / `NGINX_LINK` / `SYSTEMD_UNIT_DIR` 全部指向 `mktemp -d` 出来的临时目录 ——
+> **真机路径（`/opt` / `/etc` / `/var`）一个字节都没被写到**。
+
+### C. 手册与 F-1 ~ F-4 的逐条对账
+
+| 修复项 | 修复后的真实行为（实跑取证） | 手册写在哪 | 对账结论 |
+|---|---|---|---|
+| **F-1** 前端产物目录口径 | 唯一构建产物目录 = `platform/web/dist/`（Task 6 的 `build-demo.js --out web/dist` 产出，**走独立发布通道，不经 nginx**）；nginx 的 `location /assets/ { alias __APP_DIR__/web/assets/; }` 是**预留**的带哈希静态资源位，**本仓库无任何构建步骤产出它**，目录不存在时该前缀返 404、不影响其它路径；`install.sh` 的 rsync **两个都排除** | 手册 **§8.4**（含一张「目录 / 是什么 / 由谁产出 / 走不走 nginx」对照表） | ✅ 一致。**手册没有把 `web/assets/` 说成「构建产物目录」** |
+| **F-2** nginx 前置检查与回滚 | `require_nginx()` 在 `main()` **最前**（动任何东西之前）⇒ 缺 nginx **当场明确拒绝**；`nginx -t` 失败 ⇒ 有旧配置就 `mv` 还原、没旧配置就**撤销站点文件与软链** ⇒ 坏配置不会留在 `sites-enabled` 里毒化下一次 reload | 手册 **§8.2**（两条分支各带实跑输出 + 事后 `sites-enabled/` 为空的核对） | ✅ 一致 |
+| **F-3** 会话环境变量 | 环境文件**显式**写 `SESSION_ABSOLUTE_TTL_DAYS`（默认 **30**，与 `src/auth/session.js` 的 `DEFAULT_ABSOLUTE_TTL_DAYS` 同源）与 `SESSION_TTL_DAYS`（默认 **7**）；两个天数**必须是正整数**，否则 `install.sh` **fail-fast 报错**（代码侧是静默回退到默认值，环境文件写错没人会发现）；**改完必须重启服务**（systemd 在服务启动时读 `EnvironmentFile`） | 手册 **§8.3**（完整说明 + 「改了怎么生效」的命令 + 确认生效的查法）、**§10**（速查表） | ✅ 一致 |
+| **F-4** nginx 版本 | **已自动化，不需要人手工改语法**：`install.sh` 先跑 `deploy/nginx-http2-compat.sh`，按**目标机**的 nginx 版本自动决定：≥ 1.25.1 保留 `http2 on;`、< 1.25.1 自动降级成 `listen ... ssl http2;`（所有版本都合法）、探测不到时按需降级（保守）；`NGINX_VERSION` 可覆盖探测结果（用于预演 / 测试） | 手册 **§8.1**（含决策表、查版本的方法、`NGINX_VERSION` 覆盖用法、4 个版本的实跑输出） | ✅ 一致 —— **自动探测的解析缺陷已由父代理修复轮修掉**（D7-4）：原解析匹配不到 `nginx/1.24.0` 这种真实格式，现在带前缀/不带前缀两种形态都吃下，并有走真实探测路径的回归用例钉住（见手册 §8.1） |
+
+### D. 计划块核验结果
+
+| 核验项 | 结果 |
+|---|---|
+| 计划 Task 7 的 `markdown` 代码块（计划第 5259–5470 行）在 `docs/deployment.md` 里**逐字连续**存在 | ✅ 是（起始字节下标 **963**；块前 30 行 = 阅读须知，块后 504 行 = §8–§14） |
+| §0 段（`## 0. 三条必须先知道的硬约束` → `## 1. 本地 / 内网`）**逐字**包含 | ✅ 是 |
+| 计划 Task 7 Step 2 的验收命令 | `single writer at a time` → **1**；`proxy_buffering off` → **1**；`backup()` → **3**（计划期望 1 / 1 / 2，判据是「都 ≥ 1」⇒ 通过；见 D7-6） |
+| 计划 Task 7 的代码块**本身有没有被改** | ❌ **没改**（只追加了本台账一章） |
+| `docs/deployment.md` 是不是唯一产出 | ✅ 是（本 Task 只新增这一个文件 + 追加本台账；**`platform/` 下一个字节都没动**） |
+
+### E. 遗留（交给上游，本 Task 不处理）
+
+- **D7-4 是唯一的代码级遗留**：`deploy/nginx-http2-compat.sh` 的 `detect_version()` 解析不了真实 nginx 的
+  `nginx version: nginx/1.24.0` 格式 ⇒ 真机总是走保守降级。**后果安全**（降级语法处处合法），
+  但「≥ 1.25.1 保留 `http2 on;`」只有显式 `NGINX_VERSION` 才走得到。
+  一行修法：
+
+  ```bash
+  # 现状（匹配不到）
+  sed -n 's|^nginx version: \([0-9][0-9.]*\).*|\1|p'
+  # 修法（把可选的 "nginx/" 前缀吃掉）
+  sed -n 's|^nginx version: nginx/\?\([0-9][0-9.]*\).*|\1|p'
+  ```
+
+  ⇒ 修完要重跑 `platform/test/deploy-assets.test.js` 与 F-4 的变异检验。
+  **本 Task 明确不改** —— 本 Task 的文件归属只有 `docs/deployment.md`（+ 计划文档）。
+
+### F. 偏离与遗留（Task 7 自身）
+
+- 本 Task **新增**了 `docs/deployment.md`（计划 Task 7 Files 段已列）。
+- 本 Task **追加**了本章台账（`D7-*` 编号，承接 `D1-*` / `D2-*` / `D3-*` / `D4-*` 的序列）。
+- 手册内部的「未覆盖项」表用 `U-1` ~ `U-7` 编号，**与本台账的 `D7-*` 是两套编号**（不要混用）。
+- ⚠️ 手册 §5 与 §7（计划骨架里的演示版构建命令）**保留原样未改**，其「此刻跑不通」的状态由手册顶部的
+  「**阅读须知**」与 §8.5 承载 —— 理由见 D7-1。
