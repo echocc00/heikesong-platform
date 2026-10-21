@@ -11,14 +11,17 @@ import { createRouter } from './http/router.js';
 import { json, error } from './http/respond.js';
 import { readJsonBody } from './http/body.js';
 import { serveStatic } from './http/static.js';
+import { parseSsePath, openSseStream, sendSseEvent, sendSseComment, reviewEvents } from './http/sse.js';
 import { createSession, resolveSession, revokeSession } from './auth/session.js';
 import { can } from './auth/permissions.js';
 import { verifyPassword, hashPassword } from './auth/password.js';
 import { getUserById, getCredentialsByPhone, toPublicUser } from './db/repo/users.js';
+import { getStage, getStageJudge } from './db/repo/stages.js';
 import { appError, AppError } from './errors.js';
 import { registerRegistrationRoutes } from './http/routes/registration.js';
 import { registerTaskPackageRoutes } from './http/routes/taskPackage.js';
 import { registerTeamRoutes } from './http/routes/team.js';
+import { registerReviewRoutes } from './http/routes/review.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -107,6 +110,8 @@ export function createApp({ db, rules, webDir }) {
   registerTaskPackageRoutes({ router, db, rules });
   // 注册 P1 战队端点（建队 / 我的战队 / 成员增删汰换 / 战队修改）
   registerTeamRoutes({ router, db, rules });
+  // P2 评审 API（报名/组队等 P1 路由由 P1 追加，不要互相覆盖）
+  registerReviewRoutes(router);
   // 生产环境 Cookie 加 Secure；开发环境不加（http://127.0.0.1 会被浏览器拒收）
   const secureCookies = process.env.NODE_ENV === 'production';
 
@@ -185,6 +190,54 @@ export function createApp({ db, rules, webDir }) {
         // ⛔ 预审修正（C4-2）：router.match 必须**在 try 块内**。
         //    原来它在 try 之外 → 畸形百分号编码抛出的 URIError 越过 catch
         //    → Node 默认未捕获异常退出 → 整个服务器进程死亡。
+        // ── P2：SSE（评审进度推送）────────────────────────────────
+        // ⚠️ 必须**独立于 router**，且**在 router.match 之前**：
+        //    P0 的 router handler 约定是「返回一个值 → server.js 统一 json() 序列化
+        //    并结束响应」；SSE 要**长期持有这条连接**（多次推帧）——
+        //    挂到 router 上会被 json() 提前收尾，客户端只收到第一帧就断。
+        //    放在 router.match 之前还有第二个原因：SSE 路径**不在 router 里**，
+        //    若先 match 会直接走 404 分支。
+        const ssePath = req.method === 'GET' ? parseSsePath(url) : null;
+        if (ssePath) {
+          const sseToken = parseCookie(req.headers?.cookie || '')['hk_session'];
+          const sseSession = sseToken ? resolveSession(db, sseToken) : null;
+          const sseUser = sseSession ? getUserById(db, sseSession.userId) : null;
+          if (!sseUser) {
+            error(res, 401, 'UNAUTHENTICATED', '未登录');
+            return;
+          }
+          // ⛔ 权限闸门（父代理预审修正）：**登录还不够**。
+          //    进度事件流会暴露「谁在什么时候提交了评分」——
+          //    任何登录用户都能订阅任意赛段 = 评委行踪可被任意账号看到。
+          //    与 review-state 同一套口径：组委会 / 有 score:read 的人 / 本赛段评委。
+          const sseStage = getStage(db, ssePath.stageId);
+          const sseIsJudge = sseStage
+            ? getStageJudge(db, ssePath.stageId, sseUser.id) != null
+            : false;
+          const sseAllowed = can(sseUser, 'score:read', { scopeType: 'stage', scopeId: ssePath.stageId }, db)
+            || can(sseUser, 'score:read', { scopeType: 'global' }, db)
+            || can(sseUser, 'stage:compute', { scopeType: 'stage', scopeId: ssePath.stageId }, db)
+            || can(sseUser, 'stage:compute', { scopeType: 'global' }, db)
+            || sseIsJudge;
+          if (!sseAllowed) {
+            error(res, 403, 'FORBIDDEN', '没有订阅评审进度的权限');
+            return;
+          }
+          openSseStream(res);
+          const topic = `stage:${ssePath.stageId}`;
+          reviewEvents.add(res, topic);
+          // ⛔ 客户端断开时必须摘掉订阅者 —— 否则连接泄漏，进程内存单调增长。
+          //    同一处把心跳定时器也清掉（否则定时器会一直跑）。
+          const heartbeat = setInterval(() => sendSseComment(res, 'ping'), 25000);
+          if (typeof heartbeat.unref === 'function') heartbeat.unref();
+          res.on('close', () => {
+            clearInterval(heartbeat);
+            reviewEvents.remove(res);
+          });
+          // 首帧必须给：EventSource 的 onopen 拿不到业务数据，客户端靠它确认订阅成功。
+          sendSseEvent(res, 'connected', { stageId: ssePath.stageId, at: new Date().toISOString() });
+          return;
+        }
         const match = router.match(req.method, url);
         if (!match) {
           // 畸形 URL 编码 → 400（请求本身非法）；真没这个接口 → 404

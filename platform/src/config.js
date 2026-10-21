@@ -154,6 +154,45 @@ export function validateRules(rules, expectedCount = null) {
     if (typeof cfg.wEnterprise !== 'number' || cfg.wEnterprise < 0 || cfg.wEnterprise > 1) {
       push(`scoring.${key} wEnterprise 必须在 0..1`);
     }
+    // ── P2 追加：评委池 / 自由命题替代维度 / 归一化策略参数 ──
+    // ⛔ 为什么要在这里 fail-fast（而不是等到运行时才报）：
+    //    这些字段直接决定「谁有投票权」「自由命题组的企业项由谁顶」——
+    //    写错时不会崩，会**静默算出一份错的榜单**（与「权重合计≠100% 拒绝启动」同一类病）。
+    const pool = cfg.judgePool;
+    if (!pool) {
+      push(`scoring.${key} 缺少 judgePool 段（R-JDG-10 / R-JDG-11）`);
+    } else {
+      if (!(Number(pool.minJudgesPerDimension) > 0)) {
+        push(`scoring.${key} judgePool.minJudgesPerDimension 必须 > 0`);
+      }
+      if (Number(pool.minEnterpriseSeatShare) < 0 || Number(pool.minEnterpriseSeatShare) > 1) {
+        push(`scoring.${key} judgePool.minEnterpriseSeatShare 必须在 0..1`);
+      }
+      if (Number(pool.maxExpertSeatShare) < 0 || Number(pool.maxExpertSeatShare) > 1) {
+        push(`scoring.${key} judgePool.maxExpertSeatShare 必须在 0..1`);
+      }
+      if (!Array.isArray(pool.votingSeats) || !pool.votingSeats.length) {
+        push(`scoring.${key} judgePool.votingSeats 缺失`);
+      }
+      if (!Array.isArray(pool.nonVotingSeats) || !pool.nonVotingSeats.length) {
+        push(`scoring.${key} judgePool.nonVotingSeats 缺失`);
+      }
+    }
+    const demand = cfg.freeBrief?.judgeDimension;
+    if (!demand) {
+      push(`scoring.${key} 缺少 freeBrief.judgeDimension（R-JDG-08 R4）`);
+    } else if (!cfg.dimensions.some((d) => d.key === demand && d.seat === 'judge')) {
+      push(`scoring.${key} freeBrief.judgeDimension=${demand} 必须是一个评委席维度`);
+    }
+    if (cfg.selfEvalThreshold != null && Number(cfg.selfEvalThreshold) < 0) {
+      push(`scoring.${key} selfEvalThreshold 必须 ≥ 0`);
+    }
+    if (cfg.trimmedIterations != null && !(Number.isInteger(cfg.trimmedIterations) && cfg.trimmedIterations >= 1)) {
+      push(`scoring.${key} trimmedIterations 必须是 ≥1 的整数`);
+    }
+    if (cfg.bayesPriorStrength != null && !(Number.isFinite(cfg.bayesPriorStrength) && cfg.bayesPriorStrength >= 0)) {
+      push(`scoring.${key} bayesPriorStrength 必须是 ≥0 的有限数`);
+    }
     if (!VALID_NORMALIZATIONS.includes(cfg.normalizationStrategy)) {
       push(`scoring.${key} normalizationStrategy 非法`);
     }

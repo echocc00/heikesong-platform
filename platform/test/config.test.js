@@ -202,3 +202,39 @@ test('权重合计的容差必须严格：合计 101% 也要被拒绝（终审 I
     `合计 101% 必须被拒绝，实际校验结果：${JSON.stringify(errors)}`,
   );
 });
+
+// ── 以下 4 条来自 P2 Task 8（新增字段的 fail-fast 校验）────────────────────
+
+test('P2：缺 judgePool 段会被拒绝（R-JDG-10 / R-JDG-11 的评委池构成必须配置化）', () => {
+  const { rules } = loadRules(rulesDir);
+  const broken = structuredClone(rules);
+  delete broken.scoring.initial.judgePool;
+  const errors = validateRules(broken);
+  assert.ok(errors.some((e) => e.includes('scoring.initial') && e.includes('judgePool')));
+});
+
+test('P2：judgePool 的占比必须在 0..1', () => {
+  const { rules } = loadRules(rulesDir);
+  const broken = structuredClone(rules);
+  broken.scoring.final.judgePool.minEnterpriseSeatShare = 1.5;
+  const errors = validateRules(broken);
+  assert.ok(errors.some((e) => e.includes('minEnterpriseSeatShare')));
+});
+
+test('P2：freeBrief.judgeDimension 必须指向一个评委席维度（R4 的替代维度）', () => {
+  const { rules } = loadRules(rulesDir);
+  const broken = structuredClone(rules);
+  broken.scoring.initial.freeBrief.judgeDimension = 'enterprise'; // 企业席维度不能当替代
+  const errors = validateRules(broken);
+  assert.ok(errors.some((e) => e.includes('freeBrief.judgeDimension')));
+});
+
+test('P2：归一化策略参数（trimmedIterations / bayesPriorStrength）非法会被拒绝', () => {
+  const { rules } = loadRules(rulesDir);
+  const broken = structuredClone(rules);
+  broken.scoring.initial.trimmedIterations = 0;
+  broken.scoring.final.bayesPriorStrength = -1;
+  const errors = validateRules(broken);
+  assert.ok(errors.some((e) => e.includes('trimmedIterations')));
+  assert.ok(errors.some((e) => e.includes('bayesPriorStrength')));
+});
