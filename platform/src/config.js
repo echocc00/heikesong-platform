@@ -378,6 +378,14 @@ export function validateRules(rules, expectedCount = null) {
       || behavior.completionThreshold < 0 || behavior.completionThreshold > 100) {
       push('behavior.completionThreshold 必须在 0..100');
     }
+    // ⚠️ sortUse **不是可配置项**，它是 R-PTS-08 的硬保证：行为分只能做破同分，
+    //    绝不能变成主评分（决赛名次 0% / 奖金 0%）。
+    //    链不变量里的那处检查（assertChainInvariants）在生产链路上【拿不到 behaviorConfig】，
+    //    属于「建好却从不校验」的同款病根 —— 所以必须在这里 fail-fast：
+    //    配置被改成 'primary' 之类的值时**拒绝启动**，而不是带着违规口径上线。
+    if (behavior.sortUse !== 'tiebreak_only') {
+      push('behavior.sortUse 必须是 tiebreak_only（R-PTS-08：行为分只做破同分，不进总分/奖金）');
+    }
     if (!Array.isArray(behavior.events) || behavior.events.length === 0) {
       push('behavior.events 缺失或为空');
     } else if (hasBadItem(behavior.events)) {

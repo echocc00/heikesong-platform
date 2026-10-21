@@ -337,6 +337,15 @@ test('配置校验会拒绝非法 criteria 配置 / 缺 points / personal.lifeti
   assert.ok(validateRules(bad5).some((e) => e.includes('personal.lifetime')));
 });
 
+test('⛔ 行为分 sortUse 必须恒为 tiebreak_only（R-PTS-08 是硬保证，不是可配置项）', () => {
+  const { rules } = loadRules(rulesDir);
+  const bad = structuredClone(rules);
+  bad.behavior.sortUse = 'primary';
+  assert.ok(validateRules(bad).some((e) => e.includes('sortUse')),
+    '行为分被改成主评分口径时必须拒绝启动');
+  assert.equal(validateRules(rules).length, 0, '出厂配置必须零报错');
+});
+
 test('⛔ 占位策略不得被擅自启用（观众票 / 权重回退 / 未知部门口径 / 对接会时长）', () => {
   const { rules } = loadRules(rulesDir);
   // R-OPS-11 观众票：权重无规则依据，只占位不启用
@@ -2253,7 +2262,7 @@ test('★ 隔离断言：行为分变化【不影响总分】与【不影响非�
   assert.deepEqual(high.ordered.map((o) => o.rank), [1, 1, 3]);
 });
 
-test('★ 隔离断言：完全同分时，行为分只改变相对顺序，不改变名次数字', () => {
+test('★ 隔离断言：完全同分时行为分只当破同分用 —— 可比较时拆开、不可比较时保持并列', () => {
   const r = rankTeams({
     teams: [
       { teamId: 't_a', total: 80, peerScore: 5, enterpriseRaw: 5, behaviorScore: 1 },
@@ -2262,7 +2271,174 @@ test('★ 隔离断言：完全同分时，行为分只改变相对顺序，不�
     tiebreakChain: CHAIN, tiebreakData: { isFinal: false }, pointsConfig: rules.points,
   });
   assert.deepEqual(r.ordered.map((o) => o.teamId), ['t_b', 't_a'], '行为分高者在前');
-  assert.deepEqual(r.ordered.map((o) => o.rank), [1, 1], '名次数字不变（仍然并列）');
+  // ⚠️ 行为分是链上的**实质依据**（scope=tied_only、非 deterministic）→ 可比较时【拆开并列】，
+  //    名次变成 1、2。只有链末的 team_id（deterministic:true）才是「只排序不拆组」。
+  //    规格原写法期望 [1,1]（以为行为分不拆组）—— 与 R-PTS-08「同分时的最后排序依据」矛盾。
+  assert.deepEqual(r.ordered.map((o) => o.rank), [1, 2], '行为分可用时把并列拆开 → 名次 1、2');
+
+  // 行为分不可比较（缺值）→ 该键在本组不可用 → 保持并列，名次仍是 1、1
+  const tie = rankTeams({
+    teams: [
+      { teamId: 't_a', total: 80, peerScore: 5, enterpriseRaw: 5, behaviorScore: null },
+      { teamId: 't_b', total: 80, peerScore: 5, enterpriseRaw: 5, behaviorScore: null },
+    ],
+    tiebreakChain: CHAIN, tiebreakData: { isFinal: false }, pointsConfig: rules.points,
+  });
+  assert.deepEqual(tie.ordered.map((o) => o.rank), [1, 1], '行为分不可用 → 保持并列');
+  assert.ok(tie.warnings.some((w) => w.code === 'tiebreak_key_unusable'), '键不可用必须显式告警，不静默');
+});
+
+test('★ 证据边界：缺证据 / 非 JSON / 非对象 / oneOf 全不满足', () => {
+  const missing = behaviorScore({ events: [ev('weekly_progress', { evidence: null })], behaviorConfig: B });
+  assert.equal(missing.total, 0);
+  assert.equal(missing.items[0].reason, 'missing_evidence');
+
+  const empty = behaviorScore({ events: [ev('weekly_progress', { evidence: '' })], behaviorConfig: B });
+  assert.equal(empty.items[0].reason, 'missing_evidence');
+
+  const notObject = behaviorScore({ events: [ev('weekly_progress', { evidence: '123' })], behaviorConfig: B });
+  assert.equal(notObject.total, 0);
+  assert.equal(notObject.items[0].reason, 'evidence_not_object', 'JSON 但不是对象 → 不认');
+
+  const array = behaviorScore({ events: [ev('weekly_progress', { evidence: '[1,2]' })], behaviorConfig: B });
+  assert.equal(array.items[0].reason, 'evidence_not_object', '数组也不是对象 → 不认');
+
+  const none = behaviorScore({
+    events: [ev('weekly_progress', { evidence: JSON.stringify({ repo: 'r', version: 'v1' }) })],
+    behaviorConfig: B,
+  });
+  assert.equal(none.total, 0, '既没有 artifact 也没有 blocker → 不给分');
+  assert.equal(none.items[0].reason, 'evidence_missing_any_of_artifact_or_blocker');
+});
+
+test('once 事件：证据不合格的提交【不占用】once 名额', () => {
+  const cfg = {
+    ...B,
+    events: B.events.map((e) => (e.key === 'first_demo' ? { ...e, requiresEvidence: true } : e)),
+    evidenceRequirements: { first_demo: { required: ['artifact'], oneOf: [] } },
+  };
+  const out = behaviorScore({
+    events: [
+      ev('first_demo', { created_at: '2026-10-10T00:00:00.000Z', evidence: JSON.stringify({}) }),
+      ev('first_demo', { created_at: '2026-10-11T00:00:00.000Z', evidence: JSON.stringify({ artifact: 'demo.zip' }) }),
+    ],
+    behaviorConfig: cfg,
+  });
+  assert.equal(out.items[0].counted, false, '证据不合格 → 0 分');
+  assert.equal(out.items[1].counted, true, '不合格的那次不占用 once 名额，后面合格的可计分');
+  assert.equal(out.total, 10);
+});
+
+test('行为分配置的兜底：缺阈值/缺占比/缺 sortUse 时如实返回 null', () => {
+  const out = behaviorScore({ events: [], behaviorConfig: {} });
+  assert.equal(out.total, 0);
+  assert.equal(out.completionThreshold, 60, '缺阈值 → 兜底 60');
+  assert.equal(out.maxWeightShare, null);
+  assert.equal(out.sortUse, null, '配置没写就是 null（不硬编一个值出来）');
+  assert.equal(out.completed, false);
+
+  const noArgs = behaviorScore({ behaviorConfig: B });
+  assert.equal(noArgs.total, 0, '连 events 都不传 → 空集，不崩');
+  assert.equal(noArgs.items.length, 0);
+});
+
+test('★ 证据对象形态：evidence 已经是对象时不必再是 JSON 字符串', () => {
+  const out = behaviorScore({
+    events: [ev('weekly_progress', { evidence: { repo: 'r', version: 'v1', artifact: 'a.zip' } })],
+    behaviorConfig: B,
+  });
+  assert.equal(out.total, 2, '对象形态的证据同样认');
+  assert.equal(out.items[0].counted, true);
+});
+
+test('证据要求：没写 required / oneOf 的规则不得崩', () => {
+  const cfg = { ...B, evidenceRequirements: { weekly_progress: {} } };
+  const out = behaviorScore({
+    events: [ev('weekly_progress', { evidence: JSON.stringify({ anything: 1 }) })],
+    behaviorConfig: cfg,
+  });
+  assert.equal(out.total, 2, '没有必填字段 → 不拦');
+});
+
+test('★ 空白值不算有效证据（trim 后为空）', () => {
+  const blank = behaviorScore({
+    events: [ev('weekly_progress', { evidence: JSON.stringify({ repo: '   ', version: 'v1', artifact: 'a' }) })],
+    behaviorConfig: B,
+  });
+  assert.equal(blank.total, 0);
+  assert.equal(blank.items[0].reason, 'evidence_missing_repo', '全是空白的 repo 视为没填');
+
+  const blankBlocker = behaviorScore({
+    events: [ev('weekly_progress', { evidence: JSON.stringify({ repo: 'r', version: 'v1', blocker: '   ' }) })],
+    behaviorConfig: B,
+  });
+  assert.equal(blankBlocker.total, 0);
+  assert.equal(blankBlocker.items[0].reason, 'evidence_missing_any_of_artifact_or_blocker');
+});
+
+test('事件配置缺 points 时按 0 计（不产生 NaN）', () => {
+  const cfg = { ...B, events: [{ key: 'weekly_progress', label: '每周进度' }] };
+  const out = behaviorScore({ events: [ev('weekly_progress')], behaviorConfig: cfg });
+  assert.equal(out.total, 0);
+  assert.ok(Number.isFinite(out.total));
+});
+
+test('★ 达标线是「≥」不是「>」：刚好到线算完赛', () => {
+  const cfg = { ...B, completionThreshold: 25 };
+  const out = behaviorScore({
+    events: [
+      ev('weekly_progress'), ev('workshop_output', { evidence: JSON.stringify({ output: 'o' }) }),
+      ev('milestone_on_time'), ev('enterprise_meeting', { evidence: JSON.stringify({ enterpriseConfirmationId: 'e' }) }),
+      ev('first_demo'),
+    ],
+    behaviorConfig: cfg,
+  });
+  assert.equal(out.total, 25);
+  assert.equal(out.completed, true, '刚好 25 = 达标（>=）');
+});
+
+test('★ 事件按创建时间升序处理；同一时刻按 id 兜底（顺序可复现）', () => {
+  const out = behaviorScore({
+    events: [
+      ev('first_demo', { created_at: '2026-10-11T00:00:00.000Z', evidence: JSON.stringify({ artifact: 'ok.zip' }) }),
+      ev('first_demo', { created_at: '2026-10-10T00:00:00.000Z', evidence: JSON.stringify({}) }),
+    ],
+    behaviorConfig: { ...B, evidenceRequirements: { ...{}, first_demo: { required: ['artifact'], oneOf: [] } } },
+  });
+  assert.deepEqual(out.items.map((i) => i.counted), [false, true], '早的那条先判 → 早的不合格不算占用 once');
+  assert.equal(out.total, 10);
+
+  const same = behaviorScore({
+    events: [
+      { id: 'e_b', type: 'weekly_progress', created_at: '2026-10-10T00:00:00.000Z', evidence: JSON.stringify({ repo: 'r', version: 'v', artifact: 'a' }) },
+      { id: 'e_a', type: 'weekly_progress', created_at: '2026-10-10T00:00:00.000Z', evidence: JSON.stringify({ repo: 'r', version: 'v', artifact: 'a' }) },
+    ],
+    behaviorConfig: B,
+  });
+  assert.deepEqual(same.items.map((i) => i.type), ['weekly_progress', 'weekly_progress']);
+  assert.equal(same.total, 4);
+});
+
+test('★ 排序口径：先按创建时间，同一时刻再按 id 码位序（两条都要钉住）', () => {
+  const byTime = behaviorScore({
+    events: [
+      { id: 'e_1', type: 'milestone_on_time', created_at: '2026-10-11T00:00:00.000Z', evidence: OK },
+      { id: 'e_2', type: 'weekly_progress', created_at: '2026-10-10T00:00:00.000Z', evidence: OK },
+    ],
+    behaviorConfig: B,
+  });
+  assert.deepEqual(byTime.items.map((i) => i.type), ['weekly_progress', 'milestone_on_time'],
+    '按创建时间升序（不是按 id）');
+
+  const byId = behaviorScore({
+    events: [
+      { id: 'e_2', type: 'milestone_on_time', created_at: '2026-10-10T00:00:00.000Z', evidence: OK },
+      { id: 'e_1', type: 'weekly_progress', created_at: '2026-10-10T00:00:00.000Z', evidence: OK },
+    ],
+    behaviorConfig: B,
+  });
+  assert.deepEqual(byId.items.map((i) => i.type), ['weekly_progress', 'milestone_on_time'],
+    '同一时刻按 id 码位序兜底（e_1 < e_2）');
 });
 ```
 
@@ -2380,14 +2556,34 @@ export function behaviorScore({ events, behaviorConfig }) {
     completed: total >= threshold,          // R-PTS-09：达标线 60 → 完赛认定
     completionThreshold: threshold,
     maxWeightShare: cfg.maxWeightShare ?? null,
-    sortUse: cfg.sortUse ?? null,           // 恒为 'tiebreak_only'（R-PTS-08）
+    sortUse: cfg.sortUse ?? null,           // 取自配置；配置层 fail-fast 校验它必须是 'tiebreak_only'（R-PTS-08）
   };
 }
 ```
 
+- [ ] **Step 3b: 修改 src/config.js（行为分 `sortUse` 的 fail-fast 校验）**
+
+在 `validateRules` 的「── 行为分 ──」段里（`behavior.completionThreshold` 校验之后、`behavior.events` 校验之前）追加：
+
+```javascript
+    // ⚠️ sortUse **不是可配置项**，它是 R-PTS-08 的硬保证：行为分只能做破同分，
+    //    绝不能变成主评分（决赛名次 0% / 奖金 0%）。
+    //    链不变量里的那处检查（assertChainInvariants）在生产链路上【拿不到 behaviorConfig】，
+    //    属于「建好却从不校验」的同款病根 —— 所以必须在这里 fail-fast：
+    //    配置被改成 'primary' 之类的值时**拒绝启动**，而不是带着违规口径上线。
+    if (behavior.sortUse !== 'tiebreak_only') {
+      push('behavior.sortUse 必须是 tiebreak_only（R-PTS-08：行为分只做破同分，不进总分/奖金）');
+    }
+```
+
+> **为什么必须在这里校验**：全仓唯一检查 `sortUse` 的地方是 `assertChainInvariants`，
+> 而它的签名里**没有 behaviorConfig 参数**（`rankTeams({teams, tiebreakChain, tiebreakData, pointsConfig})`
+> 是契约定死的），生产链路**拿不到**这个值 → 那处检查**永远不生效**。
+> 与 P2 终审 I-2（`checkJudgePool` 零调用方）同款：能力建好了却从不调用。
+
 - [ ] **Step 4: 运行测试确认通过**
 
-Run: `cd platform && node --test test/behavior.test.js` → Expected: PASS（5 个测试全过：behavior.test.js 5）
+Run: `cd platform && node --test test/behavior.test.js` → Expected: PASS（**15** 个测试全过：behavior.test.js 15 —— 规格自带 5 + 预审补测 1 + 变异检验补测 9；变异体 28 → KILLED 28 / 等价 0 / 有效缺口 0）
 
 - [ ] **Step 5: 提交**
 
@@ -4222,3 +4418,33 @@ git commit -m "feat(P3): 榜单页、段位榜与战绩卡前端"
 **Task 4 的测试条数口径**：tier **16**（规格自带 7 + 变异检验补测 9）。
 
 **最终结果**：变异体 40 → **KILLED 34 / 等价变异体 6 / 有效缺口 0**；`tier.test.js` **16/16**；P3 全量 **629/629**。
+
+---
+
+## Task 5 父代理预审修正台账（2026-10-21）
+
+> Task 5 是**行为分**的落地：R-PTS-07/08/09/10 的计分明细 + 反作弊 5 条 + 与总分的算法级隔离。
+> 实施前把规格的代码块抽到 `/tmp` 的独立工程实跑（**先跑后派**）—— 规格自带 **4/5 绿、1 红**，
+> 红的那条牵出一个**方向性错误**的断言。另发现 1 条**配置项形同虚设**。
+> 变异体 **28** 个 → **KILLED 28 / 等价 0 / 有效缺口 0**。
+
+### 一、预审发现的规格缺陷
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| **P3-18** | **Important** | **规格自带的「隔离断言 #5」期望值方向性错误** —— 断言「完全同分时行为分只改变相对顺序，**不改变名次数字**」、期望 `rank = [1, 1]`。实际实现给出 `[1, 2]` | 实跑：期望 `[1,1]`、实到 `[1,2]`。**根因**：破同分链里**只有链末的 `team_id` 是 `deterministic: true`**（`applyTiebreakChain` 明确注释「确定性兜底：只决定组内顺序，**【不】拆组**（并列名次不变）」）；而 `behavior` 是 `scope: tied_only` 的**实质依据**（非 deterministic）→ 行为分**可用时必然拆开并列组** → 名次变成 1、2。规格把「确定性兜底项不拆组」的语义**错套到了行为分身上** | 拆成两个断言，把「隔离」这条真正的性质钉住：① 行为分**可用**时拆开并列 → 名次 `[1, 2]`、顺序按行为分；② 行为分**不可用**（缺值 → `readValue` 返回 null → 该键在本组不可用）时**保持并列** → 名次 `[1, 1]`，且必须带 `tiebreak_key_unusable` 告警（不静默）。依据：R-PTS-08 原文「同分时的**最后**排序依据 ✅」—— 行为分就是破同分依据，拆开后名次理应不同 |
+| **P3-19** | Minor | **`behavior.sortUse` 是一个【从未被校验】的配置项** —— 全仓唯一检查它的地方是 `assertChainInvariants`，而它的签名里**没有 `behaviorConfig` 参数**（`rankTeams` 的签名是契约定死的），生产链路**永远拿不到**这个值 → 那处检查**从不生效** | `grep -n "sortUse" platform/src/` → 只有 `behavior.js` 读它、`ranking.js` 有一处**拿不到值的**检查；`config.js` 的 `validateRules` 里**没有** `sortUse` 的校验。后果：把 `rules/behavior-points.json` 的 `sortUse` 改成 `'primary'`（行为分变主评分口径，直接违反 R-PTS-08）→ **零报错、照常启动** | 在 `src/config.js` 的 `validateRules` 里 **fail-fast**：`behavior.sortUse !== 'tiebreak_only'` → 报错拒绝启动；并加用例（改配置 → 校验报错 / 出厂配置零报错）。⚠️ 与 P2 终审 I-2（`checkJudgePool` 零调用方）、P3-15（段位引擎零调用方）**同一类病根**：能力建好了却从不调用 —— 这次是**校验**建好了却从不执行 |
+
+### 二、变异检验
+
+> 变异体 **28** 个（证据解析的各条分支 / 必填与 oneOf 的空白判定 / once 名额的占用时机 /
+> 未知类型与 once 被拒的原因码 / 分值与达标的边界 / 配置兜底 / 排序的时间与 id 两条口径 …），
+> 在 `/tmp` 副本上跑 `behavior.test.js`，**测试必须失败才算杀灭**。变异脚本：`/tmp/p3t5/mutate.mjs`。
+>
+> 首轮曾有 **10 条存活** —— 原因是**变异脚本拷的是仓库里的旧版测试文件**（新补的用例还没回写落地）。
+> 回写后复跑 → **28/28 全杀**。教训：变异脚本必须指向**已落地的**测试文件，
+> 否则「存活」会被误判成「盲区」，白补一堆用例。
+
+**Task 5 的测试条数口径**：behavior **15**（规格自带 5 + 预审补测 1 + 变异检验补测 9）。
+
+**最终结果**：变异体 28 → **KILLED 28 / 等价变异体 0 / 有效缺口 0**；`behavior.test.js` **15/15**；P3 全量 **645/645**。

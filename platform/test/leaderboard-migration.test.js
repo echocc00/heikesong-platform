@@ -195,6 +195,15 @@ test('配置校验会拒绝非法 criteria 配置 / 缺 points / personal.lifeti
   assert.ok(validateRules(bad5).some((e) => e.includes('personal.lifetime')));
 });
 
+test('⛔ 行为分 sortUse 必须恒为 tiebreak_only（R-PTS-08 是硬保证，不是可配置项）', () => {
+  const { rules } = loadRules(rulesDir);
+  const bad = structuredClone(rules);
+  bad.behavior.sortUse = 'primary';
+  assert.ok(validateRules(bad).some((e) => e.includes('sortUse')),
+    '行为分被改成主评分口径时必须拒绝启动');
+  assert.equal(validateRules(rules).length, 0, '出厂配置必须零报错');
+});
+
 test('⛔ 占位策略不得被擅自启用（观众票 / 权重回退 / 未知部门口径 / 对接会时长）', () => {
   const { rules } = loadRules(rulesDir);
   // R-OPS-11 观众票：权重无规则依据，只占位不启用
