@@ -154,20 +154,77 @@ export function collectBrowserModules(domainDir) {
 }
 
 /**
+ * Node 专属全局：浏览器里**不存在**，用了就是 ReferenceError。
+ *
+ * ⚠️⚠️ 为什么必须**单独**查它们：
+ *   这几个符号**不需要 import** 就能用 ⇒ 只查 import 说明符的守卫**一个都抓不到**。
+ *   实测踩坑（P6 Task 8 台账 G-3）：P5 的 `src/domain/icalendar.js` 用了 `Buffer.from(...)`
+ *   —— import 零违规，构建闸放行，产物照发 ⇒ 浏览器里 `Buffer is not defined` ⇒ **演示站白屏**。
+ *   ⇒ 构建闸必须在**发布前**就把它拦下来，而不是等到测试或用户看白屏。
+ *
+ * ⚠️ 清单在**数据文件** `scripts/node-globals.txt` 里，不在代码里 ——
+ *    因为平台自己有一条规则「代码里不得出现 __dirname / __filename」
+ *    （`test/portability.test.js` 扫 src/ scripts/ web/），
+ *    而守卫**必须能点名它要禁的东西** ⇒ 清单写进 .js 就会自指假红。
+ *    （与 `scripts/forbidden.txt` 同一个套路：清单用数据、规则用代码。）
+ */
+const NODE_GLOBALS_FILE = join(here, 'node-globals.txt');
+
+/**
+ * 读禁用清单。**空清单 = 闸未生效**（与 forbidden.txt 同一口径）⇒ 直接报错，不静默放行。
+ * @returns {string[]} 符号名数组
+ */
+export function loadNodeOnlyGlobals(file = NODE_GLOBALS_FILE) {
+  if (!existsSync(file)) {
+    throw new Error(`Node 专属全局禁用清单不存在：${file} —— 守卫无法工作，拒绝构建。`);
+  }
+  const tokens = readFileSync(file, 'utf8')
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith('#'));
+  if (tokens.length === 0) {
+    throw new Error(`Node 专属全局禁用清单是空的：${file} —— 空清单 ≠ 已保护，拒绝构建。`);
+  }
+  return tokens;
+}
+
+/**
+ * 在一段代码里找 Node 专属全局。返回命中的 token 数组（空数组 = 没有）。
+ * ⚠️ **先剥注释**：注释里写「// 不要用 Buffer」不是违规，否则守卫会误报、构建被冤杀。
+ *   （与 `portability.test.js` 里的那条断言是**两套独立实现** ⇒ 互为交叉校验。）
+ */
+export function findNodeOnlyGlobals(code, tokens = loadNodeOnlyGlobals()) {
+  const text = stripComments(code);
+  const hits = [];
+  for (const token of tokens) {
+    // 用**词边界**而不是 `token(`：`require` 要连 `= require(...)` 一起抓，
+    // 而 `Buffer` / `process` 也可能以属性名出现（`obj.Buffer` 不算违规，但本仓不用这种写法）。
+    if (new RegExp(`\\b${token}\\b`).test(text)) hits.push(token);
+  }
+  return hits;
+}
+
+/**
  * 领域层浏览器安全守卫。
- * 返回违规说明数组（空数组 = 通过）。违反的两种情况：
+ * 返回违规说明数组（空数组 = 通过）。违反的四种情况：
  *   ① import 了 Node 内置模块（node:fs / node:path / …）
  *   ② import 了裸模块名（不是 './' 或 '../' 开头）—— 浏览器没有 node_modules
  *   ③ 相对导入指不到文件（拷进 dist 后会 404）
+ *   ④ 用了 Node 专属全局（Buffer / process / __dirname / __filename / require）
  */
 export function assertDomainIsBrowserSafe(domainDir) {
   const violations = [];
   if (!existsSync(domainDir)) return [`领域层目录不存在：${domainDir}`];
 
+  // 清单**只读一次**（每文件读一次会把构建拖慢，也让「清单中途变了」成为可能）
+  const nodeGlobals = loadNodeOnlyGlobals();
   const { domainFiles, extraFiles } = collectBrowserModules(domainDir);
   for (const file of [...domainFiles, ...extraFiles]) {
     const rel = relative(dirname(domainDir), file);
     const code = readFileSync(file, 'utf8');
+    for (const token of findNodeOnlyGlobals(code, nodeGlobals)) {
+      violations.push(`${rel} 用了 Node 专属全局 ${token}（浏览器里不存在 ⇒ 演示站白屏）`);
+    }
     for (const spec of extractImportSpecifiers(code)) {
       if (spec.startsWith('node:')) {
         violations.push(`${rel} 导入了 Node 内置模块 ${spec}（浏览器跑不了）`);

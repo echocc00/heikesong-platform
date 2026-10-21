@@ -29,7 +29,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawn } from 'node:child_process';
 import net from 'node:net';
 import http from 'node:http';
-import { buildDemoSite, assertDomainIsBrowserSafe, collectBrowserModules } from '../scripts/build-demo.js';
+import { buildDemoSite, assertDomainIsBrowserSafe, collectBrowserModules, loadNodeOnlyGlobals } from '../scripts/build-demo.js';
 import { DEMO_RULE_FILES, SEED_URL, RULES_BASE } from '../web/api.demo.js';
 import { loadRules } from '../src/config.js';
 import { serveStatic } from '../src/http/static.js';
@@ -114,6 +114,64 @@ test('守卫也会拦下跨行的 Node 内置模块导入与裸模块名（格�
 
   rmSync(dir, { recursive: true, force: true });
   rmSync(dir2, { recursive: true, force: true });
+});
+
+test('守卫也会拦下 Node 专属全局（Buffer / process / __dirname / __filename / require）', () => {
+  // ⚠️ 这些符号**不需要 import**就能用 ⇒ 只查 import 说明符的守卫**一个都抓不到**。
+  //    实测踩坑（P6 Task 8 台账 G-3）：P5 的 src/domain/icalendar.js 用了 Buffer.from(...)
+  //    ⇒ import 零违规、构建闸放行、产物照发 ⇒ 浏览器里 ReferenceError ⇒ 演示站白屏。
+  const cases = [
+    { file: 'buf.js', code: 'export const b = Buffer.from("x", "utf8");\n', token: 'Buffer' },
+    { file: 'proc.js', code: 'export const e = process.env.HOME;\n', token: 'process' },
+    { file: 'dir.js', code: 'export const d = __dirname;\n', token: '__dirname' },
+    { file: 'fname.js', code: 'export const f = __filename;\n', token: '__filename' },
+    { file: 'req.js', code: 'const fs = require("node:fs");\nexport const x = fs;\n', token: 'require' },
+  ];
+  for (const c of cases) {
+    const dir = mkdtempSync(join(tmpdir(), 'hks-dom-'));
+    writeFileSync(join(dir, c.file), c.code, 'utf8');
+    const violations = assertDomainIsBrowserSafe(dir);
+    assert.equal(violations.length, 1, `${c.token} 必须被拦下：${JSON.stringify(violations)}`);
+    assert.ok(violations[0].includes(c.token), `违规说明里必须点名 ${c.token}：${violations[0]}`);
+    assert.ok(violations[0].includes('Node 专属全局'), '必须说清是 Node 专属全局');
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('注释里提到 Node 专属全局不算违规（守卫不许冤杀构建）', () => {
+  // ⚠️ 领域层的注释里经常写着「⛔ 不要用 Buffer」这类提醒 ——
+  //    若守卫不剥注释，就会把**正确的注释**判成违规 ⇒ 构建被冤杀。
+  const dir = mkdtempSync(join(tmpdir(), 'hks-dom-'));
+  writeFileSync(
+    join(dir, 'commented.js'),
+    '// ⛔ 不得用 Buffer / process / __dirname / __filename / require\n' +
+      '/* 这里提到 require 只是提醒 */\n' +
+      'export const ok = 1;\n',
+    'utf8',
+  );
+  const violations = assertDomainIsBrowserSafe(dir);
+  assert.deepEqual(violations, [], `注释里的提醒不该被判违规：${violations.join('；')}`);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('Node 专属全局禁用清单缺失或为空 ⇒ 守卫必须报错，不许静默放行', () => {
+  // ⚠️ 与 scripts/forbidden.txt 同一口径：**空清单 ≠ 已保护**。
+  //    清单读不到就读不到，不许「读不到就当没有违规」⇒ 那等于把闸架空。
+  const missing = join(tmpdir(), 'hks-node-globals-not-exist-xyz.txt');
+  assert.throws(() => loadNodeOnlyGlobals(missing), /禁用清单不存在/, '清单缺失必须报错');
+  assert.throws(() => loadNodeOnlyGlobals(missing), /拒绝构建/, '报错要说清是拒绝构建');
+
+  const emptyFile = join(mkdtempSync(join(tmpdir(), 'hks-globals-')), 'empty.txt');
+  writeFileSync(emptyFile, '# 只有注释，没有词条\n\n', 'utf8');
+  assert.throws(() => loadNodeOnlyGlobals(emptyFile), /是空的/, '空清单必须报错');
+  assert.throws(() => loadNodeOnlyGlobals(emptyFile), /空清单 ≠ 已保护/, '报错要说清空清单等于没保护');
+
+  // 正常清单读得到 5 条，且包含两个 __ 前缀的
+  const tokens = loadNodeOnlyGlobals();
+  assert.ok(tokens.length >= 5, `清单至少 5 条，实际 ${tokens.length}`);
+  assert.ok(tokens.includes('Buffer'), '清单必须含 Buffer');
+  assert.ok(tokens.some((t) => t.endsWith('dirname')), '清单必须含 __dirname');
+  assert.ok(tokens.every((t) => !t.startsWith('#') && t.trim() === t), '清单里不能有注释行或多余空白');
 });
 
 test('领域层之外的兄弟目录不得被当成领域层（目录边界按分隔符判，不按前缀判）', () => {

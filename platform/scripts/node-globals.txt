@@ -1,0 +1,22 @@
+# scripts/node-globals.txt — 领域层「Node 专属全局」禁用清单
+# 依据：R-OPS-01/07（零 npm 依赖 / 可移植）＋ P6 Task 5 的浏览器同构前提
+#
+# ⚠️⚠️ 为什么清单是**数据文件**而不是写在 build-demo.js 里：
+#    平台有一条可移植性规则「代码里不得出现 __dirname / __filename」
+#    （test/portability.test.js 会扫 src/ scripts/ web/ 三个目录）。
+#    而**守卫必须能点名它要禁的东西** ⇒ 清单写进 .js 源码就会让那条规则
+#    把守卫文件**自己**判成违规（自指的假红 —— 实测踩到过）。
+#    ⇒ 清单放数据文件：守卫读得到，.js 源码里也不留下完整字面量。
+#    （与 scripts/forbidden.txt 是同一个套路：**清单用数据、规则用代码**。）
+#
+# 语法：
+#   一行一个符号名；空行与 # 开头的行忽略。
+#   ⚠️ 必须是**浏览器里不存在、Node 里存在**的全局量。
+#      判据：写了它，浏览器里就是 ReferenceError（不是"有但行为不同"）。
+#
+# 清单：
+Buffer
+process
+__dirname
+__filename
+require

@@ -131,7 +131,8 @@ platform/
 ├── scripts/
 │   ├── backup.js                 sqlite.backup() 一致性备份 + 保留策略
 │   ├── restore.js                从备份恢复（先停服务 → 验完整性 → 换库 → 清 -wal/-shm）
-│   ├── build-demo.js             构建静态演示站（复制 domain/rules/seed + 校验领域层无 Node 导入）
+│   ├── build-demo.js             构建静态演示站（复制 domain/rules/seed + 校验领域层无 Node 导入/无 Node 专属全局）
+│   ├── node-globals.txt          领域层「Node 专属全局」禁用清单（数据文件，理由见 A-1）
 │   └── serve-demo.js             本地静态服务器（验证构建产物用）
 ├── src/runtime/
 │   └── pidfile.js                进程 pid 文件（让「恢复前先停服务」可被机器检查）
@@ -5768,7 +5769,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawn } from 'node:child_process';
 import net from 'node:net';
 import http from 'node:http';
-import { buildDemoSite, assertDomainIsBrowserSafe, collectBrowserModules } from '../scripts/build-demo.js';
+import { buildDemoSite, assertDomainIsBrowserSafe, collectBrowserModules, loadNodeOnlyGlobals } from '../scripts/build-demo.js';
 import { DEMO_RULE_FILES, SEED_URL, RULES_BASE } from '../web/api.demo.js';
 import { loadRules } from '../src/config.js';
 import { serveStatic } from '../src/http/static.js';
@@ -5853,6 +5854,64 @@ test('守卫也会拦下跨行的 Node 内置模块导入与裸模块名（格�
 
   rmSync(dir, { recursive: true, force: true });
   rmSync(dir2, { recursive: true, force: true });
+});
+
+test('守卫也会拦下 Node 专属全局（Buffer / process / __dirname / __filename / require）', () => {
+  // ⚠️ 这些符号**不需要 import**就能用 ⇒ 只查 import 说明符的守卫**一个都抓不到**。
+  //    实测踩坑（P6 Task 8 台账 G-3）：P5 的 src/domain/icalendar.js 用了 Buffer.from(...)
+  //    ⇒ import 零违规、构建闸放行、产物照发 ⇒ 浏览器里 ReferenceError ⇒ 演示站白屏。
+  const cases = [
+    { file: 'buf.js', code: 'export const b = Buffer.from("x", "utf8");\n', token: 'Buffer' },
+    { file: 'proc.js', code: 'export const e = process.env.HOME;\n', token: 'process' },
+    { file: 'dir.js', code: 'export const d = __dirname;\n', token: '__dirname' },
+    { file: 'fname.js', code: 'export const f = __filename;\n', token: '__filename' },
+    { file: 'req.js', code: 'const fs = require("node:fs");\nexport const x = fs;\n', token: 'require' },
+  ];
+  for (const c of cases) {
+    const dir = mkdtempSync(join(tmpdir(), 'hks-dom-'));
+    writeFileSync(join(dir, c.file), c.code, 'utf8');
+    const violations = assertDomainIsBrowserSafe(dir);
+    assert.equal(violations.length, 1, `${c.token} 必须被拦下：${JSON.stringify(violations)}`);
+    assert.ok(violations[0].includes(c.token), `违规说明里必须点名 ${c.token}：${violations[0]}`);
+    assert.ok(violations[0].includes('Node 专属全局'), '必须说清是 Node 专属全局');
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('注释里提到 Node 专属全局不算违规（守卫不许冤杀构建）', () => {
+  // ⚠️ 领域层的注释里经常写着「⛔ 不要用 Buffer」这类提醒 ——
+  //    若守卫不剥注释，就会把**正确的注释**判成违规 ⇒ 构建被冤杀。
+  const dir = mkdtempSync(join(tmpdir(), 'hks-dom-'));
+  writeFileSync(
+    join(dir, 'commented.js'),
+    '// ⛔ 不得用 Buffer / process / __dirname / __filename / require\n' +
+      '/* 这里提到 require 只是提醒 */\n' +
+      'export const ok = 1;\n',
+    'utf8',
+  );
+  const violations = assertDomainIsBrowserSafe(dir);
+  assert.deepEqual(violations, [], `注释里的提醒不该被判违规：${violations.join('；')}`);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('Node 专属全局禁用清单缺失或为空 ⇒ 守卫必须报错，不许静默放行', () => {
+  // ⚠️ 与 scripts/forbidden.txt 同一口径：**空清单 ≠ 已保护**。
+  //    清单读不到就读不到，不许「读不到就当没有违规」⇒ 那等于把闸架空。
+  const missing = join(tmpdir(), 'hks-node-globals-not-exist-xyz.txt');
+  assert.throws(() => loadNodeOnlyGlobals(missing), /禁用清单不存在/, '清单缺失必须报错');
+  assert.throws(() => loadNodeOnlyGlobals(missing), /拒绝构建/, '报错要说清是拒绝构建');
+
+  const emptyFile = join(mkdtempSync(join(tmpdir(), 'hks-globals-')), 'empty.txt');
+  writeFileSync(emptyFile, '# 只有注释，没有词条\n\n', 'utf8');
+  assert.throws(() => loadNodeOnlyGlobals(emptyFile), /是空的/, '空清单必须报错');
+  assert.throws(() => loadNodeOnlyGlobals(emptyFile), /空清单 ≠ 已保护/, '报错要说清空清单等于没保护');
+
+  // 正常清单读得到 5 条，且包含两个 __ 前缀的
+  const tokens = loadNodeOnlyGlobals();
+  assert.ok(tokens.length >= 5, `清单至少 5 条，实际 ${tokens.length}`);
+  assert.ok(tokens.includes('Buffer'), '清单必须含 Buffer');
+  assert.ok(tokens.some((t) => t.endsWith('dirname')), '清单必须含 __dirname');
+  assert.ok(tokens.every((t) => !t.startsWith('#') && t.trim() === t), '清单里不能有注释行或多余空白');
 });
 
 test('领域层之外的兄弟目录不得被当成领域层（目录边界按分隔符判，不按前缀判）', () => {
@@ -6490,20 +6549,77 @@ export function collectBrowserModules(domainDir) {
 }
 
 /**
+ * Node 专属全局：浏览器里**不存在**，用了就是 ReferenceError。
+ *
+ * ⚠️⚠️ 为什么必须**单独**查它们：
+ *   这几个符号**不需要 import** 就能用 ⇒ 只查 import 说明符的守卫**一个都抓不到**。
+ *   实测踩坑（P6 Task 8 台账 G-3）：P5 的 `src/domain/icalendar.js` 用了 `Buffer.from(...)`
+ *   —— import 零违规，构建闸放行，产物照发 ⇒ 浏览器里 `Buffer is not defined` ⇒ **演示站白屏**。
+ *   ⇒ 构建闸必须在**发布前**就把它拦下来，而不是等到测试或用户看白屏。
+ *
+ * ⚠️ 清单在**数据文件** `scripts/node-globals.txt` 里，不在代码里 ——
+ *    因为平台自己有一条规则「代码里不得出现 __dirname / __filename」
+ *    （`test/portability.test.js` 扫 src/ scripts/ web/），
+ *    而守卫**必须能点名它要禁的东西** ⇒ 清单写进 .js 就会自指假红。
+ *    （与 `scripts/forbidden.txt` 同一个套路：清单用数据、规则用代码。）
+ */
+const NODE_GLOBALS_FILE = join(here, 'node-globals.txt');
+
+/**
+ * 读禁用清单。**空清单 = 闸未生效**（与 forbidden.txt 同一口径）⇒ 直接报错，不静默放行。
+ * @returns {string[]} 符号名数组
+ */
+export function loadNodeOnlyGlobals(file = NODE_GLOBALS_FILE) {
+  if (!existsSync(file)) {
+    throw new Error(`Node 专属全局禁用清单不存在：${file} —— 守卫无法工作，拒绝构建。`);
+  }
+  const tokens = readFileSync(file, 'utf8')
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith('#'));
+  if (tokens.length === 0) {
+    throw new Error(`Node 专属全局禁用清单是空的：${file} —— 空清单 ≠ 已保护，拒绝构建。`);
+  }
+  return tokens;
+}
+
+/**
+ * 在一段代码里找 Node 专属全局。返回命中的 token 数组（空数组 = 没有）。
+ * ⚠️ **先剥注释**：注释里写「// 不要用 Buffer」不是违规，否则守卫会误报、构建被冤杀。
+ *   （与 `portability.test.js` 里的那条断言是**两套独立实现** ⇒ 互为交叉校验。）
+ */
+export function findNodeOnlyGlobals(code, tokens = loadNodeOnlyGlobals()) {
+  const text = stripComments(code);
+  const hits = [];
+  for (const token of tokens) {
+    // 用**词边界**而不是 `token(`：`require` 要连 `= require(...)` 一起抓，
+    // 而 `Buffer` / `process` 也可能以属性名出现（`obj.Buffer` 不算违规，但本仓不用这种写法）。
+    if (new RegExp(`\\b${token}\\b`).test(text)) hits.push(token);
+  }
+  return hits;
+}
+
+/**
  * 领域层浏览器安全守卫。
- * 返回违规说明数组（空数组 = 通过）。违反的两种情况：
+ * 返回违规说明数组（空数组 = 通过）。违反的四种情况：
  *   ① import 了 Node 内置模块（node:fs / node:path / …）
  *   ② import 了裸模块名（不是 './' 或 '../' 开头）—— 浏览器没有 node_modules
  *   ③ 相对导入指不到文件（拷进 dist 后会 404）
+ *   ④ 用了 Node 专属全局（Buffer / process / __dirname / __filename / require）
  */
 export function assertDomainIsBrowserSafe(domainDir) {
   const violations = [];
   if (!existsSync(domainDir)) return [`领域层目录不存在：${domainDir}`];
 
+  // 清单**只读一次**（每文件读一次会把构建拖慢，也让「清单中途变了」成为可能）
+  const nodeGlobals = loadNodeOnlyGlobals();
   const { domainFiles, extraFiles } = collectBrowserModules(domainDir);
   for (const file of [...domainFiles, ...extraFiles]) {
     const rel = relative(dirname(domainDir), file);
     const code = readFileSync(file, 'utf8');
+    for (const token of findNodeOnlyGlobals(code, nodeGlobals)) {
+      violations.push(`${rel} 用了 Node 专属全局 ${token}（浏览器里不存在 ⇒ 演示站白屏）`);
+    }
     for (const spec of extractImportSpecifiers(code)) {
       if (spec.startsWith('node:')) {
         violations.push(`${rel} 导入了 Node 内置模块 ${spec}（浏览器跑不了）`);
@@ -9791,3 +9907,95 @@ nginx 在**最后**。机器上没装 nginx 时，脚本会先把上面**全部*
    （见 `docs/deployment.md` §13 U-3）—— 本 Task 的两个测试文件**不假装**跑过它。
 8. **G-8（未覆盖）**：**本轮没有把 `platform/` 拷到第二台机器做「另一台机器上跑三条命令」的复现**（无第二台机器），
    也**没有**在 Windows 上做任何实测 —— 跨平台结论**只来自代码的静态事实**。
+## P6 演示版守卫修复轮（父代理，2026-10-21 · Task 8 台账 G-3 的处置）
+
+> **背景**：P6 Task 8 的独立验收在台账 **G-3** 里登记了一个构建闸缺口：
+> `platform/scripts/build-demo.js` 的 `assertDomainIsBrowserSafe()` **只检查 import 说明符**，
+> **查不到 Node 专属全局**（`Buffer` / `process` / `__dirname` / `__filename` / `require`）。
+>
+> **它是怎么变成真缺陷的**（不是推理，是实跑抓到的）：
+> P5 Task 5 新增的 `platform/src/domain/icalendar.js` 用了 `Buffer.from(text, 'utf8')`
+> —— **import 零违规** ⇒ 构建闸放行 ⇒ 产物照发 ⇒ 浏览器里 `Buffer is not defined`
+> ⇒ **演示站白屏**。而 `src/domain/` 整个目录是被**原样拷进产物**的
+> （`<out>/src/domain/*.js`），所以这不是「暂时没被引用就没事」，是「已经把雷放进发布产物」。
+>
+> **处置**：Task 8 已在 `platform/test/portability.test.js` 里补了**测试侧**断言；
+> 本轮由父代理补**构建侧**的闸 —— **发布前就拦下来**，而不是等测试或等用户看白屏。
+
+### A. 改动内容
+
+| 项 | 内容 |
+|---|---|
+| `platform/scripts/node-globals.txt` | **新建**数据文件：Node 专属全局禁用清单（一行一个符号名） |
+| `platform/scripts/build-demo.js` | 新增导出 `loadNodeOnlyGlobals(file)` 与 `findNodeOnlyGlobals(code, tokens)`；`assertDomainIsBrowserSafe()` 增加第 ④ 类违规：「用了 Node 专属全局」 |
+| `platform/test/demo-static.test.js` | 新增 3 个用例：① 五种 Node 专属全局逐个被拦下（`Buffer` / `process` / `__dirname` / `__filename` / `require`）② 注释里提到这些词**不算违规**（守卫不许冤杀构建）③ 清单缺失或为空 ⇒ 守卫必须报错（**空清单 ≠ 已保护**） |
+
+### A-1. ⚠️ 一条**自指假红**的发现（清单为什么必须是数据文件）
+
+第一版把清单**直接写成代码里的数组**，结果 **`test/portability.test.js` 当场把 `build-demo.js` 判成违规**：
+
+```
+not ok 654 - R-OPS-02：路径一律用 node:path 拼 —— 无字符串拼接路径、无 __dirname/__filename
+  platform/scripts/build-demo.js: 用了 __dirname/__filename（ESM 没有这两个全局量）
+```
+
+原因是**自指**：平台自己有一条可移植性规则「代码里不得出现 `__dirname` / `__filename`」
+（该规则扫 `src/` `scripts/` `web/` 三个目录），而**守卫必须能点名它要禁的东西**
+⇒ 清单以完整字面量写在 `.js` 里，就会被那条规则判成违规。
+
+⇒ **处置**：清单移到数据文件 `scripts/node-globals.txt`。
+守卫读得到清单，`.js` 源码里也不留下完整字面量 ⇒ **没有任何一条规则被放宽**。
+（与 `scripts/forbidden.txt` 是同一个套路：**清单用数据、规则用代码**；
+可移植性规则的扫描面是 `.js`，`.txt` 不在其中。）
+
+⚠️ 这条也说明：**新增「禁止某 token」的守卫时，禁用清单本身不能以字面量形式进源码** ——
+否则它会把自己判成违规。这条经验写进了 `node-globals.txt` 的头部注释。
+
+### A-2. 关键设计决定
+
+1. **先剥注释再扫** —— 复用已有的 `stripComments(code)`（原函数就是为「注释里的 import 不该被抽出来」写的）。
+   领域层的注释里常写着「⛔ 不得用 Buffer」这类提醒 ⇒ 不剥注释就会把**正确的注释**判成违规、构建被冤杀。
+   ⇒ 这条已由用例 ② 钉住。
+2. **两套独立实现互为交叉校验** —— `build-demo.js` 的 `findNodeOnlyGlobals()` 与
+   `portability.test.js` 里的那条断言是**两份独立代码**（不是共享一个函数）。
+   好处：任一边写错，另一边会暴露不一致；代价是要维护两处（本仓接受这个代价，因为它们守的是**两条不同的关卡**：
+   构建闸守「发布」，测试守「CI」）。
+3. **清单读一次** —— `assertDomainIsBrowserSafe()` 里 `loadNodeOnlyGlobals()` 只调一次
+   （每文件读一次既拖慢构建，也让「清单中途变了」成为可能）。
+4. **空清单 = 闸未生效 ⇒ 拒绝构建** —— 与 `forbidden.txt` 同一口径（`loadNodeOnlyGlobals()` 直接抛错）。
+5. **不把 `assertDomainIsBrowserSafe` 改名、不改签名** —— 它是 P6 Task 6 建立的文件，
+   按「最早建立者 owns，后续阶段 Modify（追加）不得重建」的纪律，本轮只**追加**能力。
+
+### C. 实跑证据
+
+| 检查 | 结果 |
+|---|---|
+| `node --disable-warning=ExperimentalWarning --test test/demo-static.test.js` | **23/23**（基线 20 → +3） |
+| 全量 `node --disable-warning=ExperimentalWarning --test` | **1234 例 / 1233 通过 / 0 失败 / 1 跳过** |
+| 构建闸真会中止：在副本领域层塞一个用 `Buffer` 的文件后跑 `node scripts/build-demo.js` | **中止并退出码 1**，报 `domain/__probe_buf.js 用了 Node 专属全局 Buffer（浏览器里不存在 ⇒ 演示站白屏）` |
+| 判别性：把 P5 的**修复前** iCal（`Buffer.from`）叠到 main 副本上跑 `portability.test.js` | **红**，精确报到 `src/domain/icalendar.js:39 用了 Buffer` |
+| 判别性：把 P5 的**修复后** iCal（`TextEncoder`/`TextDecoder`）叠上去 | **绿**，15/15 |
+| 自指检查：本轮改动**没有**放宽任何既有规则 | ✅ 可移植性规则、`forbidden.txt` 扫描闸、零依赖守卫全部照旧通过 |
+
+### D. 与 P5 的关系
+
+P5 Task 5 的 iCal 已由该分支的 worker 改成 `TextEncoder`/`TextDecoder`
+（WHATWG Web 标准，Node ≥ 11 起也是全局 ⇒ 两端通用，且**不需要 import 任何 Node 内置模块**）。
+⇒ 本轮守卫与 P5 的修复是**同一处缺陷的两端**：P5 修「那一处代码」，本轮修「**下次再犯时**会被构建闸拦住」。
+
+### E. 计划块逐字核验
+
+| 核验项 | 结果 |
+|---|---|
+| `docs/tools/plan-block-sync.mjs --verify`（`scripts/build-demo.js`） | ✅ 逐字一致（338 行） |
+| `docs/tools/plan-block-sync.mjs --verify`（`test/demo-static.test.js`） | ✅ 逐字一致（623 行） |
+
+### F. 遗留
+
+1. **未覆盖**：本轮仍**没有**在真实浏览器里点开过演示站（无浏览器自动化环境）⇒
+   「浏览器里必然白屏」这一条仍是**由代码事实推断**（`Buffer` 是 Node 专属全局），不是浏览器实测。
+2. **未覆盖**：真机（Linux + systemd + nginx + root）的 `install.sh` 完整执行仍未实跑（`docs/deployment.md` §13 U-3）。
+3. **Task 8 台账 G-1**（演示适配器与正式服务的响应形状不同源）本轮**未处置** ——
+   它是**演示页显示层**的问题（页面显示「总分 undefined 分」），不影响数据正确性，
+   留给 P6 演示版的下一轮，不要在本轮顺手改（改动面会波及 `web/api.demo.js` 与 `web/views/**`）。
+
