@@ -1033,17 +1033,89 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 
-export function openDatabase({ dataDir = './data', filename = 'app.db' } = {}) {
+/**
+ * SQLite 的「忙类」错误码（可重试）。
+ * 依据：sqlite.org/rescode.html
+ *   5   SQLITE_BUSY           别的连接在用这个库
+ *   6   SQLITE_LOCKED         同一连接内的表被锁
+ *   261 SQLITE_BUSY_RECOVERY  别的连接正在做热日志回滚
+ *   517 SQLITE_BUSY_SNAPSHOT  WAL 快照冲突
+ */
+const BUSY_CODES = new Set([5, 6, 261, 517]);
+
+/** 切 WAL 的退避步长（毫秒）。 */
+const WAL_RETRY_STEP_MS = 25;
+
+/** 切 WAL 的默认重试预算（毫秒）——与 busy_timeout 同口径（5 秒）。 */
+const WAL_RETRY_BUDGET_MS = 5000;
+
+/**
+ * 同步退避。node:sqlite 是同步 API，这里不能用 setTimeout
+ * （那会把事件循环占住不放，setTimeout 回调排在当前同步代码之后 ⇒ 永远等不到）。
+ * Atomics.wait 在 SharedArrayBuffer 上阻塞当前线程，Node 各平台均可用。
+ */
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * 把数据库切到 WAL 模式（读不阻塞写、写不阻塞读，见 sqlite.org/wal.html）。
+ *
+ * ⚠️ 为什么不能直接 `db.exec('PRAGMA journal_mode = WAL')`：
+ *   1. 切 journal_mode 需要**独占锁**；此时库里有别的连接在写就拿不到。
+ *   2. **SQLite 的 busy handler 不覆盖这一步** —— 实测（探针
+ *      `probe-wal-lock-2.mjs` 实验 B）：持锁时执行该 PRAGMA 在 **0ms** 内就抛
+ *      SQLITE_BUSY(errcode=5)；把 busy_timeout 设成 5000 也一样**立刻**失败，不等。
+ *      ⇒ 「先设 busy_timeout 再切 WAL」**不够**，必须自己实现退避重试。
+ *   3. 危险窗口只有**数据库文件首次创建**的那一瞬间：WAL 模式持久化在文件头里，
+ *      此后再次执行该 PRAGMA 是 no-op（不取锁，实测 0ms 成功）。
+ *      所以「两条连接同时开同一个新库」必有一方撞上第 1 条 → "database is locked"。
+ *      这正是 P5 并发建库实测到的失败。
+ *
+ * ⚠️ WAL 要求所有进程在同一台主机；数据库文件不能放 NFS（sqlite.org/faq.html）。
+ *
+ * @param {DatabaseSync} db
+ * @param {{ budgetMs?: number }} [options] 重试预算（毫秒），默认 5000
+ */
+function ensureWalMode(db, { budgetMs = WAL_RETRY_BUDGET_MS } = {}) {
+  const deadline = Date.now() + budgetMs;
+  for (;;) {
+    try {
+      // 已经是 WAL → 下面的 exec 是 no-op（不取锁），绝大多数连接走这条路径。
+      if (db.prepare('PRAGMA journal_mode').get().journal_mode === 'wal') return;
+      db.exec('PRAGMA journal_mode = WAL');
+      const mode = db.prepare('PRAGMA journal_mode').get().journal_mode;
+      if (mode !== 'wal') {
+        // SQLite 在文件系统不支持共享内存时会**静默**留在旧模式（sqlite.org/wal.html）。
+        // 静默降级会让并发写退化成整库锁 —— 显式报错，不假装成功。
+        throw new Error(
+          `无法启用 WAL 模式（当前 ${mode}）：数据库文件所在文件系统可能不支持共享内存`
+          + '（WAL 要求同主机本地文件系统，见 sqlite.org/wal.html）',
+        );
+      }
+      return;
+    } catch (err) {
+      if (!BUSY_CODES.has(err.errcode) || Date.now() >= deadline) throw err;
+      sleepSync(WAL_RETRY_STEP_MS);
+    }
+  }
+}
+
+export function openDatabase({
+  dataDir = './data',
+  filename = 'app.db',
+  walRetryBudgetMs = WAL_RETRY_BUDGET_MS,
+} = {}) {
   mkdirSync(dataDir, { recursive: true });
   const db = new DatabaseSync(join(dataDir, filename));
 
-  // WAL：读不阻塞写、写不阻塞读（sqlite.org/wal.html）
-  // ⚠️ WAL 要求所有进程在同一台主机；数据库文件不能放 NFS（sqlite.org/faq.html）
-  db.exec('PRAGMA journal_mode = WAL');
+  // ⚠️ 顺序有讲究：busy_timeout 必须**最先**设 —— 它是后续所有取锁操作的等待上限。
+  //    遇到锁等待 5 秒再报错，避免瞬时并发直接失败
+  db.exec('PRAGMA busy_timeout = 5000');
   // 外键约束默认关闭，必须显式打开
   db.exec('PRAGMA foreign_keys = ON');
-  // 遇到锁等待 5 秒再报错，避免瞬时并发直接失败
-  db.exec('PRAGMA busy_timeout = 5000');
+  // WAL：读不阻塞写、写不阻塞读（sqlite.org/wal.html）
+  ensureWalMode(db, { budgetMs: walRetryBudgetMs });
 
   return {
     db,
@@ -1305,6 +1377,159 @@ Expected: 输出 `迁移完成，当前版本 1`
 cd platform && git add src/db db/migrations scripts/migrate.js test/migrate.test.js
 git commit -m "feat(P0): SQLite 封装、迁移机制与初始表结构"
 ```
+
+- [ ] **Step 10: 补连接层并发回归（父代理修正轮 2026-10-21）**
+
+> **为什么补这一条**：P5 的 worker 在「真并发建库」实测时撞到 `database is locked`，
+> 父代理定位到根因在 `src/db/sqlite.js`：**切 journal_mode 需要独占锁，而 SQLite 的
+> busy handler 不覆盖这一步** —— 实测持锁时该 PRAGMA 在 **0ms** 内就抛 SQLITE_BUSY(errcode=5)，
+> busy_timeout 设成 5000 也**不等**（探针 `/tmp/p4-proof/probe-wal-lock-2.mjs` 实验 A/B/C/D）。
+> ⇒ 两条连接同时首开同一个**新库**必有一方失败。修法见上面 Step 3 的新实现：
+> 「已是 wal 直接返回（no-op）→ 否则带**退避重试**地切」。
+>
+> 本 Step 的用例**对旧实现是红的**：把 `src/db/sqlite.js` 回退到旧版实跑，
+> 下面第 ②④ 条变红、①③ 仍绿 ⇒ 有牙（① 是不回归、③ 守新实现的 fail-fast）。
+
+`platform/test/db-concurrency.test.js`：
+
+```javascript
+// platform/test/db-concurrency.test.js —— 连接层并发开库回归
+//
+// 缺陷背景（P5 的 worker 在「真并发建库」时撞到，父代理实证定位）：
+//   原实现把 `PRAGMA journal_mode = WAL` 排在 `PRAGMA busy_timeout = 5000` **之前**，
+//   而且 —— 关键 —— **切 journal_mode 需要独占锁，SQLite 的 busy handler 不覆盖这一步**。
+//   ⇒ 两条连接同时开同一个**新库**时，后者立刻 "database is locked"（errcode=5）。
+//
+// 探针证据（/tmp/p4-proof/probe-wal-lock-2.mjs）：
+//   实验 A：库里**已是** WAL + 另一连接持写锁 → 设 WAL **成功（0ms）**（no-op，不取锁）
+//   实验 B：库里**仍是** delete + 另一连接持写锁 → 设 WAL **0ms 即失败**（errcode=5）
+//            且 busy_timeout 设成 5000 也**不等** ⇒ busy_timeout 对这一步无效
+//   实验 C/D：顺序开 / 已是 WAL 时再开 → 成功（0ms）
+//
+// 修法：切 WAL 改成「读当前模式 → 已是 wal 直接返回（no-op）→ 否则带**退避重试**地切」。
+//       busy_timeout 提到最前，让其余取锁操作有界等待。
+//
+// 四条用例：
+//   ① 常规路径不回归（顺序开两个连接，三个 pragma 都对）
+//   ② **持锁时开新连接必须等到锁释放**（确定性回归；旧实现直接抛 "database is locked"）
+//   ③ **重试预算耗尽必须抛错**（不无限等待 —— 启动不能被一把锁吊死；这条守的是新实现）
+//   ④ **并发首开**（4 个连接同时开同一个新库）全部成功
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { Worker } from 'node:worker_threads';
+import { once } from 'node:events';
+import { openDatabase } from '../src/db/sqlite.js';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const WORKER = join(here, '..', 'test-helpers', 'db-worker.js');
+
+function tempDir() {
+  return mkdtempSync(join(tmpdir(), 'hks-dbcon-'));
+}
+
+test('常规路径不回归：顺序开两个连接都成功，三个 pragma 都对', () => {
+  const dataDir = tempDir();
+  const a = openDatabase({ dataDir });
+  assert.equal(a.db.prepare('PRAGMA journal_mode').get().journal_mode, 'wal');
+  assert.equal(a.db.prepare('PRAGMA foreign_keys').get().foreign_keys, 1);
+  assert.equal(a.db.prepare('PRAGMA busy_timeout').get().timeout, 5000);
+
+  // 第二次开同一个库：此时库已是 WAL ⇒ 切模式是 no-op（不取锁）⇒ 必须立刻成功
+  const b = openDatabase({ dataDir });
+  assert.equal(b.db.prepare('PRAGMA journal_mode').get().journal_mode, 'wal');
+
+  a.close();
+  b.close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('持锁时开新连接：必须等到锁释放（不能 0ms 失败）', async () => {
+  const dataDir = tempDir();
+  const worker = new Worker(WORKER, {
+    workerData: { role: 'lock-holder', dataDir, holdMs: 400 },
+  });
+  const [msg] = await once(worker, 'message');
+  assert.equal(msg.locked, true, 'worker 必须先拿到写锁');
+
+  const t0 = Date.now();
+  const conn = openDatabase({ dataDir });       // 旧实现在这里直接抛 "database is locked"
+  const waited = Date.now() - t0;
+
+  // 「等到了」和「恰好也成功了」是两回事 —— 只断言成功会放过「没等就抢到锁」的假象
+  assert.ok(
+    waited >= 300,
+    `必须真的等到了锁释放（实际只等了 ${waited}ms —— 说明没等就过去了）`,
+  );
+  assert.equal(conn.db.prepare('PRAGMA journal_mode').get().journal_mode, 'wal');
+
+  conn.close();
+  await worker.terminate();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('锁一直不放：重试预算耗尽后必须抛错（启动不能被一把锁吊死）', async () => {
+  const dataDir = tempDir();
+  const worker = new Worker(WORKER, {
+    workerData: { role: 'lock-holder', dataDir, holdMs: 10000 },
+  });
+  await once(worker, 'message');
+
+  const t0 = Date.now();
+  assert.throws(
+    () => openDatabase({ dataDir, walRetryBudgetMs: 300 }),
+    /database is locked/,
+    '预算耗尽必须抛错，不能一直等下去',
+  );
+  const elapsed = Date.now() - t0;
+  assert.ok(elapsed < 2500, `必须在预算附近就放弃（实际 ${elapsed}ms）`);
+
+  await worker.terminate();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('并发首开：4 个连接同时开同一个新库，全部成功', async () => {
+  const dataDir = tempDir();
+  const N = 4;
+  const workers = [];
+  const results = [];
+
+  for (let i = 0; i < N; i += 1) {
+    const w = new Worker(WORKER, { workerData: { role: 'opener', dataDir } });
+    workers.push(w);
+    w.on('message', (m) => { if (m.ok !== undefined) results.push(m); });
+  }
+
+  // 等所有 worker 就绪后同时放行 —— 制造「同时首开同一个新库」的竞争
+  await new Promise((r) => setTimeout(r, 300));
+  workers.forEach((w) => w.postMessage({ go: true }));
+
+  const deadline = Date.now() + 15000;
+  while (results.length < N && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  await Promise.all(workers.map((w) => w.terminate()));
+
+  assert.equal(
+    results.length,
+    N,
+    `全部 ${N} 个连接都该成功（实际只回来 ${results.length} 个：${JSON.stringify(results)}）`,
+  );
+  assert.deepEqual(
+    results.filter((r) => !r.ok),
+    [],
+    '不允许有连接失败（旧实现会在这里报 "database is locked"）',
+  );
+
+  rmSync(dataDir, { recursive: true, force: true });
+});
+```
+
+Run: `cd platform && node --test test/db-concurrency.test.js`
+Expected: PASS（4 个测试全过）
 
 ---
 
@@ -7723,6 +7948,7 @@ git commit -m "feat(P0): 静态服务、前端骨架、种子数据与服务器�
 | P0-12 | 终审 8 条 Minor 逐条处置 | **`server.test.js` 40 + `sql-boundary.test.js` 4 + `zero-deps.test.js` 9 + `migrate.test.js` 10** 个用例通过；**M-1 dev/ino 接线断言收紧**：必须逐字匹配 `if (!isSameFile(stat, linkStat))`（对账对象写错或被 `&&` 短路都红）；**M-2 304 分支不泄漏 fd**：`/dev/fd` 计数探针（连打 50 次 304，fd 数不得增长；Windows 跳过该用例）；**M-3 SQL 边界扫描器有自检**：10 种形态（`exec`/`prepare` × `SELECT`/`INSERT`/`UPDATE`/`DELETE`/`DROP`/`ALTER`/`CREATE TABLE`）的阳性对照 + 3 种反例对照；**M-4 三种现实绕过（SQL 存进变量 / `db['prepare']()` / 连接变量不叫 `db`）已在文件头显式登记**（有意接受的取舍）；**M-5 零依赖守卫扫到 `test/`**：`SCAN_DIRS` 含 `test`，且断言「扫描结果里出现过 `test/` 下的文件」；**M-6 五条次要护栏有断言**：静态 `Content-Type`（MIME 表）/ `Cache-Control` / `PRAGMA busy_timeout = 5000` / 404 错误码字面量 `NOT_FOUND` / 413 的 `Connection: close`；**M-7 软链判定被钉死**：指向 web/ 根外的软链（文件与目录）→ 404，指向根内的 → 200；`static.js` 注释已订正为 fail-closed 的真实行为（共享卷部署须改用挂载或复制）；**M-8 溯源与错误风格已写明**：`router.js` 补设计文档 §8 + INTERFACES 契约溯源；`scopeClause`（程序员错误，普通 `Error`）与 `grantAssignment`（客户端输入错误，`AppError`）风格有意不同的理由写入注释；`AppError.detail` 的转发**按 P4 计划排期**（P0 无任何错误携带 detail → 无可观测差异） |
 
 | P0-13 | 终审复核的 F-1 ~ F-6 | **`server.test.js` 40 + `body.test.js` 4 + `zero-deps.test.js` 9 + `sql-boundary.test.js` 4** 个用例通过；**F-1（Important）AppError 的 message 必须原样透传**：4xx 响应的 `error.message` 断言等于具体文案（「手机号或密码不正确」）且**不等于**通用回落「请求无效」（`web/api.js` 把它当界面文案直接显示，退化后所有错误提示变成同一句废话）；**F-2 请求体上限边界取「正好等于上限」**：512KB（524288 字节）必须放行、512KB+1 必须 413（`size > limit` 改成 `>=` 会被抓住）；**F-3 接线断言先剥注释再匹配**：`isSameFile` 接线断言改用共享工具 `test-helpers/strip-comments.js` 剥掉注释与正则字面量后再匹配，「代码写错 + 注释里写对形态」骗不过去；**共享 helper 消除 `zero-deps.test.js` 与 `sql-boundary.test.js` 的逐字重复**（且放在 `test-helpers/` 而非 `test/` 下 —— Node 会把名为 `test` 的目录下所有 JS 当测试文件）；**F-4 两条软链用例补 Windows skip**（与同文件其他 skip 口径一致）；**F-5 正则字面量不再误报**：`stripComments(code, { blankRegex: true })` 把正则字面量也剥成空白（正则里的 `from 'x'` 不是 import）；**F-6 `INTERFACES.md` 的 `serveStatic` 归属订正**：它住在 `src/http/static.js` 而非 `src/server.js` |
+| P0-14 | 连接层并发开库回归（父代理修正轮） | `db-concurrency.test.js` **4** 个用例通过：**①** 常规路径不回归（顺序开两个连接，`journal_mode=wal` / `foreign_keys=1` / `busy_timeout=5000`）；**②** 另一线程持写锁时开新连接**必须等到锁释放**（断言等待 ≥300ms，旧实现 0ms 即抛 `database is locked`）；**③** 锁一直不放时**重试预算耗尽必须抛错**（`walRetryBudgetMs` 可配，默认 5000ms —— 启动不能被一把锁吊死）；**④** 4 个连接**同时首开同一个新库全部成功**（旧实现必有一方失败）。|
 
 ---
 
