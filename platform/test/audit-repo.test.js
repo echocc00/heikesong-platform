@@ -120,6 +120,27 @@ test('findLatestTransition 返回最后一次迁移的 to_state', () => {
   rmSync(dataDir, { recursive: true, force: true });
 });
 
+test('同毫秒并列的迁移日志必须按【插入次序】取最后一条（不能靠随机 UUID 破并列）', () => {
+  const { db, close, dataDir } = setup();
+  const at = '2026-10-20T00:00:00.000Z';
+  // ⚠️ 故意让 id 的字典序与插入次序**相反**：
+  //    `ORDER BY id DESC` 会取到 'z1'（最先插入的那条），
+  //    `ORDER BY rowid DESC` 才取到 'x1'（最后插入的那条）⇒ 判别性数据集，两种实现结果**不同**。
+  //    （`audit_log.id` 是 randomUUID() ⇒ 同毫秒并列时次序随机 ⇒ 状态机随机报 409。
+  //      Task 5 实跑：200 次里 135 次读到过期态。）
+  for (const id of ['z1', 'y1', 'x1']) {
+    db.prepare(
+      'INSERT INTO audit_log (id, actor_id, action, entity, entity_id, detail_json, created_at) VALUES (?,?,?,?,?,?,?)',
+    ).run(id, 'u_admin', 'review_state.transition', 'stage_result', 'st1', JSON.stringify({ to: id }), at);
+  }
+  const latest = findLatestTransition(db, 'stage_result', 'st1');
+  assert.equal(latest.to, 'x1', '同毫秒并列时必须取最后插入的那条（rowid 序），不能靠 id 的字典序');
+  const { rows } = queryAuditLog(db, { entity: 'stage_result', entityId: 'st1' });
+  assert.equal(rows[0].id, 'x1', '列表也必须按插入次序倒序');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
 test('幂等键：同一 (key, scope) 只能插入一次，第二次返回 false', () => {
   const { db, close, dataDir } = setup();
   const first = insertIdempotency(db, {

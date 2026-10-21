@@ -98,3 +98,16 @@ export function revokeSignoff(db, { id, revokedAt }) {
   const r = db.prepare('UPDATE milestone_signoffs SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL').run(revokedAt, id);
   return Number(r.changes || 0);
 }
+
+// src/db/repo/tiers.js —— 【追加】到 P3 已建的文件里
+// 依据：设计文档 §6.5（段位表）+【冲突】C-02（C 段及以上公示名次，D 段只公示个人进度）
+//   表由 P3 的 004_leaderboard.sql 建好；P4 只读（申诉范围判定需要知道档位）。
+// ⚠️ 命名带 Row 后缀，是为了避开 P3 服务层已导出的 `getTeamTier({ db, teamId, viewer, rules })`，
+//    两者职责不同：这里是纯仓储读取（无可见性过滤），那里是带权限与规则的服务层函数。
+export function getTeamTierRow(db, teamId) {
+  const row = db.prepare(
+    'SELECT tier FROM tier_records WHERE team_id = ? AND deleted_at IS NULL ORDER BY computed_at DESC LIMIT 1',
+  ).get(teamId);
+  return row?.tier ?? null;
+}
+
