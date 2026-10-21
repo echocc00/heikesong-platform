@@ -5272,7 +5272,7 @@ git commit -m "feat(P3): 榜单页、段位榜与战绩卡前端"
 | 10 | 新增 3 个仓储文件 | 未列仓储文件名 | `src/db/repo/leaderboard.js` / `points.js` / `tiers.js` | 所有 SQL 必须收在 `src/db/repo/`；文件名带 P3 语义，避免与 P1/P2 的仓储重名冲突 |
 | 11 | **新增规则文件的 `version` 参与一致性校验的方式** | 契约只写「规则配置的 version 必须全等」 | **不需要在本阶段改 `src/config.js` 的 version 校验** —— 基线已按「有 `id` 的是一份配置」**自动派生**（`validateRules(rules, expectedCount)` + `loadRules` 传 `Object.keys(FILES).length`），加多少份配置都自动覆盖 | ⚠️ 原计划隐含「要把 points / criteria 加进 `versionValues` 数组」—— 那个数组**已不存在**（P0 当时是硬编码 9 项，P1 已改成自动派生）。若照原意去改，会动到一份**不该动**的校验代码。**硬前提**：新配置文件必须带 `"id"`（`points.json` → `"id": "points"`、`criteria.json` → `"id": "criteria"`），且识别到的配置份数必须等于 `FILES` 的键数，否则**拒绝启动**。依据：基线 `platform/src/config.js` + 漂移审计报告 I-2 / D-3 |
 
-| 12 | **新增 3 个写入口（终审修复轮）** | 契约的 P3 API 只列 4 个 `GET`（榜单 / 滚动总榜 / 战绩卡 / 段位） | 追加 `POST /api/teams/:id/behavior-events`、`POST /api/teams/:id/milestones/:milestoneId/signoff`、`DELETE /api/teams/:id/milestones/:milestoneId/signoff`；并在 `createTeam` 里落 `milestones` 表行 | ⚠️ 契约**只列了读接口**，但 `behavior_events` / `milestone_signoffs` 两张表是 P3 自己建的、`signoff:create` 能力点 P0 就已注册 —— **表建了、能力点授了，却没有端点消费** ⇒ 段位恒为兜底 D 档、破同分链第 5 级永不生效。偏差表 3c 早已承诺「P3 自己的写入口」在 Task 7 接线，本阶段兑现。**INTERFACES.md 本身未修改** |
+| 12 | **新增 3 个写入口（终审修复轮）** | 契约的 P3 API 只列 4 个 `GET`（榜单 / 滚动总榜 / 战绩卡 / 段位） | 追加 `POST /api/teams/:id/behavior-events`、`POST /api/milestones/:id/signoff`、`POST /api/milestones/:id/signoff/withdraw`；并在 `createTeam` 里落 `milestones` 表行 | ⚠️ 契约**只列了读接口**，但 `behavior_events` / `milestone_signoffs` 两张表是 P3 自己建的、`signoff:create` 能力点 P0 就已注册 —— **表建了、能力点授了，却没有端点消费** ⇒ 段位恒为兜底 D 档、破同分链第 5 级永不生效。偏差表 3c 早已承诺「P3 自己的写入口」在 Task 7 接线，本阶段兑现。**INTERFACES.md 本身未修改** |
 | 13 | **`publishLeaderboard` 的 MVP 发放时机与幂等键** | 契约只写 `publishLeaderboard({ db, editionId, stageId, actorId, now })` // 写 leaderboard_snapshots，**未规定积分流水的发放口径** | **只在路演赛段发榜时发放 MVP**；幂等键 = **(届期, 队伍)**；本届无路演赛段或路演未评分 ⇒ 不发 | MVP 是**届期级**奖项而发榜是**赛段级**动作，层级错配。终审实证：原实现每发一个赛段就再写一条同额流水（个人积分被重复累加），且在路演之前发榜时金额偏小而积分只增不改、补不回来。**可改**：`awardMvp` 一处 |
 | 14 | **仓储行 → 域函数契约的映射放在服务层** | 契约未规定仓储返回值的形状 | `src/db/repo/points.js` 返回**原始行**（snake_case），服务层用 `toLedgerEntry` 映射成 camelCase 再喂 `computePersonalPoints` | 仓储层统一返回原始行（与 leaderboard / teams / tiers 仓储同风格），**只有仓储层知道列名** ⇒ 翻译只在一处发生一次。⚠️ 终审实证：原先两边对不上时，域函数的 `if (!entry.userId) continue;` 会把**每一条流水**静默丢弃 ⇒ 个人积分榜恒为空且不报错 |
 | 15 | **行为分「没提交 = 0 分」** | 契约只写 `behaviorScore({ events, behaviorConfig })`，未规定「无事件」时的取值 | 服务层给**每支队**都填行为分（无事件 = 0），域函数的「显式缺值 → 该键不可用」语义**保持不变** | ⚠️ 「没提交」是 0 分（这一维度的值**就是 0**），不是「没有可比较的值」。原先留 null ⇒ 破同分链判「本组缺少可比较的值」⇒ **整组都不用行为分** ⇒ 提交过的队与没提交的队永远并列。⛔ 与 R-RNK-07 的口径区别：互评分「空交付队无记录」= 该维度**没被应用**（不可用）；行为分「没提交」= 值**就是 0**（可用） |
@@ -5669,7 +5669,7 @@ P3 计划偏差表 3c 明写「服务层接线在 Task 7（P3 自己的写入口
 | 通路 | 服务层 | HTTP 层 | 能力点 | 为什么必须有 |
 |---|---|---|---|---|
 | **行为分事件** | `services/behavior.js` → `submitBehaviorEvent` | `POST /api/teams/:id/behavior-events` | `behavior:write`（captain / member） | 不补则破同分链第 5 级永不生效（P3-38） |
-| **企业里程碑签字** | `services/milestone.js` → `createSignoff` / `withdrawSignoff` | `POST /api/teams/:id/milestones/:milestoneId/signoff` / `DELETE /api/teams/:id/milestones/:milestoneId/signoff` | `signoff:create`（enterprise / enterprise_admin，**能力点 P0 就已注册**，只是没有端点消费） | 不补则段位恒为兜底 D 档、B 榜与战绩卡里程碑清单恒空（P3-39） |
+| **企业里程碑签字** | `services/milestone.js` → `createSignoff` / `withdrawSignoff` | `POST /api/milestones/:id/signoff`（body：`{ department, content }`）/ `POST /api/milestones/:id/signoff/withdraw`（body：`{ signoffId }`） | `signoff:create`（enterprise / enterprise_admin，**能力点 P0 就已注册**，只是没有端点消费） | 不补则段位恒为兜底 D 档、B 榜与战绩卡里程碑清单恒空（P3-39） |
 | **建队时落里程碑清单** | `services/team.js` → `createTeam` 追加 `insertMilestones` | （随建队） | — | P1 已把清单写进 `teams.milestones_json`，但 P3 的段位引擎与 B 榜读的是 `milestones` **表** —— 缺了它，段位输入表恒空 |
 
 **分值与证据的口径**（防篡改，反作弊 R-PTS-10）：
@@ -6418,4 +6418,4 @@ P3 验收标准自查 **8/8 通过**。
 | 1 | **MVP 只在路演赛段发榜时产生** | 本届**没有路演赛段**、或路演赛段**尚无评分结果** ⇒ 不发 MVP（公式缺最后一个输入，不做半个公式的奖）。**运营要求**：组委会必须对路演赛段发榜，MVP 才会产生。⚠️ 积分只增不改 ⇒ MVP 一旦发出不再调整（这是「只增不改」纪律的必然结果，不是缺陷） |
 | 2 | **里程碑清单的固定时点 = 组队时** | `milestones` 表的行在**建队**时落一次（对齐 R-STG-03「里程碑报名时固定」）。**组队之后**新增的里程碑不会自动补进已有队伍 —— 补录归 **P5 的工作流** |
 | 3 | **赛段名册仍是届期级** | `stage_team` 表在 P3 建好了（Task 1 兑现 D-33），但**没有写入流程** —— 名册的登记时机（赛段开启时把该届参赛队登记进来）属 **P5 的工作流**（终审修复轮未改这一条） |
-| 4 | **企业签字的「撤回」只由组委会执行** | `DELETE /api/teams/:id/milestones/:milestoneId/signoff` 要求 `signoff:create` 能力点（企业 / 企业管理员）+ 组委会角色。**企业自己不能撤回** —— 撤回是「组委会认定签字作废」的动作（沿用 P2「回避撤销只能由组委会执行」的口径） |
+| 4 | **企业签字的「撤回」有归属限制** | `POST /api/milestones/:id/signoff/withdraw` 要求 `signoff:create` 能力点（企业 / 企业管理员），且**只能撤回自己签的那条**（`signoffId` 必填且必须属于该里程碑）；**组委会（超管）可代撤**。撤回是**软删除**（置 `revoked_at`），撤回后该里程碑回到「未达成」，段位降档由**重算**体现 |
