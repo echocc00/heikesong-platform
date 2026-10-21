@@ -4682,16 +4682,45 @@ git commit -m "feat(P4): 审计 API（7 个接口）、trace 抽屉与复核队�
 ```javascript
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, mkdirSync, readFileSync, copyFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
 import { parseManifest, scanText, scanRoots } from '../scripts/audit-scan.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
+const PLATFORM_DIR = join(here, '..');
+const SCRIPT = join(PLATFORM_DIR, 'scripts', 'audit-scan.js');
+const MANIFEST = join(PLATFORM_DIR, 'scripts', 'forbidden.txt');
 
 function tempDir() {
   return mkdtempSync(join(tmpdir(), 'hks-scan-'));
+}
+
+/**
+ * 造一个「能跑 CLI」的临时工程：<root>/platform/scripts/audit-scan.js（脚本副本）+
+ * <root>/platform/scripts/forbidden.txt（清单）+ <root>/docs/（被扫的文件）。
+ * CLI 里的 REPO_ROOT = <root>，所以相对路径可预期（docs/bad.md）。
+ */
+function cliSandbox({ manifest = '', files = {}, manifestMissing = false } = {}) {
+  const root = mkdtempSync(join(tmpdir(), 'hks-scan-cli-'));
+  const scriptsDir = join(root, 'platform', 'scripts');
+  const docsDir = join(root, 'docs');
+  mkdirSync(scriptsDir, { recursive: true });
+  mkdirSync(docsDir, { recursive: true });
+  copyFileSync(SCRIPT, join(scriptsDir, 'audit-scan.js'));
+  if (!manifestMissing) writeFileSync(join(scriptsDir, 'forbidden.txt'), manifest);
+  for (const [name, content] of Object.entries(files)) {
+    writeFileSync(join(docsDir, name), content);
+  }
+  return { root, scriptsDir, docsDir };
+}
+
+function runCli(sandbox, args = []) {
+  return spawnSync(process.execPath, [join(sandbox.scriptsDir, 'audit-scan.js'), ...args], {
+    encoding: 'utf8',
+  });
 }
 
 test('清单为空时扫描闸报错（空清单 ≠ 已保护）', () => {
@@ -4745,7 +4774,7 @@ test('scanText 能逐行定位违规', () => {
 });
 
 test('仓库自带的 forbidden.txt 非空、每条词条合法、且能被解析', () => {
-  const text = readFileSync(join(here, '..', 'scripts', 'forbidden.txt'), 'utf8');
+  const text = readFileSync(MANIFEST, 'utf8');
   const parsed = parseManifest(text);
   assert.ok(parsed.terms.length > 0, '禁用清单不得为空');
   assert.equal(parsed.errors.length, 0, parsed.errors.join('；'));
@@ -4755,13 +4784,156 @@ test('仓库自带的 forbidden.txt 非空、每条词条合法、且能被解�
 });
 
 test('仓库自带的 forbidden.txt 里没有重复词条', () => {
-  const text = readFileSync(join(here, '..', 'scripts', 'forbidden.txt'), 'utf8');
+  const text = readFileSync(MANIFEST, 'utf8');
   const parsed = parseManifest(text);
   const seen = new Set();
   for (const t of parsed.terms) {
     assert.equal(seen.has(t.term), false, `重复词条：${t.term}`);
     seen.add(t.term);
   }
+});
+
+// ── 父代理预审修正用例（2026-10-21）────────────────────────────────────
+// 规格自带的 7 条用例盖不住「闸根本没生效」这一类失败：词条写成正则占位
+// （`四维各 ?25%`）时，字面匹配下永远命中不了，闸看着在跑、实际一条不拦。
+// 下面这批用例把「闸真的生效」钉死。
+
+test('仓库自带清单能拦住「真实写错」的表述（字面串，不是 ? 占位写法）', () => {
+  const parsed = parseManifest(readFileSync(MANIFEST, 'utf8'));
+  const cases = [
+    { wrong: 'CICC 四维各 25%', term: '四维各 25%' },
+    { wrong: '初赛企业确认权重 20%', term: '初赛企业确认权重 20%' },
+  ];
+  for (const c of cases) {
+    const dir = tempDir();
+    writeFileSync(join(dir, 'wrong.md'), `行业参考：${c.wrong}\n`);
+    const report = scanRoots([dir], { terms: parsed.terms, skipPaths: parsed.skipPaths, excludePaths: [] });
+    assert.ok(
+      report.violations.some((v) => v.term === c.term),
+      `仓库清单必须能拦住「${c.wrong}」—— 词条写成 ? 占位就拦不住（闸被架空）`,
+    );
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('仓库自带清单里没有「正则占位」写法（字面匹配下 ? / * / .* 永不命中）', () => {
+  const parsed = parseManifest(readFileSync(MANIFEST, 'utf8'));
+  for (const { term } of parsed.terms) {
+    assert.ok(!term.includes('?'), `词条含正则占位「?」，字面匹配下永不命中：${term}`);
+    assert.ok(!term.includes('*'), `词条含正则占位「*」，字面匹配下永不命中：${term}`);
+    assert.ok(!term.includes('.*'), `词条含正则片段「.*」，字面匹配下永不命中：${term}`);
+  }
+});
+
+test('清单里有一行只有分隔符没有词条 → 报错（不是当成合法词条放行）', () => {
+  const parsed = parseManifest('|原表述有误\n');
+  assert.equal(parsed.terms.length, 0);
+  assert.ok(
+    parsed.errors.some((e) => e.includes('只有分隔符没有词条')),
+    parsed.errors.join('；'),
+  );
+});
+
+test('@skip-path 命中的路径整条跳过，并在排除报告里留痕（不静默）', () => {
+  const dir = tempDir();
+  mkdirSync(join(dir, 'skipped-dir'), { recursive: true });
+  writeFileSync(join(dir, 'skipped-dir', 'x.md'), '禁用词\n');
+  writeFileSync(join(dir, 'keep.md'), '禁用词\n');
+  const parsed = parseManifest('@skip-path skipped-dir\n禁用词\n');
+  assert.equal(parsed.skipPaths.length, 1);
+  const report = scanRoots([dir], { terms: parsed.terms, skipPaths: parsed.skipPaths, excludePaths: [] });
+  assert.equal(report.violations.length, 1, '被跳过的目录不该产生违规');
+  assert.ok(
+    report.excludedPaths.some((e) => e.path.endsWith('skipped-dir') && e.reason === '@skip-path'),
+    '被跳过的路径必须在排除报告里留痕',
+  );
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('CLI：清单为空（只有注释）→ 退出码 2，并报「禁用清单为空 —— 闸未生效」', () => {
+  const sb = cliSandbox({ manifest: '# 只有注释，没有词条\n' });
+  const r = runCli(sb);
+  assert.equal(r.status, 2, `期望退出码 2，实际 ${r.status}\n${r.stdout}\n${r.stderr}`);
+  assert.match(r.stderr, /禁用清单为空 —— 闸未生效/);
+  rmSync(sb.root, { recursive: true, force: true });
+});
+
+test('CLI：清单文件缺失 → 退出码 2，并报「禁用清单缺失」（闸未生效）', () => {
+  const sb = cliSandbox({ manifestMissing: true });
+  const r = runCli(sb);
+  assert.equal(r.status, 2, `期望退出码 2，实际 ${r.status}\n${r.stdout}\n${r.stderr}`);
+  assert.match(r.stderr, /禁用清单缺失/);
+  rmSync(sb.root, { recursive: true, force: true });
+});
+
+test('CLI：扫到禁用表述 → 退出码 1，并报出文件与行号', () => {
+  const sb = cliSandbox({
+    manifest: '禁用词\n',
+    files: { 'bad.md': '第一行正常\n第二行写了禁用词\n' },
+  });
+  const r = runCli(sb, [sb.docsDir]);
+  assert.equal(r.status, 1, `期望退出码 1，实际 ${r.status}\n${r.stdout}\n${r.stderr}`);
+  assert.match(r.stderr, /bad\.md:2/);
+  rmSync(sb.root, { recursive: true, force: true });
+});
+
+test('CLI：干净清单 + 无违规 → 退出码 0，排除项照样打印（不静默）', () => {
+  const sb = cliSandbox({ manifest: '禁用词\n', files: { 'ok.md': '正常内容\n' } });
+  const r = runCli(sb, [sb.docsDir]);
+  assert.equal(r.status, 0, `期望退出码 0，实际 ${r.status}\n${r.stdout}\n${r.stderr}`);
+  assert.match(r.stdout, /未发现禁用表述/);
+  assert.match(r.stdout, /排除 \d+ 项/);
+  rmSync(sb.root, { recursive: true, force: true });
+});
+
+test('CLI：更正语境豁免会记进报告（不静默）', () => {
+  const sb = cliSandbox({
+    manifest: '禁用词|已更正\n',
+    files: { 'good.md': '说明：禁用词（已更正）\n' },
+  });
+  const r = runCli(sb, [sb.docsDir]);
+  assert.equal(r.status, 0, `期望退出码 0，实际 ${r.status}\n${r.stdout}\n${r.stderr}`);
+  assert.match(r.stdout, /豁免命中 1 处/);
+  assert.match(r.stdout, /good\.md:1/);
+  rmSync(sb.root, { recursive: true, force: true });
+});
+
+test('清单里的非法正则 → 报错（不能静默吞掉）', () => {
+  const badSkip = parseManifest('@skip-path (\n禁用词\n');
+  assert.ok(
+    badSkip.errors.some((e) => e.includes('@skip-path 正则非法')),
+    badSkip.errors.join('；'),
+  );
+  const badExempt = parseManifest('禁用词|(\n');
+  assert.ok(
+    badExempt.errors.some((e) => e.includes('豁免正则非法')),
+    badExempt.errors.join('；'),
+  );
+});
+
+test('清单里有重复词条 → 报错（不许当成两条不同的词条放行）', () => {
+  const parsed = parseManifest('禁用词\n禁用词\n');
+  assert.equal(parsed.terms.length, 1);
+  assert.ok(
+    parsed.errors.some((e) => e.includes('重复词条')),
+    parsed.errors.join('；'),
+  );
+});
+
+test('仓库自带清单必须保住 P0 已证伪的词条（不许被悄悄删掉）', () => {
+  const parsed = parseManifest(readFileSync(MANIFEST, 'utf8'));
+  const terms = parsed.terms.map((t) => t.term);
+  for (const t of ['积分占决赛30%', '积分占决赛 30%', '积分占比决赛30%', '积分占比决赛 30%', '占决赛30%', '占决赛 30%']) {
+    assert.ok(terms.includes(t), `P0 已证伪词条不许被删：${t}`);
+  }
+});
+
+test('CLI：真实仓库跑一遍扫描闸 → 退出码 0（排除项与豁免都打印出来，不静默）', () => {
+  const r = spawnSync(process.execPath, [SCRIPT], { encoding: 'utf8', cwd: PLATFORM_DIR });
+  assert.equal(r.status, 0, `真实仓库扫描必须通过（退出码 0）\n${r.stdout}\n${r.stderr}`);
+  assert.match(r.stdout, /未发现禁用表述/);
+  assert.match(r.stdout, /排除 \d+ 项/);
+  assert.match(r.stdout, /platform\/scripts\/forbidden\.txt（默认排除）/);
 });
 ```
 
@@ -4785,7 +4957,7 @@ Expected: FAIL —— `Cannot find module '../scripts/audit-scan.js'`
 //    并且空清单告警、回环地址不计入发行方、占位符密度只统计正文（不含围栏代码块）。
 //    本平台的扫描器与它【必须行为一致】——同一个 forbidden.txt 在两边跑，结果不能不同。
 // 用法：node scripts/audit-scan.js [root...]   默认扫 ../docs 与 .（即 platform/）
-import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
+import { readFileSync, readdirSync, statSync, existsSync, realpathSync } from 'node:fs';
 import { join, relative, dirname, resolve, extname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -4987,7 +5159,13 @@ export function main(argv = []) {
   return 0;
 }
 
-const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+// ⚠️ 必须按 realpath 比较：macOS 的 /tmp → /private/tmp、/var → /private/var 都是符号链接，
+// 直接比字符串会不相等 ⇒ isMain 判 false ⇒ 脚本【什么都不做、退出码 0】＝静默放行。
+// 对一道发布闸来说，「静默通过」是最坏的失败模式（R-AUD-03 的同类病）。
+function realPathOrSelf(p) {
+  try { return realpathSync(p); } catch { return p; }
+}
+const isMain = process.argv[1] && realPathOrSelf(process.argv[1]) === realPathOrSelf(fileURLToPath(import.meta.url));
 if (isMain) {
   process.exit(main(process.argv.slice(2)));
 }
@@ -5002,48 +5180,148 @@ if (isMain) {
 #
 # 语法：
 #   <禁用词>[|<豁免正则1>,<豁免正则2>]
-#     · 禁用词：整行包含即算违规
+#     · 禁用词：**字面串**（不是正则！）—— 整行包含即算违规
+#       ⚠️ 词条里写 `?` 或 `.*` 在字面匹配下**永远不会命中**
+#          （scanText 用的是 line.includes(term)，不是正则匹配）——
+#          这类占位写法会让清单「看着有词条、实际一条都不拦」＝闸被架空。
+#       ⚠️ 空格变体必须各写一条（`四维各25%` 与 `四维各 25%` 是两条词条）。
 #     · 豁免正则：同一行命中该正则 → 视为「更正语境」，不计违规，但会出现在扫描报告里
 #   @skip-path <路径正则>   整条路径跳过（相对仓库根）。排除项会在报告里打印，不静默。
 #   # 开头为注释，空行忽略
 #
-# ⚠️ 本文件不得为空：清单为空 = 闸未生效，audit-scan.js 直接报错退出。
+# ⚠️ 本文件不得为空：清单为空 = 闸未生效，audit-scan.js 直接报错退出（退出码 2）。
+#   空清单 ≠ 已保护。每完成一次证伪，就把对应词条写进来。
 #
-# @skip-path ^docs/superpowers/plans/
-#   实施计划按设计要【引用并纠正】原始错误表述（例如把冲突两方都写出来），
-#   对计划文件一刀切会让计划本身写不下去。计划文件不是对外交付物，故整目录跳过。
+# 实施计划按设计要【引用并纠正】原始错误表述（例如把冲突两方都写出来），
+# 对计划文件一刀切会让计划本身写不下去。计划文件不是对外交付物，故整目录跳过。
+# ⚠️ 这条规则必须【生效】（不能写成注释）—— 计划目录里逐字引用着禁用词，
+#    规则失效时扫描闸会把计划文档本身判成违规（实测退出码 1）。
+@skip-path ^docs/superpowers/plans/
 #
-# ── 已被裁决为错误、但仍可能残留的表述 ─────────────────────────
+# ── P4 追加：已被裁决为错误、但仍可能残留的表述 ─────────────────
 # C-01：初赛 w_E 裁决为 10%（rule-decisions.md 初赛权重表合计正好 100%）
-初赛企业确认权重 ?20%|C-01|冲突|裁决|已更正
-w_E ?= ?20%.*初赛|C-01|冲突|裁决|已更正
+初赛企业确认权重20%|C-01|冲突|裁决|已更正
+初赛企业确认权重 20%|C-01|冲突|裁决|已更正
 # 四维各 25% 的旧表述（应为「创新 20% / 技术可行 20% / 完成度 25% / 协作 15%」等六维表）
-四维各 ?25%|原表述|有误|已更正|CICC[^，。]*已
+四维各25%|原表述|有误|已更正|CICC[^，。]*已
+四维各 25%|原表述|有误|已更正|CICC[^，。]*已
 # 行为分进总分的旧表述（S10 §3.3 行为分只做垫底排序，不进总分）
 行为分计入总分|已更正|S10 §3.3|只做
+#
+# ─────────────────────────────────────────────────────────────
+# 2026-10-09 已证伪：AdventureX「积分占决赛 30%」
+#
+# 证伪依据：该规则无任何官方来源。源头是一份飞书 wiki 内部讨论笔记，
+#           作者自己就写着「积分到底靠不靠谱？」。AdventureX 的评审实为
+#           「指引者」按创意/技术复杂性/社会影响力三维打分制，并非积分制。
+# 危害：曾被 22 个文件、57 处当作已验证先例引用；并于 10/15 从第三条路径
+#      回流进另一份深卡，还与同卡另一处的「0%」标注自相矛盾。
+# 登记时点：2026-10-09 竞品复核报告（第二轮）
+# 残留面：原项目全库 20 个文件仍有残留（39+18+8 处）
+#
+# 变体全部登记 —— 空格差异是最常见的绕过方式。
+积分占决赛30%
+积分占决赛 30%
+积分占比决赛30%
+积分占比决赛 30%
+占决赛30%
+占决赛 30%
+#
+# ─────────────────────────────────────────────────────────────
+# 后续证伪请继续追加到本节下方，每条注明：证伪日期 / 证伪依据 / 危害 / 残留面。
+#
+# ⚠ 反例（不要写进本清单）：
+#   「CICC 四维各 25%」虽然已被证伪（S7 §1.1 更正为初赛/决赛各 6 维），
+#   但它必须能出现在**更正语境**里（说明当初错在哪）。
+#   → 本清单用「词条 + 更正语境豁免」处理它：裸引用（当现行规则写）会被拦下；
+#     带「原表述 / 有误 / 已更正 / S7 §1.1」等更正标记的引用放行，但记进扫描报告。
 ```
 
 - [ ] **Step 5: 运行测试确认通过**
 
 Run: `cd platform && node --test test/audit-scan.test.js`
-Expected: PASS（7 个测试全过：audit-scan.test.js 7）
+Expected: PASS（20 个测试全过：audit-scan.test.js 20 —— 规格自带 7 + 父代理预审补测 13）
 
 - [ ] **Step 6: 实跑扫描闸**
 
 Run: `cd platform && node scripts/audit-scan.js`
-Expected: 输出 `[audit-scan] 词条 5 条｜扫描 N 个文件` … `[audit-scan] ✓ 未发现禁用表述`，退出码 0
+Expected: 输出 `[audit-scan] 词条 11 条｜扫描 N 个文件` … `[audit-scan] ✓ 未发现禁用表述`，退出码 0
 
 - [ ] **Step 7: 验证"闸未生效"会被拦下（人工验证，不改仓库文件）**
 
-Run: `cd platform && printf '# 只有注释\n' > /tmp/empty-forbidden.txt && node -e "import('./scripts/audit-scan.js').then(m=>{const p=m.parseManifest('# 只有注释\n');console.log(p.errors);})"`
-Expected: 输出含「禁用清单为空 —— 闸未生效」的数组元素
+Run: `cd platform && D=$(mktemp -d) && cp -R scripts "$D/" && printf '# 只有注释，没有词条\n' > "$D/scripts/forbidden.txt" && node "$D/scripts/audit-scan.js"; echo "退出码=$?"`
+Expected: 打印「[audit-scan] 禁用清单不合规：」+「禁用清单为空 —— 闸未生效（空清单 ≠ 已保护）…」，**退出码 2**
+
+> ⚠️ 必须在**副本**上清空清单，不能清空仓库里的 `scripts/forbidden.txt`（闸本身就是靠它生效的）。
+> 走副本路径（`/tmp` 是符号链接）正好也验了 `isMain` 的 realpath 修正（P4-22）。
+> （原命令只调 `parseManifest`、没跑 CLI、也没验退出码 ⇒ 已改，见 P4-25。）
 
 - [ ] **Step 8: 提交**
 
 ```bash
-cd platform && git add scripts/audit-scan.js scripts/forbidden.txt test/audit-scan.test.js package.json
-git commit -m "feat(P4): 发布前证据链扫描闸（清单为空即报错，豁免语境可放行）"
+git add platform/scripts/audit-scan.js platform/scripts/forbidden.txt platform/test/audit-scan.test.js docs/superpowers/plans/2026-10-20-platform-P4-audit-anticheat.md
+git commit -m "feat(P4): 发布前证据链扫描闸（清单为空即报错，豁免语境可放行）" -- platform/scripts/audit-scan.js platform/scripts/forbidden.txt platform/test/audit-scan.test.js docs/superpowers/plans/2026-10-20-platform-P4-audit-anticheat.md
 ```
+
+---
+
+## Task 7 父代理预审修正台账（2026-10-21）
+
+> Task 7 是**发布前证据链扫描闸**的落地，也是全局约束「`platform/scripts/forbidden.txt` 不得为空」
+> 与 R-AUD-03「空清单 ≠ 已保护」这条纪律的**唯一执行点**。
+> 实施前把规格的代码块抽到 `/tmp/p4t7/` 的独立工程实跑（**先跑后派**）——
+> 规格自带的代码块在**「闸到底拦不拦得住」这条路径**上有 4 处硬伤：
+> 其中 2 处让闸**静默放行**、1 处让闸**永远拦不住任何东西**、1 处让 2 条用例直接红；
+> 另有 2 处是规格自身的不自洽（词条条数对不上、验证命令没验到退出码）。
+> 变异体 **30** 个 → **KILLED 27 / 等价或不可观测 3 / 有效缺口 0**。
+
+### 一、预审发现的规格缺陷（**规格自带代码块里的错**，不是实现跑偏）
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| **P4-19** | **Critical** | **清单里 3 条词条是「永远命中不了」的死词条** —— 规格的 `scanText()` 用 **`line.includes(term)`**（字面串匹配，规格自己的语法说明也写着「禁用词：整行包含即算违规」），但规格清单里有 3 条写成了**正则占位**：`初赛企业确认权重 ?20%` / `w_E ?= ?20%.*初赛` / `四维各 ?25%` —— `?` 与 `.*` 在字面匹配下没有意义 | 把**真实错误表述**写进文档（`CICC 四维各 25%`、`初赛企业确认权重 20%`）后跑闸 → 输出 `[audit-scan] ✓ 未发现禁用表述`，**退出码 0**；逐条 `text.includes(term)` 全为 `false`（`/tmp/p4t7/probe-bad-entries.txt`） | 按本项目既有约定「**空格变体各写一条**」改成字面串：`初赛企业确认权重20%` / `初赛企业确认权重 20%` / `四维各25%` / `四维各 25%`；`w_E ?= ?20%.*初赛` **整条删掉**（P6 计划 Step 4 已写明同样处置：「它把正则片段（`.*`）写进了字面串，在字面匹配下没有意义」）。**不改 `scanText` 的匹配语义**（与 P6 计划「P4 的行为与测试都不动」一致） |
+| **P4-20** | **Critical** | **规格清单里的 `@skip-path` 规则写在注释里 ⇒ 闸失效 ⇒ 闸把计划文档自己判成违规** —— 规格 Step 4 的清单里 `@skip-path ^docs/superpowers/plans/` 前面带 `#`（是注释），规则**不生效** ⇒ 计划目录被扫 ⇒ 计划文档里逐字引用着禁用词 | 按规格原样落地后 `node scripts/audit-scan.js` → **退出码 1**，报 5 处违规，其中 3 处正是禁用词自身的引用（`docs/superpowers/plans/2026-10-20-platform-P6-deploy-demo.md:1737 / :1776 / :4162`）。⇒ **规格自己的 Step 4 → Step 6 不自洽**（Step 6 期望退出码 0） | `@skip-path ^docs/superpowers/plans/` 改成**生效**的规则（说明文字保留为注释）。⚠️ P0 建的那份清单里这条规则**本来就是生效的** —— 规格 Step 4 的「整文件替换」把它降级成了注释 |
+| **P4-21** | **Critical** | **规格 Step 4 用「整文件替换」抹掉了 P0 已证伪的 6 条词条** —— P0 的 `scripts/forbidden.txt` 里登记了 AdventureX「积分占决赛 30%」的 6 个变体（各带证伪依据），规格的整文件块把它们全删了 ⇒ 闸的覆盖面**下降** | `git show 0345ccd:platform/scripts/forbidden.txt` → 6 条词条（`积分占决赛30%` / `积分占决赛 30%` / `积分占比决赛30%` / `积分占比决赛 30%` / `占决赛30%` / `占决赛 30%`）；规格 Step 4 块里**一条都没有** | 保留 P0 的 6 条词条与证伪注释，在其后**追加** P4 的词条（「**补齐**」而不是「替换」）；并补一条用例钉住「P0 已证伪词条不许被悄悄删掉」 |
+| **P4-22** | **Critical** | **规格实现的 `isMain` 用字符串比较 ⇒ 符号链接路径下闸【什么都不做、退出码 0】** —— `fileURLToPath(import.meta.url)` 是 **realpath**，`process.argv[1]` 是**调用方给的路径**；macOS 的 `/tmp → /private/tmp`、`/var → /private/var` 都是符号链接 ⇒ 两者不相等 ⇒ `isMain` 假 ⇒ 脚本不执行任何扫描，静默退出 0 | `node /tmp/.../audit-scan.js <root>` → `status=0`、`stdout=""`、`stderr=""`（探针：`argv[1]=/tmp/...` vs `import.meta.url=file:///private/tmp/...`）。**这正是 R-AUD-03 要防的「静默通过」** —— 而且发生在「脚本被绝对路径调用」这种最常见的用法上 | 改成按 **realpath** 比较（`realPathOrSelf()` 包装，解析失败退回原串）。⚠️ 这条是**实跑才暴露**的：规格的 7 条用例全是函数级调用，**没有一条会走 CLI 入口**，所以 `isMain` 写错也不会红 |
+| **P4-23** | **Important** | **规格自带的测试文件用了 `readFileSync` 却没 import** —— 第 6、7 条用例要读仓库里的清单，但 import 行只有 `mkdtempSync, writeFileSync, mkdirSync, rmSync` | 按规格原样跑 `node --test test/audit-scan.test.js` → `# tests 7 / # pass 5 / # fail 2`，两条 error 都是 `ReferenceError: readFileSync is not defined` | import 补 `readFileSync`（并加 `copyFileSync` 供 CLI 用例造沙箱） |
+| **P4-24** | **Minor** | **规格 Step 6 期望「词条 5 条」，与它自己的清单（4 条）就对不上** | 规格清单解析出 **4** 条词条（3 条还是死词条）；落地后是 **11** 条（P0 6 + P4 5） | Step 6 的 Expected 改成实际条数；Step 5 的 Expected 改成实际用例数（7 → 20） |
+| **P4-25** | **Minor** | **规格 Step 7 的验证命令没验到退出码** —— 命令写的是 `printf '# 只有注释\n' > /tmp/empty-forbidden.txt && node -e "…parseManifest…"`：① 写出来的文件**根本没被用**；② 只调了 `parseManifest`，**没有跑 CLI**，而 P4-9 要验的是「清空后**重跑** → 退出码 2」 | 原命令实跑只打印一个 errors 数组，退出码 0 —— 闸的**退出码语义一条都没验到** | Step 7 改成真跑 CLI：复制 `platform/` 到 /tmp → 清空清单 → `node scripts/audit-scan.js` → 期望**退出码 2** + 报「禁用清单为空 —— 闸未生效」 |
+
+### 二、变异检验发现的覆盖盲区（**已补测**，不是实现缺陷）
+
+| # | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|
+| — | **「清单里有重复词条」这条检查没有任何用例** —— 规格自带的第 7 条用例只检查**仓库自带清单**没重复，并没有检查 `parseManifest` **会不会发现**重复 ⇒ 把 `if (seen.has(t))` 整段摘掉，20 条用例全绿 | 变异体 **M04 存活**（`exit=0`） | 补用例：`parseManifest('禁用词\n禁用词\n')` ⇒ `terms.length === 1` 且 errors 含「重复词条」。M04 随即被 **KILLED** |
+| — | **规格的 7 条用例全是函数级调用，CLI 入口（`main`）一行都没被验到** —— 退出码 0/1/2 三种语义、清单缺失、豁免是否打印、排除是否打印，规格里**一条用例都没有** | 变异体 M21/M22/M23/M24/M25/M26/M27 在规格的 7 条用例下**全部存活** | 补 6 条 CLI 级用例（`spawnSync` 跑真脚本）：清单为空 → 2；清单缺失 → 2；扫到违规 → 1 且报行号；干净 → 0；更正语境豁免记进报告；真实仓库跑一遍 → 0。M21~M27 随即全部被 **KILLED** |
+| — | **「闸真的生效」这件事本身没有用例** —— 没有任何一条用例证明「清单里的词条能拦住真实写错的表述」；规格清单里 3 条死词条（P4-19）正因此一条用例都没红 | 变异体 **M28**（把词条改回 `?` 占位写法）在规格的 7 条用例下存活 | 补 2 条用例：① 仓库清单必须能拦住「CICC 四维各 25%」「初赛企业确认权重 20%」；② 清单里不许出现 `?` / `*` / `.*` 这类正则占位。M28 随即被 **KILLED** |
+
+### 三、等价 / 不可观测变异体（**有探针差分实证**，不是凭推理放过）
+
+> 变异脚本：`/tmp/p4t7/mutate.mjs`（30 个变异体，覆盖清单解析 / 词条匹配 / 豁免 / 排除 / 跳过路径 /
+> 退出码 / 报告打印 / CLI 入口 / 清单本身）；探针：`/tmp/p4t7/probe.mjs`（对存活体跑「基线副本 vs 变异副本」
+> 的扫描闸，逐项对比退出码与 stdout/stderr）。
+
+| # | 级别 | 变异体 | 差分实证 | 结论 |
+|---|---|---|---|---|
+| **M17** | — | 排除判断去掉 `relPath.endsWith(sep + pattern)` 分支（只剩 `baseName === pattern`） | 探针跑真实仓库扫描闸：退出码 **0 = 0**、stdout **完全一致**、stderr **完全一致** | **等价**：本仓库里被排除的路径（`platform/scripts/forbidden.txt`、`platform/test/*.test.js` 等）**全部**满足两个分支之一，去掉任一分支结果不变 |
+| **M18** | — | 排除判断去掉 `baseName === pattern` 分支（只剩 `relPath.endsWith`） | 同上：退出码 / stdout / stderr **三项全一致** | **等价**：两个分支的分歧点只有「仓库根目录下的同名裸文件」（rel 里没有分隔符），本仓库不存在这种路径（`forbidden.txt` 在 `platform/scripts/` 下）⇒ 不可达 |
+| **M19** | — | 文件类型白名单失效（什么都读） | 退出码 **0 = 0**、stderr 一致；stdout 只差 1 行：`扫描 121 个文件` vs `扫描 122 个文件` —— 多读的是 `platform/src/.gitkeep`（空文件） | **不可观测（对放行/拦截结论）**：白名单只影响「读哪些文件」，而多读的那个是空文件 ⇒ 违规集、豁免集、退出码**完全不变**，只有报告里的文件计数差 1 |
+
+### 四、Task 7 的测试条数口径与最终结果
+
+**测试条数**：`audit-scan.test.js` **20**（规格自带 **7** + 父代理预审补测 **13**）；
+P4 全量 **746/746**（本分支 Task 1 之后的基线实测 **726/726** —— 注：任务书里写的「723」与工作区实测的 726 差 3 条，以实测为准）。
+
+**最终结果**：变异体 **30** → **KILLED 27 / 等价或不可观测 3 / 有效缺口 0**；
+`audit-scan.test.js` **20/20**、P4 全量 **746/746**；
+`cd platform && node scripts/audit-scan.js` → `[audit-scan] 词条 11 条｜扫描 121 个文件` … `[audit-scan] ✓ 未发现禁用表述`，**退出码 0**；
+清单清空后重跑 → **退出码 2** + 「禁用清单为空 —— 闸未生效」。
+
+**已知限制（登记，不在本 Task 修）**：
+① 排除项清单**最多逐条打印 50 项**（总数照常打印）—— 真实仓库里是 62 项 ⇒ 最后 12 项只看得见数量、看不见路径；
+② 默认扫描范围是 `docs/` 与 `platform/` —— 仓库根的《一页纸-证据链-调研结论质量.md》《周报_2026-10-12_至_10-18_AI大航海.md》里含 P0 词条（均在**更正语境**中），不在默认范围内；若将来把范围扩到仓库根，须先给这批词条加更正语境豁免；
+③ 本 Task **没有改 `src/config.js`**（`rules.audit` 的加载与校验是 Task 3 / Task 4 的活）—— 扫描闸不读 `src/config.js`，清单是独立文件。
+
 
 ---
 
