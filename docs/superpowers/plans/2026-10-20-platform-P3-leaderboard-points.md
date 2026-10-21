@@ -745,6 +745,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadRules } from '../src/config.js';
 import { rankTeams, applyTiebreakChain, assertChainInvariants } from '../src/domain/ranking.js';
+import { toNumber, cmpStr, omit } from '../src/domain/util.js';
 
 const { rules } = loadRules(join(dirname(fileURLToPath(import.meta.url)), '..', 'rules'));
 const CHAIN = rules.tiebreak.chain;
@@ -852,6 +853,119 @@ test('applyTiebreakChain 返回 applied 轨迹（哪一档被用到）', () => {
   assert.equal(peer.separated, true);
   assert.deepEqual(peer.usedBy.sort(), ['t_a', 't_b']);
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 父代理变异检验追加的用例（2026-10-21）—— 三条都是**规格自带的缺陷**
+// ═══════════════════════════════════════════════════════════════════════════
+
+test('★ 数值键必须按数值比较（字符串形态的 "100" 不能排在 "90" 后面）', () => {
+  // ⚠️ 字典序下 '100' < '90' → 100 分的队被排到 90 分的队**后面**，且没有任何报错。
+  const r = rank(teamsOf([{ teamId: 't_a', total: '100' }, { teamId: 't_b', total: '90' }]));
+  assert.deepEqual(r.ordered.map((o) => o.teamId), ['t_a', 't_b']);
+});
+
+test('★ 数值键的「相等」按数值判定：90 与 "90" 是同一个分（并列，不是 1,2）', () => {
+  const r = rank(teamsOf([
+    { teamId: 't_a', total: 90, extra: { peerScore: 5 } },
+    { teamId: 't_b', total: '90', extra: { peerScore: 5 } },
+  ]));
+  assert.deepEqual(r.ordered.map((o) => o.rank), [1, 1]);
+  assert.deepEqual(r.tieGroups, [['t_a', 't_b']]);
+});
+
+test('★ 缺值绝不被当成 0（toNumber(null) 必须是 null 而不是 0）', () => {
+  // ⚠️ `Number(null)` 是 0 —— 直接 Number() 会把「缺值」静默变成「0 分」。
+  assert.equal(toNumber(null), null);
+  assert.equal(toNumber(undefined), null);
+  assert.equal(toNumber(''), null);
+  assert.equal(toNumber(0), 0, '真正的 0 就是 0，不能与缺值混为一谈');
+  assert.equal(toNumber('0'), 0);
+  assert.equal(toNumber('88.5'), 88.5);
+});
+
+test('★ 破同分链缺少总分项必须被拦下（没有总分就不是破同分链）', () => {
+  const noTotal = CHAIN.filter((c) => c.key !== 'total');
+  assert.ok(assertChainInvariants(noTotal).some((e) => e.includes('总分')));
+});
+
+test('★ tiebreakData.byTeam 传值路径与候选内联字段等价', () => {
+  // ⚠️ 服务层是按 byTeam 传破同分数据的；候选对象内联只是等价写法。
+  //    两条路径必须给出一致的名次 —— 否则「接口换个传法榜单就变了」。
+  const teams = teamsOf([
+    { teamId: 't_a', total: 90, extra: { peerScore: 9 } },
+    { teamId: 't_b', total: 90, extra: { peerScore: 1 } },
+  ]);
+  const inline = rank(teams);
+  const byTeam = rankTeams({
+    teams: teams.map((t) => ({ teamId: t.teamId, total: t.total })),
+    tiebreakChain: CHAIN,
+    tiebreakData: { isFinal: false, byTeam: { t_a: { peerScore: 9 }, t_b: { peerScore: 1 } } },
+    pointsConfig: rules.points,
+  });
+  assert.deepEqual(byTeam.ordered.map((o) => o.teamId), inline.ordered.map((o) => o.teamId));
+  assert.deepEqual(byTeam.ordered.map((o) => o.rank), [1, 2]);
+});
+
+test('★ cmpStr 走的是码位序（不是 localeCompare）—— 跨机器可复算', () => {
+  // ⚠️ localeCompare 依赖 ICU / locale，同一份数据在不同机器上可能不同序 →
+  //    榜单不可复算（R-AUD-01）。码位序是确定性的。
+  assert.ok(cmpStr('a', 'B') > 0, "码位序下 'B'(0x42) < 'a'(0x61)");
+  assert.ok(cmpStr('a', 'B') !== 'a'.localeCompare('B'), '不得使用 localeCompare');
+  assert.equal(cmpStr('t_a', 't_a'), 0);
+  assert.equal(cmpStr(null, 'x'), -1);
+});
+
+test('★ omit 是「剔除」语义（名字与行为一致）', () => {
+  const src = { teamId: 't_a', peerScore: 90, enterpriseRaw: 80, password_hash: 'x' };
+  const out = omit(src, ['peerScore', 'enterpriseRaw', 'password_hash']);
+  assert.deepEqual(out, { teamId: 't_a' });
+  assert.deepEqual(src, { teamId: 't_a', peerScore: 90, enterpriseRaw: 80, password_hash: 'x' }, '原对象不得被改');
+  assert.equal(omit({}, ['a']).a, undefined);
+});
+
+test('★ toNumber 对 NaN / Infinity 一律当缺值', () => {
+  assert.equal(toNumber(NaN), null);
+  assert.equal(toNumber(Infinity), null);
+  assert.equal(toNumber(-Infinity), null);
+});
+
+test('★ 不变量隔离：behavior 不在「最后一项实质依据」位置（其余检查都不触发）', () => {
+  // ⚠️ 必须**只**触发这一条检查：链尾是确定性兜底、含总分、behavior 不在链首、scope 正确。
+  //    否则「行为分位置」与「确定性兜底」两条检查会互相掩盖，谁被摘掉都测不出来。
+  const chain = [
+    { key: 'total', label: '总分', direction: 'desc', scope: 'always' },
+    { key: 'behavior', label: '行为分', direction: 'desc', scope: 'tied_only' },
+    { key: 'peer', label: '互评分', direction: 'desc', scope: 'tied_only' },
+    { key: 'team_id', label: '队伍编号', direction: 'asc', scope: 'always', deterministic: true },
+  ];
+  const errs = assertChainInvariants(chain);
+  assert.ok(errs.some((e) => e.includes('最后一项实质依据')), `应报「最后一项实质依据」：${errs.join(' | ')}`);
+});
+
+test('★ 不变量隔离：链尾不是确定性兜底（且链里没有 behavior）', () => {
+  const chain = [
+    { key: 'total', label: '总分', direction: 'desc', scope: 'always' },
+    { key: 'team_id', label: '队伍编号', direction: 'asc', scope: 'always' },
+  ];
+  const errs = assertChainInvariants(chain);
+  assert.ok(errs.some((e) => e.includes('确定性兜底')), `应报「确定性兜底」：${errs.join(' | ')}`);
+});
+
+test('★ 链非法时 applyTiebreakChain 必须抛错（不得照算出一份榜单）', () => {
+  const badChain = [
+    { key: 'total', label: '总分', direction: 'desc', scope: 'always' },
+    { key: 'team_id', label: '队伍编号', direction: 'asc', scope: 'always' },
+  ];
+  assert.throws(
+    () => applyTiebreakChain({ candidates: teamsOf([{ teamId: 't_a', total: 90 }]), chain: badChain, data: {} }),
+    /破同分链配置非法/,
+  );
+});
+
+test('★ ordered 里必须带 total（榜单行要显示总分）', () => {
+  const r = rank(teamsOf([{ teamId: 't_a', total: 90 }, { teamId: 't_b', total: 80 }]));
+  assert.deepEqual(r.ordered.map((o) => o.total), [90, 80]);
+});
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -874,12 +988,20 @@ export function cmpStr(a, b) {
 
 /** 安全取数：非有限数按 null（缺值）处理，不静默当 0 */
 export function toNumber(v) {
+  // ⚠️ null / undefined / '' 必须先判掉：`Number(null)` 是 **0**、`Number('')` 也是 **0** ——
+  //    直接 Number() 会把「缺值」静默变成「0 分」，与本函数的承诺（不静默当 0）**直接矛盾**。
+  if (v === null || v === undefined || v === '') return null;
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
 }
 
-/** 取对象的一部分字段，返回新对象（不改原对象） */
-export function pick(obj, keys) {
+/**
+ * 剔除对象里指定的一批键，返回**新**对象（不改原对象）。
+ * ⚠️ 名字从 `pick` 改成 `omit`：原实现是「剔除」，但名字叫 pick（挑出）——
+ *    名实相反的函数一定会在某次调用里被用错方向（Task 6 的可见性过滤就是靠它
+ *    剔除 peer / enterprise / password_hash 等敏感字段，用错方向 = 泄露）。
+ */
+export function omit(obj, keys) {
   const out = {};
   for (const [k, v] of Object.entries(obj || {})) {
     if (keys.includes(k)) continue;
@@ -911,6 +1033,14 @@ const KEY_FIELD = {
 };
 const fieldOf = (key) => KEY_FIELD[key] || key;
 
+/**
+ * 数值型破同分键 —— 这些键必须按**数值**比较。
+ * ⚠️ 为什么不能「是字符串就按字符串比」：字符串形态的 `"100" < "90"`（字典序），
+ *    100 分的队会被排到 90 分的队**后面** —— 榜单顺序错，且**没有任何报错**。
+ *    `team_id` 不在此列：队伍编号是标识符，永远按字符串比（'0123' 与 '123' 是两支队）。
+ */
+const NUMERIC_KEYS = new Set(['total', 'tiebreak_extra', 'peer', 'enterprise_raw', 'behavior']);
+
 function readValue(candidate, key, data) {
   const bucket = (data?.byTeam || {})[candidate.teamId];
   if (bucket) {
@@ -924,14 +1054,16 @@ function readValue(candidate, key, data) {
   return null;
 }
 
-function compareValues(a, b, direction) {
+function compareValues(a, b, direction, key) {
   if (a === b) return 0;
   const dir = direction === 'asc' ? 1 : -1;
-  if (typeof a === 'string' || typeof b === 'string') return cmpStr(a, b) * dir;
-  const na = toNumber(a);
-  const nb = toNumber(b);
-  if (na === null || nb === null) return 0;
-  return (na - nb) * dir;
+  if (NUMERIC_KEYS.has(key)) {
+    const na = toNumber(a);
+    const nb = toNumber(b);
+    if (na === null || nb === null) return 0;
+    return (na - nb) * dir;
+  }
+  return cmpStr(a, b) * dir;
 }
 
 /** 破同分链不变量校验（C-03 链 + R-PTS-08）。返回错误数组，空 = 通过。 */
@@ -993,7 +1125,7 @@ export function applyTiebreakChain({ candidates, chain, data }) {
       if (item.deterministic) {
         // 确定性兜底：只决定组内顺序，【不】拆组（并列名次不变）
         next.push([...group].sort((a, b) => compareValues(
-          readValue(a, item.key, data), readValue(b, item.key, data), item.direction,
+          readValue(a, item.key, data), readValue(b, item.key, data), item.direction, item.key,
         )));
         usedBy.push(...group.map((c) => c.teamId));
         continue;
@@ -1007,7 +1139,7 @@ export function applyTiebreakChain({ candidates, chain, data }) {
       const parts = [...buckets.values()];
       if (parts.length > 1) {
         parts.sort((a, b) => compareValues(
-          readValue(a[0], item.key, data), readValue(b[0], item.key, data), item.direction,
+          readValue(a[0], item.key, data), readValue(b[0], item.key, data), item.direction, item.key,
         ));
         separated = true;
         usedBy.push(...group.map((c) => c.teamId));
@@ -1056,7 +1188,7 @@ export function rankTeams({ teams, tiebreakChain, tiebreakData, pointsConfig }) 
 
 - [ ] **Step 5: 运行测试确认通过**
 
-Run: `cd platform && node --test test/ranking.test.js` → Expected: PASS（10 个测试全过：ranking.test.js 10）
+Run: `cd platform && node --test test/ranking.test.js` → Expected: PASS（**22 个测试全过**：ranking.test.js 22 —— 规格自带 10 + 预审补测 3 + 变异检验补测 9）
 
 > **【2026-10-21 漂移审计修正 M-1】** **原来错在哪**：本计划三处「Expected: PASS」的条数声明
 > 与代码块里实际的 `test(` 数量不符 —— `ranking.test.js` 声明 **11** 实为 **10**、
@@ -2088,13 +2220,13 @@ export function applyVisibility({ payload, viewer, visibilityConfig, context }) 
 
   if (scope === 'rank') {
     // A 榜与滚动总榜：全员公开（任务书 §七 明文）
-    rows = src.map((r) => pick(r, [...peerKeys, ...entKeys]));
+    rows = src.map((r) => omit(r, [...peerKeys, ...entKeys]));
   } else if (scope === 'business') {
     // B 榜：里程碑进度公开；评分与签字人不公开；企业名不公示
     const drop = [...peerKeys];
     if (cfg.business?.scoresPublic !== true) drop.push('score', 'rawScore', 'raw_score', 'seatE', 'seatP', 'total', 'enterpriseRaw');
     if (cfg.business?.signatoryPublic !== true) drop.push('signatory', 'signatoryUserId', 'signatoryName', 'signatory_user_id', 'signedBy');
-    rows = src.map((r) => pick(r, [...drop, ...entKeys]));
+    rows = src.map((r) => omit(r, [...drop, ...entKeys]));
   } else if (scope === 'tier') {
     // 段位榜：冲突裁决 C-02 —— C 段及以上公示队名与名次；D 段不公示排名，只给本人进度卡
     const fromIdx = Math.max(0, tierOrder.indexOf(cfg.rank?.publicFromTier || 'C'));
@@ -2103,10 +2235,10 @@ export function applyVisibility({ payload, viewer, visibilityConfig, context }) 
     for (const r of src) {
       const idx = tierOrder.indexOf(r.tier);
       if (idx >= 0 && idx >= fromIdx) {
-        visible.push(pick(r, [...peerKeys, ...entKeys]));
+        visible.push(omit(r, [...peerKeys, ...entKeys]));
       } else if (viewerTeamIds.has(r.teamId)) {
         self = {
-          ...pick(r, [...peerKeys, ...entKeys, 'rank', 'tierRank', 'teamName']),
+          ...omit(r, [...peerKeys, ...entKeys, 'rank', 'tierRank', 'teamName']),
           teamId: r.teamId,
           tier: r.tier,
           progress: r.progress ?? null,
@@ -2119,11 +2251,11 @@ export function applyVisibility({ payload, viewer, visibilityConfig, context }) 
   } else if (scope === 'personal') {
     // 个人榜：终生上榜，但手机号与单位不外泄
     rows = src.map((r) => ({
-      ...pick(r, [...peerKeys, 'phone', 'org', 'idCard', 'password_hash']),
+      ...omit(r, [...peerKeys, 'phone', 'org', 'idCard', 'password_hash']),
       isSelf: Boolean(viewer && r.userId === viewer.id),
     }));
   } else {
-    rows = src.map((r) => pick(r, peerKeys));
+    rows = src.map((r) => omit(r, peerKeys));
   }
 
   out.rows = rows;
@@ -3494,6 +3626,48 @@ git commit -m "feat(P3): 榜单页、段位榜与战绩卡前端"
 **Task 1 的测试条数口径**：leaderboard-migration **14**（规格自带 8 + 变异检验补测 6）。
 
 **最终结果**：变异体 47 → **KILLED 46 / 等价变异体 1 / 有效缺口 0**；`leaderboard-migration.test.js` **14/14**；P3 全量 **551/551**。
+
+---
+
+## Task 2 父代理预审修正台账（2026-10-21）
+
+> Task 2 是**名次计算**的地基：破同分链执行器 + 1224 并列名次。
+> 实施前把规格的代码块抽到 `/tmp` 的独立工程实跑（**10/10 全绿**）再落盘 —— 「先跑后派」。
+> 但**规格自带全绿 ≠ 规格正确**：本轮在逐行审规格时发现 **2 Important + 1 Minor 缺陷**，
+> 都在**规格自己的代码块**里（实现只是忠实照抄）；实施完成后做**变异检验**，
+> 变异体一度出现 **5 条存活**，补完用例后 **28/29 杀灭**（另 1 条等价变异体）。
+
+### 一、预审发现的规格缺陷（**规格自带代码块里的错**，不是实现跑偏）
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| **P3-4** | **Important** | **`toNumber(null)` 返回 0 —— 与本函数自己的注释「非有限数按 null（缺值）处理，**不静默当 0**」直接矛盾** | 探针：`toNumber(null)` → **0**；`toNumber('')` → **0**（`Number(null)` 与 `Number('')` 都是 0，不是 NaN）。该函数是 points / tier / behavior 三个领域模块的**共同取数入口** → 「缺值」在下游被当成「0 分」，且**一路无报错** | 先判掉 `null` / `undefined` / `''` 再 `Number()`。补 2 条用例（缺值三态 + NaN/Infinity） |
+| **P3-5** | **Important** | **数值型破同分键在值是字符串时按字典序比较** —— 原 `compareValues` 只要有一边是字符串就整体走 `cmpStr` | 探针：`total: '100'` 与 `total: '90'` → 排序结果 `t_b(90) , t_a(100)`：**100 分的队排在 90 分的队后面**，且没有任何报错。根因：`'100' < '90'`（字典序） | 按**键**判定口径：数值键（total / tiebreak_extra / peer / enterprise_raw / behavior）一律走数值比较；`team_id` 是标识符，永远按码位序比（'0123' 与 '123' 是两支队）。补 2 条用例（字符串总分排序 + `90` 与 `'90'` 视为同分） |
+| **P3-6** | Minor | **`pick()` 名实相反** —— 名字是「挑出」，实现是「剔除」 | 规格自己给的调用点（Task 6 可见性过滤）就是剔除语义：`omit(r, [...peerKeys, 'phone', 'org', 'idCard', 'password_hash'])`。名实相反的函数一定会在某次调用里被用错方向 —— 用错方向 = **敏感字段全泄露** | 改名 `omit` 并改正文档注释；Task 6 的 6 处调用点同步改名（**在 Task 6 落地时一并改**，本阶段只改定义侧） |
+
+### 二、变异检验发现的实现盲区
+
+> 变异体 **29** 个（数值键表删项 / 排序方向反转 / 1224 名次偏移 / 确定性兜底拆组 /
+> final_only 判定反转 / 缺值警告 code 改写 / 不变量检查逐条摘除 / `cmpStr` 换 localeCompare /
+> `omit` 方向反转 / `omit` 改原对象 …），在 `/tmp` 副本上跑 `ranking.test.js` + `zero-deps.test.js`，
+> **测试必须失败才算杀灭**。变异脚本：`/tmp/p3t2/mutate.mjs`。
+>
+> ⚠️ 首轮的 **5 条存活**里有 **2 条是「检查互相掩盖」**（行为分位置检查与确定性兜底检查
+> 会同时触发）—— 必须写**隔离用例**（只让一条检查触发）才测得出来。
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| **P3-7** | Minor | **两条不变量检查互相掩盖** —— 「behavior 必须是最后一项实质依据」与「必须以确定性兜底项结尾」同时触发，用例只断言错误文案包含其中一句 → 谁被摘掉都测不出 | 变异存活：逐条摘掉两个检查 → 用例全绿 | 补 2 条**隔离**用例：链里没有 behavior 时只触发兜底检查；behavior 不在末位但链尾是兜底时只触发位置检查 |
+| **P3-8** | Minor | **链非法时不抛错零覆盖** —— `applyTiebreakChain` 在链不合法时抛错，但没有任何用例断言它会抛 | 变异存活：把抛错改成「照算」→ 用例全绿 | 补用例：非法链必须抛 `/破同分链配置非法/` |
+| **P3-9** | Minor | **`ordered` 的 `total` 字段零覆盖** —— 榜单行要显示总分，但没断言 | 变异存活：`total: null` → 用例全绿 | 补断言 |
+| **P3-10** | Minor | **`tiebreakData.byTeam` 这条数据通路零覆盖** —— 服务层按 `byTeam` 传数据，候选对象内联只是等价写法；两条路径必须给出一致名次 | 变异存活：`readValue` 不再查 `byTeam` → 用例全绿 | 补用例：两条路径名次一致 |
+| **P3-11** | Minor | **`cmpStr` 的码位序口径零覆盖** —— 「不得用 localeCompare」是全局约定 #61，但没有任何断言 | 变异存活：`cmpStr` 换成 `localeCompare` → 用例全绿（`'a'/'B'` 这类才区分得开） | 补用例：`cmpStr('a','B') > 0` 且 `!== localeCompare('a','B')` |
+| — | — | **等价变异体 R04**（`compareValues` 的「相等」短路被摘掉）：`a === b` 时数值路径与码位序路径都返回 0 ⇒ 两条路径结果完全相同 | 变异存活（如标注） | **不是盲区**，标记为等价变异体、允许存活 |
+
+**Task 2 的测试条数口径**：ranking **22**（规格自带 10 + 预审补测 3 + 变异检验补测 9）。
+
+**最终结果**：变异体 29 → **KILLED 28 / 等价变异体 1 / 有效缺口 0**；`ranking.test.js` **22/22**；P3 全量 **564/564**。
+
 
 ---
 
