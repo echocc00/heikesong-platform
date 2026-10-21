@@ -32,6 +32,7 @@ import { insertSnapshot, nextRevision, upsertStageResult, getSnapshotInStage, re
 import { writeAuditLog } from '../audit/log.js';
 import { scoreStage } from '../domain/scoring.js';
 import { checkRecusal } from '../domain/review-eligibility.js';
+import { checkJudgePool } from '../domain/judge-pool.js';
 import { appError } from '../errors.js';
 
 function fail(status, code, message) {
@@ -115,6 +116,11 @@ export function computeStage({ db, stageId, actorId, now, rules }) {
   }
   const config = rules.scoring[stage.scoring_config_key];
   if (!config) throw fail(500, 'SCORING_CONFIG_MISSING', `赛段 ${stageId} 指向的权重表 ${stage.scoring_config_key} 不存在`);
+  // ⚠️ judgePool 段缺失 = 评委池下限/席构成**无法校验** —— 那种情况下算出来的榜单
+  //    不可能合规。与其「静默按默认值 0/0/1 算」，不如当场拒绝计算。
+  if (!config.judgePool) {
+    throw fail(500, 'JUDGE_POOL_CONFIG_MISSING', `权重表 ${stage.scoring_config_key} 缺少 judgePool 段，拒绝计算`);
+  }
 
   const judges = listStageJudges(db, stageId).map((j) => ({ judgeId: j.user_id, seat: j.seat }));
 
@@ -158,6 +164,24 @@ export function computeStage({ db, stageId, actorId, now, rules }) {
     });
   }
 
+  // ⚠️ 终审修正 I-2：R-JDG-10（评委池下限）/ R-JDG-11（席构成）的校验原来**零调用方** ——
+  //    `checkJudgePool` 只有自己的单元测试在跑 → 1 名评委、0 企业席的赛段照样能算出
+  //    total=72 的榜单，规则里的 minJudgesPerDimension:7 / minEnterpriseSeatShare:0.30
+  //    形同虚设。**后果**：组委会可以在不合规的池子上发榜，而快照里看不出池子不合规。
+  //    口径：**不阻断发榜，但必须显式暴露** —— 与本阶段其余「业务状态类」判定一致
+  //    （自评差异 / 企业席规则 / 归一化降级 都是「算 + 显式告警」）。
+  //    「池子不合规就不许发榜」是**组委会口径**，要加这道闸只需在 compute 路由上判
+  //    `warnings` 里的 `judge_pool_invalid`，不必改领域层。
+  const judgePool = checkJudgePool({ judges, config: config.judgePool });
+  if (!judgePool.ok) {
+    result.warnings.push({
+      code: 'judge_pool_invalid',
+      message: `评委池不合规（${judgePool.errors.length} 项）：${judgePool.errors.map((e) => e.code).join(', ')}`,
+      errors: judgePool.errors,
+      stats: judgePool.stats,
+    });
+  }
+
   // 三件套快照
   const input = {
     config,
@@ -168,8 +192,13 @@ export function computeStage({ db, stageId, actorId, now, rules }) {
     peerReviews,
     selfReviews,
     teams,
+    // ⚠️ 池子构成与合规性必须进快照：事后复算时要能看出「当次发榜的评委池合不合规」
+    //    （R-AUD-01 可复算 / 可审计）。只放 warnings 不够 —— warnings 不进 input。
+    judgePool: { ok: judgePool.ok, errors: judgePool.errors, stats: judgePool.stats },
     ruleVersion: config.version ?? 'unknown',
   };
+  // trace 里也留一份：trace 是「计算过程」的完整留痕
+  result.trace = { ...(result.trace ?? {}), judgePool: { ok: judgePool.ok, errors: judgePool.errors, stats: judgePool.stats } };
 
   return inTransaction(db, () => {
     const revision = nextRevision(db, { stageId, kind: 'stage_score' });

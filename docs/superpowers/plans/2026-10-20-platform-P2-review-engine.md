@@ -119,7 +119,7 @@ platform/src/http/routes/review.js     提交评审后发布进度事件
 - Consumes: P0 `openDatabase()` / `applyMigrations()`；P1 `teams` / `task_packages`（本阶段只读，不建表）
 - Produces:
   - **15 张表**：`stages` / `stage_judges` / `conflict_declarations` / `stage_reviews` / `review_request_keys` / `calibrations` / `enterprise_confirmations` / `peer_reviews` / `self_reviews` / `score_stats` / `recusal_records` / `computation_snapshots` / `stage_results` / `tiebreak_round` / `tiebreak_votes`
-    - 相对 `INTERFACES.md` §3 的 13 张表，**新增 4 张**：`tiebreak_round` / `tiebreak_votes`（D-3）、`review_request_keys`（D-5）、**`conflict_declarations`**（D-3）
+    - 相对 `INTERFACES.md` §3 的 11 张表，**新增 4 张**：`tiebreak_round` / `tiebreak_votes`（D-3）、`review_request_keys`（D-5）、**`conflict_declarations`**（D-3）
     - ⚠️ 原规格写「14 张表」，但 SQL 里实际有 **15** 张 —— 差的那张是 `conflict_declarations`，**既没进表数声明、也没进测试的表清单、也没进偏差表**（父代理预审修正）
   - ⚠️ **引用型外键必须齐全**（父代理预审修正，Important）：
     与 P1 的 `002_registration.sql` 同一约定 —— 每一处「指向别的表的 id」都要有 `REFERENCES`。
@@ -4192,7 +4192,7 @@ export function listStageTeams(db, stageId) {
        LEFT JOIN task_packages tp ON tp.id = t.task_package_id
        WHERE t.edition_id = (SELECT edition_id FROM stages WHERE id = ?)
          AND t.deleted_at IS NULL
-       ORDER BY t.id`,
+       ORDER BY t.created_at, t.rowid`,
     )
     .all(stageId)
     .map((r) => ({
@@ -4252,8 +4252,14 @@ export function listReviews(db, { stageId, judgeId = null, teamId = null } = {})
 }
 
 export function listReviewCells(db, stageId) {
+  // ⚠️ 软删除的打分**不能**留在进度分母里（终审修正 M-1）：
+  //    `listReviews` 已带 `deleted_at IS NULL`（D-35），这里若不过滤，
+  //    被撤回的维度仍占着「应交」名额 → 进度条永远填不满 / missing 算错。
   return db
-    .prepare('SELECT DISTINCT team_id, dimension FROM stage_reviews WHERE stage_id = ? AND calibrated = 0')
+    .prepare(
+      'SELECT DISTINCT team_id, dimension FROM stage_reviews '
+      + 'WHERE stage_id = ? AND calibrated = 0 AND deleted_at IS NULL',
+    )
     .all(stageId);
 }
 
@@ -4456,10 +4462,12 @@ export function insertRecusal(db, { stageId, judgeId, teamId = null, reason, sou
 export function listRecusals(db, { stageId, judgeId = null } = {}) {
   if (judgeId) {
     return db
-      .prepare('SELECT * FROM recusal_records WHERE stage_id = ? AND judge_id = ? ORDER BY declared_at')
+      .prepare('SELECT * FROM recusal_records WHERE stage_id = ? AND judge_id = ? ORDER BY declared_at, rowid')
       .all(stageId, judgeId);
   }
-  return db.prepare('SELECT * FROM recusal_records WHERE stage_id = ? ORDER BY declared_at').all(stageId);
+  // ⚠️ `declared_at` 并列时必须有**确定性**兜底（全局约定 #43：用 rowid，不用随机 UUID）。
+  //    「取最后一条记录」是回避撤销语义的基础（同秒申报两条时必须可复现）。
+  return db.prepare('SELECT * FROM recusal_records WHERE stage_id = ? ORDER BY declared_at, rowid').all(stageId);
 }
 ```
 
@@ -4999,6 +5007,41 @@ export function submitSelfReviews({ db, stageId, teamId, items = [], requestId =
 }
 
 /** 回避申报（R-JDG-09）：必须留档 */
+/**
+ * 撤销回避（R-JDG-09 的「撤销」语义；终审修正 M-4 补上写路径）。
+ *
+ * ⛔ 领域层 `checkRecusal` 取**最后一条**记录，`action='reinstated'` 覆盖前面的 `'recused'` ——
+ *    所以撤销的实现是**再写一条**记录，而不是 UPDATE 前一条（记录只增不改，可复算）。
+ * ⚠️ 撤销必须与申报**同一队伍范围**（stage 级回避的 team_id 为 null）——
+ *    否则「赛段级回避」会被一支队的撤销记录意外盖掉。
+ */
+export function reinstateRecusal({ db, stageId, judgeId, teamId = null, reason, actorId = null, now }) {
+  assertStageExists(db, stageId);
+  if (!reason || !String(reason).trim()) {
+    throw fail(400, 'RECUSAL_REASON_REQUIRED', '撤销回避必须填写原因（误报 / 利益关系已澄清 / 其他）');
+  }
+  if (!getStageJudge(db, stageId, judgeId)) {
+    throw fail(404, 'JUDGE_NOT_ASSIGNED', '该评委未被分配到本赛段');
+  }
+  const scoped = listRecusals(db, { stageId, judgeId })
+    .filter((r) => (r.team_id ?? null) === (teamId ?? null));
+  const latest = scoped.length ? scoped[scoped.length - 1] : null;
+  if (!latest) {
+    throw fail(404, 'RECUSAL_NOT_FOUND', '没有找到可撤销的回避记录');
+  }
+  if (latest.action !== 'recused') {
+    throw fail(409, 'RECUSAL_NOT_ACTIVE', '该回避已经被撤销过了');
+  }
+  const row = insertRecusal(db, {
+    stageId, judgeId, teamId, reason, source: 'reinstated', auditBy: actorId, action: 'reinstated', now,
+  });
+  writeAuditLog(db, {
+    actorId, action: 'recusal.reinstate', entity: 'stage', entityId: stageId,
+    detail: { judgeId, teamId, reason, supersedes: latest.id }, now,
+  });
+  return row;
+}
+
 export function declareRecusal({ db, stageId, judgeId, teamId = null, reason, actorId = null, now }) {
   assertStageExists(db, stageId);
   if (!reason || !String(reason).trim()) {
@@ -7728,6 +7771,7 @@ import { insertSnapshot, nextRevision, upsertStageResult, getSnapshotInStage, re
 import { writeAuditLog } from '../audit/log.js';
 import { scoreStage } from '../domain/scoring.js';
 import { checkRecusal } from '../domain/review-eligibility.js';
+import { checkJudgePool } from '../domain/judge-pool.js';
 import { appError } from '../errors.js';
 
 function fail(status, code, message) {
@@ -7811,6 +7855,11 @@ export function computeStage({ db, stageId, actorId, now, rules }) {
   }
   const config = rules.scoring[stage.scoring_config_key];
   if (!config) throw fail(500, 'SCORING_CONFIG_MISSING', `赛段 ${stageId} 指向的权重表 ${stage.scoring_config_key} 不存在`);
+  // ⚠️ judgePool 段缺失 = 评委池下限/席构成**无法校验** —— 那种情况下算出来的榜单
+  //    不可能合规。与其「静默按默认值 0/0/1 算」，不如当场拒绝计算。
+  if (!config.judgePool) {
+    throw fail(500, 'JUDGE_POOL_CONFIG_MISSING', `权重表 ${stage.scoring_config_key} 缺少 judgePool 段，拒绝计算`);
+  }
 
   const judges = listStageJudges(db, stageId).map((j) => ({ judgeId: j.user_id, seat: j.seat }));
 
@@ -7854,6 +7903,24 @@ export function computeStage({ db, stageId, actorId, now, rules }) {
     });
   }
 
+  // ⚠️ 终审修正 I-2：R-JDG-10（评委池下限）/ R-JDG-11（席构成）的校验原来**零调用方** ——
+  //    `checkJudgePool` 只有自己的单元测试在跑 → 1 名评委、0 企业席的赛段照样能算出
+  //    total=72 的榜单，规则里的 minJudgesPerDimension:7 / minEnterpriseSeatShare:0.30
+  //    形同虚设。**后果**：组委会可以在不合规的池子上发榜，而快照里看不出池子不合规。
+  //    口径：**不阻断发榜，但必须显式暴露** —— 与本阶段其余「业务状态类」判定一致
+  //    （自评差异 / 企业席规则 / 归一化降级 都是「算 + 显式告警」）。
+  //    「池子不合规就不许发榜」是**组委会口径**，要加这道闸只需在 compute 路由上判
+  //    `warnings` 里的 `judge_pool_invalid`，不必改领域层。
+  const judgePool = checkJudgePool({ judges, config: config.judgePool });
+  if (!judgePool.ok) {
+    result.warnings.push({
+      code: 'judge_pool_invalid',
+      message: `评委池不合规（${judgePool.errors.length} 项）：${judgePool.errors.map((e) => e.code).join(', ')}`,
+      errors: judgePool.errors,
+      stats: judgePool.stats,
+    });
+  }
+
   // 三件套快照
   const input = {
     config,
@@ -7864,8 +7931,13 @@ export function computeStage({ db, stageId, actorId, now, rules }) {
     peerReviews,
     selfReviews,
     teams,
+    // ⚠️ 池子构成与合规性必须进快照：事后复算时要能看出「当次发榜的评委池合不合规」
+    //    （R-AUD-01 可复算 / 可审计）。只放 warnings 不够 —— warnings 不进 input。
+    judgePool: { ok: judgePool.ok, errors: judgePool.errors, stats: judgePool.stats },
     ruleVersion: config.version ?? 'unknown',
   };
+  // trace 里也留一份：trace 是「计算过程」的完整留痕
+  result.trace = { ...(result.trace ?? {}), judgePool: { ok: judgePool.ok, errors: judgePool.errors, stats: judgePool.stats } };
 
   return inTransaction(db, () => {
     const revision = nextRevision(db, { stageId, kind: 'stage_score' });
@@ -8001,6 +8073,7 @@ import {
   submitPeerReviews,
   submitSelfReviews,
   declareRecusal,
+  reinstateRecusal,
   submitEnterpriseConfirmation,
 } from '../../services/review.js';
 import { computeStage, getComputation } from '../../services/compute.js';
@@ -8108,17 +8181,31 @@ export function registerReviewRoutes(router) {
 
   router.add('GET', '/api/stages/:stageId/review-state', async (ctx) => {
     requireUser(ctx);
-    // 权限：组委会 / 有评分读取能力的人 / 本赛段队伍成员（队长看本队自评进度）
+    // 权限：组委会 / 有评分读取能力的人 / 本赛段评委
+    // ⚠️ 终审修正 M-5：原注释写「本赛段队伍成员（队长看本队自评进度）」，
+    //    但闸门**并不**放行队长 → 注释与行为不符（行为更严，不是更松）。
+    //    按实际行为改正注释；若将来要放开队长，需另加一道「只看本队」的过滤，
+    //    不能只把注释改回去。
     if (!isCommittee(ctx)
       && !ctx.can('score:read', { scopeType: 'stage', scopeId: ctx.params.stageId })
       && !ctx.can('score:read', { scopeType: 'global' })
       && !getStageJudge(ctx.db, ctx.params.stageId, ctx.user.id)) {
       throw new AppError(403, 'FORBIDDEN', '没有查看评审进度的权限');
     }
+    // ⚠️ 终审修正 I-1：**必须把该赛段权重表的评委席维度全集传下去**。
+    //    省略 `dimensions` 时服务层退回「已出现过打分的维度」→ 从未有人评过的维度
+    //    不进分母 → 真实完成度 20% 时接口报 100%，`missing` 为空。
+    //    （计划 Task 6 的修正 ④ 修的是「队伍轴」，这里漏的是「维度轴」。）
+    const stateStage = getStage(ctx.db, ctx.params.stageId);
+    const stateConfig = stateStage ? ctx.rules?.scoring?.[stateStage.scoring_config_key] : null;
+    const stateDimensions = (stateConfig?.dimensions ?? [])
+      .filter((d) => d.seat === 'judge')
+      .map((d) => d.key);
     return getReviewState({
       db: ctx.db,
       stageId: ctx.params.stageId,
       viewer: { userId: ctx.user.id, isAdmin: isCommittee(ctx) },
+      dimensions: stateDimensions,
     });
   });
 
@@ -8239,6 +8326,28 @@ export function registerReviewRoutes(router) {
     }
     if (!getStageJudge(ctx.db, stageId, judgeId)) {
       throw new AppError(404, 'JUDGE_NOT_ASSIGNED', '该评委未被分配到本赛段');
+    }
+    // ⛔ 终审修正 M-4：回避的**撤销**（reinstated）原来只有领域层读侧、没有写路径 ——
+    //    评委误报回避后，其分数被永久剔除，产品内**没有任何途径撤销**。
+    //    ⛔ 撤销**只能由组委会**做：自己申报又自己撤销 = 绕开回避（想不评就不评）。
+    //    所以撤销的权限闸门必须比申报**更严**。
+    const recusalAction = ctx.body?.action ?? 'recused';
+    if (recusalAction === 'reinstated') {
+      if (!committee) {
+        throw new AppError(403, 'FORBIDDEN', '撤销回避只能由组委会执行');
+      }
+      return reinstateRecusal({
+        db: ctx.db,
+        stageId,
+        judgeId,
+        teamId: ctx.body?.teamId ?? null,
+        reason: ctx.body?.reason,
+        actorId: ctx.user.id,
+        now: new Date().toISOString(),
+      });
+    }
+    if (recusalAction !== 'recused') {
+      throw new AppError(400, 'INVALID_RECUSAL_ACTION', `未知的回避动作：${recusalAction}`);
     }
     return declareRecusal({
       db: ctx.db,
@@ -9456,12 +9565,583 @@ git commit -m "feat(P2): SSE 评审进度推送（src/http/sse.js + GET /api/sta
 | R-JDG-07 | Task 4 | R3 企业席合计权重 ≤ `wEnterprise`，超出即封顶 |
 | R-JDG-08 | Task 4 | R4 自由命题组无企业签字 → 改由评委按需求真实性的公开证据打分 |
 | R-JDG-09 | Task 5 / Task 6 | `checkRecusal` + `declareRecusal` 留档；回避后该评委对该队的分不计入 |
-| R-JDG-10 | Task 5 | `checkJudgePool`：初赛每维度 ≥7 / 决赛 ≥9（配置在 `judgePool` 段） |
-| R-JDG-11 | Task 5 | 席构成校验；**观察员无投票权**（提交 403、统计不计入） |
+| R-JDG-10 | Task 5 / **Task 10** | `checkJudgePool`：初赛每维度 ≥7 / 决赛 ≥9（配置在 `judgePool` 段）。⚠️ **Task 10 补**：Task 5 只交付了纯函数、**零调用方** —— 由 `computeStage` 接线（D-47） |
+| R-JDG-11 | Task 5 / **Task 10** | 席构成校验；**观察员无投票权**（提交 403、统计不计入）。⚠️ **Task 10 补**：同上，接线在 `computeStage`（D-47） |
 | R-JDG-12 | Task 6 | `submitCalibration` → `calibrations` 表，**不计入评分** |
 | R-JDG-13 | Task 5 / Task 8 | `detectSelfEvalDiff`：d>10 要书面说明（不成立则对齐评委分）；d<−10 只提问 |
 | R-JDG-14 | Task 6 | 企业确认必须带 `content`，空白签字 400 拒收 |
 | R-JDG-19 | Task 7 | `tiebreak_round` + `tiebreak_votes`（一人一票由主键保证）→ 复议分进 trace 供 P3 破同分链 |
+
+---
+
+### Task 10: P2 整分支终审的修复（2 Important + 5 Minor）
+
+> **【2026-10-21 阶段终审闸门】** P2 的 9 个 Task 全部完成后，做了一次**独立实跑审计**
+> （verifier 子代理在 `/tmp` 里搭独立探针，不看实现代码、只按契约与计划核对）。
+> 结论：**NOT PASS** —— **0 Critical / 2 Important / 5 Minor**，且**全部未在偏差表登记**。
+> 两条 Important 都是**已上线接口的可达缺陷**，修复面很小（各 1–3 行），但**必须改掉才能合 main**。
+>
+> | # | 级别 | 缺陷 | 实跑证据 | 处置 |
+> |---|---|---|---|---|
+> | **I-1** | **Important** | **`GET /api/stages/:stageId/review-state` 的进度分母只统计「已经出现过打分的维度」** → 真实完成度 20% 时接口报 100%，`missing` 为空 | 探针：2 评委 × 2 队，只交 `innovation` 一个维度 → `total = 4`（应为 2×2×5=20），`dimensionProgress` 里只有 `innovation` 这一个键，其余 4 个评委席维度**完全不可见**。根因：`routes/review.js` 调 `getReviewState` 时**没传 `dimensions`**，服务层于是退回「已出现过的维度」 | 路由把该赛段权重表的**评委席维度全集**传下去。⚠️ **这是计划自身的半截错**：计划 Task 6 的修正 ④ 明写「Task 8 的 API 层应显式传规则里的维度全集，否则『从未有人评过的维度』不会出现在进度里」，而计划自己的 Task 8 路由块**没传** —— 实现与该块逐字一致，于是实现继承了计划的这一半错误 |
+> | **I-2** | **Important** | **R-JDG-10 / R-JDG-11 的评委池校验从未接线** —— `checkJudgePool` 在 `platform/src/` 下**零调用方** | `grep -rn "checkJudgePool" platform/src/` → 只有定义，没有调用方。探针：1 名评委的赛段提交评分 → compute → **200**，产出 `total=72` 的榜单，`warnings` 里**无任何评委池告警**（而 `rules/scoring-initial.json` 写着 `minJudgesPerDimension: 7` / `minEnterpriseSeatShare: 0.30`）。单独调 `checkJudgePool` 则报出 3 条错误 | `computeStage` 调用 `checkJudgePool`，不合规时写入 `warnings`（`judge_pool_invalid`）+ 快照 `input.judgePool` / `trace.judgePool`；**不阻断发榜**（口径见 D-47）。权重表缺 `judgePool` 段 → **拒绝计算**。⚠️ 这是「能力被建好却从不校验」的同款病根（P1 Task 3 的 A1、P2 Task 6 的 P2-4） |
+> | **M-1** | Minor | `listReviewCells` 不过滤 `deleted_at`，与 D-35 的 `listReviews` 口径不一致 | 软删全部打分后，被删维度仍留在进度分母里 | `listReviewCells` 补 `AND deleted_at IS NULL` |
+> | **M-2** | Minor | 「改分走覆盖写 UPDATE、不是追加式 + `supersedes_id`」这条偏离**只在 Task 6 台账里，没进 D 表** | `grep -rc supersedes platform/` → 全为 0（既没有列也没有代码） | 补 **D-46**：D 表才是 P3/P4/P5 被要求查阅的跨阶段偏差清单 |
+> | **M-3** | Minor | D-3 与 Task 1 台账 P2-3 的契约表数口径写错（13 → 实为 11） | `INTERFACES.md` §3 迁移段实际列 **11** 张表；11 + 4 = 15 = `003_review.sql` 实际建表数，总数自洽、基数写错 | 三处 `13 张` → `11 张` |
+> | **M-4** | Minor | **「撤回回避」只有领域层读、没有任何写路径** —— 评委一旦误报回避，其分数被永久剔除，产品内无任何途径撤销 | `grep -rn reinstated platform/src/` 只命中 `domain/review-eligibility.js`（读侧）；`declareRecusal` 恒写 `action='recused'` | 补 `reinstateRecusal` 服务 + `POST /api/stages/:stageId/recusals` 的 `action='reinstated'` 分支。⛔ **撤销只能由组委会做**（自己申报又自己撤销 = 绕开回避）→ 撤销的闸门比申报**更严**；撤销要填原因、要写审计（`recusal.reinstate`）；记录**只增不改**（再写一条 `reinstated`） |
+> | **M-5** | Minor | `review-state` 路由注释声称「本赛段队伍成员（队长看本队自评进度）」可访问，实际 403 | 探针：队长读 `review-state` → `403 FORBIDDEN` | **按实际行为改正注释**（行为更严，不更松）。若将来要放开队长，须另加一道「只看本队」的过滤，不能只把注释改回去 |
+> | **M-6** | Minor | `listStageTeams` 用随机 UUID 作排序键，与「兜底排序键用 rowid」的全局约定口径未对齐 | `ORDER BY t.id` 而 `t.id` 是 `randomUUID()` → 同一次查询两次跑出不同顺序 | `ORDER BY t.created_at, t.rowid`（补 **D-48**，并写清它与 P3 的 `team_id` 兜底是**不同层**的事） |
+
+**Files:**
+- Create: `platform/test/p2-final-gate.test.js`（**终审修复的专项回归闸门**，16 条用例）
+- Modify: `platform/src/http/routes/review.js`（I-1 传维度全集 / M-4 撤销分支 / M-5 注释）
+- Modify: `platform/src/services/review.js`（M-4 `reinstateRecusal`）
+- Modify: `platform/src/services/compute.js`（I-2 评委池接线）
+- Modify: `platform/src/db/repo/reviews.js`（M-1）
+- Modify: `platform/src/db/repo/stages.js`（M-6）
+- Modify: `platform/src/db/repo/recusals.js`（M-4 配套：排序加 `rowid` 兜底）
+- Modify: `docs/superpowers/plans/2026-10-20-platform-P2-review-engine.md`（本节 + D-46~D-48 + M-3 订正）
+
+**为什么单独开一个测试文件**（而不是并进 `review-api` / `compute` 的既有用例）：这 7 条是**终审修复**这一组变更的验收物，单独成文件才能一眼看出「修了什么、有没有回归」。既有用例测的是**功能**，这个文件测的是**修复**。
+
+- [ ] **Step 1: 写终审修复的回归用例**
+
+`platform/test/p2-final-gate.test.js`（**整文件块，内容与实现逐字一致**）：
+
+```javascript
+// platform/test/p2-final-gate.test.js —— P2 整分支终审的回归闸门
+//
+// 依据：P2 阶段终审（verifier 独立实跑审计）结论 **NOT PASS**：
+//   0 Critical / **2 Important** / **5 Minor** —— 全部是「已上线接口的可达缺陷」
+//   且**未在偏差表登记**。本文件是这 7 条修复的**专项回归**：
+//   每一处修完的行为都在这里钉死，防止后续阶段改回去。
+//
+// ⚠️ 为什么单独开一个文件而不是并进 review-api / compute 的既有用例：
+//   这 7 条是**终审修复**这一组变更的验收物，单独成文件才能一眼看出「修了什么、
+//   有没有回归」。既有测试文件的用例是「功能」的，不是「修复」的。
+//
+// 规则溯源：
+//   - 进度分母必须用维度全集 → 设计文档 §11「没有任何评分的队伍不参与排名」
+//     + P2 计划 Task 6 修正 ④（队伍轴）+ 本次 I-1（维度轴）
+//   - 评委池下限与席构成 → S7 §3.4（R-JDG-10 / R-JDG-11）
+//   - 回避必须留档、撤销也要留痕 → S7 §4.2（R-JDG-09）
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { openDatabase } from '../src/db/sqlite.js';
+import { applyMigrations } from '../src/db/migrate.js';
+import { loadRules } from '../src/config.js';
+import { createApp } from '../src/server.js';
+import { createUser } from '../src/db/repo/users.js';
+import { createEdition } from '../src/db/repo/editions.js';
+import { insertTeam } from '../src/db/repo/teams.js';
+import { insertStage, assignStageJudge, listStageTeams } from '../src/db/repo/stages.js';
+import { insertCapability } from '../src/db/repo/capabilities.js';
+import { grantAssignment } from '../src/auth/permissions.js';
+import { createSession } from '../src/auth/session.js';
+import { listReviewCells } from '../src/db/repo/reviews.js';
+import { computeStage } from '../src/services/compute.js';
+import { reinstateRecusal } from '../src/services/review.js';
+import { listRecusals } from '../src/db/repo/recusals.js';
+import { call } from '../test-helpers/http-call.js';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const migrationsDir = join(here, '..', 'db', 'migrations');
+const rulesDir = join(here, '..', 'rules');
+const webDir = join(here, '..', 'web');
+const NOW = '2026-10-20T12:00:00.000Z';
+
+/** 初赛权重表里的**评委席**维度全集（D-32 的白名单同源）。 */
+const JUDGE_DIMS_INITIAL = ['track_fit', 'innovation', 'feasibility', 'completeness', 'collaboration'];
+
+function setup() {
+  const dataDir = mkdtempSync(join(tmpdir(), 'hks-p2gate-'));
+  const { db, close } = openDatabase({ dataDir });
+  applyMigrations(db, migrationsDir);
+  const { rules } = loadRules(rulesDir);
+  const app = createApp({ db, rules, webDir });
+
+  const edition = createEdition(db, {
+    name: '首届 · 上海', city: '上海', startsAt: '2026-10-01', endsAt: '2026-11-30', now: NOW,
+  });
+  const judge = createUser(db, { name: '评委甲', phone: '13900009001', password: 'pw' });
+  const judge2 = createUser(db, { name: '评委乙', phone: '13900009002', password: 'pw' });
+  const admin = createUser(db, { name: '组委会', phone: '13900009003', password: 'pw' });
+  const captain = createUser(db, { name: '队长', phone: '13900009004', password: 'pw' });
+  const captain2 = createUser(db, { name: '队长二', phone: '13900009005', password: 'pw' });
+
+  for (const [key, description] of [
+    ['score:write', '写入评分'], ['stage:compute', '触发计算发榜'],
+    ['audit:read', '读取审计与计算快照'], ['self_review:write', '提交本队自评'],
+  ]) insertCapability(db, key, description);
+  const grant = (userId, capability) => grantAssignment(db, {
+    userId, capability, scopeType: 'global', scopeId: null, grantedBy: admin.id,
+  });
+  grant(judge.id, 'score:write');
+  grant(judge2.id, 'score:write');
+  grant(admin.id, 'score:write');
+  grant(admin.id, 'stage:compute');
+  grant(admin.id, 'audit:read');
+  grant(captain.id, 'self_review:write');
+
+  const stage = insertStage(db, {
+    editionId: edition.id, key: 's1', name: '初赛', kind: 'initial',
+    startsAt: '2026-10-01', endsAt: '2026-10-10', scoringConfigKey: 'initial', status: 'open', now: NOW,
+  });
+  assignStageJudge(db, { stageId: stage.id, userId: judge.id, seat: 'judge', now: NOW });
+  assignStageJudge(db, { stageId: stage.id, userId: judge2.id, seat: 'judge', now: NOW });
+
+  const captainUser = captain;
+  const team = insertTeam(db, {
+    editionId: edition.id, name: '一队', captainId: captainUser.id, status: 'active', now: NOW,
+  });
+  const team2 = insertTeam(db, {
+    editionId: edition.id, name: '二队', captainId: captain2.id, status: 'active', now: NOW,
+  });
+
+  return {
+    db, close, dataDir, app, stage, team, team2, judge, judge2, admin, captain,
+    tokenJudge: createSession(db, judge.id).token,
+    tokenJudge2: createSession(db, judge2.id).token,
+    tokenAdmin: createSession(db, admin.id).token,
+    tokenCaptain: createSession(db, captain.id).token,
+  };
+}
+
+function cleanup(ctx) {
+  rmSync(ctx.dataDir, { recursive: true, force: true });
+  ctx.close();
+}
+
+const postReviews = (app, token, stageId, teamId, dimension, rawScore) => call(app, 'POST', `/api/stages/${stageId}/reviews`, {
+  token, body: { items: [{ teamId, dimension, rawScore }] },
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// I-1（Important）：进度分母只统计「已出现过打分的维度」
+// ═══════════════════════════════════════════════════════════════════════
+
+test('★ I-1 组委会视角的进度分母用维度全集（只交 1 个维度时报 100% 的老 bug）', async () => {
+  const ctx = setup();
+  try {
+    // 只交 innovation 一个维度（2 评委 × 1 队）
+    const r1 = await postReviews(ctx.app, ctx.tokenJudge, ctx.stage.id, ctx.team.id, 'innovation', 80);
+    const r2 = await postReviews(ctx.app, ctx.tokenJudge2, ctx.stage.id, ctx.team.id, 'innovation', 85);
+    assert.equal(r1.status, 200, r1.body);
+    assert.equal(r2.status, 200, r2.body);
+
+    const res = await call(ctx.app, 'GET', `/api/stages/${ctx.stage.id}/review-state`, { token: ctx.tokenAdmin });
+    assert.equal(res.status, 200, res.body);
+    const body = JSON.parse(res.body);
+    const teamCount = listStageTeams(ctx.db, ctx.stage.id).length;
+    // 分母 = 评委数(2) × 队伍数(名册) × 评委席维度全集(5)
+    assert.equal(body.total, 2 * teamCount * JUDGE_DIMS_INITIAL.length,
+      `分母应为 ${2 * teamCount * JUDGE_DIMS_INITIAL.length}（维度全集），实际 ${body.total}`);
+    assert.deepEqual(Object.keys(body.dimensionProgress).sort(), [...JUDGE_DIMS_INITIAL].sort(),
+      '从未有人评过的维度也必须出现在 dimensionProgress 里');
+    // missing = 应交单元格总数 − 已交 = 评委数 × 队伍数 × 维度全集 − 已交(2)
+    const cells = 2 * teamCount * JUDGE_DIMS_INITIAL.length;
+    assert.equal(body.missing.length, cells - 2,
+      `missing 应为 ${cells - 2} 条，实际 ${body.missing.length}`);
+    // 每个评委席维度都必须出现在 missing 里
+    // （哪怕 innovation 已经交过 —— 「二队」的 innovation 单元格仍未交）
+    const dimsInMissing = new Set(body.missing.map((m) => m.dimension));
+    assert.deepEqual([...dimsInMissing].sort(), [...JUDGE_DIMS_INITIAL].sort(),
+      '每个评委席维度都必须出现在 missing 里');
+    const innovationMissing = body.missing.filter((m) => m.dimension === 'innovation');
+    assert.equal(innovationMissing.length, 2,
+      'innovation 只交了「一队」——「二队」的 2 个单元格必须出现在 missing 里');
+    assert.ok(innovationMissing.every((m) => m.teamId === ctx.team2.id));
+  } finally {
+    cleanup(ctx);
+  }
+});
+
+test('★ I-1 评委视角的进度分母同样用维度全集', async () => {
+  const ctx = setup();
+  try {
+    await postReviews(ctx.app, ctx.tokenJudge, ctx.stage.id, ctx.team.id, 'innovation', 80);
+    const res = await call(ctx.app, 'GET', `/api/stages/${ctx.stage.id}/review-state`, { token: ctx.tokenJudge });
+    assert.equal(res.status, 200, res.body);
+    const body = JSON.parse(res.body);
+    const teamCount = listStageTeams(ctx.db, ctx.stage.id).length;
+    // 评委视角：分母 = 队伍数(名册) × 维度全集(5)
+    assert.equal(body.total, teamCount * JUDGE_DIMS_INITIAL.length, `实际 ${body.total}`);
+    assert.equal(body.missing.length, teamCount * JUDGE_DIMS_INITIAL.length - 1, `实际 ${body.missing.length}`);
+  } finally {
+    cleanup(ctx);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// I-2（Important）：checkJudgePool 零调用方 → 评委池规则形同虚设
+// ═══════════════════════════════════════════════════════════════════════
+
+test('★ I-2 评委池不合规时 compute 必须显式告警（judge_pool_invalid）', async () => {
+  const ctx = setup();
+  try {
+    await postReviews(ctx.app, ctx.tokenJudge, ctx.stage.id, ctx.team.id, 'innovation', 80);
+    const res = await call(ctx.app, 'POST', `/api/stages/${ctx.stage.id}/compute`, { token: ctx.tokenAdmin });
+    assert.equal(res.status, 200, res.body);
+    const body = JSON.parse(res.body);
+    const w = body.warnings.find((x) => x.code === 'judge_pool_invalid');
+    assert.ok(w, `warnings 里必须有 judge_pool_invalid：${JSON.stringify(body.warnings)}`);
+    // 初赛下限 7 人，本赛段只有 2 人 → 必须报出「人数不足」
+    assert.ok(w.errors.some((e) => e.code === 'judge_pool_too_small'), JSON.stringify(w.errors));
+    // 企业席占比 0% < 30% → 也必须报出来
+    assert.ok(w.errors.some((e) => e.code === 'enterprise_share_too_low'), JSON.stringify(w.errors));
+  } finally {
+    cleanup(ctx);
+  }
+});
+
+test('★ I-2 评委池构成必须进快照（input + trace）—— 事后复算要能看出当次发榜合不合规', async () => {
+  const ctx = setup();
+  try {
+    await postReviews(ctx.app, ctx.tokenJudge, ctx.stage.id, ctx.team.id, 'innovation', 80);
+    const res = await call(ctx.app, 'POST', `/api/stages/${ctx.stage.id}/compute`, { token: ctx.tokenAdmin });
+    const body = JSON.parse(res.body);
+    const snap = await call(ctx.app, 'GET', `/api/stages/${ctx.stage.id}/computations/${body.computationId}`, { token: ctx.tokenAdmin });
+    assert.equal(snap.status, 200, snap.body);
+    const s = JSON.parse(snap.body);
+    assert.ok(s.input.judgePool, '快照 input 里必须有 judgePool');
+    assert.equal(s.input.judgePool.ok, false);
+    assert.ok(Array.isArray(s.input.judgePool.errors) && s.input.judgePool.errors.length > 0);
+    assert.ok(s.trace.judgePool, '快照 trace 里必须有 judgePool');
+    assert.equal(s.trace.judgePool.stats.voting, 2);
+  } finally {
+    cleanup(ctx);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// M-1：listReviewCells 不过滤 deleted_at（与 D-35 的 listReviews 口径不一致）
+// ═══════════════════════════════════════════════════════════════════════
+
+test('★ M-1 软删除的打分不进「已评分单元格」集合（与 listReviews 的 D-35 口径一致）', async () => {
+  const ctx = setup();
+  try {
+    await postReviews(ctx.app, ctx.tokenJudge, ctx.stage.id, ctx.team.id, 'innovation', 80);
+    assert.equal(listReviewCells(ctx.db, ctx.stage.id).length, 1);
+    ctx.db.prepare('UPDATE stage_reviews SET deleted_at = ? WHERE stage_id = ?').run(NOW, ctx.stage.id);
+    assert.deepEqual(listReviewCells(ctx.db, ctx.stage.id), [],
+      '软删除的打分不得留在「已评分单元格」集合里（否则进度分母永远填不满）');
+  } finally {
+    cleanup(ctx);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// M-4：回避「撤销」只有读侧、没有写路径
+// ═══════════════════════════════════════════════════════════════════════
+
+test('★ M-4 评委本人不能撤销自己的回避（撤销比申报更严）', async () => {
+  const ctx = setup();
+  try {
+    const rec = await call(ctx.app, 'POST', `/api/stages/${ctx.stage.id}/recusals`, {
+      token: ctx.tokenJudge, body: { teamId: ctx.team.id, reason: '利益冲突' },
+    });
+    assert.equal(rec.status, 200, rec.body);
+    const back = await call(ctx.app, 'POST', `/api/stages/${ctx.stage.id}/recusals`, {
+      token: ctx.tokenJudge, body: { action: 'reinstated', teamId: ctx.team.id, reason: '其实没关系' },
+    });
+    assert.equal(back.status, 403, `自撤销应被拒：${back.body}`);
+  } finally {
+    cleanup(ctx);
+  }
+});
+
+test('★ M-4 组委会可以撤销回避，且撤销后该评委的打分重新计入榜单', async () => {
+  const ctx = setup();
+  try {
+    await postReviews(ctx.app, ctx.tokenJudge, ctx.stage.id, ctx.team.id, 'innovation', 80);
+    await postReviews(ctx.app, ctx.tokenJudge2, ctx.stage.id, ctx.team.id, 'innovation', 60);
+    const rec = await call(ctx.app, 'POST', `/api/stages/${ctx.stage.id}/recusals`, {
+      token: ctx.tokenJudge, body: { teamId: ctx.team.id, reason: '误报' },
+    });
+    assert.equal(rec.status, 200, rec.body);
+
+    // 回避生效 → 评委甲的分被剔除
+    const first = JSON.parse((await call(ctx.app, 'POST', `/api/stages/${ctx.stage.id}/compute`, { token: ctx.tokenAdmin })).body);
+    const firstTeam = first.teams.find((t) => t.teamId === ctx.team.id);
+    assert.ok(first.warnings.some((w) => w.code === 'recusal_excluded'), '应报告回避剔除');
+    assert.ok(firstTeam, '应有结果行');
+
+    // 组委会撤销
+    const back = await call(ctx.app, 'POST', `/api/stages/${ctx.stage.id}/recusals`, {
+      token: ctx.tokenAdmin, body: { action: 'reinstated', judgeId: ctx.judge.id, teamId: ctx.team.id, reason: '核实后无冲突' },
+    });
+    assert.equal(back.status, 200, back.body);
+
+    // 撤销后重新计算 → 不再有 recusal_excluded
+    const second = JSON.parse((await call(ctx.app, 'POST', `/api/stages/${ctx.stage.id}/compute`, { token: ctx.tokenAdmin })).body);
+    assert.ok(!second.warnings.some((w) => w.code === 'recusal_excluded'),
+      '撤销后不应再剔除该评委的打分');
+    const secondTeam = second.teams.find((t) => t.teamId === ctx.team.id);
+    assert.ok(secondTeam.seatP > firstTeam.seatP,
+      `撤销后评委席分应回升：${firstTeam.seatP} → ${secondTeam.seatP}`);
+  } finally {
+    cleanup(ctx);
+  }
+});
+
+test('★ M-4 撤销不存在的回避记录 → 404（单条不存在）', async () => {
+  const ctx = setup();
+  try {
+    const res = await call(ctx.app, 'POST', `/api/stages/${ctx.stage.id}/recusals`, {
+      token: ctx.tokenAdmin, body: { action: 'reinstated', judgeId: ctx.judge.id, teamId: ctx.team.id, reason: '撤销' },
+    });
+    assert.equal(res.status, 404, res.body);
+  } finally {
+    cleanup(ctx);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// M-5：review-state 注释声称队长可访问，实际 403（注释与行为不符）
+// ═══════════════════════════════════════════════════════════════════════
+
+test('★ M-5 队长读 review-state → 403（注释已按实际行为改正，行为不得放宽）', async () => {
+  const ctx = setup();
+  try {
+    const res = await call(ctx.app, 'GET', `/api/stages/${ctx.stage.id}/review-state`, { token: ctx.tokenCaptain });
+    assert.equal(res.status, 403, `队长当前不应被放行：${res.body}`);
+  } finally {
+    cleanup(ctx);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// M-6：listStageTeams 用随机 UUID 排序（未对齐「兜底排序键用 rowid」约定）
+// ═══════════════════════════════════════════════════════════════════════
+
+test('★ M-6 赛段名册的排序必须确定（同一 created_at 时按 rowid，即登记顺序）', () => {
+  const ctx = setup();
+  try {
+    const sameTime = '2026-10-20T00:00:00.000Z';
+    const a = insertTeam(ctx.db, { editionId: ctx.stage.edition_id, name: '甲队', captainId: ctx.captain.id, status: 'active', now: sameTime });
+    const b = insertTeam(ctx.db, { editionId: ctx.stage.edition_id, name: '乙队', captainId: ctx.captain.id, status: 'active', now: sameTime });
+    const c = insertTeam(ctx.db, { editionId: ctx.stage.edition_id, name: '丙队', captainId: ctx.captain.id, status: 'active', now: sameTime });
+    const ids = listStageTeams(ctx.db, ctx.stage.id).map((t) => t.teamId);
+    const mine = ids.filter((id) => [a.id, b.id, c.id].includes(id));
+    assert.deepEqual(mine, [a.id, b.id, c.id],
+      '同一 created_at 时必须按登记顺序（rowid），不得按随机 UUID');
+  } finally {
+    cleanup(ctx);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// I-2 配套：权重表缺 judgePool 段 → 拒绝计算（而不是按默认值静默算）
+// ═══════════════════════════════════════════════════════════════════════
+
+test('★ I-2 权重表缺 judgePool 段时 compute 必须拒绝计算', async () => {
+  const ctx = setup();
+  try {
+    await postReviews(ctx.app, ctx.tokenJudge, ctx.stage.id, ctx.team.id, 'innovation', 80);
+    const { rules } = loadRules(rulesDir);
+    const broken = structuredClone(rules);
+    delete broken.scoring.initial.judgePool;
+    assert.throws(
+      () => computeStage({
+        db: ctx.db, stageId: ctx.stage.id, actorId: ctx.admin.id, now: NOW, rules: broken,
+      }),
+      /judgePool 段/,
+    );
+  } finally {
+    cleanup(ctx);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// M-4 配套：同秒多条回避必须可复现地取最后一条；重复撤销 / 不填原因都要挡住
+// ═══════════════════════════════════════════════════════════════════════
+
+test('★ M-4 同一秒申报的多条回避必须可复现地取最后一条（rowid 兜底）', async () => {
+  const ctx = setup();
+  try {
+    const sameTime = '2026-10-20T08:00:00.000Z';
+    ctx.db.prepare(
+      `INSERT INTO recusal_records (id, stage_id, judge_id, team_id, reason, source, declared_at, audit_by, action)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run('rec-1', ctx.stage.id, ctx.judge.id, ctx.team.id, '第一次', 'declared', sameTime, ctx.judge.id, 'recused');
+    ctx.db.prepare(
+      `INSERT INTO recusal_records (id, stage_id, judge_id, team_id, reason, source, declared_at, audit_by, action)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run('rec-2', ctx.stage.id, ctx.judge.id, ctx.team.id, '第二次', 'declared', sameTime, ctx.judge.id, 'recused');
+    const rows = listRecusals(ctx.db, { stageId: ctx.stage.id, judgeId: ctx.judge.id });
+    assert.deepEqual(rows.map((r) => r.id), ['rec-1', 'rec-2'], '同秒并列时必须按 rowid 排序');
+    assert.equal(rows[rows.length - 1].id, 'rec-2');
+  } finally {
+    cleanup(ctx);
+  }
+});
+
+test('★ M-4 赛段级回避列表在同秒并列时必须按登记顺序（rowid 兜底，索引序会乱）', () => {
+  const ctx = setup();
+  try {
+    // 本条针对 `listRecusals(db, { stageId })` 这条**赛段级**分支：
+    // 它走 `idx_recusals_lookup(stage_id, judge_id)` 的索引扫描，
+    // 并列行的自然顺序是「judge_id 升序」而不是「登记顺序」。
+    // 少了 `, rowid` 兜底，SQLite 的临时 B 树会把这个索引序原样吐出来 → 顺序错乱。
+    // （上面那条带 `judgeId` 过滤的用例查不到这个洞：同 judge_id 时索引序恰好等于 rowid 序。）
+    const judge3 = createUser(ctx.db, { name: '评委丙', phone: '13900009006', password: 'pw' });
+    assignStageJudge(ctx.db, { stageId: ctx.stage.id, userId: judge3.id, seat: 'judge', now: NOW });
+
+    const sameTime = '2026-10-20T09:00:00.000Z';
+    // 按 id 升序排列后【倒序插入】—— 登记顺序必然与 judge_id 升序相反
+    const judgeIds = [ctx.judge.id, ctx.judge2.id, judge3.id].sort();
+    const insert = ctx.db.prepare(
+      `INSERT INTO recusal_records (id, stage_id, judge_id, team_id, reason, source, declared_at, audit_by, action)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    const inserted = [];
+    for (const [i, judgeId] of [...judgeIds].reverse().entries()) {
+      const id = `rec-par-${i}`;
+      insert.run(id, ctx.stage.id, judgeId, ctx.team.id, '同秒申报', 'declared', sameTime, judgeId, 'recused');
+      inserted.push(id);
+    }
+    const rows = listRecusals(ctx.db, { stageId: ctx.stage.id });
+    assert.deepEqual(rows.map((r) => r.id), inserted,
+      '赛段级 listRecusals 在 declared_at 并列时必须按登记顺序（rowid）返回，不能是索引序');
+  } finally {
+    cleanup(ctx);
+  }
+});
+
+test('★ M-4 重复撤销 → 409；撤销不填原因 → 400', async () => {
+  const ctx = setup();
+  try {
+    const rec = await call(ctx.app, 'POST', `/api/stages/${ctx.stage.id}/recusals`, {
+      token: ctx.tokenJudge, body: { teamId: ctx.team.id, reason: '误报' },
+    });
+    assert.equal(rec.status, 200, rec.body);
+
+    const noReason = await call(ctx.app, 'POST', `/api/stages/${ctx.stage.id}/recusals`, {
+      token: ctx.tokenAdmin, body: { action: 'reinstated', judgeId: ctx.judge.id, teamId: ctx.team.id },
+    });
+    assert.equal(noReason.status, 400, `撤销必须填原因：${noReason.body}`);
+
+    const first = await call(ctx.app, 'POST', `/api/stages/${ctx.stage.id}/recusals`, {
+      token: ctx.tokenAdmin, body: { action: 'reinstated', judgeId: ctx.judge.id, teamId: ctx.team.id, reason: '核实后无冲突' },
+    });
+    assert.equal(first.status, 200, first.body);
+    const second = await call(ctx.app, 'POST', `/api/stages/${ctx.stage.id}/recusals`, {
+      token: ctx.tokenAdmin, body: { action: 'reinstated', judgeId: ctx.judge.id, teamId: ctx.team.id, reason: '再来一次' },
+    });
+    assert.equal(second.status, 409, `重复撤销应 409：${second.body}`);
+  } finally {
+    cleanup(ctx);
+  }
+});
+
+test('★ M-4 撤销必须写审计（事后要能查是谁撤的、为什么撤）', async () => {
+  const ctx = setup();
+  try {
+    await call(ctx.app, 'POST', `/api/stages/${ctx.stage.id}/recusals`, {
+      token: ctx.tokenJudge, body: { teamId: ctx.team.id, reason: '误报' },
+    });
+    const back = await call(ctx.app, 'POST', `/api/stages/${ctx.stage.id}/recusals`, {
+      token: ctx.tokenAdmin, body: { action: 'reinstated', judgeId: ctx.judge.id, teamId: ctx.team.id, reason: '核实后无冲突' },
+    });
+    assert.equal(back.status, 200, back.body);
+    const row = ctx.db.prepare("SELECT * FROM audit_log WHERE action = 'recusal.reinstate'").get();
+    assert.ok(row, 'audit_log 里必须有 recusal.reinstate');
+    assert.equal(row.actor_id, ctx.admin.id);
+    const detail = JSON.parse(row.detail_json);
+    assert.equal(detail.judgeId, ctx.judge.id);
+    assert.ok(detail.supersedes, '审计里要记被撤销的那条记录 id');
+  } finally {
+    cleanup(ctx);
+  }
+});
+
+test('★ M-4 服务层 reinstateRecusal 也要校验评委在名单内（不靠路由层代偿）', () => {
+  const ctx = setup();
+  try {
+    const stranger = createUser(ctx.db, { name: '陌生人', phone: '13900009099', password: 'pw' });
+    assert.throws(
+      () => reinstateRecusal({
+        db: ctx.db, stageId: ctx.stage.id, judgeId: stranger.id,
+        teamId: ctx.team.id, reason: '撤销', actorId: ctx.admin.id, now: NOW,
+      }),
+      /未被分配到本赛段/,
+    );
+  } finally {
+    cleanup(ctx);
+  }
+});
+```
+
+- [ ] **Step 2: 实施 7 条修复**
+
+见上方表格「处置」列。**每条修复都要能被变异体杀死** —— 「改完了」不等于「改对了」。
+
+- [ ] **Step 3: 变异检验（独立工程）**
+
+变异脚本：`/tmp/p2t10/mutate.mjs`（20 个变异体，覆盖 7 条修复的每一个闸门）。
+测试集：`p2-final-gate.test.js` + `review-api.test.js` + `compute.test.js` + `review-service.test.js` + `judge-pool.test.js`。
+→ 实跑结果见下方「终审修复台账」。
+
+- [ ] **Step 4: 全量回归**
+
+Run: `cd platform && node --test` → Expected: **553/553** 全绿（P2 原有 537 + 终审修复 16）
+
+- [ ] **Step 5: 提交**
+
+```bash
+cd platform && git add src/http/routes/review.js src/services/review.js src/services/compute.js src/db/repo/reviews.js src/db/repo/stages.js src/db/repo/recusals.js test/p2-final-gate.test.js
+git commit -m "fix(P2): 终审修复 —— 进度分母用维度全集 / 评委池校验接线 / 回避撤销写路径"
+```
+
+> ⚠️ 计划文件本身也在本次提交范围内（仓库根的 `docs/superpowers/plans/…`）——
+> 「计划是规格」意味着**计划与实现必须同一次提交落盘**，否则规格与代码会分叉。
+
+#### 终审修复台账
+
+**变异检验（第二轮实跑，`/tmp/p2t10/mutate.mjs`）**
+
+| 组 | 变异体 | 覆盖的闸门 | 结果 |
+|---|---|---|---|
+| I-1 | F01 / F02 / F03 | 进度分母传维度全集 / 只算评委席维度 / 权限闸门不得摘掉 | 3/3 KILLED |
+| I-2 | F04 / F05 / F06 / F07 / F08 / F09 | 评委池必须被调用 / 不合规必须告警 / 进快照 input / 进快照 trace / 缺配置拒算 / 告警 code | 6/6 KILLED |
+| M-1 | F10 | `listReviewCells` 必须过滤 `deleted_at` | 1/1 KILLED |
+| M-4 | F12–F19 / F20 | 组委会独占 / 路由认 `reinstated` / 写回 action / 必填原因 / 必写审计 / 拒绝重复撤销 / 记录不存在 404 / 评委在名单内 / `rowid` 兜底 | 9/9 KILLED |
+| M-6 | F11 | 名册排序必须确定 | 1/1 KILLED |
+| **合计** | **20** | — | **KILLED 20 / SURVIVED 0 / 构造失败 0** |
+
+**F20 的存活与定性（第一轮 → 第二轮）**
+
+第一轮实跑：19/20 KILLED，**F20 存活**（`listRecusals` 去掉 `, rowid` 兜底 → 竞态同秒并列的顺序不可复现）。
+按纪律「存活变异必须修、或显式标注为等价 / 不可观测」，先要**定性**再动手，不能直接当盲区补测试也不能直接放过。
+
+- **原以为会「等价」**：SQLite 对并列行的自然顺序在单表全扫下常常恰好等于 `rowid` 序。
+- **探针实测推翻**：建同款表 + `idx_recusals_lookup(stage_id, judge_id)`，插 4 条 `declared_at` 相同、
+  `judge_id` 字母序与插入序**相反**的记录 → `EXPLAIN QUERY PLAN` 显示走
+  `SEARCH recusal_records USING INDEX idx_recusals_lookup` + `USE TEMP B-TREE FOR ORDER BY`；
+  带 `, rowid` 返回插入序（`id-1,id-2,id-3,id-4`），**去掉后返回索引序**（`id-3,id-4,id-2,id-1`）。
+  → **可观测，不是等价变异体**：`rowid` 兜底是真正承重的。
+- **已有用例为什么查不到**：那条「同一秒申报的多条回避」用例查的是**带 `judgeId` 过滤**的分支；
+  同一个 `judge_id` 下索引序恰好等于 `rowid` 序 → 天然查不出。而 `listRecusals` 还有一条
+  **赛段级**分支（不带 `judgeId` 过滤），走的是同一条索引 —— 那里才有洞。
+- **补测（第 16 条用例）**：赛段级分支 + 三个评委 id 按字典序排好后**倒序插入**，
+  于是「登记顺序」与「judge_id 升序」必然相反，断言返回顺序 = 登记顺序。
+  再跑变异 → **F20 KILLED**。
+
+> **教训（值得写进全局纪律）**：变异体存活时，先问「**它真的改变行为了吗**」——
+> 构造失效与真盲区长得一模一样，但处置相反：前者要重写变异体，后者要补测试。
+> 这次的判断依据是**独立探针**（另建同款表复现查询计划与返回顺序），不是猜。
+
+**测试条数口径**
+
+| 项 | 条数 |
+|---|---|
+| P2 原有（Task 1–9） | 537 |
+| 终审修复专项（`p2-final-gate.test.js`） | 16 |
+| **P2 全量** | **553/553 全绿** |
 
 ---
 
@@ -9493,7 +10173,7 @@ git commit -m "feat(P2): SSE 评审进度推送（src/http/sse.js + GET /api/sta
 |---|---|---|---|---|---|
 | D-1 | `normalizeScores` 的 `samples` 元素多一个可选字段 | `samples: [{ judgeId, value }]` | 允许 `{ judgeId, value, series }`，`series` = 该评委在本维度对**全部参赛队**的原始分序列 | 归一化的是评委宽严，必须知道该评委在维度 d 上的**全部打分**才能算 mean(i,d)/stdev(i,d)；只给单元值无法算 | 无破坏性：不传 `series` 时退回「同 judgeId 在 samples 中的全部 value」。⚠️ **父代理预审修正**：这条回退**原实现根本没做**（直接 `continue` 跳过），导致契约形状产出**空 values + null fallbackReason**（静默空成功）——现已实现并补回归用例 |
 | D-2 | `normalizeScores` 返回值多一个字段 | `{ normalized, values, fallbackReason, stats }` | 追加 `judgeStats[judgeId] = { n, mean, stdev, center, scale, normalized, fallbackReason }` | 契约的 4 个字段无法表达「同一维度内不同评委的降级状态不同」；trace 需要逐评委样本量 | 纯追加，不改原有字段语义 |
-| D-3 | `003_review.sql` 多**四**张表 | 契约只列 13 张，未列 `tiebreak_round` / `tiebreak_votes` / `review_request_keys` / `conflict_declarations` | 新增这四张表 | ① `tiebreak_round` / `tiebreak_votes`：设计文档 §6.4【决策】已明确要求「加时陈述用独立表 + 唯一约束」，R-JDG-19 需要落库，P3 的 `applyTiebreakChain` 直接消费；② `review_request_keys`：见 D-5；③ `conflict_declarations`：R-JDG-18「评委须签署利益冲突声明」需要独立表 —— **声明（事前签署）与回避（个案动作）不是一回事**，合在一起会让「没签声明」和「这个队要回避」两种状态混为一谈 | P3 的 `applyTiebreakChain` 直接消费；`conflict_declarations` 由 P2 Task 6 的 `assignStageJudge` 写入 |
+| D-3 | `003_review.sql` 多**四**张表 | 契约只列 11 张，未列 `tiebreak_round` / `tiebreak_votes` / `review_request_keys` / `conflict_declarations` | 新增这四张表 | ① `tiebreak_round` / `tiebreak_votes`：设计文档 §6.4【决策】已明确要求「加时陈述用独立表 + 唯一约束」，R-JDG-19 需要落库，P3 的 `applyTiebreakChain` 直接消费；② `review_request_keys`：见 D-5；③ `conflict_declarations`：R-JDG-18「评委须签署利益冲突声明」需要独立表 —— **声明（事前签署）与回避（个案动作）不是一回事**，合在一起会让「没签声明」和「这个队要回避」两种状态混为一谈 | P3 的 `applyTiebreakChain` 直接消费；`conflict_declarations` 由 P2 Task 6 的 `assignStageJudge` 写入 |
 | D-4 | `enterprise_confirmations` 多一列 | 无 `content` 列 | 增加 `content TEXT NOT NULL DEFAULT ''` | R-JDG-14「企业签字必须有内容」需要落库；服务层拒绝空白内容 | 需 P3/P4 的签字表同步对齐 |
 | D-5 | 幂等机制的实现方式 | 业务表上有 `request_id` 列，未规定唯一性 | 新增 `review_request_keys(scope, stage_id, subject_id, request_id)` 表做「先抢键再落数据」；业务表的 `request_id` 只作记录、另建普通索引 | ⛔ 一次批量提交会写多行且共用同一个 `request_id` —— 把 UNIQUE 直接建在业务表的 `request_id` 上会让第二批插不进去。键表方案既保证「同一 request 只生效一次」，又天然支持批量 | 新增一张表 + 一个仓储文件；P4 的 `idempotency_keys` 是同一模式，可复用思路 |
 | D-6 | `applyEnterpriseRules` 返回值多一个字段 | `{ seatE, weights, warnings }` | 追加 `r4Substitute[teamId] = { dimension }` | R4 的替代分数来自评委维度分，由 `scoring.js` 填充；纯企业确认表算不出来 | 纯追加 |
@@ -9536,6 +10216,9 @@ git commit -m "feat(P2): SSE 评审进度推送（src/http/sse.js + GET /api/sta
 | D-43 | **客户端断开必须摘掉订阅者** | 规格：无连接生命周期约定 | `res.on('close')` 里 `clearInterval(heartbeat)` + `reviewEvents.remove(res)`；事件中心的 `remove` 真正从 `Map` 里删 | 订阅者（`res`）只增不减 ⇒ 每开一条 SSE 连接就**泄漏一个 response 对象 + 一个定时器**，进程内存单调增长，长跑必被打挂 | 无 |
 | D-44 | **非 GET 方法不得开 SSE** | 规格：端点只说「`GET /api/stages/:stageId/events`」 | server.js 的分支条件是 `req.method === 'GET' ? parseSsePath(url) : null`；其他方法按普通路由走（404） | 少了方法闸门，`POST` 到同一路径会被当成 SSE 订阅 —— **用 POST 请求开一条长连接**是典型的协议混淆（且 CSRF 形态下更容易被诱导） | 无 |
 | D-45 | **SSE 响应头必须显式声明不被代理缓冲** | 规格：未规定响应头 | `Content-Type: text/event-stream; charset=utf-8` + `Cache-Control: no-cache, no-transform` + `Connection: keep-alive` + **`X-Accel-Buffering: no`** | nginx 默认会缓冲上游响应 → 事件被攒着一起发，前端看起来像「**不推送**」；`X-Accel-Buffering: no` 是唯一能在不改 nginx 配置的前提下关掉缓冲的响应头 | 无 |
+| D-46 | **改分走「覆盖写 UPDATE」而不是追加式新记录**（`supersedes_id` 未实现） | `INTERFACES.md` §0「追加式：评分/签字类记录**只增不改**，更正走新记录 + `supersedes_id`」 | 改分用 `UPDATE stage_reviews SET raw_score = ?`（**原地覆盖**），可追溯性由**审计**补回（D-36：`changed[{from,to}]`） | ⚠️ 终审（Minor M-2）指出：这条偏离**只登记在 Task 6 台账的「刻意保持的行为」里，没进 D 表** —— 而 D 表才是 P3/P4/P5 被要求查阅的跨阶段偏差清单。**实质影响可控**（可追溯性未断链），但**登记必须补上**：若后续阶段要改成追加式链，必须同时把 `stage_reviews` 的 UNIQUE 改成**偏序索引**（见 Task 1 台账 M2-6），否则第二条记录插不进去 | P3/P4 若要接 `supersedes_id`，须先改 `stage_reviews` 的唯一约束（expand-contract） |
+| D-47 | **评委池下限与席构成（R-JDG-10 / R-JDG-11）在发榜时**不阻断、只显式告警** | 计划：Task 5 交付了 `checkJudgePool`（纯函数），但**没有任何调用方** —— 1 名评委、0 企业席的赛段照样能算出 `total=72` 的榜单 | `computeStage` 调用 `checkJudgePool({ judges, config })`：不合规时写入 `result.warnings`（`judge_pool_invalid`），并把池子构成与错误写进快照的 `input.judgePool` 与 `trace.judgePool`；**不阻断发榜** | ⚠️ 终审（Important I-2）指出这是「能力被建好却从不校验」的同款病根（P1 Task 3 的 A1 / P2 Task 6 的 P2-4）。**口径选择**：不阻断 = 与本阶段其余「业务状态类」判定一致（自评差异 / 企业席规则 / 归一化降级 都是「算 + 显式告警」），且阻断会让「1 名评委的内部彩排」也发不出榜（P6 演示版需要小规模跑通）。**「池子不合规就不许发榜」是组委会口径** —— 要加这道闸只需在 compute 路由上判 `warnings` 里的 `judge_pool_invalid`，不必改领域层。合规性**必须进快照**：事后复算要能看出当次发榜的池子合不合规 | 权重表缺 `judgePool` 段 → **拒绝计算**（500 `JUDGE_POOL_CONFIG_MISSING`），不按默认值静默算 |
+| D-48 | **赛段名册（`listStageTeams`）的排序键** | 契约未规定；全局约定 #43「兜底排序键一律用 SQLite 隐式 `rowid`」 | `ORDER BY t.created_at, t.rowid` | ⚠️ 终审（Minor M-6）指出：原实现是 `ORDER BY t.id`，而 `t.id` 是 `randomUUID()` → **顺序不可复现**（同一次查询两次跑出不同顺序）。虽无并列行、不构成榜单风险，但与「兜底排序键用 rowid」的约定**口径未对齐**。⚠️ 与 P3 的关系：P3 的破同分链最后一级兜底是 **`team_id`**（契约 §4 明写），P3 用 `cmpStr` 按码位序比 —— 两者是**不同层**的事：P2 管「名册列举顺序」，P3 管「并列时的排序依据」 | 无 |
 
 > **【2026-10-21 漂移审计修正 I-9 + M-4】** D-18 这一行原来描述的是一个**早已不存在**的冲突：
 > 「P0 建了 `002_user_roles.sql`；…⛔ **需 P1 改名为 `002_registration.sql` 之外的版本，或 P0 改名**」。
@@ -9565,7 +10248,7 @@ git commit -m "feat(P2): SSE 评审进度推送（src/http/sse.js + GET /api/sta
 |---|---|---|---|---|
 | **P2-1** | **Important** | **引用型外键只加了一半**：同一类引用一处有一处没有（`stage_judges.user_id` 有、`stage_reviews.judge_id` 没有）→ 评审数据可以指向**不存在的评委 / 队伍**，聚合时不会被发现；而测试用假 id（`'j1'` / `'t1'` / `'ed1'`）正好**掩盖**了这一点 | P1 的 `002_registration.sql` 里 `edition_id` **全都有**外键；003 里只有一半 | 逐列扫描所有 `*_id` / `*_by` 列，**该有外键的全部补齐** —— 最终 15 张表 **38 条**引用型外键，覆盖 `editions` / `users` / `teams` / `stages` / `conflict_declarations` / `computation_snapshots` / `tiebreak_round` 七个父表 |
 | **P2-2** | Minor | 测试夹具用**假 id**（`'j1'` / `'t1'` / `'ed1'`） | 夹具里 `judge_id = 'j1'` 之类 | 改建**真实的** edition / user / team（与 P1 的 `migration-002.test.js` 对齐）。⚠️ **代价**：Task 6/7/8 计划里 14 处 DB INSERT 点的假 id 夹具，实施时**必须一并改掉** |
-| **P2-3** | Minor | `conflict_declarations` 的**表数口径三处不一致**：正文说 14 张 / SQL 里 15 张 / 测试表清单 14 张 | `003_review.sql` 实际建出 15 张表 | 统一为 **15**，并在「Produces」里显式登记「相对契约 §3 的 13 张新增 4 张」 |
+| **P2-3** | Minor | `conflict_declarations` 的**表数口径三处不一致**：正文说 14 张 / SQL 里 15 张 / 测试表清单 14 张 | `003_review.sql` 实际建出 15 张表 | 统一为 **15**，并在「Produces」里显式登记「相对契约 §3 的 11 张新增 4 张」 |
 | **P2-4** | Minor | R-JDG-18「评委须签署利益冲突声明」**零接线**：表建了但没有任何代码写入 | 计划全文搜不到 `conflict_declarations` 的 INSERT | 接线放到 **Task 6**（`assignStageJudge` = 分配评委即签署声明），并把 `assignStageJudge` 的代码块改成「写 `conflict_declarations` + 回填 `stage_judges.conflict_declared_at` / `conflict_declaration_id`」 |
 | **P2-5** | Minor | 「**一人一票**」措辞不准 | `tiebreak_votes` 主键是 `(轮次, 投票人, 队伍)` —— 准确语义是「一人**一队**一票」：同一人对不同队伍各投一次**允许**（破同分时每位评委都要给每支并列队打分） | 全文改为「一人一队一票」，并配套常量 `DEFAULT_CONFLICT_STATEMENT`；⚠️ 该语义**必须**有测试区分（见 M2-4） |
 

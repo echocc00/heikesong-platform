@@ -44,8 +44,14 @@ export function listReviews(db, { stageId, judgeId = null, teamId = null } = {})
 }
 
 export function listReviewCells(db, stageId) {
+  // ⚠️ 软删除的打分**不能**留在进度分母里（终审修正 M-1）：
+  //    `listReviews` 已带 `deleted_at IS NULL`（D-35），这里若不过滤，
+  //    被撤回的维度仍占着「应交」名额 → 进度条永远填不满 / missing 算错。
   return db
-    .prepare('SELECT DISTINCT team_id, dimension FROM stage_reviews WHERE stage_id = ? AND calibrated = 0')
+    .prepare(
+      'SELECT DISTINCT team_id, dimension FROM stage_reviews '
+      + 'WHERE stage_id = ? AND calibrated = 0 AND deleted_at IS NULL',
+    )
     .all(stageId);
 }
 

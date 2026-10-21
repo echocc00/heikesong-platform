@@ -29,6 +29,7 @@ import {
   submitPeerReviews,
   submitSelfReviews,
   declareRecusal,
+  reinstateRecusal,
   submitEnterpriseConfirmation,
 } from '../../services/review.js';
 import { computeStage, getComputation } from '../../services/compute.js';
@@ -136,17 +137,31 @@ export function registerReviewRoutes(router) {
 
   router.add('GET', '/api/stages/:stageId/review-state', async (ctx) => {
     requireUser(ctx);
-    // 权限：组委会 / 有评分读取能力的人 / 本赛段队伍成员（队长看本队自评进度）
+    // 权限：组委会 / 有评分读取能力的人 / 本赛段评委
+    // ⚠️ 终审修正 M-5：原注释写「本赛段队伍成员（队长看本队自评进度）」，
+    //    但闸门**并不**放行队长 → 注释与行为不符（行为更严，不是更松）。
+    //    按实际行为改正注释；若将来要放开队长，需另加一道「只看本队」的过滤，
+    //    不能只把注释改回去。
     if (!isCommittee(ctx)
       && !ctx.can('score:read', { scopeType: 'stage', scopeId: ctx.params.stageId })
       && !ctx.can('score:read', { scopeType: 'global' })
       && !getStageJudge(ctx.db, ctx.params.stageId, ctx.user.id)) {
       throw new AppError(403, 'FORBIDDEN', '没有查看评审进度的权限');
     }
+    // ⚠️ 终审修正 I-1：**必须把该赛段权重表的评委席维度全集传下去**。
+    //    省略 `dimensions` 时服务层退回「已出现过打分的维度」→ 从未有人评过的维度
+    //    不进分母 → 真实完成度 20% 时接口报 100%，`missing` 为空。
+    //    （计划 Task 6 的修正 ④ 修的是「队伍轴」，这里漏的是「维度轴」。）
+    const stateStage = getStage(ctx.db, ctx.params.stageId);
+    const stateConfig = stateStage ? ctx.rules?.scoring?.[stateStage.scoring_config_key] : null;
+    const stateDimensions = (stateConfig?.dimensions ?? [])
+      .filter((d) => d.seat === 'judge')
+      .map((d) => d.key);
     return getReviewState({
       db: ctx.db,
       stageId: ctx.params.stageId,
       viewer: { userId: ctx.user.id, isAdmin: isCommittee(ctx) },
+      dimensions: stateDimensions,
     });
   });
 
@@ -267,6 +282,28 @@ export function registerReviewRoutes(router) {
     }
     if (!getStageJudge(ctx.db, stageId, judgeId)) {
       throw new AppError(404, 'JUDGE_NOT_ASSIGNED', '该评委未被分配到本赛段');
+    }
+    // ⛔ 终审修正 M-4：回避的**撤销**（reinstated）原来只有领域层读侧、没有写路径 ——
+    //    评委误报回避后，其分数被永久剔除，产品内**没有任何途径撤销**。
+    //    ⛔ 撤销**只能由组委会**做：自己申报又自己撤销 = 绕开回避（想不评就不评）。
+    //    所以撤销的权限闸门必须比申报**更严**。
+    const recusalAction = ctx.body?.action ?? 'recused';
+    if (recusalAction === 'reinstated') {
+      if (!committee) {
+        throw new AppError(403, 'FORBIDDEN', '撤销回避只能由组委会执行');
+      }
+      return reinstateRecusal({
+        db: ctx.db,
+        stageId,
+        judgeId,
+        teamId: ctx.body?.teamId ?? null,
+        reason: ctx.body?.reason,
+        actorId: ctx.user.id,
+        now: new Date().toISOString(),
+      });
+    }
+    if (recusalAction !== 'recused') {
+      throw new AppError(400, 'INVALID_RECUSAL_ACTION', `未知的回避动作：${recusalAction}`);
     }
     return declareRecusal({
       db: ctx.db,

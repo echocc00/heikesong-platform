@@ -441,6 +441,41 @@ export function submitSelfReviews({ db, stageId, teamId, items = [], requestId =
 }
 
 /** 回避申报（R-JDG-09）：必须留档 */
+/**
+ * 撤销回避（R-JDG-09 的「撤销」语义；终审修正 M-4 补上写路径）。
+ *
+ * ⛔ 领域层 `checkRecusal` 取**最后一条**记录，`action='reinstated'` 覆盖前面的 `'recused'` ——
+ *    所以撤销的实现是**再写一条**记录，而不是 UPDATE 前一条（记录只增不改，可复算）。
+ * ⚠️ 撤销必须与申报**同一队伍范围**（stage 级回避的 team_id 为 null）——
+ *    否则「赛段级回避」会被一支队的撤销记录意外盖掉。
+ */
+export function reinstateRecusal({ db, stageId, judgeId, teamId = null, reason, actorId = null, now }) {
+  assertStageExists(db, stageId);
+  if (!reason || !String(reason).trim()) {
+    throw fail(400, 'RECUSAL_REASON_REQUIRED', '撤销回避必须填写原因（误报 / 利益关系已澄清 / 其他）');
+  }
+  if (!getStageJudge(db, stageId, judgeId)) {
+    throw fail(404, 'JUDGE_NOT_ASSIGNED', '该评委未被分配到本赛段');
+  }
+  const scoped = listRecusals(db, { stageId, judgeId })
+    .filter((r) => (r.team_id ?? null) === (teamId ?? null));
+  const latest = scoped.length ? scoped[scoped.length - 1] : null;
+  if (!latest) {
+    throw fail(404, 'RECUSAL_NOT_FOUND', '没有找到可撤销的回避记录');
+  }
+  if (latest.action !== 'recused') {
+    throw fail(409, 'RECUSAL_NOT_ACTIVE', '该回避已经被撤销过了');
+  }
+  const row = insertRecusal(db, {
+    stageId, judgeId, teamId, reason, source: 'reinstated', auditBy: actorId, action: 'reinstated', now,
+  });
+  writeAuditLog(db, {
+    actorId, action: 'recusal.reinstate', entity: 'stage', entityId: stageId,
+    detail: { judgeId, teamId, reason, supersedes: latest.id }, now,
+  });
+  return row;
+}
+
 export function declareRecusal({ db, stageId, judgeId, teamId = null, reason, actorId = null, now }) {
   assertStageExists(db, stageId);
   if (!reason || !String(reason).trim()) {
