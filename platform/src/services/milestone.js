@@ -2,6 +2,10 @@
 // 依据：S10 §4 商业里程碑 7 类 + R-ENT-02「企业签字里程碑」
 //   + R-JDG-14（签字必须写清解决哪个环节 / 落地时间 / 我方角色）
 //   + R-PTS-03（S 段只认业务部门签字）+ 规则表 rules/milestones.default.json 的 signoffRequires。
+//   + R-PTS-11（里程碑 7 类即 L2 商业里程碑分的完整类目 —— 规则表在 milestones.default.json）
+//   + R-PTS-12（L2 里程碑与段位**共享「企业签字」这一个数据源**，但**不共享任何一条规则**：
+//        里程碑的类目/签字要求读 milestones.default.json，段位的门槛与权益读 ranks.json，
+//        两边各自独立配置 —— 改段位表**不会**动到里程碑口径，反之亦然）。
 //
 // ⛔ 本模块与 P2 的 enterprise_confirmations 是**两张不同的表**：
 //    这里签的是「这件事到底发生了没有」（客观事实，单签，不进总分）；

@@ -1,6 +1,16 @@
 // src/db/sqlite.js — SQLite 连接封装
 // 依据：设计文档 §4.2。node:sqlite 是同步 API，慢查询会阻塞 event loop，
 //       因此所有 SQL 必须在仓储层预编译 + 参数化。
+//   R-OPS-04（性能）：瓶颈在网络不在计算、数据量极小 ⇒ SQL **全部预编译 + 参数化**，
+//       杜绝拼接（拼接既是注入面也是慢查询来源）；本文件是这条口径的**执行点**。
+//   R-OPS-01（可移植）：整个仓库只依赖 Node **内置**模块（node:sqlite / node:crypto /
+//       node:test），**零 npm 依赖、零原生编译、零联网安装** —— 组员的 Mac/Windows、
+//       组委会云主机、城市联络员机器上跑的是同一份代码，不需要 `npm install`。
+//   R-OPS-07（零 npm 依赖）：同上，但指**依赖面**本身 —— package.json 里没有 dependencies，
+//       仓库里没有 node_modules / package-lock.json（由 test/zero-deps.test.js 扫描钉住）。
+//   R-OPS-08（单文件数据库）：数据库是**一个** .db 文件（本文件是它的连接封装），
+//       不引入任何外部数据库服务；WAL 模式下旁边会有 -wal / -shm 两个附属文件，
+//       但**逻辑上仍是单文件**（备份走 sqlite.backup() 产出一个独立 .db，见 scripts/backup.js）。
 //
 // ⚠️ Node 版本下限 = 22.16.0（package.json engines）。这是两个下限的**并集**：
 //    - 22.13.0：node:sqlite 不再需要 --experimental-sqlite 标志。
