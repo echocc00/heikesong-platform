@@ -2624,7 +2624,9 @@ const tierPayload = () => ({
   rows: [
     { teamId: 't_s', teamName: 'S队', tier: 'S', tierRank: 1, enterpriseName: '某某公司' },
     { teamId: 't_a', teamName: 'A队', tier: 'A', tierRank: 2, enterpriseName: '乙公司' },
-    { teamId: 't_d', teamName: 'D队', tier: 'D', tierRank: 9, enterpriseName: '丙公司', progress: { done: 0, total: 7 } },
+    // ⚠️ D 队行刻意带一个通用的 `rank` 字段：段位榜的排名字段是 `tierRank`，
+    //    但 payload 未必不会带通用 `rank` → 本人进度卡必须把它一起剔掉。
+    { teamId: 't_d', teamName: 'D队', tier: 'D', tierRank: 9, rank: 9, enterpriseName: '丙公司', progress: { done: 0, total: 7 } },
   ],
 });
 const apply = (payload, context, viewer = null, cfg = V) => applyVisibility({
@@ -2709,6 +2711,115 @@ test('配置关闭时字段才会回来（可见性是配置驱动的，不是�
   assert.equal(out.rows[0].enterpriseName, '某某公司');
   assert.equal(payload.rows[0].signatory, '张三', '原对象必须保持不变（不能污染快照）');
 });
+
+test('★ 默认口径必须是【关】：配置漏写时也不公示（fail-closed）', () => {
+  // 互评来源：配置里没有 peerReview 段 → 仍然不公示
+  const peer = apply({
+    scope: 'rank',
+    rows: [{ teamId: 't_a', peerSource: 't_x', fromTeamId: 't_x', fromUserId: 'u_7', peerScore: 5 }],
+  }, { scope: 'rank' }, null, { ...V, peerReview: undefined });
+  for (const k of ['peerSource', 'fromTeamId', 'fromUserId', 'peerScore']) {
+    assert.equal(peer.rows[0][k], undefined, `配置漏写 peerReview 时 ${k} 仍不公示`);
+  }
+
+  // 企业名：配置里没有 rank 段 → 仍然不公示
+  const ent = apply({
+    scope: 'rank',
+    rows: [{ teamId: 't_a', enterpriseName: '某某公司', enterpriseId: 'e_1' }],
+  }, { scope: 'rank' }, null, { ...V, rank: undefined });
+  assert.equal(ent.rows[0].enterpriseName, undefined, '配置漏写 rank 时企业名仍不公示');
+  assert.equal(ent.rows[0].enterpriseId, undefined);
+
+  // B 榜评分：配置里没有 business 段 → 仍然不公示
+  const biz = apply({
+    scope: 'business',
+    rows: [{ teamId: 't_a', score: 88, signatory: '张三', signatoryUserId: 'u_9' }],
+  }, { scope: 'business' }, null, { ...V, business: undefined });
+  assert.equal(biz.rows[0].score, undefined, '配置漏写 business 时评分仍不公示');
+  assert.equal(biz.rows[0].signatory, undefined, '配置漏写 business 时签字人仍不公示');
+
+  // 段位公示起点：配置里没有 publicFromTier → 仍按 C 段起公示（D 段不公示）
+  const tier = apply(tierPayload(), { scope: 'tier' }, null, { ...V, rank: { ...V.rank, publicFromTier: undefined } });
+  assert.deepEqual(tier.rows.map((r) => r.teamId), ['t_s', 't_a'], '漏写 publicFromTier 时仍按 C 段起公示');
+});
+
+test('过滤的输入输出边界：scope 兜底、空 rows、payload 其他字段保留', () => {
+  // scope 优先取 context；context 没有就取 payload.scope
+  const fromPayload = applyVisibility({
+    payload: { scope: 'business', rows: [{ teamId: 't_a', signatory: '张三' }] },
+    viewer: null, visibilityConfig: V, context: {},
+  });
+  assert.equal(fromPayload.rows[0].signatory, undefined, 'scope 从 payload 取时也要按 B 榜口径过滤');
+
+  // payload 没有 rows → 空集，不崩
+  const empty = applyVisibility({ payload: { scope: 'rank' }, viewer: null, visibilityConfig: V, context: { scope: 'rank' } });
+  assert.deepEqual(empty.rows, []);
+
+  // payload 的其他字段（scope / warnings 等）必须原样带出
+  const kept = apply({
+    scope: 'rank', warnings: [{ code: 'x' }], editionId: 'e_1',
+    rows: [{ teamId: 't_a', rank: 1 }],
+  }, { scope: 'rank' });
+  assert.equal(kept.scope, 'rank');
+  assert.equal(kept.editionId, 'e_1');
+  assert.deepEqual(kept.warnings, [{ code: 'x' }]);
+});
+
+test('段位榜：段位顺序取自上下文、旁观者拿不到任何进度卡、本人卡片不含名次', () => {
+  const byOrder = apply(tierPayload(), { scope: 'tier', tierOrder: ['D', 'C', 'B', 'A', 'S'] });
+  assert.deepEqual(byOrder.rows.map((r) => r.teamId), ['t_s', 't_a']);
+
+  // 段位顺序真的取自上下文（换个顺序 → 公示边界跟着变）
+  const custom = apply(tierPayload(), { scope: 'tier', tierOrder: ['C', 'B', 'A', 'S', 'D'] });
+  assert.deepEqual(custom.rows.map((r) => r.teamId), ['t_s', 't_a', 't_d'],
+    'C 排在首位时公示起点变成最低档 → D 也公示');
+
+  // viewerTeamIds（本人可能在多支队里）也要认
+  const multi = apply(tierPayload(), { scope: 'tier', viewerTeamIds: ['t_d'] }, { id: 'u_1' });
+  assert.equal(multi.selfProgress?.teamId, 't_d', 'context.viewerTeamIds 也要认');
+
+  const stranger = apply(tierPayload(), { scope: 'tier' });
+  assert.equal(stranger.selfProgress, undefined, '旁观者拿不到任何人的进度卡');
+
+  // viewer 自带 teamId 时也认（不只认 context.viewerTeamId）
+  const byViewer = apply(tierPayload(), { scope: 'tier' }, { id: 'u_1', teamId: 't_d' });
+  assert.equal(byViewer.selfProgress?.teamId, 't_d', 'viewer.teamId 也要认');
+
+  const self = apply(tierPayload(), { scope: 'tier', viewerTeamId: 't_d' }, { id: 'u_1' });
+  assert.equal(self.selfProgress.tierRank, undefined, '本人进度卡不含段位名次');
+  assert.equal(self.selfProgress.teamName, undefined, '本人进度卡不含队名');
+
+  const noProgress = apply({
+    scope: 'tier',
+    rows: [{ teamId: 't_d', teamName: 'D队', tier: 'D', tierRank: 9 }],
+  }, { scope: 'tier', viewerTeamId: 't_d' }, { id: 'u_1' });
+  assert.equal(noProgress.selfProgress.progress, null, '没有进度时给 null（不是 undefined）');
+});
+
+test('B 榜也清互评来源；个人榜清密码哈希；未知 scope 也清互评来源', () => {
+  const biz = apply({
+    scope: 'business',
+    rows: [{ teamId: 't_a', score: 88, peerSource: 't_x', fromTeamId: 't_x', peerScore: 5 }],
+  }, { scope: 'business' });
+  for (const k of ['peerSource', 'fromTeamId', 'peerScore']) {
+    assert.equal(biz.rows[0][k], undefined, `B 榜的 ${k} 也要清`);
+  }
+
+  const personal = apply({
+    scope: 'personal',
+    rows: [{ userId: 'u_1', name: '张三', total: 41, phone: '13800000000', org: '某公司', idCard: '310', password_hash: 'x' }],
+  }, { scope: 'personal' }, { id: 'u_1' });
+  for (const k of ['phone', 'org', 'idCard', 'password_hash']) {
+    assert.equal(personal.rows[0][k], undefined, `个人榜的 ${k} 要清`);
+  }
+
+  const unknown = apply({
+    scope: 'whatever',
+    rows: [{ teamId: 't_a', peerSource: 't_x', peerScore: 5 }],
+  }, { scope: 'whatever' });
+  assert.equal(unknown.rows[0].peerSource, undefined, '未知 scope 也要清互评来源');
+  assert.equal(unknown.rows[0].peerScore, undefined);
+});
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -2723,7 +2834,7 @@ Run: `cd platform && node --test test/visibility.test.js` → Expected: FAIL —
 //   + 冲突裁决 C-02（C 段及以上公示名次；D 段只给本人进度卡）
 //   ⛔ 可见性必须在 API 层过滤：前端隐藏 = 数据已经发到浏览器 = 任何人都能看到。
 //      前端只负责渲染，不承担过滤职责。
-import { pick } from './util.js';
+import { omit } from './util.js';
 
 const DEFAULT_TIER_ORDER = ['D', 'C', 'B', 'A', 'S'];
 // 互评来源字段：visibility.peerReview.showSource=false 时清空
@@ -2748,8 +2859,12 @@ export function applyVisibility({ payload, viewer, visibilityConfig, context }) 
     ...(viewer?.teamId ? [viewer.teamId] : []),
   ]);
 
-  const peerKeys = cfg.peerReview?.showSource === false ? PEER_SOURCE_KEYS : [];
-  const entKeys = cfg.rank?.showEnterpriseName === false ? ENTERPRISE_NAME_KEYS : [];
+  // ⚠️ 默认必须是【关】而不是【开】：可见性是「不公示」才安全。
+  //    「前端隐藏 = 数据已泄露」—— 配置里没写这个字段时，按「关」处理（fail-closed），
+  //    宁可少公示也不能因为漏配就把互评来源 / 企业名直接发出去。
+  //    （business.scoresPublic / signatoryPublic 一直是 fail-closed，这里对齐口径。）
+  const peerKeys = cfg.peerReview?.showSource !== true ? PEER_SOURCE_KEYS : [];
+  const entKeys = cfg.rank?.showEnterpriseName !== true ? ENTERPRISE_NAME_KEYS : [];
 
   const src = Array.isArray(payload?.rows) ? payload.rows : [];
   const out = { ...(payload || {}), rows: [] };
@@ -2802,7 +2917,7 @@ export function applyVisibility({ payload, viewer, visibilityConfig, context }) 
 
 - [ ] **Step 4: 运行测试确认通过**
 
-Run: `cd platform && node --test test/visibility.test.js` → Expected: PASS（5 个测试全过：visibility.test.js 5）
+Run: `cd platform && node --test test/visibility.test.js` → Expected: PASS（**9** 个测试全过：visibility.test.js 9 —— 规格自带 5 + 变异检验补测 4；变异体 31 → KILLED 31 / 等价 0 / 有效缺口 0）
 
 - [ ] **Step 5: 提交**
 
@@ -4448,3 +4563,34 @@ git commit -m "feat(P3): 榜单页、段位榜与战绩卡前端"
 **Task 5 的测试条数口径**：behavior **15**（规格自带 5 + 预审补测 1 + 变异检验补测 9）。
 
 **最终结果**：变异体 28 → **KILLED 28 / 等价变异体 0 / 有效缺口 0**；`behavior.test.js` **15/15**；P3 全量 **645/645**。
+
+---
+
+## Task 6 父代理预审修正台账（2026-10-21）
+
+> Task 6 是**可见性**的落地：唯一过滤入口（前端隐藏 = 数据已泄露）+ C-02 段位公示裁决。
+> 实施前把规格的代码块抽到 `/tmp` 的独立工程实跑（**先跑后派**）——
+> 这次规格**连模块都加载不了**（见 P3-20），修正后 9/9 全绿。
+> 变异体 **31** 个 → **KILLED 31 / 等价 0 / 有效缺口 0**。
+
+### 一、预审发现的规格缺陷
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| **P3-20** | **Important** | **规格的 import 写的是 `pick` —— Task 2 已经把它改名成 `omit`** —— 按原样落地**整个模块加载失败** | 实跑：`SyntaxError: The requested module './util.js' does not provide an export named 'pick'` → `visibility.test.js` **一条用例都跑不起来**。这不是新问题，是 **Task 2 台账 P3-6 明确留下的承诺**：「改名 `omit` 并改正文档注释；Task 6 的 6 处调用点同步改名（**在 Task 6 落地时一并改**，本阶段只改定义侧）」。规格里 6 处调用点**本来就写的是 `omit`**，只有 import 行是旧的 —— 说明这两处**不是同一次编辑** | import 改成 `omit` → **兑现 Task 2 的 P3-6 承诺**。⚠️ 这条的价值不在「修一个 typo」，而在于它证明了**跨 Task 的改名承诺必须留痕**：Task 2 台账不写那句「Task 6 落地时一并改」，这个洞就会一直留到集成时才炸 |
+| **P3-21** | Minor | **可见性的默认值是【fail-open】** —— `peerReview.showSource === false` 与 `rank.showEnterpriseName === false`：**配置里没写这两个字段时判定为「公示」**。而同一个函数里 `business.scoresPublic` / `signatoryPublic` 用的是 `!== true`（fail-closed）→ **同一个函数里两套口径** | 代码对照：`peerKeys` / `entKeys` 用 `=== false`，`drop.push('score'…)` / `drop.push('signatory'…)` 用 `!== true`。后果：配置里**漏写** `peerReview` 段 → 互评来源（`peerSource` / `fromTeamId` / `fromUserId` / `peerScore`）**直接发到浏览器**；漏写 `rank` 段 → 企业名 + 企业 id 全部公开 | 全部改成 `!== true`（**fail-closed**）：「不公示才安全」。⚠️ 出厂配置这两个字段本来都是 `false` → **生产行为完全不变**，只是把「漏配就泄露」的口子堵上。补「默认口径必须是【关】」用例（4 组漏配场景全钉住） |
+
+### 二、变异检验
+
+> 变异体 **31** 个（scope 取值 / 段位顺序来源 / 本人队伍的三种来源 / 空 rows 与 payload 其他字段 /
+> **四个 fail-closed 判定** / 公示起点兜底 / 五个分支的路由 / 各分支内部的剔除清单 /
+> 本人进度卡的四个字段 / isSelf 判定 / 两个字段清单 / 写回 rows …），
+> 在 `/tmp` 副本上跑 `visibility.test.js`，**测试必须失败才算杀灭**。变异脚本：`/tmp/p3t6/mutate.mjs`。
+
+首轮有 **1 条存活**（V21：本人进度卡保留名次）—— 根因是**夹具里 D 队行压根没有 `rank` 字段**，
+省掉这个剔除项在数据上看不出差别。处置：给 D 队行**刻意补一个通用 `rank` 字段**，
+把这条防御性剔除钉住（段位榜的排名字段是 `tierRank`，但 payload 未必不会带通用 `rank`）。
+
+**Task 6 的测试条数口径**：visibility **9**（规格自带 5 + 变异检验补测 4）。
+
+**最终结果**：变异体 31 → **KILLED 31 / 等价变异体 0 / 有效缺口 0**；`visibility.test.js` **9/9**；P3 全量 **654/654**。
