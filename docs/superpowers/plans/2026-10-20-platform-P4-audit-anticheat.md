@@ -2012,7 +2012,11 @@ git commit -m "feat(P4): 三层限频（落库）+ 评委级小时配额 + 幂�
 - Test: `platform/test/field-dictionary.test.js`
 
 **Interfaces:**
-- Consumes: Task 1 的 `createFlag` / `findOpenFlag` / `listFlagRows` / `resolveFlagRow` / `writeAuditLog`
+- Consumes: Task 1 的 `createFlag` / `listFlagRows` / `resolveFlagRow` / `writeAuditLog`
+  - ⚠️ **预审修正**：原写法还消费 `findOpenFlag`，但它的粗键 `(kind, stage_id, team_id, judge_id)`
+    分不开「同 kind 的不同问题」（两个不同的多账号分组在粗键下 team_id / judge_id 都是 NULL →
+    第二个被当成「重复」丢掉 = **真问题被漏报**）。去重改为「同 kind + 同赛段 + **同明细内容**」
+    （见台账 P4-T4-D4）。`findOpenFlag` 仍留在仓储层，本阶段不再调用。
 - Produces（领域层，纯函数：无 IO / 无 `Date.now()` / 无 `Math.random()`）：
   - `detectIdenticalPeerPattern({ peerReviews, minOverlap })` → `{ flags }`
   - `detectBurstSubmission({ events, windowSeconds, threshold })` → `{ flags, maxCount }`
@@ -2022,9 +2026,13 @@ git commit -m "feat(P4): 三层限频（落库）+ 评委级小时配额 + 幂�
   - `normalizeEvidence({ items })` → `{ columns, items, uniquePublishers, dropped, violations }`（R-AUD-04）
   - `assertKnownFields(kind, detail)` / `assertMutuallyExclusive(detail)` / `assertConfidenceLabel(v)`（R-AUD-06）
 - Produces（服务层）：
-  - `runDetection({ db, stageId, peerReviews, events, scoreStats, users, rules, now })` → `{ created, skipped, flags }`
+  - `runDetection({ db, stageId, peerReviews, events, scoreStats, users, rules, now, extraCandidates? })` → `{ created, skipped }`
+    - ⚠️ **预审修正**：原 Interfaces 写的是 `{ created, skipped, flags }`，但实现从来只返回前两个键（写接口契约就是错的）
+    - `extraCandidates` 是扩展点：追加候选 flag（默认空），给「还没进检测器模块的新检测器」用；
+      同时给「字段字典闸」一条可测的入口（候选里带越界字段 → 必须 400，不进库）
   - `resolveFlag({ db, flagId, status, reviewerId, reason, evidence, now })` → flag
   - `listFlags({ db, filter, viewer })` → `{ rows, total }`
+  - `assertFlagDetail(flag)` → `string[]`（字段字典闸，R-AUD-06；抽成导出函数才能被单独测到）
   - `buildReverseAuditTasks({ results, signoffs, topN })` → `[{ teamId, rank, signoffs, instruction }]`（R-JDG-16）
 
 > **⚠️ 检测 ≠ 处罚（本阶段的硬边界，写进代码注释与验收标准）**
@@ -2049,7 +2057,8 @@ import {
   detectMultiAccount, detectTiedMutualPeerRate,
 } from '../src/domain/anticheat.js';
 import { normalizeEvidence } from '../src/domain/evidence.js';
-import { runDetection, resolveFlag, listFlags, buildReverseAuditTasks } from '../src/services/anticheat.js';
+import { assertKnownFields } from '../src/domain/field-dictionary.js';
+import { runDetection, resolveFlag, listFlags, buildReverseAuditTasks, assertFlagDetail } from '../src/services/anticheat.js';
 import { queryAuditLog } from '../src/db/repo/audit-log.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -2059,10 +2068,38 @@ function setup() {
   const dataDir = mkdtempSync(join(tmpdir(), 'hks-p4ac-'));
   const { db, close } = openDatabase({ dataDir });
   applyMigrations(db, migrationsDir);
+  seedRefs(db);
   return { db, close, dataDir };
 }
 
+/**
+ * 造出被外键引用的行。
+ * ⚠️ 规格原写法直接用 reviewerId='u_admin' 写审计日志，
+ *    但 audit_log.actor_id REFERENCES users(id) —— **不建被引用的行就会
+ *    FOREIGN KEY constraint failed**。这不是测试写得随意，是规格自带缺陷：照抄必然红
+ *    （与 P4 Task 1 的 audit-repo.test.js 同一个坑）。
+ */
+function seedRefs(db) {
+  db.exec(`
+    INSERT INTO users (id, name, phone, password_hash, mba_status, org, is_superadmin, active, created_at)
+    VALUES ('u_admin','组委会','13900000999','x','mba',NULL,1,1,'2026-10-20T00:00:00.000Z');
+  `);
+}
+
 const VIEWER = { id: 'u_admin', is_superadmin: 1, active: 1 };
+
+// 统一的规则集（与 rules/audit.json 的 antiCheat 段同值，见 P4 计划 Task 3）
+const RULES = {
+  audit: {
+    antiCheat: {
+      identicalPeer: { minOverlap: 3 },
+      burst: { windowSeconds: 60, threshold: 5 },
+      lowVariance: { min: 3, max: 25 },
+      multiAccount: { keyFields: ['phone'] },
+      tiedMutualPeerRate: { threshold: 0.8 },
+    },
+  },
+};
 
 test('互评相对顺序完全相同 → 疑似串通，进复核队列', () => {
   const peerReviews = [
@@ -2072,15 +2109,35 @@ test('互评相对顺序完全相同 → 疑似串通，进复核队列', () => 
   const r = detectIdenticalPeerPattern({ peerReviews, minOverlap: 3 });
   assert.equal(r.flags.length, 0, '顺序相反不算串通');
 
+  // ⛔ 预审修正（P4-T4-D1）：这里的"同序"数据集原来给反了 ——
+  //    j2 打 (60,70,80) 的相对顺序是 t3>t2>t1，与 j1 的 t1>t2>t3 **正好相反**，
+  //    检测器判「顺序不一致 → 不串通」是对的，用例却期望报 1 条 → 必然红。
+  //    现在 j2 打 (60,50,40)：与 j1 同序（t1>t2>t3），但绝对分差一大截（不是照抄分数）。
   const same = [
     { judgeId: 'j1', teamId: 't1', score: 90 }, { judgeId: 'j1', teamId: 't2', score: 80 }, { judgeId: 'j1', teamId: 't3', score: 70 },
-    { judgeId: 'j2', teamId: 't1', score: 60 }, { judgeId: 'j2', teamId: 't2', score: 70 }, { judgeId: 'j2', teamId: 't3', score: 80 },
+    { judgeId: 'j2', teamId: 't1', score: 60 }, { judgeId: 'j2', teamId: 't2', score: 50 }, { judgeId: 'j2', teamId: 't3', score: 40 },
   ];
   const r2 = detectIdenticalPeerPattern({ peerReviews: same, minOverlap: 3 });
   assert.equal(r2.flags.length, 1);
   assert.equal(r2.flags[0].kind, 'identical_peer_pattern');
   assert.deepEqual([r2.flags[0].voterA, r2.flags[0].voterB].sort(), ['j1', 'j2']);
   assert.equal(r2.flags[0].overlap, 3);
+  assert.deepEqual(r2.flags[0].targets, ['t1', 't2', 't3']);
+  assert.equal(r2.flags[0].matchRatio, 1);
+  assert.equal(r2.flags[0].action, 'alert_only');
+});
+
+test('互评：也认 fromId/toId 别名（与 judgeId/teamId 等价）', () => {
+  // 互评来源在别处可能叫 fromId/toId —— 两种写法必须等价，否则换个来源就检测不出来。
+  const alias = [
+    { fromId: 'j1', toId: 't1', score: 90 }, { fromId: 'j1', toId: 't2', score: 80 }, { fromId: 'j1', toId: 't3', score: 70 },
+    { fromId: 'j2', toId: 't1', score: 60 }, { fromId: 'j2', toId: 't2', score: 50 }, { fromId: 'j2', toId: 't3', score: 40 },
+  ];
+  const r = detectIdenticalPeerPattern({ peerReviews: alias, minOverlap: 3 });
+  assert.equal(r.flags.length, 1, '别名写法也要能检出同序');
+  assert.equal(r.flags[0].voterA, 'j1');
+  assert.equal(r.flags[0].voterB, 'j2');
+  assert.deepEqual(r.flags[0].targets, ['t1', 't2', 't3']);
 });
 
 test('重叠项目少于 minOverlap 时不报（样本太少没有判定力）', () => {
@@ -2092,6 +2149,20 @@ test('重叠项目少于 minOverlap 时不报（样本太少没有判定力）',
   assert.equal(r.flags.length, 0);
 });
 
+test('互评：重叠数**刚好等于** minOverlap 也要报（阈值的另一侧）', () => {
+  // 判别性数据：3 组重叠 = minOverlap → 必须报；少一组（2 组）→ 不报。
+  // 只测「少于阈值」测不出 minOverlap 被写成 `<` 还是 `<=`。
+  const three = [
+    { judgeId: 'j1', teamId: 't1', score: 90 }, { judgeId: 'j1', teamId: 't2', score: 80 }, { judgeId: 'j1', teamId: 't3', score: 70 },
+    { judgeId: 'j2', teamId: 't1', score: 60 }, { judgeId: 'j2', teamId: 't2', score: 50 }, { judgeId: 'j2', teamId: 't3', score: 40 },
+  ];
+  const r = detectIdenticalPeerPattern({ peerReviews: three, minOverlap: 3 });
+  assert.equal(r.flags.length, 1, '重叠数正好等于 minOverlap 必须报');
+  const two = three.filter((x) => x.teamId !== 't3');
+  const r2 = detectIdenticalPeerPattern({ peerReviews: two, minOverlap: 3 });
+  assert.equal(r2.flags.length, 0, '重叠数比 minOverlap 少一个必须不报');
+});
+
 test('突发提交：窗口内提交数超阈值才报', () => {
   const events = [
     { subjectId: 'j1', at: '2026-10-20T00:00:00.000Z' },
@@ -2101,6 +2172,7 @@ test('突发提交：窗口内提交数超阈值才报', () => {
   ];
   const r = detectBurstSubmission({ events, windowSeconds: 60, threshold: 3 });
   assert.equal(r.flags.length, 0, '刚好等于阈值不报');
+  assert.equal(r.maxCount, 3, 'maxCount 要如实反映窗口内最大提交数');
 
   const events2 = [...events, { subjectId: 'j1', at: '2026-10-20T00:00:15.000Z' }];
   const r2 = detectBurstSubmission({ events: events2, windowSeconds: 60, threshold: 3 });
@@ -2108,6 +2180,7 @@ test('突发提交：窗口内提交数超阈值才报', () => {
   assert.equal(r2.flags[0].kind, 'burst_submit');
   assert.equal(r2.flags[0].subjectId, 'j1');
   assert.equal(r2.flags[0].count, 4);
+  assert.equal(r2.flags[0].action, 'alert_only');
 });
 
 test('突发提交：窗口外的提交不计入', () => {
@@ -2120,10 +2193,40 @@ test('突发提交：窗口外的提交不计入', () => {
   assert.equal(r.flags.length, 0);
 });
 
+test('突发提交：同一主体只报一次（连续爆发不重复报）', () => {
+  // 判别性数据：窗口内 6 次提交、阈值 3 —— 循环里每多一个 end 都会再次越过阈值。
+  //   「同一主体只报一次」的 break 在不在，结果差 3 倍（1 条 vs 3 条）。
+  const events = Array.from({ length: 6 }, (_, i) => ({
+    subjectId: 'j1', at: `2026-10-20T00:00:0${i}.000Z`,
+  }));
+  const r = detectBurstSubmission({ events, windowSeconds: 60, threshold: 3 });
+  assert.equal(r.flags.length, 1, '同一主体只报最早的那次爆发');
+  assert.equal(r.flags[0].count, 4);
+});
+
+test('突发提交：窗口边界 —— 相隔正好 windowSeconds 算同一窗口（判别性数据）', () => {
+  // 判别性数据：窗口是「开区间右闭」—— 差值**正好**等于窗口长度仍算同一窗口，
+  // 差 1 毫秒才算出窗。只测「差 10 分钟」测不出 `>` 写成 `>=`。
+  const inside = [
+    { subjectId: 'j1', at: '2026-10-20T00:00:00.000Z' },
+    { subjectId: 'j1', at: '2026-10-20T00:01:00.000Z' },
+  ];
+  const r = detectBurstSubmission({ events: inside, windowSeconds: 60, threshold: 1 });
+  assert.equal(r.flags.length, 1, '正好相隔 60 秒仍算同一窗口');
+  assert.equal(r.flags[0].count, 2);
+
+  const outside = [
+    { subjectId: 'j1', at: '2026-10-20T00:00:00.000Z' },
+    { subjectId: 'j1', at: '2026-10-20T00:01:00.001Z' },
+  ];
+  const r2 = detectBurstSubmission({ events: outside, windowSeconds: 60, threshold: 1 });
+  assert.equal(r2.flags.length, 0, '超出窗口 1 毫秒就不算同一窗口');
+});
+
 test('评委打分方差异常小/大都告警，但标死 action=alert_only（只告警不处罚）', () => {
   const scoreStats = [
     { judgeId: 'j1', dimension: 'innovation', n: 10, mean: 80, sum_sq: 64000 },  // stdev = 0
-    { judgeId: 'j2', dimension: 'innovation', n: 10, mean: 70, sum_sq: 100000 }, // stdev ≈ 47
+    { judgeId: 'j2', dimension: 'innovation', n: 10, mean: 70, sum_sq: 100000 }, // stdev ≈ 75.2773
   ];
   const r = detectLowVariance({ scoreStats, threshold: { min: 3, max: 25 } });
   assert.equal(r.flags.length, 2);
@@ -2131,10 +2234,53 @@ test('评委打分方差异常小/大都告警，但标死 action=alert_only（�
   const high = r.flags.find((f) => f.judgeId === 'j2');
   assert.equal(low.direction, 'too_low');
   assert.equal(high.direction, 'too_high');
+  assert.equal(low.stdev, 0);
+  assert.equal(high.stdev, 75.277265);
   for (const f of r.flags) {
     assert.equal(f.action, 'alert_only', '检测器不得产出任何处罚动作');
     assert.equal(f.kind, 'low_variance');
   }
+});
+
+test('低方差：stdev 恰好等于 min / max 时不报（严格不等号，判别性数据）', () => {
+  // 判别性数据：[0,0,0,6] 的 stdev 恰好 3；[0,0,0,50] 的 stdev 恰好 25。
+  // 阈值写 `<` 还是 `<=` 只有在这种「恰好打平」的数据上才分得开。
+  const scoreStats = [
+    { judgeId: 'j_edge_low', dimension: 'innovation', n: 4, mean: 1.5, sum_sq: 36 },   // stdev = 3
+    { judgeId: 'j_edge_high', dimension: 'innovation', n: 4, mean: 12.5, sum_sq: 2500 }, // stdev = 25
+  ];
+  const r = detectLowVariance({ scoreStats, threshold: { min: 3, max: 25 } });
+  assert.equal(r.flags.length, 0, '恰好打平阈值不报（严格不等号）');
+
+  const loose = detectLowVariance({ scoreStats, threshold: { min: 3.5, max: 25 } });
+  assert.equal(loose.flags.length, 1, '阈值放宽一点点，stdev=3 就该报');
+  assert.equal(loose.flags[0].judgeId, 'j_edge_low');
+
+  const strict = detectLowVariance({ scoreStats, threshold: { min: 3, max: 24.5 } });
+  assert.equal(strict.flags.length, 1, '阈值收紧一点点，stdev=25 就该报');
+  assert.equal(strict.flags[0].judgeId, 'j_edge_high');
+});
+
+test('低方差：脏数据（sum_sq < n·mean²）按方差 0 处理，不产生 NaN', () => {
+  // n=2, mean=5, sum_sq=10 → 真实方差是负数（脏数据）。
+  // 原来靠 Math.max(0, ...) 兜住；去掉兜底就出 NaN，而 NaN 与任何阈值的比较都是 false
+  // → 脏数据会被**静默放过**（该报的极端评分不报）。
+  const r = detectLowVariance({
+    scoreStats: [{ judgeId: 'j_dirty', dimension: 'innovation', n: 2, mean: 5, sum_sq: 10 }],
+    threshold: { min: 3, max: 25 },
+  });
+  assert.equal(r.flags.length, 1);
+  assert.equal(r.flags[0].stdev, 0);
+  assert.equal(r.flags[0].direction, 'too_low');
+});
+
+test('低方差：n=1 不报（单样本没有方差可言）', () => {
+  // 判别性数据：n=1 时 stdev 被兜底成 0，若不守 n>1 就会把「只有一个打分」误报成方差异常小。
+  const r = detectLowVariance({
+    scoreStats: [{ judgeId: 'j_single', dimension: 'innovation', n: 1, mean: 80, sum_sq: 6400 }],
+    threshold: { min: 3, max: 25 },
+  });
+  assert.equal(r.flags.length, 0, '单样本不构成方差异常');
 });
 
 test('多账号：同一手机号（规范化后）注册多个账号被识别', () => {
@@ -2147,6 +2293,8 @@ test('多账号：同一手机号（规范化后）注册多个账号被识别',
   assert.equal(r.flags.length, 1);
   assert.equal(r.flags[0].kind, 'multi_account');
   assert.deepEqual(r.flags[0].userIds.sort(), ['u1', 'u2']);
+  assert.equal(r.flags[0].count, 2);
+  assert.equal(r.flags[0].action, 'alert_only');
 });
 
 test('多账号：同一企业注册多个账号被识别', () => {
@@ -2169,6 +2317,17 @@ test('多账号：不同手机号不同企业不报', () => {
   assert.equal(r.flags.length, 0);
 });
 
+test('多账号：同一个人重复出现只算一个账号（空手机号不参与分组）', () => {
+  const users = [
+    { id: 'u1', phone: '13800000001' },
+    { id: 'u1', phone: '13800000001' },
+    { id: 'u2', phone: '' },
+    { id: 'u3', phone: '   ' },
+  ];
+  const r = detectMultiAccount({ users, keyFields: ['phone'] });
+  assert.equal(r.flags.length, 0, '同一 id 重复出现 + 空手机号 → 不构成多账号');
+});
+
 test('同分互投率过高 → 告警（R-RNK-08）', () => {
   const peerReviews = [
     { fromId: 't1', toId: 't2', score: 90 }, { fromId: 't2', toId: 't1', score: 88 },
@@ -2182,6 +2341,37 @@ test('同分互投率过高 → 告警（R-RNK-08）', () => {
   assert.equal(r.flags.length, 1);
   assert.equal(r.flags[0].kind, 'tied_mutual_peer_rate');
   assert.equal(r.flags[0].rate, 1);
+});
+
+test('同分互投率：真实互投率低于阈值不报，阈值降一点就报（判别性数据）', () => {
+  // ⛔ 预审修正（P4-T4-D3）：分母原来写成「互投的对数」→ rate 恒为 1，阈值形同虚设。
+  //    判别性数据：3 支同分队伍，候选对 3 组（A-B / A-C / B-C），其中 2 组互投
+  //    → 真实互投率 2/3 = 0.6667。阈值 0.8 → 不报；阈值 0.6 → 报。
+  const peerReviews = [
+    { fromId: 'A', toId: 'B' }, { fromId: 'B', toId: 'A' },
+    { fromId: 'A', toId: 'C' }, { fromId: 'C', toId: 'A' },
+  ];
+  const results = [{ teamId: 'A', rank: 1 }, { teamId: 'B', rank: 1 }, { teamId: 'C', rank: 1 }];
+  const low = detectTiedMutualPeerRate({ peerReviews, results, threshold: 0.8 });
+  assert.equal(low.flags.length, 0, '互投率 0.6667 < 0.8 → 不报');
+  const mid = detectTiedMutualPeerRate({ peerReviews, results, threshold: 0.6 });
+  assert.equal(mid.flags.length, 1, '阈值降到 0.6 → 报');
+  assert.equal(mid.flags[0].rate, 0.6667);
+  assert.equal(mid.flags[0].tiedPairs.length, 2);
+  assert.equal(mid.flags[0].rank, 1);
+  assert.equal(mid.flags[0].action, 'alert_only');
+});
+
+test('同分互投率：互投率恰好等于阈值要报（严格小于才跳过）', () => {
+  // 判别性数据：5 支同分队伍，候选对 10 组，其中 8 组互投 → rate 恰好 0.8。
+  // 阈值 0.8 时必须报（`rate < threshold` 是严格小于）。
+  const mutual = [['A', 'B'], ['A', 'C'], ['A', 'D'], ['A', 'E'], ['B', 'C'], ['B', 'D'], ['B', 'E'], ['C', 'D']];
+  const peerReviews = mutual.flatMap(([a, b]) => [{ fromId: a, toId: b }, { fromId: b, toId: a }]);
+  const results = ['A', 'B', 'C', 'D', 'E'].map((teamId) => ({ teamId, rank: 1 }));
+  const r = detectTiedMutualPeerRate({ peerReviews, results, threshold: 0.8 });
+  assert.equal(r.flags.length, 1);
+  assert.equal(r.flags[0].rate, 0.8);
+  assert.equal(r.flags[0].tiedPairs.length, 8);
 });
 
 test('证据三列：缺列必须显式报错，不静默丢弃', () => {
@@ -2204,29 +2394,155 @@ test('证据三列：按发行方去重，不按 URL 计数', () => {
   assert.equal(r.dropped[0].url, 'https://b.example/2');
 });
 
+test('证据三列：同一 URL 不同发行方**不合并**（去重按发行方，不按 URL）', () => {
+  const r = normalizeEvidence({
+    items: [
+      { url: 'https://same.example/1', publisher: '媒体甲', independent: true },
+      { url: 'https://same.example/1', publisher: '媒体乙', independent: true },
+    ],
+  });
+  assert.equal(r.items.length, 2, '两个发行方 = 两个独立信源，哪怕 URL 一样');
+  assert.equal(r.uniquePublishers, 2);
+  assert.equal(r.dropped.length, 0);
+});
+
+test('证据三列：发行方大小写 / 首尾空白不同算同一个发行方', () => {
+  const r = normalizeEvidence({
+    items: [
+      { url: 'https://a.example/1', publisher: 'Reuters', independent: true },
+      { url: 'https://b.example/2', publisher: ' reuters ', independent: true },
+    ],
+  });
+  assert.equal(r.items.length, 1, '规范化后是同一个发行方 → 合并');
+  assert.equal(r.uniquePublishers, 1);
+  assert.equal(r.dropped.length, 1);
+  assert.equal(r.dropped[0].keptUrl, 'https://a.example/1');
+});
+
+test('证据三列：independent 只接受布尔或字符串 "true"', () => {
+  const r = normalizeEvidence({
+    items: [
+      { url: 'https://a.example/1', publisher: '甲', independent: 'true' },
+      { url: 'https://b.example/2', publisher: '乙', independent: 'yes' },
+    ],
+  });
+  assert.equal(r.items.length, 2);
+  assert.equal(r.items[0].independent, true);
+  assert.equal(r.items[1].independent, false);
+});
+
 test('runDetection 把检测结果写进 flagged_reviews，且不重复建同一 flag', () => {
   const { db, close, dataDir } = setup();
   const args = {
     db,
     stageId: 'st1',
     peerReviews: [
+      // ⛔ 预审修正（P4-T4-D1）：j2 原来打 (60,70,80) → 与 j1 顺序相反 → 检测器正确地不报，
+      //    用例却期望报 1 条。改成同序的 (60,50,40)。
       { judgeId: 'j1', teamId: 't1', score: 90 }, { judgeId: 'j1', teamId: 't2', score: 80 }, { judgeId: 'j1', teamId: 't3', score: 70 },
-      { judgeId: 'j2', teamId: 't1', score: 60 }, { judgeId: 'j2', teamId: 't2', score: 70 }, { judgeId: 'j2', teamId: 't3', score: 80 },
+      { judgeId: 'j2', teamId: 't1', score: 60 }, { judgeId: 'j2', teamId: 't2', score: 50 }, { judgeId: 'j2', teamId: 't3', score: 40 },
     ],
     events: [],
     scoreStats: [],
     users: [],
-    rules: { audit: { antiCheat: { identicalPeer: { minOverlap: 3 }, burst: { windowSeconds: 60, threshold: 5 }, lowVariance: { min: 3, max: 25 }, multiAccount: { keyFields: ['phone'] }, tiedMutualPeerRate: { threshold: 0.8 } } } },
+    rules: RULES,
     now: '2026-10-20T00:00:00.000Z',
   };
   const first = runDetection(args);
   assert.equal(first.created.length, 1);
   assert.equal(first.created[0].kind, 'identical_peer_pattern');
+  // 检测也要留痕：flag.detected 审计日志是「检测 ≠ 处罚」的对账底账
+  const detected = queryAuditLog(db, { action: 'flag.detected' });
+  assert.equal(detected.rows.length, 1, '每次检出都要写一条审计日志');
+  assert.equal(detected.rows[0].entity_id, first.created[0].id);
   const second = runDetection(args);
   assert.equal(second.created.length, 0, '同一问题不得重复建 flag');
   assert.equal(second.skipped.length, 1);
   close();
   rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('runDetection：同 kind 的**不同**问题各建各的 flag（粗去重键会漏报）', () => {
+  // ⛔ 预审修正（P4-T4-D4）：原来按 (kind, stage, team, judge) 粗键去重 ——
+  //    两个不同的多账号分组在粗键下 team_id / judge_id 都是 NULL → 第二个被当成重复丢掉。
+  const { db, close, dataDir } = setup();
+  const users = [
+    { id: 'u1', phone: '13800000001' }, { id: 'u2', phone: '13800000001' },
+    { id: 'u3', phone: '13800000002' }, { id: 'u4', phone: '13800000002' },
+  ];
+  const r = runDetection({
+    db, stageId: 'st1', peerReviews: [], events: [], scoreStats: [], users, rules: RULES,
+    now: '2026-10-20T00:00:00.000Z',
+  });
+  assert.equal(r.created.length, 2, '两个不同的多账号分组 = 两个问题 = 两条 flag');
+  assert.deepEqual(r.created.map((c) => c.detail.keyValue).sort(), ['13800000001', '13800000002']);
+
+  const again = runDetection({
+    db, stageId: 'st1', peerReviews: [], events: [], scoreStats: [], users, rules: RULES,
+    now: '2026-10-20T00:01:00.000Z',
+  });
+  assert.equal(again.created.length, 0, '重跑不得重复建');
+  assert.equal(again.skipped.length, 2, '两个问题都应被识别为已存在');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('同一个问题：明细键顺序不同也算重复（不重建 flag）', () => {
+  // 判别性数据：库里存的是**键顺序不同**的同一份明细（模拟旧版本写下的行）。
+  //   比较若不做键排序，就会把它当成新问题 → 同一个问题被反复建 flag。
+  const { db, close, dataDir } = setup();
+  db.prepare(
+    `INSERT INTO flagged_reviews (id, stage_id, submission_id, team_id, judge_id, kind, detail_json, status, reviewed_by, reviewed_at, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'open', NULL, NULL, ?)`,
+  ).run(
+    'fl_manual', 'st1', null, null, 'j1', 'burst_submit',
+    JSON.stringify({
+      action: 'alert_only',
+      windowEnd: '2026-10-20T00:00:05.000Z',
+      count: 6,
+      kind: 'burst_submit',
+      windowStart: '2026-10-20T00:00:00.000Z',
+      subjectId: 'j1',
+    }),
+    '2026-10-20T00:00:00.000Z',
+  );
+  const events = Array.from({ length: 6 }, (_, i) => ({
+    subjectId: 'j1', at: `2026-10-20T00:00:0${i}.000Z`,
+  }));
+  const r = runDetection({
+    db, stageId: 'st1', peerReviews: [], events, scoreStats: [], users: [], rules: RULES,
+    now: '2026-10-20T00:10:00.000Z',
+  });
+  assert.equal(r.created.length, 0, '同一份明细（键顺序不同）不得重建 flag');
+  assert.equal(r.skipped.length, 1);
+  assert.equal(r.skipped[0].flagId, 'fl_manual');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('五个检测器的产出全部 action=alert_only，且全部通过字段字典（P4-7 + R-AUD-06）', () => {
+  const peerReviews = [
+    { judgeId: 'j1', teamId: 't1', score: 90 }, { judgeId: 'j1', teamId: 't2', score: 80 },
+    { judgeId: 'j2', teamId: 't1', score: 60 }, { judgeId: 'j2', teamId: 't2', score: 50 },
+  ];
+  const events = Array.from({ length: 6 }, (_, i) => ({ subjectId: 'j1', at: `2026-10-20T00:00:0${i}.000Z` }));
+  const scoreStats = [{ judgeId: 'j1', dimension: 'innovation', n: 10, mean: 80, sum_sq: 64000 }];
+  const users = [{ id: 'u1', phone: '13800000001' }, { id: 'u2', phone: '13800000001' }];
+  const results = [{ teamId: 't1', rank: 1 }, { teamId: 't2', rank: 1 }];
+  const mutual = [{ fromId: 't1', toId: 't2' }, { fromId: 't2', toId: 't1' }];
+
+  const all = [
+    ...detectIdenticalPeerPattern({ peerReviews, minOverlap: 2 }).flags,
+    ...detectBurstSubmission({ events, windowSeconds: 60, threshold: 5 }).flags,
+    ...detectLowVariance({ scoreStats, threshold: { min: 3, max: 25 } }).flags,
+    ...detectMultiAccount({ users, keyFields: ['phone'] }).flags,
+    ...detectTiedMutualPeerRate({ peerReviews: mutual, results, threshold: 0.8 }).flags,
+  ];
+  assert.equal(all.length, 5, '五个检测器各命中一条');
+  for (const f of all) {
+    assert.equal(f.action, 'alert_only', `${f.kind} 不得产出处罚动作`);
+    assert.deepEqual(assertKnownFields(f.kind, f), [], `${f.kind} 的字段必须都在字典里`);
+  }
 });
 
 test('裁决 flag 会写审计日志，且证据按发行方去重后落库', () => {
@@ -2238,7 +2554,7 @@ test('裁决 flag 会写审计日志，且证据按发行方去重后落库', ()
     events: [{ subjectId: 'j1', at: '2026-10-20T00:00:00.000Z' }, { subjectId: 'j1', at: '2026-10-20T00:00:01.000Z' }, { subjectId: 'j1', at: '2026-10-20T00:00:02.000Z' }, { subjectId: 'j1', at: '2026-10-20T00:00:03.000Z' }, { subjectId: 'j1', at: '2026-10-20T00:00:04.000Z' }, { subjectId: 'j1', at: '2026-10-20T00:00:05.000Z' }],
     scoreStats: [],
     users: [],
-    rules: { audit: { antiCheat: { identicalPeer: { minOverlap: 3 }, burst: { windowSeconds: 60, threshold: 5 }, lowVariance: { min: 3, max: 25 }, multiAccount: { keyFields: ['phone'] }, tiedMutualPeerRate: { threshold: 0.8 } } } },
+    rules: RULES,
     now: '2026-10-20T00:00:00.000Z',
   });
   assert.equal(created.length, 1);
@@ -2257,6 +2573,10 @@ test('裁决 flag 会写审计日志，且证据按发行方去重后落库', ()
   });
   assert.equal(out.status, 'confirmed');
   assert.equal(out.detail.evidence.uniquePublishers, 1, '按发行方去重');
+  assert.equal(out.detail.resolution.status, 'confirmed');
+  assert.equal(out.detail.resolution.reason, '确认为脚本刷分，已记录');
+  assert.equal(out.detail.resolution.reviewerId, 'u_admin');
+  assert.equal(out.detail.resolution.decidedAt, '2026-10-20T01:00:00.000Z');
   const { rows } = queryAuditLog(db, { action: 'flag.resolve' });
   assert.equal(rows.length, 1);
   assert.equal(rows[0].entity_id, flagId);
@@ -2264,10 +2584,105 @@ test('裁决 flag 会写审计日志，且证据按发行方去重后落库', ()
   rmSync(dataDir, { recursive: true, force: true });
 });
 
+test('裁决：无理由 / 非法状态 / 缺列证据 / 不存在 / 二次裁决 都要显式报错', () => {
+  const { db, close, dataDir } = setup();
+  const { created } = runDetection({
+    db, stageId: 'st1', peerReviews: [], events: [], scoreStats: [],
+    users: [{ id: 'u1', phone: '13800000001' }, { id: 'u2', phone: '13800000001' }],
+    rules: RULES, now: '2026-10-20T00:00:00.000Z',
+  });
+  const flagId = created[0].id;
+
+  assert.throws(
+    () => resolveFlag({ db, flagId, status: 'confirmed', reviewerId: 'u_admin', reason: '   ', now: '2026-10-20T01:00:00.000Z' }),
+    (e) => e.status === 400 && /理由/.test(e.message),
+    '没有理由的裁决必须被拒',
+  );
+  assert.throws(
+    () => resolveFlag({ db, flagId, status: 'maybe', reviewerId: 'u_admin', reason: 'x', now: '2026-10-20T01:00:00.000Z' }),
+    (e) => e.status === 400 && /confirmed/.test(e.message),
+    '非法裁决状态必须被拒',
+  );
+  assert.throws(
+    () => resolveFlag({
+      db, flagId, status: 'confirmed', reviewerId: 'u_admin', reason: 'x',
+      evidence: [{ url: 'https://a.example/1' }], now: '2026-10-20T01:00:00.000Z',
+    }),
+    (e) => e.status === 400 && /缺列/.test(e.message),
+    '证据缺列必须报错，不得静默丢弃（P4-8）',
+  );
+  assert.throws(
+    () => resolveFlag({ db, flagId: 'no-such-flag', status: 'confirmed', reviewerId: 'u_admin', reason: 'x', now: '2026-10-20T01:00:00.000Z' }),
+    (e) => e.status === 404,
+    '不存在的复核项必须是 404（单条不满足）',
+  );
+
+  resolveFlag({ db, flagId, status: 'confirmed', reviewerId: 'u_admin', reason: '确认', now: '2026-10-20T01:00:00.000Z' });
+  assert.throws(
+    () => resolveFlag({ db, flagId, status: 'rejected', reviewerId: 'u_admin', reason: '再改一次', now: '2026-10-20T02:00:00.000Z' }),
+    (e) => e.status === 400 && /不得二次裁决/.test(e.message),
+    '已裁决的复核项不得二次裁决',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
 test('复核队列：无权访问返回空集（列表不满足 → 200 + 空集）', () => {
   const { db, close, dataDir } = setup();
-  const r = listFlags({ db, filter: {}, viewer: { id: 'u_judge', is_superadmin: 0, active: 1 } });
-  assert.deepEqual(r.rows, []);
+  // ⚠️ 判别性数据：队列里**先有东西**再问权限。
+  //    队列本来是空的时，"有权"与"无权"的结果都是空集 —— 测不出权限判定有没有生效。
+  runDetection({
+    db, stageId: 'st1', peerReviews: [], events: [], scoreStats: [],
+    users: [{ id: 'u1', phone: '13800000001' }, { id: 'u2', phone: '13800000001' }],
+    rules: RULES, now: '2026-10-20T00:00:00.000Z',
+  });
+  const asJudge = listFlags({ db, filter: {}, viewer: { id: 'u_judge', is_superadmin: 0, active: 1 } });
+  assert.deepEqual(asJudge.rows, [], '无权的人看不到队列');
+  assert.equal(asJudge.total, 0);
+  const asAdmin = listFlags({ db, filter: {}, viewer: VIEWER });
+  assert.equal(asAdmin.rows.length, 1, '同一个库，有权的人看得到 —— 证明空集不是因为库里没东西');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('复核队列：有权访问能看到队列，并能按 kind 过滤', () => {
+  const { db, close, dataDir } = setup();
+  runDetection({
+    db, stageId: 'st1', peerReviews: [], events: [], scoreStats: [],
+    users: [{ id: 'u1', phone: '13800000001' }, { id: 'u2', phone: '13800000001' }],
+    rules: RULES, now: '2026-10-20T00:00:00.000Z',
+  });
+  const all = listFlags({ db, filter: {}, viewer: VIEWER });
+  assert.equal(all.rows.length, 1);
+  assert.equal(all.total, 1);
+  assert.equal(all.rows[0].kind, 'multi_account');
+  assert.equal(all.rows[0].status, 'open');
+  assert.equal(all.rows[0].detail.action, 'alert_only');
+
+  const filtered = listFlags({ db, filter: { kind: 'low_variance' }, viewer: VIEWER });
+  assert.deepEqual(filtered.rows, [], '按 kind 过滤后不应有命中');
+  assert.equal(filtered.total, 0);
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('字段字典闸：越界字段名进不了库（R-AUD-06）', () => {
+  assert.deepEqual(assertFlagDetail({ kind: 'low_variance', judgeId: 'j1', stdev: 1 }), []);
+  assert.equal(assertFlagDetail({ kind: 'low_variance', judgeId: 'j1', 越界字段: 3 }).length, 1);
+  assert.equal(assertFlagDetail({ kind: '字典里没有的 kind' }).length, 1);
+
+  const { db, close, dataDir } = setup();
+  assert.throws(
+    () => runDetection({
+      db, stageId: 'st1', peerReviews: [], events: [], scoreStats: [], users: [], rules: RULES,
+      extraCandidates: [{ kind: 'low_variance', judgeId: 'j1', stdev: 1, 越界字段: 3, action: 'alert_only' }],
+      now: '2026-10-20T00:00:00.000Z',
+    }),
+    (e) => e.status === 400 && /字段不合规/.test(e.message),
+    '越界字段名必须在写入前被拒（不进库）',
+  );
+  const { rows } = queryAuditLog(db, { action: 'flag.detected' });
+  assert.equal(rows.length, 0, '被拒的候选不得留下任何写入痕迹');
   close();
   rmSync(dataDir, { recursive: true, force: true });
 });
@@ -2282,6 +2697,11 @@ test('TOP10 反向抽查任务：从结果里取前 N 名并带上签字信息�
   assert.equal(tasks[0].signoffs.length, 1);
   assert.equal(tasks[0].signoffs[0].department, '业务部');
   assert.ok(tasks[0].instruction.includes('电话回访'));
+  assert.equal(tasks[0].action, 'alert_only', '反向抽查任务同样只告警，不代劳不自动结案');
+
+  const fewer = buildReverseAuditTasks({ results, signoffs, topN: 3 });
+  assert.equal(fewer.length, 3, 'topN 必须真的生效');
+  assert.deepEqual(fewer.map((t) => t.rank), [1, 2, 3]);
 });
 ```
 
@@ -2307,6 +2727,12 @@ test('未知字段名被拒绝（R-AUD-06：并行前先定字段字典）', () 
   assert.equal(errors.length, 1);
   assert.ok(errors[0].includes('随便写的字段'));
   assert.deepEqual(assertKnownFields('low_variance', { judgeId: 'j1', stdev: 1 }), []);
+});
+
+test('字典里没有定义的 flag kind 被拒绝（没定义就没闸 = 等于没闸）', () => {
+  const errors = assertKnownFields('字典里没有的 kind', { judgeId: 'j1' });
+  assert.equal(errors.length, 1);
+  assert.ok(errors[0].includes('未知的 flag kind'));
 });
 
 test('互斥字段名同时出现被拒绝（借鉴维度 vs 同样点/差异点）', () => {
@@ -2342,15 +2768,20 @@ Expected: FAIL —— `Cannot find module '../src/domain/anticheat.js'`
 //   置信度三套标签并行。同样的失败模式会在"多个检测器并行产出 flag"时重演。
 //   → 字段名只有这一个来源；不在字典里的字段名在【写入前】就被拒绝，不进库。
 // 纯函数常量与断言，无 IO。
-
+//
+// ⚠️ 字典的适用范围：**检测器产出的 flag 明细**（runDetection 写进 detail_json 的那份）。
+//    「裁决」阶段由人追加的 resolution / evidence 不在检测明细范围内 —— 那是裁决记录，不是检测结论。
+// ⛔ 每个 kind 的字段表必须**覆盖检测器实际写进 detail_json 的每一个键**：
+//    少写一个键，runDetection 就会把**所有**检测产出判成「字段不合规」并抛 400，
+//    检测器等于完全不能用（kind / action 是每个 flag 都带的两个固定键）。
 export const FLAG_DETAIL_FIELDS = {
-  self_vs_judge: ['teamId', 'dimension', 'judgeScore', 'selfScore', 'delta', 'action'],
-  burst_submit: ['subjectId', 'count', 'windowStart', 'windowEnd'],
-  identical_peer_pattern: ['voterA', 'voterB', 'overlap', 'targets', 'matchRatio'],
-  low_variance: ['judgeId', 'dimension', 'stdev', 'n', 'mean', 'direction', 'action'],
-  multi_account: ['keyField', 'keyValue', 'userIds', 'count'],
-  tied_mutual_peer_rate: ['tiedPairs', 'rate', 'threshold'],
-  reverse_audit: ['teamId', 'rank', 'signoffs', 'instruction'],
+  self_vs_judge: ['kind', 'teamId', 'dimension', 'judgeScore', 'selfScore', 'delta', 'action'],
+  burst_submit: ['kind', 'subjectId', 'count', 'windowStart', 'windowEnd', 'action'],
+  identical_peer_pattern: ['kind', 'voterA', 'voterB', 'overlap', 'targets', 'matchRatio', 'action'],
+  low_variance: ['kind', 'judgeId', 'dimension', 'stdev', 'n', 'mean', 'direction', 'action'],
+  multi_account: ['kind', 'keyField', 'keyValue', 'userIds', 'count', 'action'],
+  tied_mutual_peer_rate: ['kind', 'rank', 'tiedPairs', 'rate', 'threshold', 'action'],
+  reverse_audit: ['kind', 'teamId', 'rank', 'total', 'signoffs', 'instruction', 'action'],
 };
 
 // 置信度标签只有这一套。（周报教训 5：并行任务曾各自造了三套置信度标签，最后无法合并）
@@ -2675,7 +3106,12 @@ export function detectTiedMutualPeerRate({ peerReviews = [], results = [], thres
       }
     }
     if (mutual === 0) continue;
-    const rate = mutual / tiedPairs.length;
+    // ⛔ 预审修正（P4-T4-D3）：分母必须是**同分组内的全部候选对**，不是「互投的对数」。
+    //    原来写 mutual / tiedPairs.length —— tiedPairs 只装互投的对，于是分母 == 分子，
+    //    rate 恒等于 1，threshold 形同虚设（阈值调到 0.99 照样报）。
+    //    现在的口径：rate = 互投对数 / 同分组全部候选对数（C(n,2)）。
+    const candidatePairs = (teams.length * (teams.length - 1)) / 2;
+    const rate = mutual / candidatePairs;
     if (rate < threshold) continue;
     flags.push({
       kind: 'tied_mutual_peer_rate',
@@ -2704,18 +3140,81 @@ import {
 } from '../domain/anticheat.js';
 import { normalizeEvidence } from '../domain/evidence.js';
 import { assertKnownFields, assertMutuallyExclusive } from '../domain/field-dictionary.js';
-import { createFlag, findOpenFlag, listFlagRows, resolveFlagRow } from '../db/repo/flags.js';
+import { createFlag, listFlagRows, resolveFlagRow } from '../db/repo/flags.js';
 import { writeAuditLog } from '../audit/log.js';
 import { can } from '../auth/permissions.js';
 import { badRequest, notFound } from '../errors.js';
 
 /**
+ * 稳定序列化（键名排序）——用来比较两份 flag 明细是不是「同一个问题」。
+ * 不排序的话，键顺序不同但内容相同的明细会被判成两个问题。
+ */
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    const parts = Object.keys(value).sort()
+      .map((k) => `${JSON.stringify(k)}:${canonicalJson(value[k])}`);
+    return `{${parts.join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
+/**
+ * 「同一个问题」的判定：同 kind + 同赛段 + **同明细内容**。
+ *
+ * ⛔ 预审修正（P4-T4-D4）：原来用 (kind, stage_id, team_id, judge_id) 这个粗键去重。
+ *    那个键分不开「同 kind 的不同问题」——两个不同的多账号分组（138…001 / 138…002）
+ *    在粗键下 team_id / judge_id 都是 NULL → 第二个被当成「重复」丢掉；
+ *    同一位评委的**两个维度**方差异常同理（judge_id 相同、dimension 不同）。
+ *    丢掉的不是重复项，是**真问题** —— 防作弊检测漏报。改成按明细内容判定。
+ */
+function isSameFinding(row, flag, stageId) {
+  if ((row.stage_id ?? null) !== (stageId ?? null)) return false;
+  let detail = null;
+  try {
+    detail = row.detail_json ? JSON.parse(row.detail_json) : null;
+  } catch {
+    return false;   // 明细坏掉 → 不当成同一个问题（宁可多建一条让人看，也不漏）
+  }
+  return canonicalJson(detail) === canonicalJson(flag);
+}
+
+/**
+ * 逐页扫 flagged_reviews。
+ * ⚠️ 仓储层的 listFlagRows 默认只回 100 条 —— 一次查全表再 find 会漏，
+ *    漏掉的 flag 会被误判成「不存在」（404），或让去重失效（重复建 flag）。所以要翻页。
+ */
+function scanFlags(db, filter, match) {
+  const LIMIT = 200;
+  for (let offset = 0; ; offset += LIMIT) {
+    const { rows } = listFlagRows(db, { ...filter, limit: LIMIT, offset });
+    for (const row of rows) {
+      const hit = match(row);
+      if (hit) return hit;
+    }
+    if (rows.length < LIMIT) return null;
+  }
+}
+
+/**
+ * 字段字典闸（R-AUD-06）：返回这条 flag 明细的**全部**违规（空数组 = 合规）。
+ * ⛔ 单独抽成导出函数：这条闸是「不在字典里的字段名不进库」的唯一执行点，
+ *    抽出来才能被单独测到（不然只能靠「检测器恰好产出越界字段」这种偶然路径）。
+ */
+export function assertFlagDetail(flag) {
+  return [...assertKnownFields(flag.kind, flag), ...assertMutuallyExclusive(flag)];
+}
+
+/**
  * 跑一遍全部检测器，把命中的问题写进 flagged_reviews（status='open'）。
+ * @param {object[]} extraCandidates 扩展点：额外候选 flag（默认空）。
+ *   给「还没进检测器模块的新检测器」用；同时给「字段字典闸」一条可测的入口 ——
+ *   候选里带越界字段 → 必须被 400 挡住，不进库（R-AUD-06）。
  * @returns {{ created: Array, skipped: Array }}
  */
 export function runDetection({
   db, stageId = null, peerReviews = [], events = [], scoreStats = [], results = [],
-  users = [], rules, now = new Date().toISOString(),
+  users = [], rules, now = new Date().toISOString(), extraCandidates = [],
 }) {
   const antiCheat = rules?.audit?.antiCheat ?? {};
   const created = [];
@@ -2733,17 +3232,22 @@ export function runDetection({
     ...detectTiedMutualPeerRate({
       peerReviews, results, threshold: antiCheat.tiedMutualPeerRate?.threshold ?? 0.8,
     }).flags,
+    ...extraCandidates,
   ];
 
   for (const flag of candidates) {
     // 字段字典校验：不在字典里的字段名不进库（R-AUD-06）
-    const fieldErrors = [...assertKnownFields(flag.kind, flag), ...assertMutuallyExclusive(flag)];
+    const fieldErrors = assertFlagDetail(flag);
     if (fieldErrors.length) {
       throw badRequest(`flag 明细字段不合规（${flag.kind}）：${fieldErrors.join('；')}`);
     }
     const judgeId = flag.judgeId ?? flag.voterA ?? flag.subjectId ?? null;
     const teamId = flag.teamId ?? (flag.tiedPairs?.[0]?.[0] ?? null);
-    const existing = findOpenFlag({ db, kind: flag.kind, stageId, teamId, judgeId });
+    const existing = scanFlags(
+      db,
+      { status: 'open', kind: flag.kind },
+      (row) => (isSameFinding(row, flag, stageId) ? row : null),
+    );
     if (existing) {
       skipped.push({ kind: flag.kind, reason: '已存在未决 flag，不重复建', flagId: existing.id });
       continue;
@@ -2776,8 +3280,7 @@ export function resolveFlag({
   if (!reason || !String(reason).trim()) {
     throw badRequest('裁决必须写理由（无理由的裁决无法复盘）');
   }
-  const { rows } = listFlagRows(db, { limit: 1000 });
-  const row = rows.find((r) => r.id === flagId);
+  const row = scanFlags(db, {}, (r) => (r.id === flagId ? r : null));
   if (!row) throw notFound(`复核项不存在: ${flagId}`);
   if (row.status !== 'open') {
     throw badRequest(`复核项 ${flagId} 已裁决（当前状态 ${row.status}），不得二次裁决`);
@@ -2850,6 +3353,8 @@ export function buildReverseAuditTasks({ results = [], signoffs = [], topN = 10,
     total: r.total,
     signoffs: signoffs.filter((s) => s.teamId === r.teamId),
     instruction,
+    // ⛔ 检测 ≠ 处罚：反向抽查任务同样只告警、不代劳、不自动结案（把边界写进数据本身）
+    action: 'alert_only',
   }));
 }
 ```
@@ -2857,7 +3362,7 @@ export function buildReverseAuditTasks({ results = [], signoffs = [], topN = 10,
 - [ ] **Step 7: 运行测试确认通过**
 
 Run: `cd platform && node --test test/anticheat.test.js test/field-dictionary.test.js`
-Expected: PASS（anticheat 15 个 + field-dictionary 5 个全过）
+Expected: PASS（anticheat **34** 个 + field-dictionary **6** 个全过 = 40 个）
 
 - [ ] **Step 8: 提交**
 
@@ -2865,6 +3370,65 @@ Expected: PASS（anticheat 15 个 + field-dictionary 5 个全过）
 cd platform && git add src/domain/anticheat.js src/domain/evidence.js src/domain/field-dictionary.js src/services/anticheat.js test/anticheat.test.js test/field-dictionary.test.js
 git commit -m "feat(P4): 五个防作弊检测器、证据三列去重与审计字段字典（只告警不处罚）"
 ```
+
+---
+
+## Task 4 父代理预审修正台账（2026-10-21）
+
+> Task 4 是 P4 的**检测器**层：五个检测器 + 证据三列 + 字段字典 + 复核队列。
+> 规格自带的 15 + 5 条用例**实测 3 红**；顺着这 3 条红往下挖，共实证 **10 处规格缺陷**
+> （**4 Critical / 3 Important / 3 Minor**），全部处置；随后做**独立变异检验**：
+> 变异体 **47** → 首轮存活 7（其中 **5 条是真实覆盖缺口**，补用例后杀掉）→
+> **KILLED 45 / 等价 2 / 有效缺口 0**。
+> ⛔ **检测 ≠ 处罚**：这条边界同时钉在三处 —— 代码注释、**数据字段**（每个 flag 都带
+> `action='alert_only'`）、验收标准（P4-7 的 grep 无命中）。
+
+### 一、预审发现的规格缺陷
+
+| # | 级别 | 缺陷 | 实跑证据（命令 + 关键输出） | 处置 |
+|---|---|---|---|---|
+| **P4-T4-D1** | **Critical** | **「相对顺序相同」的判别性数据集给反了** —— 两处用例里 j2 的打分（60/70/80）与 j1（90/80/70）相对顺序**正好相反**；检测器判「顺序不一致 → 不串通」是对的，用例却期望报 1 条 | `node --test test/anticheat.test.js`（照抄计划的实现）→ `not ok 1 - 互评相对顺序完全相同 → 疑似串通，进复核队列`（expected 1, actual 0）、`not ok 12 - runDetection 把检测结果写进 flagged_reviews…`（expected 1, actual 0）；探针 5：j1 顺序 `t1>t2>t3` / j2 顺序 `t3>t2>t1` / 同序=`false` | 改判别性数据集：j2 改成 **60/50/40**（同序、但绝对分差一大截，不是照抄分数）。两处都改 |
+| **P4-T4-D2** | **Critical** | **字段字典少了每个 flag 都带的固定键 `kind` / `action`**（外加 `tied_mutual_peer_rate.rank`、`reverse_audit.total`）→ runDetection 拿**检测器自己的产出**去过字典闸，结果**每一个**检测结果都被判「字段不合规」抛 400 —— 检测器等于完全不能用 | 探针 2：5 个 kind 全部报错（`burst_submit` 报 `"kind"` 与 `"action"` 不在字典里…）；实跑 `not ok 13` → `error: 'flag 明细字段不合规（burst_submit）：字段名 "kind" 不在 burst_submit 的字段字典里（允许：subjectId, count, windowStart, windowEnd）'` | 字典补齐 `kind`/`action`/`rank`/`total`；字典头部写死规矩：「字段表必须**覆盖检测器实际写进 detail_json 的每一个键**，少写一个键 = 全部检测产出被拒」 |
+| **P4-T4-D3** | **Critical** | **仓储函数调用签名错** —— 计划写 `findOpenFlag({ db, kind, … })`（单对象），Task 1 的签名是 `findOpenFlag(db, { kind, … })` → 解构 undefined → **TypeError**（不是 AppError → 500） | 探针实跑：`TypeError: Cannot destructure property 'kind' of 'undefined' as it is undefined at findOpenFlag (src/db/repo/flags.js:21:36) at runDetection (src/services/anticheat.js:51:22)` | 去重改走 `listFlagRows` 的逐页扫描（见 D4），不再调用 `findOpenFlag`；仓储层该函数保留不动 |
+| **P4-T4-D4** | **Important** | **去重键太粗 → 同 kind 的不同问题被当成「重复」丢掉**（漏报）。粗键 `(kind, stage_id, team_id, judge_id)` 分不开「两个不同的多账号分组」（team_id / judge_id 都是 NULL）与「同一评委的两个维度方差异常」 | 探针 3：两个分组 138…001 / 138…002 → `created=1`、`skipped=[{kind:'multi_account', reason:'已存在未决 flag，不重复建'}]`（**第二个真问题被丢了**）；探针 4：同一评委两个维度 → `created=1`、`skipped=1` | 去重口径改为「**同 kind + 同赛段 + 同明细内容**」（明细按稳定序列化比较，键排序）；并补用例锁死（见变异表 M2） |
+| **P4-T4-D5** | **Important** | **同分互投率的分母写成「互投的对数」**（`mutual / tiedPairs.length`）→ 分母 == 分子 → **rate 恒为 1**，threshold 形同虚设 | 探针 1：3 支同分队伍、候选对 3 组、互投 2 组（真实互投率 2/3 = 0.6667）→ 阈值 0.8 仍报，`rate=1`；探针 1b：阈值调到 **0.99 仍报** | 分母改为**同分组全部候选对** C(n,2)；补「阈值两侧都可测」的判别性用例（0.6667 vs 阈值 0.8 不报 / 0.6 报；以及恰好 0.8 要报） |
+| **P4-T4-D6** | **Critical** | **规格用例没建被外键引用的行** —— 裁决时用 `reviewerId='u_admin'` 写审计日志，但 `audit_log.actor_id REFERENCES users(id)` → **FOREIGN KEY constraint failed** | 实跑 `not ok 13` → `error: 'FOREIGN KEY constraint failed' at insertAuditLogRow (src/db/repo/audit-log.js:19:5) at writeAuditLog (src/audit/log.js:10:14) at resolveFlag` | 测试加 `seedRefs(db)` 造出 `u_admin`（与 P4 Task 1 的 `audit-repo.test.js` **同一个坑**，同一套写法） |
+| **P4-T4-D7** | Minor | 规格用例注释里的 stdev「≈ 47」与实际不符 | 探针 6：注释声称 47 / 实际 **75.2773**（n=10, mean=70, sum_sq=100000 → √(5666.67)） | 注释与断言改成实际值 `75.277265`（`toFixed(6)` 后的值） |
+| **P4-T4-D8** | Minor | 裁决用 `listFlagRows(db, { limit: 1000 })` 一次查全表再 `find` → 超过 1000 条 flag 时目标不在结果里 → **误报 404**、去重也失效 | 代码 review（计划 `src/services/anticheat.js` 裁决段）：仓储 `listFlagRows` 默认 limit 100，计划写死 1000 | 改为**逐页扫描**（`scanFlags`，每页 200 条），上限不再是硬编码 |
+| **P4-T4-D9** | Minor | Interfaces 写 `runDetection → { created, skipped, flags }`，实现从来只返回**前两个键** —— 写接口契约就是错的 | 计划 Interfaces 行 vs 实现 `return { created, skipped }` | 改 Interfaces 为 `{ created, skipped }`；另补 `extraCandidates`（扩展点）说明 |
+| **P4-T4-D10** | Minor | 反向抽查任务的产出**没有 `action` 字段** → 若被做成 flag，P4-7「所有 flag 的 action='alert_only'」就不成立 | 计划 `buildReverseAuditTasks` 返回字段 | 任务产出补 `action: 'alert_only'`（边界写进数据本身），并补断言 |
+
+### 二、变异检验发现的实现盲区
+
+> 变异体 **47** 个（5 个检测器 / 证据三列 / 字段字典 / 服务层编排与裁决 / 复核队列 / 反向抽查）。
+> 变异脚本：`/tmp/p4t4/mutate.mjs`（跑在 `/tmp` 副本上，指向**已落地**的测试文件；
+> 锚点必须在目标文件里**只出现一次**，命中 2 次即报错不执行）。
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| **P4-T4-M1** | Important | **「同一主体只报一次」的 `break` 从来没被验过** —— 删掉它，循环里每个越过阈值的 end 都会再报一次（4 次提交 → 3 条 flag） | 变异存活：删掉 `break` 后 40 条用例全绿 | 补用例：窗口内 **6** 次提交、阈值 3 → 必须只报 1 条（首轮数据只有 4 次提交，删掉 break 结果**恰好一样**） |
+| **P4-T4-M2** | Important | **复核队列的权限判定没被验过** —— 用例里队列本来是**空的**，"有权"与"无权"的结果都是空集，测不出判定有没有生效 | 变异存活：把 `can(viewer,'audit:read',…)` 换成 `true` 后 40 条用例全绿 | 补用例：**队列里先有东西**再问权限（无权 → 空集，有权 → 1 条，同一个库） |
+| **P4-T4-M3** | Important | **检测留痕（`flag.detected` 审计日志）没被验过** —— 只有 `flag.resolve` 有断言 | 变异存活：把 `action:'flag.detected'` 改名后 40 条用例全绿 | 补断言：每次检出写 1 条 `flag.detected`，且 `entity_id` 对上 flagId |
+| **P4-T4-M4** | Minor | **明细比较的「键排序」没被验过** —— 不排序就只在「键顺序恰好一致」时成立 | 变异存活：`canonicalJson` 去掉 `.sort()` 后 40 条用例全绿 | 补用例：库里塞一条**键顺序不同**的同一份明细 → 不得重建 flag |
+| **P4-T4-M5** | Minor | **互评的 `fromId/toId` 别名没被验过** —— `pickVoter/pickTarget` 认三套别名，测试只用了 `judgeId/teamId` | 变异存活：`pickTarget` 退回只认 `teamId` 后 40 条用例全绿 | 补用例：用别名写法跑一遍，必须同样检出 |
+| **P4-T4-M6** | — | 空手机号不再跳过（`String(raw).trim()===''` 那道检查摘掉） | 差分实证（`/tmp/p4t4/equiv-probe.mjs`）：原版与变异版输出**逐字相同** —— `normalizeKeyValue` 对空/空白返回 `''`，下一道 `if (!value) continue;` 照样跳过 | **等价变异体**（不可观测，不是测试的漏洞）；保留原实现（多一道防御） |
+| **P4-T4-M7** | — | 同分组「只允许 2 支以上」改成「1 支以上」 | 差分实证：单队分组里 `i<j` 循环不执行 → `mutual=0` → `if (mutual===0) continue;` → 原版与变异版输出**逐字相同**（均 `{"flags":[]}`） | **等价变异体**（不可观测） |
+
+### 三、刻意保持的行为（登记口径）
+
+| 行为 | 为什么这样 |
+|---|---|
+| **服务层保留阈值兜底值**（minOverlap 3 / windowSeconds 60 / threshold 5 / tied 0.8） | 与 INTERFACES §0「可变规则一律进 rules/*.json」有偏差，但真值由 **Task 3 的 `rules/audit.json`** 提供（`rules.audit.antiCheat`），这里的常量只是 `rules` 缺失时的兜底。**不改成 fail-fast** —— 规格的接口是 `rules` 可选，缺配置就静默按默认跑是既有口径，Task 3 落地后即由配置接管 |
+| **字段字典的适用范围 = 检测器产出的 flag 明细** | 裁决阶段由人追加的 `resolution` / `evidence` 不在字典范围内 —— 那是**裁决记录**，不是检测结论；字典管的是「检测器能写什么字段名」 |
+| **字段字典闸是逐条校验**（一条越界 → 整批抛 400） | 越界字段名在**写入前**被拒（不进库）。此时本批已写的 flag 是 open 状态，重跑会被去重跳过 → 不会重复建，语义安全 |
+| **去重口径 = 同 kind + 同赛段 + 同明细内容** | 粗键会漏报（见 D4）。明细用稳定序列化（键排序）比较 → 旧版本写下的、键顺序不同的同一份明细也能认出来 |
+| **反向抽查任务不是 flag** | 它是「给人做的任务」，带 `action='alert_only'`；要不要落 `flagged_reviews` 是 Task 6 的事，本阶段不落库 |
+
+**Task 4 的测试条数口径**：anticheat **34**（规格自带 15 + 预审补 19）；field-dictionary **6**（规格自带 5 + 预审补 1）= 本阶段新增 **40** 条。
+
+**最终结果**：变异体 47 → **KILLED 45 / SURVIVED 2（均为等价变异体，探针差分实证）/ 有效缺口 0**；
+`anticheat.test.js` **34/34**、`field-dictionary.test.js` **6/6**；P4 全量 **766/766**（Task 1 后基线 726/766 → 726/726）；
+迁移到版本 **5**；P4-7 的 `grep -n "UPDATE stage_reviews\|deactivateUser\|DELETE FROM users"` **无命中**（退出码 1）。
 
 ---
 
