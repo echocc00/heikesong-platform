@@ -4943,6 +4943,14 @@ git commit -m "feat(P2): 评分提交服务（幂等 + 增量 score_stats + 校�
 `platform/test/tiebreak.test.js`：
 
 ```javascript
+// platform/test/tiebreak.test.js —— 加时陈述与一票破同分
+//
+// 依据：P2 计划 Task 7「加时陈述与一票破同分（tiebreak_round / tiebreak_votes）」
+// 溯源需求：R-JDG-19（同分 → 加时陈述 → 共同复议）
+//
+// ⚠️ **夹具必须建真实数据**（父代理预审修正，Important）：
+//    Task 1 补齐了引用型外键（`stage_id → stages`、`team_id → teams`、`voter_id → users`），
+//    原规格用的假 id（'ed1' / 't1' / 't2'）**必然触发外键失败**。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -4952,6 +4960,10 @@ import { fileURLToPath } from 'node:url';
 import { openDatabase } from '../src/db/sqlite.js';
 import { applyMigrations } from '../src/db/migrate.js';
 import { createUser } from '../src/db/repo/users.js';
+import { createEdition } from '../src/db/repo/editions.js';
+import { insertTeam } from '../src/db/repo/teams.js';
+import { insertStage, assignStageJudge } from '../src/db/repo/stages.js';
+import { insertTiebreakVote } from '../src/db/repo/tiebreak.js';
 import {
   openTiebreakRound,
   castTiebreakVote,
@@ -4969,85 +4981,298 @@ function setup() {
   applyMigrations(db, migrationsDir);
   const admin = createUser(db, { name: '组委会', phone: '13900000021', password: 'pw' });
   const voter = createUser(db, { name: '评委甲', phone: '13900000022', password: 'pw' });
-  db.prepare(
-    `INSERT INTO stages (id, edition_id, "key", name, kind, starts_at, ends_at, scoring_config_key, status)
-     VALUES ('s1', 'ed1', 's1', '决赛', 'final', '2026-10-26', '2026-10-28', 'final', 'open')`,
-  ).run();
-  return { db, close, dataDir, admin, voter };
+  const observer = createUser(db, { name: '观察员', phone: '13900000023', password: 'pw' });
+  const captain = createUser(db, { name: '队长甲', phone: '13900000024', password: 'pw' });
+  const captain2 = createUser(db, { name: '队长乙', phone: '13900000025', password: 'pw' });
+
+  const edition = createEdition(db, {
+    name: '首届', city: '上海', startsAt: '2026-10-01', endsAt: '2026-10-31', now: NOW,
+  });
+  const teamA = insertTeam(db, {
+    editionId: edition.id, name: '甲队', captainId: captain.id, status: 'forming', now: NOW,
+  });
+  const teamB = insertTeam(db, {
+    editionId: edition.id, name: '乙队', captainId: captain2.id, status: 'forming', now: NOW,
+  });
+  const stage = insertStage(db, {
+    editionId: edition.id, key: 's1', name: '决赛', kind: 'final',
+    startsAt: '2026-10-26', endsAt: '2026-10-28', scoringConfigKey: 'final', status: 'open', now: NOW,
+  });
+  assignStageJudge(db, { stageId: stage.id, userId: voter.id, seat: 'judge', now: NOW });
+  assignStageJudge(db, { stageId: stage.id, userId: observer.id, seat: 'observer', now: NOW });
+
+  return { db, close, dataDir, admin, voter, observer, teamA, teamB, stage };
+}
+
+function cleanup({ db, close, dataDir }) {
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
 }
 
 test('开启加时陈述轮次：同分组 + 10 分钟陈述截止', () => {
-  const { db, close, dataDir, admin } = setup();
+  const ctx = setup();
+  const { db, admin, teamA, teamB, stage } = ctx;
   const round = openTiebreakRound({
-    db, stageId: 's1', tiedTeamIds: ['t1', 't2'], statementMinutes: 10, actorId: admin.id, now: NOW,
+    db, stageId: stage.id, tiedTeamIds: [teamA.id, teamB.id], statementMinutes: 10, actorId: admin.id, now: NOW,
   });
   assert.equal(round.kind, 'statement');
   assert.equal(round.status, 'open');
-  assert.deepEqual(JSON.parse(round.tied_team_ids_json), ['t1', 't2']);
+  assert.deepEqual(JSON.parse(round.tied_team_ids_json), [teamA.id, teamB.id]);
   assert.equal(round.statement_deadline, '2026-10-20T10:10:00.000Z');
-  close();
-  rmSync(dataDir, { recursive: true, force: true });
+  cleanup(ctx);
 });
 
-test('一人一票：同一 (轮次, 投票人, 队伍) 第二次投票被数据库拒绝', () => {
-  const { db, close, dataDir, admin, voter } = setup();
+test('一人一队一票：同一 (轮次, 投票人, 队伍) 第二次投票被数据库拒绝', () => {
+  const ctx = setup();
+  const { db, admin, voter, teamA, teamB, stage } = ctx;
   const round = openTiebreakRound({
-    db, stageId: 's1', tiedTeamIds: ['t1', 't2'], statementMinutes: 10, actorId: admin.id, now: NOW,
+    db, stageId: stage.id, tiedTeamIds: [teamA.id, teamB.id], statementMinutes: 10, actorId: admin.id, now: NOW,
   });
-  castTiebreakVote({ db, roundId: round.id, voterId: voter.id, teamId: 't1', score: 80, now: NOW });
+  castTiebreakVote({ db, roundId: round.id, voterId: voter.id, teamId: teamA.id, score: 80, now: NOW });
   assert.throws(
-    () => castTiebreakVote({ db, roundId: round.id, voterId: voter.id, teamId: 't1', score: 90, now: NOW }),
+    () => castTiebreakVote({ db, roundId: round.id, voterId: voter.id, teamId: teamA.id, score: 90, now: NOW }),
     (err) => err.status === 409,
     '重复投票必须被拒绝（唯一约束保证）',
   );
   // 同一人对另一支队伍投票是允许的
-  castTiebreakVote({ db, roundId: round.id, voterId: voter.id, teamId: 't2', score: 70, now: NOW });
+  castTiebreakVote({ db, roundId: round.id, voterId: voter.id, teamId: teamB.id, score: 70, now: NOW });
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM tiebreak_votes').get().n, 2);
-  close();
-  rmSync(dataDir, { recursive: true, force: true });
+  cleanup(ctx);
 });
 
 test('轮次状态与票数统计', () => {
-  const { db, close, dataDir, admin, voter } = setup();
+  const ctx = setup();
+  const { db, admin, voter, teamA, teamB, stage } = ctx;
   const round = openTiebreakRound({
-    db, stageId: 's1', tiedTeamIds: ['t1', 't2'], statementMinutes: 10, actorId: admin.id, now: NOW,
+    db, stageId: stage.id, tiedTeamIds: [teamA.id, teamB.id], statementMinutes: 10, actorId: admin.id, now: NOW,
   });
-  castTiebreakVote({ db, roundId: round.id, voterId: voter.id, teamId: 't1', score: 80, now: NOW });
+  castTiebreakVote({ db, roundId: round.id, voterId: voter.id, teamId: teamA.id, score: 80, now: NOW });
   const state = getTiebreakRoundState({ db, roundId: round.id });
   assert.equal(state.votes.length, 1);
-  assert.equal(state.tallies.t1.count, 1);
-  assert.ok(Math.abs(state.tallies.t1.mean - 80) < 1e-12);
-  close();
-  rmSync(dataDir, { recursive: true, force: true });
+  assert.equal(state.tallies[teamA.id].count, 1);
+  assert.ok(Math.abs(state.tallies[teamA.id].mean - 80) < 1e-12);
+  cleanup(ctx);
 });
 
 test('关闭轮次后不能继续投票', () => {
-  const { db, close, dataDir, admin, voter } = setup();
+  const ctx = setup();
+  const { db, admin, voter, teamA, teamB, stage } = ctx;
   const round = openTiebreakRound({
-    db, stageId: 's1', tiedTeamIds: ['t1', 't2'], statementMinutes: 10, actorId: admin.id, now: NOW,
+    db, stageId: stage.id, tiedTeamIds: [teamA.id, teamB.id], statementMinutes: 10, actorId: admin.id, now: NOW,
   });
   closeTiebreakRound({ db, roundId: round.id, actorId: admin.id, now: NOW });
   assert.throws(
-    () => castTiebreakVote({ db, roundId: round.id, voterId: voter.id, teamId: 't1', score: 80, now: NOW }),
+    () => castTiebreakVote({ db, roundId: round.id, voterId: voter.id, teamId: teamA.id, score: 80, now: NOW }),
     (err) => err.status === 409,
   );
-  close();
-  rmSync(dataDir, { recursive: true, force: true });
+  cleanup(ctx);
 });
 
 test('加时陈述复议分可供破同分链消费', () => {
-  const { db, close, dataDir, admin, voter } = setup();
+  const ctx = setup();
+  const { db, admin, voter, teamA, teamB, stage } = ctx;
   const round = openTiebreakRound({
-    db, stageId: 's1', tiedTeamIds: ['t1', 't2'], statementMinutes: 10, actorId: admin.id, now: NOW,
+    db, stageId: stage.id, tiedTeamIds: [teamA.id, teamB.id], statementMinutes: 10, actorId: admin.id, now: NOW,
   });
-  castTiebreakVote({ db, roundId: round.id, voterId: voter.id, teamId: 't1', score: 80, now: NOW });
-  castTiebreakVote({ db, roundId: round.id, voterId: voter.id, teamId: 't2', score: 60, now: NOW });
+  castTiebreakVote({ db, roundId: round.id, voterId: voter.id, teamId: teamA.id, score: 80, now: NOW });
+  castTiebreakVote({ db, roundId: round.id, voterId: voter.id, teamId: teamB.id, score: 60, now: NOW });
   closeTiebreakRound({ db, roundId: round.id, actorId: admin.id, now: NOW });
-  const extra = getTiebreakExtraScores({ db, stageId: 's1', teamIds: ['t1', 't2'] });
-  assert.ok(Math.abs(extra.t1 - 80) < 1e-12);
-  assert.ok(Math.abs(extra.t2 - 60) < 1e-12);
-  close();
-  rmSync(dataDir, { recursive: true, force: true });
+  const extra = getTiebreakExtraScores({ db, stageId: stage.id, teamIds: [teamA.id, teamB.id] });
+  assert.ok(Math.abs(extra[teamA.id] - 80) < 1e-12);
+  assert.ok(Math.abs(extra[teamB.id] - 60) < 1e-12);
+  cleanup(ctx);
+});
+
+// ── 父代理预审修正用例（2026-10-21）────────────────────────────────────
+
+test('关闭一个不存在的轮次 → 404（不把裸 TypeError 漏给调用方）', () => {
+  // ⚠️ 原实现：UPDATE 0 行 → 返回 null → `round.stage_id` 抛
+  //    「Cannot read properties of null」—— 它**不是 AppError**，
+  //    HTTP 层只能回通用文案「请求无效」，调用方既拿不到状态码也拿不到原因。
+  const ctx = setup();
+  const { db, admin } = ctx;
+  assert.throws(
+    () => closeTiebreakRound({ db, roundId: 'no-such-round', actorId: admin.id, now: NOW }),
+    (err) => err.status === 404,
+  );
+  cleanup(ctx);
+});
+
+test('投票人必须是有投票权的评委：观察员 → 403，未分配 → 403', () => {
+  const ctx = setup();
+  const { db, admin, observer, teamA, teamB, stage } = ctx;
+  const round = openTiebreakRound({
+    db, stageId: stage.id, tiedTeamIds: [teamA.id, teamB.id], statementMinutes: 10, actorId: admin.id, now: NOW,
+  });
+  assert.throws(
+    () => castTiebreakVote({ db, roundId: round.id, voterId: observer.id, teamId: teamA.id, score: 80, now: NOW }),
+    (err) => err.status === 403,
+    '观察员无投票权（R-JDG-11）',
+  );
+  const outsider = createUser(db, { name: '路人', phone: '13900000026', password: 'pw' });
+  assert.throws(
+    () => castTiebreakVote({ db, roundId: round.id, voterId: outsider.id, teamId: teamA.id, score: 80, now: NOW }),
+    (err) => err.status === 403,
+    '未被分配到赛段的人不能投票',
+  );
+  cleanup(ctx);
+});
+
+test('投票分越界 → 400（不让破 100 分的复议分进榜）', () => {
+  const ctx = setup();
+  const { db, admin, voter, teamA, teamB, stage } = ctx;
+  const round = openTiebreakRound({
+    db, stageId: stage.id, tiedTeamIds: [teamA.id, teamB.id], statementMinutes: 10, actorId: admin.id, now: NOW,
+  });
+  for (const bad of [1000, -1, NaN]) {
+    assert.throws(
+      () => castTiebreakVote({ db, roundId: round.id, voterId: voter.id, teamId: teamA.id, score: bad, now: NOW }),
+      (err) => err.status === 400,
+      `score=${String(bad)} 必须被拒`,
+    );
+  }
+  cleanup(ctx);
+});
+
+test('未关闭的轮次不得被算进复议分（榜单不能随投票进行而漂移）', () => {
+  // ⚠️ 原实现：取全部轮次 → 还在开放投票的轮次，其**当前均值**被当成最终复议分。
+  const ctx = setup();
+  const { db, admin, voter, teamA, teamB, stage } = ctx;
+  const round = openTiebreakRound({
+    db, stageId: stage.id, tiedTeamIds: [teamA.id, teamB.id], statementMinutes: 10, actorId: admin.id, now: NOW,
+  });
+  castTiebreakVote({ db, roundId: round.id, voterId: voter.id, teamId: teamA.id, score: 80, now: NOW });
+  const before = getTiebreakExtraScores({ db, stageId: stage.id, teamIds: [teamA.id, teamB.id] });
+  assert.deepEqual(before, {}, '开放中的轮次不产生复议分');
+  closeTiebreakRound({ db, roundId: round.id, actorId: admin.id, now: NOW });
+  const after = getTiebreakExtraScores({ db, stageId: stage.id, teamIds: [teamA.id, teamB.id] });
+  assert.ok(Math.abs(after[teamA.id] - 80) < 1e-12);
+  cleanup(ctx);
+});
+
+test('同分组至少两支队伍；同一赛段不允许两个进行中的轮次', () => {
+  const ctx = setup();
+  const { db, admin, teamA, teamB, stage } = ctx;
+  assert.throws(
+    () => openTiebreakRound({
+      db, stageId: stage.id, tiedTeamIds: [teamA.id], statementMinutes: 10, actorId: admin.id, now: NOW,
+    }),
+    (err) => err.status === 400,
+  );
+  openTiebreakRound({
+    db, stageId: stage.id, tiedTeamIds: [teamA.id, teamB.id], statementMinutes: 10, actorId: admin.id, now: NOW,
+  });
+  assert.throws(
+    () => openTiebreakRound({
+      db, stageId: stage.id, tiedTeamIds: [teamA.id, teamB.id], statementMinutes: 10, actorId: admin.id, now: NOW,
+    }),
+    (err) => err.status === 409,
+    '同一赛段不能同时开两个轮次 —— 否则票会分散在两轮里',
+  );
+  cleanup(ctx);
+});
+
+test('投票给不在同分组里的队伍 → 400', () => {
+  const ctx = setup();
+  const { db, admin, voter, teamA, teamB, stage } = ctx;
+  const round = openTiebreakRound({
+    db, stageId: stage.id, tiedTeamIds: [teamA.id, teamB.id], statementMinutes: 10, actorId: admin.id, now: NOW,
+  });
+  assert.throws(
+    () => castTiebreakVote({ db, roundId: round.id, voterId: voter.id, teamId: 'no-such-team', score: 80, now: NOW }),
+    (err) => err.status === 400,
+  );
+  cleanup(ctx);
+});
+
+test('关闭轮次是幂等的（重复关闭原样返回）', () => {
+  const ctx = setup();
+  const { db, admin, teamA, teamB, stage } = ctx;
+  const round = openTiebreakRound({
+    db, stageId: stage.id, tiedTeamIds: [teamA.id, teamB.id], statementMinutes: 10, actorId: admin.id, now: NOW,
+  });
+  const first = closeTiebreakRound({ db, roundId: round.id, actorId: admin.id, now: NOW });
+  assert.equal(first.round.status, 'closed');
+  const second = closeTiebreakRound({ db, roundId: round.id, actorId: admin.id, now: NOW });
+  assert.equal(second.round.status, 'closed');
+  cleanup(ctx);
+});
+
+test('回避中的评委不能投票（R-JDG-09）', () => {
+  const ctx = setup();
+  const { db, admin, voter, teamA, teamB, stage } = ctx;
+  const round = openTiebreakRound({
+    db, stageId: stage.id, tiedTeamIds: [teamA.id, teamB.id], statementMinutes: 10, actorId: admin.id, now: NOW,
+  });
+  db.prepare(
+    `INSERT INTO recusal_records (id, stage_id, judge_id, team_id, reason, source, declared_at, audit_by, action)
+     VALUES ('r1', ?, ?, ?, '前雇主', 'declared', ?, ?, 'recused')`,
+  ).run(stage.id, voter.id, teamA.id, NOW, admin.id);
+  assert.throws(
+    () => castTiebreakVote({ db, roundId: round.id, voterId: voter.id, teamId: teamA.id, score: 80, now: NOW }),
+    (err) => err.status === 403,
+  );
+  cleanup(ctx);
+});
+
+test('均分：两票时 mean ≠ sum（一条票时两者恰好相同，测不出来）', () => {
+  // ⚠️ 规格自带那条用例只有**一票** → mean 与 sum **恰好都是 80**，根本区分不了。
+  const ctx = setup();
+  const { db, admin, voter, teamA, teamB, stage } = ctx;
+  const round = openTiebreakRound({
+    db, stageId: stage.id, tiedTeamIds: [teamA.id, teamB.id], statementMinutes: 10, actorId: admin.id, now: NOW,
+  });
+  const voter2 = createUser(db, { name: '评委乙', phone: '13900000027', password: 'pw' });
+  assignStageJudge(db, { stageId: stage.id, userId: voter2.id, seat: 'enterprise', now: NOW });
+  castTiebreakVote({ db, roundId: round.id, voterId: voter.id, teamId: teamA.id, score: 80, now: NOW });
+  castTiebreakVote({ db, roundId: round.id, voterId: voter2.id, teamId: teamA.id, score: 60, now: NOW });
+  const state = getTiebreakRoundState({ db, roundId: round.id });
+  assert.equal(state.tallies[teamA.id].count, 2);
+  assert.equal(state.tallies[teamA.id].sum, 140);
+  assert.ok(Math.abs(state.tallies[teamA.id].mean - 70) < 1e-12, 'mean 必须是 (80+60)/2 = 70，不是 sum');
+  cleanup(ctx);
+});
+
+test('投票给不存在的轮次 → 404（不把裸 TypeError 漏给调用方）', () => {
+  const ctx = setup();
+  const { db, voter, teamA } = ctx;
+  assert.throws(
+    () => castTiebreakVote({ db, roundId: 'no-such-round', voterId: voter.id, teamId: teamA.id, score: 80, now: NOW }),
+    (err) => err.status === 404,
+  );
+  cleanup(ctx);
+});
+
+test('投票的 UNIQUE 兜底只认「唯一约束」，其它约束错必须继续往上抛', () => {
+  // ⚠️ 兜底正则若放宽成 /UNIQUE|constraint/i，「外键失败」会被误判成「重复投票」
+  //    → 409 → 真实错误被伪装成幂等冲突。Task 6 已踩过一次同样的坑。
+  //    这里**绕过开轮次的校验**直接插一个「同分组含幽灵队伍」的轮次，从服务层打通。
+  const ctx = setup();
+  const { db, voter, teamB, stage } = ctx;
+  db.prepare(
+    `INSERT INTO tiebreak_round (id, stage_id, kind, tied_team_ids_json, statement_deadline, vote_deadline, status, created_by, created_at)
+     VALUES ('tr-x', ?, 'statement', ?, '2026-10-20T10:10:00.000Z', NULL, 'open', ?, ?)`,
+  ).run(stage.id, JSON.stringify(['no-such-team', teamB.id]), voter.id, NOW);
+  assert.throws(
+    () => castTiebreakVote({ db, roundId: 'tr-x', voterId: voter.id, teamId: 'no-such-team', score: 80, now: NOW }),
+    /FOREIGN KEY/i,
+    '外键失败不得被当成「重复投票」',
+  );
+  cleanup(ctx);
+});
+
+test('开轮次时同分组里的队伍必须真实存在且属于本赛段', () => {
+  const ctx = setup();
+  const { db, admin, teamB, stage } = ctx;
+  assert.throws(
+    () => openTiebreakRound({
+      db, stageId: stage.id, tiedTeamIds: ['no-such-team', teamB.id],
+      statementMinutes: 10, actorId: admin.id, now: NOW,
+    }),
+    (err) => err.status === 400,
+    '幽灵队伍不得进入同分组',
+  );
+  cleanup(ctx);
 });
 ```
 
@@ -5060,6 +5285,7 @@ Expected: FAIL —— `Cannot find module '../src/services/tiebreak.js'`
 
 ```javascript
 // src/db/repo/tiebreak.js — 加时陈述轮次与投票
+// 依据：S7 §3.3（R-JDG-19）+ 设计文档 §6.4【决策】加时陈述用独立表 + 唯一约束
 import { randomUUID } from 'node:crypto';
 
 export function insertTiebreakRound(db, { stageId, kind = 'statement', tiedTeamIds, statementDeadline, voteDeadline = null, createdBy, now }) {
@@ -5075,11 +5301,20 @@ export function getTiebreakRound(db, id) {
   return db.prepare('SELECT * FROM tiebreak_round WHERE id = ?').get(id) ?? null;
 }
 
+/**
+ * 轮次列表。
+ * ⚠️ 排序必须**确定**：只按 `created_at` 排是不够的 —— 同一秒开启的两个轮次
+ *    `created_at` 相同，而 SQLite 的 ORDER BY 对并列行**不保证稳定** →
+ *    「同一队多轮取最新一轮」就取到了哪一轮随缘 → 破同分链的结果**不可复算**。
+ *    `rowid` 是隐式的插入序，作为兜底排序键（全局约定：兜底排序键一律用 rowid）。
+ */
 export function listTiebreakRounds(db, { stageId, status = null } = {}) {
   if (status) {
-    return db.prepare('SELECT * FROM tiebreak_round WHERE stage_id = ? AND status = ? ORDER BY created_at').all(stageId, status);
+    return db
+      .prepare('SELECT * FROM tiebreak_round WHERE stage_id = ? AND status = ? ORDER BY created_at, rowid')
+      .all(stageId, status);
   }
-  return db.prepare('SELECT * FROM tiebreak_round WHERE stage_id = ? ORDER BY created_at').all(stageId);
+  return db.prepare('SELECT * FROM tiebreak_round WHERE stage_id = ? ORDER BY created_at, rowid').all(stageId);
 }
 
 export function closeTiebreakRoundRow(db, id, now) {
@@ -5089,7 +5324,7 @@ export function closeTiebreakRoundRow(db, id, now) {
 
 /**
  * 写入一票。
- * ⛔ 依赖主键 (tiebreak_round_id, voter_id, team_id) 保证「一人一票」——
+ * ⛔ 依赖主键 (tiebreak_round_id, voter_id, team_id) 保证「一人一队一票」——
  *    应用层「先查再插」在并发下会插出两票（设计文档 §6.4【决策】）。
  */
 export function insertTiebreakVote(db, { roundId, voterId, teamId, score, now }) {
@@ -5113,6 +5348,24 @@ export function listTiebreakVotes(db, roundId) {
 //
 // 依据：S7 §3.3（R-JDG-19 同分加时陈述：决赛同分 → 10 分钟加时陈述 → 企业席+评委席共同复议
 //       → 仍同分按企业确认原始分）+ 设计文档 §6.4【决策】加时陈述用独立表 + 唯一约束。
+//
+// 【父代理预审修正 2026-10-21 —— 本文件有 7 处修正，读代码前先看这段】
+//   ① **关闭一个不存在的轮次 → 裸 TypeError 漏到调用方**：
+//      `closeTiebreakRoundRow` 对不存在的 id 是 0 行受影响 → 返回 null →
+//      紧接着 `round.stage_id` 抛「Cannot read properties of null」，
+//      而它**不是 AppError** → HTTP 层只能回通用文案「请求无效」。现在 404。
+//   ② **UNIQUE 兜底正则过宽** —— `/UNIQUE|constraint/i` 会把「外键失败」也当成
+//      「重复投票」→ 409 → 真实错误被伪装成幂等冲突。收紧为只认唯一约束。
+//   ③ **投票分没有 0–100 区间校验** → 1000 分进票 → 复议分破 100。
+//   ④ **投票人不校验是否有投票权** —— 观察员、回避中的评委都能投票（R-JDG-09 / R-JDG-11）。
+//   ⑤ **轮次排序不确定** —— 只按 `created_at` 排，而同一秒开启的两个轮次时间戳相同，
+//      SQLite 的 ORDER BY 对并列行不保证稳定 → 「多轮取最新一轮」取到哪一轮随缘
+//      → **破同分链的结果不可复算**。现在加 `rowid` 兜底。
+//   ⑥ **未关闭的轮次也被算进复议分** —— `getTiebreakExtraScores` 取了全部轮次，
+//      一个还在开放投票的轮次，其**当前均值**会被当成最终复议分消费
+//      → 榜单随投票进行而漂移。现在只消费 `status='closed'` 的轮次。
+//   ⑦ **开轮次不校验「同分组」是否合法** —— 可以开一个只有一支队伍的「同分」轮次；
+//      同一赛段也能同时开两个 open 轮次 → 票分散在两轮里。
 import {
   insertTiebreakRound,
   getTiebreakRound,
@@ -5121,6 +5374,9 @@ import {
   insertTiebreakVote,
   listTiebreakVotes,
 } from '../db/repo/tiebreak.js';
+import { getStageJudge, listStageTeams } from '../db/repo/stages.js';
+import { listRecusals } from '../db/repo/recusals.js';
+import { checkRecusal } from '../domain/review-eligibility.js';
 import { writeAuditLog } from '../audit/log.js';
 import { appError } from '../errors.js';
 
@@ -5135,35 +5391,77 @@ function addMinutes(iso, minutes) {
   return new Date(new Date(iso).getTime() + minutes * 60_000).toISOString();
 }
 
-/** 开启一轮加时陈述（S7 §3.3：10 分钟） */
+/**
+ * 开启一轮加时陈述（S7 §3.3：10 分钟）
+ *
+ * ⛔ 同分组至少两支队伍（去重后）；同一赛段不允许已有 open 轮次 ——
+ *    否则票会分散在两个轮次里，破同分链取到的是哪一轮随缘。
+ */
 export function openTiebreakRound({ db, stageId, tiedTeamIds = [], statementMinutes = 10, actorId, now }) {
-  if (!tiedTeamIds.length) throw fail(400, 'NO_TIED_TEAMS', '没有同分队伍，无需加时陈述');
+  const unique = [...new Set(tiedTeamIds)];
+  if (unique.length < 2) {
+    throw fail(400, 'NO_TIED_TEAMS', '没有同分队伍，无需加时陈述（至少需要两支同分队伍）');
+  }
+  // ⛔ 同分组的队伍必须真实存在且属于本赛段 —— 否则会开出一个「指向幽灵队伍」的轮次，
+  //    投票时在外键上炸（而且错误信息是原始 SQL 原文）。
+  const roster = new Set(listStageTeams(db, stageId).map((t) => t.teamId));
+  const unknown = unique.filter((id) => !roster.has(id));
+  if (unknown.length) {
+    throw fail(400, 'TIED_TEAM_NOT_IN_STAGE', '同分组里有队伍不属于本赛段或不存在', { unknown });
+  }
+  if (listTiebreakRounds(db, { stageId, status: 'open' }).length) {
+    throw fail(409, 'TIEBREAK_ROUND_ALREADY_OPEN', '该赛段已有一轮进行中的加时陈述，请先关闭');
+  }
   const round = insertTiebreakRound(db, {
     stageId,
     kind: 'statement',
-    tiedTeamIds,
+    tiedTeamIds: unique,
     statementDeadline: addMinutes(now, statementMinutes),
     createdBy: actorId,
     now,
   });
   writeAuditLog(db, {
     actorId, action: 'tiebreak.open', entity: 'stage', entityId: stageId,
-    detail: { roundId: round.id, tiedTeamIds }, now,
+    detail: { roundId: round.id, tiedTeamIds: unique }, now,
   });
   return round;
 }
 
-/** 投票（一人一票由数据库主键保证） */
+/**
+ * 投票（一人一队一票由数据库主键保证）
+ *
+ * ⛔ 投票人必须**有投票权**（R-JDG-11：观察员无投票权）且**未回避**该队（R-JDG-09）。
+ */
 export function castTiebreakVote({ db, roundId, voterId, teamId, score, now }) {
   const round = getTiebreakRound(db, roundId);
   if (!round) throw fail(404, 'TIEBREAK_ROUND_NOT_FOUND', '加时陈述轮次不存在');
   if (round.status !== 'open') throw fail(409, 'TIEBREAK_ROUND_CLOSED', '该轮加时陈述已关闭');
+
+  const seat = getStageJudge(db, round.stage_id, voterId);
+  if (!seat) throw fail(403, 'NOT_ASSIGNED_JUDGE', '该投票人未被分配到本赛段');
+  if (seat.seat === 'observer') {
+    throw fail(403, 'OBSERVER_NO_VOTE', '观察员无投票权，不能参与破同分投票');
+  }
+  const recusal = checkRecusal({
+    judge: { userId: voterId },
+    team: { teamId },
+    recusalRecords: listRecusals(db, { stageId: round.stage_id, judgeId: voterId }),
+  });
+  if (recusal.recused) {
+    throw fail(403, 'RECUSED', `该投票人已回避本队（原因：${recusal.record?.reason ?? '未填写'}）`);
+  }
+
   const tied = JSON.parse(round.tied_team_ids_json);
   if (!tied.includes(teamId)) throw fail(400, 'TEAM_NOT_IN_TIE_GROUP', '该队伍不在同分组中');
+  if (typeof score !== 'number' || !Number.isFinite(score) || score < 0 || score > 100) {
+    throw fail(400, 'SCORE_OUT_OF_RANGE', '投票分必须是 0–100 之间的数字');
+  }
   try {
     return insertTiebreakVote(db, { roundId, voterId, teamId, score, now });
   } catch (err) {
-    if (/UNIQUE|constraint/i.test(String(err.message))) {
+    // ⚠️ 只认「唯一约束」这一种失败 —— 外键失败等其他错误必须继续往上抛，
+    //    否则真实错误会被伪装成「重复投票」。
+    if (/UNIQUE constraint failed: tiebreak_votes/i.test(String(err.message))) {
       throw fail(409, 'DUPLICATE_TIEBREAK_VOTE', '同一人对同一队伍只能投一次');
     }
     throw err;
@@ -5194,8 +5492,11 @@ export function getTiebreakRoundState({ db, roundId }) {
   return { round, votes, tallies: tally(votes) };
 }
 
+/** 关闭轮次（幂等：已关闭则原样返回） */
 export function closeTiebreakRound({ db, roundId, actorId, now }) {
-  const round = closeTiebreakRoundRow(db, roundId, now);
+  const existing = getTiebreakRound(db, roundId);
+  if (!existing) throw fail(404, 'TIEBREAK_ROUND_NOT_FOUND', '加时陈述轮次不存在');
+  const round = existing.status === 'closed' ? existing : closeTiebreakRoundRow(db, roundId, now);
   const votes = listTiebreakVotes(db, roundId);
   writeAuditLog(db, {
     actorId, action: 'tiebreak.close', entity: 'stage', entityId: round.stage_id,
@@ -5204,16 +5505,21 @@ export function closeTiebreakRound({ db, roundId, actorId, now }) {
   return { round, tallies: tally(votes) };
 }
 
-/** 加时陈述复议分（供 P3 的破同分链 tiebreak_extra 项消费） */
+/**
+ * 加时陈述复议分（供 P3 的破同分链 tiebreak_extra 项消费）
+ *
+ * ⛔ **只消费已关闭的轮次** —— 还在开放投票的轮次，其当前均值不是最终复议分，
+ *    榜单不能随着投票进行而漂移。
+ */
 export function getTiebreakExtraScores({ db, stageId, teamIds = [] }) {
-  const rounds = listTiebreakRounds(db, { stageId });
+  const rounds = listTiebreakRounds(db, { stageId, status: 'closed' });
   const scores = {};
   for (const round of rounds) {
     const votes = listTiebreakVotes(db, round.id);
     const t = tally(votes);
     for (const [teamId, bucket] of Object.entries(t)) {
       if (teamIds.length && !teamIds.includes(teamId)) continue;
-      // 同一队多轮取最新一轮
+      // 同一队多轮取最新一轮（轮次列表已按 created_at, rowid 确定排序）
       scores[teamId] = bucket.mean;
     }
   }
@@ -5224,7 +5530,7 @@ export function getTiebreakExtraScores({ db, stageId, teamIds = [] }) {
 - [ ] **Step 5: 运行测试确认通过**
 
 Run: `cd platform && node --test test/tiebreak.test.js`
-Expected: PASS（5 个测试全过：tiebreak.test.js 5）
+Expected: PASS（17 个测试全过：tiebreak.test.js 17）
 
 - [ ] **Step 6: 提交**
 
@@ -7197,6 +7503,56 @@ git commit -m "feat(P2): SSE 评审进度推送（src/http/sse.js + GET /api/sta
 **Task 6 的测试条数口径**：review-service **22**（规格自带 10 + 预审回归 12）。
 
 **最终结果**：变异体 20 → **KILLED 19 / 等价变异体 1 / 有效缺口 0**；`review-service.test.js` **22/22**；P2 全量 **427/427**。
+
+---
+
+## Task 7 父代理预审修正台账（2026-10-21）
+
+> Task 7 是 P2 的「破同分」链，规格自带的 **5 条用例全绿** —— 但预审发现
+> **2 Critical + 3 Important + 2 Minor**，全部在实现里修掉后再补 **12 条回归用例**；
+> 实施完成后做**变异检验**，变异体一度出现 **7 条存活**，补完后 **13/13 有效变异杀灭**
+> （另 1 条等价变异体 + 2 条不可黑盒观测的变异体）。
+
+### 一、预审发现的规格缺陷
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| **B-1** | **Critical** | **未关闭的轮次也被算进复议分** —— `getTiebreakExtraScores` 取了**全部**轮次，于是一个还在开放投票的轮次，其**当前均值**被当成最终复议分 → **榜单随投票进行而漂移**，而且未完成的轮次就参与了排名 | 实跑：开轮次 + 投一票后 → `extra = {t1: 80}`；关闭后才是「最终」值 | 只消费 `status='closed'` 的轮次 |
+| **B-2** | **Critical** | **关闭一个不存在的轮次 → 裸 TypeError 漏到调用方** —— UPDATE 0 行 → 返回 `null` → 紧接着 `round.stage_id` 抛「Cannot read properties of null」，而它**不是 AppError** → HTTP 层只能回通用文案「请求无效」，调用方既拿不到状态码也拿不到原因 | 实跑：`closeTiebreakRound({roundId:'no-such-round'})` → `TypeError` | 先校验轮次存在 → 404 `TIEBREAK_ROUND_NOT_FOUND` |
+| **B-3** | **Important** | **投票人不校验是否有投票权** —— 观察员（R-JDG-11 无投票权）、未被分配到赛段的人、**回避该队的评委**（R-JDG-09）都能投票 | 实跑：观察员投票 → 原样写入 | 三道闸门：已分配 + 非 observer + 未回避 |
+| **B-4** | **Important** | **投票分没有 0–100 区间校验** → 1000 分进票 → 复议分破 100 | 实跑：`score: 1000` → 原样落库 | 400 `SCORE_OUT_OF_RANGE` |
+| **B-5** | **Important** | **UNIQUE 兜底正则过宽** —— `/UNIQUE\|constraint/i` 会把「外键失败」也当成「重复投票」→ 409 → 真实错误被伪装成幂等冲突（Task 6 已踩过一次） | 实跑：放宽正则后，外键失败被回成 409 | 收紧为只认 `/UNIQUE constraint failed: tiebreak_votes/i` |
+| **B-6** | Minor | **轮次排序不确定** —— 只按 `created_at` 排，同一秒开启的两个轮次时间戳相同，而 SQLite 的 ORDER BY 对并列行**不保证稳定** → 「多轮取最新一轮」取到哪一轮随缘 → **破同分链不可复算** | 代码审查（并列排序的不稳定性） | 加 `rowid` 兜底（全局约定：兜底排序键一律用 SQLite 隐式 `rowid`）。⚠️ 该修正**不可黑盒观测**（见下方） |
+| **B-7** | Minor | **开轮次不校验「同分组」是否合法** —— 可以开一个只有一支队伍的「同分」轮次；同一赛段也能同时开两个 open 轮次 → 票分散在两轮里 | 实跑：`tiedTeamIds: ['t1']` → 成功开轮 | 同分组去重后 ≥2 支；同赛段只允许一个 open 轮次；同分组队伍必须真实存在且属于本赛段 |
+| **B-8** | Minor | 测试夹具用假 id（`'ed1'` / `'t1'` / `'t2'`）→ Task 1 补外键后必然失败 | 实跑：插入时 `FOREIGN KEY constraint failed` | 夹具改建真实届期 / 用户 / 战队 / 赛段 |
+
+### 二、变异检验发现的实现盲区
+
+> 变异体 **16** 个（关不存在的轮次不 404 / UNIQUE 兜底放宽 / 摘掉分数校验 /
+> 摘掉观察员与回避检查 / 摘掉同分组检查 / 摘掉「只允许一个 open 轮次」 /
+> 复议分消费全部轮次 / 均分用 sum / 排序去 rowid …）。变异脚本：`/tmp/p2t7/mutate.mjs`。
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| **B-9** | Minor | **UNIQUE 兜底只认唯一约束这条规则零覆盖** —— 没有任何一条测试会触发**非唯一约束**的失败 | 变异存活：放宽正则后 17 条用例全绿 | 补用例：直接插一个「同分组含幽灵队伍」的轮次（绕过开轮次的校验），从**服务层**打通 → 外键失败必须继续往上抛 |
+| **B-10** | Minor | **回避中的评委能不能投票零覆盖** | 变异存活：摘掉回避检查后全绿 | 补用例：先写回避记录 → 投票 403 |
+| **B-11** | Minor | **均分算错测不出来** —— 规格自带那条用例只有**一票**，`mean` 与 `sum` **恰好都是 80** | 变异存活：用 sum 代替 mean 后全绿 | 补用例：两票（80 / 60）→ `sum = 140`、`mean = 70` |
+| **B-12** | Minor | **轮次不存在时投票的 404 零覆盖** | 变异存活 | 补用例：`roundId: 'no-such-round'` → 404 |
+| — | — | **等价变异体 B12**（关闭轮次不再幂等）：UPDATE 把 `closed` 再写成 `closed`，结果完全相同 | 变异存活 | **不是盲区**，标记为等价变异体 |
+| — | — | **不可黑盒观测 B15 / B16**（排序去掉 `rowid` 兜底）：并列行在 SQLite 内部排序器里本就按扫描序返回，**黑盒测试无法区分** | 变异存活 | 保留 `rowid` 兜底（全局约定 #43），**按构造正确性**接受，不追求用例会话覆盖 |
+
+### 三、刻意保持的行为（登记口径）
+
+| 行为 | 为什么这样 |
+|---|---|
+| **复议分 = 该队在该轮所有投票的均值** | R-JDG-19 的原文是「企业席 + 评委席共同复议」→ 均分（不是最高分、不是加权） |
+| **`closeTiebreakRound` 幂等** | 重复关闭原样返回，不报错（网络重试不该让组委会看到 500） |
+| **投票不给「改票」能力** | `tiebreak_votes` 的主键是 `(轮次,投票人,队伍)`，同一人对同一队只能投一次；⛔ 要改票得开新一轮 |
+| **同一人对不同队伍各投一次是允许的** | 破同分时每位评委都要给每支并列队打分。⚠️ 精确语义是「一人**一队**一票」，不是「一人一票」（Task 1 已登记） |
+
+**Task 7 的测试条数口径**：tiebreak **17**（规格自带 5 + 预审回归 12）。
+
+**最终结果**：变异体 16 → **KILLED 13 / 等价变异体 1 / 不可观测 2 / 有效缺口 0**；`tiebreak.test.js` **17/17**；P2 全量 **444/444**。
 
 ---
 
