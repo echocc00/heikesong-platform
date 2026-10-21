@@ -890,10 +890,44 @@ import { fileURLToPath } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const deployDir = join(here, '..', 'deploy');
+const srcDir = join(here, '..', 'src');
 
 function read(name) {
   return readFileSync(join(deployDir, name), 'utf8');
 }
+
+function readSrc(name) {
+  return readFileSync(join(srcDir, name), 'utf8');
+}
+
+/**
+ * 去掉整行注释，只留**真正参与配置语义**的行。
+ * systemd 的 '#' 与 YAML 的 '#' 都从行首起，shell 的 '#' 同理。
+ * 为什么要这一步：注释里写「默认值 /opt/heikesong/platform」是**文档**，
+ * 不是「把部署路径写死在配置里」；两件事必须分开断言，
+ * 否则断言会把有用的注释也一起禁掉（→ 假红 / 假绿）。
+ */
+function effective(text) {
+  return String(text).split(/\r?\n/).filter((line) => !/^\s*#/.test(line)).join('\n');
+}
+
+// ── 真实代码里的口径（部署资产必须与它一致，不能各写各的）────────────────
+const serverSrc = readSrc(join('server.js'));
+const sessionSrc = readSrc(join('auth', 'session.js'));
+const pkg = JSON.parse(readFileSync(join(here, '..', 'package.json'), 'utf8'));
+
+/** 应用真实默认端口：src/server.js 的 `process.env.PORT || <数字>` */
+const APP_PORT = (serverSrc.match(/process\.env\.PORT\s*\|\|\s*(\d+)/) || [])[1];
+/** 应用真实的数据目录环境变量名 */
+const APP_DATA_DIR_VAR = (serverSrc.match(/process\.env\.([A-Z_]*DATA_DIR)/) || [])[1];
+/** 应用真实的会话有效期环境变量名 */
+const APP_SESSION_TTL_VAR = (sessionSrc.match(/process\.env\.([A-Z_]*SESSION_TTL_DAYS)/) || [])[1];
+/** 应用真实的健康检查路径 */
+const APP_HEALTH_PATH = (serverSrc.match(/router\.add\('GET',\s*'([^']+)'/) || [])[1];
+/** package.json engines.node 的主版本与次版本（部署脚本的下限必须与它一致） */
+const ENGINE = (pkg.engines.node || '').match(/(\d+)\.(\d+)/) || [];
+const APP_ENGINE_MAJOR = Number(ENGINE[1]);
+const APP_ENGINE_MINOR = Number(ENGINE[2]);
 
 test('systemd 单元：常驻守护 + 工作目录 + 环境文件 + journald 日志 + 非 root 运行', () => {
   const unit = read('heikesong.service');
@@ -964,12 +998,164 @@ test('install.sh：占位符与被替换的资产一一对应', () => {
     assert.ok(sh.includes(ph), `install.sh 必须替换占位符 ${ph}`);
   }
 });
+
+// ── 以下为预审追加：把「字面扫一遍」升级成「对配置本身断言」──────────────
+
+test('systemd 单元：只起【一个】Node 进程 + 入口是真实入口 + ⛔ 不得设 DEMO_MODE=1', () => {
+  const unit = read('heikesong.service');
+  const eff = effective(unit);
+  const execStarts = eff.match(/^ExecStart=.*$/gm) || [];
+  assert.equal(execStarts.length, 1, '⛔ 只能有一条 ExecStart（多进程 = 多写者 = SQLITE_BUSY）');
+  assert.match(execStarts[0], /src\/server\.js$/, '入口必须是应用真实入口 src/server.js');
+  assert.doesNotMatch(execStarts[0], /--worker|--cluster|-c\s*\d/i, '⛔ ExecStart 不得带多进程参数');
+  assert.doesNotMatch(eff, /DEMO_MODE\s*=\s*1/, '⛔ 生产部署绝对不得设 DEMO_MODE=1（会挂出 /src/domain/* 与 /rules/*）');
+  assert.doesNotMatch(eff, /\/opt\/heikesong\/platform/, '⛔ 部署路径必须走占位符，不得硬编码');
+  assert.match(eff, /^Documentation=file:__APP_DIR__\/README\.md$/m, '文档路径也要走占位符');
+});
+
+test('nginx：正式形态（域名 + TLS）+ 上游只绑回环 + 端口与真实默认一致', () => {
+  const conf = read('nginx.conf');
+  assert.ok(APP_PORT, '读不到 src/server.js 的默认端口，测试本身失效');
+  assert.match(conf, /listen 443 ssl;/, '正式形态必须是 443 + TLS（备案域名的硬要求）');
+  assert.match(conf, /ssl_certificate\s+__CERT_PATH__;/, '必须挂证书');
+  assert.match(conf, /ssl_certificate_key\s+__KEY_PATH__;/, '必须挂私钥');
+  const upstream = (conf.match(/server\s+([\d.]+):(\d+);/) || []);
+  assert.equal(upstream[1], '127.0.0.1', '⛔ 上游必须只绑回环（Node 不直接暴露到公网）');
+  assert.equal(upstream[2], APP_PORT, '上游端口必须与应用真实默认端口一致');
+  assert.doesNotMatch(conf, /server\s+0\.0\.0\.0/, '⛔ 上游不得绑 0.0.0.0');
+});
+
+test('docker-compose：⛔ 不扩副本 + 只绑回环 + ⛔ 不得设 DEMO_MODE=1 + 容器网络可达', () => {
+  const yml = read('docker-compose.yml');
+  const eff = effective(yml);
+  assert.doesNotMatch(eff, /^\s*replicas\s*:/m, '⛔ 禁止 compose 扩副本（多写者）');
+  assert.doesNotMatch(eff, /^\s*scale\b/m, '⛔ 禁止 compose scale');
+  assert.doesNotMatch(eff, /^\s*deploy\s*:/m, '⛔ 禁止用 deploy.replicas 扩副本');
+  assert.doesNotMatch(eff, /DEMO_MODE\s*:\s*"?1"?/, '⛔ 生产部署绝对不得设 DEMO_MODE=1');
+  assert.doesNotMatch(eff, /"0\.0\.0\.0:/, '⛔ 端口发布不得绑 0.0.0.0');
+  // src/server.js 只绑 127.0.0.1 ⇒ 容器必须与宿主机共享网络栈，
+  // 否则宿主机侧 127.0.0.1:8080 连不上（容器 healthy 但宿主 curl 不通）。
+  assert.match(eff, /network_mode:\s*host/, 'Node 只绑回环 ⇒ 容器网络必须用 host，否则宿主机反代连不上');
+  const health = (eff.match(/http:\/\/127\.0\.0\.1:\d+(\/[^\s'"]*)/) || [])[1];
+  assert.equal(health, APP_HEALTH_PATH, '健康检查路径必须是应用真实健康检查路径');
+  // 容器里的 Node 必须满足 package.json 的 engines（node:sqlite.backup() 要 22.16.0）
+  const imageMajor = Number((eff.match(/image:\s*node:(\d+)/) || [])[1]);
+  assert.ok(imageMajor >= APP_ENGINE_MAJOR, `⛔ 容器镜像的 Node 主版本 ${imageMajor} 低于 engines 要求的 ${APP_ENGINE_MAJOR}`);
+  // 代码挂载必须只读（代码不进容器，升级靠替换宿主机目录）
+  const codeMounts = eff.match(/-\s*\.\.:\/app:\w+/g) || [];
+  assert.equal(codeMounts.length, 1, '⛔ 代码只能挂一次（多挂一份 = 多一份可写副本）');
+  assert.ok(codeMounts[0].endsWith(':ro'), '⛔ 代码挂载必须只读（:ro）');
+  // 容器加固：根文件系统只读 + 丢掉全部 capability
+  assert.match(eff, /read_only:\s*true/, '⛔ 容器根文件系统必须只读');
+  assert.match(eff, /cap_drop:\s*\n\s*-\s*ALL/, '⛔ 容器必须丢掉全部 capability');
+});
+
+test('install.sh：环境文件不落口令 + 幂等守卫齐备 + 口令只能来自环境变量或交互', () => {
+  const sh = read('install.sh');
+  const envBlock = effective(sh.slice(sh.indexOf('write_env_file()'), sh.indexOf('as_service_user()')));
+  assert.ok(envBlock.length > 0, '找不到 write_env_file 函数');
+  assert.doesNotMatch(envBlock, /PASSWORD/i, '⛔ 环境文件里绝不能出现口令（口令只用一次、不落盘）');
+  assert.doesNotMatch(envBlock, /ADMIN_PHONE/, '环境文件里不写管理员手机号');
+  // 幂等守卫：每一条都对应「重复执行不炸」的一种具体机制
+  assert.match(sh, /id -u "\$RUN_USER"/, '用户已存在 ⇒ 跳过（不能重复创建）');
+  assert.match(sh, /install -d/, '目录已存在 ⇒ install -d 不报错');
+  assert.match(sh, /ln -sfn/, '软链已存在 ⇒ ln -sfn 不报错');
+  assert.match(sh, /systemctl enable/, 'systemd enable 可重复执行');
+  assert.match(sh, /read -rs/, '没有 ADMIN_PASSWORD 时必须交互读取（不回显）');
+  assert.match(sh, /\[ -n "\$password" \] \|\| die/, '⛔ 口令读不到时必须明确报错退出（不能带空口令继续）');
+});
+
+test('nginx / install.sh：注释不能掩盖配置错误（必须对**有效配置**断言）', () => {
+  const conf = effective(read('nginx.conf'));
+  const sh = effective(read('install.sh'));
+  // 规格的用例 3/6 是「全文扫一遍」：把真指令注释掉，注释里那份文字仍会被扫到 ⇒ 假绿。
+  // 这里对**去掉整行注释后**的配置再断言一遍，堵住这个洞。
+  assert.match(conf, /proxy_buffering off;/, '⛔ SSE 必须关缓冲（有效配置里不能被注释掉）');
+  assert.match(conf, /add_header X-Accel-Buffering no;/, '⛔ SSE 必须关掉 nginx 缓冲（有效配置里不能被注释掉）');
+  assert.match(conf, /proxy_read_timeout 360s;/, '⛔ SSE 长连接超时（有效配置里不能被注释掉）');
+  assert.match(conf, /proxy_set_header Connection '';/, '⛔ Connection 头必须清空（有效配置里不能被注释掉）');
+  assert.match(conf, /proxy_http_version 1\.1;/, '⛔ 必须 HTTP/1.1（有效配置里不能被注释掉）');
+  assert.match(sh, /systemctl daemon-reload/, '⛔ 必须 reload systemd（有效配置里不能被注释掉）');
+  assert.match(sh, /nginx -t/, '⛔ 必须先 nginx -t 再 reload（有效配置里不能被注释掉）');
+  // 静态资源的两个缓存头必须一致：expires N 天 ≡ max-age N*86400 秒
+  const expDays = (conf.match(/expires (\d+)d;/) || [])[1];
+  const maxAge = (conf.match(/max-age=(\d+)/) || [])[1];
+  assert.ok(expDays && maxAge, '读不到 expires / max-age，测试本身失效');
+  assert.equal(Number(maxAge), Number(expDays) * 86400, '⛔ expires 与 Cache-Control max-age 必须一致');
+  // 每一处 X-Real-IP 都必须透传 $remote_addr（有一处被置空，审计里就是空 IP）
+  const realIpTotal = (conf.match(/proxy_set_header X-Real-IP/g) || []).length;
+  const realIpOk = (conf.match(/proxy_set_header X-Real-IP \$remote_addr;/g) || []).length;
+  assert.equal(realIpOk, realIpTotal, '⛔ 每一处 X-Real-IP 都必须是 $remote_addr（审计要真实客户端 IP）');
+});
+
+test('install.sh：Node 下限 / 环境文件权限 / umask / 占位符映射 / locale 安全展开', () => {
+  const sh = read('install.sh');
+  // ① Node 版本下限必须与 package.json engines 一致（22.16.0 = sqlite.backup() 引入版本）
+  assert.ok(APP_ENGINE_MAJOR, '读不到 package.json engines，测试本身失效');
+  assert.match(sh, new RegExp(`MIN_NODE_MAJOR=${APP_ENGINE_MAJOR}\\b`), '⛔ Node 主版本下限必须与 engines 一致');
+  assert.match(sh, new RegExp(`MIN_NODE_MINOR=${APP_ENGINE_MINOR}\\b`), '⛔ Node 次版本下限必须与 engines 一致');
+  // ② 环境文件必须组可读（systemd 以 root 读，但服务组要能读到；0600 会让环境变量全丢）
+  assert.match(sh, /chmod 0640 "\$ENV_FILE"/, '⛔ 环境文件权限必须是 0640（组可读）');
+  // ③ umask 必须存取成对（不恢复的话，后面的 nginx 站点文件会被建成 600）
+  assert.match(sh, /old_umask="\$\(umask\)"/, '⛔ 写环境文件前必须先存 umask');
+  assert.match(effective(sh), /umask "\$old_umask"/, '⛔ 写完必须恢复 umask（否则后面的站点文件权限被带偏）');
+  // ④ 占位符 → 变量必须一一对应（不能把 __DATA_DIR__ 替换成程序目录），且**每一处**替换值都必须转义
+  const appSites = (sh.match(/s\|__APP_DIR__\|/g) || []).length;
+  const appEscaped = (sh.match(/s\|__APP_DIR__\|.*sed_escape "\$APP_DIR"/g) || []).length;
+  assert.ok(appSites > 0, '读不到 __APP_DIR__ 的替换点，测试本身失效');
+  assert.equal(appEscaped, appSites, '⛔ 每一处 __APP_DIR__ 替换都必须走 sed_escape（路径含 & 或 | 时 sed 会写坏）');
+  const dataSites = (sh.match(/s\|__DATA_DIR__\|/g) || []).length;
+  const dataEscaped = (sh.match(/s\|__DATA_DIR__\|.*sed_escape "\$DATA_DIR"/g) || []).length;
+  assert.ok(dataSites > 0, '读不到 __DATA_DIR__ 的替换点，测试本身失效');
+  assert.equal(dataEscaped, dataSites, '⛔ 每一处 __DATA_DIR__ 替换都必须走 sed_escape（且必须是数据目录，不是程序目录）');
+  // ⑤ locale 安全：$变量 紧跟非 ASCII 字符时，bash 在 C/C.UTF-8 locale 下会把高位字节
+  //    并进变量名 → set -u 下直接 unbound variable 崩掉（必须写成 ${变量}）
+  const unsafe = [...sh.matchAll(/\$[A-Za-z_][A-Za-z0-9_]*([^\x00-\x7F])/g)].map((m) => m[0]);
+  assert.deepEqual(unsafe, [], `⛔ $变量 紧跟非 ASCII 字符会炸（bash 会把高位字节并进变量名）：${unsafe.join(' ')}`);
+  // ⑥ 交互读口令必须被保护（read 失败时不能被 set -e 静默打断）
+  assert.match(sh, /read -rs password \|\| true/, '⛔ 交互读口令失败必须被显式处理');
+});
+
+test('跨资产口径一致：端口 / 数据目录变量 / 会话变量 / 入口 / 健康检查必须与应用真实代码一致', () => {
+  const unit = read('heikesong.service');
+  const conf = read('nginx.conf');
+  const yml = read('docker-compose.yml');
+  const sh = read('install.sh');
+  assert.ok(APP_PORT, '读不到 src/server.js 的默认端口，测试本身失效');
+  assert.ok(APP_DATA_DIR_VAR, '读不到 src/server.js 的数据目录变量，测试本身失效');
+  assert.ok(APP_SESSION_TTL_VAR, '读不到 src/auth/session.js 的会话变量，测试本身失效');
+  assert.ok(APP_HEALTH_PATH, '读不到 src/server.js 的健康检查路径，测试本身失效');
+
+  // 端口四处同口径
+  assert.match(unit, new RegExp(`^Environment=PORT=${APP_PORT}$`, 'm'), 'systemd 端口必须与真实默认一致');
+  assert.match(conf, new RegExp(`server 127\\.0\\.0\\.1:${APP_PORT};`), 'nginx 上游端口必须与真实默认一致');
+  assert.match(yml, new RegExp(`PORT:\\s*"${APP_PORT}"`), 'compose 端口必须与真实默认一致');
+  assert.match(sh, new RegExp(`printf 'PORT=${APP_PORT}`), 'install.sh 写的环境文件端口必须与真实默认一致');
+
+  // 数据目录变量名四处同口径
+  assert.match(unit, new RegExp(`^Environment=${APP_DATA_DIR_VAR}=__DATA_DIR__$`, 'm'), 'systemd 数据目录变量名必须与真实代码一致');
+  assert.match(yml, new RegExp(`${APP_DATA_DIR_VAR}:\\s*"/data"`), 'compose 数据目录变量名必须与真实代码一致');
+  assert.match(sh, new RegExp(`printf '${APP_DATA_DIR_VAR}=%s`), 'install.sh 写的环境文件数据目录变量名必须与真实代码一致');
+
+  // 会话有效期变量名
+  assert.match(sh, new RegExp(`${APP_SESSION_TTL_VAR}=`), '环境文件必须写会话有效期变量');
+
+  // 入口与健康检查路径
+  assert.match(unit, /src\/server\.js/, 'systemd 入口必须与应用真实入口一致');
+  assert.match(yml, new RegExp(APP_HEALTH_PATH.replace(/\//g, '\\/')), 'compose 健康检查路径必须与应用真实健康检查路径一致');
+});
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
 
 Run: `cd platform && node --test test/deploy-assets.test.js`
 Expected: FAIL —— `ENOENT: no such file or directory, open 'platform/deploy/heikesong.service'`
+
+> ⚠️ **2026-10-21 预审补记（Task 2）**：本步只证明了「文件不存在」。预审把**规格自己的**
+> 四个资产文件原样抽到 `/tmp` 再跑同一条命令，**7 个用例里 3 个仍然红** ——
+> 规格的资产文件与规格的验收用例**互相矛盾**（注释里写了被禁词、`$0` 定位写法对不上、
+> 口令示例被自己的正则判成硬编码口令）。
+> 逐条缺陷与证据见本文件末尾「Task 2 父代理预审修正台账（2026-10-21）」。
 
 - [ ] **Step 3: 创建 `deploy/heikesong.service`**
 
@@ -983,15 +1169,17 @@ Expected: FAIL —— `ENOENT: no such file or directory, open 'platform/deploy/
 #   __DATA_DIR__  数据目录（默认 /var/lib/heikesong/data）
 #   __RUN_USER__  运行用户（默认 heikesong）
 #
-# ⛔ 单写者约束：这里【绝不】加 --workers=N 或 cluster 模式。
+# ⛔ 单写者约束：这里【绝不】加「多 worker 进程」或「多进程集群」启动参数。
 #    SQLite 官方：There can only be a single writer at a time。
 #    多个 Node worker 进程同时写同一个 .db 文件是 SQLITE_BUSY 的真正来源。
+#    ⚠️ 本文件【不】写出多进程参数的具体名字：规格 test/deploy-assets.test.js
+#       按字面扫全文（注释里出现同样判违规），参数名见 P6 计划 Task 2 章节。
 # ✅ 扩容只能加「读」：静态资源交给 nginx 直出，几百并发静态请求根本不进 Node 进程。
 # ⚠️ WAL 要求所有进程在同一台主机；要多机部署必须换 Postgres，没有第三条路。
 
 [Unit]
 Description=Heikesong Platform (单进程 Node · 单写者 SQLite)
-Documentation=file:/opt/heikesong/platform/README.md
+Documentation=file:__APP_DIR__/README.md
 After=network-online.target
 Wants=network-online.target
 
@@ -1001,7 +1189,7 @@ User=__RUN_USER__
 Group=__RUN_USER__
 WorkingDirectory=__APP_DIR__
 
-# 环境文件：PORT / DATA_DIR / SESSION_TTL_DAYS
+# 环境文件：PORT / DATA_DIR / SESSION_TTL_DAYS / NODE_ENV
 # ⛔ 这里不放任何口令：口令只在初始化管理员时用一次，不落盘。
 EnvironmentFile=-/etc/heikesong/platform.env
 
@@ -1023,8 +1211,8 @@ SyslogIdentifier=heikesong
 Environment=PORT=8080
 Environment=DATA_DIR=__DATA_DIR__
 Environment=NODE_ENV=production
-# ⛔⛔ **绝对不要设 DEMO_MODE=1**（2026-10-21 漂移审计修正 I-5）：
-#    DEMO_MODE=1 会把 /src/domain/* 与 /rules/* 挂到 HTTP 上 ——
+# ⛔⛔ **绝对不要打开 DEMO_MODE**（2026-10-21 漂移审计修正 I-5）：
+#    DEMO_MODE 一旦打开，会把 /src/domain/* 与 /rules/* 挂到 HTTP 上 ——
 #    那是**领域层算法源码**（打分 / 破同分 / 防作弊判定）与**全部规则配置**
 #    （权重表、破同分链、行为分、段位表）。生产部署下必须一律 404。
 #    这道门只给本地预览（scripts/serve-demo.js）与开发服务器用。
@@ -1067,6 +1255,9 @@ WantedBy=multi-user.target
 #
 # ⚠️ nginx 需要 ≥ 1.25.1（用 `http2 on;` 语法）。更低版本请把
 #    `http2 on;` 换成 `listen 443 ssl http2;`。
+#
+# ⚠️ 端口口径：上游固定 127.0.0.1:8080，与 systemd 单元 / 环境文件 / compose
+#    的 PORT=8080 是同一口径。改端口要三处一起改，否则反代连不上。
 
 upstream heikesong_app {
     # ⛔ 只能起【一个】后端进程（单写者）。要加读能力就加 nginx 副本，不要加 Node 副本。
@@ -1114,6 +1305,9 @@ server {
 
     # ── 静态资源直出（不进 Node 进程）────────────────────────
     # ✅ 这是「扩容只能加读」的落点：几百并发静态请求根本不进 Node。
+    # ⚠️ web/assets/ 是【前端构建产物目录】：仓库里现在还没有这个目录
+    #    （现有静态文件在 web/ 根下，由下面的 location / 交给 Node 出）。
+    #    目录不存在时本段对 /assets/ 请求返 404，不影响其它路径。
     location /assets/ {
         alias __APP_DIR__/web/assets/;
         expires 7d;
@@ -1163,15 +1357,30 @@ server {
 #
 # 依据：设计文档 §14.2「deploy/docker-compose.yml（单容器编排）」
 #
-# ⛔ 单写者约束：这里的 command 里【绝不】加 --workers=N，也不要用 compose 的 scale 扩副本。
+# ⛔ 单写者约束：这里的 command 里【绝不】加多 worker 进程 / 多进程集群启动参数，
+#    也不要用 compose 的 scale 扩副本。
 #    SQLite 官方：There can only be a single writer at a time。
 #    多个 Node 进程同时写同一个 .db 文件是 SQLITE_BUSY 的真正来源。
+#    ⚠️ 本文件【不】写出多进程参数的具体名字：规格 test/deploy-assets.test.js
+#       按字面扫全文（注释里出现同样判违规），参数名见 P6 计划 Task 2 章节。
 # ✅ 扩容只能加「读」：静态资源交给 nginx 直出。
 # ⚠️ WAL 要求所有进程在同一台主机；要多机部署必须换 Postgres，没有第三条路。
 #
-# ⚠️ 本文件在 platform/deploy/ 下，compose 的相对路径以本文件所在目录为基准。
+# ⚠️ 本文件在 platform/deploy/ 下，compose 的相对路径以本文件所在目录为基准
+#    （compose 的 project directory = 第一个 compose 文件所在目录）。
 #    运行： cd platform && docker compose -f deploy/docker-compose.yml up -d
-#    宿主机 127.0.0.1:8080 出来，Node 不直接暴露到公网，由 nginx 反代。
+#    ⇒ 挂载源 `..` = platform/，代码进容器，升级靠替换宿主机目录。
+#
+# ⚠️ 网络口径（照实写：src/server.js 只绑回环）：
+#    src/server.js 的 server.listen(port, '127.0.0.1') —— 进程只听回环。
+#    ⇒ 若用 ports 端口映射，宿主机的 127.0.0.1:8080 会被转发到容器的 eth0 地址，
+#      而进程不听那里 → 连接被拒（容器 healthy，但宿主机 curl 不通、静默失败）。
+#    ⇒ 因此这里用 network_mode: host：容器与宿主机共享网络栈，
+#      进程绑的 127.0.0.1:8080 就是宿主机的 127.0.0.1:8080 ——
+#      nginx 的反代目标（127.0.0.1:8080）不用改，Node 也不会暴露到公网。
+#    ⚠️ host 网络只保证 Linux 宿主机的语义；Docker Desktop（macOS/Windows）上
+#       容器拿到的是 Linux 虚拟机的网络栈，宿主机 127.0.0.1:8080 仍不通。
+#    （若日后把 src/server.js 改成可绑 0.0.0.0，这里可换回 ports 映射。）
 
 name: heikesong
 
@@ -1180,20 +1389,20 @@ services:
     image: node:24-alpine
     container_name: heikesong-app
     working_dir: /app
-    # ⛔ 不要改成 ["node", "--cluster", "src/server.js"] 或加 --workers
+    # ⛔ 不要改成多进程启动参数，也不要加多 worker 进程
     command: ["node", "src/server.js"]
     restart: always
     environment:
       PORT: "8080"
       DATA_DIR: "/data"
       NODE_ENV: "production"
-      # ⛔⛔ **绝对不要设 DEMO_MODE=1**（2026-10-21 漂移审计修正 I-5）：
-      #    DEMO_MODE=1 会把 /src/domain/* 与 /rules/* 挂到 HTTP 上 ——
+      # ⛔⛔ **绝对不要打开 DEMO_MODE**（2026-10-21 漂移审计修正 I-5）：
+      #    DEMO_MODE 一旦打开，会把 /src/domain/* 与 /rules/* 挂到 HTTP 上 ——
       #    那是**领域层算法源码**与**全部规则配置**。生产部署下必须一律 404。
       #    这道门只给本地预览（scripts/serve-demo.js）与开发服务器用。
-    ports:
-      # 只绑回环：对外由 nginx 反代
-      - "127.0.0.1:8080:8080"
+    # 只绑回环：Node 自己 listen 127.0.0.1（src/server.js 的实际行为），
+    # 宿主机侧即 127.0.0.1:8080，对外仍由 nginx 反代。
+    network_mode: host
     volumes:
       # platform/ 只读挂载：代码不进容器，升级靠替换宿主机目录
       - ..:/app:ro
@@ -1238,11 +1447,14 @@ volumes:
 # ⛔ 不硬编码任何口令：管理员口令来自环境变量 ADMIN_PASSWORD，或交互读取（不回显）。
 #    环境文件 /etc/heikesong/platform.env 里【不放口令】——口令只用于初始化那一次。
 #
-# 用法：
+# 用法（【不要】把口令写进本文件，也不要提交进仓库）：
 #   sudo SERVER_NAME=heikesong.example.com \
 #        CERT_PATH=/etc/letsencrypt/live/heikesong.example.com/fullchain.pem \
 #        KEY_PATH=/etc/letsencrypt/live/heikesong.example.com/privkey.pem \
-#        ADMIN_PASSWORD='...' ./deploy/install.sh
+#        ./deploy/install.sh
+#   → 不给 ADMIN_PASSWORD 时，脚本会交互读取口令（不回显，仅用于这一次初始化）。
+#   → 想免交互：在你自己的 shell 里 export ADMIN_PASSWORD（值当场填，
+#     【不要】写进本文件 / 仓库 / 命令历史），再用 sudo -E 调用本脚本。
 #
 # 全部变量（都有默认值，见下）：
 #   APP_DIR       程序目录            默认 /opt/heikesong/platform
@@ -1254,9 +1466,18 @@ volumes:
 #   KEY_PATH      私钥路径            默认 /etc/letsencrypt/live/<域名>/privkey.pem
 #   ADMIN_PHONE   管理员手机号         默认 13800000000
 #   ADMIN_PASSWORD 管理员口令          默认空（空 = 交互读取）
+#   ENV_FILE      环境文件路径         默认 /etc/heikesong/platform.env
+#   NGINX_SITE    nginx 站点文件       默认 /etc/nginx/sites-available/heikesong.conf
+#   NGINX_LINK    nginx 站点软链       默认 /etc/nginx/sites-enabled/heikesong.conf
+#   SYSTEMD_UNIT_DIR systemd 单元目录  默认 /etc/systemd/system
+#
+# ⚠️ 端口口径：8080 是**写死**的口径（与 deploy/nginx.conf 的 upstream、
+#    systemd 单元的 Environment=PORT、docker-compose 的 PORT 同一套）。
+#    要换端口必须四处一起改 —— 本脚本不提供 PORT 变量，避免只改一处连不上。
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"     # platform/ 根目录
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"     # platform/ 根目录
 APP_DIR="${APP_DIR:-/opt/heikesong/platform}"
 DATA_DIR="${DATA_DIR:-/var/lib/heikesong/data}"
 SERVICE_NAME="${SERVICE_NAME:-heikesong}"
@@ -1265,8 +1486,11 @@ SERVER_NAME="${SERVER_NAME:-}"
 ENV_FILE="${ENV_FILE:-/etc/heikesong/platform.env}"
 NGINX_SITE="${NGINX_SITE:-/etc/nginx/sites-available/heikesong.conf}"
 NGINX_LINK="${NGINX_LINK:-/etc/nginx/sites-enabled/heikesong.conf}"
+SYSTEMD_UNIT_DIR="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
+# ⛔ Node 下限 = 22.16.0（package.json engines）。22.16.0 是 node:sqlite.backup()
+#    的引入版本 —— 备份脚本（P6 Task 1）依赖它，低版本装了也跑不了备份。
 MIN_NODE_MAJOR=22
-MIN_NODE_MINOR=5
+MIN_NODE_MINOR=16
 
 log() { printf '[install] %s\n' "$*"; }
 die() { printf '[install] 错误：%s\n' "$*" >&2; exit 1; }
@@ -1287,6 +1511,12 @@ node_version_ok() {
   if [ "$major" -lt "$MIN_NODE_MAJOR" ]; then return 1; fi
   if [ "$major" -eq "$MIN_NODE_MAJOR" ] && [ "$minor" -lt "$MIN_NODE_MINOR" ]; then return 1; fi
   return 0
+}
+
+# sed 替换文本转义：反斜杠 / & / | 在替换文本里必须转义，
+# 否则路径里的特殊字符会被 sed 当成自己的语法（& = 整个匹配）。
+sed_escape() {
+  printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'
 }
 
 install_node() {
@@ -1318,16 +1548,25 @@ create_service_user() {
   fi
   log "创建系统用户 $RUN_USER"
   if command -v useradd >/dev/null 2>&1; then
-    useradd --system --home-dir /var/lib/heikesong --shell /usr/sbin/nologin "$RUN_USER"
+    useradd --system --home-dir "$(dirname "$DATA_DIR")" --shell /usr/sbin/nologin "$RUN_USER"
   else
-    adduser -S -D -H -h /var/lib/heikesong -s /sbin/nologin "$RUN_USER"
+    adduser -S -D -H -h "$(dirname "$DATA_DIR")" -s /sbin/nologin "$RUN_USER"
   fi
 }
 
+# 运行用户的主组：落盘时用它，而不是「与用户名同名的组」——
+# 同名组是 Debian/RHEL 上 useradd 的默认行为，但不是通用假设
+# （例如 macOS 的主组是 staff，install -g <用户名> 会直接报 unknown group）。
+run_group() {
+  id -gn "$RUN_USER" 2>/dev/null || printf '%s' "$RUN_USER"
+}
+
 prepare_dirs() {
+  local group
+  group="$(run_group)"
   install -d -m 0755 "$APP_DIR"
-  install -d -m 0750 -o "$RUN_USER" -g "$RUN_USER" "$DATA_DIR"
-  install -d -m 0750 -o "$RUN_USER" -g "$RUN_USER" "$DATA_DIR/backups"
+  install -d -m 0750 -o "$RUN_USER" -g "$group" "$DATA_DIR"
+  install -d -m 0750 -o "$RUN_USER" -g "$group" "$DATA_DIR/backups"
 }
 
 copy_app() {
@@ -1346,14 +1585,25 @@ copy_app() {
 write_env_file() {
   log "写环境文件 $ENV_FILE"
   install -d -m 0750 "$(dirname "$ENV_FILE")"
+  # umask 收窄到 077 再写文件，写完恢复 —— 否则 umask 会漏到后面的
+  # nginx 站点文件上（那个文件 nginx 主进程以 root 读，但 600 的配置
+  # 会让「非 root 的配置检查工具」读不了）。
+  local old_umask
+  old_umask="$(umask)"
   umask 077
   {
     printf 'PORT=8080\n'
     printf 'DATA_DIR=%s\n' "$DATA_DIR"
     printf 'SESSION_TTL_DAYS=7\n'
+    # ⚠️ NODE_ENV=production 会让登录 Cookie 带 Secure 标记
+    #    （src/server.js: secureCookies = NODE_ENV === 'production'）——
+    #    「IP + 端口 + 纯 HTTP」的调试形态下浏览器会直接拒收 Cookie → 登录失效。
+    #    那种形态请用 NODE_ENV=development 调用本脚本。
+    printf 'NODE_ENV=%s\n' "${NODE_ENV:-production}"
   } > "$ENV_FILE"
+  umask "$old_umask"
   chmod 0640 "$ENV_FILE"
-  chown root:"$RUN_USER" "$ENV_FILE" 2>/dev/null || true
+  chown root:"$(run_group)" "$ENV_FILE" 2>/dev/null || true
   # ⛔ 这里【不写】任何口令：口令只在初始化管理员时用一次，不落盘。
 }
 
@@ -1375,21 +1625,26 @@ init_database() {
   local password="${ADMIN_PASSWORD:-}"
   if [ -z "$password" ]; then
     printf '请输入管理员口令（不回显，仅用于本次初始化，不写入任何文件）：'
-    read -rs password
+    # ⚠️ 读不到（stdin 不是终端 / 已关闭）时 read 返回非 0 ——
+    #    在 set -e 下会让脚本直接死掉，报错信息还很难懂，所以吞掉退出码，
+    #    交给下面的空值检查给出人话。
+    read -rs password || true
     printf '\n'
   fi
   [ -n "$password" ] || die "未提供管理员口令（ADMIN_PASSWORD 环境变量或交互输入）"
-  log "初始化能力点 / 角色 / 管理员账号（手机号 $phone）"
+  log "初始化能力点 / 角色 / 管理员账号（手机号 ${phone}）"
   ( cd "$APP_DIR" && as_service_user env DATA_DIR="$DATA_DIR" ADMIN_PHONE="$phone" ADMIN_PASSWORD="$password" node scripts/seed.js )
   unset password
 }
 
 write_systemd_unit() {
   log "写 systemd 单元 $SERVICE_NAME"
-  sed -e "s|__APP_DIR__|$APP_DIR|g" \
-      -e "s|__DATA_DIR__|$DATA_DIR|g" \
-      -e "s|__RUN_USER__|$RUN_USER|g" \
-      "$ROOT/deploy/heikesong.service" > "/etc/systemd/system/$SERVICE_NAME.service"
+  install -d -m 0755 "$SYSTEMD_UNIT_DIR"
+  sed -e "s|__APP_DIR__|$(sed_escape "$APP_DIR")|g" \
+      -e "s|__DATA_DIR__|$(sed_escape "$DATA_DIR")|g" \
+      -e "s|__RUN_USER__|$(sed_escape "$RUN_USER")|g" \
+      -e "s|/etc/heikesong/platform.env|$(sed_escape "$ENV_FILE")|g" \
+      "$ROOT/deploy/heikesong.service" > "$SYSTEMD_UNIT_DIR/$SERVICE_NAME.service"
   systemctl daemon-reload
   systemctl enable "$SERVICE_NAME"
 }
@@ -1403,10 +1658,10 @@ write_nginx_site() {
   install -d -m 0755 "$(dirname "$NGINX_SITE")" "$(dirname "$NGINX_LINK")"
   local cert="${CERT_PATH:-/etc/letsencrypt/live/$SERVER_NAME/fullchain.pem}"
   local key="${KEY_PATH:-/etc/letsencrypt/live/$SERVER_NAME/privkey.pem}"
-  sed -e "s|__SERVER_NAME__|$SERVER_NAME|g" \
-      -e "s|__CERT_PATH__|$cert|g" \
-      -e "s|__KEY_PATH__|$key|g" \
-      -e "s|__APP_DIR__|$APP_DIR|g" \
+  sed -e "s|__SERVER_NAME__|$(sed_escape "$SERVER_NAME")|g" \
+      -e "s|__CERT_PATH__|$(sed_escape "$cert")|g" \
+      -e "s|__KEY_PATH__|$(sed_escape "$key")|g" \
+      -e "s|__APP_DIR__|$(sed_escape "$APP_DIR")|g" \
       "$ROOT/deploy/nginx.conf" > "$NGINX_SITE"
   ln -sfn "$NGINX_SITE" "$NGINX_LINK"
   nginx -t                 # ⛔ 先验配置再 reload：配置错了不炸线上
@@ -1437,6 +1692,9 @@ main() {
   fi
   node_version_ok || die "Node 版本仍不满足要求（需要 >= ${MIN_NODE_MAJOR}.${MIN_NODE_MINOR}）"
 
+  [ -f "$ROOT/deploy/heikesong.service" ] || die "缺少 $ROOT/deploy/heikesong.service（脚本必须在 platform/deploy/ 下）"
+  [ -f "$ROOT/deploy/nginx.conf" ] || die "缺少 $ROOT/deploy/nginx.conf（脚本必须在 platform/deploy/ 下）"
+
   create_service_user
   prepare_dirs
   copy_app
@@ -1449,7 +1707,10 @@ main() {
   log "部署完成。"
   log "  程序目录：$APP_DIR"
   log "  数据目录：$DATA_DIR"
-  log "  备份命令： cd $APP_DIR && DATA_DIR=$DATA_DIR node scripts/backup.js"
+  # 备份脚本是 P6 Task 1 的产物：还没落地就不打印这条命令，免得给出跑不通的提示。
+  if [ -f "$APP_DIR/scripts/backup.js" ]; then
+    log "  备份命令： cd $APP_DIR && DATA_DIR=$DATA_DIR node scripts/backup.js"
+  fi
   log "  查看日志： journalctl -u $SERVICE_NAME -f"
 }
 
@@ -1459,15 +1720,25 @@ main "$@"
 - [ ] **Step 7: 运行测试确认通过**
 
 Run: `cd platform && node --test test/deploy-assets.test.js`
-Expected: PASS（7 个测试全过：deploy-assets.test.js 7）
+Expected: PASS（14 个测试全过：deploy-assets.test.js 14）
+
+> ⚠️ **2026-10-21 预审补记（Task 2）**：规格原写「7 个测试」。规格自带的 7 个用例**逐字保留**；
+> 预审**追加 7 个**「对配置本身断言」的用例（单进程 / DEMO_MODE 禁令 / 正式形态 TLS /
+> 上游只绑回环 / 不扩副本 / 端口与真实代码同口径 / 环境文件不落口令 / 幂等守卫 /
+> 「注释不能掩盖配置错误」），理由见台账 D-11 与 D-15。
 
 - [ ] **Step 8: 语法自检（不执行）**
 
 Run: `cd platform && bash -n deploy/install.sh && echo "install.sh 语法 OK"`
 Expected: `install.sh 语法 OK`
 
-Run: `cd platform && sh -c 'grep -c "proxy_buffering off;" deploy/nginx.conf'`
+Run: `cd platform && sh -c 'grep -v "^[[:space:]]*#" deploy/nginx.conf | grep -c "proxy_buffering off;"'`
 Expected: `1`
+
+> ⚠️ **2026-10-21 预审补记（Task 2）**：规格原命令是 `grep -c "proxy_buffering off;"`（不过滤注释），
+> 期望值写 `1` —— 但**规格自己的 nginx.conf 头部注释里就写了一遍** `proxy_buffering off;`，
+> 所以原命令在原文件上实测是 **2**（注释 1 处 + 真指令 1 处）。
+> 真指令本来就只有 1 处，所以改成「去掉整行注释再计数」，期望值 `1` 成立且能真正抓到重复指令。
 
 - [ ] **Step 9: 提交**
 
@@ -4161,7 +4432,117 @@ git commit -m "test(P6): 全链路验收 + 跨平台可移植性验收"
 | 8 | **P6 的 `scripts/restore.js` 需要读 schema 版本** | `INTERFACES.md` §1 的 P0 产出清单里 `src/db/migrate.js` 只有 `applyMigrations` / `readMigrationFiles`。P6 **追加**一个导出 `currentVersion(db)`（P0 已建，本阶段只追加，**不改 `applyMigrations` 的签名与行为**），`scripts/restore.js` 改为 import 它。⚠️ **不能在 `scripts/` 里自己写 SQL** —— 全局约束「所有 SQL 收进 `src/db/repo/`」，而 `src/db/migrate.js` 是 `platform/test/sql-boundary.test.js` 守卫的**唯一豁免文件**（守卫扫描 `src/` **与 `scripts/`**）；照原写法（`db.prepare('SELECT MAX(version) …')`）**当场判违规**。见 C-5 修正记录 |
 | 9 | **P4 的 `scripts/forbidden.txt` 有三条词条永远命中不了** | P4 的 `scanText()` 用 **`line.includes(term)` 字面串匹配**，但 P4 清单里有 `四维各 ?25%` / `初赛企业确认权重 ?20%` / `w_E ?= ?20%.*初赛` —— `?` 与 `.*` 在字面匹配下没有意义，**这三条词条等于没写**（R-AUD-03 被架空）。P6 在「修改 `scripts/forbidden.txt`」这一步里把这几条**拆成空格变体**（沿用平台自带 `platform/scripts/forbidden.txt` 的既有约定：空格变体各写一条），P6 自己新增的词条也一律用字面串。**不改 `scanText` 的匹配语义**（P4 的行为与测试都不动）。 |
 
+### Task 2（部署资产）本轮偏差 —— 2026-10-21 预审
+
+> `INTERFACES.md` §7 对 P6 部署资产只规定了**文件名与职责**（`deploy/heikesong.service` /
+> `nginx.conf` / `docker-compose.yml` / `install.sh`）与三条禁令（`DEMO_MODE=1`、单写者、
+> 不硬编码口令），**没有规定具体内容**。因此下表记的是「本 Task 的实现 vs 计划正文原写法」的偏差，
+> 以及**是否触碰 `INTERFACES.md` 的契约**。
+
+| # | 偏差 | 是否触碰 INTERFACES.md 契约 | 处理 |
+|---|---|---|---|
+| T2-1 | `deploy/docker-compose.yml` 原来用 `ports: "127.0.0.1:8080:8080"`，改为 `network_mode: host`（去掉 `ports`） | ❌ 不触碰（文件名/职责不变） | `src/server.js` 实测**只绑 127.0.0.1**（`lsof`：`TCP 127.0.0.1:8080 (LISTEN)`，非回环 IP 不可达）。容器里用 `ports` 转发到容器 eth0，而进程不听那里 ⇒ 连接被拒（容器 healthy 但宿主 curl 不通）。`network_mode: host` 让「进程绑的 127.0.0.1:8080」= 宿主机的 127.0.0.1:8080，与 `nginx` 反代目标一致、也不暴露公网。**上游另一条路**：`src/server.js` 改成可绑 0.0.0.0（不在本 Task 归属内），届时可换回 `ports`。 |
+| T2-2 | `deploy/install.sh` 的 Node 版本下限由 `22.5` 改为 `22.16.0` | ❌ 不触碰 | `package.json` engines 写 `>=22.16.0`；`sqlite.backup()`（P6 Task 1 的备份脚本依赖）也是 22.16.0 引入的。22.5 会装上跑不了备份的 Node。 |
+| T2-3 | `deploy/heikesong.service` 的 `Documentation=` 由硬编码 `/opt/heikesong/platform/README.md` 改为 `__APP_DIR__/README.md` | ❌ 不触碰 | 违反「部署路径不硬编码」；占位符集合仍是规格声明的 `__APP_DIR__` / `__DATA_DIR__` / `__RUN_USER__`，**没有新增占位符**。 |
+| T2-4 | `deploy/install.sh` 新增 `SYSTEMD_UNIT_DIR` 变量（默认 `/etc/systemd/system`） | ❌ 不触碰 | 原写法把 `/etc/systemd/system/` 写死在函数里 → 干跑（临时目录）必然写到真机。做成变量后默认值不变，行为不变。 |
+| T2-5 | `deploy/install.sh` 的 `ENV_FILE` 变量原本**形同虚设**（单元里写死了 `/etc/heikesong/platform.env`），现改为 sed 替换该字面路径 | ❌ 不触碰（占位符集合不变） | 修「改了变量不生效」的静默失效。 |
+| T2-6 | `deploy/install.sh` 新增 `NODE_ENV` 变量（默认 `production`）写进环境文件 | ❌ 不触碰 | 落实计划「临时调试形态」D-2：`NODE_ENV=production` 会让 Cookie 带 `Secure`，`http://` 下浏览器拒收 → 登录失效。`EnvironmentFile` 优先于 `Environment=`，所以环境文件里的值生效。 |
+| T2-7 | `deploy/install.sh` 的落盘属组由「与用户名同名的组」改为**运行用户的主组**（`id -gn`） | ❌ 不触碰 | `install -d -g <用户名>` 假设存在同名组（Debian/RHEL 的 `useradd` 默认行为，但不是通用假设；macOS 主组是 `staff`，实测直接报 `unknown group`）。systemd 单元的 `Group=__RUN_USER__` 保持不变（占位符集合不变），在目标平台（Linux）两者一致。 |
+| T2-8 | `deploy/nginx.conf` 增补 3 处注释（端口口径、`web/assets/` 目录现状、占位符替换说明） | ❌ 不触碰 | 只加注释，不改任何指令。 |
+| T2-9 | `platform/test/deploy-assets.test.js` 由 7 个用例扩到 14 个 | ❌ 不触碰（测试文件不在 `INTERFACES.md` 契约内） | 规格的 7 个用例**逐字保留**；追加 7 个「对有效配置断言」的用例（见台账 D-11 / D-15）。 |
+| T2-10 | 计划 Task 2 的 Step 8 第二条命令改为「去掉整行注释再计数」 | ❌ 不触碰 | 规格原命令在**规格自己的文件**上实测是 2（注释里写了一遍），期望值 1 与文件不符。 |
+
 ---
 
 *配套：`../specs/2026-10-20-heikesong-platform-design.md`｜`../requirements-traceability.md`｜`../rule-decisions.md`｜`../`*
+
+---
+
+## Task 2 父代理预审修正台账（2026-10-21）
+
+> 本节是 Task 2（部署资产）的预审记录：**规格缺陷清单**、处置方式、逐字回写位置、硬约束自证。
+> 纪律：本计划 Task 2 的 5 个代码块 = 最终实现的**逐字副本**
+> （核验脚本 `platform/test/plan-assets-match.test.js` 之外的独立核验见下「D-13」）。
+
+### A. 预审方法（先跑后派）
+
+1. 把规格 Task 2 的 5 个代码块**原样抽到** `/tmp/p6-t2/spec/`（一个字节都没改）。
+2. 在该副本上跑规格自带用例 → **红**（真实输出见 D-01）。
+3. 逐条定位根因 → 改实现 → 再跑 → 全绿 → 才落盘到 `platform/deploy/` 与 `platform/test/`。
+4. 落盘后做：幂等干跑（连续两次执行）、YAML 解析、nginx 结构检查（含反证）、全量测试、
+   发布扫描、变异测试。
+
+### B. 规格缺陷清单
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| D-01 | **Critical** | **规格的资产文件与规格自己的验收用例互相矛盾**：systemd 单元与 compose 的**注释里**写了被禁字面量（`--workers` / `cluster`），而规格的用例是 `doesNotMatch(全文)` → 注释里出现同样判红 | 规格副本上跑自带用例：`# tests 7 / # pass 4 / # fail 3`；逐条断言探针：`12/18 断言通过，6 条失败` | 资产文件的注释改写为不含被禁字面量（保留语义与指向计划的指引）。**不改用例**（用例的意图是对的：文件里就不该出现这些字面量）。 |
+| D-02 | **Critical** | `install.sh` 的 `ROOT="$(cd "$(dirname "$0")/.." && pwd)"` **对不上**规格用例的正则 `\$\(cd "\$\(dirname "\$0\)" && pwd\)`（少一个 `/..`） | 同上探针：`FAIL [sh] match /\$\(cd "\$\(dirname "\$0\)" && pwd\)/` | 拆成两行：`SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"`（**正是全局约束写的那个写法**）+ `ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"`。用例与全局约束同时满足。 |
+| D-03 | **Critical** | `install.sh` 的用法注释里 `ADMIN_PASSWORD='...'` **被规格自己的「不许硬编码口令」正则判成硬编码口令**（`'...'` 里第一个字符不是 `$`） | 同上探针：`FAIL [sh] doesNotMatch /PASSWORD\s*=\s*["'][^"'$][^"']*["']/`（大小写不敏感那条同样红） | 用法注释改成**不出现任何带引号的口令字面量**（口令值当场填、且不落盘）。口令来源仍是 `ADMIN_PASSWORD` 环境变量或交互读取。 |
+| D-04 | **Critical** | `install.sh` 里 `log "…（手机号 $phone）"` 的 `$phone` **紧跟全角括号** → bash 在 `C` / `C.UTF-8` locale 下把高位字节并进变量名 → `set -u` 下直接 **unbound variable 崩掉**（种子步骤之后全流程中断） | 干跑实测：`/tmp/…/install.sh: line 195: phone?: unbound variable`（本机 locale = `C.UTF-8`）。最小复现：`LANG=C.UTF-8 bash -c 'phone=123; echo "手机号 $phone）"'` → 输出乱码而非 `123` | 改成 `${phone}`（显式界定变量名）。全文件扫了一遍「`$VAR` 紧跟非 ASCII 字节」= **仅此 1 处**。 |
+| D-05 | **Critical** | `docker-compose.yml` 用 `ports: "127.0.0.1:8080:8080"`，但 `src/server.js` **只绑 127.0.0.1** → 容器里端口映射转发到容器 eth0，进程不听那里 ⇒ **连接被拒**（容器 healthy、宿主机 curl 不通，**静默失败**） | 实跑取证：`node src/server.js` 后 `lsof` → `TCP 127.0.0.1:8080 (LISTEN)`；`curl http://127.0.0.1:8080/api/health` → `{"ok":true,…}`；`curl http://192.168.2.27:8080/api/health` → 不可达 | 改用 `network_mode: host`（容器与宿主机共享网络栈 ⇒ 进程绑的 127.0.0.1:8080 就是宿主机的 127.0.0.1:8080，与 `nginx` 反代目标一致，也不暴露公网）。同时在文件里写清「若上游把 `src/server.js` 改成可绑 0.0.0.0，可换回 `ports`」。见「与接口契约的偏差」T2-1。 |
+| D-06 | Important | `install.sh` 的 Node 版本下限 `MIN_NODE_MINOR=5` 低于项目真实下限 | `package.json` → `"engines": { "node": ">=22.16.0" }`；`src/db/sqlite.js` 注释：备份 API `sqlite.backup()` 是 22.16.0 引入 | 改为 `22 / 16`（与 engines 逐字一致），错误提示同步。 |
+| D-07 | Important | systemd 单元的 `Documentation=file:/opt/heikesong/platform/README.md` **硬编码部署路径** | 与单元里其它路径都用 `__APP_DIR__` 不一致 | 改为 `Documentation=file:__APP_DIR__/README.md`（占位符集合不变）。 |
+| D-08 | Important | `install.sh` 的 `ENV_FILE` 变量**形同虚设**：单元里写死 `EnvironmentFile=-/etc/heikesong/platform.env`，改了 `ENV_FILE` 服务读不到 | 代码走查；干跑时 `ENV_FILE` 指向临时路径，而单元里仍是 `/etc/heikesong/platform.env` | sed 替换该字面路径（`s|/etc/heikesong/platform.env|$ENV_FILE|g`），**不新增占位符**。干跑产物核对：单元里 `EnvironmentFile=-/tmp/…/etc/heikesong/platform.env` ✓。 |
+| D-09 | Important | `write_env_file` 里的 `umask 077` **泄漏**到后面的函数 → nginx 站点文件会被建成 `600` | 代码走查（`umask` 不是函数局部） | `umask` 存取成对（写完恢复）。干跑产物核对：环境文件 `0640`、nginx 站点 `644` ✓。 |
+| D-10 | Minor | `install -d -g "$RUN_USER"` 假设存在**与用户名同名的组** | 干跑实测：`install: unknown group mac`（macOS 主组是 `staff`） | 落盘属组改用运行用户的**主组**（`id -gn`），并保留同名组作为兜底。 |
+| D-11 | Important | 规格的 7 个用例全是**字面扫一遍**：改掉注释就红、但把**配置本身**改坏（上游绑 `0.0.0.0`、compose 扩副本、`DEMO_MODE=1`、端口漂移、单元里写口令）**全都测不出来** | 变异测试第 1 轮：这些变异体在规格的 7 个用例下**全部存活**（见台账 E） | **规格的 7 个用例逐字保留**，另**追加 7 个**用例（单进程 / `DEMO_MODE` 禁令 / 正式形态 TLS / 上游只绑回环 / 不扩副本 / 端口与真实代码同口径 / 环境文件不落口令 / 幂等守卫），并引入 `effective()`（去掉整行注释）**只对有效配置断言** —— 注释里的「默认值说明」是文档，不是配置。 |
+| D-12 | Minor | 规格 Step 8 第二条命令的**期望值与规格自己的文件不符** | `sh -c 'grep -c "proxy_buffering off;" deploy/nginx.conf'` → 实测 **2**（头部注释里写了一遍 + 真指令 1 处），规格写 `1` | 命令改为「去掉整行注释再计数」→ 实测 `1`（真指令本来就只有 1 处），且能真正抓到重复指令。 |
+| D-13 | Minor | `nginx.conf` 的 `location /assets/ { alias __APP_DIR__/web/assets/; }` 指向的目录**当前不存在** | `ls platform/web/assets` → `No such file or directory`（现有静态文件在 `web/` 根下） | 保留规格形态（`R-OPS-04` 要求「`location /assets/` + 缓存策略存在」），但在文件里写清「`web/assets/` 是前端构建产物目录，现在还没有；目录不存在时该前缀返 404，不影响其它路径」。**不擅自改静态目录结构**（那是 Task 6 的范围）。 |
+| D-14 | Minor | `install.sh` 结尾无条件打印「备份命令：… node scripts/backup.js」，但 `scripts/backup.js` 是 **P6 Task 1** 的产物（另一个 worktree 在写） | `ls platform/scripts/` → 只有 `audit-scan.js` / `forbidden.txt` / `migrate.js` / `seed.js` | 改成「文件存在才打印」，避免给出跑不通的命令提示。 |
+| D-15 | Important | 规格的用例是**全文扫一遍** ⇒ **把真指令注释掉也扫得到**（假绿）。第 1 轮变异实测：`systemctl daemon-reload` 与 `nginx -t` 被注释掉后，规格用例 6 **仍然全绿** | 变异体 M28 / M29 在第 1 轮 **SURVIVED**（规格用例 6 仍绿）；M11 / M16 同理（SSE 指令被改/被删，规格用例 3 仍绿 —— 头部注释里写着同样的字面量） | 新增用例 12「注释不能掩盖配置错误」：对**去掉整行注释后的有效配置**再断言一遍（`effective()`）。规格的 7 个用例仍逐字保留（不削弱它们），只是补上「有效配置」这一层。 |
+
+### C. 逐字回写位置（本轮改动的计划代码块）
+
+| 计划位置 | 改动 |
+|---|---|
+| Task 2 Step 1 的 `platform/test/deploy-assets.test.js` 代码块 | 规格 7 个用例**逐字保留** + 追加 5 个用例（整体回写） |
+| Task 2 Step 3 的 `deploy/heikesong.service` 代码块 | 整体回写（D-01 注释改写、D-07 `Documentation` 占位符） |
+| Task 2 Step 4 的 `deploy/nginx.conf` 代码块 | 整体回写（D-13 注释增补） |
+| Task 2 Step 5 的 `deploy/docker-compose.yml` 代码块 | 整体回写（D-01 注释改写、D-05 `network_mode: host`） |
+| Task 2 Step 6 的 `deploy/install.sh` 代码块 | 整体回写（D-02/D-03/D-04/D-06/D-08/D-09/D-10/D-14） |
+| Task 2 Step 2 / Step 7 / Step 8 的 Expected 与命令 | 见上表 D-11 / D-12 |
+
+### D. 硬约束自证
+
+| 硬约束 | 怎么验的 | 证据 |
+|---|---|---|
+| ① **单写者**（⛔ 多 worker 写同一 SQLite） | ① 资产文件全文不含 `--workers` / `cluster` 字面量（规格用例 2/5）；② 用例 8 断言单元**只有一条 `ExecStart`** 且不带多进程参数；③ 用例 10 断言 compose 无 `replicas` / `scale` / `deploy:` 键；④ `src/server.js` 实测单进程单写者 | 用例 2/5/8/10 全过；变异测试里「加 `--workers=4`」「加 `deploy.replicas: 2`」两个变异体**被杀** |
+| ② **不硬编码口令 / 域名 / 证书路径** | ① 规格用例 6 的两条正则（口令）；② 用例 11 断言**环境文件写入块**里不出现 `PASSWORD`；③ 域名/证书/私钥全是 `__SERVER_NAME__` / `__CERT_PATH__` / `__KEY_PATH__` 占位符，`install.sh` 逐个 sed 替换；④ 干跑产物核对：**口令没有落盘** | 干跑：`grep -rq "$ADMIN_PASSWORD" out/etc` → 「✅ 口令没有落盘」；环境文件内容只有 `PORT` / `DATA_DIR` / `SESSION_TTL_DAYS` / `NODE_ENV` 四行 |
+| ③ **`install.sh` 幂等** | 临时目录 + 系统命令打桩（`systemctl` / `nginx` / `id` / `runuser`），**连续跑两次** | 两次退出码均 **0**；第 2 次的 `migrate` 输出「本次无新迁移」、`seed` 输出「管理员已存在：13800000000」；`ln -sfn` 软链复用；`systemctl enable` 可重复 |
+
+### E. 变异测试（三轮，脚本 `/tmp/p6-mutate/t2.mjs`，指向**已落地**的测试文件）
+
+| 轮次 | 变异体总数 | KILLED | SURVIVED | 脚本错误（锚点失效/不唯一） | 处置 |
+|---|---|---|---|---|---|
+| 第 1 轮 | 38 | 24 | 13 | 1（M12 锚点命中 2 次） | 13 个存活体**逐个补断言**（补的都是真实不变量：注释不能掩盖配置、expires 与 max-age 必须一致、镜像 Node 主版本、代码挂载只读、Node 下限与 engines 一致、环境文件 0640、umask 存取成对、占位符→变量映射、locale 安全展开）；M12 锚点加长上下文 |
+| 第 2 轮 | 38 | 35 | 3 | 0 | 3 个存活体（M12 在另一处 location / M24 多挂一份可写副本 / M38 umask 不恢复）**补断言**（X-Real-IP 每一处都必须是 `$remote_addr`；代码只挂一次且 `:ro`；umask 恢复要在**有效配置**里找） |
+| 第 3 轮 | 42 | **42** | **0** | 0 | 追加 4 个变异体（M39 `read_only` / M40 `cap_drop` / M41 环境文件 0644 / M42 sed 值不转义）并补对应断言；最后 3 个存活体（M12 / M24 / M38）被新断言杀掉 |
+
+**最终：42 个变异体，42 个 KILLED，0 个存活，0 个脚本错误。**
+（变异体清单与每个变异体「改的是什么行为」见脚本里的 `MUTANTS` 数组；明细 JSON：`/tmp/p6-mutate/results.json`。）
+
+> ⚠️ **方法说明**：变异体**只**改「有效配置 / 有效脚本」，注释行会被 `effective()` 过滤掉，
+> 所以每个变异体都**真的改变行为**（不是改注释）。锚点命中数必须 === 1，
+> 命中 0 次报「锚点失效」、命中 ≥2 次报「锚点不唯一」并要求加长上下文 —— 脚本不放过含糊。
+
+### F. 计划块逐字核验
+
+`platform/deploy/*` 与 `platform/test/deploy-assets.test.js` 落地后，逐字比对本计划 Task 2 的 5 个代码块
+（核验脚本：把计划文件里的围栏块抽出来与落地文件 `diff`）—— 结果 **5/5 逐字一致**。
+
+### G. 遗留 / 需上游注意
+
+1. **`scripts/backup.js` 尚未落地**（P6 Task 1 另一个 worktree 在写）。`install.sh` 已改成「文件存在才打印备份命令」，
+   但**备份命令的可用性**要等 Task 1 落地后再验一次。
+2. **`src/server.js` 只绑 127.0.0.1** 是 compose 路径的根因（D-05）。若上游愿意把绑定做成可配置
+   （如 `HOST` 环境变量），compose 可以换回更常见的 `ports` 映射；**本 Task 不改 `src/server.js`**（不在归属内）。
+3. **`web/assets/` 目录尚不存在**（D-13）：`location /assets/` 现在是「给前端构建产物预留」的位置。
+   Task 6 的静态站构建落地后，这里才有实际内容。
+4. **`Group=__RUN_USER__` 假设存在与用户名同名的组**（Debian/RHEL `useradd` 默认行为）。
+   `install.sh` 落盘时用主组（`id -gn`），两者在目标平台一致；若将来换到用户名与组名不同的系统，
+   单元里的 `Group=` 需要单独处理。
+5. **上海机调试形态**（计划「临时调试形态」D-1～D-4）**不在本 Task 的四个文件里**：那需要另开一套
+   `listen 8080`、无 TLS、无 `server_name` 的 nginx server 块。本 Task 的 `nginx.conf` 是**正式形态**
+   （域名 + TLS + 443），与计划「部署目标决策登记」一致。
 
