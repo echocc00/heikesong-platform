@@ -1092,16 +1092,20 @@ proxy_buffering off;  proxy_read_timeout 360s;  add_header X-Accel-Buffering no;
 
 ## 15. 实施路线
 
-| 阶段 | 内容 | 借鉴的零件 | 产出 |
-|---|---|---|---|
-| **P0 地基** | 仓库骨架、SQLite 封装、迁移机制、配置加载 + 校验、HTTP 路由、认证会话、capability/assignment 权限骨架 | CTFd 破同分双保险；PocketBase 三态语义 | 能登录的空系统；配置改错会启动失败 |
-| **P1 报名与组队** | SABC 算分分级、注册流程、战队与成员、任务卡与六维准入、报名状态机 + 变更审计 | hack-the-back 报名状态机 + `ApplicationStatusHistory`；dribdat `PR_STAGES` | 报名到组队全链路 |
-| **P2 评审引擎** | 评分界面、z-score、去极值、双签、回避、自评检测、互评、**归一化策略可切换** | portal 评审 schema 三件套；Hangar 加权算分；hack-the-back `crowd_bt.py`（备选策略）；ORA rubric 快照思路 | 能真实算分，且换归一化策略不改代码 |
-| **P3 榜单与积分** | 破同分链、加时陈述、A/B/个人榜、段位、行为分、战绩卡、可见性过滤 | hibiscus 并列名次 + 双列（**修 bug**）；CTFd 可见性分档 | 能真实发榜；行为分在 schema 层隔离 |
-| **P4 审计与防作弊** | 计算快照、trace 抽屉、审计日志、复算 diff、限频三层、幂等、复核状态机、扫描闸 | CTFd 限频三层；OpenReview 复核状态机 + 冲突申报 | 榜单可复算；刷分可拦截 |
-| **P5 工作流与三池** | 任务清单与领取、三池底座接口、公开榜单 API + iCal | dribdat 开放 API / iCal | 数据沉淀 |
-| **P6 部署与演示版** | 部署资产、备份恢复、演示版适配器、静态站发布 | —— | 公网 URL + 云主机就绪 |
-| **二期** | 组队 MILP 撮合、贝叶斯归一化主用 | dribdat `matching.py`（HiGHS） | — |
+| 阶段 | 内容 | 借鉴的零件 | 产出 | 实施状态 |
+|---|---|---|---|---|
+| **P0 地基** | 仓库骨架、SQLite 封装、迁移机制、配置加载 + 校验、HTTP 路由、认证会话、capability/assignment 权限骨架 | CTFd 破同分双保险；PocketBase 三态语义 | 能登录的空系统；配置改错会启动失败 | ✅ 已落地 |
+| **P1 报名与组队** | SABC 算分分级、注册流程、战队与成员、任务卡与六维准入、报名状态机 + 变更审计 | hack-the-back 报名状态机 + `ApplicationStatusHistory`；dribdat `PR_STAGES` | 报名到组队全链路 | ✅ 已落地 |
+| **P2 评审引擎** | 评分界面、z-score、去极值、双签、回避、自评检测、互评、**归一化策略可切换** | portal 评审 schema 三件套；Hangar 加权算分；hack-the-back `crowd_bt.py`（备选策略）；ORA rubric 快照思路 | 能真实算分，且换归一化策略不改代码 | ✅ 已落地 |
+| **P3 榜单与积分** | 破同分链、加时陈述、A/B/个人榜、段位、行为分、战绩卡、可见性过滤 | hibiscus 并列名次 + 双列（**修 bug**）；CTFd 可见性分档 | 能真实发榜；行为分在 schema 层隔离 | ✅ 已落地 |
+| **P4 审计与防作弊** | 计算快照、trace 抽屉、审计日志、复算 diff、限频三层、幂等、复核状态机、扫描闸 | CTFd 限频三层；OpenReview 复核状态机 + 冲突申报 | 榜单可复算；刷分可拦截 | ✅ 已落地 |
+| **P5 工作流与三池** | 任务清单与领取、三池底座接口、公开榜单 API + iCal | dribdat 开放 API / iCal | 数据沉淀 | 🟡 Task 1–4 已落地（公开榜 + token 鉴权已合入）；Task 5/6（iCal / 任务清单页）进行中 |
+| **P6 部署与演示版** | 部署资产、备份恢复、演示版适配器、静态站发布 | —— | 公网 URL + 云主机就绪 | 🟡 Task 1–5 + 7 已落地（部署资产、备份恢复、扫描闸、种子、适配器、运维手册，并经两轮修复 + 独立复核）；Task 6（静态站构建）/ 8（端到端与跨平台）未完成；**公网发布**待云主机 + 用户确认 |
+| **二期** | 组队 MILP 撮合、贝叶斯归一化主用 | dribdat `matching.py`（HiGHS） | — | ⬜ 未开始 |
+
+> **「实施状态」这一列是实况**（2026-10-21）：每个阶段的**缺陷台账 / 变异检验 / 计划块逐字核验**
+> 都在各自的计划文档末尾；逐条需求的落点见
+> [`../requirement-implementation-map.md`](../requirement-implementation-map.md)。
 
 **排序理由**：
 - **P2/P3 是不可替代的核心价值**（S7/S10 的算法只有我们实现了），必须最扎实
