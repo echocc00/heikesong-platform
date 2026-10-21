@@ -1,4 +1,5 @@
 // src/server.js — 进程入口 + 可测的应用装配
+// 溯源需求：R-OPS-06（演示模式挂载 /src/domain/* 与 /rules/*；⛔ 默认不挂 ⇒ 生产部署一律 404）
 // 依据：设计文档 §4.1 / §14.1
 import http from 'node:http';
 import { fileURLToPath } from 'node:url';
@@ -32,6 +33,33 @@ import { listEditions, getEdition } from './db/repo/editions.js';
 import { writePidFile, removePidFile } from './runtime/pidfile.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
+
+// 演示模式的静态挂载：/src/domain/* 与 /rules/* 在 platform/ 下，不在 web/ 下。
+// ⛔ 只读、只挂这两个白名单目录，不开放整个 platform/。
+//
+// ⚠️⛔ **默认不挂**（2026-10-21 漂移审计修正 I-5）：
+//    这两个目录里是**领域层算法源码**（打分 / 破同分 / 防作弊判定）与**全部规则配置**
+//    （权重表、破同分链、行为分、段位表）。无条件挂载 = 公网可读全部源码与配置。
+//    本阶段正是「部署到公网 + nginx + systemd」的阶段，所以这道门必须有。
+//    只有显式设了 DEMO_MODE=1 才挂；deploy/ 里的 systemd 与 docker-compose
+//    **不得**设 DEMO_MODE=1（生产部署下这两个路径一律 404）。
+const DEMO_MOUNTS = process.env.DEMO_MODE === '1' ? [
+  { prefix: '/src/domain/', dir: join(here, '..', 'src', 'domain') },
+  { prefix: '/rules/', dir: join(here, '..', 'rules') },
+] : [];
+
+function serveMounted(req, res) {
+  if (!DEMO_MOUNTS.length) return false;
+  for (const m of DEMO_MOUNTS) {
+    if (!req.url || !req.url.startsWith(m.prefix)) continue;
+    const rel = req.url.split('?')[0].slice(m.prefix.length);
+    if (!rel) continue;
+    // 浅拷贝一个只带 url/headers 的请求代理（serveStatic 只读这两个字段）
+    const proxy = { url: `/${rel}`, headers: req.headers || {} };
+    if (serveStatic(m.dir, proxy, res)) return true;
+  }
+  return false;
+}
 
 /**
  * ⛔ 评审修正（Important）：登录失败路径的**计时侧信道**。
@@ -374,6 +402,9 @@ export function createApp({ db, rules, webDir }) {
     if (req.method === 'GET') {
       try {
         if (serveStatic(webDir, req, res)) return;
+        // 演示模式（DEMO_MODE=1）：领域层与规则配置不在 web/ 下，挂出去。
+        // ⚠️ serveStatic 的签名不变（webDir, req, res）——这里只换 webDir，不改它。
+        if (serveMounted(req, res)) return;
       } catch (err) {
         console.error('[server] 静态服务异常', err);
       }

@@ -1,4 +1,5 @@
 // web/app.js — 前端入口
+// 溯源需求：R-OPS-06（?demo=1 走演示版适配器；正式版走真实 API）
 import { route, match, navigate, currentPath } from './router.js';
 import { getState, setState, subscribe } from './store.js';
 import { renderLogin } from './views/login.js';
@@ -13,6 +14,8 @@ import { renderFlags } from './views/flags.js';
 import { escapeHtml } from './escape.js';
 
 // 演示版：?demo=1 时用 localStorage 适配器；正式版走真实 API。
+// ⚠️ 演示版的规则引擎在浏览器里真实运行（web/api.demo.js 直接 import ../src/domain/*.js），
+//    所以「演示好看、正式不一样」这件事不会发生。
 const isDemo = new URLSearchParams(window.location.search).get('demo') === '1';
 const { api } = isDemo ? await import('./api.demo.js') : await import('./api.js');
 
@@ -87,11 +90,25 @@ function currentQuery() {
   return Object.fromEntries(new URLSearchParams(q));
 }
 
+function demoBanner() {
+  if (!isDemo) return null;
+  const el = document.createElement('div');
+  el.className = 'card demo-banner';
+  el.innerHTML = `
+    <strong>演示版</strong>：当前是公网演示站——所有数据只存在你的浏览器里（不跨人共享），
+    但<b>规则引擎是在你的浏览器里真实运行的</b>（z-score 归一化 / 去极值 / 双签 / 破同分链 / 段位判定），
+    算法行为与正式系统一致。
+  `;
+  return el;
+}
+
 async function render() {
   const app = document.getElementById('app');
+  const banner = demoBanner();
   const found = match(currentPath());
   if (!found) {
     app.innerHTML = '<div class="card">页面不存在</div>';
+    if (banner) app.prepend(banner);
     return;
   }
   try {
@@ -100,8 +117,10 @@ async function render() {
     //    P0 原来只传 ctx —— 视图拿不到参数（前端 router.match 会把 '?query' 剥掉再匹配）。
     const el = await found.view({ ...ctx, params: found.params, query: currentQuery() });
     app.replaceChildren(el);
+    if (banner) app.prepend(banner);
   } catch (e) {
     app.innerHTML = `<div class="card err">${escapeHtml(e.message)}</div>`;
+    if (banner) app.prepend(banner);
   }
 }
 

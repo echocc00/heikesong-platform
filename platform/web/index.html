@@ -4,10 +4,13 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>AI 商业黑客松 · 赛事平台</title>
-  <link rel="stylesheet" href="/styles.css" />
+  <!-- 溯源需求：R-OPS-06（公网可访问：公网演示站入口页） -->
+  <!-- ⚠️ 资源路径必须是相对路径：静态托管（公网演示站）可能挂在任意 base path 下 -->
+  <link rel="stylesheet" href="./styles.css" />
 </head>
 <body>
   <div id="app"><div class="boot">正在加载…</div></div>
-  <script type="module" src="/app.js"></script>
+  <noscript>本演示版需要启用 JavaScript——规则引擎是在你的浏览器里真实运行的。</noscript>
+  <script type="module" src="./app.js"></script>
 </body>
 </html>
