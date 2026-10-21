@@ -39,23 +39,20 @@ export function getSubjectState({ db, subjectType, subjectId }) {
 /**
  * 把迁移时间戳单调化：同一 subject 的相邻迁移必须**严格递增**。
  *
- * ⚠️ 为什么必须有这个（2026-10-21 Task 5 实跑发现的 Critical 缺陷）：
- *   「当前状态」的真值来源是 audit_log 里最后一条 `review_state.transition`，
- *   而仓储层 `findLatestTransition` 的排序是 `created_at DESC, id DESC` ——
- *   `id` 是 randomUUID()，**同一毫秒内的多条迁移之间的先后是随机的**。
- *   实测：三条迁移共用同一 created_at 时，200 次里有 135 次读到**过期**状态。
- *   后果不是"排序不好看"，而是状态机直接抛 409：
- *     - `decideAppeal` 连续两次迁移**用同一个 now** → 约 50% 概率假报
- *       「状态冲突：当前是 FINALIZED，本次声明 REJECTED」；
- *     - 任何连续两条迁移共用同一时间戳的调用方都会踩到。
- *   修法有两条路：
- *     ① 改仓储层 `findLatestTransition` 的 ORDER BY（用 rowid 做次序）——
- *        治本，但要动 Task 1 的文件（越界）；
- *     ② 在服务层保证「自己写出去的迁移时间戳严格递增」（本函数）——
- *        本服务是 `review_state.transition` 的**唯一写入方**，只要自己严格递增，
- *        就不存在并列，`created_at DESC` 的排序就是确定的。
- *   选 ②：治本且不越界；只有"时间戳完全相同"时才 +1ms，正常调用**不动**调用方的 now。
- *   （治本的 ① 留给上游：见 Task 5 报告「存疑/需上游注意」。）
+ * ⚠️ 为什么要有这个（2026-10-21 Task 5 实跑发现的 Critical 缺陷）：
+ *   「当前状态」的真值来源是 audit_log 里最后一条 `review_state.transition`。
+ *   ⚠️ **这条注释里的根因描述已被 P4 终审修正（2026-10-21）** ——
+ *   原先写的是「仓储层排序是 `created_at DESC, id DESC`」，**与实际代码不符**：
+ *   仓储层 `findLatestTransition` 的破并列键**早已改成 SQLite 隐式 `rowid`**
+ *   （P4-13 根因修复，提交 `fba7b6e`；`id` 是 randomUUID()，同毫秒内次序随机）。
+ *   当时的缺陷（实测三条迁移共用同一 created_at 时，200 次里有 135 次读到**过期**状态；
+ *   `decideAppeal` 连续两次迁移用同一个 now → 约 50% 概率假报 409）因此**已治本**：
+ *     · 根因修复：仓储层 `ORDER BY created_at DESC, rowid DESC`；
+ *     · 双保险（本函数）：本服务是 `review_state.transition` 的**唯一写入方**，
+ *       自己写出去的时间戳严格递增 ⇒ 正常调用根本不会出现并列。
+ *   本函数**保留**：① 兼容「同毫秒内多条迁移」的外部写入；② 防止将来有人
+ *   把仓储层的 ORDER BY 改回去时，静默退化回随机次序。
+ *   只有「时间戳完全相同」时才 +1ms，正常调用**不动**调用方的 now。
  */
 function monotonicAt(db, subjectType, subjectId, now) {
   const prev = findLatestTransition(db, subjectType, subjectId);

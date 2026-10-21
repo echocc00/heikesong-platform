@@ -14,10 +14,10 @@
 //    其余用例照常跑 —— ⛔ 绝不伪造 Task 5 的实现，也不用桩把绿灯骗出来。
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, cpSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { openDatabase } from '../src/db/sqlite.js';
 import { applyMigrations } from '../src/db/migrate.js';
@@ -234,6 +234,47 @@ test('GET /api/audit/log 无权访问返回 200 + 空集，有权返回行', asy
   assert.equal(allowed.status, 200);
   assert.ok(Array.isArray(allowed.json.rows));
   assert.ok(allowed.json.rows.length > 0, '有权时应能看到审计行');
+  // ⚠️ 终审修正（Important，I-4）：`detail` 与 `total` 此前**零断言** ——
+  //    实测把 detail 整体置 null、total 恒 0，测试**照样全绿**（变异 SURVIVED）。
+  //    审计轨迹的内容就是这两个字段，必须钉住。
+  const recorded = allowed.json.rows.find((r) => r.action === 'computation.record');
+  assert.ok(recorded, '必须能看到 recordComputation 写入的那条审计记录');
+  assert.equal(recorded.entity, 'computation');
+  assert.equal(typeof recorded.entityId, 'string');
+  assert.ok(recorded.entityId.length > 0, 'entityId 必须指向那条计算快照');
+  assert.ok(recorded.detail && typeof recorded.detail === 'object', 'detail 必须是解析后的对象，不能是 null');
+  assert.equal(recorded.detail.kind, 'stage_score');
+  assert.equal(recorded.detail.ruleVersion, input.ruleVersion);
+  assert.equal(recorded.detail.revision, 1);
+  assert.equal(recorded.detailParseError, false, '正常行的 detailParseError 必须是 false');
+  // total 是分页计数，必须与实际返回的行数对得上（否则「翻页」语义是假的）
+  assert.equal(allowed.json.total, allowed.json.rows.length, 'total 必须等于本次返回的行数');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('GET /api/audit/log：单行 detail_json 损坏不得让整页 500（降级 + 显式告警）', async () => {
+  // ⚠️ 终审修正（Important，I-1）：此前 `listAuditLog` 对每行直接 `JSON.parse` 且**无 try/catch**
+  //    ⇒ **一行坏数据 ⇒ 整份审计轨迹 500、整页不可读**（审计轨迹是 P4 的核心交付物）。
+  //    终审实测：GET /api/audit/log status=500，body 是通用 INTERNAL 文案。
+  //    正确口径：一行坏数据只降级**那一行**，其余行照常可读，且必须**显式标记**（不静默）。
+  const { db, close, dataDir, app, rules } = setup();
+  const refs = seedRefs(db);
+  const adminToken = createSession(db, refs.admin.id).token;
+  const input = makeInput(rules);
+  recordComputation({
+    db, kind: 'stage_score', stageId: refs.stage.id, ruleVersion: input.ruleVersion,
+    input, output: engineOutput(input), trace: {},
+  });
+  // 手工把这一行的 detail_json 写坏（模拟历史脏数据）
+  db.prepare("UPDATE audit_log SET detail_json = '{BROKEN' WHERE action = 'computation.record'").run();
+
+  const res = await callJson(app, 'GET', '/api/audit/log', { token: adminToken });
+  assert.equal(res.status, 200, '一行坏数据不得让整页 500');
+  const bad = res.json.rows.find((r) => r.action === 'computation.record');
+  assert.ok(bad, '坏行仍应出现在列表里');
+  assert.equal(bad.detail, null, '坏行的 detail 降级为 null');
+  assert.equal(bad.detailParseError, true, '必须显式标记解析失败（不静默）');
   close();
   rmSync(dataDir, { recursive: true, force: true });
 });
@@ -581,6 +622,91 @@ test('Task 5 未落地时申诉接口必须 503（fail closed，不静默放行�
   assert.equal(list.json.error.code, 'REVIEW_STATE_UNAVAILABLE');
   close();
   rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('【终审修正 M-5】503 fail closed 必须有**活体**覆盖：用「缺模块的副本」复现，不靠跳过', async () => {
+  // ⚠️ 终审修正（Minor，M-5）：上面那条用例在 Task 5 落地后会被**跳过** ——
+  //    于是「模块不在 → 503」这条分支在本分支上**没有任何活体覆盖**
+  //    （台账自陈变异体 M10/M11「模块在场 → 这两条分支根本走不到」）。
+  //    ⇒ 这里造一份**删掉了 review-state.js 的 src 副本**：
+  //    副本里的动态 import 解析到副本自己的目录 ⇒ 目标真的不存在 ⇒ 真的走 503 分支。
+  //    （不删仓库里的真文件 —— 别的测试文件正并行跑着，删了会互相踩。）
+  const { db, close, dataDir, rules } = setup();
+  const refs = seedRefs(db);
+  const token = createSession(db, refs.captain.id).token;
+
+  const copyDir = mkdtempSync(join(tmpdir(), 'hks-norevstate-'));
+  cpSync(join(here, '..', 'src'), join(copyDir, 'src'), { recursive: true });
+  rmSync(join(copyDir, 'src', 'services', 'review-state.js'), { force: true });
+
+  // 用副本的 server.js 建 app（它内部的动态 import 解析到副本目录 ⇒ 目标缺失）
+  const copied = await import(pathToFileURL(join(copyDir, 'src', 'server.js')).href);
+  const copiedApp = copied.createApp({ db, rules, webDir });
+
+  const res = await callJson(copiedApp, 'POST', '/api/appeals', {
+    token, body: { subjectType: 'team_result', subjectId: `${refs.stage.id}:${refs.team.id}`, reason: '理由' },
+  });
+  assert.equal(res.status, 503, '模块不在时必须 fail closed');
+  assert.equal(res.json.error.code, 'REVIEW_STATE_UNAVAILABLE');
+  const list = await callJson(copiedApp, 'GET', '/api/appeals', { token });
+  assert.equal(list.status, 503, '申诉列表同样必须 fail closed');
+  assert.equal(list.json.error.code, 'REVIEW_STATE_UNAVAILABLE');
+
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+  rmSync(copyDir, { recursive: true, force: true });
+});
+
+test('【终审修正 I-2】模块**在场但加载期崩溃**必须抛错，不得误报成「模块未落地」（503）', async () => {
+  // ⚠️ 终审修正（Important，I-2）：无差别 `catch {}` 会把「模块在场但自己炸了」
+  //    （语法错 / 传递依赖缺失）也报成「未落地」—— fail closed 成立，**诊断是假的**，
+  //    运维会被指向「模块还没写」这个错误方向。
+  //    判据（见 src/http/optional-module.js）：只有「目标模块文件本身不存在」才算未落地。
+  //    这里用一个**加载期就抛错**的模块来验证：它**在磁盘上存在** ⇒ 必须抛，不得返回 null。
+  const { db, close, dataDir } = setup();
+  const copyDir = mkdtempSync(join(tmpdir(), 'hks-boomstate-'));
+  cpSync(join(here, '..', 'src'), join(copyDir, 'src'), { recursive: true });
+  // 让副本里的 review-state.js 在**加载期**就炸（模块文件存在，只是内容坏）
+  writeFileSync(
+    join(copyDir, 'src', 'services', 'review-state.js'),
+    "throw new Error('BOOM: 加载期炸了');\n",
+  );
+  const { loadOptionalModule } = await import(pathToFileURL(join(copyDir, 'src', 'http', 'optional-module.js')).href);
+  const specifier = pathToFileURL(join(copyDir, 'src', 'services', 'review-state.js')).href;
+  await assert.rejects(
+    () => loadOptionalModule(specifier, join(copyDir, 'src', 'services', 'review-state.js')),
+    /BOOM/,
+    '加载期崩溃必须抛出去，不得被当成「模块未落地」吞掉',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+  rmSync(copyDir, { recursive: true, force: true });
+});
+
+test('【终审修正 I-2】目标模块**在场但它的依赖缺失**同样必须抛错（错误码一样，要靠文件存在性区分）', async () => {
+  // ⚠️ 终审修正（Important，I-2）：「目标模块不存在」与「目标模块的传递依赖不存在」
+  //    在 Node 里 **code 完全一样**（都是 ERR_MODULE_NOT_FOUND）⇒ 只能靠
+  //    「出错指向的文件是不是目标本身」区分（实测：前者 url=目标，后者 url=缺失的依赖）。
+  //    判据用「目标文件在磁盘上是否真的存在」实现 ⇒ 这一侧必须**抛出去**：
+  //    目标在场说明模块**写了**，只是它自己缺依赖 —— 报「未落地」是假诊断。
+  const { db, close, dataDir } = setup();
+  const copyDir = mkdtempSync(join(tmpdir(), 'hks-brodep-'));
+  cpSync(join(here, '..', 'src'), join(copyDir, 'src'), { recursive: true });
+  // 目标模块**存在**，但它 import 的东西不存在 ⇒ ERR_MODULE_NOT_FOUND，且 url 指向依赖
+  writeFileSync(
+    join(copyDir, 'src', 'services', 'review-state.js'),
+    "import './this-dependency-does-not-exist.js';\nexport const fileAppeal = () => null;\n",
+  );
+  const { loadOptionalModule } = await import(pathToFileURL(join(copyDir, 'src', 'http', 'optional-module.js')).href);
+  const target = join(copyDir, 'src', 'services', 'review-state.js');
+  await assert.rejects(
+    () => loadOptionalModule(pathToFileURL(target).href, target),
+    (err) => err?.code === 'ERR_MODULE_NOT_FOUND',
+    '传递依赖缺失必须抛出去（目标模块在场 ⇒ 不是「未落地」）',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+  rmSync(copyDir, { recursive: true, force: true });
 });
 
 test('错误响应必须带 Retry-After（限频语义在 HTTP 层，不靠业务代码自己塞头）', async () => {

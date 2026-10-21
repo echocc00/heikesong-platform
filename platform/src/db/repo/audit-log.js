@@ -3,6 +3,7 @@
 // ⛔ 全局约束「所有 SQL 收在 src/db/repo/」—— 本文件是 audit_log 的 SQL 唯一归宿，
 //    P0 的 test/sql-boundary.test.js 会扫描 src/ 与 scripts/ 下**除 src/db/repo/ 外**的一切 .js。
 import { randomUUID } from 'node:crypto';
+import { appError } from '../../errors.js';
 
 export function insertAuditLogRow(db, {
   id = randomUUID(),
@@ -67,11 +68,16 @@ export function findLatestTransition(db, entity, entityId) {
       ORDER BY created_at DESC, rowid DESC LIMIT 1`,
   ).all(entity, entityId);
   if (!rows.length) return null;
-  let detail = {};
+  // ⚠️ 终审修正（Minor，M-6）：**解析失败必须 fail loud，不能静默降级成 {}**。
+  //    降级成 {} ⇒ detail 里没有 `to` ⇒ getSubjectState 返回 null ⇒
+  //    状态机把主体当成 'SUBMITTED' ⇒ **放行一次本应被拒的迁移**（静默降级到一个错的状态）。
+  //    「有迁移记录、但读不出来」= 数据损坏 = 必须显式报错
+  //    （HTTP 层会转成通用 500 文案，不外泄内部细节）。
+  let detail;
   try {
     detail = rows[0].detail_json ? JSON.parse(rows[0].detail_json) : {};
   } catch {
-    detail = {};
+    throw appError(500, 'AUDIT_LOG_CORRUPT', '审计日志内容损坏，无法读取状态迁移记录');
   }
   return { ...detail, at: rows[0].created_at };
 }

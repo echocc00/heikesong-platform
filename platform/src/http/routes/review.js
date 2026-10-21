@@ -37,6 +37,8 @@ import { reviewEvents } from '../sse.js';
 import { getStage, getStageJudge, listStageTeams } from '../../db/repo/stages.js';
 import { getTeamWithPackage } from '../../db/repo/teams.js';
 import { listActiveMembers } from '../../db/repo/teamMembers.js';
+import { loadOptionalModule } from '../optional-module.js';
+import { fileURLToPath } from 'node:url';
 
 function requireUser(ctx) {
   if (!ctx.user) {
@@ -120,16 +122,19 @@ function assertJudgeDimensions(ctx, items) {
  *         （没有分数 = 没有可泄露的东西，过滤是恒等的）；
  *       · **有分数但过滤模块缺失** → 503（fail closed：宁可报错，
  *         也绝不把未过滤的分数发出去）。
+ *
+ * ⚠️ 终审修正（Important，I-2）：**只把「目标模块真不存在」当成缺失**。
+ *    模块在场但加载期崩了（语法错 / 传递依赖缺失）→ **抛出去**，
+ *    绝不装成「模块未就绪」—— 后者会让排查指向错误方向。判据见 optional-module.js。
  */
+const REVIEW_STATE_URL = new URL('../../services/review-state.js', import.meta.url).href;
+const REVIEW_STATE_PATH = fileURLToPath(REVIEW_STATE_URL);
+
 export async function applyScoreVisibility({ db, stageId, viewer, state }) {
   const scores = Array.isArray(state?.scores) ? state.scores : [];
   if (!scores.length) return state;
-  let filterVisibleScores = null;
-  try {
-    ({ filterVisibleScores } = await import('../../services/review-state.js'));
-  } catch {
-    filterVisibleScores = null;
-  }
+  const mod = await loadOptionalModule(REVIEW_STATE_URL, REVIEW_STATE_PATH);
+  const filterVisibleScores = mod?.filterVisibleScores;
   if (typeof filterVisibleScores !== 'function') {
     return {
       status: 503,

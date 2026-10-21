@@ -270,15 +270,31 @@ export function listAuditLog({ db, filter = {}, viewer = null, rules = null, now
     : { archiveMonths, queryableSince: monthsAgoIso(now, archiveMonths) };
 
   return {
-    rows: rows.map((r) => ({
-      id: r.id,
-      actorId: r.actor_id,
-      action: r.action,
-      entity: r.entity,
-      entityId: r.entity_id,
-      detail: r.detail_json ? JSON.parse(r.detail_json) : null,
-      createdAt: r.created_at,
-    })),
+    rows: rows.map((r) => {
+      // ⚠️ 终审修正（Important，I-1）：**一行坏 detail_json 不能让整页 500**。
+      //    审计轨迹是 P4 的核心交付物 —— 一行坏数据不该让整份不可读。
+      //    降级成 detail=null + detailParseError=true：**显式告警，不静默**。
+      //    （同仓的 repo/audit-log.js findLatestTransition 也有同样的降级口径。）
+      let detail = null;
+      let detailParseError = false;
+      if (r.detail_json) {
+        try {
+          detail = JSON.parse(r.detail_json);
+        } catch {
+          detailParseError = true;
+        }
+      }
+      return {
+        id: r.id,
+        actorId: r.actor_id,
+        action: r.action,
+        entity: r.entity,
+        entityId: r.entity_id,
+        detail,
+        detailParseError,
+        createdAt: r.created_at,
+      };
+    }),
     total,
     retention,
   };

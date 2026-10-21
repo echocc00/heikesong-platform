@@ -541,6 +541,68 @@ test('appError 带上 status / code / detail', () => {
   assert.equal(err.code, 'RATE_LIMITED');
   assert.equal(err.detail.retryAfterSeconds, 7);
 });
+
+// ── 终审修正（M-3）：同毫秒并列时的破并列键必须是 `rowid`，不是 `id` ──
+//
+// ⚠️ 为什么这条容易写成「恒绿」：全局约束说「确定性排序的兜底键一律用 SQLite 隐式
+//    `rowid`（不用随机 UUID）」，但**同一个库内 UUID 是固定的** ⇒ 顺序其实稳定、
+//    分页不会漂移（终审实测：4×5 分页 20 行 distinct=20 / duplicates=0）。
+//    ⇒ 光断言「顺序稳定」区分不出 `rowid DESC` 与 `id DESC`。
+//    **判别性做法**：让 `id` 的**字典序与插入次序相反**（先插的用 'z…'，后插的用 'a…'），
+//    同一毫秒下 —— `rowid DESC` ⇒ 后插的在前；`id DESC` ⇒ 'z…' 在前 ⇒ 两条实现结论相反。
+const SAME_MS = '2026-10-20T03:00:00.000Z';
+
+test('flagged_reviews：同毫秒并列时，后插入的必须在前（rowid 破并列，不是 id）', () => {
+  const { db, close, dataDir } = setup();
+  // ⚠️ id 的字典序与插入次序**故意相反**
+  createFlag(db, { id: 'z-first-inserted', kind: 'low_variance', detail: { n: 1 }, now: SAME_MS });
+  createFlag(db, { id: 'a-second-inserted', kind: 'low_variance', detail: { n: 2 }, now: SAME_MS });
+  const { rows } = listFlagRows(db, { kind: 'low_variance' });
+  assert.equal(rows.length, 2);
+  assert.equal(
+    rows[0].id,
+    'a-second-inserted',
+    '同毫秒并列时必须按 rowid 破并列（后插入的在前）；用 id 破并列会得到相反的顺序',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('appeals：同毫秒并列时，后插入的必须在前（rowid 破并列，不是 id）', () => {
+  const { db, close, dataDir } = setup();
+  insertAppeal(db, { id: 'z-first-inserted', subjectType: 'team_result', subjectId: 'st1:t1', reason: '先插的', now: SAME_MS });
+  insertAppeal(db, { id: 'a-second-inserted', subjectType: 'team_result', subjectId: 'st1:t1', reason: '后插的', now: SAME_MS });
+  const { rows } = listAppealRows(db, {});
+  assert.equal(rows.length, 2);
+  assert.equal(
+    rows[0].id,
+    'a-second-inserted',
+    '同毫秒并列时必须按 rowid 破并列（后插入的在前）；用 id 破并列会得到相反的顺序',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('computation_snapshots：同毫秒并列时，后插入的必须在前（rowid 破并列，不是 id）', () => {
+  const { db, close, dataDir } = setup();
+  insertSnapshot(db, {
+    id: 'z-first-inserted', kind: 'stage_score', stageId: 'st1', ruleVersion: 'scoring.final@2026-10-20',
+    input: { a: 1 }, output: { total: 80 }, trace: {}, revision: 1, now: SAME_MS,
+  });
+  insertSnapshot(db, {
+    id: 'a-second-inserted', kind: 'stage_score', stageId: 'st1', ruleVersion: 'scoring.final@2026-10-20',
+    input: { a: 2 }, output: { total: 81 }, trace: {}, revision: 2, now: SAME_MS,
+  });
+  const { rows } = listComputationRows(db, { kind: 'stage_score', stageId: 'st1' });
+  assert.equal(rows.length, 2);
+  assert.equal(
+    rows[0].id,
+    'a-second-inserted',
+    '同毫秒并列时必须按 rowid 破并列（后插入的在前）；用 id 破并列会得到相反的顺序',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -742,15 +804,19 @@ export function findLatestTransition(db, entity, entityId) {
       ORDER BY created_at DESC, rowid DESC LIMIT 1`,
   ).all(entity, entityId);
   if (!rows.length) return null;
-  let detail = {};
+  // ⚠️ 终审修正（Minor，M-6）：**解析失败必须 fail loud，不能静默降级成 {}**。
+  //    降级成 {} ⇒ detail 里没有 `to` ⇒ getSubjectState 返回 null ⇒
+  //    状态机把主体当成 'SUBMITTED' ⇒ **放行一次本应被拒的迁移**（静默降级到一个错的状态）。
+  //    「有迁移记录、但读不出来」= 数据损坏 = 必须显式报错
+  //    （HTTP 层会转成通用 500 文案，不外泄内部细节）。
+  let detail;
   try {
     detail = rows[0].detail_json ? JSON.parse(rows[0].detail_json) : {};
   } catch {
-    detail = {};
+    throw appError(500, 'AUDIT_LOG_CORRUPT', '审计日志内容损坏，无法读取状态迁移记录');
   }
   return { ...detail, at: rows[0].created_at };
 }
-
 ```
 
 > **【2026-10-21 漂移审计修正 I-8（与 C-3 联动）】**
@@ -875,8 +941,11 @@ export function listFlagRows(db, {
   if (stageId) { where.push('stage_id = ?'); params.push(stageId); }
   const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const total = db.prepare(`SELECT COUNT(*) AS n FROM flagged_reviews ${clause}`).get(...params).n;
+  // ⛔ 确定性排序：破并列键用 SQLite 隐式 `rowid`，**不用 `id`** ——
+  //    `id` 是 randomUUID() ⇒ 同 `created_at` 的两条记录**次序随机**。
+  //    全局约束同 `src/db/repo/audit-log.js`（P4-13 根因修复）。
   const rows = db.prepare(
-    `SELECT * FROM flagged_reviews ${clause} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`,
+    `SELECT * FROM flagged_reviews ${clause} ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?`,
   ).all(...params, limit, offset);
   return { rows, total };
 }
@@ -1031,8 +1100,11 @@ export function listAppealRows(db, {
   if (subjectId) { where.push('subject_id = ?'); params.push(subjectId); }
   const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const total = db.prepare(`SELECT COUNT(*) AS n FROM appeals ${clause}`).get(...params).n;
+  // ⛔ 确定性排序：破并列键用 SQLite 隐式 `rowid`，**不用 `id`** ——
+  //    `id` 是 randomUUID() ⇒ 同 `created_at` 的两条记录**次序随机**。
+  //    全局约束同 `src/db/repo/audit-log.js`（P4-13 根因修复）。
   const rows = db.prepare(
-    `SELECT * FROM appeals ${clause} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`,
+    `SELECT * FROM appeals ${clause} ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?`,
   ).all(...params, limit, offset);
   return { rows, total };
 }
@@ -1047,7 +1119,7 @@ export function updateAppeal(db, { id, status, decidedBy = null, decidedAt = nul
 - [ ] **Step 6: 运行测试确认通过**
 
 Run: `cd platform && node --test test/audit-repo.test.js`
-Expected: PASS（12 个测试全过：audit-repo.test.js 12）
+Expected: PASS（21 个测试全过：audit-repo.test.js 21 —— 规格自带 12 + 父代理预审补测 6 + 终审修正轮破并列补测 3）
 
 - [ ] **Step 7: 提交**
 
@@ -1938,15 +2010,31 @@ export function listAuditLog({ db, filter = {}, viewer = null, rules = null, now
     : { archiveMonths, queryableSince: monthsAgoIso(now, archiveMonths) };
 
   return {
-    rows: rows.map((r) => ({
-      id: r.id,
-      actorId: r.actor_id,
-      action: r.action,
-      entity: r.entity,
-      entityId: r.entity_id,
-      detail: r.detail_json ? JSON.parse(r.detail_json) : null,
-      createdAt: r.created_at,
-    })),
+    rows: rows.map((r) => {
+      // ⚠️ 终审修正（Important，I-1）：**一行坏 detail_json 不能让整页 500**。
+      //    审计轨迹是 P4 的核心交付物 —— 一行坏数据不该让整份不可读。
+      //    降级成 detail=null + detailParseError=true：**显式告警，不静默**。
+      //    （同仓的 repo/audit-log.js findLatestTransition 也有同样的降级口径。）
+      let detail = null;
+      let detailParseError = false;
+      if (r.detail_json) {
+        try {
+          detail = JSON.parse(r.detail_json);
+        } catch {
+          detailParseError = true;
+        }
+      }
+      return {
+        id: r.id,
+        actorId: r.actor_id,
+        action: r.action,
+        entity: r.entity,
+        entityId: r.entity_id,
+        detail,
+        detailParseError,
+        createdAt: r.created_at,
+      };
+    }),
     total,
     retention,
   };
@@ -1992,7 +2080,7 @@ function monthsAgoIso(nowIso, months) {
 - [ ] **Step 5: 运行测试确认通过**
 
 Run: `cd platform && node --test test/audit-snapshot.test.js`
-Expected: PASS（19 个测试全过：audit-snapshot.test.js 19 —— 规格自带 11 + 父代理预审补测 8，详见「Task 2 父代理预审修正台账」）
+Expected: PASS（23 个测试全过：audit-snapshot.test.js 23 —— 规格自带 11 + 父代理预审补测 8 + 父代理预审修正轮补测 4，详见「Task 2 父代理预审修正台账」）
 
 - [ ] **Step 6: 提交**
 
@@ -5023,6 +5111,36 @@ test('申诉列表：按 status 过滤', () => {
   close();
   rmSync(dataDir, { recursive: true, force: true });
 });
+
+test('【终审修正 M-6】迁移日志损坏必须 fail loud，不得静默把主体当成 SUBMITTED', () => {
+  // ⚠️ 终审修正（Minor，M-6）：`findLatestTransition` 此前把解析失败静默降级成 `{}`
+  //    ⇒ detail 里没有 `to` ⇒ getSubjectState 返回 null ⇒ 状态机 `?? 'SUBMITTED'`
+  //    ⇒ **把主体当成 SUBMITTED**：既可能放行一次本应被拒的迁移，
+  //    也可能报出一个「当前是 SUBMITTED」的**假**状态冲突。
+  //    「有迁移记录、但读不出来」= 数据损坏 = 必须显式报错。
+  const { db, close, dataDir } = setup();
+  transition({
+    db, subjectType: 'team_result', subjectId: 'st1:t1', from: 'SUBMITTED', to: 'PENDING_REVIEW',
+    actorId: 'u_admin', reason: '待复核', idempotencyKey: 'k-m6', now: '2026-10-20T00:00:00.000Z',
+  });
+  // 把这条迁移日志的 detail 写坏（模拟历史脏数据）
+  db.prepare("UPDATE audit_log SET detail_json = '{BROKEN' WHERE action = 'review_state.transition'").run();
+
+  assert.throws(
+    () => transition({
+      db, subjectType: 'team_result', subjectId: 'st1:t1', from: 'PENDING_REVIEW', to: 'CONFIRMED',
+      actorId: 'u_admin', reason: '确认', idempotencyKey: 'k-m6b', now: '2026-10-20T01:00:00.000Z',
+    }),
+    (err) => {
+      assert.equal(err.code, 'AUDIT_LOG_CORRUPT', `必须是数据损坏错误（实际 ${err.code}：${err.message}）`);
+      assert.equal(err.status, 500);
+      return true;
+    },
+    '日志损坏必须 fail loud —— 不得当成 SUBMITTED，也不得报假的 409 状态冲突',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -5096,23 +5214,20 @@ export function getSubjectState({ db, subjectType, subjectId }) {
 /**
  * 把迁移时间戳单调化：同一 subject 的相邻迁移必须**严格递增**。
  *
- * ⚠️ 为什么必须有这个（2026-10-21 Task 5 实跑发现的 Critical 缺陷）：
- *   「当前状态」的真值来源是 audit_log 里最后一条 `review_state.transition`，
- *   而仓储层 `findLatestTransition` 的排序是 `created_at DESC, id DESC` ——
- *   `id` 是 randomUUID()，**同一毫秒内的多条迁移之间的先后是随机的**。
- *   实测：三条迁移共用同一 created_at 时，200 次里有 135 次读到**过期**状态。
- *   后果不是"排序不好看"，而是状态机直接抛 409：
- *     - `decideAppeal` 连续两次迁移**用同一个 now** → 约 50% 概率假报
- *       「状态冲突：当前是 FINALIZED，本次声明 REJECTED」；
- *     - 任何连续两条迁移共用同一时间戳的调用方都会踩到。
- *   修法有两条路：
- *     ① 改仓储层 `findLatestTransition` 的 ORDER BY（用 rowid 做次序）——
- *        治本，但要动 Task 1 的文件（越界）；
- *     ② 在服务层保证「自己写出去的迁移时间戳严格递增」（本函数）——
- *        本服务是 `review_state.transition` 的**唯一写入方**，只要自己严格递增，
- *        就不存在并列，`created_at DESC` 的排序就是确定的。
- *   选 ②：治本且不越界；只有"时间戳完全相同"时才 +1ms，正常调用**不动**调用方的 now。
- *   （治本的 ① 留给上游：见 Task 5 报告「存疑/需上游注意」。）
+ * ⚠️ 为什么要有这个（2026-10-21 Task 5 实跑发现的 Critical 缺陷）：
+ *   「当前状态」的真值来源是 audit_log 里最后一条 `review_state.transition`。
+ *   ⚠️ **这条注释里的根因描述已被 P4 终审修正（2026-10-21）** ——
+ *   原先写的是「仓储层排序是 `created_at DESC, id DESC`」，**与实际代码不符**：
+ *   仓储层 `findLatestTransition` 的破并列键**早已改成 SQLite 隐式 `rowid`**
+ *   （P4-13 根因修复，提交 `fba7b6e`；`id` 是 randomUUID()，同毫秒内次序随机）。
+ *   当时的缺陷（实测三条迁移共用同一 created_at 时，200 次里有 135 次读到**过期**状态；
+ *   `decideAppeal` 连续两次迁移用同一个 now → 约 50% 概率假报 409）因此**已治本**：
+ *     · 根因修复：仓储层 `ORDER BY created_at DESC, rowid DESC`；
+ *     · 双保险（本函数）：本服务是 `review_state.transition` 的**唯一写入方**，
+ *       自己写出去的时间戳严格递增 ⇒ 正常调用根本不会出现并列。
+ *   本函数**保留**：① 兼容「同毫秒内多条迁移」的外部写入；② 防止将来有人
+ *   把仓储层的 ORDER BY 改回去时，静默退化回随机次序。
+ *   只有「时间戳完全相同」时才 +1ms，正常调用**不动**调用方的 now。
  */
 function monotonicAt(db, subjectType, subjectId, now) {
   const prev = findLatestTransition(db, subjectType, subjectId);
@@ -5381,6 +5496,7 @@ git commit -m "feat(P4): 复核与申诉状态机、幂等守卫与 PENDING_REVI
 - Modify: `platform/scripts/seed.js`（新增能力点 `audit:write` / `appeal:write`）
 - Modify: `platform/src/http/routes/review.js`（**跨阶段接线**：P2 的 `GET /api/stages/:stageId/review-state` 的分数必须过一遍 `filterVisibleScores`）
 - Test: `platform/test/audit-api.test.js`
+- Create: `platform/src/http/optional-module.js`（**终审修正 I-2 新建**：可判定的「可选模块加载器」——只有「目标模块文件本身不存在」才返回 null；模块在场却加载失败一律抛出去，不误报成「未落地」）
 
 **Interfaces:**
 - Consumes: Task 2 的 `getComputation` / `recomputeAndDiff` / `listAuditLog`；Task 4 的 `listFlags` / `resolveFlag`；Task 5 的 `fileAppeal` / `decideAppeal` / `listAppeals`；Task 3 的 `assertRateLimit`
@@ -5426,10 +5542,10 @@ git commit -m "feat(P4): 复核与申诉状态机、幂等守卫与 PENDING_REVI
 //    其余用例照常跑 —— ⛔ 绝不伪造 Task 5 的实现，也不用桩把绿灯骗出来。
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, cpSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { openDatabase } from '../src/db/sqlite.js';
 import { applyMigrations } from '../src/db/migrate.js';
@@ -5646,6 +5762,47 @@ test('GET /api/audit/log 无权访问返回 200 + 空集，有权返回行', asy
   assert.equal(allowed.status, 200);
   assert.ok(Array.isArray(allowed.json.rows));
   assert.ok(allowed.json.rows.length > 0, '有权时应能看到审计行');
+  // ⚠️ 终审修正（Important，I-4）：`detail` 与 `total` 此前**零断言** ——
+  //    实测把 detail 整体置 null、total 恒 0，测试**照样全绿**（变异 SURVIVED）。
+  //    审计轨迹的内容就是这两个字段，必须钉住。
+  const recorded = allowed.json.rows.find((r) => r.action === 'computation.record');
+  assert.ok(recorded, '必须能看到 recordComputation 写入的那条审计记录');
+  assert.equal(recorded.entity, 'computation');
+  assert.equal(typeof recorded.entityId, 'string');
+  assert.ok(recorded.entityId.length > 0, 'entityId 必须指向那条计算快照');
+  assert.ok(recorded.detail && typeof recorded.detail === 'object', 'detail 必须是解析后的对象，不能是 null');
+  assert.equal(recorded.detail.kind, 'stage_score');
+  assert.equal(recorded.detail.ruleVersion, input.ruleVersion);
+  assert.equal(recorded.detail.revision, 1);
+  assert.equal(recorded.detailParseError, false, '正常行的 detailParseError 必须是 false');
+  // total 是分页计数，必须与实际返回的行数对得上（否则「翻页」语义是假的）
+  assert.equal(allowed.json.total, allowed.json.rows.length, 'total 必须等于本次返回的行数');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('GET /api/audit/log：单行 detail_json 损坏不得让整页 500（降级 + 显式告警）', async () => {
+  // ⚠️ 终审修正（Important，I-1）：此前 `listAuditLog` 对每行直接 `JSON.parse` 且**无 try/catch**
+  //    ⇒ **一行坏数据 ⇒ 整份审计轨迹 500、整页不可读**（审计轨迹是 P4 的核心交付物）。
+  //    终审实测：GET /api/audit/log status=500，body 是通用 INTERNAL 文案。
+  //    正确口径：一行坏数据只降级**那一行**，其余行照常可读，且必须**显式标记**（不静默）。
+  const { db, close, dataDir, app, rules } = setup();
+  const refs = seedRefs(db);
+  const adminToken = createSession(db, refs.admin.id).token;
+  const input = makeInput(rules);
+  recordComputation({
+    db, kind: 'stage_score', stageId: refs.stage.id, ruleVersion: input.ruleVersion,
+    input, output: engineOutput(input), trace: {},
+  });
+  // 手工把这一行的 detail_json 写坏（模拟历史脏数据）
+  db.prepare("UPDATE audit_log SET detail_json = '{BROKEN' WHERE action = 'computation.record'").run();
+
+  const res = await callJson(app, 'GET', '/api/audit/log', { token: adminToken });
+  assert.equal(res.status, 200, '一行坏数据不得让整页 500');
+  const bad = res.json.rows.find((r) => r.action === 'computation.record');
+  assert.ok(bad, '坏行仍应出现在列表里');
+  assert.equal(bad.detail, null, '坏行的 detail 降级为 null');
+  assert.equal(bad.detailParseError, true, '必须显式标记解析失败（不静默）');
   close();
   rmSync(dataDir, { recursive: true, force: true });
 });
@@ -5995,6 +6152,91 @@ test('Task 5 未落地时申诉接口必须 503（fail closed，不静默放行�
   rmSync(dataDir, { recursive: true, force: true });
 });
 
+test('【终审修正 M-5】503 fail closed 必须有**活体**覆盖：用「缺模块的副本」复现，不靠跳过', async () => {
+  // ⚠️ 终审修正（Minor，M-5）：上面那条用例在 Task 5 落地后会被**跳过** ——
+  //    于是「模块不在 → 503」这条分支在本分支上**没有任何活体覆盖**
+  //    （台账自陈变异体 M10/M11「模块在场 → 这两条分支根本走不到」）。
+  //    ⇒ 这里造一份**删掉了 review-state.js 的 src 副本**：
+  //    副本里的动态 import 解析到副本自己的目录 ⇒ 目标真的不存在 ⇒ 真的走 503 分支。
+  //    （不删仓库里的真文件 —— 别的测试文件正并行跑着，删了会互相踩。）
+  const { db, close, dataDir, rules } = setup();
+  const refs = seedRefs(db);
+  const token = createSession(db, refs.captain.id).token;
+
+  const copyDir = mkdtempSync(join(tmpdir(), 'hks-norevstate-'));
+  cpSync(join(here, '..', 'src'), join(copyDir, 'src'), { recursive: true });
+  rmSync(join(copyDir, 'src', 'services', 'review-state.js'), { force: true });
+
+  // 用副本的 server.js 建 app（它内部的动态 import 解析到副本目录 ⇒ 目标缺失）
+  const copied = await import(pathToFileURL(join(copyDir, 'src', 'server.js')).href);
+  const copiedApp = copied.createApp({ db, rules, webDir });
+
+  const res = await callJson(copiedApp, 'POST', '/api/appeals', {
+    token, body: { subjectType: 'team_result', subjectId: `${refs.stage.id}:${refs.team.id}`, reason: '理由' },
+  });
+  assert.equal(res.status, 503, '模块不在时必须 fail closed');
+  assert.equal(res.json.error.code, 'REVIEW_STATE_UNAVAILABLE');
+  const list = await callJson(copiedApp, 'GET', '/api/appeals', { token });
+  assert.equal(list.status, 503, '申诉列表同样必须 fail closed');
+  assert.equal(list.json.error.code, 'REVIEW_STATE_UNAVAILABLE');
+
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+  rmSync(copyDir, { recursive: true, force: true });
+});
+
+test('【终审修正 I-2】模块**在场但加载期崩溃**必须抛错，不得误报成「模块未落地」（503）', async () => {
+  // ⚠️ 终审修正（Important，I-2）：无差别 `catch {}` 会把「模块在场但自己炸了」
+  //    （语法错 / 传递依赖缺失）也报成「未落地」—— fail closed 成立，**诊断是假的**，
+  //    运维会被指向「模块还没写」这个错误方向。
+  //    判据（见 src/http/optional-module.js）：只有「目标模块文件本身不存在」才算未落地。
+  //    这里用一个**加载期就抛错**的模块来验证：它**在磁盘上存在** ⇒ 必须抛，不得返回 null。
+  const { db, close, dataDir } = setup();
+  const copyDir = mkdtempSync(join(tmpdir(), 'hks-boomstate-'));
+  cpSync(join(here, '..', 'src'), join(copyDir, 'src'), { recursive: true });
+  // 让副本里的 review-state.js 在**加载期**就炸（模块文件存在，只是内容坏）
+  writeFileSync(
+    join(copyDir, 'src', 'services', 'review-state.js'),
+    "throw new Error('BOOM: 加载期炸了');\n",
+  );
+  const { loadOptionalModule } = await import(pathToFileURL(join(copyDir, 'src', 'http', 'optional-module.js')).href);
+  const specifier = pathToFileURL(join(copyDir, 'src', 'services', 'review-state.js')).href;
+  await assert.rejects(
+    () => loadOptionalModule(specifier, join(copyDir, 'src', 'services', 'review-state.js')),
+    /BOOM/,
+    '加载期崩溃必须抛出去，不得被当成「模块未落地」吞掉',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+  rmSync(copyDir, { recursive: true, force: true });
+});
+
+test('【终审修正 I-2】目标模块**在场但它的依赖缺失**同样必须抛错（错误码一样，要靠文件存在性区分）', async () => {
+  // ⚠️ 终审修正（Important，I-2）：「目标模块不存在」与「目标模块的传递依赖不存在」
+  //    在 Node 里 **code 完全一样**（都是 ERR_MODULE_NOT_FOUND）⇒ 只能靠
+  //    「出错指向的文件是不是目标本身」区分（实测：前者 url=目标，后者 url=缺失的依赖）。
+  //    判据用「目标文件在磁盘上是否真的存在」实现 ⇒ 这一侧必须**抛出去**：
+  //    目标在场说明模块**写了**，只是它自己缺依赖 —— 报「未落地」是假诊断。
+  const { db, close, dataDir } = setup();
+  const copyDir = mkdtempSync(join(tmpdir(), 'hks-brodep-'));
+  cpSync(join(here, '..', 'src'), join(copyDir, 'src'), { recursive: true });
+  // 目标模块**存在**，但它 import 的东西不存在 ⇒ ERR_MODULE_NOT_FOUND，且 url 指向依赖
+  writeFileSync(
+    join(copyDir, 'src', 'services', 'review-state.js'),
+    "import './this-dependency-does-not-exist.js';\nexport const fileAppeal = () => null;\n",
+  );
+  const { loadOptionalModule } = await import(pathToFileURL(join(copyDir, 'src', 'http', 'optional-module.js')).href);
+  const target = join(copyDir, 'src', 'services', 'review-state.js');
+  await assert.rejects(
+    () => loadOptionalModule(pathToFileURL(target).href, target),
+    (err) => err?.code === 'ERR_MODULE_NOT_FOUND',
+    '传递依赖缺失必须抛出去（目标模块在场 ⇒ 不是「未落地」）',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+  rmSync(copyDir, { recursive: true, force: true });
+});
+
 test('错误响应必须带 Retry-After（限频语义在 HTTP 层，不靠业务代码自己塞头）', async () => {
   const { db, close, dataDir, app } = setup();
   seedRefs(db);
@@ -6286,6 +6528,8 @@ import { assertRateLimit } from '../../services/rate-limit.js';
 import { withIdempotency } from '../../services/idempotency.js';
 import { can } from '../../auth/permissions.js';
 import { unauthenticated, forbidden } from '../../errors.js';
+import { loadOptionalModule } from '../optional-module.js';
+import { fileURLToPath } from 'node:url';
 
 function requireLogin(user) {
   if (!user) throw unauthenticated();
@@ -6305,13 +6549,16 @@ function requireLogin(user) {
  *      decideAppeal({ db, appealId, decision, decidedBy, note, now, rules })
  *        → { appeal, transitions, recomputeRequired }
  *      listAppeals({ db, filter, viewer }) → { rows, total }
+ *
+ * ⚠️ 终审修正（Important，I-2）：**只把「目标模块真不存在」当成未落地**。
+ *    无差别 `catch {}` 会把「模块在场但加载期崩溃」也报成「未落地」——
+ *    fail closed 没错，但**诊断是假的**，会把排查带偏。判据见 optional-module.js。
  */
+const REVIEW_STATE_URL = new URL('../../services/review-state.js', import.meta.url).href;
+const REVIEW_STATE_PATH = fileURLToPath(REVIEW_STATE_URL);
+
 async function loadReviewState() {
-  try {
-    return await import('../../services/review-state.js');
-  } catch {
-    return null;
-  }
+  return loadOptionalModule(REVIEW_STATE_URL, REVIEW_STATE_PATH);
 }
 
 /** Task 5 未落地时的统一响应：503 + 明确的 code（不是 500 通用文案，调用方能分辨）。 */
@@ -6450,6 +6697,52 @@ export function registerAuditRoutes(router, { db, rules }) {
   });
 }
 ```
+- [ ] **Step 4a: 创建可选模块加载器（终审修正 I-2：可判定的「模块在不在」）**
+
+`platform/src/http/optional-module.js`：
+
+```javascript
+// src/http/optional-module.js — 「模块在不在」的**可判定**加载器
+//
+// 依据：P4 终审（Important，I-2）—— 无差别 `catch {}` 会把
+//   「模块在场但加载期崩溃」（语法错 / 传递依赖缺失）也报成「模块未落地」。
+//   fail closed 本身是对的，但**诊断是假的**：运维会被指向「模块还没写」这个错误方向，
+//   而真实原因是「模块在、但它自己炸了」。
+//
+// 判据：只有「**目标模块文件本身**不存在」才算未落地。
+//   实测（探针 /tmp/p4-proof/probe-errshape.mjs，三种失败逐个打）：
+//     ① 目标模块不存在          → code=ERR_MODULE_NOT_FOUND, url=**目标文件**
+//     ② 目标在场、传递依赖缺失   → code=ERR_MODULE_NOT_FOUND, url=**缺失的那个依赖**
+//     ③ 目标在场、加载期抛错      → code=undefined
+//   ①②的 code **完全一样** ⇒ 光看 code 分不出来，只能看「出错指向的文件是不是目标本身」。
+//   本实现用「目标文件在磁盘上是否真的存在」判定（比比对 url 稳，不受 symlink 归一化影响）：
+//     目标不存在        → 确实未落地 → 返回 null（调用方据此 fail closed）；
+//     目标存在却报 BUSY/模块找不到 → 是**它的依赖**缺了 → **不算未落地**，抛出去。
+//
+// ⛔ 抛出去的真异常会走 server.js 的 5xx 分支 ⇒ 对外只回通用 500 文案，不外泄内部细节。
+import { existsSync } from 'node:fs';
+
+/**
+ * @param {string} specifier 动态 import 的**绝对 URL**（file://…）。
+ *   ⚠️ 必须是绝对 URL：动态 import 的解析基准是**本文件**，
+ *      传相对说明符会解析到错的地方（调用方的相对基准在调用方自己手里）。
+ * @param {string} targetPath 该模块在**磁盘上**的绝对路径
+ * @returns {Promise<object|null>} 模块在 → 它的命名空间；确实未落地 → null
+ * @throws 其它一切异常（模块在场却加载失败 —— 别装成「没落地」）
+ */
+export async function loadOptionalModule(specifier, targetPath) {
+  try {
+    return await import(specifier);
+  } catch (err) {
+    if (err?.code === 'ERR_MODULE_NOT_FOUND' && !existsSync(targetPath)) {
+      return null;
+    }
+    console.error(`[optional-module] ${specifier} 加载失败（不是「未落地」）：`, err);
+    throw err;
+  }
+}
+```
+
 
 - [ ] **Step 4: 修改 `src/http/respond.js` 与 `src/server.js`**
 
@@ -6572,16 +6865,19 @@ P4 只在其上**追加一件事**：**Retry-After 响应头**（第 6 参 extra
  *         （没有分数 = 没有可泄露的东西，过滤是恒等的）；
  *       · **有分数但过滤模块缺失** → 503（fail closed：宁可报错，
  *         也绝不把未过滤的分数发出去）。
+ *
+ * ⚠️ 终审修正（Important，I-2）：**只把「目标模块真不存在」当成缺失**。
+ *    模块在场但加载期崩了（语法错 / 传递依赖缺失）→ **抛出去**，
+ *    绝不装成「模块未就绪」—— 后者会让排查指向错误方向。判据见 optional-module.js。
  */
+const REVIEW_STATE_URL = new URL('../../services/review-state.js', import.meta.url).href;
+const REVIEW_STATE_PATH = fileURLToPath(REVIEW_STATE_URL);
+
 export async function applyScoreVisibility({ db, stageId, viewer, state }) {
   const scores = Array.isArray(state?.scores) ? state.scores : [];
   if (!scores.length) return state;
-  let filterVisibleScores = null;
-  try {
-    ({ filterVisibleScores } = await import('../../services/review-state.js'));
-  } catch {
-    filterVisibleScores = null;
-  }
+  const mod = await loadOptionalModule(REVIEW_STATE_URL, REVIEW_STATE_PATH);
+  const filterVisibleScores = mod?.filterVisibleScores;
   if (typeof filterVisibleScores !== 'function') {
     return {
       status: 503,
@@ -6925,7 +7221,7 @@ route('/flags', (c) => renderFlags(c));
 - [ ] **Step 8: 运行测试确认通过**
 
 Run: `cd platform && node --test test/audit-api.test.js`
-Expected: PASS —— 实测 **30 例：24 通过 + 6 跳过 + 0 失败**。
+Expected: PASS —— 实测 **33 例：32 通过 + 1 跳过 + 0 失败**（终审修正轮新增 3 例后）。
 （规格自带 9 例；本阶段补到 30 例：权限三态 / 限频落库与重启仍限频 / 幂等重放 / 可见性过滤 fail closed /
 前端 trace 抽屉与复核队列 / 种子能力点。跳过的 6 例**依赖 Task 5 的 `src/services/review-state.js`**，
 未落地时按「跳过并写明原因」处理，**Task 5 合入后自动转为通过**（已在装了 Task 5 的副本上实测 29 通过 + 1 跳过 + 0 失败）。）
@@ -7845,7 +8141,7 @@ test('【已知限制】评委池不合规时：分数本身仍可复算，但�
 - [ ] **Step 2: 运行测试确认通过**
 
 Run: `cd platform && node --test test/recompute-e2e.test.js`
-Expected: PASS（1 个测试全过：recompute-e2e.test.js 1）
+Expected: PASS（2 个测试全过：recompute-e2e.test.js 2）
 
 > ⚠️ 若这里报 `Cannot find module '../src/domain/scoring.js'`，说明 **P2 尚未落地**（本阶段依赖 P2 的 `scoreStage`）。
 > 若报「scoreStage 必须返回 teams 数组」之类的断言失败，说明 P2 的实现与 `INTERFACES.md` §3 的契约不符 —— **修 P2，不要改本测试**。
@@ -8027,7 +8323,7 @@ git commit -m "test(P4): 端到端复算验收（改一个原始分 → diff 非
 | 7 | **分页参数校验** | `if (query.limit !== undefined) out.limit = Number(query.limit);` | 只接受**有限正整数**（`Number.isInteger` + `> 0` / `>= 0`） | `Number('abc') = NaN` → 绑进 SQL → `node:sqlite` 抛 TypeError → **一个 query 参数就能把接口打成 500** |
 | 8 | **前端的 `escapeHtml`** | 两个视图各自**本地定义**一份 | 统一 `import { escapeHtml } from '../escape.js'` | 项目已有统一转义工具（`web/escape.js`，注释明写「所有插值统一走它」），本地副本 = 两份会漂移的实现；顺带修掉规格副本 `String(s)` 对 `null` 会渲染成 `"null"` 的问题 |
 | 9 | **前端路由传参** | `route('/audit/:computationId', () => renderAudit(ctx));` | `route('/audit/:computationId', (c) => renderAudit(c));` | 前端 router 传给视图的是 `{...ctx, params, query}`；模块级 `ctx` **没有 params** → 抽屉永远拿不到 `computationId`（永远显示「缺少 computationId」）。与 `app.js` 既有 6 处路由同一写法 |
-| 10 | **测试文件的用例数与内容** | 9 例（其中 3 例依赖 Task 5） | **30 例**（24 通过 + 6 跳过），补：三态（无权读快照 404 / 无权复算 403 / 无权裁决 403）、限频落库与「换连接（模拟重启）仍超限」、幂等重放、可见性过滤 fail closed、非法 `limit` 不打 500、Task 5 未落地时 503、**前端 trace 抽屉 / 复核队列 / 路由透传 / XSS 转义**、种子能力点与授权 | 变异检验暴露的有效缺口（见台账三）；Task 6 的两个前端视图是**交付物**，不能没有测试。**用例只加不改语义**：规格自带的 9 例断言一条没动 |
+**33 例**（32 通过 + 1 跳过）
 | 11 | **申诉列表的过滤参数** | `pickFilter` 不含 `subjectType` / `subjectId` | 加上这两个键 | 否则 `GET /api/appeals` 只能按 `status` 过滤，委员会用不了「按赛段/队伍查申诉」 |
 
 ### H. Task 2 实施后的偏差
@@ -8061,7 +8357,7 @@ git commit -m "test(P4): 端到端复算验收（改一个原始分 → diff 非
 | # | 偏差 | 规格的写法 | 本阶段的写法 | 理由 |
 |---|---|---|---|---|
 | 1 | **测试补 `seedRefs(db)` 外键夹具** | 规格用例直接用 `'u_admin'` / `'u_captain'` 写审计日志、用 `'t1'`/`'t2'` 写段位记录 | 加 `seedRefs(db)`：建 `users`（u_admin / u_captain / u_judge / j1 / j2）、`editions(ed_1)`、`teams(t1..t6)` | `PRAGMA foreign_keys = ON`；`audit_log.actor_id → users(id)`、`tier_records.team_id → teams(id)`；不建被引用的行必然 `FOREIGN KEY constraint failed`（实跑 13 条红 8 条）。与 §G 第 2 行、§H 第 2 行同一处置口径 |
-| 2 | **服务层加 `monotonicAt()`：同一 subject 的迁移时间戳严格递增** | 规格直接 `const at = now;` | 加 `monotonicAt(db, subjectType, subjectId, now)`：与上一条迁移**同毫秒**时 +1ms | 「当前状态」取自 `audit_log` 最后一条迁移，而 `findLatestTransition` 排序是 `created_at DESC, id DESC`、`id` 是 randomUUID() ⇒ 同毫秒内次序随机（实跑 200 次里 135 次读到过期状态）⇒ 状态机假报 409。治本是改仓储层 ORDER BY（属 Task 1，**越界**）⇒ 本阶段选服务层单调化，**不越界** |
+⇒ 状态机假报 409。**根因已治本**（P4-13 根因修复 `fba7b6e`：仓储层 ORDER BY 改为 `created_at DESC, rowid DESC`）；服务层单调化**保留为双保险**（兼容同毫秒的外部写入、并防止将来有人把 ORDER BY 改回去） |
 | 3 | **测试补 14 例（13 → 27）** | 规格自带 13 例 | 27 例（规格自带 13 + 变异检验补测 14） | 变异检验暴露的**有效缺口**（详见「Task 5 父代理预审修正台账」二），并把两处规格缺陷钉成回归用例 |
 | 4 | **§Interfaces 的 `Consumes` 列了 `withIdempotency` —— 该函数不存在** | Consumes 写「Task 1 的 … `withIdempotency` / `writeAuditLog`」 | 实际用 `src/db/repo/idempotency.js` 的 `findIdempotency` / `insertIdempotency`（Task 1 已建） | 实测 `grep -rn "withIdempotency" platform/src` **零命中**（整个 src/ 都没有这个函数）。与 §G 第 1 行、§H 第 1 行**同款裁决**：复用已建的近义函数，不另起名字 |
 
@@ -8261,7 +8557,7 @@ P4 全量 **861/861**（Task 5 合并后的 860 + 本轮根因修复新增的 1 
 | # | 级别 | 缺陷 | 实跑证据 | 处置 |
 |---|---|---|---|---|
 | **P4-T5-1** | **Critical** | **规格的测试没有建被外键引用的行** —— `audit_log.actor_id REFERENCES users(id)`、`tier_records.team_id REFERENCES teams(id)`；而 `PRAGMA foreign_keys = ON`（`src/db/sqlite.js`） | 跑规格自带用例 → 13 条里 **8 条红**，全部 `Error: FOREIGN KEY constraint failed`（errcode 787），栈顶分别在 `insertAuditLogRow`（audit-log.js:19）与 `seedTier` | 测试加 `seedRefs(db)`（users / editions / teams），`seedTier` 本身不动 |
-| **P4-T5-2** | **Critical** | **规格的 `transition` 直接 `const at = now;` ⇒ 迁移时间戳可以并列**；而「当前状态」取自 `audit_log` 最后一条 `review_state.transition`，仓储层 `findLatestTransition` 排序是 `created_at DESC, id DESC`、`id` 是 `randomUUID()` ⇒ 同毫秒内次序**随机** | 独立探针（`/tmp/p4-probe/orderprobe.mjs`）：三条迁移共用同一 `created_at`，200 次里 **135 次读到过期状态**；规格自带 3 段式用例**每次跑都可能红**（5 次连跑红 1~2 条/次，实测报错 `状态冲突：当前是 PENDING_REVIEW，本次声明 CONFIRMED`） | 服务层加 `monotonicAt()`：与上一条迁移同毫秒时 +1ms（本服务是该 action 的唯一写入方 ⇒ 自己严格递增即无并列）。**治本**（仓储层 ORDER BY 用 rowid）**越界**，留给上游 |
+**根因已治本**（P4-13 根因修复 `fba7b6e` 把仓储层 ORDER BY 改成 `rowid DESC`）；服务层单调化**保留为双保险**
 | **P4-T5-3** | **Important** | **规格的 `decideAppeal` 成立时连续两次迁移用同一个 `now`** ⇒ 自我并列 ⇒ 约 50% 概率假报 409「状态冲突」，**申诉成立**这条主流程在生产上随机失败 | 同 P4-T5-2 的探针路径（`decideAppeal` 的两条迁移同 `now`） | 同 P4-T5-2（`monotonicAt` 一并覆盖） |
 
 ### 二、变异检验发现的实现盲区
@@ -8296,9 +8592,11 @@ P4 全量 **861/861**（Task 5 合并后的 860 + 本轮根因修复新增的 1 
 
 > **Task 5 的文件归属纪律**：`src/db/repo/tiers.js` 是 **P3 Task 7 建立**的，
 > 本阶段**只追加** `getTeamTierRow`（12 行），**未重建、未改动** P3 的任何既有函数；
-> `src/db/repo/audit-log.js`、`src/db/repo/appeals.js`、`src/db/repo/idempotency.js`、
-> `src/errors.js`、`src/auth/permissions.js`、`src/audit/log.js` —— **一行未动**
-> （本阶段的 P4-T5-2 用**服务层单调化**规避了改仓储层 ORDER BY 的需要）。
+> `src/db/repo/idempotency.js`、`src/errors.js`、`src/auth/permissions.js`、`src/audit/log.js` —— **一行未动**。
+> ⚠️ **但 `src/db/repo/audit-log.js` 与 `src/db/repo/appeals.js` 不再「一行未动」**（P4 终审修正）：
+> Task 5 落地后，父代理在 P4-13 根因修复（`fba7b6e`）里把 `audit-log.js` 的 ORDER BY 改成了 `rowid DESC`；
+> 终审修复轮（2026-10-21）又把 `audit-log.js` 的坏 JSON 改成 fail loud、把 `appeals.js` 的 ORDER BY 也改成 `rowid DESC`。
+> ⇒ 当时那句「用**服务层单调化**规避了改仓储层 ORDER BY 的需要」**已不成立**：根因（`rowid` 破并列）早已治本。
 
 ### 三、落地与提交
 
@@ -8417,3 +8715,71 @@ P4 全量 **861/861**（Task 5 合并后的 860 + 本轮根因修复新增的 1 
 
 > **关于「跳过」的口径**：跳过的 6 例**不是绿灯**，是「依赖尚未落地的模块 → 明确标注跳过原因」。
 > Task 5 合入后它们会自动转为通过（已在装了 Task 5 的副本上实测）。
+
+---
+
+## P4 终审修复轮（2026-10-21，父代理）
+
+> **背景**：P4 整分支终审（独立 verifier）结论 **PASS-WITH-NOTES** —— 无 Critical，
+> 4 条 Important + 7 条 Minor。基线 897 = 896 通过 + 1 跳过 + 0 失败（连跑 3 次一致）。
+> 终审**没有采信任何台账里的「实跑证据」**，全部自行重跑（含 P4-13 的 135/200 量级、
+> `decideAppeal` 50 次连跑、Task 6 的真 socket 8/8 冒烟）。
+> 本章记录**父代理逐条处置**的结果。
+
+### 一、Important 四条（全部已修）
+
+| # | 缺陷 | 实跑证据（终审自跑） | 处置 | 变异体 |
+|---|---|---|---|---|
+| **I-1** | `listAuditLog` 对每行直接 `JSON.parse(detail_json)` 且**无 try/catch** ⇒ **一行坏数据 ⇒ 整页 500**（审计轨迹是本阶段核心交付物） | `src/services/audit.js:279`；探针实测 `GET /api/audit/log status = 500`，body 是通用 INTERNAL | 逐行安全解析：坏行降级为 `detail=null` + `detailParseError=true`（**显式告警，不静默**），其余行照常可读；新增用例「单行 detail_json 损坏不得让整页 500」 | **M-F1 KILLED** |
+| **I-2** | 动态 import 的**无差别 `catch {}`** ⇒ 模块**在场但加载期崩溃**（语法错 / 传递依赖缺失）也报成「未落地」—— fail closed 成立，**诊断是假的** | `src/http/routes/audit.js:38-44` / `src/http/routes/review.js:127-132`；实测把 `review-state.js` 首行改成 `throw` → 503 + 文案「未落地」 | 新建 `src/http/optional-module.js`：只有「**目标模块文件本身不存在**」才返回 null；否则**抛出去**（server.js 的 5xx 分支转成通用 500，不外泄原文）。判据的实证基础见下 | **M-F3 KILLED** |
+| **I-3** | 计划台账与实现**互相矛盾**：根因（`rowid` 破并列）早已在 `fba7b6e` 修好，但偏差表 §J、Task 5 台账 P4-T5-2、台账 §三、以及**已发布源码注释**仍写「越界 / 留给上游」，源码注释还写着仓储层排序是 `id DESC`（与实际代码不符） | 计划 8064 / 8264 / 8299-8301 行；`src/services/review-state.js:44` 注释；终审实测「改回 `id DESC` → 200 次读**全部**读到过期态；改回 `rowid` → 0/200」 | 4 处措辞订正（计划）+ 源码注释订正（`review-state.js` 的 `monotonicAt` 文档改为「根因已治本，本函数保留为双保险」） | — |
+| **I-4** | 审计日志的 `detail`（每条记录的实际内容）与 `total`（分页计数）**零断言** ⇒ 载荷被整体清空也全绿 | 终审变异实测：detail 置 null / total 恒 0 ⇒ `audit-api.test.js` 与 `audit-repo.test.js` **均 SURVIVED**；现有用例只断言到 `rows.length > 0` | 补断言：`rows[0].detail` 的 `kind` / `ruleVersion` / `revision` 与写入值一致、`entityId` 非空、`detailParseError === false`、`total === rows.length` | **M-F2 KILLED** |
+
+### 二、Minor 七条
+
+| # | 缺陷 | 处置 |
+|---|---|---|
+| **M-1** | `walRetryBudgetMs`「不传即原语义」**与实测不符**（旧实现锁竞争时 0ms 失败，新实现 5s 后失败 —— 签名向后兼容但**行为语义已变**） | `INTERFACES.md` 措辞订正为「不传 = 默认 5000ms 预算；**这是行为变更**」 |
+| **M-2** | WAL 根因表述**过度泛化**：终审自建探针实测，别的连接持 **EXCLUSIVE** 锁时 busy handler **仍会**等待（busy_timeout=5000 等 5485ms、=1000 等 1129ms，随 busy_timeout 线性缩放）；只有持 **RESERVED**（写事务）时才是 0ms 即失败 | `src/db/sqlite.js` / `test/db-concurrency.test.js` / `INTERFACES.md` 三处补上**限定条件**（「别的连接持有写事务（RESERVED 锁）时」），并明确写「别再无条件地转述这句话」 |
+| **M-3** | `rowid` 破并列只改了 `audit_log`，同批 P4 仓储仍有 3 处用 `id DESC`（`flags.js` / `appeals.js` / `computations.js`），**违反该修复自己声明的全局约束** | 三处一并改 `rowid DESC`；**各补一条同毫秒并列的判别性用例**（id 字典序与插入次序**故意相反**：先插 `'z-first-inserted'`、后插 `'a-second-inserted'` ⇒ `rowid DESC` 与 `id DESC` 结论相反） |
+| **M-4** | 计划里 4 处测试条数已过期（audit-repo 12→21、audit-snapshot 19→23、audit-api 30(24+6)→33(32+1)、recompute-e2e 1→2） | 逐处订正。**所有累计口径原本就是准的**（终审用 `git archive` 复核了 4 个提交处的累计条数：7107f26=863/863、ee5cf04=859、a6fd2db=713/713、8ee37fd=897），属「现在时措辞未跟改」，非错数 |
+| **M-5** | 503 fail-closed 分支在**当前配置下无任何活体覆盖**（唯一针对它的用例因 Task 5 已落地而被跳过；台账自陈 M10/M11「模块在场 → 这两条分支根本走不到」） | 新增**不依赖跳过**的活体用例：造一份**删掉了 `review-state.js` 的 `src/` 副本**，动态 import 副本的 `server.js` ⇒ 副本里的动态 import 解析到副本自己的目录 ⇒ 目标真的不存在 ⇒ 真的走 503 分支 |
+| **M-6** | `findLatestTransition` 把坏 `detail_json` **静默降级为 `{}`** ⇒ `getSubjectState` 返回 null ⇒ 状态机 `?? 'SUBMITTED'` 把主体当成 `SUBMITTED` ⇒ **放行一次本应被拒的迁移**（或报出假的 409 状态冲突） | 改为 **fail loud**：`appError(500, 'AUDIT_LOG_CORRUPT', ...)`（「有迁移记录、但读不出来」= 数据损坏 = 必须显式报错）；新增用例断言错误码是 `AUDIT_LOG_CORRUPT` 而**不是** `CONFLICT` |
+| **M-7** | 同一幂等键**内容不同**时返回首次响应（200），非 409 | **记为已知限制**：终审核过 —— 计划 / 契约 / 设计文档**从未要求 409**，契约 §5 明确「重复请求返回**首次的响应**」⇒ 属**规格缺口**不是实现偏离。要改成 409 需在 `idempotency_keys` 存请求指纹并比对 ⇒ **契约变更**，须走 `INTERFACES.md` 变更纪律 |
+
+### 三、终审修复轮的变异检验
+
+脚本 `/tmp/p4-mutate/final.mjs`（指向**已落地**的 `platform/`）。**8 个变异体，0 个构造失效**（锚点命中 0 次会直接报出来），全部真改行为。
+
+| 变异体 | 改坏什么 | 结果 |
+|---|---|---|
+| M-F1 | I-1 还原：detail_json 直接 `JSON.parse`（无 try/catch） | **KILLED** |
+| M-F2 | I-4 还原：detail 恒为 null | **KILLED** |
+| M-F3 | I-2 还原：无差别 `catch {}` | **KILLED** |
+| M-F4 | M-5 还原：模块不在时放行（不 fail closed） | **KILLED** |
+| M-F5 | M-6 还原：坏 detail_json 静默降级成 `{}` | **KILLED** |
+| M-F6 / M-F7 / M-F8 | M-3 还原：flags / appeals / computations 仓储用 `id DESC` | **KILLED ×3** |
+
+**合计 8/8 杀灭，存活 0，等价/不可观测变异体 0 个。**
+
+> ⚠️ 第一轮曾有 **5 个存活**（M-F3 / M-F5 / M-F6 / M-F7 / M-F8），根因是**用例不够判别**：
+> ① M-F3 的原用例只覆盖「加载期抛错」（`err.code` 是 undefined），没覆盖「传递依赖缺失」
+>    （`err.code` 同样是 `ERR_MODULE_NOT_FOUND`）—— 补了后者；
+> ② M-F5 原本没有用例 —— 补了「日志损坏必须 fail loud」；
+> ③ M-F6/F7/F8 的用例没造**同毫秒并列**数据 ⇒ 顺序根本区分不出来 —— 补了
+>    「id 字典序与插入次序故意相反」的判别性数据。
+> ⇒ 再次印证本项目的硬纪律：**期望值「恰好相同」区分不出两种实现**。
+
+### 四、本轮新增文件
+
+| 文件 | 性质 | 说明 |
+|---|---|---|
+| `platform/src/http/optional-module.js` | **新建** | 可判定的「可选模块加载器」（I-2）。契约已写进 `INTERFACES.md` |
+
+### 五、最终结果
+
+- P4 全量：**905 = 904 通过 + 1 跳过 + 0 失败**（终审前 897；本轮新增 8 例：I-1 一条、I-2 三条、
+  I-4 并入既有用例、M-3 三条、M-5 一条、M-6 一条；被并入/改写的既有用例不另计）。
+- 剩余那 1 个跳过：`test/audit-api.test.js` 的「Task 5 未落地时申诉接口必须 503」——
+  条件式跳过（Task 5 已落地故不适用）。**该分支已由本轮的 M-5 活体用例覆盖**（用缺模块的副本复现）。
+- 计划块逐字核验：整文件块与片段块**全部一致**（核验方式与结果见提交说明）。

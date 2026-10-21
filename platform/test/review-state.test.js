@@ -618,3 +618,33 @@ test('申诉列表：按 status 过滤', () => {
   close();
   rmSync(dataDir, { recursive: true, force: true });
 });
+
+test('【终审修正 M-6】迁移日志损坏必须 fail loud，不得静默把主体当成 SUBMITTED', () => {
+  // ⚠️ 终审修正（Minor，M-6）：`findLatestTransition` 此前把解析失败静默降级成 `{}`
+  //    ⇒ detail 里没有 `to` ⇒ getSubjectState 返回 null ⇒ 状态机 `?? 'SUBMITTED'`
+  //    ⇒ **把主体当成 SUBMITTED**：既可能放行一次本应被拒的迁移，
+  //    也可能报出一个「当前是 SUBMITTED」的**假**状态冲突。
+  //    「有迁移记录、但读不出来」= 数据损坏 = 必须显式报错。
+  const { db, close, dataDir } = setup();
+  transition({
+    db, subjectType: 'team_result', subjectId: 'st1:t1', from: 'SUBMITTED', to: 'PENDING_REVIEW',
+    actorId: 'u_admin', reason: '待复核', idempotencyKey: 'k-m6', now: '2026-10-20T00:00:00.000Z',
+  });
+  // 把这条迁移日志的 detail 写坏（模拟历史脏数据）
+  db.prepare("UPDATE audit_log SET detail_json = '{BROKEN' WHERE action = 'review_state.transition'").run();
+
+  assert.throws(
+    () => transition({
+      db, subjectType: 'team_result', subjectId: 'st1:t1', from: 'PENDING_REVIEW', to: 'CONFIRMED',
+      actorId: 'u_admin', reason: '确认', idempotencyKey: 'k-m6b', now: '2026-10-20T01:00:00.000Z',
+    }),
+    (err) => {
+      assert.equal(err.code, 'AUDIT_LOG_CORRUPT', `必须是数据损坏错误（实际 ${err.code}：${err.message}）`);
+      assert.equal(err.status, 500);
+      return true;
+    },
+    '日志损坏必须 fail loud —— 不得当成 SUBMITTED，也不得报假的 409 状态冲突',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});

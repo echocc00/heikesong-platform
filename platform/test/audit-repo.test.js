@@ -393,3 +393,65 @@ test('appError 带上 status / code / detail', () => {
   assert.equal(err.code, 'RATE_LIMITED');
   assert.equal(err.detail.retryAfterSeconds, 7);
 });
+
+// ── 终审修正（M-3）：同毫秒并列时的破并列键必须是 `rowid`，不是 `id` ──
+//
+// ⚠️ 为什么这条容易写成「恒绿」：全局约束说「确定性排序的兜底键一律用 SQLite 隐式
+//    `rowid`（不用随机 UUID）」，但**同一个库内 UUID 是固定的** ⇒ 顺序其实稳定、
+//    分页不会漂移（终审实测：4×5 分页 20 行 distinct=20 / duplicates=0）。
+//    ⇒ 光断言「顺序稳定」区分不出 `rowid DESC` 与 `id DESC`。
+//    **判别性做法**：让 `id` 的**字典序与插入次序相反**（先插的用 'z…'，后插的用 'a…'），
+//    同一毫秒下 —— `rowid DESC` ⇒ 后插的在前；`id DESC` ⇒ 'z…' 在前 ⇒ 两条实现结论相反。
+const SAME_MS = '2026-10-20T03:00:00.000Z';
+
+test('flagged_reviews：同毫秒并列时，后插入的必须在前（rowid 破并列，不是 id）', () => {
+  const { db, close, dataDir } = setup();
+  // ⚠️ id 的字典序与插入次序**故意相反**
+  createFlag(db, { id: 'z-first-inserted', kind: 'low_variance', detail: { n: 1 }, now: SAME_MS });
+  createFlag(db, { id: 'a-second-inserted', kind: 'low_variance', detail: { n: 2 }, now: SAME_MS });
+  const { rows } = listFlagRows(db, { kind: 'low_variance' });
+  assert.equal(rows.length, 2);
+  assert.equal(
+    rows[0].id,
+    'a-second-inserted',
+    '同毫秒并列时必须按 rowid 破并列（后插入的在前）；用 id 破并列会得到相反的顺序',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('appeals：同毫秒并列时，后插入的必须在前（rowid 破并列，不是 id）', () => {
+  const { db, close, dataDir } = setup();
+  insertAppeal(db, { id: 'z-first-inserted', subjectType: 'team_result', subjectId: 'st1:t1', reason: '先插的', now: SAME_MS });
+  insertAppeal(db, { id: 'a-second-inserted', subjectType: 'team_result', subjectId: 'st1:t1', reason: '后插的', now: SAME_MS });
+  const { rows } = listAppealRows(db, {});
+  assert.equal(rows.length, 2);
+  assert.equal(
+    rows[0].id,
+    'a-second-inserted',
+    '同毫秒并列时必须按 rowid 破并列（后插入的在前）；用 id 破并列会得到相反的顺序',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('computation_snapshots：同毫秒并列时，后插入的必须在前（rowid 破并列，不是 id）', () => {
+  const { db, close, dataDir } = setup();
+  insertSnapshot(db, {
+    id: 'z-first-inserted', kind: 'stage_score', stageId: 'st1', ruleVersion: 'scoring.final@2026-10-20',
+    input: { a: 1 }, output: { total: 80 }, trace: {}, revision: 1, now: SAME_MS,
+  });
+  insertSnapshot(db, {
+    id: 'a-second-inserted', kind: 'stage_score', stageId: 'st1', ruleVersion: 'scoring.final@2026-10-20',
+    input: { a: 2 }, output: { total: 81 }, trace: {}, revision: 2, now: SAME_MS,
+  });
+  const { rows } = listComputationRows(db, { kind: 'stage_score', stageId: 'st1' });
+  assert.equal(rows.length, 2);
+  assert.equal(
+    rows[0].id,
+    'a-second-inserted',
+    '同毫秒并列时必须按 rowid 破并列（后插入的在前）；用 id 破并列会得到相反的顺序',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});

@@ -15,6 +15,8 @@ import { assertRateLimit } from '../../services/rate-limit.js';
 import { withIdempotency } from '../../services/idempotency.js';
 import { can } from '../../auth/permissions.js';
 import { unauthenticated, forbidden } from '../../errors.js';
+import { loadOptionalModule } from '../optional-module.js';
+import { fileURLToPath } from 'node:url';
 
 function requireLogin(user) {
   if (!user) throw unauthenticated();
@@ -34,13 +36,16 @@ function requireLogin(user) {
  *      decideAppeal({ db, appealId, decision, decidedBy, note, now, rules })
  *        → { appeal, transitions, recomputeRequired }
  *      listAppeals({ db, filter, viewer }) → { rows, total }
+ *
+ * ⚠️ 终审修正（Important，I-2）：**只把「目标模块真不存在」当成未落地**。
+ *    无差别 `catch {}` 会把「模块在场但加载期崩溃」也报成「未落地」——
+ *    fail closed 没错，但**诊断是假的**，会把排查带偏。判据见 optional-module.js。
  */
+const REVIEW_STATE_URL = new URL('../../services/review-state.js', import.meta.url).href;
+const REVIEW_STATE_PATH = fileURLToPath(REVIEW_STATE_URL);
+
 async function loadReviewState() {
-  try {
-    return await import('../../services/review-state.js');
-  } catch {
-    return null;
-  }
+  return loadOptionalModule(REVIEW_STATE_URL, REVIEW_STATE_PATH);
 }
 
 /** Task 5 未落地时的统一响应：503 + 明确的 code（不是 500 通用文案，调用方能分辨）。 */

@@ -34,10 +34,24 @@
 ```js
 // src/db/sqlite.js
 openDatabase({ dataDir, filename, walRetryBudgetMs? })  // → { db, close() }，已开 WAL + foreign_keys + busy_timeout=5000
-//   walRetryBudgetMs：切 WAL 时的**重试预算**（毫秒，默认 5000）。可选 —— 不传即原语义。
-//   ⚠️ 切 journal_mode 需要**独占锁**，而 SQLite 的 busy handler **不覆盖这一步**
-//      （实测：持锁时该 PRAGMA 0ms 即抛 SQLITE_BUSY，busy_timeout 对它无效）
+//   walRetryBudgetMs：切 WAL 时的**重试预算**（毫秒，默认 5000）。**可选参数**。
+//   ⚠️ **不传 ≠ 原语义**（P4 终审 Minor M-1 实测纠正）：旧实现锁竞争时 **0ms 即失败**，
+//      现在最多等 5s 再失败 —— 签名向后兼容成立，但**行为语义已变**（fail-fast → 有界等待）。
+//   ⚠️ 切 journal_mode 需要**独占锁**；**别的连接持有写事务（RESERVED 锁）时**，
+//      SQLite 的 busy handler **在这一种锁型上不生效**
+//      （实测：该 PRAGMA 0ms 即抛 SQLITE_BUSY，busy_timeout 对它无效）
 //      ⇒ 连接层必须自实现退避重试，否则「两条连接同时首开同一个新库」必有一方失败。
+//      ⚠️ 限定条件（M-2）：并非无条件 —— 别的连接持 **EXCLUSIVE** 锁时 busy handler **仍会**等待
+//      （实测 busy_timeout=5000 等 5485ms、=1000 等 1129ms，随 busy_timeout 线性缩放）。
+
+// src/http/optional-module.js（P4 新建）
+loadOptionalModule(specifier, targetPath)  // → Promise<模块命名空间 | null>
+//   specifier 必须是**绝对 file:// URL**（动态 import 的解析基准是本文件，不是调用方）。
+//   targetPath 是该模块在磁盘上的绝对路径。
+//   → 模块在 → 返回命名空间；**目标模块本身不存在** → 返回 null（调用方据此 fail closed）。
+//   → 目标在场却加载失败（加载期抛错 / 传递依赖缺失）→ **抛出去**，不装成「未落地」
+//     （P4 终审 Important I-2：无差别 catch {} 会把「模块在场但自己炸了」
+//      误报成「模块未落地」，fail closed 成立但诊断是假的）。
 
 // src/db/migrate.js
 applyMigrations(db, migrationsDir)       // → { applied: string[], version: number }
