@@ -33,6 +33,12 @@
 #   ENV_FILE      环境文件路径         默认 /etc/heikesong/platform.env
 #   NGINX_SITE    nginx 站点文件       默认 /etc/nginx/sites-available/heikesong.conf
 #   NGINX_LINK    nginx 站点软链       默认 /etc/nginx/sites-enabled/heikesong.conf
+#   NGINX_TEMPLATE nginx 站点模板      默认 deploy/nginx.conf（域名 + TLS）
+#                                令路形态用 deploy/nginx-plain-http.conf
+#                                （纯 HTTP + 自定义端口，**无 TLS**）
+#   NGINX_HTTP_PORT 纯 HTTP 监听端口   默认 8081（只对 plain-http 模板有意义）
+#   COOKIE_SECURE  登录 Cookie 的 Secure 属性  默认空 = 跟随 NODE_ENV
+#                                纯 HTTP 形态必须显式给 false（否则浏览器拒收 Cookie → 登录失效）
 #   SYSTEMD_UNIT_DIR systemd 单元目录  默认 /etc/systemd/system
 #   SESSION_TTL_DAYS 会话滑动有效期（天）默认 7（与 src/auth/session.js 的默认值一致）
 #   SESSION_ABSOLUTE_TTL_DAYS 会话绝对过期上限（天）默认 30（同上）
@@ -55,6 +61,14 @@ SERVER_NAME="${SERVER_NAME:-}"
 ENV_FILE="${ENV_FILE:-/etc/heikesong/platform.env}"
 NGINX_SITE="${NGINX_SITE:-/etc/nginx/sites-available/heikesong.conf}"
 NGINX_LINK="${NGINX_LINK:-/etc/nginx/sites-enabled/heikesong.conf}"
+# 站点模板：默认是「域名 + TLS」那套；复用既有主机（443 被占 / 80 被 default_server 占）
+# 时改用 deploy/nginx-plain-http.conf —— 纯 HTTP + 自定义端口，不碰 443。
+NGINX_TEMPLATE="${NGINX_TEMPLATE:-$ROOT/deploy/nginx.conf}"
+NGINX_HTTP_PORT="${NGINX_HTTP_PORT:-8081}"
+# 登录 Cookie 的 Secure 属性：默认空 = 跟随 NODE_ENV（=production）。
+# 纯 HTTP 对外面必须显式给 false —— 但**不要**用 NODE_ENV=development 去绕，
+# 那会连带改掉其它生产行为。
+COOKIE_SECURE="${COOKIE_SECURE:-}"
 SYSTEMD_UNIT_DIR="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
 SESSION_TTL_DAYS="${SESSION_TTL_DAYS:-7}"
 SESSION_ABSOLUTE_TTL_DAYS="${SESSION_ABSOLUTE_TTL_DAYS:-30}"
@@ -159,6 +173,27 @@ validate_session_ttls() {
   check_ttl_days "SESSION_ABSOLUTE_TTL_DAYS" "$SESSION_ABSOLUTE_TTL_DAYS" "$MAX_SESSION_TTL_DAYS"
 }
 
+# ⛔ COOKIE_SECURE 只接受 true / false（或不设）。
+#    「不设」= 跟随 NODE_ENV（=production ⇒ Secure）。
+#    ⛔ 空串**不算**「不设」：应用侧读的是「已定义且等于 true」，
+#    写成空值会**静默关掉** Secure ⇒ 明文 HTTP 下本该有的保护没了。
+validate_cookie_secure() {
+  case "$COOKIE_SECURE" in
+    ''|true|false) ;;
+    *) die "COOKIE_SECURE 只能是 true 或 false（不设 = 跟随 NODE_ENV），实际：$COOKIE_SECURE" ;;
+  esac
+}
+
+# ⛔ NGINX_HTTP_PORT 必须是合法端口号（1–65535）。
+validate_http_port() {
+  case "$NGINX_HTTP_PORT" in
+    ''|*[!0-9]*) die "NGINX_HTTP_PORT 必须是 1-65535 的整数，实际：$NGINX_HTTP_PORT" ;;
+  esac
+  if [ "$NGINX_HTTP_PORT" -lt 1 ] || [ "$NGINX_HTTP_PORT" -gt 65535 ]; then
+    die "NGINX_HTTP_PORT 必须在 1-65535 之间，实际：$NGINX_HTTP_PORT"
+  fi
+}
+
 install_node() {
   log "安装 Node.js 24（生产建议；代码在 22 与 24 上都能跑）"
   if command -v apt-get >/dev/null 2>&1; then
@@ -249,7 +284,15 @@ write_env_file() {
     #    （src/server.js: secureCookies = NODE_ENV === 'production'）——
     #    「IP + 端口 + 纯 HTTP」的调试形态下浏览器会直接拒收 Cookie → 登录失效。
     #    那种形态请用 NODE_ENV=development 调用本脚本。
+    #    ⛔ 但更推荐显式给 COOKIE_SECURE=false：NODE_ENV=development 会连带
+    #    改掉**其它**生产行为（错误信息、缓存头等），只关一个开关更可控。
     printf 'NODE_ENV=%s\n' "${NODE_ENV:-production}"
+    # ⚠️ COOKIE_SECURE **只在显式给了 true/false 时才写**。
+    #    写空值不行 —— 应用侧判的是「已定义且等于 true」，
+    #    空串会**静默关掉** Secure ⇒ 本该有的保护没了。
+    if [ -n "$COOKIE_SECURE" ]; then
+      printf 'COOKIE_SECURE=%s\n' "$COOKIE_SECURE"
+    fi
   } > "$ENV_FILE"
   umask "$old_umask"
   chmod 0640 "$ENV_FILE"
@@ -305,7 +348,8 @@ write_nginx_site() {
     return 0
   fi
   [ -f "$NGINX_COMPAT_SCRIPT" ] || die "缺少 ${NGINX_COMPAT_SCRIPT}（HTTP/2 兼容脚本）"
-  log "写 nginx 站点配置 $NGINX_SITE"
+  [ -f "$NGINX_TEMPLATE" ] || die "缺少 nginx 站点模板：${NGINX_TEMPLATE}"
+  log "写 nginx 站点配置 ${NGINX_SITE}（模板 ${NGINX_TEMPLATE}）"
   install -d -m 0755 "$(dirname "$NGINX_SITE")" "$(dirname "$NGINX_LINK")"
   local cert="${CERT_PATH:-/etc/letsencrypt/live/$SERVER_NAME/fullchain.pem}"
   local key="${KEY_PATH:-/etc/letsencrypt/live/$SERVER_NAME/privkey.pem}"
@@ -317,7 +361,7 @@ write_nginx_site() {
   #    而那已经是整个部署的最后一步了。
   local rendered
   rendered="$(mktemp)"
-  if ! bash "$NGINX_COMPAT_SCRIPT" "$ROOT/deploy/nginx.conf" "$rendered"; then
+  if ! bash "$NGINX_COMPAT_SCRIPT" "$NGINX_TEMPLATE" "$rendered"; then
     rm -f "$rendered"
     die "nginx HTTP/2 兼容处理失败（见上面的 [nginx-compat] 输出）"
   fi
@@ -341,6 +385,7 @@ write_nginx_site() {
       -e "s|__CERT_PATH__|$(sed_escape "$cert")|g" \
       -e "s|__KEY_PATH__|$(sed_escape "$key")|g" \
       -e "s|__APP_DIR__|$(sed_escape "$APP_DIR")|g" \
+      -e "s|__HTTP_PORT__|$(sed_escape "$NGINX_HTTP_PORT")|g" \
       "$rendered" > "$NGINX_SITE"
   rm -f "$rendered"
   ln -sfn "$NGINX_SITE" "$NGINX_LINK"
@@ -393,6 +438,8 @@ main() {
   #    否则会留下一个装了一半的机器（服务在跑、但反代没配），排查成本极高。
   require_nginx
   validate_session_ttls
+  validate_cookie_secure
+  validate_http_port
   if ! node_version_ok; then
     install_node
   fi

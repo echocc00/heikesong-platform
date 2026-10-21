@@ -2386,6 +2386,12 @@ volumes:
 #   ENV_FILE      环境文件路径         默认 /etc/heikesong/platform.env
 #   NGINX_SITE    nginx 站点文件       默认 /etc/nginx/sites-available/heikesong.conf
 #   NGINX_LINK    nginx 站点软链       默认 /etc/nginx/sites-enabled/heikesong.conf
+#   NGINX_TEMPLATE nginx 站点模板      默认 deploy/nginx.conf（域名 + TLS）
+#                                令路形态用 deploy/nginx-plain-http.conf
+#                                （纯 HTTP + 自定义端口，**无 TLS**）
+#   NGINX_HTTP_PORT 纯 HTTP 监听端口   默认 8081（只对 plain-http 模板有意义）
+#   COOKIE_SECURE  登录 Cookie 的 Secure 属性  默认空 = 跟随 NODE_ENV
+#                                纯 HTTP 形态必须显式给 false（否则浏览器拒收 Cookie → 登录失效）
 #   SYSTEMD_UNIT_DIR systemd 单元目录  默认 /etc/systemd/system
 #   SESSION_TTL_DAYS 会话滑动有效期（天）默认 7（与 src/auth/session.js 的默认值一致）
 #   SESSION_ABSOLUTE_TTL_DAYS 会话绝对过期上限（天）默认 30（同上）
@@ -2408,6 +2414,14 @@ SERVER_NAME="${SERVER_NAME:-}"
 ENV_FILE="${ENV_FILE:-/etc/heikesong/platform.env}"
 NGINX_SITE="${NGINX_SITE:-/etc/nginx/sites-available/heikesong.conf}"
 NGINX_LINK="${NGINX_LINK:-/etc/nginx/sites-enabled/heikesong.conf}"
+# 站点模板：默认是「域名 + TLS」那套；复用既有主机（443 被占 / 80 被 default_server 占）
+# 时改用 deploy/nginx-plain-http.conf —— 纯 HTTP + 自定义端口，不碰 443。
+NGINX_TEMPLATE="${NGINX_TEMPLATE:-$ROOT/deploy/nginx.conf}"
+NGINX_HTTP_PORT="${NGINX_HTTP_PORT:-8081}"
+# 登录 Cookie 的 Secure 属性：默认空 = 跟随 NODE_ENV（=production）。
+# 纯 HTTP 对外面必须显式给 false —— 但**不要**用 NODE_ENV=development 去绕，
+# 那会连带改掉其它生产行为。
+COOKIE_SECURE="${COOKIE_SECURE:-}"
 SYSTEMD_UNIT_DIR="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
 SESSION_TTL_DAYS="${SESSION_TTL_DAYS:-7}"
 SESSION_ABSOLUTE_TTL_DAYS="${SESSION_ABSOLUTE_TTL_DAYS:-30}"
@@ -2512,6 +2526,27 @@ validate_session_ttls() {
   check_ttl_days "SESSION_ABSOLUTE_TTL_DAYS" "$SESSION_ABSOLUTE_TTL_DAYS" "$MAX_SESSION_TTL_DAYS"
 }
 
+# ⛔ COOKIE_SECURE 只接受 true / false（或不设）。
+#    「不设」= 跟随 NODE_ENV（=production ⇒ Secure）。
+#    ⛔ 空串**不算**「不设」：应用侧读的是「已定义且等于 true」，
+#    写成空值会**静默关掉** Secure ⇒ 明文 HTTP 下本该有的保护没了。
+validate_cookie_secure() {
+  case "$COOKIE_SECURE" in
+    ''|true|false) ;;
+    *) die "COOKIE_SECURE 只能是 true 或 false（不设 = 跟随 NODE_ENV），实际：$COOKIE_SECURE" ;;
+  esac
+}
+
+# ⛔ NGINX_HTTP_PORT 必须是合法端口号（1–65535）。
+validate_http_port() {
+  case "$NGINX_HTTP_PORT" in
+    ''|*[!0-9]*) die "NGINX_HTTP_PORT 必须是 1-65535 的整数，实际：$NGINX_HTTP_PORT" ;;
+  esac
+  if [ "$NGINX_HTTP_PORT" -lt 1 ] || [ "$NGINX_HTTP_PORT" -gt 65535 ]; then
+    die "NGINX_HTTP_PORT 必须在 1-65535 之间，实际：$NGINX_HTTP_PORT"
+  fi
+}
+
 install_node() {
   log "安装 Node.js 24（生产建议；代码在 22 与 24 上都能跑）"
   if command -v apt-get >/dev/null 2>&1; then
@@ -2602,7 +2637,15 @@ write_env_file() {
     #    （src/server.js: secureCookies = NODE_ENV === 'production'）——
     #    「IP + 端口 + 纯 HTTP」的调试形态下浏览器会直接拒收 Cookie → 登录失效。
     #    那种形态请用 NODE_ENV=development 调用本脚本。
+    #    ⛔ 但更推荐显式给 COOKIE_SECURE=false：NODE_ENV=development 会连带
+    #    改掉**其它**生产行为（错误信息、缓存头等），只关一个开关更可控。
     printf 'NODE_ENV=%s\n' "${NODE_ENV:-production}"
+    # ⚠️ COOKIE_SECURE **只在显式给了 true/false 时才写**。
+    #    写空值不行 —— 应用侧判的是「已定义且等于 true」，
+    #    空串会**静默关掉** Secure ⇒ 本该有的保护没了。
+    if [ -n "$COOKIE_SECURE" ]; then
+      printf 'COOKIE_SECURE=%s\n' "$COOKIE_SECURE"
+    fi
   } > "$ENV_FILE"
   umask "$old_umask"
   chmod 0640 "$ENV_FILE"
@@ -2658,7 +2701,8 @@ write_nginx_site() {
     return 0
   fi
   [ -f "$NGINX_COMPAT_SCRIPT" ] || die "缺少 ${NGINX_COMPAT_SCRIPT}（HTTP/2 兼容脚本）"
-  log "写 nginx 站点配置 $NGINX_SITE"
+  [ -f "$NGINX_TEMPLATE" ] || die "缺少 nginx 站点模板：${NGINX_TEMPLATE}"
+  log "写 nginx 站点配置 ${NGINX_SITE}（模板 ${NGINX_TEMPLATE}）"
   install -d -m 0755 "$(dirname "$NGINX_SITE")" "$(dirname "$NGINX_LINK")"
   local cert="${CERT_PATH:-/etc/letsencrypt/live/$SERVER_NAME/fullchain.pem}"
   local key="${KEY_PATH:-/etc/letsencrypt/live/$SERVER_NAME/privkey.pem}"
@@ -2670,7 +2714,7 @@ write_nginx_site() {
   #    而那已经是整个部署的最后一步了。
   local rendered
   rendered="$(mktemp)"
-  if ! bash "$NGINX_COMPAT_SCRIPT" "$ROOT/deploy/nginx.conf" "$rendered"; then
+  if ! bash "$NGINX_COMPAT_SCRIPT" "$NGINX_TEMPLATE" "$rendered"; then
     rm -f "$rendered"
     die "nginx HTTP/2 兼容处理失败（见上面的 [nginx-compat] 输出）"
   fi
@@ -2694,6 +2738,7 @@ write_nginx_site() {
       -e "s|__CERT_PATH__|$(sed_escape "$cert")|g" \
       -e "s|__KEY_PATH__|$(sed_escape "$key")|g" \
       -e "s|__APP_DIR__|$(sed_escape "$APP_DIR")|g" \
+      -e "s|__HTTP_PORT__|$(sed_escape "$NGINX_HTTP_PORT")|g" \
       "$rendered" > "$NGINX_SITE"
   rm -f "$rendered"
   ln -sfn "$NGINX_SITE" "$NGINX_LINK"
@@ -2746,6 +2791,8 @@ main() {
   #    否则会留下一个装了一半的机器（服务在跑、但反代没配），排查成本极高。
   require_nginx
   validate_session_ttls
+  validate_cookie_secure
+  validate_http_port
   if ! node_version_ok; then
     install_node
   fi
@@ -10340,3 +10387,99 @@ Cannot find module '<repo>/test-helpers/tmp.js' imported from <repo>/platform/[e
 - **真机**：`/tmp` 下历史 `hks-*` 残留 —— 用脚本文件 + `find -delete` 清
   （⛔ 远程清理**必须**排除 `/tmp/hks-repro`，那是代码副本所在，也是脚本自己的 cwd）。
 
+
+---
+
+## P6 让路形态部署轮（父代理，2026-10-21 · 复用既有主机）
+
+> **背景**：用户拍板正式部署走**路线 ②** —— 复用 `8.133.200.235`，换端口让路，
+> 并给 frps 补 token/TLS（另一条干净主机的路线未采纳）。
+> 本章记录这一轮做出来的东西、改过的资产、真机证据，以及**还没解决的那一件**。
+
+### A. 这台机的真实拓扑（部署前只读勘察，DP-1）
+
+| 项 | 实况 | 影响 |
+|---|---|---|
+| 内网地址 | `172.17.106.68`（eth0） | `8.133.200.235` 是**云上的端口映射**，不是本机地址 ⇒ 机内 curl 公网 IP **不通**（NAT 无 hairpin） |
+| 云侧转发端口 | **只有 22 / 80 / 443 / 7000 / 8888**（实测 8080/8081/6000/18080/19090/8443/27017/18443/8082/8088/9090/10000 全不通） | ⛔ **新开的端口在云侧打不开** —— 见 §F |
+| 80 | nginx `default` = headscale 控制台（`default_server` + `server_name _`） | 可以**同端口加 `server_name`** 分流，但裸 IP 直连会被抢 |
+| 443 | **xray 直接 bind**（VLESS + Reality，`dest` 指向 `127.0.0.1:18443` 的 headscale TLS） | nginx 在这台机上**拿不到 TLS** |
+| 8080 | 空闲 | ✅ 正是 `deploy/nginx.conf` 的 upstream 口径 ⇒ 应用侧端口一行不用改 |
+| frps | `0.61.2`，`/root/frp/frps.toml` **只有 `bindPort = 7000`** | 见 §E |
+
+### B. 让路形态的三个开关（DP-2 ~ DP-4）
+
+| 编号 | 开关 | 设计 |
+|---|---|---|
+| DP-2 | `NGINX_TEMPLATE` | 默认 `deploy/nginx.conf`（域名 + TLS）；让路形态用**新增资产** `deploy/nginx-plain-http.conf`（纯 HTTP + `__HTTP_PORT__` 占位符，**不含 ssl / 不含 301 跳转**）。<br>为什么用「换模板」而不是「加条件开关」：`nginx.conf` 里 80→443 跳转与 443 站点是**两整块**，用 sed 条件删除既难读又易错。 |
+| DP-3 | `NGINX_HTTP_PORT` | 默认 8081；`validate_http_port` 在**动任何东西之前** fail-fast（fail-fast 顺序：nginx 存在 → 会话天数 → `COOKIE_SECURE` → 端口）。 |
+| DP-4 | `COOKIE_SECURE` | 应用侧 `src/server.js`：`COOKIE_SECURE` **不设 ⇒ 跟随 `NODE_ENV`**；只有**显式的 `false`** 才关掉 `Secure`，其它取值（含拼错的 `flase`）一律按「要 Secure」处理 —— **失败即安全**。<br>为什么不复用 `NODE_ENV=development`：那会连带改掉**其它**生产行为（错误信息、缓存头……），只关一个开关更可控。 |
+
+### C. 真机部署（DP-5 ~ DP-8）
+
+| 编号 | 步骤 | 结果 |
+|---|---|---|
+| DP-5 | **部署前预检**（不写 `/etc/nginx/**`、不 reload） | 让路模板渲染 ⇒ 占位符**零残留**；8081 空闲；临时主配置 `nginx -t` ⇒ `syntax is ok`（退出码 0）；**系统既有配置的 `nginx -t` 仍正常** |
+| DP-6 | `install.sh`（`SERVER_NAME=8.133.200.235` + `NGINX_TEMPLATE=…/nginx-plain-http.conf` + `NGINX_HTTP_PORT=8081` + `COOKIE_SECURE=false`） | 退出码 **0**：用户/目录/环境文件/迁移（版本 6）/种子/系统单元/nginx 站点全部落地；`nginx -t` 通过后 reload 成功；服务 **active** |
+| DP-7 | **功能实跑**（经 nginx 8081） | 首页 200；登录 200 且 `Set-Cookie` **不带 Secure** ✅；带 Cookie 访问 `/api/me`、`/api/registrations` ⇒ 200；公开榜单 ⇒ 200；SSE 首段 `event: connected` ✅（未被缓冲） |
+| DP-8 | **既有业务未受影响** | nginx / xray / headscale / frps / mongod **全部 active**；80/443/7000/8888 仍在听；`sites-enabled/` 里 `default`、`headscale-tls` **原样保留**，只是**新增**了 `heikesong.conf`；headscale 控制台（80）仍 HTTP 200 |
+
+### D. 变异检验（DP-9）
+
+新守卫的变异体 **8 个 / 8 KILLED / 0 存活**（对照组未改动副本全绿）：
+去掉 `COOKIE_SECURE` 覆盖、覆盖语义反转、让路模板混入 `ssl`、混入 `return 301`、
+`install.sh` 不替换 `__HTTP_PORT__`、端口校验被架空、`COOKIE_SECURE` 空值也写进环境文件、
+`install.sh` 忽略 `NGINX_TEMPLATE`。
+
+> ⚠️ 中途有一个变异体**存活**：`=== 'true'` → `!== 'false'` 在三个合法取值上**行为完全相同**
+> ⇒ 它不是「用例没判别力」，是**语义等价**。处置：把实现改成**失败即安全**（只有显式 `false` 才关），
+> 并补一条「非法值按要 Secure 处理」的用例 ⇒ 该变异体随即被杀掉。
+
+### E. frps 的 token —— 发现了一件比「补 token」更重要的事（DP-10）
+
+`journalctl -u frps` 里能看到**两类客户端**：
+
+```
+[…] client login info: ip [66.132.172.184:41832] … hostname [censys.local]   ← 连上了
+[…] register control error: token in login doesn't match token from configuration   ← 连不上
+```
+
+⇒ **服务器侧的 token 配置被撤掉了**（`frps.toml` 现在只有 `bindPort = 7000`），
+而**客户端一直在带 token** ⇒ 那些带 token 的客户端**现在全是连不上的**。
+（和 SSH 公钥一样：配置曾经在，被人撤了。）
+
+⚠️ 因此「补 frps token」**不是**给服务器加一道锁，而是**把客户端本来就在用的那个 token 恢复回去** ——
+但**那个值不在本机任何文件里**（`/root/frp/frpc.toml` 是测试配置，没 token，且 frpc 没在跑）。
+⇒ 需要用户提供现用 token 值，或授权生成新值并同步更新客户端。
+
+⚠️ frp 的 `transport.tls.force = true` 会**踢掉老客户端**（日志里见过 frpc **0.42.0**，
+frp 的 transport TLS 是 0.44+ 才有）⇒ 建议**先补 token**（真正的鉴权缺口），
+TLS 作为可选增强、不 force。
+
+### F. 还没解决的那一件（DP-11）
+
+**平台在公网打不开。** 机内 8081 全通（DP-7），但云侧只映射了 22/80/443/7000/8888 五个端口
+⇒ 新开的 8081 到不了公网（DP-1 实测）。三条路：
+
+1. **云侧加一条端口映射**（任意空闲端口 → 8081）—— 最省事，**代码零改动**；
+2. **域名 + 80 端口同端口分流**（nginx `server_name <域名>` 精确匹配，不动 headscale 的
+   `default_server`）—— 需要域名，且**裸 IP 直连 80 会从 headscale 切到我们平台**（headscale 控制台要改用域名访问）；
+3. **隧道到另一台有域名的机器做 TLS 终结** —— 需要第二台机器。
+
+### G. 计划块同步与文档（DP-12）
+
+| 文件 | 类别 | 处置 |
+|---|---|---|
+| `src/server.js` | **C-RW** | ⛔ 已用 `plan-block-sync.mjs` **逐字同步回 P0 计划**（改了 `secureCookies` 那一行 ⇒ 审计的贪心子序列匹配失配） |
+| `deploy/install.sh` | **C-RW** | ⛔ 已**逐字同步回 P6 计划**（计划块 423 行 → 470 行） |
+| `deploy/nginx-plain-http.conf` | **新资产** | 不在任何计划块里 ⇒ 记在本台账 |
+| `platform/test/deploy-plain-http.test.js` | **新文件** | 不在任何计划块里 ⇒ 记在本台账 |
+
+审计复核：**A 155 ｜ B 4 ｜ C-EXT 55 ｜ C-RW 0 ｜ D 18**。
+
+> ⚠️ 又一次踩到同一条：**审计的 `orderKeepRate` 是贪心子序列匹配** ——
+> 只要**替换掉一行**（哪怕只改一行），后面所有行都对不上 ⇒ 命中率断崖 ⇒ 必然判 C-RW。
+> ⇒ 「C-RW 变多」的第一嫌疑是「改掉了某一行」，不是「乱改了」。
+
+文档同步：`docs/deployment.md` 新增 **§14 让路形态**（含回滚步骤）、
+证据台账新增 **E24–E29**、未覆盖项 **U-3 / U-8** 状态更新、**U-9** 新增（公网不可达）。

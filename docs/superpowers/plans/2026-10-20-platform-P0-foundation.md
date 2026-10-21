@@ -7231,7 +7231,20 @@ export function createApp({ db, rules, webDir }) {
   registerMilestoneRoutes(router);
   registerBehaviorRoutes(router);
   // 生产环境 Cookie 加 Secure；开发环境不加（http://127.0.0.1 会被浏览器拒收）
-  const secureCookies = process.env.NODE_ENV === 'production';
+  //
+  // ⚠️ COOKIE_SECURE 是**显式覆盖**（不设 = 跟随 NODE_ENV）：
+  //    「纯 HTTP + 非标准端口」的对外面（复用既有主机、443 被占时）需要
+  //    **既保持 NODE_ENV=production 的其它行为**、又让 Cookie 不带 Secure
+  //    （否则浏览器直接拒收 ⇒ 登录失效）。
+  //    ⛔ 不设这个变量时行为与以前**完全一致**（跟随 NODE_ENV）。
+  //
+  // ⚠️ 只有**显式的 'false'** 才关掉 Secure；其它取值（含拼错的 'flase'）
+  //    一律按「要 Secure」处理 —— 失败即安全：
+  //    拼错 ⇒ 浏览器拒收 Cookie ⇒ 登录失败（症状明显），
+  //    而不是「静默把会话 Cookie 明文发出去」（症状不可见）。
+  const secureCookies = process.env.COOKIE_SECURE !== undefined
+    ? process.env.COOKIE_SECURE !== 'false'
+    : process.env.NODE_ENV === 'production';
 
   router.add('GET', '/api/health', async () => ({ ok: true, at: new Date().toISOString() }));
   // P4 审计 API（7 个接口 + 申诉列表）：计算快照 / 复算 diff / 审计日志 / 复核队列 / 申诉

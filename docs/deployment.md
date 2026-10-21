@@ -773,16 +773,78 @@ heikesong-platform 启动于 http://127.0.0.1:8080（规则版本 2026-10-20）
 |---|---|---|
 | U-1 | **证书签发的完整流程未实跑** | 需要真实域名 + 公网 DNS。手册只把它当**前置条件**（`install.sh` 收 `CERT_PATH` / `KEY_PATH`），certbot 的命令按需自取（§9.6） |
 | U-2 | **Docker 形态未实跑** | 本 Task 环境无 Docker daemon。`deploy/docker-compose.yml` 的形态与注意事项写在 §2.4。⚠️ 它用的是 `network_mode: host` —— 那是 **Linux 宿主机的语义**；在 macOS / Windows 的 Docker Desktop 上容器拿的是 Linux 虚拟机的网络栈，宿主 `127.0.0.1:8080` 仍不通 |
-| U-3 | **`install.sh` 的完整执行未在真机实跑** | 需要 Linux + root + systemd + nginx，且会**接管 nginx 站点**。**沙箱实跑**已覆盖：fail-fast 三条（缺 nginx / TTL 非法 / Node 版本不足）、一次完整部署（所有落盘产物 + 自动降级 + 幂等重跑）、`nginx -t` 失败的两条回滚路径（见 §14 E9–E14）。<br>⚠️ **2026-10-21 补充**：已在**真机**（Debian 12 / nginx 1.22.1 / systemd 252）上把它的**各个可独立验证的部分**验过：HTTP/2 自动降级判定、降级后站点配置的 `nginx -t` 语法校验、`heikesong.service` 的 `systemd-analyze verify`（零告警）—— 见 §14 E18–E20。**完整执行仍未做**，因为本机承载着既有业务（80 是 headscale 控制台的 `default_server`、443 被 xray 占用），跑它必须改端口并接管 nginx 站点，属于会动生产配置的动作 |
+| U-3 | **`install.sh` 的完整执行未在真机实跑** | 需要 Linux + root + systemd + nginx，且会**接管 nginx 站点**。**沙箱实跑**已覆盖：fail-fast 三条（缺 nginx / TTL 非法 / Node 版本不足）、一次完整部署（所有落盘产物 + 自动降级 + 幂等重跑）、`nginx -t` 失败的两条回滚路径（见 §14 E9–E14）。<br>⚠️ **2026-10-21 补充**：已在**真机**（Debian 12 / nginx 1.22.1 / systemd 252）上把它的**各个可独立验证的部分**验过：HTTP/2 自动降级判定、降级后站点配置的 `nginx -t` 语法校验、`heikesong.service` 的 `systemd-analyze verify`（零告警）—— 见 §14 E18–E20。**完整执行仍未做**，因为本机承载着既有业务（80 是 headscale 控制台的 `default_server`、443 被 xray 占用），跑它必须改端口并接管 nginx 站点，属于会动生产配置的动作<br>⚠️ **2026-10-21 晚补充**：已在同一台真机上用**让路形态**（§14：纯 HTTP + 8081，`NGINX_TEMPLATE=…/nginx-plain-http.conf`）**完整执行过一遍** `install.sh` —— 退出码 0，迁移/种子/系统单元/nginx 站点全部落地，服务 active，登录链路与 SSE 实跑通过（证据 E24–E28）。**没有**动 headscale 的 `default_server`、没有碰 443 |
 | U-4 | ~~`nginx-http2-compat.sh` 的版本探测在真机上总是失败~~ **已修** | 原 `detect_version()` 的 sed 匹配不到 nginx 的真实输出格式 `nginx version: nginx/1.24.0`（版本号前带 `nginx/` 前缀）⇒ 真机总是走保守降级。**后果安全**（降级语法在所有版本都合法），但「≥ 1.25.1 保留 `http2 on;`」只有显式 `NGINX_VERSION` 才走得到。**已由父代理修复轮修掉**（2026-10-21）：解析式改为同时吃下带前缀/不带前缀两种形态，并补了走**真实自动探测路径**的回归用例（假 `nginx` 放 `PATH` 上）—— 见 §8.1 |
 | U-5 | **演示版构建 / 发布流程未实跑** | `scripts/build-demo.js` / `scripts/serve-demo.js` 是 **P6 Task 6** 的产物，**本 Task 时点尚未落地**。§8.5 写的是**目标流程**（接口以 P6 计划 Task 6 为准） |
 | U-6 | **多机 / Postgres 方案** | 超出本阶段范围。§0.2 与 §4 只把**边界**说清楚（多机必须换 Postgres，没有第三条路） |
-| U-7 | **计划代码块原样保留，未作改动** | 计划 Task 7 的 `docs/deployment.md` 代码块在本文件里**逐字连续**保留（§0–§7），补写内容全部落在 §8–§14。计划文档本身只**追加**了「Task 7 实施台账」一章 |
-| U-8 | **systemd 侧未在真机验证** | 本手册写作环境是 macOS（无 systemd）。§8.3 的「确认生效」三条命令里，②（`systemctl show -p EnvironmentFiles`）与 ③（读 `/proc/<pid>/environ`）**未在真机跑过** —— 但 ③ 读的是内核暴露的进程环境，语义不依赖 systemd 版本。⚠️ 刻意**不用** `systemctl show -p Environment`：那条**看不到** `EnvironmentFile=` 的内容（systemd issue #14723），会让人误判「环境文件没生效」。<br>⚠️ **2026-10-21 补充**：单元文件本身已在**真机 systemd 252** 上过 `systemd-analyze verify`（零告警，见 §14 E20）；仍未验证的是「**服务真跑起来之后**那三条确认命令」（那需要真的把服务装上并启动） |
+| U-7 | **计划代码块原样保留，未作改动** | 计划 Task 7 的 `docs/deployment.md` 代码块在本文件里**逐字连续**保留（§0–§7），补写内容全部落在 §8–§15。计划文档本身只**追加**了「Task 7 实施台账」一章 |
+| U-8 | **systemd 侧未在真机验证** | 本手册写作环境是 macOS（无 systemd）。§8.3 的「确认生效」三条命令里，②（`systemctl show -p EnvironmentFiles`）与 ③（读 `/proc/<pid>/environ`）**未在真机跑过** —— 但 ③ 读的是内核暴露的进程环境，语义不依赖 systemd 版本。⚠️ 刻意**不用** `systemctl show -p Environment`：那条**看不到** `EnvironmentFile=` 的内容（systemd issue #14723），会让人误判「环境文件没生效」。<br>⚠️ **2026-10-21 补充**：单元文件本身已在**真机 systemd 252** 上过 `systemd-analyze verify`（零告警，见 §15 E20）；仍未验证的是「**服务真跑起来之后**那三条确认命令」（那需要真的把服务装上并启动）<br>✅ **2026-10-21 晚补充**：让路形态部署后服务**真的跑起来了**（`systemctl is-active heikesong` ⇒ `active`，`Main PID` 为 `node /opt/heikesong/platform/src/server.js`），见 §15 E25；「确认生效」三条命令仍可自行跑 |
+| U-9 | **平台在公网打不开**（真机部署后实测） | 云侧只把 **22 / 80 / 443 / 7000 / 8888** 五个端口映射到这台机（内网地址 `172.17.106.68`，`8.133.200.235` 是映射地址）。让路形态部署在 **8081** ⇒ 机内全通（E26/E27），**公网不通**（E29）。<br>⇒ **不是应用问题**，是云侧没有这条端口映射：加一条（任意空闲端口 → 8081）即可对外；在此之前可用 `ssh -L 8081:127.0.0.1:8081` 本机隧道访问 |
 
 ---
 
-## 14. 实跑证据台账（2026-10-21）
+## 14. 让路形态：复用既有主机（80/443 被占时）
+
+> 适用场景：目标机**已经在跑别的业务**，80 / 443 被占（nginx 的 `default_server`、
+> xray 直接 bind 443……），没法按 §9 的正式形态（域名 + 443 TLS）部署。
+> 本节是**真机实跑过的形态**（8.133.200.235 / Debian 12 / nginx 1.22.1，证据 E24–E29）。
+
+### 14.1 三个新开关
+
+| 开关 | 默认 | 作用 |
+|---|---|---|
+| `NGINX_TEMPLATE` | `deploy/nginx.conf` | 站点模板。令路形态用 **`deploy/nginx-plain-http.conf`**（纯 HTTP、无 TLS、无 301 跳转） |
+| `NGINX_HTTP_PORT` | `8081` | 让路模板的对外 HTTP 端口（模板里的 `__HTTP_PORT__` 占位符） |
+| `COOKIE_SECURE` | 不设 = 跟随 `NODE_ENV` | 登录 Cookie 的 `Secure` 属性。**纯 HTTP 形态必须显式给 `false`** |
+
+```bash
+# 让路形态（复用既有主机）
+sudo SERVER_NAME=8.133.200.235 \
+     NGINX_TEMPLATE="$(pwd)/platform/deploy/nginx-plain-http.conf" \
+     NGINX_HTTP_PORT=8081 \
+     COOKIE_SECURE=false \
+     ADMIN_PASSWORD=… \
+     ./platform/deploy/install.sh
+```
+
+### 14.2 为什么 `COOKIE_SECURE` 要单独一个开关（而不是用 `NODE_ENV=development`）
+
+`src/server.js` 的判定是：`COOKIE_SECURE` **不设** ⇒ 跟随 `NODE_ENV`（=production ⇒ `Secure`）。
+明文 HTTP 下浏览器会**直接拒收**带 `Secure` 的 Cookie ⇒ 登录失效。
+用 `NODE_ENV=development` 能绕过，但会**连带改掉其它生产行为**（错误信息、缓存头……）⇒
+只关一个开关更可控。
+
+应用侧语义是**失败即安全**：只有**显式的 `false`** 才关掉 `Secure`；
+其它取值（含拼错的 `flase`）一律按「要 Secure」处理 ⇒ 拼错的后果是「登录失败」（症状明显），
+而不是「会话 Cookie 明文发出」（症状不可见）。
+
+### 14.3 上游端口口径不变
+
+让路形态**只改对外入口**，上游仍是 `127.0.0.1:8080`（与 systemd 单元的 `Environment=PORT`、
+环境文件的 `PORT=8080`、docker-compose 的 `PORT` 同一套）⇒ **应用侧一行不用改**。
+应用本身仍只绑 `127.0.0.1`（不是 `0.0.0.0`）⇒ 8080 **不直接暴露公网**，入口只有 nginx。
+
+### 14.4 ⚠️ 公网可达性取决于**云侧端口映射**，不由本手册决定
+
+真机实测：这台机的内网地址是 `172.17.106.68`，`8.133.200.235` 是**云上的端口映射**，
+只转发了 **22 / 80 / 443 / 7000 / 8888** 五个端口 ⇒ 部署到 8081 后**公网打不开**。
+⇒ **部署前先确认云侧能不能加一条端口映射**；加好之后本节形态即可直接对外。
+
+### 14.5 回滚
+
+```bash
+systemctl stop heikesong && systemctl disable heikesong
+rm -f /etc/systemd/system/heikesong.service && systemctl daemon-reload
+rm -f /etc/nginx/sites-enabled/heikesong.conf /etc/nginx/sites-available/heikesong.conf
+nginx -t && systemctl reload nginx          # ⛔ nginx -t 不过就**不要** reload
+rm -rf /opt/heikesong /var/lib/heikesong /etc/heikesong
+userdel heikesong && groupdel heikesong
+```
+
+> 回滚只删**本次部署创建**的东西；`default`（headscale）、`headscale-tls`、xray、frps、
+> HydroOJ、mongod 一律不碰。
+
+## 15. 实跑证据台账（2026-10-21）
 
 > 全部在**临时目录**（`mktemp -d`）里做，不碰工作树的库文件。
 > 环境：macOS（darwin 27.0.0 arm64）、Node **v22.23.2**、**本机没装 nginx**（正好用来验证降级路径与探测失败路径）。
@@ -812,6 +874,12 @@ heikesong-platform 启动于 http://127.0.0.1:8080（规则版本 2026-10-20）
 | E21 | **真机跨平台复现**（P6 Task 8 Step 4 的原配方，三条命令） | `node scripts/migrate.js` ⇒ `迁移完成，当前版本 6`；`node --test` ⇒ **1290 例 / 1288 通过 / 0 失败 / 2 跳过**（2 跳过各有一条：Task 5 已落地故不适用；**以 root 跑、mode 000 也读得到**）；`node scripts/build-demo.js` ⇒ 产物 60 文件、**伴生文件 0 个** |
 | E22 | **临时目录泄漏闸 + 泄漏差分**（本轮新增 `scripts/temp-leak-scan.js`） | 静态闸：本机与真机**各 0 违规**（退出码 0）；跑完全量后**两侧临时目录残留都是 0 个**（修前：本机 3 个、真机 4 个，真机历史累计 80+ 个）<br>⇒ 这条是**服务器运维口径**：测试跑完不会再往 `/tmp` 里堆 `hks-*` 目录把磁盘吃满 |
 | E23 | 清理历史残留（本机 macOS） | `$TMPDIR` 下 **24 252 个** `hks-*` 目录 / **5.7 GB** ⇒ 同盘暂存后一次性交给 `mavis-trash` 回收（可恢复）⇒ `$TMPDIR` 从 ~5.9 GB 降到 **229 MB** |
+| E24 | 真机部署**前置预检**（让路形态：渲染 `deploy/nginx-plain-http.conf` → 临时主配置 `nginx -t`） | 占位符**零残留**；8081 空闲；`nginx -t -c <临时主配置>` ⇒ `syntax is ok` / `test is successful`（退出码 0）；**系统既有配置的 `nginx -t` 仍正常**（全程未写 `/etc/nginx/**`、未 reload） |
+| E25 | 真机执行 `install.sh`（`SERVER_NAME=8.133.200.235` + `NGINX_TEMPLATE=…/nginx-plain-http.conf` + `NGINX_HTTP_PORT=8081` + `COOKIE_SECURE=false`） | 退出码 **0**；用户/目录/环境文件/迁移（版本 6）/种子/系统单元/nginx 站点全部落地；`nginx -t` 通过后 **reload 成功**；`systemctl is-active heikesong` ⇒ **active** |
+| E26 | 真机部署后的健康检查（应用直连 8080 / 经 nginx 8081） | `127.0.0.1:8080/api/health` ⇒ **200**；`127.0.0.1:8081/api/health` ⇒ **200**；返回 `{"ok":true,"at":"2026-10-21T15:10:40.300Z"}` |
+| E27 | 真机**登录链路**（经 nginx 8081，重点验 `COOKIE_SECURE=false`） | 登录 ⇒ **200**，响应头 `Set-Cookie: hk_session=…; HttpOnly; SameSite=Lax; Path=/; Max-Age=604799` —— **不带 Secure** ✅（否则明文 HTTP 下浏览器会拒收 ⇒ 登录失效）；带该 Cookie 访问 `/api/me` ⇒ **200**、`/api/registrations` ⇒ **200**；公开榜单 `/api/leaderboard/rolling` ⇒ **200**；SSE `/api/stages/ed_1/events` ⇒ 首段 `event: connected` ✅（经 nginx 未被缓冲） |
+| E28 | 真机上**既有业务未受影响**（部署前后逐项比对） | `nginx` / `xray` / `headscale` / `frps` / `mongod` **全部 active**；80 / 443 / 7000 / 8888 仍在听；`/etc/nginx/sites-enabled/` 里 `default`（headscale）与 `headscale-tls` **原样保留**，只是**新增**了 `heikesong.conf` 软链；headscale 控制台（80）仍 HTTP **200** |
+| E29 | **公网可达性实测**（从公网侧扫这台机的端口） | 云上只转发 **22 / 80 / 443 / 7000 / 8888** 五个端口；`8080`/`8081`/`6000`/`18080`/`19090`/`8443`/`27017`/`18443`/`8082`/`8088`/`9090`/`10000` **全部不通** ⇒ 平台在机内跑通了，但**公网打不开**（不是应用问题，是云侧端口映射没开） |
 
 ---
 
