@@ -949,14 +949,32 @@ git commit -m "feat(P2): 评审数据模型与迁移 003（15 表 + 关键唯一
   - `normalizeScores({ samples, strategy, config })` → `{ normalized, values, fallbackReason, stats, judgeStats }`
   - `NORMALIZATION_STRATEGIES` = `['zscore', 'median', 'trimmed', 'bayes']`
   - `samples` 元素：`{ judgeId, value, series }`——`value` 是该评委对**当前 (队伍, 维度) 单元**的原始分；`series` 是该评委在本维度上对**全部参赛队**的原始分序列（样本数 n_i 的来源）
+    - ⛔ **一个单元内 `judgeId` 必须唯一** —— 违反 → `TypeError`（响亮报错，不静默覆盖）
+    - ✅ **`series` 缺省时按 D-1 回退**到「同 `judgeId` 在本单元内的全部 `value`」（**原实现漏了这条，已修正**）
   - `stats` = 全局口径统计 `{ n, mean, stdev }`（n = 该维度全部 (评委, 队伍) 原始分个数）
+    - ⚠️ 全局口径**与策略无关** —— 策略名写错时照样给出（**原实现会一起丢掉，已修正**）
   - `judgeStats[judgeId]` = `{ n, mean, stdev, center, scale, normalized, fallbackReason }`
+  - `FALLBACK_REASONS` = `{ SAMPLE_TOO_SMALL, ZERO_STDEV, RAW_FALLBACK, UNKNOWN_STRATEGY, EMPTY_SAMPLES, NO_FINITE_VALUES }`
+  - `FALLBACK_MODES` = `['global', 'raw']`
+  - ⛔ **配置 fail-fast**（父代理预审修正）：`minSamplesForJudgeNormalization`（整数 ≥0）、
+    `trimmedIterations`（整数 ≥1）、`bayesPriorStrength`（有限数 ≥0）、`fallback`（枚举）
+    任一非法 → 抛 `TypeError`。⛔ **不退回默认值** —— 静默改默认值会重演 P1 T5-8
+    「配置与实现各说各话」，且坏阈值会产出 NaN，NaN 进榜单比崩掉更可怕。
+    同一原则同构于 P0 的 `validateRules`（权重合计 ≠ 100% 拒绝启动）。
+  - ⚠️ **「未知策略」不抛错、「配置非法」抛错** —— 这不是不一致，而是两种不同的失败性质：
+    策略名写错时「不归一化」是一个**安全且有意义的降级结果**（显式标 `unknown_strategy`）；
+    而数值阈值写错时我们**猜不出**安全的值，只能炸出来。
 
 - [ ] **Step 1: 写失败的测试**
 
 `platform/test/normalization.test.js`：
 
 ```javascript
+// platform/test/normalization.test.js —— 评委宽严归一化引擎（4 策略可切换）
+//
+// 依据：P2 计划 Task 2「归一化引擎（4 策略可切换）」
+// 溯源需求：R-JDG-02（评委宽严 z-score 归一化）｜R-JDG-01（初赛/决赛两套权重表里的归一化参数）
+// 冲突裁决：C-05（归一化口径与降级策略）
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { normalizeScores, NORMALIZATION_STRATEGIES } from '../src/domain/normalization.js';
@@ -1097,6 +1115,182 @@ test('空样本显式返回降级，不返回空成功', () => {
   assert.equal(r.fallbackReason, 'empty_samples');
   assert.equal(r.stats.n, 0);
 });
+
+// ── 父代理预审修正用例（2026-10-21）────────────────────────────────────
+// ⚠️ 这 8 条都是**先复现缺陷、再补的回归用例**：
+//    规格自带的 10 条用例全绿，但下面的缺陷在它们**全都看不见**。
+
+test('D-1 回退：不传 series 时用同 judgeId 在本单元的 value 当 series（不再是空结果）', () => {
+  // ⚠️ 原实现**根本没实现** D-1 承诺的这条回退：直接 `continue` 跳过没有 series 的样本，
+  //    于是契约形状（INTERFACES.md 的 `samples: [{ judgeId, value }]`）产出
+  //    **空 values + fallbackReason = null** —— 一个「静默空成功」。
+  const r = normalizeScores({
+    samples: [{ judgeId: 'j1', value: 80 }],
+    strategy: 'zscore',
+    config: cfgA,
+  });
+  assert.notDeepEqual(r.values, {}, 'values 不能是空集（否则调用方拿到 0 个 z 值）');
+  assert.equal(Object.keys(r.values).length, 1);
+  // 回退后的 series 长度为 1 → 样本不足 → 显式降级（不能是 null）
+  assert.equal(r.fallbackReason, 'judge_sample_too_small');
+  assert.equal(r.stats.n, 1);
+  assert.equal(r.values.j1, 0);
+});
+
+test('未知策略时全局统计仍然给出（策略名写错不该把原始分统计一起丢掉）', () => {
+  // ⚠️ 原实现把策略校验放在最前面直接 return，stats 全部返回 0 ——
+  //    而全局口径**与策略无关**，trace 里记的全局统计是假的。
+  const r = normalizeScores({
+    samples: [{ judgeId: 'j1', value: 80, series: A1 }],
+    strategy: 'nope',
+    config: cfgA,
+  });
+  assert.equal(r.fallbackReason, 'unknown_strategy');
+  assert.equal(r.stats.n, 5, '全局样本数不该因为策略名写错就变成 0');
+  assert.ok(Math.abs(r.stats.mean - 80) < 1e-9);
+  assert.ok(Math.abs(r.stats.stdev - 15.811388301) < 1e-9);
+});
+
+test('配置非法直接抛错（绝不让 NaN 静默污染榜单）', () => {
+  // ⚠️ 原实现：trimmedIterations=0 → 0/0 = NaN；trimmedIterations='x' → NaN；
+  //    而 normalized 仍报 true、fallbackReason 仍是 null —— **NaN 静默进榜**。
+  for (const bad of [0, 'x', NaN, -1, 1.5]) {
+    assert.throws(
+      () => normalizeScores({
+        samples: [{ judgeId: 'j1', value: 80, series: A1 }],
+        strategy: 'trimmed',
+        config: { ...cfgA, trimmedIterations: bad },
+      }),
+      /trimmedIterations/,
+      `trimmedIterations=${String(bad)} 必须报错`,
+    );
+  }
+  assert.throws(
+    () => normalizeScores({
+      samples: [{ judgeId: 'j1', value: 80, series: A1 }],
+      strategy: 'zscore',
+      config: { ...cfgA, minSamplesForJudgeNormalization: 'x' },
+    }),
+    /minSamplesForJudgeNormalization/,
+  );
+  assert.throws(
+    () => normalizeScores({
+      samples: [{ judgeId: 'j1', value: 80, series: A1 }],
+      strategy: 'bayes',
+      config: { ...cfgA, bayesPriorStrength: -1 },
+    }),
+    /bayesPriorStrength/,
+  );
+  // ⚠️ bayesPriorStrength **不是整数**约束项 —— 「整数」与「最小值」两道守卫都拦不住
+  //    非数值：'x' 与 0 比较是 false、NaN 的整数检查也是 false。
+  //    所以「必须是有限数」那道守卫是**唯一**的拦截点，必须有自己的用例。
+  for (const bad of ['x', NaN, Infinity, null]) {
+    if (bad === null) continue; // null = 缺省，走默认值，合法
+    assert.throws(
+      () => normalizeScores({
+        samples: [{ judgeId: 'j1', value: 80, series: A1 }],
+        strategy: 'bayes',
+        config: { ...cfgA, bayesPriorStrength: bad },
+      }),
+      /bayesPriorStrength/,
+      `bayesPriorStrength=${String(bad)} 必须报错`,
+    );
+  }
+  assert.throws(
+    () => normalizeScores({
+      samples: [{ judgeId: 'j1', value: 80, series: A1 }],
+      strategy: 'zscore',
+      config: { ...cfgA, fallback: 'nope' },
+    }),
+    /fallback/,
+  );
+});
+
+test('fallback=raw 真的给原始分（名实相符，不是全局 z 值）', () => {
+  // ⚠️ 原实现：reason 写着 raw_fallback，center/scale 却还是全局的 ——
+  //    trace 说「用了原始分」，实际算的是全局归一化值。
+  const r = normalizeScores({
+    samples: [{ judgeId: 'j1', value: 80, series: [70, 80, 90] }],
+    strategy: 'zscore',
+    config: { ...cfgA, fallback: 'raw' },
+  });
+  assert.equal(r.fallbackReason, 'raw_fallback');
+  assert.equal(r.values.j1, 80, 'raw 模式下 z 必须等于原始分');
+  assert.equal(r.judgeStats.j1.center, 0);
+  assert.equal(r.judgeStats.j1.scale, 1);
+});
+
+test('同一 judgeId 在一个单元内出现两次 → 响亮报错，不静默覆盖', () => {
+  // ⚠️ 原实现：后者直接覆盖前者，调用方看不出发生过覆盖。
+  assert.throws(
+    () => normalizeScores({
+      samples: [
+        { judgeId: 'j1', value: 80, series: A1 },
+        { judgeId: 'j1', value: 95, series: A1 },
+      ],
+      strategy: 'zscore',
+      config: cfgA,
+    }),
+    /judgeId/,
+  );
+});
+
+test('配置缺省时用默认值（阈值默认 5）—— 不许因为没传就换口径', () => {
+  // ⚠️ 原规格**所有**用例都显式传了 `minSamplesForJudgeNormalization: 5`，
+  //    于是「规则文件漏写这个键时怎么办」从来没被验证过 ——
+  //    把默认值改成 6，全部用例照样绿。
+  const r5 = normalizeScores({
+    samples: [{ judgeId: 'j1', value: 80, series: A1 }], // A1 长度 5
+    strategy: 'zscore',
+    config: {},
+  });
+  assert.equal(r5.normalized, true, 'n=5 恰好达到默认阈值，应当走归一化');
+  assert.equal(r5.judgeStats.j1.n, 5);
+  assert.equal(r5.fallbackReason, null);
+
+  const r4 = normalizeScores({
+    samples: [{ judgeId: 'j1', value: 80, series: [70, 80, 90, 60] }], // 长度 4
+    strategy: 'zscore',
+    config: {},
+  });
+  assert.equal(r4.normalized, false, 'n=4 低于默认阈值，应当降级');
+  assert.equal(r4.fallbackReason, 'judge_sample_too_small');
+});
+
+test('样本的 value 全是非有限数 → 显式降级，不谎称「归一化成功」', () => {
+  // ⚠️ 原来的行为：`normalized = true`（评委本身没降级）但 `values` 是空集 ——
+  //    「声称成功却一个分数都没产出」，调用方会以为一切正常。
+  const r = normalizeScores({
+    samples: [{ judgeId: 'j1', value: null, series: A1 }],
+    strategy: 'zscore',
+    config: cfgA,
+  });
+  assert.equal(r.normalized, false);
+  assert.equal(r.fallbackReason, 'no_finite_values');
+  assert.deepEqual(r.values, {});
+});
+
+test('产出值与统计量必须全是有限数（防御性：NaN 不许逃逸到榜单）', () => {
+  for (const strategy of NORMALIZATION_STRATEGIES) {
+    const r = normalizeScores({
+      samples: [
+        { judgeId: 'j1', value: 80, series: A1 },
+        { judgeId: 'j2', value: 60, series: A2 },
+      ],
+      strategy,
+      config: cfgA,
+    });
+    for (const [id, v] of Object.entries(r.values)) {
+      assert.ok(Number.isFinite(v), `${strategy}/${id} 产出非有限数：${v}`);
+    }
+    for (const [id, st] of Object.entries(r.judgeStats)) {
+      for (const k of ['n', 'mean', 'stdev', 'center', 'scale']) {
+        assert.ok(Number.isFinite(st[k]), `${strategy}/${id}.${k} 非有限数：${st[k]}`);
+      }
+    }
+    assert.ok(Number.isFinite(r.stats.mean) && Number.isFinite(r.stats.stdev));
+  }
+});
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -1130,6 +1324,19 @@ Expected: FAIL —— `Cannot find module '../src/domain/normalization.js'`
 //
 // 【纯函数】无 IO、无 Date.now()、无 Math.random()：
 //   trimmed 策略的「多轮截尾」用确定性散列做并列打散，保证同输入同输出（可复算要求）。
+//
+// 【父代理预审修正 2026-10-21 —— 本文件有 5 处修正，读代码前先看这段】
+//   ① D-1 的 series 缺省回退**原实现根本没做**：直接 `continue` 跳过没有 series 的样本，
+//      于是契约形状（INTERFACES.md 的 `samples: [{ judgeId, value }]`）产出
+//      **空 values + fallbackReason = null** —— 一个「静默空成功」。现在按 D-1 兑现。
+//   ② 未知策略时**全局统计被一起丢掉**（stats.n 返回 0）。全局口径与策略无关，
+//      现在无论策略是否认识都照常给出。
+//   ③ 配置项坏值会让 **NaN 静默逃逸**到榜单（trimmedIterations=0 → 0/0 = NaN，
+//      而 normalized 仍报 true）。现在配置**fail-fast 抛错**（同构于 P0 的 validateRules）。
+//   ④ `fallback: 'raw'` **名实不符**：原来仍然算全局 z 值，只是把 reason 写成 raw_fallback。
+//      现在 raw 模式真的给原始分（center = 0、scale = 1 ⇒ z ≡ 原始分）。
+//   ⑤ 同一 judgeId 在一个单元内出现两次会被**静默覆盖**。这是契约前提被破坏，
+//      现在响亮报错。
 
 // MAD → 标准差的一致估计系数（正态分布下 MAD 的 1/0.6745 ≈ 1.4826）
 const MAD_TO_SIGMA = 1.4826;
@@ -1143,7 +1350,41 @@ export const FALLBACK_REASONS = Object.freeze({
   RAW_FALLBACK: 'raw_fallback',               // 配置要求直接用原始分
   UNKNOWN_STRATEGY: 'unknown_strategy',
   EMPTY_SAMPLES: 'empty_samples',
+  NO_FINITE_VALUES: 'no_finite_values',
 });
+
+export const FALLBACK_MODES = Object.freeze(['global', 'raw']);
+
+/**
+ * 读一个数值型配置项并做 fail-fast 校验。
+ * ⛔ 为什么是「抛错」而不是「退回默认值」：配置写错若被静默改成默认值，
+ *    就会重演 P1 Task 5 的 T5-8（「配置项从未被读取，行为硬编码」——
+ *    配置与实现各说各话）。而且坏阈值会产出 NaN，NaN 进榜单比崩掉更可怕。
+ * @param {object} config
+ * @param {string} key
+ * @param {number} fallback 缺省值（key 缺失时用）
+ * @param {{min?:number, integer?:boolean}} opts
+ */
+function readConfigNumber(config, key, fallback, opts = {}) {
+  const raw = config[key];
+  if (raw === undefined || raw === null) return fallback;
+  if (typeof raw !== 'number' || !Number.isFinite(raw)) {
+    throw new TypeError(
+      `归一化配置项 ${key} 非法：${JSON.stringify(raw)}（必须是有限数）`,
+    );
+  }
+  if (opts.integer && !Number.isInteger(raw)) {
+    throw new TypeError(
+      `归一化配置项 ${key} 非法：${JSON.stringify(raw)}（必须是整数）`,
+    );
+  }
+  if (opts.min !== undefined && raw < opts.min) {
+    throw new TypeError(
+      `归一化配置项 ${key} 非法：${JSON.stringify(raw)}（必须 ≥ ${opts.min}）`,
+    );
+  }
+  return raw;
+}
 
 function arithmeticMean(values) {
   if (!values.length) return 0;
@@ -1205,19 +1446,33 @@ function trimmedCenter(values, iterations) {
  * 评委宽严归一化。
  *
  * @param {object} input
- * @param {Array<{judgeId:string, value:number|null, series:number[]}>} input.samples
- *   同一个 (队伍, 维度) 单元内的样本。**一个单元内 judgeId 必须唯一**。
- *   `series` = 该评委在本维度上对【全部参赛队】的原始分序列（n_i 的来源）。
+ * @param {Array<{judgeId:string, value:number|null, series?:number[]}>} input.samples
+ *   同一个 (队伍, 维度) 单元内的样本。**一个单元内 judgeId 必须唯一**（违反 → 抛错）。
+ *   `value` 是该评委对当前单元的原始分；
+ *   `series` 是该评委在本维度上对**全部参赛队**的原始分序列（样本数 n_i 的来源）。
+ *   **不传 series 时按 D-1 退回「同 judgeId 在本单元内的全部 value」**。
  * @param {'zscore'|'median'|'trimmed'|'bayes'} input.strategy
  * @param {object} input.config 规则配置（minSamplesForJudgeNormalization 等）
  * @returns {{normalized:boolean, values:Object<string,number>, fallbackReason:string|null,
  *            stats:{n:number,mean:number,stdev:number}, judgeStats:Object}}
  */
 export function normalizeScores({ samples, strategy = 'zscore', config = {} } = {}) {
-  const minSamples = Number(config.minSamplesForJudgeNormalization ?? 5);
+  // ── 0) 配置 fail-fast（坏配置绝不让 NaN 逃逸） ────────────────────────
+  const minSamples = readConfigNumber(config, 'minSamplesForJudgeNormalization', 5, {
+    min: 0,
+    integer: true,
+  });
+  const iterations = readConfigNumber(config, 'trimmedIterations', 20, {
+    min: 1,
+    integer: true,
+  });
+  const priorStrength = readConfigNumber(config, 'bayesPriorStrength', 5, { min: 0 });
   const fallbackMode = config.fallback ?? 'global';
-  const iterations = Number(config.trimmedIterations ?? 20);
-  const priorStrength = Number(config.bayesPriorStrength ?? 5);
+  if (!FALLBACK_MODES.includes(fallbackMode)) {
+    throw new TypeError(
+      `归一化配置项 fallback 非法：${JSON.stringify(fallbackMode)}（必须是 ${FALLBACK_MODES.join(' / ')} 之一）`,
+    );
+  }
 
   const list = Array.isArray(samples) ? samples : [];
   if (!list.length) {
@@ -1229,31 +1484,60 @@ export function normalizeScores({ samples, strategy = 'zscore', config = {} } = 
       judgeStats: {},
     };
   }
+
+  // ── 1) 一个单元内 judgeId 必须唯一（契约前提，违反 → 响亮报错） ───────
+  const occurrence = new Map();
+  for (const sample of list) {
+    occurrence.set(sample.judgeId, (occurrence.get(sample.judgeId) ?? 0) + 1);
+  }
+  for (const [judgeId, times] of occurrence) {
+    if (times > 1) {
+      throw new TypeError(
+        `归一化样本中评委 ${judgeId} 出现 ${times} 次 —— 一个 (队伍,维度) 单元内 judgeId 必须唯一`,
+      );
+    }
+  }
+
+  // ── 2) 每个评委在本单元内的原始分（D-1 的 series 缺省回退来源） ──────
+  const valuesByJudge = new Map();
+  for (const sample of list) {
+    if (!Number.isFinite(sample.value)) continue;
+    if (!valuesByJudge.has(sample.judgeId)) valuesByJudge.set(sample.judgeId, []);
+    valuesByJudge.get(sample.judgeId).push(sample.value);
+  }
+
+  // ── 3) 每个评委的 series（本维度上对全部参赛队的原始分） ──────────────
+  const seriesByJudge = new Map();
+  for (const sample of list) {
+    const judgeId = sample.judgeId;
+    if (seriesByJudge.has(judgeId)) continue; // 同一评委只取一份
+    const provided = Array.isArray(sample.series)
+      ? sample.series.filter((v) => Number.isFinite(v))
+      : [];
+    // D-1：不传（或传了无效的）series → 退回「同 judgeId 在 samples 中的全部 value」
+    const series = provided.length ? provided : (valuesByJudge.get(judgeId) ?? []);
+    if (series.length) seriesByJudge.set(judgeId, series);
+  }
+
+  // ── 4) 全局口径统计（该维度全部 (评委, 队伍) 原始分） ────────────────
+  //    ⚠️ 与策略**无关**：策略名写错也不该把全局统计一起丢掉（父代理预审修正 ②）
+  const globalPool = [];
+  for (const series of seriesByJudge.values()) globalPool.push(...series);
+  const globalMean = arithmeticMean(globalPool);
+  const globalStdev = sampleStdev(globalPool);
+  const globalStats = { n: globalPool.length, mean: globalMean, stdev: globalStdev };
+
   if (!NORMALIZATION_STRATEGIES.includes(strategy)) {
     return {
       normalized: false,
       values: {},
       fallbackReason: FALLBACK_REASONS.UNKNOWN_STRATEGY,
-      stats: { n: 0, mean: 0, stdev: 0 },
+      stats: globalStats,
       judgeStats: {},
     };
   }
 
-  // ── 1) 每个评委的 series（本维度上对全部参赛队的原始分） ──────────────
-  const seriesByJudge = new Map();
-  for (const sample of list) {
-    if (!Array.isArray(sample.series) || !sample.series.length) continue;
-    if (seriesByJudge.has(sample.judgeId)) continue; // 同一评委只取一份
-    seriesByJudge.set(sample.judgeId, sample.series.filter((v) => Number.isFinite(v)));
-  }
-
-  // ── 2) 全局口径统计（该维度全部 (评委, 队伍) 原始分） ────────────────
-  const globalPool = [];
-  for (const series of seriesByJudge.values()) globalPool.push(...series);
-  const globalMean = arithmeticMean(globalPool);
-  const globalStdev = sampleStdev(globalPool);
-
-  // ── 3) 逐评委统计与策略口径 ───────────────────────────────────────────
+  // ── 5) 逐评委统计与策略口径 ───────────────────────────────────────────
   const judgeStats = {};
   for (const [judgeId, series] of seriesByJudge) {
     judgeStats[judgeId] = {
@@ -1291,16 +1575,23 @@ export function normalizeScores({ samples, strategy = 'zscore', config = {} } = 
     // zscore（默认，S7 原文）：center = mean，scale = stdev
   }
 
-  // ── 4) 降级判定（必须显式，绝不静默） ─────────────────────────────────
+  // ── 6) 降级判定（必须显式，绝不静默） ─────────────────────────────────
   for (const stat of Object.values(judgeStats)) {
     if (stat.n < minSamples) {
-      // 样本不足 → 退回全局口径（S7 §3.1 + C-05 第 1 条）
-      // 数值上：center=全局均值、scale=全局标准差 ⇒ 映射回原始单位后等于原始分
+      // 样本不足 → 退回（S7 §3.1 + C-05 第 1 条）
       stat.normalized = false;
-      stat.fallbackReason =
-        fallbackMode === 'raw' ? FALLBACK_REASONS.RAW_FALLBACK : FALLBACK_REASONS.SAMPLE_TOO_SMALL;
-      stat.center = globalMean;
-      stat.scale = globalStdev;
+      if (fallbackMode === 'raw') {
+        // raw 模式**真的**给原始分：center = 0、scale = 1 ⇒ z ≡ 原始分（父代理预审修正 ④）
+        stat.fallbackReason = FALLBACK_REASONS.RAW_FALLBACK;
+        stat.center = 0;
+        stat.scale = 1;
+      } else {
+        // 全局口径：center = 全局均值、scale = 全局标准差
+        // ⇒ 映射回原始单位后等价于「不做宽严校正」（D-14）
+        stat.fallbackReason = FALLBACK_REASONS.SAMPLE_TOO_SMALL;
+        stat.center = globalMean;
+        stat.scale = globalStdev;
+      }
     }
     if (stat.scale === 0) {
       // 该评委该维度无区分度 → z 记 0（S7 §3.1 + 设计文档 §6.2 Step 2）
@@ -1309,21 +1600,34 @@ export function normalizeScores({ samples, strategy = 'zscore', config = {} } = 
     }
   }
 
-  // ── 5) 逐评委产出 z 值 ───────────────────────────────────────────────
+  // ── 7) 逐评委产出 z 值 ───────────────────────────────────────────────
   const values = {};
   for (const sample of list) {
     if (!Number.isFinite(sample.value)) continue;
     const stat = judgeStats[sample.judgeId];
     if (!stat) continue;
-    values[sample.judgeId] = stat.scale > 0 ? (sample.value - stat.center) / stat.scale : 0;
+    const z = stat.scale > 0 ? (sample.value - stat.center) / stat.scale : 0;
+    // 防御性：任何非有限数都不许逃逸到榜单（父代理预审修正 ③）
+    values[sample.judgeId] = Number.isFinite(z) ? z : 0;
   }
 
   const judgeIds = Object.keys(judgeStats).sort();
+  // ⚠️ 「声称归一化成功，却一个分数都没产出」是误导 —— 必须显式降级。
+  //    触发场景：样本全在，但 value 全是 null / NaN（该单元没人真正打了分）。
+  if (!Object.keys(values).length) {
+    return {
+      normalized: false,
+      values: {},
+      fallbackReason: FALLBACK_REASONS.NO_FINITE_VALUES,
+      stats: globalStats,
+      judgeStats,
+    };
+  }
   return {
     normalized: judgeIds.length > 0 && judgeIds.every((id) => judgeStats[id].normalized),
     values,
     fallbackReason: judgeIds.map((id) => judgeStats[id].fallbackReason).find(Boolean) ?? null,
-    stats: { n: globalPool.length, mean: globalMean, stdev: globalStdev },
+    stats: globalStats,
     judgeStats,
   };
 }
@@ -1332,7 +1636,7 @@ export function normalizeScores({ samples, strategy = 'zscore', config = {} } = 
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cd platform && node --test test/normalization.test.js`
-Expected: PASS（10 个测试全过：normalization.test.js 10）
+Expected: PASS（18 个测试全过：normalization.test.js 18）
 
 - [ ] **Step 5: 提交**
 
@@ -5210,7 +5514,7 @@ git commit -m "feat(P2): SSE 评审进度推送（src/http/sse.js + GET /api/sta
 
 | # | 偏差 | 契约原文 | 本计划做法 | 理由 | 影响 |
 |---|---|---|---|---|---|
-| D-1 | `normalizeScores` 的 `samples` 元素多一个可选字段 | `samples: [{ judgeId, value }]` | 允许 `{ judgeId, value, series }`，`series` = 该评委在本维度对**全部参赛队**的原始分序列 | 归一化的是评委宽严，必须知道该评委在维度 d 上的**全部打分**才能算 mean(i,d)/stdev(i,d)；只给单元值无法算 | 无破坏性：不传 `series` 时退回「同 judgeId 在 samples 中的全部 value」 |
+| D-1 | `normalizeScores` 的 `samples` 元素多一个可选字段 | `samples: [{ judgeId, value }]` | 允许 `{ judgeId, value, series }`，`series` = 该评委在本维度对**全部参赛队**的原始分序列 | 归一化的是评委宽严，必须知道该评委在维度 d 上的**全部打分**才能算 mean(i,d)/stdev(i,d)；只给单元值无法算 | 无破坏性：不传 `series` 时退回「同 judgeId 在 samples 中的全部 value」。⚠️ **父代理预审修正**：这条回退**原实现根本没做**（直接 `continue` 跳过），导致契约形状产出**空 values + null fallbackReason**（静默空成功）——现已实现并补回归用例 |
 | D-2 | `normalizeScores` 返回值多一个字段 | `{ normalized, values, fallbackReason, stats }` | 追加 `judgeStats[judgeId] = { n, mean, stdev, center, scale, normalized, fallbackReason }` | 契约的 4 个字段无法表达「同一维度内不同评委的降级状态不同」；trace 需要逐评委样本量 | 纯追加，不改原有字段语义 |
 | D-3 | `003_review.sql` 多**四**张表 | 契约只列 13 张，未列 `tiebreak_round` / `tiebreak_votes` / `review_request_keys` / `conflict_declarations` | 新增这四张表 | ① `tiebreak_round` / `tiebreak_votes`：设计文档 §6.4【决策】已明确要求「加时陈述用独立表 + 唯一约束」，R-JDG-19 需要落库，P3 的 `applyTiebreakChain` 直接消费；② `review_request_keys`：见 D-5；③ `conflict_declarations`：R-JDG-18「评委须签署利益冲突声明」需要独立表 —— **声明（事前签署）与回避（个案动作）不是一回事**，合在一起会让「没签声明」和「这个队要回避」两种状态混为一谈 | P3 的 `applyTiebreakChain` 直接消费；`conflict_declarations` 由 P2 Task 6 的 `assignStageJudge` 写入 |
 | D-4 | `enterprise_confirmations` 多一列 | 无 `content` 列 | 增加 `content TEXT NOT NULL DEFAULT ''` | R-JDG-14「企业签字必须有内容」需要落库；服务层拒绝空白内容 | 需 P3/P4 的签字表同步对齐 |
@@ -5223,10 +5527,10 @@ git commit -m "feat(P2): SSE 评审进度推送（src/http/sse.js + GET /api/sta
 | D-11 | API 数量 | 8 条 | 9 条（追加 `POST /api/stages/:stageId/enterprise-confirmations`） | R2 双签 / R-JDG-14 内容 / R1 都需要企业确认的写入口，否则这三条规则无处落地 | 追加一条，不改既有 8 条路径与语义 |
 | D-12 | `stage_results` 的 `rank` / `tied_with` / `points` | 列存在 | P2 阶段显式写 `NULL` | 名次与积分由 P3 的 `rankTeams` / `stagePointsFor` 产出；P2 若自己排一份名次会与破同分链打架 | 列改为可空，不影响既有写入 |
 | D-13 | 破同分链的消费时机 | `rankTeams` 在 P3 | P2 只落「加时陈述轮次 + 投票 + 复议分」，`getTiebreakExtraScores` 供 P3 取用 | 破同分链本身属 P3；P2 只保证数据齐备且一人一票 | 无 |
-| D-14 | 归一化「全局口径」的数值 | 「退回全局均值与标准差」 | z = (s − 全局均值)/全局标准差，再按「全局均值 + z×全局标准差」还原回 0–100 尺度 | 还原回原始单位后，全局口径等价于「不做宽严校正」；否则 P（z 单位）与 E（0–100）不可通约 | 语义等价，trace 里 `fallbackReason` 照常标出 |
+| D-14 | 归一化「全局口径」的数值 | 「退回全局均值与标准差」 | z = (s − 全局均值)/全局标准差，再按「全局均值 + z×全局标准差」还原回 0–100 尺度 | 还原回原始单位后，全局口径等价于「不做宽严校正」；否则 P（z 单位）与 E（0–100）不可通约 | 语义等价，trace 里 `fallbackReason` 照常标出。⚠️ **父代理预审修正**：`fallback: 'raw'` 这一档原来**名实不符**（reason 写 `raw_fallback`，实际仍算全局 z 值）；现已改为 `center = 0 / scale = 1` ⇒ **z ≡ 原始分**，与「还原回原始单位」的统一公式 `score = center + z×scale` 自洽 |
 | D-15 | P 席包含自评维度 | 决赛权重表含「自评测 5%」 | P 席 = 评委维度 ∪ 自评维度 | 决赛权重表 70+25+5=100%，而公式 (1−w_E)=75% 只能覆盖「评委 70% + 自评 5%」 | 初赛无自评维度，完全不受影响 |
 | D-16 | 规则文件新增字段 | 9 份规则的字段未列 | `scoring-initial.json` / `scoring-final.json` 增加 `judgePool` / `freeBrief` / `fallback` / `trimmedIterations` / `bayesPriorStrength` / `selfEvalThreshold` | R-JDG-10 / R-JDG-11 / R-JDG-08 的数值必须配置化（⛔ 不硬编码） | 只加字段，不改已有权重与 `wEnterprise` |
-| D-17 | `fallbackReason` 取值 | INTERFACES 用 `zero_stdev`；C-05 用 `stdev_zero` | 统一用 INTERFACES 的 `zero_stdev` | INTERFACES 是跨阶段唯一事实来源 | 另两处取值为 `judge_sample_too_small` / `raw_fallback` / `unknown_strategy` / `empty_samples` |
+| D-17 | `fallbackReason` 取值 | INTERFACES 用 `zero_stdev`；C-05 用 `stdev_zero` | 统一用 INTERFACES 的 `zero_stdev` | INTERFACES 是跨阶段唯一事实来源 | 另两处取值为 `judge_sample_too_small` / `raw_fallback` / `unknown_strategy` / `empty_samples`；⚠️ **父代理预审修正**新增第 6 个 `no_finite_values`（样本在但 `value` 全是 null/NaN → 一个 z 值都没产出，**不能谎称 `normalized: true`**） |
 | D-18 | 迁移版本号 | 全局唯一序位：`001=P0`、`002=P1`、`003=P2`、`004=P3`、`005=P4`、`006=P5` | P2 的迁移用 `003_review.sql`（不冲突） | ✅ **已消解**（2026-10-21 订正）：P0 终态 `platform/db/migrations/` **只有 `001_init.sql`**，**从未建过 `002_user_roles.sql`**；P1 的迁移是 `002_registration.sql`，与 P2 的 `003_review.sql` 无冲突。`applyMigrations` 按 version 去重，重复版本号会**响亮抛错**（P0 `src/db/migrate.js` 有专门的重复检测），不存在「后者被静默跳过」。⚠️ 不要再按原写法提「需 P1 改名」或「需 P0 改名」—— 那个冲突在 P1 落地时就不存在了 |
 | D-19 | **`audit_log` 的写入口与 SQL 落点** | 契约未规定 `audit_log` 的仓储落点 | `src/db/repo/audit-log.js`（**新建**，SQL 唯一归宿）+ `src/audit/log.js`（**薄服务门面**，不含 SQL） | ⚠️ 原写法是把两条 SQL **内联在 `src/audit/log.js`** 里 —— 那会越过全局约束「所有 SQL 收进 `src/db/repo/`」，P0 的 `test/sql-boundary.test.js` 守卫**当场判违规**（审计实跑：`not ok 1`，3 条违规）。同时 P4 原计划另建 `src/db/repo/audit-log.js` → 同一张表**两条写路径**。现改为**单一归属**：SQL 全在仓储层，门面只转调。见 C-3 / I-8 修正记录 |
 | D-20 | **新增 SSE 端点 `GET /api/stages/:stageId/events`** | 契约的 P2 API 清单里没有这一条 | 新增该端点 + `src/http/sse.js`（新建） | P0 的 `platform/web/api.js:28-30` 的 `subscribe()` 明写「⚠️ SSE 端点在 **P2** 才实现（`src/http/sse.js`）」，而 P2–P6 五份计划**全都没有承接** → 一条**指向不存在实现的活引用**。现由 P2 的 **Task 9** 落地（审计报告 I-6 的第 ① 条路；第 ② 条路要改 `platform/web/api.js`，属 P0 的地盘，本阶段不得改动）。契约已同步更新 |
@@ -5291,6 +5595,51 @@ git commit -m "feat(P2): SSE 评审进度推送（src/http/sse.js + GET /api/sta
 **Task 1 的测试条数口径**：migration-review **18**（建表存在性 1 + 关键唯一约束 5 + 引用型外键 8 + 企业确认偏序索引 1 + 非偏序 UNIQUE 登记 1 + 赛段代号唯一 1 + 自评/结果同格唯一 1 …）。
 
 **最终结果**：变异体 44 → **KILLED 44 / SURVIVED 0**；`migration-review.test.js` **18/18**；P2 全量 **324/324**。
+
+---
+
+## Task 2 父代理预审修正台账（2026-10-21）
+
+> Task 2 的规格在**实施前**被父代理逐条实跑预审（把计划里的代码块抽到 `/tmp` 独立工程里跑）。
+> 规格自带的 **10 条用例全绿** —— 但预审用**探针脚本**逐个探测边界，发现 **1 Critical + 4 Important + 1 Minor**，
+> 全部在实现里修掉后再补 **8 条回归用例**；
+> 实施完成后又做了一轮**变异检验**，变异体一度出现 **2 条存活**，补完后 **27/27 杀灭**。
+
+### 一、预审发现的规格缺陷
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| **N-1** | **Critical** | **D-1 承诺的「不传 `series` 时退回同 judgeId 在 samples 中的全部 value」根本没实现** —— 原实现对没有 `series` 的样本直接 `continue` 跳过 | 探针：`samples: [{judgeId:'j1', value:80}]` → `{"normalized":false,"values":{},"fallbackReason":null,"stats":{"n":0,…}}` —— **契约形状（`INTERFACES.md` 的 `samples: [{ judgeId, value }]`）产出「空 values + 无原因」的静默空成功** | 兑现 D-1：`series` 缺省（或所给序列全是非有限数）时，用「同 `judgeId` 在本单元内的全部 `value`」当序列。修复后同一探针 → `{"values":{"j1":0},"fallbackReason":"judge_sample_too_small","stats":{"n":1,…}}` |
+| **N-2** | **Important** | **未知策略时全局统计被一起丢掉** —— 策略校验放在最前面直接 `return`，`stats` 全部返回 0 | 探针：`strategy:'nope'` + 3 个原始分 → `stats.n = 0`（真实值 3） | 全局口径**与策略无关**，把全局池统计提到策略校验**之前**计算；未知策略时照样返回真实 `stats` |
+| **N-3** | **Important** | **配置坏值让 NaN 静默逃逸到榜单** —— `trimmedIterations: 0` → `0/0 = NaN`；`'x'` → `NaN`；而 `normalized` 仍报 `true`、`fallbackReason` 仍是 `null` | 探针：`trimmedIterations: 0` → `values.j1 = NaN`（JSON 序列化成 `null`），`normalized: true` | 配置 **fail-fast 抛 `TypeError`**：`minSamplesForJudgeNormalization`（整数 ≥0）、`trimmedIterations`（整数 ≥1）、`bayesPriorStrength`（有限数 ≥0）、`fallback`（枚举）。⛔ **不退回默认值** —— 那会重演 P1 T5-8「配置与实现各说各话」，且坏阈值直接产出 NaN |
+| **N-4** | **Important** | **`fallback: 'raw'` 名实不符** —— reason 写着 `raw_fallback`，但 `center/scale` 仍是全局的，产出的是**全局 z 值**不是原始分 | 探针：`fallback:'raw'` → `values.j1 = 0`（全局 z），而非原始分 80 | raw 模式改为 `center = 0 / scale = 1` ⇒ **z ≡ 原始分**，与统一还原公式 `score = center + z×scale` 自洽（D-14 同步订正） |
+| **N-5** | Minor | **同一 `judgeId` 在一个单元内出现两次被静默覆盖**（后者覆盖前者，调用方看不出发生过覆盖） | 探针：两个 `j1` → `values.j1 = 1.5`（第二个 value 生效，第一个无声消失） | 契约前提被破坏 → 响亮抛 `TypeError`（与「坏配置抛错」同源：没有安全的猜测） |
+| **N-6** | Minor | **「声称归一化成功，却一个分数都没产出」** —— 样本 `value` 全是 null/NaN 时，`judgeStats` 里的评委没降级 → `normalized: true`，但 `values` 是空集 | 探针：`value: null` → `{"normalized":false,"values":{}}`（此条 `normalized` 侥幸为 false，但原因是「无评委」而非「无值」） | 新增第 6 个降级原因 `no_finite_values`：一个 z 值都没产出 ⇒ 显式降级，绝不谎称成功（D-17 同步登记） |
+
+### 二、变异检验发现的实现盲区
+
+> 变异体 **27** 个（系数改错 / 标准差分母改口径 / 阈值改边界 / 收缩权重失效 / 截尾不去极值 /
+> 守卫被摘 / 符号取反 / 全局池换源 / 阈值漏除 …），在 `/tmp` 副本上跑 `normalization.test.js`，
+> **测试必须失败才算杀灭**。变异脚本：`/tmp/p2t2/mutate.mjs`。
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| **N-7** | Minor | **阈值默认值 5 从没被验证过** —— 规格里**所有**用例都显式传了 `minSamplesForJudgeNormalization: 5` | 变异存活：把默认值改成 6，18 条用例全绿 | 补用例「配置缺省时用默认值」：`config: {}` 时 n=5 走归一化、n=4 降级 |
+| **N-8** | Minor | **「必须是有限数」那道守卫是唯一拦截点，却没有自己的用例** —— `bayesPriorStrength` 不受「整数」与「最小值」两道守卫保护（`'x' < 0` 为 false、`isInteger('x')` 为 false），摘掉「有限数」守卫后 `'x'` 能溜过去 | 变异存活：摘掉 `typeof/finite` 守卫后用例全绿 | 补 `bayesPriorStrength` 的 `'x'` / `NaN` / `Infinity` 断言 |
+
+### 三、刻意保持的行为（登记口径）
+
+| 行为 | 为什么这样 |
+|---|---|
+| **标准差用 n−1（样本标准差）** | 已实测锁定：`A1=[80,90,70,100,60]` → `stdev = √250 = 15.811388301`。⚠️ 口径提醒：评委的 `series` 其实是「他在该维度上的**全部**打分」，从统计上说更像**总体**而非样本；但 S7 原文与计划预期值都用 n−1，**本阶段不改**，差异登记在此 |
+| **`judgeStats.n` = 该评委 `series` 的长度**（不是他在本单元打了几个分） | n_i 的定义就是「该评委在该维度上的样本量」，是宽严估计的样本量 |
+| **评委没在本单元打分（`value` 非有限）→ 不产出 z 值，但他的 `series` 仍计入全局池** | 评委的宽严尺度是【该维度整体】的记录，与他在这一队打不打分无关。全局池的完整性由调用方传**完整 series** 保证 |
+| **顶层 `fallbackReason` 只报第一个降级原因** | 顶层是**摘要**；逐评委的完整降级状态在 `judgeStats[judgeId].fallbackReason` 里（契约 D-2 的 `judgeStats` 就是为此而设） |
+| **「未知策略」不抛错、「配置非法」抛错** | 不是不一致，是两种不同的失败性质：策略名写错时「不归一化」是**安全且有意义**的降级结果；数值阈值写错时我们**猜不出**安全的值 |
+
+**Task 2 的测试条数口径**：normalization **18**（规格自带 10 + 预审回归 8）。
+
+**最终结果**：变异体 27 → **KILLED 27 / SURVIVED 0**；`normalization.test.js` **18/18**；P2 全量 **342/342**。
 
 ---
 
