@@ -82,7 +82,8 @@ node scripts/seed.js        # 种子数据（可选）
 node src/server.js          # 默认 http://127.0.0.1:8080
 ```
 
-环境变量：`PORT` `DATA_DIR` `SESSION_TTL_DAYS`
+环境变量：`PORT` `DATA_DIR` `SESSION_TTL_DAYS` `SESSION_ABSOLUTE_TTL_DAYS`
+（后两个是**会话有效期**的两个天数；**完整 9 个变量的速查表见 §10** —— 本地跑不用配，缺省值就能用）
 
 **零依赖**：不需要 `npm install`。`git clone` 完直接跑。
 
@@ -376,6 +377,10 @@ NODE_ENV=production
 | `SESSION_ABSOLUTE_TTL_DAYS` | **30** | 与 `src/auth/session.js` 的 `DEFAULT_ABSOLUTE_TTL_DAYS` 同源 | 会话**绝对过期上限**（天）：到这个天数**必须**重新登录 |
 
 **两个天数必须是正整数**，否则 `install.sh` **fail-fast 报错**（不是警告、不是静默兜底）。
+并且**不得超过 3650 天（10 年）** —— 超过这个量级的数字在 bash 里会溢出整数比较，
+而且真写进环境文件后 `new Date(now + 1e20 * 86400000)` 会得到 **Invalid Date**，
+`.toISOString()` 直接抛 `RangeError` ⇒ 部署会在**签发会话时崩**（而不是安静地退回默认值）。
+上界把它挡在部署这一步。
 
 **为什么要 fail-fast**：代码对非法值是**静默回退到默认值**
 （`SESSION_TTL_DAYS=abc` ⇒ 悄悄用 7 天）—— 环境文件里写错却**没有任何提示**，
@@ -389,12 +394,16 @@ $ SESSION_TTL_DAYS=abc ./deploy/install.sh
 
 $ SESSION_ABSOLUTE_TTL_DAYS=0 ./deploy/install.sh
 [install] 错误：SESSION_ABSOLUTE_TTL_DAYS 必须 > 0（当前：0）
+
+$ SESSION_TTL_DAYS=99999999999999999999 ./deploy/install.sh
+[install] 错误：SESSION_TTL_DAYS 不能超过 3650 天（当前：99999999999999999999）
 ```
 
-⇒ 两次都是**退出码 1** 且**机器状态零改动**（校验排在建用户 / 建目录 / 建库之前）。
+⇒ 三次都是**退出码 1** 且**机器状态零改动**（校验排在建用户 / 建目录 / 建库之前），
+且第一行永远是**可执行的人话**（不是 bash 的 `integer expression expected` 噪音）。
 
 ⚠️ **绝对过期上限可以小于滑动有效期** —— 那是「更严」的合法配置（到期必须重登）。
-脚本**不禁止**这种组合，只校验两者都是正整数。
+脚本**不禁止**这种组合，只校验两者都是正整数且不超过上界。
 
 **「改了怎么生效」** —— 环境文件由 systemd 在**服务启动时**读
 （单元里 `EnvironmentFile=-/etc/heikesong/platform.env`）⇒ **改完必须重启服务**：
@@ -407,9 +416,22 @@ sudo systemctl restart heikesong
 确认「文件里写的」＝「生效的」：
 
 ```bash
+# ① 文件里写了什么
 sudo grep SESSION_ /etc/heikesong/platform.env
-sudo systemctl show heikesong --property=Environment
+
+# ② systemd 读的是**哪个**环境文件（只报路径，不内联内容）
+sudo systemctl show -p EnvironmentFiles heikesong
+
+# ③ **进程实际拿到的**环境变量（这才是「生效的」）
+sudo tr '\0' '\n' < /proc/$(systemctl show -p MainPID --value heikesong)/environ | grep SESSION_
 ```
+
+> ⚠️ **别用 `systemctl show heikesong --property=Environment` 来确认环境文件的值** ——
+> systemd 的 `Environment` 属性只由单元里的 `Environment=` 构建；
+> `EnvironmentFile=` 的内容走**另一个**属性（`EnvironmentFiles=`，只报**路径**、不内联内容）。
+> ⇒ 跑那条命令只会看到 `PORT=… DATA_DIR=… NODE_ENV=production`（单元里写的那些），
+> **看不到 `SESSION_*`** —— 容易误判成「环境文件没生效」。
+> 上游 issue：<https://github.com/systemd/systemd/issues/14723>（`EnvironmentFile` 是 `systemctl show` 的已知例外）。
 
 > `EnvironmentFile=` 里的同名变量**优先于**单元里的 `Environment=` ——
 > 所以「改环境文件」是改这些值的正确入口，不要去改单元模板。
@@ -713,11 +735,12 @@ heikesong-platform 启动于 http://127.0.0.1:8080（规则版本 2026-10-20）
 |---|---|---|
 | U-1 | **证书签发的完整流程未实跑** | 需要真实域名 + 公网 DNS。手册只把它当**前置条件**（`install.sh` 收 `CERT_PATH` / `KEY_PATH`），certbot 的命令按需自取（§9.6） |
 | U-2 | **Docker 形态未实跑** | 本 Task 环境无 Docker daemon。`deploy/docker-compose.yml` 的形态与注意事项写在 §2.4。⚠️ 它用的是 `network_mode: host` —— 那是 **Linux 宿主机的语义**；在 macOS / Windows 的 Docker Desktop 上容器拿的是 Linux 虚拟机的网络栈，宿主 `127.0.0.1:8080` 仍不通 |
-| U-3 | **`install.sh` 的完整执行未在真机实跑** | 需要 Linux + root + systemd + nginx。**沙箱实跑**已覆盖：fail-fast 三条（缺 nginx / TTL 非法 / Node 版本不足）、一次完整部署（所有落盘产物 + 自动降级 + 幂等重跑）、`nginx -t` 失败的两条回滚路径（见 §14 E9–E13） |
+| U-3 | **`install.sh` 的完整执行未在真机实跑** | 需要 Linux + root + systemd + nginx。**沙箱实跑**已覆盖：fail-fast 三条（缺 nginx / TTL 非法 / Node 版本不足）、一次完整部署（所有落盘产物 + 自动降级 + 幂等重跑）、`nginx -t` 失败的两条回滚路径（见 §14 E9–E14） |
 | U-4 | ~~`nginx-http2-compat.sh` 的版本探测在真机上总是失败~~ **已修** | 原 `detect_version()` 的 sed 匹配不到 nginx 的真实输出格式 `nginx version: nginx/1.24.0`（版本号前带 `nginx/` 前缀）⇒ 真机总是走保守降级。**后果安全**（降级语法在所有版本都合法），但「≥ 1.25.1 保留 `http2 on;`」只有显式 `NGINX_VERSION` 才走得到。**已由父代理修复轮修掉**（2026-10-21）：解析式改为同时吃下带前缀/不带前缀两种形态，并补了走**真实自动探测路径**的回归用例（假 `nginx` 放 `PATH` 上）—— 见 §8.1 |
 | U-5 | **演示版构建 / 发布流程未实跑** | `scripts/build-demo.js` / `scripts/serve-demo.js` 是 **P6 Task 6** 的产物，**本 Task 时点尚未落地**。§8.5 写的是**目标流程**（接口以 P6 计划 Task 6 为准） |
 | U-6 | **多机 / Postgres 方案** | 超出本阶段范围。§0.2 与 §4 只把**边界**说清楚（多机必须换 Postgres，没有第三条路） |
 | U-7 | **计划代码块原样保留，未作改动** | 计划 Task 7 的 `docs/deployment.md` 代码块在本文件里**逐字连续**保留（§0–§7），补写内容全部落在 §8–§14。计划文档本身只**追加**了「Task 7 实施台账」一章 |
+| U-8 | **systemd 侧未在真机验证** | 本手册写作环境是 macOS（无 systemd）。§8.3 的「确认生效」三条命令里，②（`systemctl show -p EnvironmentFiles`）与 ③（读 `/proc/<pid>/environ`）**未在真机跑过** —— 但 ③ 读的是内核暴露的进程环境，语义不依赖 systemd 版本。⚠️ 刻意**不用** `systemctl show -p Environment`：那条**看不到** `EnvironmentFile=` 的内容（systemd issue #14723），会让人误判「环境文件没生效」 |
 
 ---
 
@@ -728,7 +751,7 @@ heikesong-platform 启动于 http://127.0.0.1:8080（规则版本 2026-10-20）
 
 | # | 跑了什么 | 观察到 |
 |---|---|---|
-| E1 | `cd platform && node --disable-warning=ExperimentalWarning --test` | **981 例 / 980 通过 / 0 失败 / 1 跳过**（基线 981/981） |
+| E1 | `cd platform && node --disable-warning=ExperimentalWarning --test` | **1137 例 / 1136 通过 / 0 失败 / 1 跳过**（基线 981/981）<br>⚠️ 数字是**本轮提交时**的实况；后续阶段合入会变（用例数只增不减）⇒ 以实跑为准 |
 | E2 | `cd platform && node scripts/audit-scan.js` | **退出码 0**（词条 15 条、扫描 142 个文件、0 违规） |
 | E3 | `DATA_DIR=<tmp>/data node scripts/migrate.js` | `迁移完成，当前版本 5`（本次应用 001–005 五个迁移） |
 | E4 | `node scripts/seed.js` 连跑两次 | 第一次「已创建管理员：13800000000」，第二次「管理员已存在」⇒ 幂等 |
@@ -737,11 +760,14 @@ heikesong-platform 启动于 http://127.0.0.1:8080（规则版本 2026-10-20）
 | E7 | `node src/server.js` + `curl -s http://127.0.0.1:8080/api/health` | `{"ok":true,"at":"..."}` |
 | E8 | `bash deploy/nginx-http2-compat.sh` × 4 个 `NGINX_VERSION` + 不探测 | 1.18.0 / 1.24.0 ⇒ 降级；1.25.1 / 2.0.0 ⇒ 保留 `http2 on;`；不探测 ⇒ 降级 |
 | E9 | 父代理修复轮：`test/deploy-assets.test.js` 的「自动探测必须认得 nginx 真实输出格式」（假 `nginx` 放 `PATH`、输出官方格式版本号、**不**给 `NGINX_VERSION`） | 1.24.0 ⇒ 被探测到并降级；1.25.1 ⇒ 被探测到并保留 `http2 on;`（这条钉住的正是原缺陷） |
-| E9 | 沙箱 `install.sh`：**缺 nginx** | 退出码 1，错误信息明确，**沙箱目录零改动** |
-| E10 | 沙箱 `install.sh`：`SESSION_TTL_DAYS=abc` / `SESSION_ABSOLUTE_TTL_DAYS=0` / `SESSION_TTL_DAYS=3.5` | 三次都退出码 1，**沙箱目录零改动** |
-| E11 | 沙箱 `install.sh`：完整部署（nginx 桩 = 1.24.0） | 退出码 0；环境文件含 `SESSION_ABSOLUTE_TTL_DAYS=30`；站点配置**自动降级**成 `listen 443 ssl http2;`；`alias .../web/assets/` 为**预留位** |
-| E12 | 沙箱 `install.sh`：连跑两次 | 两次退出码 0；第二次「本次无新迁移」「管理员已存在」⇒ 幂等 |
-| E13 | 沙箱 `install.sh`：`nginx -t` 失败（有旧配置 / 无旧配置） | 有旧 ⇒ 还原旧配置；无旧 ⇒ **站点文件与软链都撤销**，`sites-enabled/` 为空 |
+| E10 | 沙箱 `install.sh`：**缺 nginx** | 退出码 1，错误信息明确，**沙箱目录零改动** |
+| E11 | 沙箱 `install.sh`：`SESSION_TTL_DAYS=abc` / `SESSION_ABSOLUTE_TTL_DAYS=0` / `SESSION_TTL_DAYS=3.5` | 三次都退出码 1，**沙箱目录零改动** |
+| E12 | 沙箱 `install.sh`：完整部署（nginx 桩 = 1.24.0） | 退出码 0；环境文件含 `SESSION_ABSOLUTE_TTL_DAYS=30`；站点配置**自动降级**成 `listen 443 ssl http2;`；`alias .../web/assets/` 为**预留位** |
+| E13 | 沙箱 `install.sh`：连跑两次 | 两次退出码 0；第二次「本次无新迁移」「管理员已存在」⇒ 幂等 |
+| E14 | 沙箱 `install.sh`：`nginx -t` 失败（有旧配置 / 无旧配置） | 有旧 ⇒ 还原旧配置；无旧 ⇒ **站点文件与软链都撤销**，`sites-enabled/` 为空 |
+| E15 | 沙箱：会话天数取值矩阵（12 组） | 合法（`7/30`、`1/1`、**更严的 `7/3`**、带前导零 `007/030`）⇒ 放行；`0`、`abc`、`3.5`、`-1`、空串 ⇒ **退出码 1** + 人话提示；`99999999999999999999` ⇒ **退出码 1** + 「不能超过 3650 天」，**第一行没有 bash 的 `integer expression expected` 噪音** |
+| E16 | 沙箱：`nginx -t` 失败 + **预置软链指向别的文件** | 退出码 1；**软链被还原成部署前的指向**（`OTHER.conf` 没被删）；本次写入的站点文件已撤销；**没有预置软链**时软链同样撤销、`sites-enabled/` 为空 |
+| E17 | 变异检验（`/tmp/p6-mutate/t2fix2.mjs`） | **18 个变异体 / 18 KILLED / 0 存活 / 0 无效 / 0 锚点异常**；对照组（未改动副本）**22/22 全绿** |
 
 ---
 

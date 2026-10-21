@@ -113,15 +113,50 @@ require_nginx() {
 # 为什么要在这里 fail-fast：src/auth/session.js 对非法值是**静默回退到默认值**
 # （"SESSION_TTL_DAYS=abc" ⇒ 悄悄用 7 天）—— 环境文件里写错却没有任何提示，
 # 运维会以为改了其实没改。配置非法就报错，不静默兜底。
+# 上界：10 年（3650 天）。会话有效期超过 10 年在业务上没有意义。
+MAX_SESSION_TTL_DAYS=3650
+
+# 把十进制数字串规范化（去前导零）；不是纯数字则返回 1。
+normalize_uint() {
+  case "$1" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  local v="$1"
+  v="${v#"${v%%[!0]*}"}"    # 去掉前导零
+  [ -n "$v" ] || v=0
+  printf '%s' "$v"
+}
+
+# 判定「正整数且不超过上限」，不合法就 die（人话，不是 bash 噪音）。
+#
+# ⚠️ 判定全程用**字符串**比较，**不碰** bash 的整数比较 `[ n -gt m ]`：
+#    bash 的 `[` 内部走 strtol，超过 2^63-1 就报
+#    「[: 99999999999999999999: integer expression expected」——
+#    运维看到的第一行会变成这句 bash 噪音，而不是可执行的提示。
+#
+# ⚠️ 上界为什么必须查（不只是「> 0」）：
+#    src/auth/session.js 的判定是 `Number.isFinite(n) && n > 0`，
+#    对**超长数字**是**放行**的（Number("99999999999999999999") = 1e20，是有限数），
+#    但 `new Date(now + 1e20 * 86400000)` 得到的是 **Invalid Date**，
+#    `.toISOString()` 直接抛 RangeError ⇒ 写成这种值的部署会在**签发会话时崩**，
+#    而不是「安静地退回默认值」。上界把它挡在部署这一步。
+check_ttl_days() {
+  local name="$1" value="$2" max="$3" norm
+  if ! norm="$(normalize_uint "$value")"; then
+    die "${name} 必须是正整数（当前：'${value}'）"
+  fi
+  if [ "$norm" = "0" ]; then
+    die "${name} 必须 > 0（当前：${value}）"
+  fi
+  # 位数多的一定更大；位数相同才比字典序（同位数下字典序 == 数值序）
+  if [ "${#norm}" -gt "${#max}" ] || { [ "${#norm}" -eq "${#max}" ] && [ "$norm" \> "$max" ]; }; then
+    die "${name} 不能超过 ${max} 天（当前：${value}）"
+  fi
+}
+
 validate_session_ttls() {
-  case "$SESSION_TTL_DAYS" in
-    ''|*[!0-9]*) die "SESSION_TTL_DAYS 必须是正整数（当前：'$SESSION_TTL_DAYS'）" ;;
-  esac
-  case "$SESSION_ABSOLUTE_TTL_DAYS" in
-    ''|*[!0-9]*) die "SESSION_ABSOLUTE_TTL_DAYS 必须是正整数（当前：'$SESSION_ABSOLUTE_TTL_DAYS'）" ;;
-  esac
-  [ "$SESSION_TTL_DAYS" -gt 0 ] || die "SESSION_TTL_DAYS 必须 > 0（当前：${SESSION_TTL_DAYS}）"
-  [ "$SESSION_ABSOLUTE_TTL_DAYS" -gt 0 ] || die "SESSION_ABSOLUTE_TTL_DAYS 必须 > 0（当前：${SESSION_ABSOLUTE_TTL_DAYS}）"
+  check_ttl_days "SESSION_TTL_DAYS" "$SESSION_TTL_DAYS" "$MAX_SESSION_TTL_DAYS"
+  check_ttl_days "SESSION_ABSOLUTE_TTL_DAYS" "$SESSION_ABSOLUTE_TTL_DAYS" "$MAX_SESSION_TTL_DAYS"
 }
 
 install_node() {
@@ -290,10 +325,16 @@ write_nginx_site() {
   # ② 备份旧站点文件：nginx -t 失败时要**回滚**，不能把一份坏配置留在
   #    sites-enabled 里 —— 那会毒化这台机器上**下一次**任何 nginx reload
   #    （哪怕是别人触发的、跟这次部署无关的 reload）。
-  local backup=""
+  local backup="" link_before=""
   if [ -f "$NGINX_SITE" ]; then
     backup="$(mktemp "${TMPDIR:-/tmp}/heikesong-nginx-site.XXXXXX")"
     cp -p "$NGINX_SITE" "$backup"
+  fi
+  # ⚠️ 软链的**部署前原状**也要记：它可能**早就存在**且指向**别的**文件。
+  #    回滚时如果无条件删软链，就把别人（或上一套配置）的软链删掉了
+  #    —— 那是回滚路径上唯一一处「删掉不是自己创建的东西」。
+  if [ -L "$NGINX_LINK" ]; then
+    link_before="$(readlink "$NGINX_LINK")"
   fi
 
   sed -e "s|__SERVER_NAME__|$(sed_escape "$SERVER_NAME")|g" \
@@ -310,8 +351,16 @@ write_nginx_site() {
       mv -f "$backup" "$NGINX_SITE"
       log "已回滚到上一版 nginx 站点配置"
     else
-      rm -f "$NGINX_SITE" "$NGINX_LINK"
+      rm -f "$NGINX_SITE"
       log "已撤销本次 nginx 站点配置（此前没有旧配置）"
+    fi
+    # 软链还原到**部署前**的样子：原本有软链就还回它原来的指向，
+    # 原本没有就删掉（别留一条指向已撤销配置的坏链）。
+    if [ -n "$link_before" ]; then
+      ln -sfn "$link_before" "$NGINX_LINK"
+      log "已还原 nginx 软链到部署前指向：${link_before}"
+    else
+      rm -f "$NGINX_LINK"
     fi
     die "nginx 配置校验失败（nginx -t 返回非 0）——已回滚，请按上面的 nginx -t 输出修正后重跑本脚本"
   fi

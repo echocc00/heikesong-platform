@@ -4,7 +4,7 @@ import { readFileSync, existsSync, mkdtempSync, rmSync, mkdirSync, writeFileSync
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const deployDir = join(here, '..', 'deploy');
@@ -304,7 +304,10 @@ test('install.sh：nginx -t 失败必须回滚（坏配置绝不能留在 sites-
   assert.ok(guardEnd > guardIdx, '找不到 nginx -t 保护块的结尾，测试本身失效');
   const block = sh.slice(guardIdx, guardEnd);
   assert.match(block, /mv -f "\$backup" "\$NGINX_SITE"/, '失败时必须还原上一版站点配置');
-  assert.match(block, /rm -f "\$NGINX_SITE" "\$NGINX_LINK"/, '没有旧配置时必须撤销站点文件与软链');
+  assert.match(block, /rm -f "\$NGINX_SITE"/, '没有旧配置时必须撤销站点文件');
+  // 软链：只有**部署前就有**软链才还原它；没有才删（别删掉不是自己创建的软链）
+  assert.match(block, /rm -f "\$NGINX_LINK"/, '回滚时必须处理软链（没有旧软链就删掉）');
+  assert.match(sh, /link_before="\$\(readlink "\$NGINX_LINK"\)"/, '必须记住软链在部署前的指向（回滚要还原它）');
 });
 
 test('会话有效期：环境文件必须写绝对过期变量，且默认值与真实代码一致', () => {
@@ -412,4 +415,175 @@ test('nginx HTTP/2 兼容：自动探测必须认得 nginx 真实输出格式（
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }
+});
+
+// ── 真跑 install.sh 的函数（看**行为**，不看注释）────────────────────────────
+//
+// 为什么要真跑：下面这两条的正确性**在注释里看不见、也盖不住** ——
+//   ① bash 的整数比较在超过 2^63-1 时会报 "integer expression expected"，
+//      运维看到的第一行会变成 bash 噪音而不是可执行的提示；
+//   ② 回滚时软链的**部署前原状**能不能还原，只有真跑才知道。
+// 正则断言盖不住这两点（它们都在 shell 的**运行期**才暴露）。
+
+/**
+ * 在沙箱里 source install.sh（去掉末尾的 `main "$@"`）并执行一段 shell 片段。
+ * @param {string} body  在 install.sh 的函数都加载好之后执行的 shell 片段
+ * @param {object} env   追加的环境变量
+ * @param {object} opts  { nginxTestFails: boolean } —— nginx -t 是否一律失败
+ * @returns {{code:number, out:string}}
+ */
+function runInstallShell(body, env = {}, opts = {}) {
+  const tmp = mkdtempSync(join(tmpdir(), 'heikesong-install-'));
+  try {
+    // 去掉末尾的 `main "$@"`（否则它会去改机器状态）
+    writeFileSync(join(tmp, 'install.sh'), read('install.sh').replace(/^main "\$@"$/m, ''));
+
+    const binDir = join(tmp, 'bin');
+    mkdirSync(binDir, { recursive: true });
+    const nginxStub = join(binDir, 'nginx');
+    writeFileSync(
+      nginxStub,
+      opts.nginxTestFails
+        ? '#!/bin/sh\nif [ "$1" = "-t" ]; then echo "nginx: [emerg] unknown directive \\"http2\\"" >&2; exit 1; fi\necho "nginx version: nginx/1.24.0 (Ubuntu)" >&2\nexit 0\n'
+        : '#!/bin/sh\necho "nginx version: nginx/1.24.0 (Ubuntu)" >&2\nexit 0\n',
+    );
+    chmodSync(nginxStub, 0o755);
+
+    // ⚠️ 必须给 `rm` 打个桩：某些开发环境把 `rm` shim 成「可恢复删除」
+    //    （走 osascript + Finder，**每次要好几秒**，有时还会卡住）⇒
+    //    install.sh 的回滚路径里那两条 `rm -f` 会把测试拖成分钟级。
+    //    这里让桩直接调**真正的** /bin/rm：被测的是**逻辑**（删没删对东西），
+    //    不是「删除是否可恢复」。
+    const realRm = ['/bin/rm', '/usr/bin/rm'].find((p) => existsSync(p)) || 'rm';
+    const rmStub = join(binDir, 'rm');
+    writeFileSync(rmStub, `#!/bin/sh\nexec ${realRm} "$@"\n`);
+    chmodSync(rmStub, 0o755);
+
+    const script = [
+      'set -uo pipefail',
+      `export PATH="${binDir}:$PATH"`,
+      'export NGINX_SITE="${HKS_TMP}/etc/nginx/sites-available/heikesong.conf"',
+      'export NGINX_LINK="${HKS_TMP}/etc/nginx/sites-enabled/heikesong.conf"',
+      'export SERVER_NAME="t.example.com"',
+      'export APP_DIR="${HKS_TMP}/app"',
+      'export DATA_DIR="${HKS_TMP}/data"',
+      'export CERT_PATH="${HKS_TMP}/c.pem"',
+      'export KEY_PATH="${HKS_TMP}/k.pem"',
+      'mkdir -p "$(dirname "$NGINX_SITE")" "$(dirname "$NGINX_LINK")"',
+      'source "${HKS_TMP}/install.sh"',
+      // source 之后 SCRIPT_DIR/ROOT 是按 $0 算的（source 时 $0 是 bash）⇒ 必须改回来
+      `SCRIPT_DIR="${deployDir}"`,
+      `ROOT="${join(here, '..')}"`,
+      `NGINX_COMPAT_SCRIPT="${deployDir}/nginx-http2-compat.sh"`,
+      'set +e',
+      body,
+    ].join('\n');
+
+    const res = spawnSync('bash', ['-c', script], {
+      env: { ...process.env, HKS_TMP: tmp, ...env },
+      encoding: 'utf8',
+    });
+    return { code: res.status, out: `${res.stdout || ''}${res.stderr || ''}` };
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+test('会话有效期：非法值必须报**人话**（不得先吐 bash 的整数比较噪音）', () => {
+  const probe = (ttl, abs) =>
+    runInstallShell('validate_session_ttls', {
+      SESSION_TTL_DAYS: ttl,
+      SESSION_ABSOLUTE_TTL_DAYS: abs,
+    });
+
+  // ① 合法值放行（含「更严配置」与前导零 —— 不得过度加规则）
+  for (const [ttl, abs, why] of [
+    ['7', '30', '常规'],
+    ['1', '1', '最小值'],
+    ['7', '3', '绝对上限 < 滑动有效期是合法的更严配置'],
+    ['007', '030', '前导零'],
+  ]) {
+    const r = probe(ttl, abs);
+    assert.equal(r.code, 0, `${why}（ttl=${ttl} abs=${abs}）必须放行，实际 exit=${r.code}：${r.out}`);
+  }
+
+  // ② 非正整数必须 fail-fast，且提示是**人话**
+  const cases = [
+    ['0', '30', /必须 > 0/],
+    ['7', '0', /必须 > 0/],
+    ['abc', '30', /必须是正整数/],
+    ['3.5', '30', /必须是正整数/],
+    ['-1', '30', /必须是正整数/],
+  ];
+  for (const [ttl, abs, expect] of cases) {
+    const r = probe(ttl, abs);
+    assert.notEqual(r.code, 0, `ttl=${ttl} abs=${abs} 必须 fail-fast`);
+    assert.match(r.out, expect, `ttl=${ttl} abs=${abs} 的提示不对：${r.out}`);
+    assert.doesNotMatch(
+      r.out,
+      /integer expression expected/,
+      `ttl=${ttl} abs=${abs} 的第一行不能是 bash 的整数比较噪音：${r.out}`,
+    );
+  }
+
+  // ②' 空串**不是**非法值：install.sh 顶层的 `${SESSION_TTL_DAYS:-7}` 会把空串
+  //     换成默认值 7 ⇒ 放行。这里钉的是「空串走默认值」这条既有口径，别被误改成报错。
+  const empty = probe('', '30');
+  assert.equal(empty.code, 0, `空串应走默认值（放行），实际 exit=${empty.code}：${empty.out}`);
+
+  // ③ 超长数字：bash 的整数比较会溢出 ⇒ 必须先被上界挡下，且**不吐** bash 噪音
+  const big = probe('99999999999999999999', '30');
+  assert.notEqual(big.code, 0, '超长数字必须 fail-fast');
+  assert.doesNotMatch(
+    big.out,
+    /integer expression expected/,
+    `超长数字的第一行不能是 bash 噪音：${big.out}`,
+  );
+  assert.match(big.out, /不能超过/, `超长数字必须给出「超出上界」的人话提示：${big.out}`);
+
+  // ④ 上界本身必须真的存在（否则 ③ 是被别的分支挡下的）
+  const over = probe('3651', '30');
+  assert.notEqual(over.code, 0, '超过上界的天数必须 fail-fast');
+  assert.match(over.out, /不能超过/, over.out);
+});
+
+test('nginx 回滚：不得删掉**不是自己创建的**软链（部署前原状必须还原）', () => {
+  // ① 预置的软链指向**别的**文件 ⇒ 回滚后必须还原成原来的指向
+  const withPreexisting = runInstallShell(
+    [
+      'OTHER="${HKS_TMP}/etc/nginx/sites-available/OTHER.conf"',
+      'printf "OTHER\\n" > "$OTHER"',
+      'ln -sfn "$OTHER" "$NGINX_LINK"',
+      // ⚠️ 必须放**子 shell**：write_nginx_site 失败时 die() 会 exit 整个脚本，
+      //    直接调用的话后面的断言行根本执行不到（out 会是空的）。
+      '( write_nginx_site ) >/dev/null 2>&1',
+      'echo "EXIT=$?"',
+      'if [ -L "$NGINX_LINK" ]; then echo "LINK=$(readlink "$NGINX_LINK")"; else echo "LINK=GONE"; fi',
+      'if [ -e "$OTHER" ]; then echo "OTHER=KEPT"; else echo "OTHER=DELETED"; fi',
+      'if [ -e "$NGINX_SITE" ]; then echo "SITE=KEPT"; else echo "SITE=REMOVED"; fi',
+    ].join('\n'),
+    {},
+    { nginxTestFails: true },
+  );
+  assert.match(withPreexisting.out, /EXIT=1/, `nginx -t 失败必须退出非 0：${withPreexisting.out}`);
+  assert.match(
+    withPreexisting.out,
+    /LINK=.*OTHER\.conf/,
+    `回滚必须把软链还原成部署前的指向，不能删掉它：${withPreexisting.out}`,
+  );
+  assert.match(withPreexisting.out, /OTHER=KEPT/, '不能删掉别人的文件');
+  assert.match(withPreexisting.out, /SITE=REMOVED/, '本次写入的新配置必须被撤销');
+
+  // ② 预置软链**不存在** ⇒ 回滚后软链也不该残留
+  const withoutPreexisting = runInstallShell(
+    [
+      '( write_nginx_site ) >/dev/null 2>&1',
+      'echo "EXIT=$?"',
+      'if [ -L "$NGINX_LINK" ]; then echo "LINK=STILL-THERE"; else echo "LINK=REMOVED"; fi',
+    ].join('\n'),
+    {},
+    { nginxTestFails: true },
+  );
+  assert.match(withoutPreexisting.out, /LINK=REMOVED/, `回滚后不得残留坏软链：${withoutPreexisting.out}`);
+  assert.match(withoutPreexisting.out, /EXIT=1/, withoutPreexisting.out);
 });

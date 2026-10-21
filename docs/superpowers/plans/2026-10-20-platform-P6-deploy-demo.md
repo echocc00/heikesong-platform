@@ -1315,7 +1315,7 @@ import { readFileSync, existsSync, mkdtempSync, rmSync, mkdirSync, writeFileSync
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const deployDir = join(here, '..', 'deploy');
@@ -1615,7 +1615,10 @@ test('install.sh：nginx -t 失败必须回滚（坏配置绝不能留在 sites-
   assert.ok(guardEnd > guardIdx, '找不到 nginx -t 保护块的结尾，测试本身失效');
   const block = sh.slice(guardIdx, guardEnd);
   assert.match(block, /mv -f "\$backup" "\$NGINX_SITE"/, '失败时必须还原上一版站点配置');
-  assert.match(block, /rm -f "\$NGINX_SITE" "\$NGINX_LINK"/, '没有旧配置时必须撤销站点文件与软链');
+  assert.match(block, /rm -f "\$NGINX_SITE"/, '没有旧配置时必须撤销站点文件');
+  // 软链：只有**部署前就有**软链才还原它；没有才删（别删掉不是自己创建的软链）
+  assert.match(block, /rm -f "\$NGINX_LINK"/, '回滚时必须处理软链（没有旧软链就删掉）');
+  assert.match(sh, /link_before="\$\(readlink "\$NGINX_LINK"\)"/, '必须记住软链在部署前的指向（回滚要还原它）');
 });
 
 test('会话有效期：环境文件必须写绝对过期变量，且默认值与真实代码一致', () => {
@@ -1723,6 +1726,177 @@ test('nginx HTTP/2 兼容：自动探测必须认得 nginx 真实输出格式（
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }
+});
+
+// ── 真跑 install.sh 的函数（看**行为**，不看注释）────────────────────────────
+//
+// 为什么要真跑：下面这两条的正确性**在注释里看不见、也盖不住** ——
+//   ① bash 的整数比较在超过 2^63-1 时会报 "integer expression expected"，
+//      运维看到的第一行会变成 bash 噪音而不是可执行的提示；
+//   ② 回滚时软链的**部署前原状**能不能还原，只有真跑才知道。
+// 正则断言盖不住这两点（它们都在 shell 的**运行期**才暴露）。
+
+/**
+ * 在沙箱里 source install.sh（去掉末尾的 `main "$@"`）并执行一段 shell 片段。
+ * @param {string} body  在 install.sh 的函数都加载好之后执行的 shell 片段
+ * @param {object} env   追加的环境变量
+ * @param {object} opts  { nginxTestFails: boolean } —— nginx -t 是否一律失败
+ * @returns {{code:number, out:string}}
+ */
+function runInstallShell(body, env = {}, opts = {}) {
+  const tmp = mkdtempSync(join(tmpdir(), 'heikesong-install-'));
+  try {
+    // 去掉末尾的 `main "$@"`（否则它会去改机器状态）
+    writeFileSync(join(tmp, 'install.sh'), read('install.sh').replace(/^main "\$@"$/m, ''));
+
+    const binDir = join(tmp, 'bin');
+    mkdirSync(binDir, { recursive: true });
+    const nginxStub = join(binDir, 'nginx');
+    writeFileSync(
+      nginxStub,
+      opts.nginxTestFails
+        ? '#!/bin/sh\nif [ "$1" = "-t" ]; then echo "nginx: [emerg] unknown directive \\"http2\\"" >&2; exit 1; fi\necho "nginx version: nginx/1.24.0 (Ubuntu)" >&2\nexit 0\n'
+        : '#!/bin/sh\necho "nginx version: nginx/1.24.0 (Ubuntu)" >&2\nexit 0\n',
+    );
+    chmodSync(nginxStub, 0o755);
+
+    // ⚠️ 必须给 `rm` 打个桩：某些开发环境把 `rm` shim 成「可恢复删除」
+    //    （走 osascript + Finder，**每次要好几秒**，有时还会卡住）⇒
+    //    install.sh 的回滚路径里那两条 `rm -f` 会把测试拖成分钟级。
+    //    这里让桩直接调**真正的** /bin/rm：被测的是**逻辑**（删没删对东西），
+    //    不是「删除是否可恢复」。
+    const realRm = ['/bin/rm', '/usr/bin/rm'].find((p) => existsSync(p)) || 'rm';
+    const rmStub = join(binDir, 'rm');
+    writeFileSync(rmStub, `#!/bin/sh\nexec ${realRm} "$@"\n`);
+    chmodSync(rmStub, 0o755);
+
+    const script = [
+      'set -uo pipefail',
+      `export PATH="${binDir}:$PATH"`,
+      'export NGINX_SITE="${HKS_TMP}/etc/nginx/sites-available/heikesong.conf"',
+      'export NGINX_LINK="${HKS_TMP}/etc/nginx/sites-enabled/heikesong.conf"',
+      'export SERVER_NAME="t.example.com"',
+      'export APP_DIR="${HKS_TMP}/app"',
+      'export DATA_DIR="${HKS_TMP}/data"',
+      'export CERT_PATH="${HKS_TMP}/c.pem"',
+      'export KEY_PATH="${HKS_TMP}/k.pem"',
+      'mkdir -p "$(dirname "$NGINX_SITE")" "$(dirname "$NGINX_LINK")"',
+      'source "${HKS_TMP}/install.sh"',
+      // source 之后 SCRIPT_DIR/ROOT 是按 $0 算的（source 时 $0 是 bash）⇒ 必须改回来
+      `SCRIPT_DIR="${deployDir}"`,
+      `ROOT="${join(here, '..')}"`,
+      `NGINX_COMPAT_SCRIPT="${deployDir}/nginx-http2-compat.sh"`,
+      'set +e',
+      body,
+    ].join('\n');
+
+    const res = spawnSync('bash', ['-c', script], {
+      env: { ...process.env, HKS_TMP: tmp, ...env },
+      encoding: 'utf8',
+    });
+    return { code: res.status, out: `${res.stdout || ''}${res.stderr || ''}` };
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+test('会话有效期：非法值必须报**人话**（不得先吐 bash 的整数比较噪音）', () => {
+  const probe = (ttl, abs) =>
+    runInstallShell('validate_session_ttls', {
+      SESSION_TTL_DAYS: ttl,
+      SESSION_ABSOLUTE_TTL_DAYS: abs,
+    });
+
+  // ① 合法值放行（含「更严配置」与前导零 —— 不得过度加规则）
+  for (const [ttl, abs, why] of [
+    ['7', '30', '常规'],
+    ['1', '1', '最小值'],
+    ['7', '3', '绝对上限 < 滑动有效期是合法的更严配置'],
+    ['007', '030', '前导零'],
+  ]) {
+    const r = probe(ttl, abs);
+    assert.equal(r.code, 0, `${why}（ttl=${ttl} abs=${abs}）必须放行，实际 exit=${r.code}：${r.out}`);
+  }
+
+  // ② 非正整数必须 fail-fast，且提示是**人话**
+  const cases = [
+    ['0', '30', /必须 > 0/],
+    ['7', '0', /必须 > 0/],
+    ['abc', '30', /必须是正整数/],
+    ['3.5', '30', /必须是正整数/],
+    ['-1', '30', /必须是正整数/],
+  ];
+  for (const [ttl, abs, expect] of cases) {
+    const r = probe(ttl, abs);
+    assert.notEqual(r.code, 0, `ttl=${ttl} abs=${abs} 必须 fail-fast`);
+    assert.match(r.out, expect, `ttl=${ttl} abs=${abs} 的提示不对：${r.out}`);
+    assert.doesNotMatch(
+      r.out,
+      /integer expression expected/,
+      `ttl=${ttl} abs=${abs} 的第一行不能是 bash 的整数比较噪音：${r.out}`,
+    );
+  }
+
+  // ②' 空串**不是**非法值：install.sh 顶层的 `${SESSION_TTL_DAYS:-7}` 会把空串
+  //     换成默认值 7 ⇒ 放行。这里钉的是「空串走默认值」这条既有口径，别被误改成报错。
+  const empty = probe('', '30');
+  assert.equal(empty.code, 0, `空串应走默认值（放行），实际 exit=${empty.code}：${empty.out}`);
+
+  // ③ 超长数字：bash 的整数比较会溢出 ⇒ 必须先被上界挡下，且**不吐** bash 噪音
+  const big = probe('99999999999999999999', '30');
+  assert.notEqual(big.code, 0, '超长数字必须 fail-fast');
+  assert.doesNotMatch(
+    big.out,
+    /integer expression expected/,
+    `超长数字的第一行不能是 bash 噪音：${big.out}`,
+  );
+  assert.match(big.out, /不能超过/, `超长数字必须给出「超出上界」的人话提示：${big.out}`);
+
+  // ④ 上界本身必须真的存在（否则 ③ 是被别的分支挡下的）
+  const over = probe('3651', '30');
+  assert.notEqual(over.code, 0, '超过上界的天数必须 fail-fast');
+  assert.match(over.out, /不能超过/, over.out);
+});
+
+test('nginx 回滚：不得删掉**不是自己创建的**软链（部署前原状必须还原）', () => {
+  // ① 预置的软链指向**别的**文件 ⇒ 回滚后必须还原成原来的指向
+  const withPreexisting = runInstallShell(
+    [
+      'OTHER="${HKS_TMP}/etc/nginx/sites-available/OTHER.conf"',
+      'printf "OTHER\\n" > "$OTHER"',
+      'ln -sfn "$OTHER" "$NGINX_LINK"',
+      // ⚠️ 必须放**子 shell**：write_nginx_site 失败时 die() 会 exit 整个脚本，
+      //    直接调用的话后面的断言行根本执行不到（out 会是空的）。
+      '( write_nginx_site ) >/dev/null 2>&1',
+      'echo "EXIT=$?"',
+      'if [ -L "$NGINX_LINK" ]; then echo "LINK=$(readlink "$NGINX_LINK")"; else echo "LINK=GONE"; fi',
+      'if [ -e "$OTHER" ]; then echo "OTHER=KEPT"; else echo "OTHER=DELETED"; fi',
+      'if [ -e "$NGINX_SITE" ]; then echo "SITE=KEPT"; else echo "SITE=REMOVED"; fi',
+    ].join('\n'),
+    {},
+    { nginxTestFails: true },
+  );
+  assert.match(withPreexisting.out, /EXIT=1/, `nginx -t 失败必须退出非 0：${withPreexisting.out}`);
+  assert.match(
+    withPreexisting.out,
+    /LINK=.*OTHER\.conf/,
+    `回滚必须把软链还原成部署前的指向，不能删掉它：${withPreexisting.out}`,
+  );
+  assert.match(withPreexisting.out, /OTHER=KEPT/, '不能删掉别人的文件');
+  assert.match(withPreexisting.out, /SITE=REMOVED/, '本次写入的新配置必须被撤销');
+
+  // ② 预置软链**不存在** ⇒ 回滚后软链也不该残留
+  const withoutPreexisting = runInstallShell(
+    [
+      '( write_nginx_site ) >/dev/null 2>&1',
+      'echo "EXIT=$?"',
+      'if [ -L "$NGINX_LINK" ]; then echo "LINK=STILL-THERE"; else echo "LINK=REMOVED"; fi',
+    ].join('\n'),
+    {},
+    { nginxTestFails: true },
+  );
+  assert.match(withoutPreexisting.out, /LINK=REMOVED/, `回滚后不得残留坏软链：${withoutPreexisting.out}`);
+  assert.match(withoutPreexisting.out, /EXIT=1/, withoutPreexisting.out);
 });
 ```
 
@@ -2291,15 +2465,50 @@ require_nginx() {
 # 为什么要在这里 fail-fast：src/auth/session.js 对非法值是**静默回退到默认值**
 # （"SESSION_TTL_DAYS=abc" ⇒ 悄悄用 7 天）—— 环境文件里写错却没有任何提示，
 # 运维会以为改了其实没改。配置非法就报错，不静默兜底。
+# 上界：10 年（3650 天）。会话有效期超过 10 年在业务上没有意义。
+MAX_SESSION_TTL_DAYS=3650
+
+# 把十进制数字串规范化（去前导零）；不是纯数字则返回 1。
+normalize_uint() {
+  case "$1" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  local v="$1"
+  v="${v#"${v%%[!0]*}"}"    # 去掉前导零
+  [ -n "$v" ] || v=0
+  printf '%s' "$v"
+}
+
+# 判定「正整数且不超过上限」，不合法就 die（人话，不是 bash 噪音）。
+#
+# ⚠️ 判定全程用**字符串**比较，**不碰** bash 的整数比较 `[ n -gt m ]`：
+#    bash 的 `[` 内部走 strtol，超过 2^63-1 就报
+#    「[: 99999999999999999999: integer expression expected」——
+#    运维看到的第一行会变成这句 bash 噪音，而不是可执行的提示。
+#
+# ⚠️ 上界为什么必须查（不只是「> 0」）：
+#    src/auth/session.js 的判定是 `Number.isFinite(n) && n > 0`，
+#    对**超长数字**是**放行**的（Number("99999999999999999999") = 1e20，是有限数），
+#    但 `new Date(now + 1e20 * 86400000)` 得到的是 **Invalid Date**，
+#    `.toISOString()` 直接抛 RangeError ⇒ 写成这种值的部署会在**签发会话时崩**，
+#    而不是「安静地退回默认值」。上界把它挡在部署这一步。
+check_ttl_days() {
+  local name="$1" value="$2" max="$3" norm
+  if ! norm="$(normalize_uint "$value")"; then
+    die "${name} 必须是正整数（当前：'${value}'）"
+  fi
+  if [ "$norm" = "0" ]; then
+    die "${name} 必须 > 0（当前：${value}）"
+  fi
+  # 位数多的一定更大；位数相同才比字典序（同位数下字典序 == 数值序）
+  if [ "${#norm}" -gt "${#max}" ] || { [ "${#norm}" -eq "${#max}" ] && [ "$norm" \> "$max" ]; }; then
+    die "${name} 不能超过 ${max} 天（当前：${value}）"
+  fi
+}
+
 validate_session_ttls() {
-  case "$SESSION_TTL_DAYS" in
-    ''|*[!0-9]*) die "SESSION_TTL_DAYS 必须是正整数（当前：'$SESSION_TTL_DAYS'）" ;;
-  esac
-  case "$SESSION_ABSOLUTE_TTL_DAYS" in
-    ''|*[!0-9]*) die "SESSION_ABSOLUTE_TTL_DAYS 必须是正整数（当前：'$SESSION_ABSOLUTE_TTL_DAYS'）" ;;
-  esac
-  [ "$SESSION_TTL_DAYS" -gt 0 ] || die "SESSION_TTL_DAYS 必须 > 0（当前：${SESSION_TTL_DAYS}）"
-  [ "$SESSION_ABSOLUTE_TTL_DAYS" -gt 0 ] || die "SESSION_ABSOLUTE_TTL_DAYS 必须 > 0（当前：${SESSION_ABSOLUTE_TTL_DAYS}）"
+  check_ttl_days "SESSION_TTL_DAYS" "$SESSION_TTL_DAYS" "$MAX_SESSION_TTL_DAYS"
+  check_ttl_days "SESSION_ABSOLUTE_TTL_DAYS" "$SESSION_ABSOLUTE_TTL_DAYS" "$MAX_SESSION_TTL_DAYS"
 }
 
 install_node() {
@@ -2468,10 +2677,16 @@ write_nginx_site() {
   # ② 备份旧站点文件：nginx -t 失败时要**回滚**，不能把一份坏配置留在
   #    sites-enabled 里 —— 那会毒化这台机器上**下一次**任何 nginx reload
   #    （哪怕是别人触发的、跟这次部署无关的 reload）。
-  local backup=""
+  local backup="" link_before=""
   if [ -f "$NGINX_SITE" ]; then
     backup="$(mktemp "${TMPDIR:-/tmp}/heikesong-nginx-site.XXXXXX")"
     cp -p "$NGINX_SITE" "$backup"
+  fi
+  # ⚠️ 软链的**部署前原状**也要记：它可能**早就存在**且指向**别的**文件。
+  #    回滚时如果无条件删软链，就把别人（或上一套配置）的软链删掉了
+  #    —— 那是回滚路径上唯一一处「删掉不是自己创建的东西」。
+  if [ -L "$NGINX_LINK" ]; then
+    link_before="$(readlink "$NGINX_LINK")"
   fi
 
   sed -e "s|__SERVER_NAME__|$(sed_escape "$SERVER_NAME")|g" \
@@ -2488,8 +2703,16 @@ write_nginx_site() {
       mv -f "$backup" "$NGINX_SITE"
       log "已回滚到上一版 nginx 站点配置"
     else
-      rm -f "$NGINX_SITE" "$NGINX_LINK"
+      rm -f "$NGINX_SITE"
       log "已撤销本次 nginx 站点配置（此前没有旧配置）"
+    fi
+    # 软链还原到**部署前**的样子：原本有软链就还回它原来的指向，
+    # 原本没有就删掉（别留一条指向已撤销配置的坏链）。
+    if [ -n "$link_before" ]; then
+      ln -sfn "$link_before" "$NGINX_LINK"
+      log "已还原 nginx 软链到部署前指向：${link_before}"
+    else
+      rm -f "$NGINX_LINK"
     fi
     die "nginx 配置校验失败（nginx -t 返回非 0）——已回滚，请按上面的 nginx -t 输出修正后重跑本脚本"
   fi
@@ -7268,11 +7491,12 @@ Node v22 的真实签名是**单对象** `{ totalPages, remainingPages }`（探�
 | E6 | `node scripts/restore.js`（活 pid / pid 文件坏 / 成功） | 活 pid ⇒ **拒绝**（`服务仍在运行，拒绝恢复（pid 文件显示进程 N 仍在运行）`）；pid 不可解析 ⇒ **保守判为在跑并拒绝**（`pid 文件存在但内容无法解析，无法确认服务已停止`）；成功 ⇒ 旧库留存 + **删旧 `-wal` / `-shm`** + 新库就位 |
 | E7 | `node src/server.js` + `curl -s http://127.0.0.1:8080/api/health` | `{"ok":true,"at":"2026-10-21T08:04:57.542Z"}`；启动日志 `heikesong-platform 启动于 http://127.0.0.1:8080（规则版本 2026-10-20）` |
 | E8 | `bash deploy/nginx-http2-compat.sh` × 4 个 `NGINX_VERSION` + 不探测 | 1.18.0 / 1.24.0 ⇒ **双 listen 行都降级**；1.25.1 / 2.0.0 ⇒ **保留 `http2 on;`**；不探测 ⇒ 降级（**端口 80 的 listen 不受影响**） |
-| E9 | 沙箱 `install.sh`：**PATH 里没有 nginx** + 设了 `SERVER_NAME` | 退出码 **1**，错误信息明确，**沙箱目录零改动**（`find` 结果为空）⇒ F-2 前置检查**在动任何东西之前**就拒绝 |
-| E10 | 沙箱 `install.sh`：`SESSION_TTL_DAYS=abc` / `SESSION_ABSOLUTE_TTL_DAYS=0` / `SESSION_TTL_DAYS=3.5` | 三次都退出码 **1**、**沙箱目录零改动** ⇒ F-3 的 fail-fast **在动任何东西之前**就拒绝 |
-| E11 | 沙箱 `install.sh`：**完整部署**（nginx 桩 = 1.24.0） | 退出码 **0**；环境文件 = `PORT` / `DATA_DIR` / `SESSION_TTL_DAYS=7` / **`SESSION_ABSOLUTE_TTL_DAYS=30`** / `NODE_ENV=production`；站点配置**自动降级**成 `listen 443 ssl http2;` + `listen [::]:443 ssl http2;`；`alias .../web/assets/` 是**预留位** |
-| E12 | 沙箱 `install.sh`：**连跑两次** | 两次退出码 **0**；第二次「本次无新迁移」「管理员已存在：13800000000」⇒ **幂等** |
-| E13 | 沙箱 `install.sh`：`nginx -t` 失败（**有旧配置** / **无旧配置**） | 有旧 ⇒ `已回滚到上一版 nginx 站点配置` 且站点文件内容回到部署前；无旧 ⇒ `已撤销本次 nginx 站点配置（此前没有旧配置）` 且**站点文件与软链都不存在**、`sites-enabled/` 为空 |
+| E9 | 父代理修复轮（D7-4）：`test/deploy-assets.test.js` 的「自动探测必须认得 nginx 真实输出格式」（假 `nginx` 放 `PATH`、输出官方格式版本号、**不**给 `NGINX_VERSION`） | 1.24.0 ⇒ 被探测到并降级；1.25.1 ⇒ 被探测到并保留 `http2 on;`（这条钉住的正是原缺陷：真实输出是 `nginx version: nginx/1.24.0`，版本号前带 `nginx/` 前缀，旧解析式匹配不到 ⇒ 真机永远探测失败、永远保守降级） |
+| E10 | 沙箱 `install.sh`：**PATH 里没有 nginx** + 设了 `SERVER_NAME` | 退出码 **1**，错误信息明确，**沙箱目录零改动**（`find` 结果为空）⇒ F-2 前置检查**在动任何东西之前**就拒绝 |
+| E11 | 沙箱 `install.sh`：`SESSION_TTL_DAYS=abc` / `SESSION_ABSOLUTE_TTL_DAYS=0` / `SESSION_TTL_DAYS=3.5` | 三次都退出码 **1**、**沙箱目录零改动** ⇒ F-3 的 fail-fast **在动任何东西之前**就拒绝 |
+| E12 | 沙箱 `install.sh`：**完整部署**（nginx 桩 = 1.24.0） | 退出码 **0**；环境文件 = `PORT` / `DATA_DIR` / `SESSION_TTL_DAYS=7` / **`SESSION_ABSOLUTE_TTL_DAYS=30`** / `NODE_ENV=production`；站点配置**自动降级**成 `listen 443 ssl http2;` + `listen [::]:443 ssl http2;`；`alias .../web/assets/` 是**预留位** |
+| E13 | 沙箱 `install.sh`：**连跑两次** | 两次退出码 **0**；第二次「本次无新迁移」「管理员已存在：13800000000」⇒ **幂等** |
+| E14 | 沙箱 `install.sh`：`nginx -t` 失败（**有旧配置** / **无旧配置**） | 有旧 ⇒ `已回滚到上一版 nginx 站点配置` 且站点文件内容回到部署前；无旧 ⇒ `已撤销本次 nginx 站点配置（此前没有旧配置）` 且**站点文件与软链都不存在**、`sites-enabled/` 为空 |
 
 > 沙箱做法：`PATH` 里放 `id`（`id -u` 返回 0，模拟 root）/ `nginx` / `systemctl` / `useradd` / `runuser` 五个**桩命令**，
 > 并把 `APP_DIR` / `DATA_DIR` / `ENV_FILE` / `NGINX_SITE` / `NGINX_LINK` / `SYSTEMD_UNIT_DIR` 全部指向 `mktemp -d` 出来的临时目录 ——
@@ -7299,20 +7523,24 @@ Node v22 的真实签名是**单对象** `{ totalPages, remainingPages }`（探�
 
 ### E. 遗留（交给上游，本 Task 不处理）
 
-- **D7-4 是唯一的代码级遗留**：`deploy/nginx-http2-compat.sh` 的 `detect_version()` 解析不了真实 nginx 的
-  `nginx version: nginx/1.24.0` 格式 ⇒ 真机总是走保守降级。**后果安全**（降级语法处处合法），
+- ~~**D7-4 是唯一的代码级遗留**~~ —— ✅ **已由父代理修复轮修掉**（提交 `cf2e19e`，见本计划「P6 部署资产修复轮」章的 D7-4 行）。
+  原缺陷：`deploy/nginx-http2-compat.sh` 的 `detect_version()` 解析不了真实 nginx 的
+  `nginx version: nginx/1.24.0` 格式（版本号前带 `nginx/` 前缀）⇒ 真机总是走保守降级。**后果安全**（降级语法处处合法），
   但「≥ 1.25.1 保留 `http2 on;`」只有显式 `NGINX_VERSION` 才走得到。
-  一行修法：
+  **实际修法**（POSIX BRE，BSD sed（macOS）与 GNU sed 都认）：
 
   ```bash
-  # 现状（匹配不到）
-  sed -n 's|^nginx version: \([0-9][0-9.]*\).*|\1|p'
-  # 修法（把可选的 "nginx/" 前缀吃掉）
-  sed -n 's|^nginx version: nginx/\?\([0-9][0-9.]*\).*|\1|p'
+  # ✅ 实际修法（已落地）：可选的 "nginx/" 前缀用 POSIX 的 \{0,1\} 表达
+  sed -n 's|^nginx version: *\(nginx/\)\{0,1\}\([0-9][0-9.]*\).*|\2|p'
   ```
 
-  ⇒ 修完要重跑 `platform/test/deploy-assets.test.js` 与 F-4 的变异检验。
-  **本 Task 明确不改** —— 本 Task 的文件归属只有 `docs/deployment.md`（+ 计划文档）。
+  ⛔ **本节原先写的「修法」是错的，别再照抄**：`sed -n 's|...nginx/\?\(...\)...|\1|p'` 里的 `\?`
+  是 **GNU sed 的 BRE 扩展**，**BSD sed（macOS）不认** ⇒ 照抄会在开发机上直接失效。
+  正确写法见上（`\{0,1\}` 是 POSIX 的）。本节保留这一行是**为了让「为什么不能照抄」有据可查**。
+
+  ⇒ 修完后已重跑 `platform/test/deploy-assets.test.js`（20 例全绿）与 F-4 的变异检验（M12 变异体被杀）。
+  **本 Task（Task 7）当时确实不改** —— 它的文件归属只有 `docs/deployment.md`（+ 计划文档）；
+  修复由**后续的父代理修复轮**接手。
 
 ### F. 偏离与遗留（Task 7 自身）
 
@@ -7400,10 +7628,19 @@ nginx 在**最后**。机器上没装 nginx 时，脚本会先把上面**全部*
 兼容脚本不降级、阈值放宽到 1.24.0、漏改 IPv6 那一支、改回「web/assets/ 是构建产物目录」的注释、
 不排除 `web/dist/` —— **每一个都让对应的新用例变红**。
 
+> ⚠️ **这一段是 2026-10-21 那一轮（提交 `214d3f1`）的实况**，后来又被
+> **父代理修复轮**（`cf2e19e`，补 M12 变异体 + D7-4 回归用例）与
+> **独立复核后的第二轮修复**（补 M13/M14 变异体）推高了 ⇒
+> **下面的数字已更新到最新一轮**（12 体 / 20 例 / 982 例那个）。
+> ⇒ **凡是这里的数字，一律以「实跑」为准**：
+> `node --disable-warning=ExperimentalWarning --test test/deploy-assets.test.js`
+> 与 `node --disable-warning=ExperimentalWarning --test`。
+
 ### 实跑数字
 
-- 单文件 `test/deploy-assets.test.js`：**19 例 / 19 通过**（原 14 + 本轮 5）
-- 全量 `node --test`：**961 例 / 960 通过 / 1 跳过 / 0 失败**（基线 956）
+- 单文件 `test/deploy-assets.test.js`：**22 例 / 22 通过**（原 14 + 修复轮 5 + D7-4 回归 1 + 独立复核轮 2）
+- 全量 `node --test`：**1137 例 / 1136 通过 / 1 跳过 / 0 失败**（基线 956）
+- ⚠️ 这两个数字是**本修复轮提交时**的实况；后续阶段合入会变（用例数只增不减）⇒ 以实跑为准
 - `bash -n` 语法自检：`install.sh` 与 `nginx-http2-compat.sh` 均通过
 - 隔离实证：PATH 里没有 nginx 时 `require_nginx` **当场拒绝**（不进入后续步骤）；
   有 nginx 时打印版本并放行
@@ -7418,3 +7655,109 @@ nginx 在**最后**。机器上没装 nginx 时，脚本会先把上面**全部*
   合并 P6 Task 4 分支时需要重编号（Task 3 → `D3-*`、Task 4 → `D4-*`）——
   这是**合并时要处理的事**，本轮不动（Task 4 的台账在另一个分支上）。
 ---
+
+---
+
+## P6 部署资产修复轮 · 第二轮（独立复核后，2026-10-21）
+
+> 本轮是**独立 verifier 复核第一轮修复（F-1~F-4 + D7-4）与 Task 7 手册**之后的处置。
+> 复核结论：**PASS-WITH-NOTES** —— 0 Critical、4 Important、5 Minor。
+> 四条修复与 D7-4 经**实跑**确认真的有效，变异检验独立复现 12/12 全杀 + 对照组 20/20 全绿，
+> 12 个锚点独立复算全部唯一；手册的可执行命令逐条复现且输出与手册所写一致。
+> ⇒ 本轮把复核提的 **6 条**（I-1~I-4、M-1~M-3、M-4 中需要动手的）**逐条处置**，
+> 另外 1 条（M-5）**显式标注为「有意保留」**并说明理由。
+
+### A. 实施方法（先跑后落盘）
+
+两处**代码**修改（M-1 / M-2）严格按「先跑后派」：
+
+1. 把 `platform/` 整份拷到 `/tmp` 沙箱（`mktemp -d`）；
+2. 在沙箱里实现修复；
+3. 写一份**真跑 shell 函数**的 harness（`source install.sh` 后直接调
+   `validate_session_ttls` / `write_nginx_site`），先在**未修复的副本**上跑一遍，
+   确认「旧版会失败、新版会通过」⇒ **用例有判别力**；
+4. 通过后才把改动同步回仓库工作树；
+5. 再把同样的 harness 逻辑落成**仓库里的回归用例**（`test/deploy-assets.test.js`）。
+
+⚠️ 踩到的一个**环境**坑（不是产品缺陷，但会让测试慢到不可用）：
+本机把 `rm` shim 成了「可恢复删除」（走 `osascript` + Finder，**每次好几秒、还会卡住**）
+⇒ `install.sh` 回滚路径里那两条 `rm -f` 把单文件测试拖到 **121 秒**。
+**处置**：回归用例在自己的沙箱 `bin/` 目录里放一个 `rm` 桩，直接 `exec /bin/rm`
+（被测的是**逻辑** —— 删没删对东西 —— 不是「删除是否可恢复」）。
+处置后单文件 **4.6 秒**。
+
+### B. 问题清单与逐条处置
+
+| 编号 | 级别 | 问题 | 处置 |
+|---|---|---|---|
+| **F-5** | Minor | **`validate_session_ttls` 对超范围整数先吐 bash 原始报错** —— `SESSION_TTL_DAYS=99999999999999999999` 的**第一行**是 `[: 99999999999999999999: integer expression expected`（bash 的 strtol 溢出），人话提示排在后面 | ① 判定全程改用**字符串**比较（不碰 bash 的整数比较 `[ n -gt m ]`）；② 加**上界 3650 天**（10 年）。<br>⚠️ **上界不是凭空加的规则**：`src/auth/session.js` 的判定是 `Number.isFinite(n) && n > 0`，对 `1e20` 是**放行**的，但 `new Date(now + 1e20 * 86400000)` 是 **Invalid Date**，`.toISOString()` 抛 `RangeError` ⇒ 那种值会在**签发会话时崩**，而不是安静地退回默认值。上界把它挡在部署这一步 |
+| **F-6** | Minor | **nginx 回滚会删掉不是自己创建的软链** —— `$NGINX_SITE` 不存在、但 `$NGINX_LINK` **早就存在**且指向别的文件时，回滚走 `rm -f "$NGINX_SITE" "$NGINX_LINK"` ⇒ 别人的软链被删 | 回滚前记住软链的**部署前指向**（`link_before="$(readlink "$NGINX_LINK")"`）；回滚时：原本有软链 ⇒ `ln -sfn` 还回原来的指向；原本没有 ⇒ 删掉（不残留指向已撤销配置的坏链） |
+| **F-7** | Important | **计划 Task 7 台账 §E 把已修的 D7-4 仍写成「唯一的代码级遗留」** —— 与同章 D7-4 行（已标「已修」）、手册 §13 U-4（已标「已修」）**三处互斥**；照 §E 去改会把已修好的解析式改回另一种写法 | §E 改为「✅ 已由父代理修复轮修掉（`cf2e19e`）」，并**保留**一条**反例说明**：原 §E 给的「修法」`sed -n 's\|...nginx/\?\(...\)\|...'` 里的 `\?` 是 **GNU sed 的 BRE 扩展，BSD sed（macOS）不认** ⇒ 照抄会在开发机上直接失效。实际修法用 POSIX BRE `\(nginx/\)\{0,1\}` |
+| **F-8** | Important | **手册 §8.3「确认生效」的第二条命令看不到环境文件里的值** —— `systemctl show heikesong --property=Environment` 只由单元里的 `Environment=` 构建；`EnvironmentFile=` 的内容走**另一个**属性（`EnvironmentFiles=`，只报**路径**、不内联内容）。⇒ 运维会误判「环境文件没生效」，而 §8.3 末尾又劝人「不要去改单元模板」，两条建议互相打架 | 换成三条一定能看到生效值的命令：① `grep` 文件 → ② `systemctl show -p EnvironmentFiles`（确认读的是哪个文件）→ ③ **读 `/proc/<pid>/environ`**（这才是「生效的」）。并注明**别用** `-p Environment` 的理由 + systemd issue #14723 链接 |
+| **F-9** | Important | **修复轮台账的变异 / 用例数字过期** —— 章里写「11 个变异体 / 19 例 / 961 例」，当前 HEAD 实测是 12 体 / 20 例 / 982 例（差额全来自 D7-4 那轮补的 M12 + 回归用例）。复核已核实**当时不是编造**（在 `214d3f1` 上复跑完全吻合），只是**过期** | 数字更新到当前值；并在章首加一段说明：**这些数字是「某一轮提交时」的实况，后续阶段合入会变（用例数只增不减）⇒ 以实跑为准** |
+| **F-10** | Important | **手册 §14 实跑证据表有**两行**同号 E9** —— `:739` 与 `:740` 都以 `\| E9 \|` 开头；§13 U-3 的「见 §14 E9–E13」区间引用因此**无法唯一定位** | 手册与**计划**的 E 表**统一重编号**（新增 D7-4 那行占 E9，原 E9→E10 … E13→**E14**），U-3 的引用同步改成「E9–E14」。两处的 E1–E8 本来就一一对应，重编号后仍然一一对应 |
+| **F-11** | Minor | **手册 §1（本地 / 内网）的环境变量清单漏 `SESSION_ABSOLUTE_TTL_DAYS`**（只列 3 个） | 补成 4 个，并加一行指针指向 §10 的**完整 9 个变量**速查表（本地跑不用配，缺省值就能用） |
+| **F-12** | Minor | **手册 §14 E1 的用例数比当前 HEAD 少 1**（写 981，实际 982） | 更新；并加一句「数字是本轮提交时的实况，后续阶段合入会变 ⇒ 以实跑为准」 |
+| **M-5** | Minor（**有意保留**） | 计划 Task 2 / Task 3 的历史台账里仍写着「`web/assets/` 是前端构建产物目录」的**旧口径** | **不修**。它们是**历史记录**（保留有审计价值），而修复轮 F-1 章已明确裁决「不再作为遗留」。**检索旧说法时别把它们当成现行口径** |
+
+### C. 逐字回写位置（本轮改动的计划代码块）
+
+| 位置 | 改了什么 |
+|---|---|
+| Task 2 Step 6 的 `deploy/install.sh` 代码块 | **整体回写**（F-5 的 `MAX_SESSION_TTL_DAYS` / `normalize_uint` / `check_ttl_days` + F-6 的 `link_before` 与回滚分支） |
+| Task 2 Step 5 的 `test/deploy-assets.test.js` 代码块 | **整体回写**（回滚断言从「删站点文件与软链」改成「删站点文件 + 记住/还原软链」，并追加 2 条**真跑 shell** 的回归用例） |
+| Task 7 台账 §E | F-7 的文字处置（**不改代码块**） |
+| Task 7 台账「实跑数字」段 | F-9 的数字更新（**不改代码块**） |
+
+### D. 实跑证据
+
+| # | 跑了什么 | 观察到 |
+|---|---|---|
+| **F-5** | 沙箱 `validate_session_ttls` 取值矩阵（12 组） | 合法（`7/30`、`1/1`、**更严的 `7/3`**、带前导零 `007/030`）⇒ 放行；`0` / `abc` / `3.5` / `-1` / 空串 ⇒ 退出码 1 + 人话；`99999999999999999999` ⇒ 退出码 1 +「不能超过 3650 天」，**第一行没有 bash 噪音** |
+| **F-6** | 沙箱 `nginx -t` 失败 + 预置软链指向别的文件 | 退出码 1；**软链还原成部署前指向**（`OTHER.conf` 没被删）；新站点文件已撤销；**没有预置软链**时软链同样撤销、`sites-enabled/` 为空 |
+| **判别力** | 同一份 harness 跑**未修复的副本** | F-5 复现 bash 噪音（`integer expression expected` 在第一行）；F-6 复现「预置软链被删」⇒ **旧版确实过不了新用例** |
+| **回归用例** | `node --disable-warning=ExperimentalWarning --test test/deploy-assets.test.js` | **22 例 / 22 通过**（原 20 + 本轮 2）；`bash -n deploy/install.sh` 通过 |
+| **全量** | `cd platform && node --disable-warning=ExperimentalWarning --test` | **1137 例 / 1136 通过 / 0 失败 / 1 跳过**（连跑 8 次全绿） |
+| **扫描闸** | `cd platform && node scripts/audit-scan.js` | **退出码 0** |
+
+### E. 变异检验（`/tmp/p6-mutate/t2fix2.mjs`，**不入库**）
+
+**18 个变异体 / 18 KILLED / 0 存活 / 0 无效 / 0 锚点异常**；对照组（未改动副本）**22/22 全绿**。
+
+- 既有 12 体（M01~M12）**原样复验**，全部仍被杀；
+- 新增 6 体覆盖本轮两处修复：
+
+| ID | 变异内容 | 为什么真改行为 |
+|---|---|---|
+| M13 | 去掉会话天数的**上界**检查 | 超长数字从「拒绝」变「放行」 |
+| M14 | 去掉「必须 > 0」判定 | `0` 从「拒绝」变「放行」 |
+| M15 | 回滚时**不还原**软链 | 预置软链被删 |
+| M16 | 软链原状记错（`link_before` 记成空） | 预置软链被删 |
+| M17 | `normalize_uint` 不再校验「纯数字」 | 非数字值的提示从「必须是正整数」变「必须 > 0」 |
+| M18 | 判定改回 bash 整数比较 | 超长数字吐出 `integer expression expected` 噪音 |
+
+⚠️ **M18 的第一版是无效变异体**：我最初把替换写成 `[ "$value" -gt 0 ] 2>/dev/null` ——
+`2>/dev/null` 把噪音**吞掉**了 ⇒ 行为**没变**（等价变异体）。
+按纪律「等价变异体必须修或显式标注」⇒ **直接修**：去掉 `2>/dev/null`，
+让它真的把噪音吐出来 ⇒ 被 M-1 用例的「不得先吐 bash 噪音」断言杀掉。
+（这一版变异体**自己也**是判别力的一次校准：它证明那条断言测的是**噪音本身**，
+不是「有没有报错」。）
+
+### F. 计划块逐字核验
+
+| 核验项 | 结果 |
+|---|---|
+| Task 2 Step 6 的 `deploy/install.sh` 块 ≡ 真实文件 | ✅ 一致（423 行） |
+| Task 2 Step 5 的 `test/deploy-assets.test.js` 块 ≡ 真实文件 | ✅ 一致（589 行） |
+| 其余 4 个部署资产块（`nginx.conf` / `heikesong.service` / `docker-compose.yml` / `nginx-http2-compat.sh`） | ✅ 未受影响，仍一致 |
+| 手册 §0–§7 与计划 Task 7 块的连续性 | ✅ 仍逐字连续（本轮只在 §1 / §8.3 / §13 / §14 补写） |
+
+### G. 遗留 / 需上游注意
+
+1. **真机未验证**：本轮两处修复在**沙箱**里验证（macOS + bash + 桩 nginx）。
+   真机（Linux + systemd + nginx + root）的 `install.sh` 完整执行仍未实跑 —— 见手册 §13 U-3。
+2. **`MAX_SESSION_TTL_DAYS = 3650` 是一个新引入的上界**：业务上「会话有效期 > 10 年」没有意义，
+   但它**确实是新规则** ⇒ 如果组委会要别的口径，改 `install.sh` 的这个常量即可
+   （`check_ttl_days` 的上界判定与提示文案都由它驱动）。
+3. **F-8 的两条 systemd 命令未在真机跑过**（macOS 无 systemd）⇒ 手册 §13 U-8 已登记。
+4. **M-5 故意不改**（历史台账保留旧口径有审计价值）—— 检索时注意别当现行口径。
