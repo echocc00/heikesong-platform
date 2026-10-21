@@ -63,3 +63,35 @@ export function lastLeaveAt(db, teamId) {
     .prepare('SELECT MAX(left_at) AS t FROM team_members WHERE team_id = ? AND left_at IS NOT NULL')
     .get(teamId).t ?? null;
 }
+
+// src/db/repo/teamMembers.js —— 【追加】到 P1 已建的文件里
+// 依据：R-OPS-13 / R-OPS-14（自主领取的人必须是某个队的成员）
+// ⚠️ 本文件由 P1 建立。本阶段【追加】下面两个函数，P1 已有的函数保持不动
+//    （签名一个字都不改）。
+//
+// hasActiveMembership：这个人**是不是这支队的**在队成员。
+// ⛔ 不能用 P1 的 countActiveMembers(db, teamId) > 0 代替 ——
+//    那问的是「这支队还有没有在队成员」，不是「这个人是不是在队成员」。
+//    两者在「队里只剩别人」时结论完全相反（前者 true、后者 false）。
+export function hasActiveMembership(db, teamId, userId) {
+  const row = db
+    .prepare('SELECT 1 AS ok FROM team_members WHERE team_id = ? AND user_id = ? AND left_at IS NULL')
+    .get(teamId, userId);
+  return row !== undefined;
+}
+
+// listMemberTeams：这个人在哪些队（可选按届期过滤）。
+// 依据：R-REG-03「赛程中成员可持续招募汰换」→ 只要 left_at IS NULL 就算在队。
+export function listMemberTeams(db, userId, { editionId = null } = {}) {
+  const sql = editionId
+    ? `SELECT t.* FROM teams t
+        JOIN team_members m ON m.team_id = t.id
+       WHERE m.user_id = ? AND m.left_at IS NULL AND t.edition_id = ?
+       ORDER BY t.id`
+    : `SELECT t.* FROM teams t
+        JOIN team_members m ON m.team_id = t.id
+       WHERE m.user_id = ? AND m.left_at IS NULL
+       ORDER BY t.id`;
+  const rows = editionId ? db.prepare(sql).all(userId, editionId) : db.prepare(sql).all(userId);
+  return rows;
+}

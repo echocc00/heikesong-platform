@@ -99,6 +99,7 @@ platform/
 │   └── tasks.js                      任务清单页（可领取的 / 我领取的 / 已完成的）
 └── test/
     ├── pools-migration.test.js       迁移 006 + 7 张表 + 部分唯一索引 + 三池唯一约束
+    │                                 + 真并发用例（两连接同时 insert）+ 仓储层用例 + 约束矩阵用例（共 13 例）
     ├── workflow-service.test.js      领取唯一性 / 释放 / 完成证据 / 禁止岗位制 / 完成不加分
     ├── pools-sync.test.js            三池派生正确性 + 幂等（连跑两次一致）+ 积分唯一真源自检
     ├── public-api.test.js            token 鉴权 4 种失败 + 可见性过滤 + 公开字段白名单
@@ -153,14 +154,27 @@ platform/web/app.js                   注册 /tasks/:workflowId 路由 + 把路�
 `platform/test/pools-migration.test.js`：
 
 ```javascript
+// test/pools-migration.test.js —— P5 Task 1：迁移 006 + 工作流/三池仓储层
+// 依据：INTERFACES.md §6（P5 产出）；设计文档 §5.4
+// ⛔ 本 Task 的灵魂：「同一任务不能被两人同时领取」必须由**数据库**保证 ——
+//    部分唯一索引 ux_task_claims_active ON task_claims(task_id) WHERE released_at IS NULL。
+//    ⛔ 不接受「应用层先查再插」作为并发保证 —— 下面「真并发」用例用两个
+//    **独立连接 + 两个 worker 线程 + 屏障同步**同时插入，验证放行权在数据库。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { Worker } from 'node:worker_threads';
 import { openDatabase } from '../src/db/sqlite.js';
 import { applyMigrations } from '../src/db/migrate.js';
+import * as workflowsRepo from '../src/db/repo/workflows.js';
+import * as taskClaimsRepo from '../src/db/repo/task-claims.js';
+import * as poolsRepo from '../src/db/repo/pools.js';
+import * as poolSourcesRepo from '../src/db/repo/pool-sources.js';
+import * as publicTokensRepo from '../src/db/repo/public-tokens.js';
+import { hasActiveMembership, listMemberTeams } from '../src/db/repo/teamMembers.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrationsDir = join(here, '..', 'db', 'migrations');
@@ -200,6 +214,68 @@ function seedBase(db) {
     INSERT INTO team_members (team_id, user_id, role, joined_at, left_at)
     VALUES ('tm_1', 'u_cap', 'captain', '2026-10-01T00:00:00.000Z', NULL),
            ('tm_1', 'u_other', 'member', '2026-10-01T00:00:00.000Z', NULL);
+  `);
+}
+
+/**
+ * 仓储层与派生源用的**多届期 / 多状态 / 含软删**种子。
+ * ⚠️ 数据必须**判别性**：两个算法的结果不同时，用例才区分得开。
+ *    例如 listEditionPackages 的 status 过滤，只有同时存在 approved 与 submitted
+ *    两种包时，漏掉过滤条件才会被发现。
+ */
+function seedRepo(db) {
+  db.exec(`
+    INSERT INTO users (id, name, phone, password_hash, mba_status, org, is_superadmin, active, created_at)
+    VALUES ('u_a', '甲', '13900000021', 'x', 'mba', '学堂', 0, 1, '2026-10-01T00:00:00.000Z'),
+           ('u_b', '乙', '13900000022', 'x', 'other', '学堂', 0, 1, '2026-10-01T00:00:00.000Z'),
+           ('u_c', '丙', '13900000023', 'x', 'other', '外单位', 0, 1, '2026-10-01T00:00:00.000Z'),
+           ('u_off', '停用丁', '13900000024', 'x', 'other', '学堂', 0, 0, '2026-10-01T00:00:00.000Z');
+    INSERT INTO editions (id, name, city, starts_at, ends_at, created_at)
+    VALUES ('ed_1', '第一届', '杭州', '2026-10-01', '2026-10-31', '2026-10-01T00:00:00.000Z'),
+           ('ed_2', '第二届', '上海', '2027-10-01', '2027-10-31', '2026-10-01T00:00:00.000Z');
+    INSERT INTO task_packages (id, edition_id, enterprise_id, enterprise_name, title, pain_point,
+      expected_delivery, acceptance_criteria, grade, status, solvability_score, solvability_grade,
+      commitment, agreement, is_free_brief, submitted_by, submitted_at, deleted_at)
+    VALUES ('tp_ok', 'ed_1', 'ent_1', '某银行', '零售风控助手', '人工审批慢', '可演示原型', '能跑起来就行',
+      'A', 'approved', 11, 'A', '试点承诺', '承诺书', 0, 'u_a', '2026-10-01T00:00:00.000Z', NULL),
+           ('tp_wait', 'ed_1', 'ent_2', '某券商', '智能投顾', '风控缺失', '原型', '能跑', 'B', 'submitted',
+      9, 'B', NULL, NULL, 0, 'u_a', '2026-10-01T00:00:00.000Z', NULL),
+           ('tp_free', 'ed_1', 'ent_3', NULL, '自由命题', '自主', '原型', '能跑', 'C', 'approved',
+      8, 'C', NULL, NULL, 1, 'u_b', '2026-10-01T00:00:00.000Z', NULL),
+           ('tp_gone', 'ed_1', 'ent_4', '某已撤企业', '已撤题', 'x', 'x', 'x', NULL, 'approved',
+      NULL, NULL, NULL, NULL, 0, 'u_a', '2026-10-01T00:00:00.000Z', '2026-10-02T00:00:00.000Z');
+    INSERT INTO teams (id, edition_id, name, captain_id, task_package_id, tier, status, created_at, deleted_at)
+    VALUES ('tm_1', 'ed_1', '一队', 'u_a', 'tp_ok', 'C', 'active', '2026-10-01T00:00:00.000Z', NULL),
+           ('tm_2', 'ed_1', '二队', 'u_c', 'tp_wait', 'D', 'active', '2026-10-02T00:00:00.000Z', NULL),
+           ('tm_gone', 'ed_1', '已撤队', 'u_a', 'tp_ok', 'D', 'active', '2026-10-03T00:00:00.000Z',
+      '2026-10-04T00:00:00.000Z'),
+           ('tm_9', 'ed_2', '九队', 'u_b', 'tp_ok', 'B', 'active', '2026-10-05T00:00:00.000Z', NULL);
+    INSERT INTO team_members (team_id, user_id, role, joined_at, left_at)
+    VALUES ('tm_1', 'u_a', 'captain', '2026-10-01T00:00:00.000Z', NULL),
+           ('tm_1', 'u_b', 'member', '2026-10-01T00:00:00.000Z', NULL),
+           ('tm_2', 'u_c', 'captain', '2026-10-02T00:00:00.000Z', NULL),
+           ('tm_9', 'u_a', 'member', '2026-10-05T00:00:00.000Z', '2026-10-06T00:00:00.000Z');
+    INSERT INTO stages (id, edition_id, "key", name, kind, starts_at, ends_at, freeze_at, scoring_config_key, status)
+    VALUES ('st_1', 'ed_1', 's1', '调研', 'initial', '2026-10-01', '2026-10-10', NULL, 'initial', 'computed'),
+           ('st_2', 'ed_1', 's2', '决赛', 'final', '2026-10-11', '2026-10-20', NULL, 'final', 'computed'),
+           ('st_9', 'ed_2', 's1', '调研二', 'initial', '2027-10-01', '2027-10-10', NULL, 'initial', 'computed');
+    INSERT INTO stage_results (id, stage_id, team_id, rank, total, seat_p, seat_e, tied_with, points, created_at)
+    VALUES ('sr_1', 'st_1', 'tm_1', 1, 90, 45, 45, 0, 10, '2026-10-10T00:00:00.000Z'),
+           ('sr_2', 'st_1', 'tm_2', 2, 80, 40, 40, 0, 6, '2026-10-10T00:00:00.000Z'),
+           ('sr_3', 'st_2', 'tm_1', 1, 95, 48, 47, 0, 12, '2026-10-20T00:00:00.000Z'),
+           ('sr_9', 'st_9', 'tm_9', 1, 70, 35, 35, 0, 4, '2027-10-10T00:00:00.000Z');
+    INSERT INTO points_ledger (id, edition_id, stage_id, team_id, user_id, kind, points, created_at)
+    VALUES ('pl_1', 'ed_1', 'st_1', 'tm_1', 'u_a', 'stage_rank', 10, '2026-10-10T00:00:00.000Z'),
+           ('pl_2', 'ed_1', 'st_1', 'tm_1', 'u_b', 'stage_rank', 6, '2026-10-10T00:00:00.000Z'),
+           ('pl_3', 'ed_1', 'st_2', 'tm_1', 'u_b', 'mvp', 4, '2026-10-20T00:00:00.000Z'),
+           ('pl_9', 'ed_2', 'st_9', 'tm_9', 'u_a', 'stage_rank', 4, '2027-10-10T00:00:00.000Z');
+    INSERT INTO tier_records (id, team_id, tier, milestone_count, business_signoff_count, reasons_json, computed_at, deleted_at)
+    VALUES ('tr_1', 'tm_1', 'C', 1, 0, '[]', '2026-10-10T00:00:00.000Z', NULL),
+           ('tr_2', 'tm_2', 'D', 0, 0, '[]', '2026-10-10T00:00:00.000Z', NULL),
+           ('tr_9', 'tm_9', 'B', 2, 1, '[]', '2027-10-10T00:00:00.000Z', NULL);
+    INSERT INTO registrations (id, edition_id, user_id, answers_json, dimension_scores_json, raw_score, level, created_at, deleted_at)
+    VALUES ('rg_1', 'ed_1', 'u_a', '{}', '{"a":1}', 3.5, 'L2', '2026-10-01T00:00:00.000Z', NULL),
+           ('rg_9', 'ed_2', 'u_b', '{}', '{"a":2}', 4.0, 'L3', '2026-10-01T00:00:00.000Z', NULL);
   `);
 }
 
@@ -316,12 +392,513 @@ test('public_tokens 表可存可查，且 token 是主键', () => {
   );
   cleanup(db, close, dataDir);
 });
+
+/**
+ * ★ 真并发用例（本 Task 灵魂的正面验证）。
+ *
+ * 为什么不能只串行跑一次：串行跑两次 insert，第一次提交后第二次必然撞唯一索引 ——
+ * 这证明不了「并发下数据库会仲裁」，只证明「索引存在」。
+ * 本用例用**两个 worker 线程 + 两条独立数据库连接 + 屏障同步**，
+ * 让两次 INSERT **真正同时**发起（用插入起止时间区间是否重叠来证明确实重叠），
+ * 然后断言：**恰好一条成功，另一条被数据库以 UNIQUE 约束拒绝**，
+ * 且库里的有效领取永远只有一条。
+ *
+ * ⚠️ 屏障必须**两个 worker 都到达**才放行：worker 在连上库之后、
+ *    真正发起 INSERT 之前才递增屏障计数 —— 因此「同时」的是 INSERT 本身，
+ *    不是连接建立。
+ * ⚠️ 两个连接必须**错开建立**：openDatabase() 第一条语句是 PRAGMA journal_mode = WAL，
+ *    而 busy_timeout 在它之后才设 —— 两个连接同时执行这条 PRAGMA 会有一方
+ *    立刻 "database is locked"（实测，见缺陷台账 C-2）。
+ */
+const CLAIM_WORKER_SRC = `
+import { parentPort, workerData } from 'node:worker_threads';
+import { openDatabase } from ${JSON.stringify(pathToFileURL(join(here, '..', 'src', 'db', 'sqlite.js')).href)};
+const { db, close } = openDatabase({ dataDir: workerData.dataDir });
+const ins = db.prepare(
+  'INSERT INTO task_claims (id, task_id, team_id, user_id, claimed_at, released_at) VALUES (?, ?, ?, ?, ?, NULL)',
+);
+parentPort.postMessage({ ready: true });
+const barrier = new Int32Array(workerData.barrier);
+Atomics.add(barrier, 0, 1);
+while (Atomics.load(barrier, 0) < 2) {
+  Atomics.wait(barrier, 0, Atomics.load(barrier, 0), 20);
+}
+const t0 = Number(process.hrtime.bigint() / 1000000n);
+let outcome;
+try {
+  ins.run(workerData.claimId, workerData.taskId, workerData.teamId, workerData.userId, workerData.claimedAt);
+  outcome = { ok: true };
+} catch (err) {
+  outcome = { ok: false, message: String(err && err.message) };
+}
+const t1 = Number(process.hrtime.bigint() / 1000000n);
+close();
+parentPort.postMessage({ ...outcome, t0, t1 });
+`;
+
+function spawnClaimWorker(workerData) {
+  const worker = new Worker(CLAIM_WORKER_SRC, { eval: true, workerData });
+  let resolveReady;
+  let resolveDone;
+  const ready = new Promise((r) => { resolveReady = r; });
+  const done = new Promise((r) => { resolveDone = r; });
+  worker.on('message', (m) => { if (m.ready) resolveReady(); else resolveDone(m); });
+  worker.on('error', (err) => { resolveReady(); resolveDone({ ok: false, message: String(err && err.message) }); });
+  return { ready, done };
+}
+
+test('真并发：两个连接同时领取同一任务，数据库只放行一个（放行权在数据库，不在应用层）', async () => {
+  const { db, close, dataDir } = setup();
+  seedBase(db);
+  db.prepare('INSERT INTO workflows (id, edition_id, task_package_id, name, created_at) VALUES (?,?,?,?,?)')
+    .run('wf_1', 'ed_1', 'tp_1', '风控助手工作流', '2026-10-02T00:00:00.000Z');
+  db.prepare('INSERT INTO workflow_tasks (id, workflow_id, title, detail, owner_team_id, status, due_at, created_at) VALUES (?,?,?,?,?,?,?,?)')
+    .run('tk_1', 'wf_1', '跑通风控模型', '需要一个可演示的 demo', 'tm_1', 'todo', null, '2026-10-02T00:00:00.000Z');
+  // 先把主连接关掉：下面的并发由 worker 自己持有的两条连接完成
+  close();
+
+  const barrier = new SharedArrayBuffer(4);
+  const base = { dataDir, barrier, taskId: 'tk_1', teamId: 'tm_1', claimedAt: '2026-10-03T00:00:00.000Z' };
+  const a = spawnClaimWorker({ ...base, claimId: 'tc_a', userId: 'u_cap' });
+  await a.ready;                       // 连接 A 已建立
+  const b = spawnClaimWorker({ ...base, claimId: 'tc_b', userId: 'u_other' });
+  await b.ready;                       // 连接 B 已建立（错开建立，避开 WAL PRAGMA 抢锁）
+  const [ra, rb] = await Promise.all([a.done, b.done]);
+
+  const winners = [ra, rb].filter((r) => r.ok);
+  const losers = [ra, rb].filter((r) => !r.ok);
+  assert.equal(winners.length, 1, `恰好一条领取成功，实际 ${JSON.stringify([ra, rb])}`);
+  assert.equal(losers.length, 1, `恰好一条被拒，实际 ${JSON.stringify([ra, rb])}`);
+  assert.match(losers[0].message, /UNIQUE constraint failed/, '被拒的一方必须由数据库的唯一索引拒绝');
+
+  // 证明这**确实是并发**而不是被测试串行化：两次 INSERT 的时间区间必须重叠
+  const earliest = Math.min(ra.t0, rb.t0);
+  const latest = Math.max(ra.t1, rb.t1);
+  assert.ok(earliest < latest, `两次 INSERT 必须重叠才叫并发，实际区间 ${earliest}~${latest}`);
+
+  // 库里的有效领取永远只有一条
+  const { db: db2, close: close2 } = openDatabase({ dataDir });
+  const n = db2
+    .prepare('SELECT COUNT(*) AS n FROM task_claims WHERE task_id = ? AND released_at IS NULL')
+    .get('tk_1').n;
+  assert.equal(n, 1, '有效领取永远只有一条');
+  close2();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('workflows / workflow_tasks 仓储：建档、读档、改状态、完成留痕', () => {
+  const { db, close, dataDir } = setup();
+  seedRepo(db);
+
+  const wf = workflowsRepo.insertWorkflow(db, {
+    editionId: 'ed_1', taskPackageId: 'tp_ok', name: '风控助手工作流', now: '2026-10-02T00:00:00.000Z',
+  });
+  assert.equal(wf.id !== undefined, true);
+  assert.equal(wf.edition_id, 'ed_1');
+  assert.equal(wf.task_package_id, 'tp_ok');
+  assert.equal(wf.name, '风控助手工作流');
+  assert.equal(workflowsRepo.getWorkflow(db, wf.id).name, '风控助手工作流');
+  assert.equal(workflowsRepo.getWorkflow(db, 'wf_none'), null, '不存在的 id 必须返回 null 而不是 undefined');
+
+  const wf2 = workflowsRepo.insertWorkflow(db, {
+    editionId: 'ed_1', taskPackageId: 'tp_wait', name: '投顾工作流', now: '2026-10-03T00:00:00.000Z',
+  });
+  // 同一个任务包的**第二个**工作流（created_at 更晚）—— 用来判别 findWorkflowByPackage
+  // 取的是「最早的那个」：只有一个工作流时排序不可判别。
+  workflowsRepo.insertWorkflow(db, {
+    editionId: 'ed_1', taskPackageId: 'tp_ok', name: '风控助手工作流二', now: '2026-10-06T00:00:00.000Z',
+  });
+  workflowsRepo.insertWorkflow(db, {
+    editionId: 'ed_2', taskPackageId: 'tp_ok', name: '第二届工作流', now: '2026-10-01T00:00:00.000Z',
+  });
+  const listed = workflowsRepo.listWorkflowsByEdition(db, 'ed_1');
+  assert.deepEqual(
+    listed.map((r) => r.name),
+    ['风控助手工作流', '投顾工作流', '风控助手工作流二'],
+    '必须只返回本届且按 created_at 升序',
+  );
+  assert.equal(workflowsRepo.findWorkflowByPackage(db, 'ed_1', 'tp_ok').id, wf.id, '同一任务包取最早建立的工作流');
+  assert.equal(workflowsRepo.findWorkflowByPackage(db, 'ed_1', 'tp_free'), null, '找不到时返回 null');
+
+  // 任务默认值：detail / owner_team_id / due_at 为 NULL，status 为 'todo'
+  const task = workflowsRepo.insertWorkflowTask(db, {
+    workflowId: wf.id, title: '跑通风控模型', now: '2026-10-04T00:00:00.000Z',
+  });
+  assert.equal(task.status, 'todo');
+  assert.equal(task.detail, null);
+  assert.equal(task.owner_team_id, null);
+  assert.equal(task.due_at, null);
+  assert.equal(task.evidence_json, null);
+  assert.equal(task.completed_at, null);
+  assert.equal(task.completed_by, null);
+
+  workflowsRepo.insertWorkflowTask(db, {
+    workflowId: wf.id, title: '任务二', detail: '细节', ownerTeamId: 'tm_1', status: 'in_progress',
+    dueAt: '2026-10-20', now: '2026-10-05T00:00:00.000Z',
+  });
+  workflowsRepo.insertWorkflowTask(db, {
+    workflowId: wf2.id, title: '另一工作流的任务', now: '2026-10-04T00:00:00.000Z',
+  });
+  const tasks = workflowsRepo.listWorkflowTasksByWorkflow(db, wf.id);
+  assert.deepEqual(tasks.map((r) => r.title), ['跑通风控模型', '任务二'], '只返回本工作流的任务且按 created_at 升序');
+  assert.equal(workflowsRepo.getWorkflowTask(db, task.id).title, '跑通风控模型');
+
+  assert.equal(workflowsRepo.updateWorkflowTaskStatus(db, task.id, 'in_progress'), 1);
+  assert.equal(workflowsRepo.getWorkflowTask(db, task.id).status, 'in_progress');
+  assert.equal(workflowsRepo.updateWorkflowTaskStatus(db, 'tk_none', 'done'), 0, '改不存在的任务返回 0');
+
+  // 完成留痕：状态 + 证据 + 完成时间 + 完成人
+  assert.equal(workflowsRepo.completeWorkflowTask(db, task.id, {
+    status: 'done', evidenceJson: '{"repo":"https://example.com/x","version":"v1"}',
+    completedAt: '2026-10-06T00:00:00.000Z', completedBy: 'u_a',
+  }), 1);
+  const done = workflowsRepo.getWorkflowTask(db, task.id);
+  assert.equal(done.status, 'done');
+  assert.equal(done.evidence_json, '{"repo":"https://example.com/x","version":"v1"}');
+  assert.equal(done.completed_at, '2026-10-06T00:00:00.000Z');
+  assert.equal(done.completed_by, 'u_a');
+  cleanup(db, close, dataDir);
+});
+
+test('task-claims 仓储：有效领取、释放后退出索引、可再领、重复领取被数据库拒绝', () => {
+  const { db, close, dataDir } = setup();
+  seedRepo(db);
+  workflowsRepo.insertWorkflow(db, {
+    editionId: 'ed_1', taskPackageId: 'tp_ok', name: '风控助手工作流', now: '2026-10-02T00:00:00.000Z',
+  });
+  const task = workflowsRepo.insertWorkflowTask(db, {
+    workflowId: db.prepare('SELECT id FROM workflows LIMIT 1').get().id,
+    title: '跑通风控模型', now: '2026-10-04T00:00:00.000Z',
+  });
+  const task2 = workflowsRepo.insertWorkflowTask(db, {
+    workflowId: db.prepare('SELECT id FROM workflows LIMIT 1').get().id,
+    title: '第二个任务', now: '2026-10-04T01:00:00.000Z',
+  });
+
+  const claim = taskClaimsRepo.insertTaskClaim(db, {
+    taskId: task.id, teamId: 'tm_1', userId: 'u_a', now: '2026-10-03T00:00:00.000Z',
+  });
+  assert.equal(claim.task_id, task.id);
+  assert.equal(claim.user_id, 'u_a');
+  assert.equal(claim.released_at, null);
+  assert.equal(taskClaimsRepo.getActiveClaim(db, task.id).id, claim.id);
+  assert.equal(taskClaimsRepo.countActiveClaims(db, task.id), 1);
+
+  // 已被占用时再领 → 数据库拒绝（不是应用层判断）
+  assert.throws(
+    () => taskClaimsRepo.insertTaskClaim(db, {
+      taskId: task.id, teamId: 'tm_1', userId: 'u_b', now: '2026-10-03T00:00:01.000Z',
+    }),
+    /UNIQUE constraint failed/,
+  );
+
+  // 释放：第一次改 1 行，第二次（已释放）改 0 行
+  assert.equal(taskClaimsRepo.releaseTaskClaim(db, claim.id, '2026-10-03T01:00:00.000Z'), 1);
+  assert.equal(taskClaimsRepo.releaseTaskClaim(db, claim.id, '2026-10-03T02:00:00.000Z'), 0, '已释放的不能再改');
+  assert.equal(taskClaimsRepo.getActiveClaim(db, task.id), null, '释放后没有有效领取');
+  assert.equal(taskClaimsRepo.countActiveClaims(db, task.id), 0);
+
+  // 释放后可以再领
+  const again = taskClaimsRepo.insertTaskClaim(db, {
+    taskId: task.id, teamId: 'tm_1', userId: 'u_b', now: '2026-10-03T03:00:00.000Z',
+  });
+  assert.equal(again.user_id, 'u_b');
+  assert.equal(taskClaimsRepo.countActiveClaims(db, task.id), 1);
+
+  // u_a 的第二笔领取 —— 用来判别 listClaimsByUser 的排序（只有一笔时排序不可判别）
+  const claim2 = taskClaimsRepo.insertTaskClaim(db, {
+    taskId: task2.id, teamId: 'tm_1', userId: 'u_a', now: '2026-10-03T04:00:00.000Z',
+  });
+
+  const byUser = taskClaimsRepo.listClaimsByUser(db, 'u_a');
+  assert.deepEqual(byUser.map((r) => r.id), [claim.id, claim2.id], '按 claimed_at 升序列出该人的全部领取（含已释放的）');
+  assert.equal(taskClaimsRepo.listClaimsByUser(db, 'u_nobody').length, 0);
+  cleanup(db, close, dataDir);
+});
+
+test('teamMembers 追加的两个函数：只认「这个人是不是这支队的在队成员」', () => {
+  const { db, close, dataDir } = setup();
+  seedRepo(db);
+
+  assert.equal(hasActiveMembership(db, 'tm_1', 'u_a'), true, 'u_a 是 tm_1 的在队队长');
+  assert.equal(hasActiveMembership(db, 'tm_1', 'u_b'), true, 'u_b 是 tm_1 的在队成员');
+  assert.equal(hasActiveMembership(db, 'tm_1', 'u_c'), false, 'u_c 不是 tm_1 的成员');
+  assert.equal(hasActiveMembership(db, 'tm_9', 'u_a'), false, 'u_a 已从 tm_9 离队（left_at 非空）');
+
+  const teams = listMemberTeams(db, 'u_a');
+  assert.deepEqual(teams.map((r) => r.id), ['tm_1'], '已离队的 tm_9 不算在队');
+  assert.deepEqual(listMemberTeams(db, 'u_a', { editionId: 'ed_1' }).map((r) => r.id), ['tm_1']);
+  assert.deepEqual(listMemberTeams(db, 'u_a', { editionId: 'ed_2' }).map((r) => r.id), [], 'tm_9 已离队，不算 ed_2 的在队队');
+  assert.deepEqual(listMemberTeams(db, 'u_c').map((r) => r.id), ['tm_2']);
+  cleanup(db, close, dataDir);
+});
+
+test('三池仓储：写、覆盖、删、按届期读，且人才池按积分倒序', () => {
+  const { db, close, dataDir } = setup();
+  seedRepo(db);
+
+  // 项目池
+  const ppId = poolsRepo.insertPoolProject(db, {
+    editionId: 'ed_1', teamId: 'tm_1', title: '零售风控助手', stageReached: 'S3', tier: 'C',
+    businessValue: 1, summary: '摘要', now: '2026-10-05T00:00:00.000Z',
+  });
+  poolsRepo.insertPoolProject(db, {
+    editionId: 'ed_1', teamId: 'tm_2', title: '智能投顾', now: '2026-10-05T00:00:00.000Z',
+  });
+  poolsRepo.insertPoolProject(db, {
+    editionId: 'ed_2', teamId: 'tm_9', title: '第二届项目', now: '2026-10-05T00:00:00.000Z',
+  });
+  assert.equal(poolsRepo.listPoolProjectRows(db, 'ed_1').length, 2, '按届期过滤');
+  assert.equal(poolsRepo.listPoolProjectRows(db).length, 3, '不传届期返回全部');
+  assert.deepEqual(poolsRepo.listPoolProjectRows(db, 'ed_1').map((r) => r.team_id), ['tm_1', 'tm_2']);
+  assert.equal(poolsRepo.updatePoolProject(db, ppId, {
+    title: '零售风控助手 v2', industry: '金融', stageReached: 'S4', tier: 'B', businessValue: 2, summary: '新摘要',
+  }), 1);
+  const pp = poolsRepo.listPoolProjectRows(db, 'ed_1')[0];
+  assert.equal(pp.title, '零售风控助手 v2');
+  assert.equal(pp.industry, '金融');
+  assert.equal(pp.stage_reached, 'S4');
+  assert.equal(pp.tier, 'B');
+  assert.equal(pp.business_value, 2);
+  assert.equal(pp.summary, '新摘要');
+  assert.equal(poolsRepo.deletePoolProject(db, ppId), 1);
+  assert.equal(poolsRepo.deletePoolProject(db, ppId), 0, '删不存在的返回 0');
+  assert.equal(poolsRepo.listPoolProjectRows(db, 'ed_1').length, 1);
+
+  // 人才池（积分顺序与 user_id 顺序**故意相反** → 排序可判别）
+  poolsRepo.insertPoolTalent(db, {
+    editionId: 'ed_1', userId: 'u_a', name: '甲', org: '学堂', totalPoints: 5, mbaStatus: 'mba',
+    stagesJoined: 3, now: '2026-10-05T00:00:00.000Z',
+  });
+  const ptId = poolsRepo.insertPoolTalent(db, {
+    editionId: 'ed_1', userId: 'u_b', name: '乙', org: '学堂', totalPoints: 18, now: '2026-10-05T00:00:00.000Z',
+  });
+  poolsRepo.insertPoolTalent(db, {
+    editionId: 'ed_2', userId: 'u_c', name: '丙', totalPoints: 99, now: '2026-10-05T00:00:00.000Z',
+  });
+  const talents = poolsRepo.listPoolTalentRows(db, 'ed_1');
+  assert.deepEqual(talents.map((r) => r.user_id), ['u_b', 'u_a'], '人才池按 total_points 倒序（不是按 user_id）');
+  // 不传届期：先按 edition_id 分组，组内再按 total_points 倒序
+  assert.deepEqual(poolsRepo.listPoolTalentRows(db).map((r) => r.user_id), ['u_b', 'u_a', 'u_c']);
+  assert.equal(poolsRepo.updatePoolTalent(db, ptId, {
+    name: '乙改', org: '新学堂', totalPoints: 7, mbaStatus: 'member', stagesJoined: 2, skillsJson: '["风控"]',
+  }), 1);
+  const pt = poolsRepo.listPoolTalentRows(db, 'ed_1').find((r) => r.id === ptId);
+  assert.equal(pt.name, '乙改');
+  assert.equal(pt.org, '新学堂');
+  assert.equal(pt.total_points, 7);
+  assert.equal(pt.mba_status, 'member');
+  assert.equal(pt.stages_joined, 2);
+  assert.equal(pt.skills_json, '["风控"]');
+  assert.equal(poolsRepo.deletePoolTalent(db, ptId), 1);
+  assert.equal(poolsRepo.listPoolTalentRows(db, 'ed_1').length, 1);
+
+  // 资源池
+  const prId = poolsRepo.insertPoolResource(db, {
+    editionId: 'ed_1', enterpriseId: 'ent_1', enterpriseName: '某银行', kind: 'enterprise_brief',
+    detail: '零售风控助手', now: '2026-10-05T00:00:00.000Z',
+  });
+  poolsRepo.insertPoolResource(db, {
+    editionId: 'ed_1', enterpriseId: 'ent_2', enterpriseName: '某券商', kind: 'free_brief',
+    now: '2026-10-05T00:00:00.000Z',
+  });
+  assert.equal(poolsRepo.listPoolResourceRows(db, 'ed_1').length, 2);
+  assert.deepEqual(poolsRepo.listPoolResourceRows(db, 'ed_1').map((r) => r.enterprise_id), ['ent_1', 'ent_2']);
+  assert.equal(poolsRepo.updatePoolResource(db, prId, {
+    enterpriseName: '某银行科技部', kind: 'enterprise_brief', detail: '新详情',
+  }), 1);
+  const pr = poolsRepo.listPoolResourceRows(db, 'ed_1')[0];
+  assert.equal(pr.enterprise_name, '某银行科技部');
+  assert.equal(pr.detail, '新详情');
+  assert.equal(poolsRepo.deletePoolResource(db, prId), 1);
+  assert.equal(poolsRepo.listPoolResourceRows(db, 'ed_1').length, 1);
+  cleanup(db, close, dataDir);
+});
+
+test('pool-sources 只读派生源：按届期过滤、软删过滤、status 过滤、跨届期积分', () => {
+  const { db, close, dataDir } = setup();
+  seedRepo(db);
+
+  assert.equal(poolSourcesRepo.getEdition(db, 'ed_1').name, '第一届');
+  assert.equal(poolSourcesRepo.getEdition(db, 'ed_none'), null);
+
+  // 软删的队不算
+  assert.deepEqual(poolSourcesRepo.listEditionTeams(db, 'ed_1').map((r) => r.id), ['tm_1', 'tm_2']);
+
+  // 软删的题不算；status 过滤要真的起作用（种子同时有 approved 与 submitted）
+  const allPkgs = poolSourcesRepo.listEditionPackages(db, 'ed_1');
+  assert.deepEqual(allPkgs.map((r) => r.id), ['tp_free', 'tp_ok', 'tp_wait'], '软删的 tp_gone 被过滤');
+  const approved = poolSourcesRepo.listEditionPackages(db, 'ed_1', { statuses: ['approved'] });
+  assert.deepEqual(approved.map((r) => r.id), ['tp_free', 'tp_ok'], '只留 approved');
+  const two = poolSourcesRepo.listEditionPackages(db, 'ed_1', { statuses: ['approved', 'submitted'] });
+  assert.deepEqual(two.map((r) => r.id), ['tp_free', 'tp_ok', 'tp_wait']);
+
+  // stages."key" 是带引号的标识符 → 必须映射成 stage_key
+  const stages = poolSourcesRepo.listEditionStages(db, 'ed_1');
+  assert.deepEqual(stages.map((r) => r.stage_key), ['s1', 's2']);
+  assert.equal(stages[0].stage_key, 's1');
+
+  // stage_results 通过 stages 关联到届期：ed_2 的结果不混进来
+  const results = poolSourcesRepo.listEditionStageResults(db, 'ed_1');
+  assert.deepEqual(results.map((r) => r.team_id), ['tm_1', 'tm_2', 'tm_1']);
+  const withTeams = poolSourcesRepo.listStageResultsWithTeams(db, 'st_1');
+  assert.deepEqual(withTeams.map((r) => r.team_name), ['一队', '二队']);
+
+  // tier_records 没有 edition_id → 通过 teams 关联
+  assert.deepEqual(poolSourcesRepo.listEditionTierRecords(db, 'ed_1').map((r) => r.team_id), ['tm_1', 'tm_2']);
+
+  // 积分流水按届期；个人积分跨届期累加（R-RNK-10）
+  assert.equal(poolSourcesRepo.listEditionLedger(db, 'ed_1').length, 3);
+  assert.equal(poolSourcesRepo.listUserLedger(db, 'u_a').length, 2, 'u_a 的积分跨两届');
+  assert.deepEqual(poolSourcesRepo.listUserLedger(db, 'u_a').map((r) => r.edition_id), ['ed_1', 'ed_2']);
+
+  // 本届有积分流水的人 / 全部在册用户
+  assert.deepEqual(poolSourcesRepo.listEditionUsers(db, 'ed_1').map((r) => r.id), ['u_a', 'u_b']);
+  assert.deepEqual(poolSourcesRepo.listAllUsers(db).map((r) => r.id), ['u_a', 'u_b', 'u_c'], '停用用户不算在册');
+
+  // 报名
+  assert.deepEqual(poolSourcesRepo.listEditionRegistrations(db, 'ed_1').map((r) => r.id), ['rg_1']);
+  cleanup(db, close, dataDir);
+});
+
+test('public-tokens 仓储：签发、查、吊销、按届期列', () => {
+  const { db, close, dataDir } = setup();
+  seedRepo(db);
+
+  const issued = publicTokensRepo.insertPublicToken(db, {
+    token: 'hash_a', scope: 'leaderboard', editionId: 'ed_1', expiresAt: '2026-11-01T00:00:00.000Z',
+    now: '2026-10-20T00:00:00.000Z',
+  });
+  assert.deepEqual(issued, {
+    token: 'hash_a', scope: 'leaderboard', editionId: 'ed_1', expiresAt: '2026-11-01T00:00:00.000Z',
+  });
+  publicTokensRepo.insertPublicToken(db, {
+    token: 'hash_b', scope: 'calendar', editionId: 'ed_2', expiresAt: '2026-11-01T00:00:00.000Z',
+    now: '2026-10-21T00:00:00.000Z',
+  });
+
+  const found = publicTokensRepo.findPublicToken(db, 'hash_a');
+  assert.equal(found.scope, 'leaderboard');
+  assert.equal(found.edition_id, 'ed_1');
+  assert.equal(found.created_at, '2026-10-20T00:00:00.000Z');
+  assert.equal(publicTokensRepo.findPublicToken(db, 'hash_none'), null);
+
+  assert.deepEqual(publicTokensRepo.listPublicTokens(db).map((r) => r.token), ['hash_a', 'hash_b']);
+  assert.deepEqual(publicTokensRepo.listPublicTokens(db, { editionId: 'ed_1' }).map((r) => r.token), ['hash_a']);
+
+  assert.equal(publicTokensRepo.deletePublicToken(db, 'hash_a'), 1);
+  assert.equal(publicTokensRepo.deletePublicToken(db, 'hash_a'), 0, '删不存在的返回 0');
+  assert.equal(publicTokensRepo.findPublicToken(db, 'hash_a'), null);
+  cleanup(db, close, dataDir);
+});
+
+test('必填列与外键真的由数据库挡住（不是应用层自觉）', () => {
+  const { db, close, dataDir } = setup();
+  seedRepo(db);
+
+  // 先造出**真实存在**的父行：否则「NOT NULL 用例」会先撞外键，
+  // 报错信息就不是 NOT NULL，断言就测错了东西。
+  db.prepare("INSERT INTO workflows (id, edition_id, task_package_id, name, created_at) VALUES ('wf','ed_1','tp_ok','风控助手工作流','2026-10-02T00:00:00.000Z')").run();
+  db.prepare("INSERT INTO workflow_tasks (id, workflow_id, title, detail, owner_team_id, status, due_at, created_at) VALUES ('tk','wf','跑通风控模型',NULL,'tm_1','todo',NULL,'2026-10-02T00:00:00.000Z')").run();
+
+  const NOT_NULL_CASES = [
+    ['workflows.name', "INSERT INTO workflows (id, edition_id, task_package_id, name, created_at) VALUES ('x1','ed_1','tp_ok',NULL,'t')"],
+    ['workflows.edition_id', "INSERT INTO workflows (id, edition_id, task_package_id, name, created_at) VALUES ('x2',NULL,'tp_ok','n','t')"],
+    ['workflows.task_package_id', "INSERT INTO workflows (id, edition_id, task_package_id, name, created_at) VALUES ('x3','ed_1',NULL,'n','t')"],
+    ['workflows.created_at', "INSERT INTO workflows (id, edition_id, task_package_id, name, created_at) VALUES ('x4','ed_1','tp_ok','n',NULL)"],
+    ['workflow_tasks.title', "INSERT INTO workflow_tasks (id, workflow_id, title, detail, owner_team_id, status, due_at, created_at) VALUES ('y1','wf',NULL,NULL,NULL,'todo',NULL,'t')"],
+    ['workflow_tasks.status', "INSERT INTO workflow_tasks (id, workflow_id, title, detail, owner_team_id, status, due_at, created_at) VALUES ('y2','wf','t',NULL,NULL,NULL,NULL,'t')"],
+    ['workflow_tasks.workflow_id', "INSERT INTO workflow_tasks (id, workflow_id, title, detail, owner_team_id, status, due_at, created_at) VALUES ('y3',NULL,'t',NULL,NULL,'todo',NULL,'t')"],
+    ['task_claims.task_id', "INSERT INTO task_claims (id, task_id, team_id, user_id, claimed_at, released_at) VALUES ('z1',NULL,NULL,'u_a','t',NULL)"],
+    ['task_claims.user_id', "INSERT INTO task_claims (id, task_id, team_id, user_id, claimed_at, released_at) VALUES ('z2','tk',NULL,NULL,'t',NULL)"],
+    ['task_claims.claimed_at', "INSERT INTO task_claims (id, task_id, team_id, user_id, claimed_at, released_at) VALUES ('z3','tk',NULL,'u_a',NULL,NULL)"],
+    ['pool_projects.edition_id', "INSERT INTO pool_projects (id, edition_id, team_id, title, industry, stage_reached, tier, business_value, summary, created_at) VALUES ('p1',NULL,'tm_1','t',NULL,NULL,NULL,NULL,NULL,'t')"],
+    ['pool_projects.team_id', "INSERT INTO pool_projects (id, edition_id, team_id, title, industry, stage_reached, tier, business_value, summary, created_at) VALUES ('p2','ed_1',NULL,'t',NULL,NULL,NULL,NULL,NULL,'t')"],
+    ['pool_talents.user_id', "INSERT INTO pool_talents (id, user_id, edition_id, name, org, total_points, mba_status, stages_joined, skills_json, created_at) VALUES ('t1',NULL,'ed_1','n',NULL,0,NULL,0,'[]','t')"],
+    ['pool_talents.edition_id', "INSERT INTO pool_talents (id, user_id, edition_id, name, org, total_points, mba_status, stages_joined, skills_json, created_at) VALUES ('t0','u_a',NULL,'n',NULL,0,NULL,0,'[]','t')"],
+    ['pool_talents.total_points', "INSERT INTO pool_talents (id, user_id, edition_id, name, org, total_points, mba_status, stages_joined, skills_json, created_at) VALUES ('t2','u_a','ed_1','n',NULL,NULL,NULL,0,'[]','t')"],
+    ['pool_talents.stages_joined', "INSERT INTO pool_talents (id, user_id, edition_id, name, org, total_points, mba_status, stages_joined, skills_json, created_at) VALUES ('t3','u_a','ed_1','n',NULL,0,NULL,NULL,'[]','t')"],
+    ['pool_talents.skills_json', "INSERT INTO pool_talents (id, user_id, edition_id, name, org, total_points, mba_status, stages_joined, skills_json, created_at) VALUES ('t4','u_a','ed_1','n',NULL,0,NULL,0,NULL,'t')"],
+    ['pool_resources.edition_id', "INSERT INTO pool_resources (id, edition_id, enterprise_id, enterprise_name, kind, detail, created_at) VALUES ('r1',NULL,'ent_1','n','enterprise_brief','d','t')"],
+    ['pool_resources.enterprise_id', "INSERT INTO pool_resources (id, edition_id, enterprise_id, enterprise_name, kind, detail, created_at) VALUES ('r2','ed_1',NULL,'n','enterprise_brief','d','t')"],
+    ['pool_resources.kind', "INSERT INTO pool_resources (id, edition_id, enterprise_id, enterprise_name, kind, detail, created_at) VALUES ('r3','ed_1','ent_1','n',NULL,'d','t')"],
+    ['public_tokens.scope', "INSERT INTO public_tokens (token, scope, edition_id, expires_at, created_at) VALUES ('h9',NULL,'ed_1','e','c')"],
+    ['public_tokens.expires_at', "INSERT INTO public_tokens (token, scope, edition_id, expires_at, created_at) VALUES ('h10','leaderboard','ed_1',NULL,'c')"],
+  ];
+  for (const [label, sql] of NOT_NULL_CASES) {
+    assert.throws(() => db.prepare(sql).run(), /NOT NULL constraint failed/, `${label} 必须为 NOT NULL`);
+  }
+
+  // ⚠️ public_tokens.token **不在**上面的名单里 —— 这不是漏写，是 SQLite 的历史行为：
+  //    TEXT PRIMARY KEY（只有 INTEGER PRIMARY KEY 才是 rowid 别名）允许 NULL。
+  //    P0–P4 的所有 id 列都是这个写法（users.id / teams.id / task_packages.id / …），
+  //    本迁移沿用同一约定（不单点偏离）。
+  //    → 这里把它**钉住**：将来若给主键补 NOT NULL，这条会红，提示同步补仓储层的空值防线。
+  //    实际影响：无 —— 公开令牌的查找键恒为 SHA-256 十六进制串，永远匹配不到 NULL 行。
+  assert.doesNotThrow(
+    () => db.prepare("INSERT INTO public_tokens (token, scope, edition_id, expires_at, created_at) VALUES (NULL,'leaderboard','ed_1','e','c')").run(),
+    'SQLite 的 TEXT PRIMARY KEY 允许 NULL（P0–P4 既有约定）',
+  );
+
+  const FK_CASES = [
+    ['workflows.task_package_id → task_packages(id)', "INSERT INTO workflows (id, edition_id, task_package_id, name, created_at) VALUES ('f1','ed_1','tp_none','n','t')"],
+    ['workflow_tasks.workflow_id → workflows(id)', "INSERT INTO workflow_tasks (id, workflow_id, title, detail, owner_team_id, status, due_at, created_at) VALUES ('f2','wf_none','t',NULL,NULL,'todo',NULL,'t')"],
+    ['workflow_tasks.owner_team_id → teams(id)', "INSERT INTO workflow_tasks (id, workflow_id, title, detail, owner_team_id, status, due_at, created_at) VALUES ('f3','wf','t',NULL,'tm_none','todo',NULL,'t')"],
+    ['task_claims.task_id → workflow_tasks(id)', "INSERT INTO task_claims (id, task_id, team_id, user_id, claimed_at, released_at) VALUES ('f4','tk_none',NULL,'u_a','t',NULL)"],
+    ['task_claims.team_id → teams(id)', "INSERT INTO task_claims (id, task_id, team_id, user_id, claimed_at, released_at) VALUES ('f5','tk','tm_none','u_a','t',NULL)"],
+    ['task_claims.user_id → users(id)', "INSERT INTO task_claims (id, task_id, team_id, user_id, claimed_at, released_at) VALUES ('f6','tk',NULL,'u_none','t',NULL)"],
+    ['pool_projects.team_id → teams(id)', "INSERT INTO pool_projects (id, edition_id, team_id, title, industry, stage_reached, tier, business_value, summary, created_at) VALUES ('f7','ed_1','tm_none','t',NULL,NULL,NULL,NULL,NULL,'t')"],
+    ['pool_talents.user_id → users(id)', "INSERT INTO pool_talents (id, user_id, edition_id, name, org, total_points, mba_status, stages_joined, skills_json, created_at) VALUES ('f8','u_none','ed_1','n',NULL,0,NULL,0,'[]','t')"],
+  ];
+  for (const [label, sql] of FK_CASES) {
+    assert.throws(() => db.prepare(sql).run(), /FOREIGN KEY constraint failed/, `${label} 必须有外键`);
+  }
+
+  // 主键重复必须被拒绝
+  db.prepare("INSERT INTO public_tokens (token, scope, edition_id, expires_at, created_at) VALUES ('dup','leaderboard','ed_1','e','c')").run();
+  assert.throws(
+    () => db.prepare("INSERT INTO public_tokens (token, scope, edition_id, expires_at, created_at) VALUES ('dup','calendar','ed_1','e','c')").run(),
+    /UNIQUE constraint failed/,
+  );
+
+  // 七张表的主键都要真的挡住重复 id
+  // ⚠️ 重复行必须**只撞主键**：自然键 / 部分唯一索引要用不同的值，
+  //    否则报错信息指向的是自然键，这条断言就测错了东西。
+  db.prepare("INSERT INTO workflow_tasks (id, workflow_id, title, detail, owner_team_id, status, due_at, created_at) VALUES ('tk2','wf','第二个任务',NULL,'tm_1','todo',NULL,'t')").run();
+  db.prepare("INSERT INTO task_claims (id, task_id, team_id, user_id, claimed_at, released_at) VALUES ('ck1','tk','tm_1','u_a','2026-10-03T00:00:00.000Z',NULL)").run();
+  db.prepare("INSERT INTO pool_projects (id, edition_id, team_id, title, industry, stage_reached, tier, business_value, summary, created_at) VALUES ('pk1','ed_2','tm_9','t',NULL,NULL,NULL,NULL,NULL,'t')").run();
+  db.prepare("INSERT INTO pool_talents (id, user_id, edition_id, name, org, total_points, mba_status, stages_joined, skills_json, created_at) VALUES ('pt1','u_a','ed_1','n',NULL,0,NULL,0,'[]','t')").run();
+  db.prepare("INSERT INTO pool_resources (id, edition_id, enterprise_id, enterprise_name, kind, detail, created_at) VALUES ('pr1','ed_1','ent_1','n','enterprise_brief','d','t')").run();
+  const PK_DUP_CASES = [
+    ['workflows', "INSERT INTO workflows (id, edition_id, task_package_id, name, created_at) VALUES ('wf','ed_1','tp_ok','n2','t')"],
+    ['workflow_tasks', "INSERT INTO workflow_tasks (id, workflow_id, title, detail, owner_team_id, status, due_at, created_at) VALUES ('tk','wf','t2',NULL,'tm_1','todo',NULL,'t')"],
+    ['task_claims', "INSERT INTO task_claims (id, task_id, team_id, user_id, claimed_at, released_at) VALUES ('ck1','tk2','tm_1','u_b','t',NULL)"],
+    ['pool_projects', "INSERT INTO pool_projects (id, edition_id, team_id, title, industry, stage_reached, tier, business_value, summary, created_at) VALUES ('pk1','ed_2','tm_1','t2',NULL,NULL,NULL,NULL,NULL,'t')"],
+    ['pool_talents', "INSERT INTO pool_talents (id, user_id, edition_id, name, org, total_points, mba_status, stages_joined, skills_json, created_at) VALUES ('pt1','u_b','ed_1','n2',NULL,0,NULL,0,'[]','t')"],
+    ['pool_resources', "INSERT INTO pool_resources (id, edition_id, enterprise_id, enterprise_name, kind, detail, created_at) VALUES ('pr1','ed_1','ent_2','n2','free_brief','d','t')"],
+    ['public_tokens', "INSERT INTO public_tokens (token, scope, edition_id, expires_at, created_at) VALUES ('dup','calendar','ed_1','e','c')"],
+  ];
+  for (const [label, sql] of PK_DUP_CASES) {
+    assert.throws(() => db.prepare(sql).run(), /UNIQUE constraint failed/, `${label} 的主键必须挡住重复 id`);
+  }
+
+  // 同一届的**两支不同队**各自都能有项目池记录（唯一键是 (edition_id, team_id)，不是 edition_id）
+  const insProject = db.prepare(
+    `INSERT INTO pool_projects (id, edition_id, team_id, title, industry, stage_reached, tier, business_value, summary, created_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?)`,
+  );
+  insProject.run('pp_a', 'ed_1', 'tm_1', '一队项目', null, null, null, null, null, 't');
+  insProject.run('pp_b', 'ed_1', 'tm_2', '二队项目', null, null, null, null, null, 't');
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM pool_projects WHERE edition_id = ?').get('ed_1').n, 2);
+
+  cleanup(db, close, dataDir);
+});
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
 
 Run: `cd platform && node --test test/pools-migration.test.js`
-Expected: FAIL —— `assert.equal(result.version, 6)` 失败（当前迁移版本是 5，`006_pools.sql` 不存在，七张表一张都没建出来）
+Expected: FAIL —— `assert.equal(result.version, 6)` 失败（当前迁移版本是 5，`006_pools.sql` 不存在，七张表一张都没建出来）。**实测补充**：另外 4 个用例也红，报 `no such table: workflows` / `no such table: public_tokens` —— 因为建表本身就不存在，测的不是「版本号对不对」而是「表在不在」。
 
 - [ ] **Step 3: 创建 `db/migrations/006_pools.sql`**
 
@@ -870,7 +1447,7 @@ export function listPublicTokens(db, { editionId = null } = {}) {
 - [ ] **Step 10: 运行测试确认通过**
 
 Run: `cd platform && node --test test/pools-migration.test.js`
-Expected: PASS（5 个测试全过：pools-migration.test.js 5）
+Expected: PASS —— `pools-migration.test.js` **13 例全过**。（原规格写「5 个测试」，是**只覆盖迁移层**的版本；本 Task 实跑后补了「真并发」与「仓储层」用例，见文末台账 T1-1 C-1 / C-2。）
 
 - [ ] **Step 11: 实跑迁移**
 
@@ -880,14 +1457,25 @@ Expected: 输出 `迁移完成，当前版本 6`，本次应用包含 `006_pools
 - [ ] **Step 12: 提交**
 
 ```bash
-cd platform && git add db/migrations/006_pools.sql src/db/repo test/pools-migration.test.js
+cd platform && git add db/migrations/006_pools.sql src/db/repo/workflows.js src/db/repo/task-claims.js \
+  src/db/repo/pools.js src/db/repo/pool-sources.js src/db/repo/public-tokens.js src/db/repo/teamMembers.js \
+  test/pools-migration.test.js
 git commit -m "feat(P5): 工作流与三池数据模型（006_pools.sql）+ 领取唯一约束 + 仓储层
 
 对应 R-OPS-13 / R-OPS-14 / R-POOL-01 / R-POOL-02 / R-POOL-03：
 - task_claims 用部分唯一索引保证同一任务同时只有一个人领取
 - 三池表只提供仓储，不提供手工写入口（派生值单一来源）
-- 任务清单与里程碑不共享表"
+- 任务清单与里程碑不共享表" -- \
+  db/migrations/006_pools.sql src/db/repo/workflows.js src/db/repo/task-claims.js \
+  src/db/repo/pools.js src/db/repo/pool-sources.js src/db/repo/public-tokens.js src/db/repo/teamMembers.js \
+  test/pools-migration.test.js
 ```
+
+> ⚠️ **【2026-10-21 父代理预审修正 T1-9】提交写法**
+> 原写法：`git add …` 后 `git commit -m "…" `（**没有 `-- <paths…>`**）。
+> 问题：`-m` 与 `--` 的顺序、以及**必须显式路径**是本项目的提交纪律 ——
+> 显式路径让「这次提交到底动了哪些文件」在命令里就写死，不依赖暂存区的残留状态。
+> 改成：`git add <paths…>` → `git commit -m "…" -- <paths…>`（`-m` 在 `--` 之前）。
 
 ---
 
@@ -3963,6 +4551,22 @@ git commit -m "feat(P5): 任务清单前端页 + 端到端验收（工作流→�
 - **R-STG-04「纯文字进度说明不给分」** 原文针对的是**赛段交付物打分**（P2/P3 的评审对象）。本阶段只把它用来约束**任务清单的完成记录**：`completeTask` 只写 `workflow_tasks` 的状态与证据，⛔ **不写 `points_ledger`、不写 `behavior_events`、不产生任何分数**。→ **任务完成 ≠ 赛段交付物得分**（有测试断言）。
 - **「列表不满足 → 200 + 空集」** 与 **R-AUD-05「空结果必须显式报错」** 适用范围不同：读取类列表（三池、任务清单）仍按三态返回 200 + 空集；**写入/同步类**（同步三池、提交完成状态）返回空才是危险场景 → 一律抛错或 4xx，不返回空成功。
 
+### I. Task 1（工作流与三池数据模型）的偏差
+
+> 逐条核对 `INTERFACES.md` §6 的**列清单**（契约只约束列名，索引不是列）。
+> 核对结论：**契约的 7 张表、全部列名，本 Task 一列不多、一列不少**（唯一的多项是 `workflow_tasks` 的 3 列，
+> 已在上面的 C 节登记）。下面记的是「计划写法 vs 实际写法」里**需要父代理知情**的部分。
+
+| # | 偏差 | 规格的写法 | 本阶段的写法 | 理由 |
+|---|---|---|---|---|
+| I-1 | `workflow_tasks` 多 3 列 | 契约 8 列：`id, workflow_id, title, detail, owner_team_id, status, due_at, created_at` | 11 列：追加 `evidence_json` / `completed_at` / `completed_by` | 计划 C 节已登记；R-STG-04 要求「完成」留痕（可运行产物 / 明确阻塞点）。**不追加这 3 列 → 完成记录无法复核** |
+| I-2 | 其余 6 张表 | 契约列清单 | **逐字一致**（`workflows` / `task_claims` / `pool_projects` / `pool_talents` / `pool_resources` / `public_tokens`） | 逐列比对通过 |
+| I-3 | 索引（契约未列） | 契约只给列清单 | 8 个索引：`idx_workflows_edition` / `idx_workflows_package` / `idx_workflow_tasks_workflow` / `idx_workflow_tasks_team` / `idx_task_claims_task` / `idx_task_claims_user` / `idx_public_tokens_edition` + 4 个**唯一**索引（`ux_task_claims_active` 部分唯一索引 + 三池自然键唯一索引） | 索引不是列，不与契约冲突；**「同一任务只能有一个有效领取」的唯一载体就是 `ux_task_claims_active` ���— 没有它，本 Task 的灵魂就塌了 |
+| I-4 | `edition_id` 要不要外键 | 契约只列列名 | **不加** `REFERENCES editions(id)`（`workflows` / `pool_projects` / `pool_talents` / `pool_resources` / `public_tokens` 五张表） | 计划的 `public_tokens` 测试用例**不建 `editions` 行**就能插入 —— 一旦加外键该用例当场失败。契约 §6 也只约束列名。⚠️ 已知代价：届期维度靠应用层保证，库里可以插出指向不存在届期的行 |
+| I-5 | 仓储层的额外导出 | 契约 §6 只列了**服务层** 4 个函数 + 「派生源读取」，没列仓储层函数（P0–P4 也都没列） | 额外导出：`findWorkflowByPackage`（workflows.js）/ `listClaimsByUser`（task-claims.js）/ `listPublicTokens`（public-tokens.js）/ 13 个派生源读取函数（pool-sources.js） | 这些是 Task 2/3/4 的只读入口；契约没规定仓储层导出名（P0–P4 的既有命名法：camelCase 文件名 + 函数名） |
+| I-6 | `teamMembers.js` 的归属 | 契约未列仓储层 | **追加**（不重建）`hasActiveMembership` / `listMemberTeams` 到 P1 已建的 `src/db/repo/teamMembers.js` | 计划 I-3 漂移审计已定：同一张 `team_members` 只允许一个仓储文件 |
+| I-7 | 测试文件的覆盖面 | 计划写「迁移 006 + 7 张表 + 部分唯一索引 + 三池唯一约束」（5 例） | 13 例：+ 真并发（两连接同时 insert）+ 仓储层 6 例 + 约束矩阵 1 例 | 原 5 例**只覆盖迁移层** → 本 Task 新建的 5 个仓储文件零覆盖，变异检验会全体存活。见文末台账 T1-1 C-1 |
+
 ### H. 本阶段的**刻意功能缺失**（不是遗漏，评审时不要当 bug 提）
 
 | 缺什么 | 为什么 |
@@ -3975,3 +4579,87 @@ git commit -m "feat(P5): 任务清单前端页 + 端到端验收（工作流→�
 ---
 
 *配套：`../specs/2026-10-20-heikesong-platform-design.md`｜`../requirements-traceability.md`｜`../rule-decisions.md`｜`../`*
+
+
+---
+
+## Task 1 父代理预审修正台账（2026-10-21）
+
+> 执行者：P5 Task 1 实现 Agent。**规格 = 本计划 Task 1 章节**（唯一权威）。
+> 本台账记三件事：① 实跑发现的规格缺陷与处置；② 与 `INTERFACES.md` §6 的逐条核对结论；
+> ③ 变异检验与测试数字。**落盘文件与本计划 Task 1 的代码块逐字一致**（核验脚本见 T1-4）。
+
+### T1-1 实跑发现的规格缺陷与处置
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| C-1 | Important | Task 1 的测试块**只覆盖迁移层**：本 Task 新建的 5 个仓储文件与 `teamMembers.js` 的两个追加函数**零覆盖** | 把 `getActiveClaim` 的 `AND released_at IS NULL` 删掉后，计划原测试**仍全绿** → 仓储层变异体全部存活 | 已补：测试 5 例 → 13 例（仓储层 6 例 + 约束矩阵 1 例 + 真并发 1 例） |
+| C-2 | Important | 计划里的「并发」用例**是串行的**（同一连接先后两次 insert） | 串行的第二次必然撞唯一索引 —— 证明不了「并发下由数据库仲裁」 | 已补：真并发用例（两个 worker 线程 + 两条独立连接 + `SharedArrayBuffer` 屏障），并断言两次 INSERT 的时间区间**重叠**（实测重叠 11–16 ms，8/8 次） |
+| C-3 | Important | 两条连接**同时**建立会撞 `PRAGMA journal_mode = WAL`（`busy_timeout` 在它**之后**才设） | 实测 `Error: database is locked`（errcode 261）于 `src/db/sqlite.js:25` | 测试里改「握手式错开建立」（A 连接 ready 后才起 B）。⛔ **未改 `src/db/sqlite.js`**（P0 的文件，不在本 Task 范围）→ 登记为**上游建议**（把 `busy_timeout` 提到 `journal_mode` 之前） |
+| C-4 | Minor | Step 10 写「PASS（5 个测试全过）」，与补测后不符 | 实跑 13 例 | 已回写 Step 10 |
+| C-5 | Minor | DDL 注释引用的「偏差章节 **D-2 / D-7**」**指向空**（偏差章节实际用 A–H 编号） | 全篇 grep：`D-2` / `D-7` 只出现在引用处，无对应条目 | 登记为知悉项；**未改 DDL 注释**（避免无意义 churn，且注释是计划原文） |
+| C-6 | Minor | `TEXT PRIMARY KEY` 在 SQLite 里**允许 NULL**（历史行为）→ `public_tokens.token` **没有** NOT NULL 防线 | 实测：插入 `token = NULL` 成功、不报 NOT NULL；P0–P4 的 id 列全是同一写法 | 已在测试里**钉住**该行为 + 注释说明；沿用 P0–P4 约定，**不在本迁移单点偏离** → 登记为**上游知悉项**（建议全项目统一补 `NOT NULL`） |
+| C-7 | Minor | Step 2 的 Expected 只提版本断言，实际另外 4 例也红 | 实跑：`no such table: workflows` / `no such table: public_tokens` | 已回写 Step 2 的 Expected |
+| C-8 | Minor | Step 12 的 commit 写法没有 `-- <paths…>` 显式路径 | 本项目提交纪律要求显式路径 | 已回写 Step 12 |
+| C-9 | Minor | 计划的围栏代码块**不含 EOF 换行**（闭合围栏另起一行）→ 直接落盘会让 6 个文件缺结尾换行 | 实测：落盘后 `tail -c 1` 为 `0a` 的只有本 Task 之外的旧文件；本 Task 复制的 6 个文件**无**结尾换行 | 已给这 6 个文件**各补一个结尾换行**（对齐仓库既有约定：`platform/src/db/repo/*.js`、`platform/db/migrations/*.sql`、`platform/test/*.js` **全部**以换行结尾）。代码块内容本身**一字未改** |
+| — | 核对通过 | §E 说「必要时写 `s."key"`」：实测 `key` 在 SQLite 里**不作关键字** | `SELECT key FROM stages` / `SELECT s.key FROM stages s` 全部 OK | **无缺陷**。`pool-sources.js` 仍按计划写 `"key" AS stage_key` —— 列名映射要用（不是关键字问题） |
+
+### T1-2 与 `INTERFACES.md` §6 的逐条核对结论
+
+| 契约表 | 契约列 | 本 Task 实际列 | 多出的列 |
+|---|---|---|---|
+| `workflows` | id, edition_id, task_package_id, name, created_at | 同 | 无 |
+| `workflow_tasks` | id, workflow_id, title, detail, owner_team_id, status, due_at, created_at | 同 | **`evidence_json` / `completed_at` / `completed_by`**（计划 C 节已登记；R-STG-04 完成留痕） |
+| `task_claims` | id, task_id, team_id, user_id, claimed_at, released_at | 同 | 无 |
+| `pool_projects` | id, edition_id, team_id, title, industry, stage_reached, tier, business_value, summary, created_at | 同 | 无 |
+| `pool_talents` | id, user_id, edition_id, name, org, total_points, mba_status, stages_joined, skills_json, created_at | 同 | 无 |
+| `pool_resources` | id, edition_id, enterprise_id, enterprise_name, kind, detail, created_at | 同 | 无 |
+| `public_tokens` | token, scope, edition_id, expires_at, created_at | 同 | 无 |
+
+**唯一的列级超出 = `workflow_tasks` 的 3 列。** 其余超出契约的只有**索引**（8 个，其中 4 个是唯一索引），
+索引不是列、不与契约冲突 —— 而且 `ux_task_claims_active` 正是本 Task 灵魂（并发唯一领取）的载体。
+
+### T1-3 变异检验与测试数字
+
+| 项 | 数 |
+|---|---|
+| 变异体总数 | **81**（SQL 38 + workflows.js 9 + task-claims.js 6 + teamMembers.js 3 + pools.js 9 + pool-sources.js 12 + public-tokens.js 4） |
+| KILLED（测试变红） | **80** |
+| 等价 / 不可观测 | **1**（`L12`：`listStageResultsWithTeams` 的 `LEFT JOIN teams` → `JOIN teams`） |
+| **有效缺口** | **0** |
+| 锚点问题（命中数 ≠ 1） | **0** |
+
+**`L12` 的等价实证**（不是推理，是探针差分）：`stage_results.team_id TEXT NOT NULL REFERENCES teams(id)`（003_review.sql:203）
++ `PRAGMA foreign_keys = ON` ⇒ 每条 `stage_results` 的 `team_id` 必然存在于 `teams` ⇒ `LEFT JOIN` 与 `JOIN` 等价。
+探针差分：**基线快照与变异体快照逐字节相同**（`diff` 为空）。
+
+脚本：`/tmp/p5-mutate/t1.mjs`（指向**已落地**的 `platform/test/pools-migration.test.js`）；
+探针：`/tmp/p5-mutate/dump.mjs`（把本 Task 所有仓储读接口的输出打成一个确定性 JSON 快照）。
+判定三态：`KILLED`（测试红）/ `SURVIVED-EQUIV`（测试绿 **且** 探针差分为空 ⇒ 等价）/ `SURVIVED-GAP`（测试绿 **但** 探针差分非空 ⇒ 有效缺口）。
+
+| 项 | 数 |
+|---|---|
+| 新测试文件用例数 | **13**（`test/pools-migration.test.js`） |
+| 全量用例数 | **818**（基线 805 + 13），**0 红** |
+| 迁移幂等（第 1 次 / 第 2 次） | `迁移完成，当前版本 6` + 本次应用 6 个迁移 / `迁移完成，当前版本 6` + `本次无新迁移` |
+
+### T1-4 计划块逐字核验
+
+核验脚本 `/tmp/p5-t1-sandbox/verify-plan.mjs`：把本计划 Task 1 的每个围栏代码块与**落盘文件**逐字比对
+（`whole` 判定整个文件、`suffix` 判定文件尾部追加段；围栏块不带 EOF 换行，落盘文件 = 计划块 + 一个结尾换行，
+这一位**显式比对、不做静默归一化** —— 见台账 C-9）。
+
+实跑结果：**9 / 9 个块逐字一致，不一致 0 个**。
+
+| 块 | 目标文件 | 判定 |
+|---|---|---|
+| 0（javascript） | `platform/test/pools-migration.test.js` | 整个文件 = 计划块 + 结尾换行 |
+| 1（sql） | `platform/db/migrations/006_pools.sql` | 整个文件 = 计划块 + 结尾换行 |
+| 2（javascript） | `platform/src/db/repo/workflows.js` | 整个文件 = 计划块 + 结尾换行 |
+| 3（javascript） | `platform/src/db/repo/task-claims.js` | 整个文件 = 计划块 + 结尾换行 |
+| 4（javascript） | `platform/src/db/repo/teamMembers.js` | 追加段 = 文件尾部的逐字后缀（P1 已有部分**未动**） |
+| 5（javascript） | `platform/src/db/repo/pools.js` | 整个文件 = 计划块 + 结尾换行 |
+| 6（javascript） | `platform/src/db/repo/pool-sources.js` | 整个文件 = 计划块 + 结尾换行 |
+| 7（javascript） | `platform/src/db/repo/public-tokens.js` | 整个文件 = 计划块 + 结尾换行 |
+| 8（bash） | Step 12 提交命令 | 含 `-- <显式路径>`，且 `-m` 在 `--` 之前 |
+
