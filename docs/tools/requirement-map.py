@@ -52,8 +52,8 @@ ARGS = _ap.parse_args()
 ③ 没有代码引用的需求（多为 NFR 或计划级）← 回落到**计划里**出现该 ID 的 Task；
    仍找不到 ⇒ 标 `未落地（平台不实现）` 或 `未落地（需拍板）`。
 
-⚠️ 扫描面：main（.）+ P5 worktree + P6 worktree（.worktrees/p5-pools / .worktrees/p6-deploy）。
-   三棵树的重叠文件取并集（内容相同的重复文件不影响结论）。
+⚠️ 扫描面：由 `--trees` 给出（默认 `.`，即 main 一棵树；P5/P6 的代码合回 main 后收敛成一棵）。
+   多棵树的重叠文件取并集（内容相同的重复文件不影响结论）。
 """
 import io
 import json
@@ -130,6 +130,52 @@ for pn, plan_rel, tree in PLANS:
                     p = p.replace('platform/', '', 1) if p.startswith('platform/') else p
                     file2task.setdefault(p, (pn, tno, ttitle))
                     task_files.setdefault((pn, tno), set()).add(p)
+        # 次要来源：代码块**首行**的文件头注释（本仓约定 `// <path> — 说明`）。
+        #   有些文件是在「终审修复轮」这类**偏差章节**里新建的，压根没进过 `**Files:**` 段
+        #   （真实实例：P3 修复轮的 `src/services/milestone.js`）⇒ 只认 Files 段会漏掉归属。
+        HDR_RE = re.compile(r'^\s*//\s+(?:platform/)?([\w./-]+\.(?:js|json|sql|html|css|sh|conf|service|yml))\s*[—\-:：]')
+        for i in range(s, e):
+            # 遇到 `## ` 级标题就停 —— 终审修复轮 / 台账是**独立章节**，不属于任何一个 Task，
+            #   否则会被算进「最后一个 Task」头上（真实踩过的坑：P3 修复轮的 milestone.js 被挂到 P3 Task 8）。
+            if re.match(r'^##\s', lines[i]):
+                break
+            m2 = HDR_RE.match(lines[i])
+            if not m2:
+                continue
+            p = m2.group(1)
+            if p in file2task:
+                continue
+            file2task.setdefault(p, (pn, tno, ttitle))
+            task_files.setdefault((pn, tno), set()).add(p)
+    # 次要来源之二：`## ` 级章节（终审修复轮 / 各 Task 台账）也是**独立的落点**，
+    #   那里新建的文件同样要能反查到「落在哪」。它们不是 `### Task N` ⇒ 记成伪 Task。
+    PSEC_SKIP = re.compile(r'^##\s+(?:.*验收标准|与接口契约的偏差|需求覆盖|Global Constraints|File Structure|运行环境|硬约束|环境变量|设计文档|部署目标决策登记|★)')
+    for i, l in enumerate(lines):
+        m3 = re.match(r'^##\s+(.*)', l)
+        if not m3 or PSEC_SKIP.match(l):
+            continue
+        title = m3.group(1).strip()
+        tno3 = re.sub(r'（.*?）|\(.*?\)|\d{4}-\d{2}-\d{2}.*$', '', title).strip()
+        if not tno3:
+            continue
+        # 章节名与去日期后的短名相同时（如「终审修复轮」），标题不重复写一遍
+        if tno3 == title:
+            title = ''
+        # 该章节的边界：到下一个 `## ` 或 `### Task ` 为止
+        e3 = len(lines)
+        for j in range(i + 1, len(lines)):
+            if re.match(r'^##\s|^### Task \d+', lines[j]):
+                e3 = j
+                break
+        for j in range(i, e3):
+            m4 = HDR_RE.match(lines[j])
+            if not m4:
+                continue
+            p = m4.group(1)
+            if p in file2task:
+                continue
+            file2task.setdefault(p, (pn, tno3, title))
+            task_files.setdefault((pn, tno3), set()).add(p)
     # 验收标准表
     ai = None
     for i, l in enumerate(lines):
@@ -344,15 +390,25 @@ def phase_key(pn):
         return 99
 
 
+def tag_of(pn, tno):
+    """任务标签：数字 Task 用 `P3·Task 8`，伪 Task（修复轮 / 台账）用 `P3·终审修复轮`。"""
+    return ('%s Task %s' % (pn, tno)) if tno.isdigit() else ('%s %s' % (pn, tno))
+
+
 def tasks_of(r):
     if not r['tasks']:
         return '—'
     seen = []
     for pn, tno, ttitle in sorted(r['tasks'], key=lambda x: (phase_key(x[0]), int(x[1]) if x[1].isdigit() else 99)):
-        k = '%s·Task %s' % (pn, tno)
+        k = ('%s·Task %s' % (pn, tno)) if tno.isdigit() else ('%s·%s' % (pn, tno))
         if k not in [x[0] for x in seen]:
             seen.append((k, ttitle))
-    return '<br>'.join('%s %s' % (k, clean_title(t)) for k, t in seen)
+    out = []
+    for k, t in seen:
+        ct = clean_title(t)
+        # 伪 Task 的短名与标题同义时（如「终审修复轮」）不重复写一遍
+        out.append(k if (not ct or ct == k.split('·')[-1]) else '%s %s' % (k, ct))
+    return '<br>'.join(out)
 
 
 def impls_of(r):
@@ -434,7 +490,8 @@ A('| **落地** | 扫实现文件里的**溯源注释**（`R-XXX-NN` 字样）�
 A('| **怎么验** | 实现文件 → 引用它的**测试文件** → owning 阶段 `## P{n} 验收标准` 表里提到该测试文件的行（`P{n}-{m}`） | `grep -n "P{n}-{m}" docs/superpowers/plans/*P{n}*.md` |')
 A('| **状态** | 「已落地」= 代码里有溯源注释；「计划中」= 只有计划里有；「平台不实现」= 两边都没有 | 三个来源全部可重跑 |')
 A('')
-A('> ⚠️ 扫描面 = `main` + P5 worktree + P6 worktree 三棵树的**并集**（P5/P6 的代码还没合回 main）。')
+_trees_desc = ' + '.join(f'`{label}`' for label, _ in TREES)
+A(f'> ⚠️ 扫描面 = {_trees_desc} 的**并集**（本次用 `--trees {" ".join(t for _, t in TREES)}` 生成）。')
 A('> ⚠️ 「怎么验」一列有时会写「验收行未点名该测试文件」—— 这是**如实记录**：该需求的验证确实发生了，')
 A('> 但那条验收标准是用「同文件」或散文描述指向它的，没有逐字点名测试文件名。这种情况不掩盖。')
 A('')
@@ -497,12 +554,12 @@ for p, n in top:
 A('')
 A('---')
 A('')
-A('## 三类尾巴')
+A('## 四类尾巴')
 A('')
 _no_trace = [r for r in rows if r.get('land') == 'landed-no-trace']
+A('### 一、已落地但**代码里没写溯源注释**（%d 条）—— 应补注释' % len(_no_trace))
+A('')
 if _no_trace:
-    A('### 一、已落地但**代码里没写溯源注释**（%d 条）—— 应补注释' % len(_no_trace))
-    A('')
     A('> 这些需求的**功能确实已经实现**（对应 Task 声明的文件在工作树里真实存在），')
     A('> 但实现文件里**没有** `R-XXX-NN` 的溯源注释 ⇒ 事后从代码反查「这条需求落在哪」时查不到。')
     A('> 补一条注释的成本 ≈ 0，收益是溯源链不断。')
@@ -510,8 +567,11 @@ if _no_trace:
     A('| 需求 | 状态 | 落地在哪 | 说明 |')
     A('|---|---|---|---|')
     for r in _no_trace:
-        where = '、'.join('%s Task %s' % (pn, tno) for pn, tno, _ in r['tasks'][:3]) or '—'
+        where = '、'.join(tag_of(pn, tno) for pn, tno, _ in r['tasks'][:3]) or '—'
         A('| **%s** %s | %s | %s | 代码里查不到 `%s` 的溯源注释 |' % (r['id'], r['name'], state_of(r), where, r['id']))
+    A('')
+else:
+    A('> **0 条** —— 所有已落地需求的实现文件里都有 `R-XXX-NN` 溯源注释，溯源链无缺口。')
     A('')
 A('### 二、计划中（尚未实现）')
 A('')
@@ -526,7 +586,7 @@ for r in rows:
                 '并禁止任何人往平台里加「报名费 / 押金」字段或退费流程。')
     elif r['tasks']:
         note = '计划已写明落点（%s），代码尚未落地 —— **在本表生成时尚未实现**。' % (
-            '、'.join('%s Task %s' % (pn, tno) for pn, tno, _ in r['tasks'][:3]))
+            '、'.join(tag_of(pn, tno) for pn, tno, _ in r['tasks'][:3]))
     else:
         note = '**未定位到落点** —— 需要人工确认。'
     A('| **%s** %s | %s | %s |' % (r['id'], r['name'], state_of(r), note))
@@ -539,10 +599,31 @@ for r in rows:
           '**财务科目口径**而非平台功能；「中途不退部分去向」本身是规则空白。'
           '溯源表已声明平台不实现，并禁止任何人往平台里加「报名费 / 押金」字段或退费流程。'))
 A('')
+_unlinked = [r for r in rows if r.get('land') in ('landed', 'landed-no-trace') and not r['acc']]
+A('### 四、已落地但**验收标准未逐字点名该测试文件**（%d 条）' % len(_unlinked))
+A('')
+if _unlinked:
+    A('> 这些需求的**验证确实发生了**（实现文件被测试文件引用，测试在跑），')
+    A('> 但那条验收标准是用「同文件」或散文描述指向它的，**没有逐字点名测试文件名**')
+    A('> ⇒ 本表的「怎么验」一列给不出 `P{n}-{m}` 编号，只能给出被测文件名。**如实记录，不掩盖。**')
+    A('')
+    A('| 需求 | 状态 | 落地文件 | 被测文件（验收行未点名） |')
+    A('|---|---|---|---|')
+    for r in _unlinked:
+        where = '、'.join(tag_of(pn, tno) for pn, tno, _ in r['tasks'][:2]) or '—'
+        A('| **%s** %s | %s（%s） | `%s` | %s |' % (
+            r['id'], r['name'], state_of(r), where,
+            '`、`'.join(os.path.basename(x) for x in r['impls'][:2]) or '—',
+            '`、`'.join(os.path.basename(x) for x in r['tested'][:3]) or '—（未被任何测试文件引用）'))
+    A('')
+else:
+    A('> **0 条** —— 所有已落地需求的验收标准都逐字点名了对应测试文件。')
+    A('')
 A('---')
 A('')
 A('*本表由 `docs/requirements-traceability.md` + 7 份阶段计划 + 代码树的溯源注释扫描**自动生成**；')
-A('生成器：`python3 docs/tools/requirement-map.py --trees . .worktrees/p5-pools .worktrees/p6-deploy --out docs/requirement-implementation-map.md`（**在仓库里，可复算**）。*')
+A('生成器：`python3 docs/tools/requirement-map.py --trees %s --out %s`（**在仓库里，可复算**）。*'
+  % (' '.join(t for _, t in TREES), ARGS.out))
 
 out_path = ARGS.out
 io.open(out_path, 'w', encoding='utf-8').write('\n'.join(lines) + '\n')
