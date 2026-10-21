@@ -2,6 +2,10 @@
 # deploy/install.sh — 一键部署（幂等）
 #
 # 依据：设计文档 §14.2「deploy/install.sh（一键：装 Node → 写 service → 配 nginx → 建库 → 初始化管理员账号）」
+#   R-OPS-05（云主机部署）：后期部署到云主机，需要「一键部署 + 备份恢复」⇒ 本脚本就是一键部署；
+#     备份/恢复在 scripts/backup.js 与 scripts/restore.js（走 sqlite.backup() API，不用 cp）。
+#   R-OPS-01（可移植）：脚本只依赖 POSIX 工具与 Node 内置，**不联网安装 npm 包**；
+#     路径一律用 $(dirname "$0") 定位，不依赖当前工作目录 ⇒ 同一份脚本在 Linux/macOS 都能跑。
 #
 # ✅ 幂等：可重复执行不炸（用户/目录/文件已存在 → 跳过或覆盖，不报错）。
 # ⛔ 不硬编码任何口令：管理员口令来自环境变量 ADMIN_PASSWORD，或交互读取（不回显）。

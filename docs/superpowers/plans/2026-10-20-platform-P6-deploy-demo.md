@@ -1752,6 +1752,8 @@ Expected: FAIL —— `ENOENT: no such file or directory, open 'platform/deploy/
 # ⛔ 单写者约束：这里【绝不】加「多 worker 进程」或「多进程集群」启动参数。
 #    SQLite 官方：There can only be a single writer at a time。
 #    多个 Node worker 进程同时写同一个 .db 文件是 SQLITE_BUSY 的真正来源。
+#    R-OPS-03（可扩容）：**扩容只能加「读」** —— 静态资源交给 nginx 直出，几百并发静态请求
+#    根本不进 Node 进程；本单元**永远只起一个** Node 进程（见下方 ExecStart 与下面的断言）。
 #    ⚠️ 本文件【不】写出多进程参数的具体名字：规格 test/deploy-assets.test.js
 #       按字面扫全文（注释里出现同样判违规），参数名见 P6 计划 Task 2 章节。
 # ✅ 扩容只能加「读」：静态资源交给 nginx 直出，几百并发静态请求根本不进 Node 进程。
@@ -2178,6 +2180,10 @@ volumes:
 # deploy/install.sh — 一键部署（幂等）
 #
 # 依据：设计文档 §14.2「deploy/install.sh（一键：装 Node → 写 service → 配 nginx → 建库 → 初始化管理员账号）」
+#   R-OPS-05（云主机部署）：后期部署到云主机，需要「一键部署 + 备份恢复」⇒ 本脚本就是一键部署；
+#     备份/恢复在 scripts/backup.js 与 scripts/restore.js（走 sqlite.backup() API，不用 cp）。
+#   R-OPS-01（可移植）：脚本只依赖 POSIX 工具与 Node 内置，**不联网安装 npm 包**；
+#     路径一律用 $(dirname "$0") 定位，不依赖当前工作目录 ⇒ 同一份脚本在 Linux/macOS 都能跑。
 #
 # ✅ 幂等：可重复执行不炸（用户/目录/文件已存在 → 跳过或覆盖，不报错）。
 # ⛔ 不硬编码任何口令：管理员口令来自环境变量 ADMIN_PASSWORD，或交互读取（不回显）。
