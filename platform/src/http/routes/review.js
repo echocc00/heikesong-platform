@@ -107,6 +107,43 @@ function assertJudgeDimensions(ctx, items) {
   }
 }
 
+/**
+ * ⛔ P4 跨阶段接线（P4 Task 6）：把 review-state 返回的**分数数组**过一遍
+ *    filterVisibleScores({ db, stageId, viewer, scores })。
+ *
+ * ⚠️ 两处必须说清楚：
+ *  ① **过滤发生在 API 层**，不是前端隐藏 —— 设计文档 §6.6：「前端隐藏 = 数据已泄露」。
+ *  ② 过滤模块（Task 5 的 `src/services/review-state.js`）由**并行 Task** 落地，
+ *     静态 import 会让整个平台在它落地前**加载不了**（server.js 顶层 import 失败
+ *     → createApp 抛错 → 全站 500）→ 改成**动态 import**：
+ *       · **没有分数可过滤**（当前 P2 的 getReviewState 不返回分数）→ 原样放行
+ *         （没有分数 = 没有可泄露的东西，过滤是恒等的）；
+ *       · **有分数但过滤模块缺失** → 503（fail closed：宁可报错，
+ *         也绝不把未过滤的分数发出去）。
+ */
+export async function applyScoreVisibility({ db, stageId, viewer, state }) {
+  const scores = Array.isArray(state?.scores) ? state.scores : [];
+  if (!scores.length) return state;
+  let filterVisibleScores = null;
+  try {
+    ({ filterVisibleScores } = await import('../../services/review-state.js'));
+  } catch {
+    filterVisibleScores = null;
+  }
+  if (typeof filterVisibleScores !== 'function') {
+    return {
+      status: 503,
+      body: {
+        error: {
+          code: 'SCORE_VISIBILITY_UNAVAILABLE',
+          message: '分数可见性过滤模块尚未就绪，拒绝返回未过滤的分数',
+        },
+      },
+    };
+  }
+  return { ...state, scores: filterVisibleScores({ db, stageId, viewer, scores }) };
+}
+
 export function registerReviewRoutes(router) {
   router.add('POST', '/api/stages/:stageId/reviews', async (ctx) => {
     requireStageCapability(ctx, 'score:write');
@@ -157,11 +194,16 @@ export function registerReviewRoutes(router) {
     const stateDimensions = (stateConfig?.dimensions ?? [])
       .filter((d) => d.seat === 'judge')
       .map((d) => d.key);
-    return getReviewState({
+    return applyScoreVisibility({
       db: ctx.db,
       stageId: ctx.params.stageId,
-      viewer: { userId: ctx.user.id, isAdmin: isCommittee(ctx) },
-      dimensions: stateDimensions,
+      viewer: ctx.user,
+      state: await getReviewState({
+        db: ctx.db,
+        stageId: ctx.params.stageId,
+        viewer: { userId: ctx.user.id, isAdmin: isCommittee(ctx) },
+        dimensions: stateDimensions,
+      }),
     });
   });
 

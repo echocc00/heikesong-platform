@@ -5379,6 +5379,7 @@ git commit -m "feat(P4): 复核与申诉状态机、幂等守卫与 PENDING_REVI
 - Modify: `platform/src/http/respond.js`（`error()` 增加可选第 6 参 `extraHeaders`）
 - Modify: `platform/web/app.js`（注册 `/audit` 与 `/flags` 路由 + 导航）
 - Modify: `platform/scripts/seed.js`（新增能力点 `audit:write` / `appeal:write`）
+- Modify: `platform/src/http/routes/review.js`（**跨阶段接线**：P2 的 `GET /api/stages/:stageId/review-state` 的分数必须过一遍 `filterVisibleScores`）
 - Test: `platform/test/audit-api.test.js`
 
 **Interfaces:**
@@ -5395,34 +5396,70 @@ git commit -m "feat(P4): 复核与申诉状态机、幂等守卫与 PENDING_REVI
 
 > **跨阶段接线说明（P2 必读）**：P2 的 `GET /api/stages/:stageId/review-state` 必须把返回的分数数组过一遍
 > `filterVisibleScores({ db, stageId, viewer, scores })`（Task 5 提供）。**前端隐藏 = 数据已泄露**（设计文档 §6.6）。
-> 执行本 Task 时先 `grep -n "review-state" platform/src/server.js` 找到 P2 的 handler，
-> 在其返回前加一行 `scores: filterVisibleScores({ db, stageId, viewer: user, scores })`。
+> ⚠️ **实测更正**：这个 handler **不在 `platform/src/server.js`**，而在 **`platform/src/http/routes/review.js`**
+>    （`grep -n "review-state" platform/src/server.js` 命中 0 次；`grep -rn "review-state" platform/src/` 才命中）。
+>    接线方式见 **Step 4b**。
+> ⚠️ **另一处实测更正**：P2 的 `getReviewState` **当前不返回分数数组**（只回
+>    `submitted` / `total` / `missing` / `dimensionProgress`）——
+>    所以「加一行 `scores: filterVisibleScores(...)`」的写法要么拿到 `undefined`，要么静默不过滤。
+>    正确做法是 Step 4b 的 `applyScoreVisibility({ db, stageId, viewer, state })`：
+>    **有分数才过滤 / 没分数原样放行 / 有分数但过滤模块缺失 → 503（fail closed）**。
 
 - [ ] **Step 1: 写失败的测试**
 
 `platform/test/audit-api.test.js`：
 
 ```javascript
+// platform/test/audit-api.test.js —— P4 审计 API（7 个接口）+ trace 抽屉 + 复核队列接线
+//
+// 规则溯源：
+//   - 「审计 API 的路径与语义」→ INTERFACES.md §5「API（P4）」
+//   - 「三态状态码」→ 设计文档 §7.3（列表不满足 → 200+空集；单条不满足 → 404；禁用 → 403）
+//   - 「限频触发 → 429 + retryAfterSeconds + Retry-After 响应头」→ 设计文档 §11.1（R-AUD-05）
+//   - 「可见性在 API 层过滤」→ 设计文档 §6.6（前端隐藏 = 数据已泄露）
+//   - 「证据三列 + 按发行方去重」→ R-AUD-04
+//   - 「幂等只生效一次」→ 设计文档 §11.1（重复提交返回首次的响应）
+//
+// ⚠️ **Task 5（复核与申诉状态机）由并行 Task 落地**：本文件用**动态 import** 探测
+//    `src/services/review-state.js` 是否已落地。
+//    没落地时，依赖它的用例**跳过**（跳过原因写明「Task 5 未落地」），
+//    其余用例照常跑 —— ⛔ 绝不伪造 Task 5 的实现，也不用桩把绿灯骗出来。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
 import { openDatabase } from '../src/db/sqlite.js';
 import { applyMigrations } from '../src/db/migrate.js';
 import { loadRules } from '../src/config.js';
 import { createApp } from '../src/server.js';
 import { createSession } from '../src/auth/session.js';
-import { createUser } from '../src/db/repo/users.js';
+import { createUser, getUserById, setSuperadmin } from '../src/db/repo/users.js';
+import { createEdition } from '../src/db/repo/editions.js';
+import { insertStage, assignStageJudge } from '../src/db/repo/stages.js';
+import { insertTeam } from '../src/db/repo/teams.js';
+import { insertCapability, insertRoleCapability } from '../src/db/repo/capabilities.js';
+import { insertRole, insertUserRole } from '../src/db/repo/roles.js';
 import { recordComputation } from '../src/services/audit.js';
-import { transition } from '../src/services/review-state.js';
 import { createFlag } from '../src/db/repo/flags.js';
+import { scoreStage } from '../src/domain/scoring.js';
+import { applyScoreVisibility } from '../src/http/routes/review.js';
+import { rateLimited } from '../src/errors.js';
+import { callJson } from '../test-helpers/http-call.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrationsDir = join(here, '..', 'db', 'migrations');
 const rulesDir = join(here, '..', 'rules');
 const webDir = join(here, '..', 'web');
+const NOW = '2026-10-20T12:00:00.000Z';
+
+// Task 5 的复核与申诉状态机：并行 Task 落地，未落地时相关用例跳过（不伪造实现）。
+const reviewState = await import('../src/services/review-state.js').catch(() => null);
+const skipNoReviewState = reviewState
+  ? false
+  : 'Task 5 的 src/services/review-state.js 尚未落地（并行 Task），依赖它的用例跳过';
 
 function setup() {
   const dataDir = mkdtempSync(join(tmpdir(), 'hks-p4api-'));
@@ -5433,79 +5470,92 @@ function setup() {
   return { db, close, dataDir, app, rules };
 }
 
-function seedCapabilities(db) {
-  const insCap = db.prepare('INSERT OR IGNORE INTO capabilities (key, description) VALUES (?, ?)');
-  insCap.run('audit:read', '读取审计与计算快照');
-  insCap.run('audit:write', '裁决复核项与申诉');
-  insCap.run('appeal:write', '提交申诉');
-  const insRole = db.prepare('INSERT OR IGNORE INTO roles (key, description) VALUES (?, ?)');
-  insRole.run('admin', '组委会');
-  insRole.run('captain', '队长');
-  const insRc = db.prepare('INSERT OR IGNORE INTO role_capabilities (role_id, capability) VALUES (?, ?)');
-  insRc.run('admin', 'audit:read');
-  insRc.run('admin', 'audit:write');
-  insRc.run('admin', 'appeal:write');
-  insRc.run('captain', 'appeal:write');
-}
+/**
+ * 外键夹具。
+ * ⚠️ PRAGMA foreign_keys = ON（src/db/sqlite.js）—— 凡是被引用的行必须先建，
+ *    否则一律 FOREIGN KEY constraint failed（Task 2 的同款修正）。
+ *    规格自带用例直接写 'st1' / 'u_admin' / 't1'（这三个 id 在库里都不存在）→ 必炸。
+ *    所以这里建真实的 users / editions / stages / teams / tier_records，
+ *    断言里的 id 一律用真实行 id 拼出来。
+ */
+function seedRefs(db) {
+  const admin = createUser(db, { name: '管理员', phone: '13800000001', password: 'pw' });
+  setSuperadmin(db, admin.id);
+  // ⚠️ 必须**重新读一次**：setSuperadmin 改的是库里的行，createUser 返回的是改之前的快照 ——
+  //    直接拿旧对象调 can() 会把超管判成普通用户（这正是「静默降级」最难查的一类）。
+  const adminUser = getUserById(db, admin.id);
+  const judge = createUser(db, { name: '评委', phone: '13800000002', password: 'pw' });
+  const captain = createUser(db, { name: '队长', phone: '13800000003', password: 'pw' });
 
-function makeUser(db, { name, phone, superadmin = false, role = null }) {
-  const user = createUser(db, { name, phone, password: 'pw' });
-  if (superadmin) db.prepare('UPDATE users SET is_superadmin = 1 WHERE id = ?').run(user.id);
-  if (role) db.prepare('INSERT OR IGNORE INTO user_roles (user_id, role_key) VALUES (?, ?)').run(user.id, role);
-  const { token } = createSession(db, user.id);
-  return { user, cookie: `hk_session=${token}` };
-}
+  insertCapability(db, 'audit:read', '读取审计与计算快照');
+  insertCapability(db, 'audit:write', '裁决复核项与申诉');
+  insertCapability(db, 'appeal:write', '提交申诉');
+  insertRole(db, 'admin', '组委会');
+  insertRole(db, 'captain', '队长');
+  insertRoleCapability(db, 'admin', 'audit:read');
+  insertRoleCapability(db, 'admin', 'audit:write');
+  insertRoleCapability(db, 'admin', 'appeal:write');
+  insertRoleCapability(db, 'captain', 'appeal:write');
+  insertUserRole(db, captain.id, 'captain');
 
-function call(app, method, path, { cookie = null, body = null } = {}) {
-  return new Promise((resolve) => {
-    const chunks = body ? [Buffer.from(JSON.stringify(body))] : [];
-    const req = {
-      method,
-      url: path,
-      headers: cookie ? { cookie } : {},
-      async *[Symbol.asyncIterator]() {
-        for (const c of chunks) yield c;
-      },
-      on() {},
-    };
-    const res = {
-      statusCode: 200,
-      headers: {},
-      body: '',
-      writeHead(status, h) { this.statusCode = status; this.headers = h || {}; },
-      end(payload) {
-        if (payload) this.body = payload.toString();
-        resolve({ status: this.statusCode, headers: this.headers, body: this.body, json: this.body ? JSON.parse(this.body) : null });
-      },
-    };
-    app.handle(req, res);
+  const edition = createEdition(db, {
+    name: '首届 · 上海', city: '上海', startsAt: '2026-10-01', endsAt: '2026-11-30', now: NOW,
   });
+  const stage = insertStage(db, {
+    editionId: edition.id, key: 's1', name: '初赛', kind: 'initial',
+    startsAt: '2026-10-01', endsAt: '2026-10-10', scoringConfigKey: 'final', status: 'open', now: NOW,
+  });
+  // 评委必须在本赛段评委名单里，否则 review-state 的权限闸门直接 403
+  assignStageJudge(db, { stageId: stage.id, userId: judge.id, seat: 'judge', now: NOW });
+  const team = insertTeam(db, {
+    editionId: edition.id, name: '一队', captainId: captain.id, status: 'active', now: NOW,
+  });
+  // tier_records.team_id REFERENCES teams(id) → 队伍必须先建
+  db.prepare(
+    `INSERT INTO tier_records (id, team_id, tier, milestone_count, business_signoff_count, reasons_json, computed_at, deleted_at)
+     VALUES (?, ?, 'D', 0, 0, '[]', ?, NULL)`,
+  ).run('tr_t1', team.id, NOW);
+  return { admin: adminUser, judge, captain, edition, stage, team };
 }
 
 // 输入快照按 INTERFACES.md §3 的契约构造（真实权重表 + 合法 submissions）。
-// 若 P2 的 scoreStage 对入参结构有更严格要求，按 P2 的实际结构调整本函数，其余断言不变。
+// ⚠️ judges 的形状必须是 P2 的 scoreStage **实际认**的 { judgeId, seat }：
+//    规格写的 { id: 'j1' } 会让评委池为空 → 所有打分被静默丢弃 → 复算结果恒为空，
+//    diff 测试就会因为「两边都没数据」而假绿。
+//    （规格原文已授权调整：「若 P2 的 scoreStage 对入参结构有更严格要求，按 P2 的实际结构调整本函数，其余断言不变」。）
 function makeInput(rules) {
   return {
     configKey: 'scoring.final',
     ruleVersion: `scoring.final@${rules.scoring.final.version}`,
     config: rules.scoring.final,
-    judges: [{ id: 'j1' }],
+    judges: [{ judgeId: 'j1', seat: 'judge' }],
     submissions: [{ judgeId: 'j1', teamId: 't1', dimension: 'innovation', rawScore: 80 }],
     enterpriseConfirmations: [],
     peerReviews: [],
   };
 }
 
+/** 用真实引擎算一遍输出（复算与快照必须是同一套算法，比对才有意义）。 */
+function engineOutput(input) {
+  return scoreStage({
+    config: input.config,
+    judges: input.judges,
+    submissions: input.submissions,
+    enterpriseConfirmations: input.enterpriseConfirmations,
+    peerReviews: input.peerReviews,
+  });
+}
+
 test('GET /api/audit/computations/:id 返回三件套', async () => {
   const { db, close, dataDir, app, rules } = setup();
-  seedCapabilities(db);
-  const { cookie } = makeUser(db, { name: '管理员', phone: '13800000001', superadmin: true });
+  const refs = seedRefs(db);
+  const token = createSession(db, refs.admin.id).token;
   const input = makeInput(rules);
   const { id } = recordComputation({
-    db, kind: 'stage_score', stageId: 'st1', ruleVersion: input.ruleVersion,
+    db, kind: 'stage_score', stageId: refs.stage.id, ruleVersion: input.ruleVersion,
     input, output: { teams: [{ teamId: 't1', total: 80 }] }, trace: { normalization: {} },
   });
-  const res = await call(app, 'GET', `/api/audit/computations/${id}`, { cookie });
+  const res = await callJson(app, 'GET', `/api/audit/computations/${id}`, { token });
   assert.equal(res.status, 200);
   assert.equal(res.json.ruleVersion, input.ruleVersion);
   assert.equal(res.json.output.teams[0].total, 80);
@@ -5516,11 +5566,11 @@ test('GET /api/audit/computations/:id 返回三件套', async () => {
 
 test('GET /api/audit/computations/:id 未登录返回 401，单条不存在返回 404', async () => {
   const { db, close, dataDir, app } = setup();
-  seedCapabilities(db);
-  const { cookie } = makeUser(db, { name: '管理员', phone: '13800000001', superadmin: true });
-  const anon = await call(app, 'GET', '/api/audit/computations/nope');
+  const refs = seedRefs(db);
+  const token = createSession(db, refs.admin.id).token;
+  const anon = await callJson(app, 'GET', '/api/audit/computations/nope');
   assert.equal(anon.status, 401);
-  const missing = await call(app, 'GET', '/api/audit/computations/nope', { cookie });
+  const missing = await callJson(app, 'GET', '/api/audit/computations/nope', { token });
   assert.equal(missing.status, 404);
   close();
   rmSync(dataDir, { recursive: true, force: true });
@@ -5528,14 +5578,19 @@ test('GET /api/audit/computations/:id 未登录返回 401，单条不存在返�
 
 test('GET /api/audit/computations/:id/diff 返回 diff 与 warnings（能被看见）', async () => {
   const { db, close, dataDir, app, rules } = setup();
-  seedCapabilities(db);
-  const { cookie } = makeUser(db, { name: '管理员', phone: '13800000001', superadmin: true });
+  const refs = seedRefs(db);
+  const token = createSession(db, refs.admin.id).token;
   const input = makeInput(rules);
+  // 快照存的是「真实引擎算出来的结果，只把总分改了」——
+  // ⛔ 不能拿手写的假输出当快照：那样 diff 里的差异会来自「快照压根不是这套算法算的」，
+  //    区分不出「引擎变了」与「快照被改」两种情形（判别性要求）。
+  const output = engineOutput(input);
+  output.teams[0].total = 999;
   const { id } = recordComputation({
-    db, kind: 'stage_score', stageId: 'st1', ruleVersion: input.ruleVersion,
-    input, output: { teams: [{ teamId: 't1', total: 999 }] }, trace: {},
+    db, kind: 'stage_score', stageId: refs.stage.id, ruleVersion: input.ruleVersion,
+    input, output, trace: {},
   });
-  const res = await call(app, 'GET', `/api/audit/computations/${id}/diff`, { cookie });
+  const res = await callJson(app, 'GET', `/api/audit/computations/${id}/diff`, { token });
   assert.equal(res.status, 200);
   assert.ok(Array.isArray(res.json.diff));
   assert.ok(Array.isArray(res.json.warnings));
@@ -5546,37 +5601,69 @@ test('GET /api/audit/computations/:id/diff 返回 diff 与 warnings（能被看�
   rmSync(dataDir, { recursive: true, force: true });
 });
 
+test('GET /api/audit/computations/:id/diff 精确定位到被改的那一处（path 可定位）', async () => {
+  const { db, close, dataDir, app, rules } = setup();
+  const refs = seedRefs(db);
+  const token = createSession(db, refs.admin.id).token;
+  const input = makeInput(rules);
+  const output = engineOutput(input);
+  output.teams[0].total = output.teams[0].total + 1;   // 只改一个数
+  const { id } = recordComputation({
+    db, kind: 'stage_score', stageId: refs.stage.id, ruleVersion: input.ruleVersion,
+    input, output, trace: {},
+  });
+  const res = await callJson(app, 'GET', `/api/audit/computations/${id}/diff`, { token });
+  assert.equal(res.status, 200);
+  assert.equal(res.json.diff.length, 1, `只改一个数就只该有一条差异（实际 ${JSON.stringify(res.json.diff)}）`);
+  assert.equal(res.json.diff[0].path, 'teams[t1].total');
+  assert.equal(res.json.identical, false);
+  // 规则版本没变 → 不能谎报「无法严格复算」
+  assert.equal(
+    res.json.warnings.some((w) => w.code === 'rule_version_changed'),
+    false,
+    '规则版本未变时不得出现 rule_version_changed 告警',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
 test('GET /api/audit/log 无权访问返回 200 + 空集，有权返回行', async () => {
-  const { db, close, dataDir, app } = setup();
-  seedCapabilities(db);
-  const { cookie: adminCookie } = makeUser(db, { name: '管理员', phone: '13800000001', superadmin: true });
-  const { cookie: judgeCookie } = makeUser(db, { name: '评委', phone: '13800000002' });
-  const anon = await call(app, 'GET', '/api/audit/log');
+  const { db, close, dataDir, app, rules } = setup();
+  const refs = seedRefs(db);
+  const adminToken = createSession(db, refs.admin.id).token;
+  const judgeToken = createSession(db, refs.judge.id).token;
+  const input = makeInput(rules);
+  recordComputation({
+    db, kind: 'stage_score', stageId: refs.stage.id, ruleVersion: input.ruleVersion,
+    input, output: engineOutput(input), trace: {},
+  });
+  const anon = await callJson(app, 'GET', '/api/audit/log');
   assert.equal(anon.status, 401);
-  const denied = await call(app, 'GET', '/api/audit/log', { cookie: judgeCookie });
+  const denied = await callJson(app, 'GET', '/api/audit/log', { token: judgeToken });
   assert.equal(denied.status, 200);
   assert.deepEqual(denied.json.rows, []);
-  const allowed = await call(app, 'GET', '/api/audit/log', { cookie: adminCookie });
+  const allowed = await callJson(app, 'GET', '/api/audit/log', { token: adminToken });
   assert.equal(allowed.status, 200);
   assert.ok(Array.isArray(allowed.json.rows));
+  assert.ok(allowed.json.rows.length > 0, '有权时应能看到审计行');
   close();
   rmSync(dataDir, { recursive: true, force: true });
 });
 
 test('GET /api/audit/flags 返回复核队列；POST resolve 裁决并留痕', async () => {
   const { db, close, dataDir, app } = setup();
-  seedCapabilities(db);
-  const { cookie } = makeUser(db, { name: '管理员', phone: '13800000001', superadmin: true });
+  const refs = seedRefs(db);
+  const token = createSession(db, refs.admin.id).token;
   const flagId = createFlag(db, {
-    stageId: 'st1', teamId: 't1', judgeId: 'j1', kind: 'low_variance',
-    detail: { judgeId: 'j1', dimension: 'innovation', stdev: 1, n: 5, mean: 80, direction: 'too_low', action: 'alert_only' },
+    stageId: refs.stage.id, teamId: refs.team.id, judgeId: refs.judge.id, kind: 'low_variance',
+    detail: { judgeId: refs.judge.id, dimension: 'innovation', stdev: 1, n: 5, mean: 80, direction: 'too_low', action: 'alert_only' },
   });
-  const list = await call(app, 'GET', '/api/audit/flags', { cookie });
+  const list = await callJson(app, 'GET', '/api/audit/flags', { token });
   assert.equal(list.status, 200);
   assert.equal(list.json.rows.length, 1);
 
-  const resolve = await call(app, 'POST', `/api/audit/flags/${flagId}/resolve`, {
-    cookie,
+  const resolve = await callJson(app, 'POST', `/api/audit/flags/${flagId}/resolve`, {
+    token,
     body: {
       status: 'confirmed',
       reason: '确认为异常宽严，列入观察名单',
@@ -5586,90 +5673,146 @@ test('GET /api/audit/flags 返回复核队列；POST resolve 裁决并留痕', a
   assert.equal(resolve.status, 200);
   assert.equal(resolve.json.status, 'confirmed');
   assert.equal(resolve.json.detail.evidence.uniquePublishers, 1);
+  // 裁决必须留痕（审计日志）
+  const log = await callJson(app, 'GET', '/api/audit/log?action=flag.resolve', { token });
+  assert.equal(log.json.rows.length, 1, '裁决必须写一条审计日志');
   close();
   rmSync(dataDir, { recursive: true, force: true });
 });
 
 test('POST /api/audit/flags/:id/resolve 缺理由返回 400（不静默通过）', async () => {
   const { db, close, dataDir, app } = setup();
-  seedCapabilities(db);
-  const { cookie } = makeUser(db, { name: '管理员', phone: '13800000001', superadmin: true });
-  const flagId = createFlag(db, { stageId: 'st1', kind: 'burst_submit', detail: { subjectId: 'j1', count: 9, windowStart: 'x', windowEnd: 'y' } });
-  const res = await call(app, 'POST', `/api/audit/flags/${flagId}/resolve`, {
-    cookie, body: { status: 'confirmed', reason: '  ' },
+  const refs = seedRefs(db);
+  const token = createSession(db, refs.admin.id).token;
+  const flagId = createFlag(db, {
+    stageId: refs.stage.id, kind: 'burst_submit',
+    detail: { subjectId: refs.judge.id, count: 9, windowStart: 'x', windowEnd: 'y' },
+  });
+  const res = await callJson(app, 'POST', `/api/audit/flags/${flagId}/resolve`, {
+    token, body: { status: 'confirmed', reason: '  ' },
   });
   assert.equal(res.status, 400);
   close();
   rmSync(dataDir, { recursive: true, force: true });
 });
 
-test('POST /api/appeals 超限返回 429 + Retry-After（不静默丢包）', async () => {
+test('GET /api/audit/flags 无权访问返回 200 + 空集（列表三态）', async () => {
+  const { db, close, dataDir, app } = setup();
+  const refs = seedRefs(db);
+  const judgeToken = createSession(db, refs.judge.id).token;
+  createFlag(db, {
+    stageId: refs.stage.id, kind: 'burst_submit',
+    detail: { subjectId: refs.judge.id, count: 9, windowStart: 'x', windowEnd: 'y' },
+  });
+  const res = await callJson(app, 'GET', '/api/audit/flags', { token: judgeToken });
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.json.rows, []);
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('POST /api/appeals 无权提交返回 403，未登录返回 401（能力点闸门先于业务）', async () => {
+  const { db, close, dataDir, app } = setup();
+  const refs = seedRefs(db);
+  const judgeToken = createSession(db, refs.judge.id).token;
+  const body = { subjectType: 'team_result', subjectId: `${refs.stage.id}:${refs.team.id}`, reason: '理由' };
+  const denied = await callJson(app, 'POST', '/api/appeals', { token: judgeToken, body });
+  assert.equal(denied.status, 403);
+  const anon = await callJson(app, 'POST', '/api/appeals', { body });
+  assert.equal(anon.status, 401);
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('POST /api/appeals 超限返回 429 + Retry-After（不静默丢包）', { skip: skipNoReviewState }, async () => {
   const { db, close, dataDir, app, rules } = setup();
-  seedCapabilities(db);
+  const refs = seedRefs(db);
   rules.audit.rateLimit.appealSubmit = {
     sliding: { seconds: 60, max: 2 },
     perMinute: { max: 2 },
   };
-  const { cookie } = makeUser(db, { name: '队长', phone: '13800000003', role: 'captain' });
-  db.prepare(
-    `INSERT INTO tier_records (id, team_id, tier, milestone_count, business_signoff_count, reasons_json, computed_at, deleted_at)
-     VALUES ('tr_t1', 't1', 'D', 0, 0, '[]', '2026-10-20T00:00:00.000Z')`,
-  ).run();
-  const steps = [['SUBMITTED', 'PENDING_REVIEW', 'k1'], ['PENDING_REVIEW', 'CONFIRMED', 'k2'], ['CONFIRMED', 'FINALIZED', 'k3']];
-  for (const [from, to, key] of steps) {
-    transition({
-      db, subjectType: 'stage_result', subjectId: 'st1', from, to,
-      actorId: 'u_admin', reason: 'x', idempotencyKey: key, now: '2026-10-20T00:00:00.000Z',
+  const token = createSession(db, refs.captain.id).token;
+  for (const [from, to, key] of [['SUBMITTED', 'PENDING_REVIEW', 'k1'], ['PENDING_REVIEW', 'CONFIRMED', 'k2'], ['CONFIRMED', 'FINALIZED', 'k3']]) {
+    reviewState.transition({
+      db, subjectType: 'stage_result', subjectId: refs.stage.id, from, to,
+      actorId: refs.admin.id, reason: 'x', idempotencyKey: key, now: NOW,
     });
   }
-  const body = { subjectType: 'team_result', subjectId: 'st1:t1', reason: '企业确认分与事实不符' };
-  const first = await call(app, 'POST', '/api/appeals', { cookie, body });
+  const body = { subjectType: 'team_result', subjectId: `${refs.stage.id}:${refs.team.id}`, reason: '企业确认分与事实不符' };
+  const first = await callJson(app, 'POST', '/api/appeals', { token, body });
   assert.equal(first.status, 200);
-  const second = await call(app, 'POST', '/api/appeals', { cookie, body });
+  const second = await callJson(app, 'POST', '/api/appeals', { token, body });
   assert.equal(second.status, 200);
-  const third = await call(app, 'POST', '/api/appeals', { cookie, body });
+  const third = await callJson(app, 'POST', '/api/appeals', { token, body });
   assert.equal(third.status, 429);
   assert.ok(Number(third.headers['Retry-After']) >= 1, '必须带 Retry-After 响应头');
   assert.ok(third.json.error.detail.retryAfterSeconds >= 1);
+  // P4-3：限频计数必须落库（只在内存计数 = 进程重启即失效 = 等于没有限频）
+  const events = db.prepare('SELECT COUNT(*) AS n FROM rate_limit_events').get().n;
+  assert.ok(events > 0, '限频计数必须落 rate_limit_events 表');
   close();
   rmSync(dataDir, { recursive: true, force: true });
 });
 
-test('POST /api/appeals 理由为空返回 400', async () => {
+test('POST /api/appeals 超限后换连接（模拟重启）仍然超限（限频落库）', { skip: skipNoReviewState }, async () => {
+  const { db, close, dataDir, app, rules } = setup();
+  const refs = seedRefs(db);
+  rules.audit.rateLimit.appealSubmit = {
+    sliding: { seconds: 60, max: 1 },
+    perMinute: { max: 1 },
+  };
+  const token = createSession(db, refs.captain.id).token;
+  for (const [from, to, key] of [['SUBMITTED', 'PENDING_REVIEW', 'k1'], ['PENDING_REVIEW', 'CONFIRMED', 'k2'], ['CONFIRMED', 'FINALIZED', 'k3']]) {
+    reviewState.transition({
+      db, subjectType: 'stage_result', subjectId: refs.stage.id, from, to,
+      actorId: refs.admin.id, reason: 'x', idempotencyKey: key, now: NOW,
+    });
+  }
+  const body = { subjectType: 'team_result', subjectId: `${refs.stage.id}:${refs.team.id}`, reason: '企业确认分与事实不符' };
+  const first = await callJson(app, 'POST', '/api/appeals', { token, body });
+  assert.equal(first.status, 200);
+  close();
+
+  // 重新打开同一个库文件（模拟进程重启）→ 限频仍应生效
+  const { db: db2, close: close2 } = openDatabase({ dataDir });
+  const app2 = createApp({ db: db2, rules, webDir });
+  const again = await callJson(app2, 'POST', '/api/appeals', { token, body });
+  assert.equal(again.status, 429, '重启后仍必须超限（限频计数只在内存 = 没有限频）');
+  assert.ok(Number(again.headers['Retry-After']) >= 1);
+  close2();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('POST /api/appeals 理由为空返回 400', { skip: skipNoReviewState }, async () => {
   const { db, close, dataDir, app } = setup();
-  seedCapabilities(db);
-  const { cookie } = makeUser(db, { name: '队长', phone: '13800000003', role: 'captain' });
-  const res = await call(app, 'POST', '/api/appeals', {
-    cookie, body: { subjectType: 'team_result', subjectId: 'st1:t1', reason: '' },
+  const refs = seedRefs(db);
+  const token = createSession(db, refs.captain.id).token;
+  const res = await callJson(app, 'POST', '/api/appeals', {
+    token, body: { subjectType: 'team_result', subjectId: `${refs.stage.id}:${refs.team.id}`, reason: '' },
   });
   assert.equal(res.status, 400);
   close();
   rmSync(dataDir, { recursive: true, force: true });
 });
 
-test('POST /api/appeals/:id/decide 成立返回 recomputeRequired=true', async () => {
+test('POST /api/appeals/:id/decide 成立返回 recomputeRequired=true', { skip: skipNoReviewState }, async () => {
   const { db, close, dataDir, app } = setup();
-  seedCapabilities(db);
-  const { cookie: adminCookie } = makeUser(db, { name: '管理员', phone: '13800000001', superadmin: true });
-  const { cookie: captainCookie } = makeUser(db, { name: '队长', phone: '13800000003', role: 'captain' });
-  db.prepare(
-    `INSERT INTO tier_records (id, team_id, tier, milestone_count, business_signoff_count, reasons_json, computed_at, deleted_at)
-     VALUES ('tr_t1', 't1', 'D', 0, 0, '[]', '2026-10-20T00:00:00.000Z')`,
-  ).run();
-  const steps = [['SUBMITTED', 'PENDING_REVIEW', 'k1'], ['PENDING_REVIEW', 'CONFIRMED', 'k2'], ['CONFIRMED', 'FINALIZED', 'k3']];
-  for (const [from, to, key] of steps) {
-    transition({
-      db, subjectType: 'stage_result', subjectId: 'st1', from, to,
-      actorId: 'u_admin', reason: 'x', idempotencyKey: key, now: '2026-10-20T00:00:00.000Z',
+  const refs = seedRefs(db);
+  const adminToken = createSession(db, refs.admin.id).token;
+  const captainToken = createSession(db, refs.captain.id).token;
+  for (const [from, to, key] of [['SUBMITTED', 'PENDING_REVIEW', 'k1'], ['PENDING_REVIEW', 'CONFIRMED', 'k2'], ['CONFIRMED', 'FINALIZED', 'k3']]) {
+    reviewState.transition({
+      db, subjectType: 'stage_result', subjectId: refs.stage.id, from, to,
+      actorId: refs.admin.id, reason: 'x', idempotencyKey: key, now: NOW,
     });
   }
-  const filed = await call(app, 'POST', '/api/appeals', {
-    cookie: captainCookie,
-    body: { subjectType: 'team_result', subjectId: 'st1:t1', reason: '企业确认分与事实不符' },
+  const filed = await callJson(app, 'POST', '/api/appeals', {
+    token: captainToken,
+    body: { subjectType: 'team_result', subjectId: `${refs.stage.id}:${refs.team.id}`, reason: '企业确认分与事实不符' },
   });
   assert.equal(filed.status, 200);
-  const decided = await call(app, 'POST', `/api/appeals/${filed.json.id}/decide`, {
-    cookie: adminCookie, body: { decision: 'accepted', note: '成立，重算' },
+  const decided = await callJson(app, 'POST', `/api/appeals/${filed.json.id}/decide`, {
+    token: adminToken, body: { decision: 'accepted', note: '成立，重算' },
   });
   assert.equal(decided.status, 200);
   assert.equal(decided.json.recomputeRequired, true);
@@ -5677,12 +5820,451 @@ test('POST /api/appeals/:id/decide 成立返回 recomputeRequired=true', async (
   close();
   rmSync(dataDir, { recursive: true, force: true });
 });
+
+test('POST /api/appeals 同一 requestId 重复提交只生效一次，返回首次的响应', { skip: skipNoReviewState }, async () => {
+  const { db, close, dataDir, app } = setup();
+  const refs = seedRefs(db);
+  const token = createSession(db, refs.captain.id).token;
+  for (const [from, to, key] of [['SUBMITTED', 'PENDING_REVIEW', 'k1'], ['PENDING_REVIEW', 'CONFIRMED', 'k2'], ['CONFIRMED', 'FINALIZED', 'k3']]) {
+    reviewState.transition({
+      db, subjectType: 'stage_result', subjectId: refs.stage.id, from, to,
+      actorId: refs.admin.id, reason: 'x', idempotencyKey: key, now: NOW,
+    });
+  }
+  const body = {
+    subjectType: 'team_result',
+    subjectId: `${refs.stage.id}:${refs.team.id}`,
+    reason: '企业确认分与事实不符',
+    requestId: 'req-001',
+  };
+  const first = await callJson(app, 'POST', '/api/appeals', { token, body });
+  assert.equal(first.status, 200);
+  const second = await callJson(app, 'POST', '/api/appeals', { token, body });
+  assert.equal(second.status, 200);
+  assert.equal(second.json.id, first.json.id, '重复提交必须返回首次的响应');
+  const rows = db.prepare('SELECT COUNT(*) AS n FROM appeals').get().n;
+  assert.equal(rows, 1, '同一 requestId 只能落一条申诉');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('GET /api/appeals 申诉列表：无权返回 200 + 空集，有权返回行', { skip: skipNoReviewState }, async () => {
+  const { db, close, dataDir, app } = setup();
+  const refs = seedRefs(db);
+  const adminToken = createSession(db, refs.admin.id).token;
+  const judgeToken = createSession(db, refs.judge.id).token;
+  for (const [from, to, key] of [['SUBMITTED', 'PENDING_REVIEW', 'k1'], ['PENDING_REVIEW', 'CONFIRMED', 'k2'], ['CONFIRMED', 'FINALIZED', 'k3']]) {
+    reviewState.transition({
+      db, subjectType: 'stage_result', subjectId: refs.stage.id, from, to,
+      actorId: refs.admin.id, reason: 'x', idempotencyKey: key, now: NOW,
+    });
+  }
+  const captainToken = createSession(db, refs.captain.id).token;
+  const filed = await callJson(app, 'POST', '/api/appeals', {
+    token: captainToken,
+    body: { subjectType: 'team_result', subjectId: `${refs.stage.id}:${refs.team.id}`, reason: '理由' },
+  });
+  assert.equal(filed.status, 200);
+  const denied = await callJson(app, 'GET', '/api/appeals', { token: judgeToken });
+  assert.equal(denied.status, 200);
+  assert.deepEqual(denied.json.rows, []);
+  const allowed = await callJson(app, 'GET', '/api/appeals', { token: adminToken });
+  assert.equal(allowed.status, 200);
+  assert.equal(allowed.json.rows.length, 1);
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('GET /api/stages/:stageId/review-state 的分数过一遍可见性过滤（API 层，不是前端隐藏）', async () => {
+  const { db, close, dataDir, app } = setup();
+  const refs = seedRefs(db);
+  const judgeToken = createSession(db, refs.judge.id).token;
+  const res = await callJson(app, 'GET', `/api/stages/${refs.stage.id}/review-state`, { token: judgeToken });
+  // 当前 P2 的 getReviewState 不返回分数数组 → 过滤是恒等的，接口照常工作。
+  // ⛔ 一旦 P2 开始返回分数，这条接口必须把分数过一遍 filterVisibleScores
+  //    （设计文档 §6.6：前端隐藏 = 数据已泄露）。
+  assert.equal(res.status, 200);
+  assert.ok(res.json && typeof res.json === 'object');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('applyScoreVisibility：有分数时必须过一遍过滤（模块缺失 → 503 fail closed）', async () => {
+  const { db, close, dataDir } = setup();
+  const refs = seedRefs(db);
+  const scores = [{ judgeId: 'someone-else', teamId: refs.team.id, dimension: 'innovation', rawScore: 90 }];
+  if (reviewState) {
+    // 赛段进入 PENDING_REVIEW → 除本人与组委会外，分数不可见
+    reviewState.transition({
+      db, subjectType: 'stage_result', subjectId: refs.stage.id, from: 'SUBMITTED', to: 'PENDING_REVIEW',
+      actorId: refs.admin.id, reason: '待复核', idempotencyKey: 'k-vis', now: NOW,
+    });
+    const judgeView = await applyScoreVisibility({
+      db, stageId: refs.stage.id, viewer: refs.judge, state: { scores },
+    });
+    assert.equal(judgeView.scores[0].rawScore, null, '无权限者的分数必须被置空');
+    assert.equal(judgeView.scores[0].hidden, true);
+    const adminView = await applyScoreVisibility({
+      db, stageId: refs.stage.id, viewer: refs.admin, state: { scores },
+    });
+    assert.equal(adminView.scores[0].rawScore, 90, '组委会看得到全量分数');
+  } else {
+    // Task 5 未落地 → 503（fail closed：宁可报错，也不放行未过滤的分数）
+    const out = await applyScoreVisibility({
+      db, stageId: refs.stage.id, viewer: refs.judge, state: { scores },
+    });
+    assert.equal(out.status, 503);
+    assert.equal(out.body.error.code, 'SCORE_VISIBILITY_UNAVAILABLE');
+  }
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('单条无权访问返回 404（不泄露记录是否存在）：无 audit:read 的人读快照', async () => {
+  const { db, close, dataDir, app, rules } = setup();
+  const refs = seedRefs(db);
+  const judgeToken = createSession(db, refs.judge.id).token;
+  const input = makeInput(rules);
+  const { id } = recordComputation({
+    db, kind: 'stage_score', stageId: refs.stage.id, ruleVersion: input.ruleVersion,
+    input, output: engineOutput(input), trace: {},
+  });
+  const res = await callJson(app, 'GET', `/api/audit/computations/${id}`, { token: judgeToken });
+  assert.equal(res.status, 404, '单条不满足 → 404（不是 403，也不给数据）');
+  assert.equal(res.json.error.code, 'NOT_FOUND');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('GET /api/audit/computations/:id/diff 无权复算返回 403', async () => {
+  const { db, close, dataDir, app, rules } = setup();
+  const refs = seedRefs(db);
+  const judgeToken = createSession(db, refs.judge.id).token;
+  const input = makeInput(rules);
+  const { id } = recordComputation({
+    db, kind: 'stage_score', stageId: refs.stage.id, ruleVersion: input.ruleVersion,
+    input, output: engineOutput(input), trace: {},
+  });
+  const res = await callJson(app, 'GET', `/api/audit/computations/${id}/diff`, { token: judgeToken });
+  assert.equal(res.status, 403);
+  assert.equal(res.json.error.code, 'FORBIDDEN');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('POST /api/audit/flags/:id/resolve 无权裁决返回 403', async () => {
+  const { db, close, dataDir, app } = setup();
+  const refs = seedRefs(db);
+  const judgeToken = createSession(db, refs.judge.id).token;
+  const flagId = createFlag(db, {
+    stageId: refs.stage.id, kind: 'burst_submit',
+    detail: { subjectId: refs.judge.id, count: 9, windowStart: 'x', windowEnd: 'y' },
+  });
+  const res = await callJson(app, 'POST', `/api/audit/flags/${flagId}/resolve`, {
+    token: judgeToken, body: { status: 'confirmed', reason: '我说了算' },
+  });
+  assert.equal(res.status, 403);
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('分页参数非法（limit=abc）不得把接口打成 500', async () => {
+  const { db, close, dataDir, app } = setup();
+  const refs = seedRefs(db);
+  const token = createSession(db, refs.admin.id).token;
+  const res = await callJson(app, 'GET', '/api/audit/log?limit=abc&offset=xyz', { token });
+  assert.equal(res.status, 200);
+  assert.ok(Array.isArray(res.json.rows));
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('Task 5 未落地时申诉接口必须 503（fail closed，不静默放行也不 500）', { skip: reviewState ? 'Task 5 已落地，本分支不适用' : false }, async () => {
+  const { db, close, dataDir, app } = setup();
+  const refs = seedRefs(db);
+  const token = createSession(db, refs.captain.id).token;
+  const res = await callJson(app, 'POST', '/api/appeals', {
+    token, body: { subjectType: 'team_result', subjectId: `${refs.stage.id}:${refs.team.id}`, reason: '理由' },
+  });
+  assert.equal(res.status, 503);
+  assert.equal(res.json.error.code, 'REVIEW_STATE_UNAVAILABLE');
+  const list = await callJson(app, 'GET', '/api/appeals', { token });
+  assert.equal(list.status, 503, '申诉列表同样必须 fail closed');
+  assert.equal(list.json.error.code, 'REVIEW_STATE_UNAVAILABLE');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('错误响应必须带 Retry-After（限频语义在 HTTP 层，不靠业务代码自己塞头）', async () => {
+  const { db, close, dataDir, app } = setup();
+  seedRefs(db);
+  // 在 app 的 router 上临时挂一个只会抛 429 的**探针路由**：
+  // 这里验的是 **server.js 的错误分支**（4xx → 领域错误 + Retry-After 头），
+  // 不是业务代码 —— 限频那层（申诉接口）要等 Task 5 落地才能端到端跑。
+  app.router.add('GET', '/api/_probe-rate-limited', async () => {
+    throw rateLimited('触发限频', { retryAfterSeconds: 7 });
+  });
+  const res = await callJson(app, 'GET', '/api/_probe-rate-limited');
+  assert.equal(res.status, 429);
+  assert.equal(res.headers['Retry-After'], '7', '429 必须带 Retry-After 响应头');
+  assert.equal(res.json.error.code, 'RATE_LIMITED');
+  assert.equal(res.json.error.detail.retryAfterSeconds, 7);
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('respond.error() 的第 6 参 extraHeaders 真的写进响应头（向后兼容）', async () => {
+  const { error } = await import('../src/http/respond.js');
+  const captured = {};
+  const res = {
+    writeHead(status, headers) { captured.status = status; captured.headers = headers; },
+    end() {},
+  };
+  error(res, 429, 'RATE_LIMITED', '触发限频', { retryAfterSeconds: 42 }, { 'Retry-After': '42' });
+  assert.equal(captured.status, 429);
+  assert.equal(captured.headers['Retry-After'], '42');
+  assert.equal(captured.headers['Content-Type'], 'application/json; charset=utf-8');
+});
+
+test('种子必须注册 audit:write / appeal:write 并授权（能力点没注册 = 权限不存在）', () => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'hks-p4seed-'));
+  const res = spawnSync(
+    process.execPath,
+    ['--disable-warning=ExperimentalWarning', join(here, '..', 'scripts', 'seed.js')],
+    {
+      cwd: join(here, '..'), encoding: 'utf8',
+      env: { ...process.env, DATA_DIR: dataDir, ADMIN_PASSWORD: 'Str0ng-Pass!2026' },
+      timeout: 60000,
+    },
+  );
+  assert.equal(res.status, 0, `种子应成功：${(res.stdout ?? '').slice(0, 300)}`);
+  const { db, close } = openDatabase({ dataDir });
+  try {
+    const caps = db.prepare('SELECT key FROM capabilities').all().map((r) => r.key);
+    assert.ok(caps.includes('audit:write'), '必须注册能力点 audit:write');
+    assert.ok(caps.includes('appeal:write'), '必须注册能力点 appeal:write');
+    const grants = db.prepare('SELECT role_id, capability FROM role_capabilities').all();
+    const has = (role, cap) => grants.some((g) => g.role_id === role && g.capability === cap);
+    assert.ok(has('admin', 'audit:write'), 'admin 必须能裁决复核项与申诉');
+    assert.ok(has('admin', 'appeal:write'), 'admin 必须能提交申诉');
+    assert.ok(has('captain', 'appeal:write'), '队长必须能提交申诉');
+  } finally {
+    close();
+  }
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+// ── 前端视图（trace 抽屉 / 复核队列）────────────────────────────────
+// 原生 ESM、无构建 → 视图模块可以被 Node 直接 import（配合最小 DOM 桩）。
+// 桩只实现视图真正用到的那几个动作：createElement / innerHTML / appendChild /
+// querySelector('#id') / addEventListener / textContent / value / checked。
+// ⚠️ innerHTML 里的 id 也要能被 querySelector 找到 —— 视图是这么写的
+//    （`head.innerHTML = '...<p id="au-msg">'` 然后 `wrap.querySelector('#au-msg')`），
+//    真实浏览器里 innerHTML 会解析成真节点，桩必须等价地暴露这些 id。
+function installDom() {
+  const listeners = {};
+  const mk = (tag) => {
+    const el = {
+      tagName: tag, className: '', id: '', _text: '', _html: '', _htmlIds: [], _byId: {},
+      children: [], handlers: {}, value: '', checked: false,
+      get textContent() { return this._text; },
+      set textContent(v) { this._text = String(v); },
+      get innerHTML() { return this._html; },
+      set innerHTML(v) {
+        this._html = String(v);
+        this._htmlIds = [...String(v).matchAll(/id="([^"]+)"/g)].map((m) => m[1]);
+      },
+      appendChild(c) { this.children.push(c); return c; },
+      addEventListener(type, fn) { (this.handlers[type] = this.handlers[type] || []).push(fn); },
+      querySelector(sel) { return queryById(this, sel); },
+      replaceChildren() { /* 首屏渲染用不到内容 */ },
+    };
+    return el;
+  };
+  const queryById = (root, sel) => {
+    if (!sel.startsWith('#')) return null;
+    const id = sel.slice(1);
+    // 元素自己的 innerHTML 里的 id（真实浏览器里 innerHTML 会解析成子节点）
+    if (root._htmlIds.includes(id)) {
+      if (!root._byId[id]) { const s = mk('div'); s.id = id; root._byId[id] = s; }
+      return root._byId[id];
+    }
+    const walk = (el) => {
+      for (const c of el.children) {
+        if (c.id === id) return c;
+        if (c._htmlIds.includes(id)) {
+          if (!c._byId[id]) { const s = mk('div'); s.id = id; c._byId[id] = s; }
+          return c._byId[id];
+        }
+        const hit = walk(c);
+        if (hit) return hit;
+      }
+      return null;
+    };
+    return walk(root);
+  };
+  const app = mk('div');
+  const win = {
+    location: { search: '', hash: '' },
+    addEventListener(type, fn) { (listeners[type] = listeners[type] || []).push(fn); },
+  };
+  globalThis.window = win;
+  globalThis.document = { createElement: (tag) => mk(tag), getElementById: () => app };
+  return { mk, win, listeners, app };
+}
+
+const tick = () => new Promise((r) => setTimeout(r, 5));
+
+test('前端 trace 抽屉：三件套 + 降级告警置顶 + 复算 diff 必须被看见', async () => {
+  installDom();
+  const { renderAudit } = await import('../web/views/audit.js');
+  const calls = [];
+  const ctx = {
+    params: { computationId: 'cmp-1' },
+    api: {
+      get: async (p) => {
+        calls.push(p);
+        if (p.endsWith('/diff')) {
+          return {
+            identical: false,
+            diff: [{ path: 'teams[t1].total', before: 61, after: 60 }],
+            warnings: [{ code: 'strict_replay_failed', message: '快照被改过' }],
+          };
+        }
+        return {
+          ruleVersion: 'scoring.final@2026-10-20', revision: 2, createdAt: '2026-10-20T00:00:00.000Z',
+          input: { submissions: [{ judgeId: 'j1' }] },
+          output: { teams: [{ teamId: 't1', total: 60 }] },
+          trace: { normalization: { innovation: { normalized: false, fallbackReason: 'judge_sample_too_small' } } },
+        };
+      },
+    },
+  };
+  const wrap = renderAudit(ctx);
+  await tick();
+  assert.ok(calls.includes('/api/audit/computations/cmp-1'), '必须按路由参数拉快照');
+  const body = wrap.children[1];
+  const warnBox = body.children[0];
+  assert.ok(warnBox.innerHTML.includes('降级告警'), '降级告警必须置顶');
+  assert.ok(warnBox.innerHTML.includes('未做评委宽严归一化'), '告警必须说清降级原因');
+  const teamItem = body.children[1].children[0];
+  for (const step of ['原始分', 'z 分', '去极值', '加权', '总分', '破同分']) {
+    assert.ok(teamItem.innerHTML.includes(step), `trace 步骤缺 ${step}`);
+  }
+  const actions = body.children[2];
+  const btn = actions.children[0];
+  assert.equal(btn.textContent, '用同一输入复算并比对');
+  await btn.handlers.click[0]();
+  assert.ok(calls.includes('/api/audit/computations/cmp-1/diff'), '复算 diff 必须真的去拉');
+  const diffBox = actions.children[1];
+  assert.ok(diffBox.innerHTML.includes('identical = false'), 'diff 必须被看见（不能只写一条日志）');
+  assert.ok(diffBox.innerHTML.includes('teams[t1].total'), 'diff 必须给出可定位的 path');
+});
+
+test('前端复核队列：渲染 + 缺理由不提交 + 裁决后显示独立发行方数', async () => {
+  installDom();
+  const { renderFlags } = await import('../web/views/flags.js');
+  const posts = [];
+  const ctx = {
+    api: {
+      get: async () => ({
+        rows: [{ id: 'f1', kind: 'low_variance', status: 'open', stageId: 'st1', teamId: 't1', judgeId: 'j1', detail: { stdev: 1 } }],
+        total: 1,
+      }),
+      post: async (p, body) => {
+        posts.push([p, body]);
+        return { status: 'confirmed', detail: { evidence: { uniquePublishers: 2 } } };
+      },
+    },
+  };
+  const wrap = renderFlags(ctx);
+  await tick();
+  const row = wrap.children[1].children[0];
+  assert.ok(row.innerHTML.includes('low_variance'));
+  const form = row.children[0];
+  form.querySelector('#fl-reason').value = '   ';
+  await form.querySelector('#fl-submit').handlers.click[0]();
+  assert.equal(posts.length, 0, '没写理由不得提交');
+  assert.equal(form.querySelector('#fl-note').textContent, '必须写理由');
+  form.querySelector('#fl-reason').value = ' 确认为异常宽严 ';
+  form.querySelector('#fl-url').value = 'https://a.example/1';
+  form.querySelector('#fl-publisher').value = '某媒体';
+  await form.querySelector('#fl-submit').handlers.click[0]();
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0][0], '/api/audit/flags/f1/resolve');
+  assert.equal(posts[0][1].reason, '确认为异常宽严', '理由要 trim 后提交');
+  assert.equal(posts[0][1].evidence.length, 1);
+  assert.equal(posts[0][1].evidence[0].publisher, '某媒体');
+  assert.ok(form.querySelector('#fl-note').textContent.includes('独立发行方 2 个'), '裁决后要显示按发行方去重的计数');
+});
+
+test('前端：服务端数据必须转义（不能变成可执行标记）', async () => {
+  installDom();
+  const { renderFlags } = await import('../web/views/flags.js');
+  const ctx = {
+    api: {
+      get: async () => ({
+        rows: [{ id: 'f1', kind: '<img src=x onerror=alert(1)>', status: 'open', detail: { note: '</pre><script>alert(1)</script>' } }],
+        total: 1,
+      }),
+      post: async () => ({}),
+    },
+  };
+  const wrap = renderFlags(ctx);
+  await tick();
+  const row = wrap.children[1].children[0];
+  assert.ok(row.innerHTML.includes('&lt;img'), '必须转义 <');
+  assert.ok(!row.innerHTML.includes('<img'), '不得出现可执行标记');
+  assert.ok(!row.innerHTML.includes('<script'), '不得出现可执行标记');
+});
+
+test('前端：/audit/:computationId 与 /flags 路由都把参数透传给视图', async () => {
+  const dom = installDom();
+  const calls = [];
+  globalThis.fetch = async (url) => {
+    calls.push(String(url));
+    return {
+      ok: true, status: 200,
+      text: async () => JSON.stringify({
+        user: null, rows: [], total: 0,
+        ruleVersion: 'v1', revision: 1, createdAt: 'c', output: { teams: [] }, trace: {},
+      }),
+    };
+  };
+  await import('../web/app.js?v=t6-app');
+  await tick();
+  dom.win.location.hash = '#/audit/cmp-9';
+  await dom.listeners.hashchange[0]();
+  await tick();
+  assert.ok(
+    calls.some((u) => u.includes('/api/audit/computations/cmp-9')),
+    `trace 抽屉必须拿到路由参数（实际请求：${JSON.stringify(calls)}）`,
+  );
+  dom.win.location.hash = '#/flags';
+  await dom.listeners.hashchange[0]();
+  await tick();
+  assert.ok(calls.some((u) => u.includes('/api/audit/flags')), '复核队列必须拉 /api/audit/flags');
+});
+
+test('前端 trace 抽屉：缺 computationId 时不得发请求（并说清从发榜页进入）', async () => {
+  installDom();
+  const { renderAudit } = await import('../web/views/audit.js');
+  const calls = [];
+  const ctx = { params: {}, api: { get: async (p) => { calls.push(p); return {}; } } };
+  const wrap = renderAudit(ctx);
+  await tick();
+  assert.equal(calls.length, 0, '缺 id 时不得发请求');
+  assert.ok(wrap.querySelector('#au-msg').textContent.includes('缺少 computationId'));
+});
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
 
 Run: `cd platform && node --test test/audit-api.test.js`
-Expected: FAIL —— 404（`/api/audit/...` 路由尚未注册）
+Expected: FAIL —— 实测**不是 404**，而是 `ERR_MODULE_NOT_FOUND`（规格块自带两处硬伤，见台账一.1 / 一.2）：
+① `src/http/routes/audit.js` 的 import 路径写成 `../services/...`（**少一层**）→ 解析到 `src/http/services/audit.js`；
+② 测试块**静态 import** 了 Task 5 尚未落地的 `src/services/review-state.js` → 整个测试文件加载不了，连只读接口的用例都跑不起来。
+（规格原文写的是「404」，但规格块自身在加载阶段就炸了 —— 照抄必然先撞模块解析，不是先撞路由。）
 
 - [ ] **Step 3: 创建 `src/http/routes/audit.js`**
 
@@ -5698,24 +6280,68 @@ Expected: FAIL —— 404（`/api/audit/...` 路由尚未注册）
 //   POST /api/appeals/:id/decide              裁决申诉
 // ⛔ 三态语义：列表不满足 → 200 + 空集（服务层已处理）；单条不满足 → 404；未登录 → 401。
 // ⛔ 限频触发 → 429 + Retry-After（由 server.js 的错误分支统一加头）。
-import { getComputation, recomputeAndDiff, listAuditLog } from '../services/audit.js';
-import { listFlags, resolveFlag } from '../services/anticheat.js';
-import { fileAppeal, decideAppeal, listAppeals } from '../services/review-state.js';
-import { assertRateLimit } from '../services/rate-limit.js';
-import { can } from '../auth/permissions.js';
-import { unauthenticated, forbidden } from '../errors.js';
+import { getComputation, recomputeAndDiff, listAuditLog } from '../../services/audit.js';
+import { listFlags, resolveFlag } from '../../services/anticheat.js';
+import { assertRateLimit } from '../../services/rate-limit.js';
+import { withIdempotency } from '../../services/idempotency.js';
+import { can } from '../../auth/permissions.js';
+import { unauthenticated, forbidden } from '../../errors.js';
 
 function requireLogin(user) {
   if (!user) throw unauthenticated();
 }
 
+/**
+ * Task 5 的复核与申诉状态机（src/services/review-state.js）由**并行 Task** 落地。
+ *
+ * ⛔ 这里**不能**用静态 import：server.js 顶层 import 本文件 → 该模块一旦缺失，
+ *    **整个平台加载不了**（createApp 抛错 → 全站 500，连只读的审计接口都起不来）。
+ *    所以改成**动态 import**：
+ *      · 模块在 → 正常调用（Task 5 合入后自动生效，本文件一个字都不用再改）；
+ *      · 模块不在 → 503 REVIEW_STATE_UNAVAILABLE（fail closed，绝不静默放行）。
+ *
+ * ⛔ 期望的调用形态（Task 5「Interfaces」一节逐字对齐，本文件只按这个形状调）：
+ *      fileAppeal({ db, subjectType, subjectId, filedBy, reason, now, rules }) → appeal
+ *      decideAppeal({ db, appealId, decision, decidedBy, note, now, rules })
+ *        → { appeal, transitions, recomputeRequired }
+ *      listAppeals({ db, filter, viewer }) → { rows, total }
+ */
+async function loadReviewState() {
+  try {
+    return await import('../../services/review-state.js');
+  } catch {
+    return null;
+  }
+}
+
+/** Task 5 未落地时的统一响应：503 + 明确的 code（不是 500 通用文案，调用方能分辨）。 */
+function reviewStateUnavailable() {
+  return {
+    status: 503,
+    body: {
+      error: {
+        code: 'REVIEW_STATE_UNAVAILABLE',
+        message: '复核与申诉状态机尚未就绪（src/services/review-state.js 未落地）',
+      },
+    },
+  };
+}
+
 function pickFilter(query = {}) {
   const out = {};
-  for (const key of ['action', 'entity', 'entityId', 'since', 'until', 'status', 'kind', 'stageId']) {
+  for (const key of ['action', 'entity', 'entityId', 'since', 'until', 'status', 'kind', 'stageId', 'subjectType', 'subjectId']) {
     if (query[key] !== undefined && query[key] !== '') out[key] = query[key];
   }
-  if (query.limit !== undefined) out.limit = Number(query.limit);
-  if (query.offset !== undefined) out.offset = Number(query.offset);
+  // ⛔ limit / offset 必须是**有限正整数**：Number('abc') = NaN → 直接绑进 SQL
+  //    会让 node:sqlite 抛 TypeError → 整个请求变 500（客户端一个 query 参数就能打挂接口）。
+  if (query.limit !== undefined) {
+    const limit = Number(query.limit);
+    if (Number.isInteger(limit) && limit > 0) out.limit = limit;
+  }
+  if (query.offset !== undefined) {
+    const offset = Number(query.offset);
+    if (Number.isInteger(offset) && offset >= 0) out.offset = offset;
+  }
   return out;
 }
 
@@ -5760,30 +6386,51 @@ export function registerAuditRoutes(router, { db, rules }) {
   router.add('POST', '/api/appeals', async ({ user, body }) => {
     requireLogin(user);
     if (!can(user, 'appeal:write', null, db)) throw forbidden('无权提交申诉');
-    // 限频：申诉提交必须限频。触发即 429 + retryAfterSeconds，⛔ 绝不静默丢包。
-    assertRateLimit({
-      db,
-      subjectKey: `appeal:${user.id}`,
-      rule: 'appealSubmit',
-      now: now(),
-      limits: rules?.audit?.rateLimit,
-      subjects: { default: `appeal:${user.id}` },
-    });
-    return fileAppeal({
-      db,
-      subjectType: body?.subjectType,
-      subjectId: body?.subjectId,
-      filedBy: user.id,
-      reason: body?.reason,
-      now: now(),
-      rules,
-    });
+    const reviewState = await loadReviewState();
+    if (!reviewState) return reviewStateUnavailable();
+    const submit = () => {
+      // 限频：申诉提交必须限频。触发即 429 + retryAfterSeconds，⛔ 绝不静默丢包。
+      assertRateLimit({
+        db,
+        subjectKey: `appeal:${user.id}`,
+        rule: 'appealSubmit',
+        now: now(),
+        limits: rules?.audit?.rateLimit,
+        subjects: { default: `appeal:${user.id}` },
+      });
+      return reviewState.fileAppeal({
+        db,
+        subjectType: body?.subjectType,
+        subjectId: body?.subjectId,
+        filedBy: user.id,
+        reason: body?.reason,
+        now: now(),
+        rules,
+      });
+    };
+    // 幂等：同一 requestId 重复提交**只生效一次**，重复请求返回**首次的响应**（不重新提一次申诉）。
+    // ⚠️ 限频放在 fn() **里面**：重放**不消耗配额、不取提交锁** ——
+    //    否则「5 秒提交锁」会把合法重试也打成 429，客户端就分不清
+    //    「重复提交（该给我首次的响应）」与「被限频（该等一会儿）」。
+    // ⛔ requestId 是**可选**的：不传就走普通提交路径，语义完全不变。
+    if (body?.requestId) {
+      const out = withIdempotency({
+        db,
+        key: String(body.requestId),
+        scope: `appeal:${user.id}`,
+        requestId: String(body.requestId),
+        now: now(),
+      }, submit);
+      return out.result;
+    }
+    return submit();
   });
-
   router.add('POST', '/api/appeals/:id/decide', async ({ user, params, body }) => {
     requireLogin(user);
     if (!can(user, 'audit:write', null, db)) throw forbidden('无权裁决申诉');
-    return decideAppeal({
+    const reviewState = await loadReviewState();
+    if (!reviewState) return reviewStateUnavailable();
+    return reviewState.decideAppeal({
       db,
       appealId: params.id,
       decision: body?.decision,
@@ -5797,7 +6444,9 @@ export function registerAuditRoutes(router, { db, rules }) {
   // 申诉列表挂在 /api/audit/log 的同族路径下，供委员会用（不新增 INTERFACES 之外的必选接口）
   router.add('GET', '/api/appeals', async ({ user, query }) => {
     requireLogin(user);
-    return listAppeals({ db, filter: pickFilter(query), viewer: user });
+    const reviewState = await loadReviewState();
+    if (!reviewState) return reviewStateUnavailable();
+    return reviewState.listAppeals({ db, filter: pickFilter(query), viewer: user });
   });
 }
 ```
@@ -5807,9 +6456,8 @@ export function registerAuditRoutes(router, { db, rules }) {
 `platform/src/http/respond.js`（`error()` 增加可选第 6 参，向后兼容）：
 
 ```javascript
-// src/http/respond.js —— 修改处：error() 增加可选 extraHeaders（第 6 参）
-// ⛔ 限频要返回 429 + Retry-After 响应头，调用方拿不到 res.writeHead 的二次机会，
-//    所以错误响应也必须能带自定义头。
+// ⛔ P4 追加（第 6 参 extraHeaders，向后兼容）：限频要返回 429 + Retry-After 响应头，
+//    调用方拿不到 res.writeHead 的二次机会，所以错误响应也必须能带自定义头。
 export function error(res, status, code, message, detail, extraHeaders = {}) {
   json(res, status, { error: { code, message, ...(detail ? { detail } : {}) } }, extraHeaders);
 }
@@ -5817,44 +6465,25 @@ export function error(res, status, code, message, detail, extraHeaders = {}) {
 
 `platform/src/server.js`（三处修改）：
 
-```text
-（以下是并入 platform/src/server.js 对应位置的【片段】，不是独立文件）
+（以下是并入 platform/src/server.js 对应位置的【片段】，不是独立文件。）
 
-// src/server.js —— 修改处 1：import
+`platform/src/server.js`（修改处 1：import）：
+
+```javascript
 import { registerAuditRoutes } from './http/routes/audit.js';
+```
 
-// src/server.js —— 修改处 2：createApp 内挂载路由（放在 /api/health 之后）
+`platform/src/server.js`（修改处 2：createApp 内挂载路由，放在 /api/health 之后）：
+
+```javascript
   router.add('GET', '/api/health', async () => ({ ok: true, at: new Date().toISOString() }));
+  // P4 审计 API（7 个接口 + 申诉列表）：计算快照 / 复算 diff / 审计日志 / 复核队列 / 申诉
   registerAuditRoutes(router, { db, rules });
+```
 
-// src/server.js —— 修改处 3：错误分支带上 Retry-After
-//    ⚠️ 这段是在**当前基线**（P1 终态）的 catch 分支上**追加**，不是**替换**掉它。
-//    基线的 catch 分支里已修好的防线必须原样保留：
-//      ① 5xx 分支只回「服务内部错误」，内部原文只进 console.error（I7-3）
-//      ② code 走 domainCode(err, 'BAD_REQUEST')，不外泄 Node 的 ERR_* 码
-//      ③ message 只透传 AppError 的 message，裸 Error 一律回落「请求无效」（I-C）
-//      ④ 413 分支带 Connection: close（M-6）
-//      ⑤ detail 只透传 AppError 的 detail（P1 的 Task 3「detail 透传断言」已落地）
-//    P4 只在其上**追加一件事**：**Retry-After 响应头**（第 6 参 extraHeaders）。
-//    ⚠️ detail 透传**不要**改回 err.detail —— 那是 P1 已修好的 I-C 延伸。
-      } catch (err) {
-        const status = err.status || 500;
-        if (status >= 500) {
-          // ⛔ 预审修正（I7-3）：内部错误原文不外泄 ——
-          //    SQLite 错误带表名列名，Node 错误带内部实现细节。只进日志。
-          console.error('[server]', err);
-          json(res, 500, { error: { code: 'INTERNAL', message: '服务内部错误' } });
-          return;
-        }
-        const code = domainCode(err, 'BAD_REQUEST');
-        // ⛔ 终审修正（Important，I-C 延伸）：**只透传领域错误（AppError）的 message**。
-        //    AppError 的 message 是我们自己写的中文文案（"该手机号已注册"…），可以给用户看；
-        //    而裸 Error / Node 内置错误 / SQLite 错误的 message 里含**内部原文**
-        //    （表名列名、SQL 参数位置、文件路径）——
-        //    契约 INTERFACES.md「错误」纪律明写「不外泄 Node 的 ERR_* 与 SQLite 原文」。
-        //    实测（修复前）：handler 抛 `e.status=400; e.code='ERR_SQLITE_ERROR'` 时，
-        //    响应体是 {"code":"BAD_REQUEST","message":"users.phone UNIQUE constraint failed"}
-        //    —— code 挡住了，message 没挡住。
+`platform/src/server.js`（修改处 3：错误分支带上 Retry-After）：
+
+```javascript
         const message = err instanceof AppError ? err.message : '请求无效';
         // ── P4 追加：限频要带 Retry-After，调用方才知道多久能重试（不静默丢包）──
         const extraHeaders = {};
@@ -5869,8 +6498,17 @@ import { registerAuditRoutes } from './http/routes/audit.js';
         // detail 同理：**只透传 AppError 的 detail** —— detail 可能含表名 / 列名
         //（问卷缺项说明是我们自己写的文案，可给前端看；裸 Error 的 detail 不行）。
         error(res, status, code, message, err instanceof AppError ? err.detail : undefined, extraHeaders);
-      }
 ```
+
+⚠️ 修改处 3 是在**当前基线**（P1 终态）的 catch 分支上**追加**，不是**替换**掉它。
+基线的 catch 分支里已修好的防线必须原样保留：
+  ① 5xx 分支只回「服务内部错误」，内部原文只进 console.error（I7-3）
+  ② code 走 domainCode(err, 'BAD_REQUEST')，不外泄 Node 的 ERR_* 码
+  ③ message 只透传 AppError 的 message，裸 Error 一律回落「请求无效」（I-C）
+  ④ 413 分支带 Connection: close（M-6）
+  ⑤ detail 只透传 AppError 的 detail（P1 的 Task 3「detail 透传断言」已落地）
+P4 只在其上**追加一件事**：**Retry-After 响应头**（第 6 参 extraHeaders）。
+⚠️ detail 透传**不要**改回 err.detail —— 那是 P1 已修好的 I-C 延伸。
 
 > **【2026-10-21 漂移审计修正 C-1】**（**本计划最危险的一处**）
 > **原来错在哪**：「修改处 3」原来是一段**整块替换**，把 P0 终审的错误分支换成：
@@ -5916,6 +6554,72 @@ import { registerAuditRoutes } from './http/routes/audit.js';
 > **连带**：P4 的 `src/http/respond.js` 的 `error()` 第 6 参 `extraHeaders` **保持不变**
 > （向后兼容的追加，默认 `{}`），本处只改**调用点**。
 
+- [ ] **Step 4b: 跨阶段接线 —— P2 的 review-state 分数必须过一遍可见性过滤**
+
+`platform/src/http/routes/review.js`（新增助手 `applyScoreVisibility`）：
+
+```javascript
+/**
+ * ⛔ P4 跨阶段接线（P4 Task 6）：把 review-state 返回的**分数数组**过一遍
+ *    filterVisibleScores({ db, stageId, viewer, scores })。
+ *
+ * ⚠️ 两处必须说清楚：
+ *  ① **过滤发生在 API 层**，不是前端隐藏 —— 设计文档 §6.6：「前端隐藏 = 数据已泄露」。
+ *  ② 过滤模块（Task 5 的 `src/services/review-state.js`）由**并行 Task** 落地，
+ *     静态 import 会让整个平台在它落地前**加载不了**（server.js 顶层 import 失败
+ *     → createApp 抛错 → 全站 500）→ 改成**动态 import**：
+ *       · **没有分数可过滤**（当前 P2 的 getReviewState 不返回分数）→ 原样放行
+ *         （没有分数 = 没有可泄露的东西，过滤是恒等的）；
+ *       · **有分数但过滤模块缺失** → 503（fail closed：宁可报错，
+ *         也绝不把未过滤的分数发出去）。
+ */
+export async function applyScoreVisibility({ db, stageId, viewer, state }) {
+  const scores = Array.isArray(state?.scores) ? state.scores : [];
+  if (!scores.length) return state;
+  let filterVisibleScores = null;
+  try {
+    ({ filterVisibleScores } = await import('../../services/review-state.js'));
+  } catch {
+    filterVisibleScores = null;
+  }
+  if (typeof filterVisibleScores !== 'function') {
+    return {
+      status: 503,
+      body: {
+        error: {
+          code: 'SCORE_VISIBILITY_UNAVAILABLE',
+          message: '分数可见性过滤模块尚未就绪，拒绝返回未过滤的分数',
+        },
+      },
+    };
+  }
+  return { ...state, scores: filterVisibleScores({ db, stageId, viewer, scores }) };
+}
+```
+
+`platform/src/http/routes/review.js`（修改处 2：review-state handler 的返回）：
+
+```javascript
+    return applyScoreVisibility({
+      db: ctx.db,
+      stageId: ctx.params.stageId,
+      viewer: ctx.user,
+      state: await getReviewState({
+        db: ctx.db,
+        stageId: ctx.params.stageId,
+        viewer: { userId: ctx.user.id, isAdmin: isCommittee(ctx) },
+        dimensions: stateDimensions,
+      }),
+    });
+```
+
+⛔ **为什么不是「加一行 `scores: filterVisibleScores(...)`」**：
+P2 的 `getReviewState` **当前不返回分数数组** —— 那一行要么拿到 `undefined`（filter 恒等），
+要么在 P2 将来加上分数后**静默不过滤**（= 数据已泄露）。
+本助手把三件事分开：① **有分数才过滤**；② **没分数原样放行**（没有分数 = 没有可泄露的东西）；
+③ **有分数但过滤模块缺失 → 503（fail closed）** —— 宁可报错，也绝不把未过滤的分数发出去。
+
+
 - [ ] **Step 5: 创建 `web/views/audit.js`（trace 抽屉）**
 
 ```javascript
@@ -5924,6 +6628,9 @@ import { registerAuditRoutes } from './http/routes/audit.js';
 //   原始分 → z 分 → 去极值 → 加权 → 总分 → 破同分）；降级告警置顶」
 //   + §12 三件套结构 + S-5「降级状态可见」。
 // ⛔ 降级告警置顶且不可折叠：榜单页必须显式提示"本轮该维度未做评委宽严归一化（样本不足 5）"。
+// ⛔ 复算 diff 必须**被看见**（不能只写一条日志）：抽屉里直接给出 identical + 逐条 path。
+import { escapeHtml } from '../escape.js';
+
 const STEPS = [
   ['raw', '原始分'],
   ['z', 'z 分'],
@@ -6055,12 +6762,6 @@ function formatStep(tr, key) {
 function round2(n) {
   return Number(n).toFixed(2);
 }
-
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-  }[c]));
-}
 ```
 
 - [ ] **Step 6: 创建 `web/views/flags.js`（复核队列）**
@@ -6070,6 +6771,8 @@ function escapeHtml(s) {
 // 依据：设计文档 §9「组委会视角 → 复核/申诉/改级」、§11.1（检测 → 进人工复核队列）
 // ⛔ 检测 ≠ 处罚：队列里只做"确认 / 驳回"的人工判断，系统不改分、不封号。
 // ⛔ 裁决必须写理由与证据（证据三列：URL / 发行方 / 独立性，按发行方去重）。
+import { escapeHtml } from '../escape.js';
+
 export function renderFlags(ctx) {
   const wrap = document.createElement('div');
   wrap.className = 'card flags-queue';
@@ -6163,30 +6866,34 @@ function renderFlagRow(ctx, flag) {
   }
   return box;
 }
-
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-  }[c]));
-}
 ```
 
 - [ ] **Step 7: 修改 `web/app.js` 与 `scripts/seed.js`**
 
 `platform/web/app.js`（新增 import、路由与导航）：
 
-```text
-（以下是并入 platform/web/app.js 对应位置的【片段】，不是独立文件）
+（以下是并入 platform/web/app.js 对应位置的【片段】，不是独立文件。）
 
-// web/app.js —— 修改处 1：import
+`platform/web/app.js`（修改处 1：import）：
+
+```javascript
 import { renderAudit } from './views/audit.js';
 import { renderFlags } from './views/flags.js';
+```
 
-// web/app.js —— 修改处 2：路由
-route('/audit/:computationId', () => renderAudit(ctx));
-route('/flags', () => renderFlags(ctx));
+`platform/web/app.js`（修改处 2：路由）：
 
-// web/app.js —— 修改处 3：首页导航
+```javascript
+// P4 两页：计算留痕 trace 抽屉（从发榜页点队伍进入）/ 复核队列
+// ⚠️ 必须透传路由参数（c = {...ctx, params, query}）：trace 抽屉靠 params.computationId
+//    决定拉哪份快照 —— 只传模块级 ctx 会把 params 丢掉，抽屉永远拿不到 computationId。
+route('/audit/:computationId', (c) => renderAudit(c));
+route('/flags', (c) => renderFlags(c));
+```
+
+`platform/web/app.js`（修改处 3：首页导航）：
+
+```javascript
       <a href="#/login">登录</a>
       <a href="#/leaderboard">榜单</a>
       <a href="#/flags">复核队列</a>
@@ -6194,27 +6901,42 @@ route('/flags', () => renderFlags(ctx));
 
 `platform/scripts/seed.js`（新增能力点与授权）：
 
-```text
-（以下是并入 platform/scripts/seed.js 对应位置的【片段】，不是独立文件）
+（以下是并入 platform/scripts/seed.js 对应位置的【片段】，不是独立文件。）
 
-// scripts/seed.js —— 修改处 1：CAPABILITIES 增加两条
+`platform/scripts/seed.js`（修改处 1：CAPABILITIES 增加两条）：
+
+```javascript
   ['audit:write', '裁决复核项与申诉'],
   ['appeal:write', '提交申诉'],
+```
 
-// scripts/seed.js —— 修改处 2：ROLE_CAPABILITIES 增加授权
-  ['admin', 'audit:write'], ['admin', 'appeal:write'],
-  ['captain', 'appeal:write'],
+`platform/scripts/seed.js`（修改处 2：ROLE_CAPABILITIES 给 admin 增加授权）：
+
+```javascript
+  ['admin', 'stage:compute'], ['admin', 'audit:read'], ['admin', 'audit:write'], ['admin', 'appeal:write'], ['admin', 'pool:read'], ['admin', 'pool:write'],
+```
+
+`platform/scripts/seed.js`（修改处 3：ROLE_CAPABILITIES 给 captain 增加授权）：
+
+```javascript
+  ['captain', 'peer_review:write'], ['captain', 'self_review:write'], ['captain', 'appeal:write'],
 ```
 
 - [ ] **Step 8: 运行测试确认通过**
 
 Run: `cd platform && node --test test/audit-api.test.js`
-Expected: PASS（9 个测试全过：audit-api.test.js 9）
+Expected: PASS —— 实测 **30 例：24 通过 + 6 跳过 + 0 失败**。
+（规格自带 9 例；本阶段补到 30 例：权限三态 / 限频落库与重启仍限频 / 幂等重放 / 可见性过滤 fail closed /
+前端 trace 抽屉与复核队列 / 种子能力点。跳过的 6 例**依赖 Task 5 的 `src/services/review-state.js`**，
+未落地时按「跳过并写明原因」处理，**Task 5 合入后自动转为通过**（已在装了 Task 5 的副本上实测 29 通过 + 1 跳过 + 0 失败）。）
+
+全量：`cd platform && node --disable-warning=ExperimentalWarning --test`
+Expected: **859 例：853 通过 + 6 跳过 + 0 失败**（基线 `3db2722` 是 829 例）。
 
 - [ ] **Step 9: 提交**
 
 ```bash
-cd platform && git add src/http/routes/audit.js src/http/respond.js src/server.js web/views web/app.js scripts/seed.js test/audit-api.test.js
+cd platform && git add src/http/routes/audit.js src/http/respond.js src/server.js src/http/routes/review.js web/views web/app.js scripts/seed.js test/audit-api.test.js
 git commit -m "feat(P4): 审计 API（7 个接口）、trace 抽屉与复核队列前端"
 ```
 
@@ -7292,6 +8014,22 @@ git commit -m "test(P4): 端到端复算验收（改一个原始分 → diff 非
 | 1 | **`src/db/repo/computations.js` 的 `nextRevision` / `insertSnapshot` 被**扩展**而非重定义** | 文件归属表写「`src/db/repo/computations.js` = **P2**，P4 **追加** `nextRevision` / `listComputationRows`」 | P4 **扩展** P2 已有的 `nextRevision`（加可选 `teamId`）与 `insertSnapshot`（加可选 `id`），**只新增** `listComputationRows`；**不建** `insertComputation` / `getComputationRow` 这对与 P2 近义的函数 | ① P2 的 `nextRevision` **已经存在**（`src/services/compute.js:204` 在用），契约那行「P4 追加 `nextRevision`」是**照 P2 落地前的设想写的**，实际落地时 P2 已建 —— 照字面「追加」= 同名导出重复声明 = **整个平台加载不了**（已实跑三种读法全部失败）。② 契约同表明写「计算快照表由 P2 的 `003_review.sql` 建，写入方是 P2 的 `computeStage`」⇒ P4 不该另起一条写路径。③ `listComputationRows` 与 P2 的 `listSnapshots` **语义不同**（最近优先 + 分页 vs 赛段内按 revision 升序），不是同一件事的第二个名字 |
 | 2 | **`insertIdempotency` 用「try + 只认唯一约束」而不是 `INSERT OR IGNORE`** | 契约只给了 `idempotency_keys(key, scope, request_id, response_json, created_at, PRIMARY KEY(key, scope))` 的表结构，**未规定实现** | try INSERT + 兜底正则只认 `UNIQUE constraint failed: idempotency_keys`，其它错误照抛 | `INSERT OR IGNORE` 会把**所有**约束冲突（含 NOT NULL 违规、磁盘写满）一并吞掉 ⇒ 返回 `false`（=「重复请求」）⇒ **调用方以为写成功了，实际一条都没落库**。这正是 P1 的 T-7 踩过的坑，P2 的 `claimRequestKey` 也是同款实现 ⇒ 与全项目口径一致 |
 
+### K. Task 6 实施后的偏差
+
+| # | 偏差 | 规格的写法 | 本阶段的写法 | 理由 |
+|---|---|---|---|---|
+| 1 | **`src/http/routes/audit.js` 的 import 路径少一层** | `from '../services/audit.js'` 等（按「文件在 `src/` 下」写） | `from '../../services/audit.js'` 等 | 文件实际在 `src/http/routes/`，同级目录是 `src/`（P1/P2 的 `src/http/routes/*.js` 全部用 `../../`）。照规格写 = 模块解析失败，实跑 `ERR_MODULE_NOT_FOUND: .../src/http/services/audit.js` |
+| 2 | **Task 5 的三个函数的引用方式** | 静态 `import { fileAppeal, decideAppeal, listAppeals } from '../services/review-state.js'` | **动态 `import()`** + 模块缺失时 503 `REVIEW_STATE_UNAVAILABLE` | Task 5 是**并行 Task**，静态 import 会让整个平台在它落地前**加载不了**（`server.js` 顶层 import 本文件 → `createApp` 抛错 → 全站 500，连只读的审计接口都起不来）。动态 import 在 Task 5 合入后自动生效，本文件一个字都不用再改 |
+| 3 | **`GET /api/appeals`（§C 的额外接口）** | 与其它接口一样直接调服务层 | 同样走动态 import（缺失时 503） | 同上 |
+| 4 | **P2 `review-state` 的分数过滤接线** | 「在 handler 返回前加一行 `scores: filterVisibleScores(...)`」 | 新增助手 `applyScoreVisibility({ db, stageId, viewer, state })` + handler 调用它 | ① handler **不在 `src/server.js`**（在 `src/http/routes/review.js`，规格给的 grep 命令命中 0 次）；② P2 的 `getReviewState` **当前不返回分数数组** —— 那一行要么拿到 `undefined`，要么在 P2 将来加分数后**静默不过滤**（= 数据已泄露）。助手版把三件事分开：有分数才过滤 / 没分数原样放行 / **有分数但过滤模块缺失 → 503（fail closed）** |
+| 5 | **申诉提交的幂等** | 规格的 `POST /api/appeals` **没有幂等** | 增加**可选** `requestId`：给了走 `withIdempotency`（只生效一次 + 返回首次的响应），不传语义完全不变 | P4-4「同一 request_id 重复提交只生效一次，且重复请求返回**首次的响应**」要在 HTTP 层可验收；可选参数不改 `INTERFACES.md` §5 的契约（不传即原语义） |
+| 6 | **限频与幂等的先后** | 限频在业务调用之前 | 限频放在幂等执行器**内部**（重放**不**消耗配额、**不**取提交锁） | 否则 `appealSubmit` 的 5 秒**提交锁**会把**合法的幂等重放**也打成 429 —— 客户端分不清「重复提交（该给首次响应）」与「被限频（该等一会儿）」。首次执行的限频语义一点没变 |
+| 7 | **分页参数校验** | `if (query.limit !== undefined) out.limit = Number(query.limit);` | 只接受**有限正整数**（`Number.isInteger` + `> 0` / `>= 0`） | `Number('abc') = NaN` → 绑进 SQL → `node:sqlite` 抛 TypeError → **一个 query 参数就能把接口打成 500** |
+| 8 | **前端的 `escapeHtml`** | 两个视图各自**本地定义**一份 | 统一 `import { escapeHtml } from '../escape.js'` | 项目已有统一转义工具（`web/escape.js`，注释明写「所有插值统一走它」），本地副本 = 两份会漂移的实现；顺带修掉规格副本 `String(s)` 对 `null` 会渲染成 `"null"` 的问题 |
+| 9 | **前端路由传参** | `route('/audit/:computationId', () => renderAudit(ctx));` | `route('/audit/:computationId', (c) => renderAudit(c));` | 前端 router 传给视图的是 `{...ctx, params, query}`；模块级 `ctx` **没有 params** → 抽屉永远拿不到 `computationId`（永远显示「缺少 computationId」）。与 `app.js` 既有 6 处路由同一写法 |
+| 10 | **测试文件的用例数与内容** | 9 例（其中 3 例依赖 Task 5） | **30 例**（24 通过 + 6 跳过），补：三态（无权读快照 404 / 无权复算 403 / 无权裁决 403）、限频落库与「换连接（模拟重启）仍超限」、幂等重放、可见性过滤 fail closed、非法 `limit` 不打 500、Task 5 未落地时 503、**前端 trace 抽屉 / 复核队列 / 路由透传 / XSS 转义**、种子能力点与授权 | 变异检验暴露的有效缺口（见台账三）；Task 6 的两个前端视图是**交付物**，不能没有测试。**用例只加不改语义**：规格自带的 9 例断言一条没动 |
+| 11 | **申诉列表的过滤参数** | `pickFilter` 不含 `subjectType` / `subjectId` | 加上这两个键 | 否则 `GET /api/appeals` 只能按 `status` 过滤，委员会用不了「按赛段/队伍查申诉」 |
+
 ### H. Task 2 实施后的偏差
 
 | # | 偏差 | 规格的写法 | 本阶段的写法 | 理由 |
@@ -7614,3 +8352,68 @@ P4 全量 **861/861**（Task 5 合并后的 860 + 本轮根因修复新增的 1 
 
 `test/recompute-e2e.test.js` **2/2**；P4 全量 **863/863**（Task 5 合并后的 861 + Task 8 的 2）。
 计划块逐字核验：`test/recompute-e2e.test.js` 整文件块 **✅ 一致**（209 行）。
+
+
+---
+
+## Task 6 父代理预审修正台账（2026-10-21）
+
+> 本台账记录 **Task 6（审计 API + 前端 trace 抽屉 + 复核队列）** 实施时的预审修正。
+> 口径与 Task 1/2/3/4/7 一致：**先跑后派**（规格块先在 `/tmp` 副本实跑，再落盘）、
+> **计划是规格**（每处必要改动都回写计划对应代码块 + 登记偏差）、
+> **变异检验**（脚本 `/tmp/p4-mutate/t6.mjs`，指向已落地的 `platform/test/audit-api.test.js`）。
+
+### 一、预审发现的规格缺陷（**规格自带代码块里的错**，不是实现跑偏）
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| 1 | **Critical** | `src/http/routes/audit.js` 的 import 路径写成 `../services/...` / `../auth/...` / `../errors.js`（**比实际少一层**） | 把规格块逐字落盘后实跑：`Error [ERR_MODULE_NOT_FOUND]: Cannot find module '/private/tmp/p4t6/platform/src/http/services/audit.js' imported from .../src/http/routes/audit.js` | 改成 `../../services/...` / `../../auth/...` / `../../errors.js`（与 P1/P2 的 `src/http/routes/*.js` 同一写法）。**计划块已逐字回写** |
+| 2 | **Critical** | 规格的测试块**静态 import** `../src/services/review-state.js`（Task 5 由**并行 Task** 落地，本分支尚不存在） | 同一条命令直接 `ERR_MODULE_NOT_FOUND` → **整个测试文件加载不了**，连只读接口的用例都跑不起来 | 测试文件改用**动态 import 探测**（`await import(...).catch(() => null)`），未落地时依赖它的 **6 例跳过**并写明原因；路由模块同样改**动态 import**（缺失 → 503 `REVIEW_STATE_UNAVAILABLE`，fail closed）。⛔ **不伪造 Task 5 的实现** |
+| 3 | **Critical** | 规格的测试块直接写 `'st1'` / `'u_admin'` / `'t1'` 作为外键 id（库里都不存在） | 探针实跑：`探针 2｜tier_records 外键报错： ERR_SQLITE_ERROR \| FOREIGN KEY constraint failed`（`PRAGMA foreign_keys = ON`；`audit_log.actor_id` / `computation_snapshots.stage_id` / `tier_records.team_id` 三处同款） | 补 `seedRefs(db)` 夹具：真实建 `users` / `editions` / `stages` / `teams` / `tier_records`，断言里用**真实行 id** 拼 `subjectId`（`<stageId>:<teamId>`） |
+| 4 | **Critical** | 规格的 `makeInput` 用 `judges: [{ id: 'j1' }]`，但 P2 的 `scoreStage` 读的是 `j.judgeId` | 探针实跑：`探针 1｜规格 makeInput（judges: [{id}]）的复算结果：teams = []` ← **评委池为空 → 所有打分被静默丢弃 → diff 测试会「因为两边都没数据」而假绿**；改对后 `teams = [{"teamId":"t1","total":60}]` | 按规格自带的授权（「若 P2 的 scoreStage 对入参结构有更严格要求，按 P2 的实际结构调整本函数」）改成 `{ judgeId: 'j1', seat: 'judge' }` |
+| 5 | **Important** | 规格的 `web/app.js` 片段写 `route('/audit/:computationId', () => renderAudit(ctx));` | 前端 router 传给视图的是 `{...ctx, params, query}`；模块级 `ctx` **没有 params** → 抽屉永远显示「缺少 computationId：请从发榜页点任一队伍进入」 | 改成 `(c) => renderAudit(c)`（与 `app.js` 既有 6 处路由同一写法）。变异体 M29 验证：不改则用例变红 |
+| 6 | **Important** | 规格的两个视图各自**本地重写**一份 `escapeHtml` | 项目已有 `web/escape.js`（注释明写「所有插值统一走它」）；规格副本 `String(s)` 对 `null` 会渲染成 `"null"` | 两个视图改成 `import { escapeHtml } from '../escape.js';` |
+| 7 | **Important** | 规格的 `POST /api/appeals` **没有幂等** —— P4-4「重复提交返回**首次的响应**」在 HTTP 层无法验收 | 实跑：同一条申诉连发两次 → `appeals` 表落 **2 条**（重复申诉） | 增加**可选** `requestId`：给了走 `withIdempotency`（只生效一次 + 返回首次响应）；不传语义完全不变（契约 §5 的 7 个接口一个没动） |
+| 8 | **Minor** | 规格的 `pickFilter` 把 `limit` 直接 `Number()` | `?limit=abc` → `NaN` 绑进 SQL → `node:sqlite` 抛 TypeError → **一个 query 参数就能把接口打成 500** | 只接受**有限正整数**（`Number.isInteger` + `> 0` / `>= 0`）。变异体 M09 验证 |
+
+### 二、实测发现的行为缺口（**不是规格错，是规格没覆盖**）
+
+| # | 级别 | 缺口 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| 1 | **Important** | 限频的**提交锁**（`appealSubmit.lock` 5 秒）会把**合法的幂等重放**也打成 429 —— 客户端分不清「重复提交（该给我首次响应）」与「被限频（该等一会儿）」 | 实跑：带 `requestId` 的第二次提交返回 `429`（不是 200 + 首次响应） | 限频从「幂等之外」挪进幂等执行器**内部**：重放**不消耗配额、不取锁**；首次执行照常限频（429 + `Retry-After` 语义一点没变） |
+| 2 | **Important** | 规格的跨阶段接线说「在 P2 的 handler 返回前加一行 `scores: filterVisibleScores(...)`」，但 P2 的 `getReviewState` **根本不返回分数数组**（只回 `submitted` / `total` / `missing` / `dimensionProgress`） | 实测 `src/services/review.js:276` 的返回就是 `{ submitted, total, missing, dimensionProgress }`；且 handler 在 **`src/http/routes/review.js`**（规格给的 `grep -n "review-state" platform/src/server.js` **命中 0 次**） | 接线做成助手 `applyScoreVisibility({ db, stageId, viewer, state })`：**有分数才过滤 / 没分数原样放行 / 有分数但过滤模块缺失 → 503（fail closed）** —— 宁可报错，也绝不把未过滤的分数发出去 |
+| 3 | **Minor** | 规格的 `pickFilter` 不含 `subjectType` / `subjectId` | `GET /api/appeals` 只能按 `status` 过滤 | 补上这两个键（`listAppealRows` 认，`queryAuditLog` / `listFlagRows` 忽略，不影响其它接口） |
+
+### 三、变异检验（**独立变异测试**，脚本 `/tmp/p4-mutate/t6.mjs`）
+
+- 变异体 **34 个**，锚点精确到调用点（命中 2 次的加长上下文；命中 0 次的脚本直接报出来 —— 本轮 **0 个**构造失效）。
+- 变异体**全部真的改变行为**（没有等价变异体）。
+- 跑**两遍**（因为 Task 5 是并行 Task，同一批变异体在两种配置下的可观测性互补）：
+
+| 配置 | KILLED | 存活 | 存活者的原因 |
+|---|---|---|---|
+| **A：本分支落地的 `platform/`**（Task 5 未落地） | 31 | 3 | M07（申诉限频）/ M08（幂等）/ M17（分数过滤）—— 对应用例**依赖 Task 5 而被跳过**，在 A 配置下**不可观测** |
+| **B：装了 Task 5 的副本**（`/tmp/p4t6/platform`，Task 5 的 `review-state.js` + `tiers.js` 就位） | 31 | 3 | M10 / M11（Task 5 缺失时 503）/ M16（过滤模块缺失时 fail closed）—— 模块在场 → 这三条分支**根本走不到**，在 B 配置下**不可观测** |
+
+- **合并口径：34/34 变异体在至少一遍里被杀死** ⇒ **有效缺口 0**；
+  等价 / 不可观测变异体 **0 个**（A 的 3 个与 B 的 3 个互补，不是放过，是换配置各杀一次）。
+- 变异体清单：M01 登录闸 / M02 单条 404 / M03 复算 403 / M04 裁决 403 / M05 申诉 403 / M06 证据三列 /
+  M07 申诉限频 / M08 幂等 / M09 非法 limit / M10 申诉 503 / M11 申诉列表 503 / M12 `error()` 第 6 参 /
+  M13 429 的 `Retry-After` / M14 `RATE_LIMITED` 匹配 / M15 有分数才过滤 / M16 过滤缺失 fail closed /
+  M17 分数过滤真的生效 / M18 抽屉读路由参数 / M19 缺 id 不发请求 / M20 告警收集 / M21 告警渲染 /
+  M22 告警置顶 / M23 复算真的去拉 / M24 裁决写理由 / M25 理由 trim / M26 证据提交 /
+  M27 发行方计数 / M28 XSS 转义 / M29 路由传参 / M30 `/flags` 路由 / M31-M34 种子能力点与授权。
+
+### 四、测试条数口径与最终结果
+
+| 口径 | 数字 |
+|---|---|
+| 基线（`3db2722`）全量 | 829 |
+| 本分支全量（`node --disable-warning=ExperimentalWarning --test`） | **859 = 853 通过 + 6 跳过 + 0 失败**（新增 30 例） |
+| `test/audit-api.test.js` 单文件 | **30 = 24 通过 + 6 跳过 + 0 失败** |
+| 装了 Task 5 的副本上同一文件 | **30 = 29 通过 + 1 跳过 + 0 失败**（跳过的那条是「Task 5 未落地时必须 503」） |
+| 真 socket 冒烟（`/tmp/p4t6/smoke.mjs`，真 `http.createServer` + 真 socket） | 装了 Task 5：**8/8 通过**（含 P4-2 复算 diff、规则版本变更告警、P4-3 429 + `Retry-After` + 计数落库、P4-4 幂等重放）；本分支：**6/6 通过**（申诉接口 503 fail closed） |
+| 发布前扫描闸 `node scripts/audit-scan.js` | 退出码 **0**（11 条词条、133 个文件、无违规） |
+
+> **关于「跳过」的口径**：跳过的 6 例**不是绿灯**，是「依赖尚未落地的模块 → 明确标注跳过原因」。
+> Task 5 合入后它们会自动转为通过（已在装了 Task 5 的副本上实测）。
