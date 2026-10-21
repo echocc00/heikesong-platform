@@ -7205,9 +7205,35 @@ git commit -m "docs(P6): 部署与运维手册（单写者 / WAL 同主机 / 备
 `platform/test/p6-e2e.test.js`：
 
 ```javascript
+// platform/test/p6-e2e.test.js —— P6 Task 8：端到端验收（收官用例）
+//
+// ⚠️ 本文件**不产出功能，它证明功能**。
+//    P0–P6 每个 Task 都有自己的一组用例；这一组回答的是两个收官问题：
+//      ① 「前面这些拼在一起能不能跑通」
+//         —— 报名 → 组队 → 打分 → 计算 → 发榜 → 段位 → 战绩卡 → 三池 → 公开 API
+//      ② 「每一段是不是真的在干活」
+//         —— 每一步都有**判别性断言**（不是「跑完不报错」）
+//
+// 两条轨道（都走**真实实现**，一步都不 mock）：
+//   A. 演示线：web/api.demo.js 的 createDemoApi({ storage, seed, rules })
+//      —— 浏览器里跑的那条线。⛔ Node 侧**必须**用 createDemoApi：
+//      默认导出的 api 包装走 fetch('./seed/…')，Node 里不认相对 URL。
+//   B. 正式线：createApp + 真实 SQLite + 真实路由 + 真实规则引擎（src/domain/** 原样调用）
+//      —— 部署到云主机后跑的那条线。
+//
+// 溯源需求（逐条标在用例上）：
+//   R-OPS-13/14：任务清单工作流拆解 / 禁止岗位制
+//              —— 「任务完成 ≠ 赛段交付物得分」这条不变量
+//   R-OPS-06  ：公网可访问 —— 本文件能验的是**演示线的引擎真的在跑**；
+//              「公网 URL 能不能打开」要等真机发布（P6-12），**本轮未覆盖**
+//   R-OPS-01/02/07：零依赖 / 可移植 / 跨平台稳定 —— 见 test/portability.test.js
+//
+// ⚠️ 诚实性声明（不要在别处引用本文件时夸大它）：
+//   本文件**没有**在 Linux / Windows 上跑过（本机是 macOS darwin arm64）；
+//   也**没有**真机发布过公网演示站。两件事都不是本文件能自动验收的。
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -7215,113 +7241,26 @@ import { loadRules } from '../src/config.js';
 import { openDatabase } from '../src/db/sqlite.js';
 import { applyMigrations } from '../src/db/migrate.js';
 import { createApp } from '../src/server.js';
-import { buildDemoState, createDemoApi } from '../web/api.demo.js';
+import { createSession } from '../src/auth/session.js';
+import { grantAssignment } from '../src/auth/permissions.js';
+import { createUser, setSuperadmin } from '../src/db/repo/users.js';
+import { insertCapability } from '../src/db/repo/capabilities.js';
+import { createPublicToken } from '../src/services/public-api.js';
+import { publishLeaderboard } from '../src/services/leaderboard.js';
+import { createDemoApi } from '../web/api.demo.js';
+import { call, callJson } from '../test-helpers/http-call.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const seed = JSON.parse(readFileSync(join(here, '..', 'web', 'seed', 'demo-data.json'), 'utf8'));
-const { rules } = loadRules(join(here, '..', 'rules'));
+const platformDir = join(here, '..');
+const migrationsDir = join(platformDir, 'db', 'migrations');
+const rulesDir = join(platformDir, 'rules');
+const webDir = join(platformDir, 'web');
+const seed = JSON.parse(readFileSync(join(webDir, 'seed', 'demo-data.json'), 'utf8'));
+const { rules } = loadRules(rulesDir);
 
-test('全链路：报名 → 组队 → 打分 → 计算 → 发榜 → 段位 → 战绩卡 → 三池 → 公开 API', async () => {
-  const api = createDemoApi({ storage: makeStorage(), seed, rules });
+// ── 工具 ────────────────────────────────────────────────────────
 
-  await api.post('/api/auth/login', { name: '演示管理员' });
-
-  // 1. 报名
-  const reg = await api.post('/api/registrations', {
-    answers: {
-      direction: [5, 4, 5, 5, 4], capability: [4, 4, 5, 5, 5], collaboration: [5, 5, 4, 5, 5],
-      open: '演示报名：把门店缺货预测做成可落地的试点。',
-    },
-  });
-  assert.ok(['S', 'A', 'B'].includes(reg.level), `报名等级应为 S/A/B，实际 ${reg.level}`);
-  assert.ok(reg.explain.length > 0, '报名必须给出可解释明细');
-
-  // 2. 组队
-  const team = await api.post('/api/teams', {
-    name: '验收队', taskPackageId: 'tp_manu', captainId: 'mba_captain',
-    memberIds: ['mba_captain', 'demo_member_1'],
-  });
-  assert.ok(team.id);
-  assert.equal(team.formation.ok, true);
-
-  // 3. 打分
-  const review = await api.post('/api/stages/stage_final/reviews', {
-    items: [{ judgeId: 'j_mid1', teamId: 't_gamma', dimension: 'completeness', rawScore: 88 }],
-  });
-  assert.equal(review.submitted, 1);
-
-  // 4. 计算
-  const computed = await api.post('/api/stages/stage_final/compute', {});
-  assert.ok(computed.computationId);
-  assert.ok(computed.teams.length === seed.teams.length);
-  assert.ok(computed.trace && computed.trace.normalization);
-
-  // 5. 发榜
-  const lb = await api.get('/api/leaderboard/stage_final?scope=rank');
-  assert.equal(lb.rows.length, seed.teams.length);
-  assert.equal(lb.rows[0].rank, 1);
-
-  // 6. 段位
-  const tier = await api.get('/api/teams/t_delta/tier');
-  assert.equal(tier.tier, 'S', 't_delta 有 5 项里程碑 + 业务部门签字 → S 段');
-
-  // 7. 战绩卡
-  const card = await api.get('/api/teams/t_delta/performance-card');
-  assert.equal(card.items.length, rules.milestones.items.length);
-  assert.ok(card.items.filter((i) => i.achieved).length >= 5);
-
-  // 8. 三池
-  for (const kind of ['projects', 'talents', 'resources']) {
-    const pool = await api.get(`/api/pools/${kind}`);
-    assert.ok(pool.rows.length > 0, `三池 ${kind} 不能是空的`);
-  }
-
-  // 9. 公开 API（无登录，靠 token）
-  const pub = await api.get('/api/public/leaderboard?editionId=ed_demo&token=demo');
-  assert.ok(pub.rows.length > 0);
-});
-
-test('正式服务的路由清单覆盖 INTERFACES.md 里约定的全部 API', () => {
-  const dataDir = mkdtempSync(join(tmpdir(), 'hks-e2e-'));
-  const { db, close } = openDatabase({ dataDir });
-  applyMigrations(db, join(here, '..', 'db', 'migrations'));
-  const webDir = join(here, '..', 'web');
-  const app = createApp({ db, rules, webDir });
-  const routes = app.router.list();
-  close();
-  rmSync(dataDir, { recursive: true, force: true });
-
-  // INTERFACES.md §2–§6 里约定的 API（路径里的 :param 统一成 :*）
-  const expected = [
-    'POST /api/registrations',
-    'GET /api/registrations',
-    'POST /api/teams',
-    'GET /api/teams/*',
-    'POST /api/task-packages',
-    'GET /api/task-packages',
-    'POST /api/stages/*/reviews',
-    'GET /api/stages/*/review-state',
-    'POST /api/stages/*/compute',
-    'GET /api/stages/*/computations/*',
-    'GET /api/leaderboard/*',
-    'GET /api/leaderboard/rolling',
-    'GET /api/teams/*/performance-card',
-    'GET /api/teams/*/tier',
-    'GET /api/audit/computations/*',
-    'GET /api/audit/log',
-    'GET /api/workflows/*/tasks',
-    'POST /api/tasks/*/claim',
-    'GET /api/pools/projects',
-    'GET /api/pools/talents',
-    'GET /api/pools/resources',
-    'GET /api/public/leaderboard',
-  ];
-  const norm = (s) => s.replace(/:[A-Za-z_][A-Za-z0-9_]*/g, ':*');
-  const actual = new Set(routes.map((r) => `${r.method} ${norm(r.pattern)}`));
-  const missing = expected.filter((e) => !actual.has(e));
-  assert.deepEqual(missing, [], `正式服务缺少这些路由：${missing.join('、')}`);
-});
-
+/** 内存版 localStorage（浏览器里那份的真等价物：跨调用持久，重启进程即丢）。 */
 function makeStorage() {
   const m = new Map();
   return {
@@ -7330,21 +7269,777 @@ function makeStorage() {
     removeItem: (k) => m.delete(k),
   };
 }
+
+/**
+ * 报名问卷：三维各 5 题（1–5）+ 一道开放式题 + 合规同意记录。
+ * ⚠️ `consent` 不是可选项：正式服务按 R-ENT-12「未明确同意不收」硬拦
+ *    （少它就是 400 CONSENT_REQUIRED）—— 演示适配器目前不查这一条（差异见台账 D8-4）。
+ */
+function answers(direction, capability, collaboration, open = '演示报名：把门店缺货预测做成可落地的试点。') {
+  return { direction, capability, collaboration, open, consent: { accepted: true } };
+}
+
+const STRONG = answers([5, 4, 5, 5, 4], [4, 4, 5, 5, 5], [5, 5, 4, 5, 5]);
+const WEAK = answers([1, 1, 1, 1, 1], [1, 1, 1, 1, 1], [1, 1, 1, 1, 1], '弱画像报名：还没想清楚要解决什么商业问题。');
+
+// ═══════════════════════════════════════════════════════════════════════
+// 轨道 A：演示线（createDemoApi + 真实规则引擎 + 真实种子）
+// ═══════════════════════════════════════════════════════════════════════
+
+test('演示线全链路：报名 → 组队 → 打分 → 计算 → 发榜 → 段位 → 战绩卡 → 三池 → 公开 API', async () => {
+  const api = createDemoApi({ storage: makeStorage(), seed, rules });
+  await api.post('/api/auth/login', { name: '演示管理员' });
+
+  // ── 1. 报名 ────────────────────────────────────────────────────
+  const reg = await api.post('/api/registrations', { answers: STRONG });
+  assert.ok(['S', 'A', 'B'].includes(reg.level), `报名等级应为 S/A/B，实际 ${reg.level}`);
+  assert.ok(reg.explain.length > 0, '报名必须给出可解释明细');
+  assert.equal(reg.explain.length, 3, '三维各给一条可解释明细');
+  assert.equal(reg.status, 'accepted', 'S/A/B 级必须被接收');
+  assert.ok(reg.rawScore > 0, '报名必须算出总分');
+
+  // 判别性A1：同一套规则换成低分作答 ⇒ 降到 C 段且**不接收**（不是恒真的「都接受」）
+  const weak = await api.post('/api/registrations', { answers: WEAK });
+  assert.equal(weak.level, 'C', '低分作答必须降到 C 段');
+  assert.equal(weak.status, 'rejected', 'C 段不接收（R-REG-08）');
+  assert.ok(weak.rawScore < reg.rawScore, '低分作答的总分必须低于高分作答');
+
+  // 判别性A2：报名真的进了列表（写路径通到读路径）
+  const regList = await api.get('/api/registrations');
+  assert.equal(regList.rows.length, 2, '两条报名都应进列表');
+  assert.ok(regList.rows.some((r) => r.id === reg.id));
+  assert.ok(regList.rows.some((r) => r.id === weak.id));
+
+  // ── 2. 组队 ────────────────────────────────────────────────────
+  const team = await api.post('/api/teams', {
+    name: '验收队', taskPackageId: 'tp_manu', captainId: 'mba_captain',
+    memberIds: ['mba_captain', 'demo_member_1'],
+  });
+  assert.ok(team.id);
+  assert.equal(team.formation.ok, true, `组队必须成立：${JSON.stringify(team.formation.errors)}`);
+  assert.deepEqual(team.memberIds, ['mba_captain', 'demo_member_1']);
+  assert.equal(team.packageId ?? team.taskPackageId, 'tp_manu');
+
+  // 判别性A3：1 人组队必须被拒（人数下限是真在跑的）
+  await assert.rejects(
+    () => api.post('/api/teams', {
+      name: '单人队', taskPackageId: 'tp_manu', captainId: 'mba_captain', memberIds: ['mba_captain'],
+    }),
+    (err) => err.status === 400 && err.code === 'TEAM_FORMATION_INVALID',
+    '1 人组队必须被拒（team-formation.json 的 teamSize.min = 2）',
+  );
+  // 判别性A4：组长必须是一堂 MBA 在籍（硬门槛）
+  await assert.rejects(
+    () => api.post('/api/teams', {
+      name: '非 MBA 队', taskPackageId: 'tp_manu', captainId: 'demo_member_1',
+      memberIds: ['demo_member_1', 'demo_member_2'],
+    }),
+    (err) => err.status === 400 && err.code === 'TEAM_FORMATION_INVALID',
+    '组长不是 MBA 在籍必须被拒（captainMustBeMba）',
+  );
+  // 判别性A5：被拒的组队**没有**混进名册
+  const teamsAfter = api._state().teams;
+  assert.equal(teamsAfter.length, seed.teams.length + 1, '只有成立的验收队进了名册（失败的两次没进）');
+
+  // ── 3. 打分 ────────────────────────────────────────────────────
+  const rsBefore = await api.get('/api/stages/stage_final/review-state');
+
+  // 3a. 给**新建的验收队**打一条（全新的一格：评委 × 队 × 维度）
+  const reviewNew = await api.post('/api/stages/stage_final/reviews', {
+    items: [{ judgeId: 'j_mid1', teamId: team.id, dimension: 'completeness', rawScore: 80 }],
+  });
+  assert.equal(reviewNew.submitted, 1);
+  assert.equal(reviewNew.stageId, 'stage_final');
+
+  // 判别性A6：这一条真的进了「已提交」统计
+  const rsAfter = await api.get('/api/stages/stage_final/review-state');
+  assert.equal(rsAfter.submitted, rsBefore.submitted + 1, '提交的分数必须计入 review-state');
+  assert.equal(
+    rsAfter.dimensionProgress.j_mid1, rsBefore.dimensionProgress.j_mid1 + 1,
+    '该评委的已提交数必须 +1',
+  );
+
+  // 3b. 给**已有的格子**改分（覆盖，不是累加）
+  const reviewOverwrite = await api.post('/api/stages/stage_final/reviews', {
+    items: [{ judgeId: 'j_mid1', teamId: 't_gamma', dimension: 'completeness', rawScore: 88 }],
+  });
+  assert.equal(reviewOverwrite.submitted, 1);
+  const rsAgain = await api.get('/api/stages/stage_final/review-state');
+  assert.equal(rsAgain.submitted, rsAfter.submitted, '同一评委同一队同一维度重复打分必须覆盖，不能累加');
+  assert.equal(rsAgain.dimensionProgress.j_mid1, rsAfter.dimensionProgress.j_mid1, '覆盖不增加已提交数');
+
+  // ── 4. 计算 ────────────────────────────────────────────────────
+  const computed = await api.post('/api/stages/stage_final/compute', {});
+  assert.ok(computed.computationId);
+  assert.equal(computed.teams.length, seed.teams.length + 1, '名册里的每支队都要进计算（含刚建的验收队）');
+  assert.ok(computed.trace && computed.trace.normalization, '计算必须留下归一化 trace');
+
+  // 判别性A7：原始分真的进了引擎 —— 同一份种子，只改 t_gamma 的一个原始分，总分必须变
+  const baseline = await (async () => {
+    const fresh = createDemoApi({ storage: makeStorage(), seed, rules });
+    await fresh.post('/api/auth/login', { name: '演示管理员' });
+    await fresh.post('/api/teams', {
+      name: '验收队', taskPackageId: 'tp_manu', captainId: 'mba_captain',
+      memberIds: ['mba_captain', 'demo_member_1'],
+    });
+    await fresh.post('/api/stages/stage_final/reviews', {
+      items: [{ judgeId: 'j_mid1', teamId: 'team_demo_1', dimension: 'completeness', rawScore: 80 }],
+    });
+    return fresh.post('/api/stages/stage_final/compute', {});
+  })();
+  const gammaNow = computed.teams.find((t) => t.teamId === 't_gamma');
+  const gammaBase = baseline.teams.find((t) => t.teamId === 't_gamma');
+  assert.notEqual(gammaNow.total, gammaBase.total, '改了原始分，引擎算出的总分必须跟着变（否则打分没接进引擎）');
+
+  // 判别性A8：同分两队仍然严格相等（破同分链之前的原始分口径没被改坏）
+  const [tieA, tieB] = seed.expectations.tiedTeams;
+  assert.equal(
+    computed.teams.find((t) => t.teamId === tieA).total,
+    computed.teams.find((t) => t.teamId === tieB).total,
+    '种子声明的同分两队必须仍然严格相等',
+  );
+
+  // ── 5. 发榜 ────────────────────────────────────────────────────
+  const lb = await api.get('/api/leaderboard/stage_final?scope=rank');
+  assert.equal(lb.rows.length, seed.teams.length + 1, '榜单覆盖名册里的每支队');
+  assert.equal(lb.rows[0].rank, 1, '第一名是 rank 1');
+  const totals = lb.rows.map((r) => r.total);
+  assert.deepEqual(totals, [...totals].sort((a, b) => b - a), '榜单按总分从高到低排');
+
+  // 判别性A9：企业名不公示（rank 榜全员公开，但企业名不在公开字段里）
+  assert.ok(lb.rows.every((r) => !('enterpriseName' in r)), '榜单行里不得出现 enterpriseName 字段');
+  const lbText = JSON.stringify(lb);
+  for (const pkg of seed.taskPackages) {
+    if (!pkg.enterpriseName) continue;
+    assert.equal(lbText.includes(pkg.enterpriseName), false, `企业名「${pkg.enterpriseName}」不得出现在榜单里`);
+  }
+
+  // ── 6. 段位 ────────────────────────────────────────────────────
+  const tier = await api.get('/api/teams/t_delta/tier');
+  assert.equal(tier.tier, 'S', 't_delta 有 5 项里程碑 + 业务部门签字 → S 段');
+  assert.equal(tier.businessSignoffCount, 1, '业务部门签字数必须是 1');
+  assert.equal(tier.milestoneCount, 5, 't_delta 达成 5 项里程碑');
+
+  // 判别性A10：段位榜里 D 段队伍不公示（C-02：C 段及以上公示名次，D 段只给本人进度卡）
+  const tierBoard = await api.get('/api/leaderboard/tier');
+  const tierIds = tierBoard.rows.map((r) => r.teamId);
+  assert.ok(tierIds.includes('t_alpha'), 'B 段队伍必须出现在段位榜');
+  assert.equal(tierIds.includes('t_epsilon'), false, 'D 段队伍不公示');
+  assert.equal(tierBoard.rows.some((r) => r.teamName === '自由花队'), false, 'D 段队名不得出现在段位榜');
+
+  // ── 7. 战绩卡 ──────────────────────────────────────────────────
+  const card = await api.get('/api/teams/t_delta/performance-card');
+  assert.equal(card.items.length, rules.milestones.items.length, '战绩卡覆盖全部 7 类里程碑');
+  assert.equal(card.achievedCount, 5, 't_delta 达成 5 项里程碑');
+  assert.equal(card.tier, 'S', '战绩卡上的段位与段位接口一致');
+
+  // 判别性A11：卡里只有部门，**没有签字人**（S10 §0.3「B 榜签字人不公开」）
+  assert.deepEqual(
+    Object.keys(card.items[0]).sort(),
+    ['achieved', 'confirmedBy', 'countsTowardTier', 'key', 'label', 'revoked', 'signed', 'signedByDepartment'],
+    '战绩卡条目的字段是白名单：加一个签字人字段即视为泄露',
+  );
+  assert.equal(
+    card.items.some((i) => Object.keys(i).some((k) => /signator|signer|person|name/i.test(k))),
+    false,
+    '战绩卡条目里不得有「签字人」字段',
+  );
+  const businessSigned = card.items.find((i) => i.signedByDepartment);
+  assert.ok(businessSigned, '已签字的里程碑必须给出签字部门');
+  assert.equal(businessSigned.signedByDepartment, '业务部', '签字部门来自签字记录本身');
+
+  // ── 8. 三池 ────────────────────────────────────────────────────
+  const projects = await api.get('/api/pools/projects');
+  const talents = await api.get('/api/pools/talents');
+  const resources = await api.get('/api/pools/resources');
+  assert.ok(projects.rows.length > 0, '项目池不能是空的');
+  assert.ok(talents.rows.length > 0, '人才池不能是空的');
+  assert.ok(resources.rows.length > 0, '资源池不能是空的');
+
+  // 判别性A12：三池的行数与名册/种子对得上（不是随便塞几行）
+  assert.equal(projects.rows.length, seed.teams.length + 1, '项目池每支队一行');
+  assert.equal(talents.rows.length, seed.users.length, '人才池覆盖每一个队员');
+  assert.equal(resources.rows.length, seed.taskPackages.length, '资源池覆盖每一张任务包');
+
+  // 判别性A13：人才池的积分来自**本轮计算的名次积分**（不是常量 0）
+  assert.ok(
+    talents.rows.some((r) => r.total_points > 0),
+    '人才池必须有人拿到名次积分（算分没接进三池就会全 0）',
+  );
+  // 判别性A14：项目池的段位与段位接口同源
+  const projectTiers = new Map(projects.rows.map((r) => [r.teamId, r.tier]));
+  assert.equal(projectTiers.get('t_delta'), 'S', '项目池里 t_delta 的段位是 S');
+  assert.equal(projectTiers.get('t_epsilon'), 'D', '项目池里 t_epsilon 的段位是 D');
+
+  // ── 9. 公开 API ────────────────────────────────────────────────
+  const pub = await api.get('/api/public/leaderboard?editionId=ed_demo&token=demo');
+  assert.ok(pub.rows.length > 0, '公开榜不能是空的');
+  assert.deepEqual(
+    pub.rows.map((r) => r.teamId), lb.rows.map((r) => r.teamId),
+    '公开榜与内部榜是同一份数据（口径不能分叉）',
+  );
+  assert.ok(pub.rows.every((r) => !('enterpriseName' in r)), '公开榜行里不得出现 enterpriseName 字段');
+
+  // 判别性A15：公开榜**必须**要 token（没有 token 一律拒绝）
+  // ⚠️ 只断言「拒绝」这条不变式，不断言具体状态码：演示适配器目前回 401，
+  //    而正式服务按契约回 403 PUBLIC_TOKEN_MISSING（差异登记在 P6 Task 8 台账 D8-3）。
+  await assert.rejects(
+    () => api.get('/api/public/leaderboard?editionId=ed_demo'),
+    (err) => err.status === 401 || err.status === 403,
+    '公开榜没有 token 必须被拒',
+  );
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// 轨道 B：正式服务（createApp + 真实 SQLite + 真实路由 + 真实规则引擎）
+// ═══════════════════════════════════════════════════════════════════════
+
+const CAPABILITIES = [
+  ['registration:write', '提交报名'],
+  ['team:create', '创建战队'],
+  ['team:read', '读取战队'],
+  ['task_package:read', '读取任务卡'],
+  ['score:write', '写入评分'],
+  ['score:read', '读取评分'],
+  ['self_review:write', '提交本队自评'],
+  ['signoff:create', '企业里程碑签字'],
+  ['behavior:write', '提交行为分记录'],
+  ['stage:compute', '触发计算发榜'],
+  ['audit:read', '读取审计与计算快照'],
+  ['pool:read', '读取三池'],
+  ['pool:write', '维护三池'],
+];
+
+/** 评委席 5 人 + 企业席 5 人 = 10 席（judgePool 段：≥9 席 / 企业席 ≥30% / 专家席 ≤50%）。 */
+const JUDGE_SEATS = [
+  ...Array.from({ length: 5 }, (_, i) => ({ id: `j${i + 1}`, name: `评委${i + 1}`, seat: 'judge' })),
+  ...Array.from({ length: 5 }, (_, i) => ({ id: `e${i + 1}`, name: `企业席${i + 1}`, seat: 'enterprise' })),
+];
+const JUDGE_DIMS = ['innovation', 'feasibility', 'completeness', 'collaboration'];
+
+function setupServer() {
+  const dataDir = mkdtempSync(join(tmpdir(), 'hks-p6e2e-'));
+  const { db, close } = openDatabase({ dataDir });
+  applyMigrations(db, migrationsDir);
+  const { rules: R } = loadRules(rulesDir);
+
+  for (const [key, desc] of CAPABILITIES) insertCapability(db, key, desc);
+
+  // ── 用户（走真实写入方 createUser）──
+  const admin = createUser(db, { name: '组委会', phone: '13900000001', password: 'pw-admin', mbaStatus: 'mba' });
+  setSuperadmin(db, admin.id);
+  const captain = createUser(db, { name: '队长甲', phone: '13900000002', password: 'pw-cap', mbaStatus: 'mba' });
+  const member = createUser(db, { name: '组员乙', phone: '13900000003', password: 'pw-mem', mbaStatus: 'mba' });
+  const weakUser = createUser(db, { name: '落选丙', phone: '13900000005', password: 'pw-weak', mbaStatus: 'mba' });
+  const enterprise = createUser(db, {
+    name: '签字人丁', phone: '13900000004', password: 'pw-ent', mbaStatus: 'other', org: '某银行',
+  });
+  // 评委席 5 人 + 企业席 5 人（judgePool 段：≥9 席 / 企业席 ≥30% / 专家席 ≤50%）
+  const judges = JUDGE_SEATS.map((spec, i) => {
+    const u = createUser(db, {
+      name: spec.name, phone: `139000001${String(i).padStart(2, '0')}`, password: 'pw-judge', mbaStatus: 'mba',
+    });
+    return { id: u.id, name: spec.name, seat: spec.seat };
+  });
+
+  const grant = (userId, capability) => grantAssignment(db, {
+    userId, capability, scopeType: 'global',
+  });
+  for (const cap of ['registration:write', 'team:create', 'team:read', 'task_package:read', 'self_review:write', 'behavior:write', 'pool:read']) {
+    grant(captain.id, cap);
+    grant(member.id, cap);
+  }
+  grant(weakUser.id, 'registration:write');
+  grant(weakUser.id, 'team:create');
+  for (const cap of ['score:write', 'score:read']) {
+    grant(enterprise.id, cap);
+    for (const j of judges) grant(j.id, cap);
+  }
+  grant(enterprise.id, 'signoff:create');
+
+  // ── 届期 / 任务包 / 赛段 / 评委名单 ──
+  db.exec(`
+    INSERT INTO editions (id, name, city, starts_at, ends_at, created_at)
+    VALUES ('ed_1', '第一届 · 杭州', '杭州', '2026-10-01', '2026-10-31', '2026-10-01T00:00:00.000Z');
+    INSERT INTO task_packages (id, edition_id, enterprise_id, enterprise_name, title, pain_point,
+      expected_delivery, acceptance_criteria, grade, status, solvability_score, solvability_grade,
+      commitment, agreement, is_free_brief, submitted_by, submitted_at, deleted_at)
+    VALUES ('tp_1', 'ed_1', '${enterprise.id}', '某银行', '零售风控助手', '人工审批慢', '可演示原型',
+      '能跑', 'A', 'approved', 11, 'A', '试点承诺', '试点承诺书', 0, '${enterprise.id}',
+      '2026-10-01T00:00:00.000Z', NULL);
+    INSERT INTO stages (id, edition_id, "key", name, kind, starts_at, ends_at, scoring_config_key, status)
+    VALUES ('st_1', 'ed_1', 's1', '决赛', 'final', '2026-10-01T00:00:00.000Z', '2026-10-20T00:00:00.000Z',
+      'final', 'open');
+  `);
+  const seat = db.prepare(
+    'INSERT INTO stage_judges (stage_id, user_id, seat, scope_type, scope_id, assigned_at) VALUES (?,?,?,?,?,?)',
+  );
+  for (const j of judges) {
+    seat.run('st_1', j.id, j.seat, 'global', null, '2026-10-01T00:00:00.000Z');
+  }
+
+  const app = createApp({ db, rules: R, webDir });
+  return {
+    db,
+    close,
+    dataDir,
+    app,
+    rules: R,
+    users: { admin, captain, member, weakUser, enterprise, judges },
+    tokens: {
+      admin: createSession(db, admin.id).token,
+      captain: createSession(db, captain.id).token,
+      member: createSession(db, member.id).token,
+      weak: createSession(db, weakUser.id).token,
+      enterprise: createSession(db, enterprise.id).token,
+    },
+  };
+}
+
+function teardown(s) {
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+}
+
+test('正式服务全链路：报名 → 组队 → 打分 → 计算 → 发榜 → 段位 → 战绩卡 → 三池 → 公开 API', async () => {
+  const s = setupServer();
+  const { db, app, tokens, users } = s;
+  try {
+    // ── 1. 报名（HTTP）──
+    const regRes = await callJson(app, 'POST', '/api/registrations', {
+      token: tokens.captain, body: { editionId: 'ed_1', answers: STRONG },
+    });
+    assert.equal(regRes.status, 200, regRes.text);
+    assert.ok(['S', 'A', 'B'].includes(regRes.json.level), `报名等级应为 S/A/B，实际 ${regRes.json.level}`);
+    // ⚠️ 形状：正式服务把可解释明细放在 `grading.explain`（presentRegistration 的口径），
+    //    演示适配器放在顶层 `explain` —— 两者不一致（差异登记在 P6 Task 8 台账 D8-5）。
+    assert.ok(regRes.json.grading.explain.length > 0, '报名必须给出可解释明细');
+    // ⚠️ 正式服务的报名状态是 'submitted'（待组委会分级），「是否接收」由 grading.accepted 表达；
+    //    演示适配器把 status 直接写成 'accepted' / 'rejected' —— 语义不一致（台账 D8-5）。
+    assert.equal(regRes.json.status, 'submitted');
+    assert.equal(regRes.json.grading.accepted, true, 'S/A/B 级必须被接收');
+
+    // 组员也报一份（他后面要加入队伍）
+    const memReg = await callJson(app, 'POST', '/api/registrations', {
+      token: tokens.member, body: { editionId: 'ed_1', answers: STRONG },
+    });
+    assert.equal(memReg.status, 200, memReg.text);
+    assert.equal(memReg.json.grading.accepted, true, '组员也要被接收');
+
+    // 判别性B1：低分作答 ⇒ C 段 ⇒ 报名**不被接收**（不是恒真的「都接受」）
+    const weakRes = await callJson(app, 'POST', '/api/registrations', {
+      token: tokens.weak, body: { editionId: 'ed_1', answers: WEAK },
+    });
+    assert.equal(weakRes.status, 200, weakRes.text);
+    assert.equal(weakRes.json.level, 'C', '低分作答必须降到 C 段');
+    assert.equal(weakRes.json.grading.accepted, false, 'C 段不接收（R-REG-08）');
+
+    // 判别性B2：组队必须被「报名未接收」拦住（写路径真的在看报名状态）
+    const blocked = await callJson(app, 'POST', '/api/teams', {
+      token: tokens.weak,
+      body: { editionId: 'ed_1', taskPackageId: 'tp_1', name: 'C 级队' },
+    });
+    assert.equal(blocked.status, 409, blocked.text);
+    assert.equal(blocked.json.error.code, 'REGISTRATION_NOT_ACCEPTED');
+
+    // ── 2. 组队（HTTP）──
+    const teamRes = await callJson(app, 'POST', '/api/teams', {
+      token: tokens.captain, body: { editionId: 'ed_1', taskPackageId: 'tp_1', name: '验收一队' },
+    });
+    assert.equal(teamRes.status, 200, teamRes.text);
+    const teamId = teamRes.json.id;
+    assert.ok(teamId);
+    assert.equal(teamRes.json.memberCount, 1);
+    assert.equal(teamRes.json.formation.ok, false, '只有队长一人时组队校验必须不通过（人数下限 2）');
+
+    // 组员自己加入（⛔ 加入只能是自己加入 —— 路由层已锁死）
+    const joinRes = await callJson(app, 'POST', `/api/teams/${teamId}/members`, {
+      token: tokens.member, body: { action: 'add' },
+    });
+    assert.equal(joinRes.status, 200, joinRes.text);
+    assert.equal(joinRes.json.memberCount, 2);
+    assert.equal(joinRes.json.formation.ok, true, `两人队必须成立：${JSON.stringify(joinRes.json.formation.errors)}`);
+    assert.equal(joinRes.json.status, 'active', '人数达标后战队成立');
+
+    // 判别性B3：替别人加入必须无效（⛔ 加入只能是自己加入；body.userId 不作数）
+    const hijack = await callJson(app, 'POST', `/api/teams/${teamId}/members`, {
+      token: tokens.captain, body: { action: 'add', userId: users.enterprise.id },
+    });
+    assert.equal(hijack.status, 409, hijack.text);
+    assert.equal(hijack.json.error.code, 'ALREADY_IN_TEAM', '队长自己已在队里，不能借 body.userId 拉别人进队');
+    const teamView = await callJson(app, 'GET', `/api/teams/${teamId}`, { token: tokens.admin });
+    assert.equal(teamView.status, 200, teamView.text);
+    assert.equal(teamView.json.memberCount, 2, '成员数仍是 2（替别人加入没生效）');
+    assert.equal(
+      teamView.json.members.some((m) => m.userId === users.enterprise.id), false,
+      '被「拉」的人不在队里（加入只能是自己加入）',
+    );
+
+    // ── 3. 打分（HTTP）──
+    // 专家席 5 人 × 4 个评委席维度（真实写入 stage_reviews）
+    // ⚠️ 为什么是 5 人：scoring-final.json 的 minSamplesForJudgeNormalization = 5、
+    //    minJudgesForTrim = 5 —— 少于 5 个样本就会走归一化降级，测的就不是主路径了。
+    const judge = users.judges[0];
+    for (let k = 0; k < 5; k += 1) {
+      const j = users.judges[k];
+      const judgeRes = await callJson(app, 'POST', '/api/stages/st_1/reviews', {
+        token: createSession(db, j.id).token,
+        body: {
+          items: JUDGE_DIMS.map((dimension, i) => ({
+            teamId, dimension, rawScore: 70 + i * 3 + k,
+          })),
+        },
+      });
+      assert.equal(judgeRes.status, 200, judgeRes.text);
+      assert.equal(judgeRes.json.submitted, 4, '四条打分必须全部入库');
+    }
+    // 判别性：评审进度里能看到 5 位评委各交了 4 条（写路径真的落到 stage_reviews）
+    const stateRes = await callJson(app, 'GET', '/api/stages/st_1/review-state', { token: tokens.admin });
+    assert.equal(stateRes.status, 200, stateRes.text);
+    assert.equal(stateRes.json.submitted, 20, '5 位评委 × 4 个维度 = 20 条打分');
+
+    // 判别性B4：评委不能给「自评测」维度打分（自评席专属）
+    const selfDim = await callJson(app, 'POST', '/api/stages/st_1/reviews', {
+      token: createSession(db, judge.id).token,
+      body: { items: [{ teamId, dimension: 'self_eval', rawScore: 100 }] },
+    });
+    assert.equal(selfDim.status, 403, selfDim.text);
+    assert.equal(selfDim.json.error.code, 'DIMENSION_SEAT_FORBIDDEN');
+
+    // 企业席双签确认（企业项 25% 权重；缺双签按 R2 记 0 分）
+    const confRes = await callJson(app, 'POST', '/api/stages/st_1/enterprise-confirmations', {
+      token: tokens.enterprise,
+      body: {
+        enterpriseId: users.enterprise.id, teamId, dimension: 'enterprise', rawScore: 80,
+        crossJudgeId: users.judges[5].id, content: '解决审批排队环节，两周内试点，我方出接口',
+      },
+    });
+    assert.equal(confRes.status, 200, confRes.text);
+
+    // ── 4. 计算（HTTP）──
+    const computeRes = await callJson(app, 'POST', '/api/stages/st_1/compute', {
+      token: tokens.admin, body: {},
+    });
+    assert.equal(computeRes.status, 200, computeRes.text);
+    assert.ok(computeRes.json.computationId, '计算必须产出快照 id');
+    assert.equal(computeRes.json.teams.length, 1, '只有打了 P 席分的队伍进结果');
+    assert.ok(computeRes.json.trace && computeRes.json.trace.normalization, '计算必须留下归一化 trace');
+    assert.ok(computeRes.json.trace.judgePool, '计算快照必须带上评委池合规信息');
+    // 判别性：企业席的双签确认真的进了引擎（E 席有分；缺双签会按 R2 记 0）
+    assert.ok(computeRes.json.teams[0].seatE > 0, '企业席必须有分（双签确认没进引擎就会是 0）');
+    // 判别性B5：评委池合规（10 席 / 企业席 50% / 专家席 50%）—— 不合规会告警
+    assert.equal(computeRes.json.trace.judgePool.ok, true, '评委池必须合规');
+    assert.equal(
+      computeRes.json.warnings.some((w) => w.code === 'judge_pool_invalid'), false,
+      '评委池合规时不得出现 judge_pool_invalid 告警',
+    );
+    // 判别性B6：企业席双签成立 ⇒ 不得出现 R2 告警
+    assert.equal(
+      computeRes.json.warnings.some((w) => w.code === 'R2_missing_dual_signature'), false,
+      '双签齐全时不得出现 R2_missing_dual_signature 告警',
+    );
+
+    // ── 5. 发榜 ──
+    // ⚠️ publishLeaderboard **没有 HTTP 路由**（src/server.js 里只挂了读接口），
+    //    「发榜」= 写快照 + 发名次积分 + 重算段位，只有服务层这一条路。
+    //    这里直接调**真实服务层**（不是 mock）—— 路由缺口登记在 P6 Task 8 台账 G-1。
+    const publish = publishLeaderboard({
+      db, editionId: 'ed_1', stageId: 'st_1', actorId: users.admin.id,
+      now: '2026-10-20T00:00:00.000Z', rules: s.rules,
+    });
+    assert.ok(publish.snapshots.rank, '发榜必须写 A 榜快照');
+    assert.ok(publish.awarded.stage.length > 0, '发榜必须发放名次积分');
+
+    // 判别性B7：发榜幂等 —— 再发一次不重复发积分（points_ledger 行数不变）
+    const ledgerCount = () => db.prepare('SELECT COUNT(*) AS n FROM points_ledger').get().n;
+    const beforeRepublish = ledgerCount();
+    publishLeaderboard({
+      db, editionId: 'ed_1', stageId: 'st_1', actorId: users.admin.id,
+      now: '2026-10-20T00:00:01.000Z', rules: s.rules,
+    });
+    assert.equal(ledgerCount(), beforeRepublish, '重复发榜不得重复写积分流水（幂等）');
+
+    // ── 6. 榜单（HTTP）──
+    const lbRes = await callJson(app, 'GET', '/api/leaderboard/st_1?scope=rank');
+    assert.equal(lbRes.status, 200, lbRes.text);
+    assert.equal(lbRes.json.rows.length, 1);
+    assert.equal(lbRes.json.rows[0].teamId, teamId);
+    assert.equal(lbRes.json.rows[0].rank, 1);
+    assert.ok(lbRes.json.rows[0].total > 0, '总分必须大于 0');
+    // 判别性B8：榜单里没有企业名
+    assert.equal(lbRes.text.includes('某银行'), false, '企业名不公示');
+    assert.equal('enterpriseName' in lbRes.json.rows[0], false, '榜单行里不得出现 enterpriseName 字段');
+
+    // ── 7. 段位（HTTP）──
+    // 5 项里程碑签字（S 段要 5 项 + 业务部门签字）—— 企业通过真实签字接口签
+    const milestoneRows = db.prepare('SELECT * FROM milestones WHERE team_id = ? ORDER BY key').all(teamId);
+    assert.equal(milestoneRows.length, 7, '组队时固定的里程碑清单是 7 类');
+    for (const m of milestoneRows.slice(0, 5)) {
+      const signRes = await callJson(app, 'POST', `/api/milestones/${m.id}/signoff`, {
+        token: tokens.enterprise,
+        body: { department: '业务部', content: `已确认「${m.label}」落地，我方业务部门签字` },
+      });
+      assert.equal(signRes.status, 200, signRes.text);
+    }
+    // 段位记录是**发榜时**重算的 ⇒ 再发一次榜让段位落库
+    publishLeaderboard({
+      db, editionId: 'ed_1', stageId: 'st_1', actorId: users.admin.id,
+      now: '2026-10-20T00:00:02.000Z', rules: s.rules,
+    });
+    const tierRes = await callJson(app, 'GET', `/api/teams/${teamId}/tier`);
+    assert.equal(tierRes.status, 200, tierRes.text);
+    assert.equal(tierRes.json.tier, 'S', `5 项里程碑 + 业务部门签字 ⇒ S 段（实际 ${tierRes.json.tier}）`);
+    assert.equal(tierRes.json.progress.milestoneCount, 5);
+
+    // 判别性B9：段位接口对 D 段队伍「单条不满足 ⇒ 404」（不泄露别人的 D 段进度）
+    const dTier = db.prepare("SELECT * FROM tier_records WHERE team_id = ? ORDER BY computed_at DESC").all(teamId)[0];
+    assert.ok(dTier, '必须落一条段位记录');
+    db.prepare("UPDATE tier_records SET tier = 'D', milestone_count = 0, business_signoff_count = 0 WHERE id = ?")
+      .run(dTier.id);
+    const dRes = await callJson(app, 'GET', `/api/teams/${teamId}/tier`);
+    assert.equal(dRes.status, 404, 'D 段队伍对非成员必须 404（不公示）');
+    const dSelf = await callJson(app, 'GET', `/api/teams/${teamId}/tier`, { token: tokens.captain });
+    assert.equal(dSelf.status, 200, '本人看自己的 D 段进度卡必须 200');
+    assert.equal(dSelf.json.self, true, '本人拿到的必须是「本人进度卡」而不是公示口径');
+    // 复原：再发一次榜，段位按「5 项里程碑 + 业务部门签字」重算回 S 段
+    publishLeaderboard({
+      db, editionId: 'ed_1', stageId: 'st_1', actorId: users.admin.id,
+      now: '2026-10-20T00:00:04.000Z', rules: s.rules,
+    });
+
+    // ── 8. 战绩卡（HTTP）──
+    const cardRes = await callJson(app, 'GET', `/api/teams/${teamId}/performance-card`, { token: tokens.admin });
+    assert.equal(cardRes.status, 200, cardRes.text);
+    assert.equal(cardRes.json.items.length, 7, '战绩卡覆盖全部 7 类里程碑');
+    assert.equal(cardRes.json.achievedCount, 5, '已签字的 5 项里程碑必须算达成');
+    // 判别性B10：战绩卡只有「达成/已签」，**没有签字人**
+    assert.deepEqual(
+      Object.keys(cardRes.json.items[0]).sort(),
+      ['achieved', 'key', 'label', 'signed'],
+      '战绩卡条目的字段是白名单：不得出现签字人',
+    );
+    assert.equal(cardRes.text.includes('签字人丁'), false, '签字人不得出现在战绩卡里');
+
+    // ── 9. 三池（HTTP）──
+    const syncRes = await callJson(app, 'POST', '/api/pools/sync', {
+      token: tokens.admin, body: { editionId: 'ed_1' },
+    });
+    assert.equal(syncRes.status, 200, syncRes.text);
+    // ⚠️ 同步接口返回的是**同步摘要**（{inserted, updated, removed, total}），不是行数组
+    assert.ok(syncRes.json.projects.total > 0, '同步后项目池必须有派生的行');
+    assert.ok(syncRes.json.talents.total > 0, '同步后人才池必须有派生的行');
+    assert.ok(syncRes.json.resources.total > 0, '同步后资源池必须有派生的行');
+
+    const projRes = await callJson(app, 'GET', '/api/pools/projects?editionId=ed_1', { token: tokens.admin });
+    const talRes = await callJson(app, 'GET', '/api/pools/talents?editionId=ed_1', { token: tokens.admin });
+    const resRes = await callJson(app, 'GET', '/api/pools/resources?editionId=ed_1', { token: tokens.admin });
+    assert.equal(projRes.status, 200, projRes.text);
+    assert.ok(projRes.json.projects.length > 0, '项目池不能是空的');
+    assert.ok(talRes.json.talents.length > 0, '人才池不能是空的');
+    assert.ok(resRes.json.resources.length > 0, '资源池不能是空的');
+    // 判别性B11：三池同步是幂等的（再同步一次行数不变）
+    const projectsBefore = projRes.json.projects.length;
+    await callJson(app, 'POST', '/api/pools/sync', { token: tokens.admin, body: { editionId: 'ed_1' } });
+    const projAgain = await callJson(app, 'GET', '/api/pools/projects?editionId=ed_1', { token: tokens.admin });
+    assert.equal(projAgain.json.projects.length, projectsBefore, '三池同步必须幂等');
+    // 判别性B12：人才池的积分来自名次积分流水（不是常量 0）
+    assert.ok(talRes.json.talents.some((t) => t.totalPoints > 0), '人才池必须有人拿到名次积分');
+
+    // ── 10. 公开 API（HTTP）──
+    const publicToken = createPublicToken({
+      db, scope: 'leaderboard', editionId: 'ed_1', expiresAt: '2027-01-01T00:00:00.000Z',
+      now: '2026-10-20T00:00:00.000Z',
+    }).token;
+    const pubRes = await callJson(app, 'GET', `/api/public/leaderboard?token=${publicToken}&editionId=ed_1`);
+    assert.equal(pubRes.status, 200, pubRes.text);
+    assert.equal(pubRes.json.stages.length, 1);
+    assert.equal(pubRes.json.stages[0].rows.length, 1, 'S 段队伍必须进公开榜');
+    assert.equal(pubRes.json.stages[0].rows[0].teamName, '验收一队');
+    // 判别性B13：公开响应里没有企业名、没有签字人、没有 D 段队伍
+    assert.equal(pubRes.text.includes('某银行'), false, '企业名不公示');
+    assert.equal(pubRes.text.includes('签字人丁'), false, '签字人不公开');
+    assert.deepEqual(
+      Object.keys(pubRes.json.stages[0].rows[0]).sort(),
+      ['points', 'rank', 'teamName', 'tier', 'tiedWith', 'total'].sort(),
+      '公开行是字段白名单',
+    );
+
+    // 判别性B14：无 token ⇒ 403 PUBLIC_TOKEN_MISSING（公开接口不是登录接口）
+    const noToken = await callJson(app, 'GET', '/api/public/leaderboard?editionId=ed_1');
+    assert.equal(noToken.status, 403, noToken.text);
+    assert.equal(noToken.json.error.code, 'PUBLIC_TOKEN_MISSING');
+    // 判别性B15：无效 token ⇒ 403 PUBLIC_TOKEN_INVALID
+    const badToken = await callJson(app, 'GET', '/api/public/leaderboard?token=not-a-token&editionId=ed_1');
+    assert.equal(badToken.status, 403, badToken.text);
+    assert.equal(badToken.json.error.code, 'PUBLIC_TOKEN_INVALID');
+  } finally {
+    teardown(s);
+  }
+});
+
+test('R-OPS-13/14：任务完成 ≠ 赛段交付物得分（完成一个任务不写积分流水）', async () => {
+  const s = setupServer();
+  const { db, app, tokens, users } = s;
+  try {
+    // 报名 → 组队（真实写路径）：任务清单要有归属，队长才在「认领了该任务包的队」里
+    const reg = await callJson(app, 'POST', '/api/registrations', {
+      token: tokens.captain, body: { editionId: 'ed_1', answers: STRONG },
+    });
+    assert.equal(reg.status, 200, reg.text);
+    const teamRes = await callJson(app, 'POST', '/api/teams', {
+      token: tokens.captain, body: { editionId: 'ed_1', taskPackageId: 'tp_1', name: '任务验收队' },
+    });
+    assert.equal(teamRes.status, 200, teamRes.text);
+    const teamId = teamRes.json.id;
+
+    // 工作流 → 任务清单（真实写路径：R-OPS-13「任务包 → 工作流 → 任务清单」）
+    const wfRes = await callJson(app, 'POST', '/api/workflows', {
+      token: tokens.captain, body: { editionId: 'ed_1', taskPackageId: 'tp_1', name: '验收工作流' },
+    });
+    assert.equal(wfRes.status, 200, wfRes.text);
+    const wfId = wfRes.json.workflow.id;
+    const taskRes = await callJson(app, 'POST', `/api/workflows/${wfId}/tasks`, {
+      token: tokens.captain, body: { title: '把风控原型跑通', detail: '端到端跑一遍' },
+    });
+    assert.equal(taskRes.status, 200, taskRes.text);
+    const taskId = taskRes.json.task.id;
+
+    // 任务清单可见
+    const listRes = await callJson(app, 'GET', `/api/workflows/${wfId}/tasks`, { token: tokens.captain });
+    assert.equal(listRes.status, 200, listRes.text);
+    assert.equal(listRes.json.tasks.length, 1);
+    assert.equal(listRes.json.tasks[0].status, 'todo');
+    assert.equal(listRes.json.tasks[0].claim, null, '还没人领取');
+
+    // 自主领取（R-OPS-13/14 的核心动作）
+    const claim = await callJson(app, 'POST', `/api/tasks/${taskId}/claim`, { token: tokens.captain, body: {} });
+    assert.equal(claim.status, 200, claim.text);
+    assert.equal(claim.json.task.status, 'in_progress');
+
+    // 判别性B16：完成必须带「可运行产物 + 版本」证据（纯文字进度说明不给分，R-STG-04）
+    const noEvidence = await callJson(app, 'POST', `/api/tasks/${taskId}/complete`, {
+      token: tokens.captain, body: { evidence: { kind: 'runnable', summary: '做完了' } },
+    });
+    assert.equal(noEvidence.status, 400, noEvidence.text);
+    assert.equal(noEvidence.json.error.code, 'EVIDENCE_REQUIRED');
+
+    const ledgerCount = () => db.prepare('SELECT COUNT(*) AS n FROM points_ledger').get().n;
+    const before = ledgerCount();
+    const done = await callJson(app, 'POST', `/api/tasks/${taskId}/complete`, {
+      token: tokens.captain,
+      body: {
+        evidence: {
+          kind: 'runnable', summary: '原型已跑通', artifactUrl: 'https://example.com/hks', version: 'v0.1.0',
+        },
+      },
+    });
+    assert.equal(done.status, 200, done.text);
+    assert.equal(done.json.task.status, 'done');
+
+    // 判别性B17：任务完成**不写**积分流水（赛段交付物得分只由计算/发榜产生）
+    assert.equal(ledgerCount(), before, '完成一个任务不得写 points_ledger（任务完成 ≠ 赛段交付物得分）');
+
+    // 判别性B18：禁止岗位制 —— 不得存在任何「按岗位/身份派活」的接口
+    const assignLike = s.app.router.list().filter((r) => /assign|dispatch|allocate|appoint/i.test(r.pattern));
+    assert.deepEqual(assignLike, [], '不得存在按岗位/身份分配任务的接口（R-OPS-14 禁止岗位制）');
+
+    // 对照：真发一次榜，积分流水才会增加 —— 证明上面那条不是「流水表根本没长」
+    db.prepare(
+      `INSERT INTO stage_results (id, stage_id, team_id, rank, total, seat_p, seat_e, tied_with, points, computation_id, created_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+    ).run('sr_x', 'st_1', teamId, 1, 90, 88, 95, 0, 10, null, '2026-10-20T00:00:00.000Z');
+    publishLeaderboard({
+      db, editionId: 'ed_1', stageId: 'st_1', actorId: users.admin.id,
+      now: '2026-10-20T00:00:03.000Z', rules: s.rules,
+    });
+    assert.ok(ledgerCount() > before, '发榜后积分流水必须增加（对照：流水表不是死的）');
+  } finally {
+    teardown(s);
+  }
+});
+
+test('正式服务的路由清单覆盖 INTERFACES.md §2–§6 里约定的全部 API', () => {
+  const s = setupServer();
+  try {
+    const routes = s.app.router.list();
+    // INTERFACES.md §2–§6 里约定的 API（路径里的 :param 统一成 :*）
+    const expected = [
+      'POST /api/registrations',
+      'GET /api/registrations',
+      'POST /api/teams',
+      'GET /api/teams/*',
+      'POST /api/task-packages',
+      'GET /api/task-packages',
+      'POST /api/stages/*/reviews',
+      'GET /api/stages/*/review-state',
+      'POST /api/stages/*/compute',
+      'GET /api/stages/*/computations/*',
+      'GET /api/leaderboard/*',
+      'GET /api/leaderboard/rolling',
+      'GET /api/teams/*/performance-card',
+      'GET /api/teams/*/tier',
+      'GET /api/audit/computations/*',
+      'GET /api/audit/log',
+      'GET /api/workflows/*/tasks',
+      'POST /api/tasks/*/claim',
+      'GET /api/pools/projects',
+      'GET /api/pools/talents',
+      'GET /api/pools/resources',
+      'GET /api/public/leaderboard',
+    ];
+    const norm = (s2) => s2.replace(/:[A-Za-z_][A-Za-z0-9_]*/g, '*');
+    const actual = new Set(routes.map((r) => `${r.method} ${norm(r.pattern)}`));
+    const missing = expected.filter((e) => !actual.has(e));
+    assert.deepEqual(missing, [], `正式服务缺少这些路由：${missing.join('、')}`);
+  } finally {
+    teardown(s);
+  }
+});
 ```
 
 `platform/test/portability.test.js`：
 
 ```javascript
+// platform/test/portability.test.js —— P6 Task 8：跨平台可移植性验收（静态可判定部分）
+//
+// ⚠️ **诚实性声明（先读这段再引用本文件）**：
+//   本机是 **macOS（darwin arm64）**。**Linux / ext4 与 Windows 本轮没有跑过**。
+//   ⇒ 本文件断言的全部是**「代码里能静态判定的可移植性事实」**，
+//      **不是**「在 Windows 上验证过」这种没做过的断言。
+//   真正把 platform/ 拷到另一台机器上跑 migrate / test / build-demo 三条命令
+//   （P6 验收标准 P6-13 的**实机部分**）**本轮未覆盖**，理由见 P6 Task 8 台账「未覆盖清单」。
+//   同理，真机（Linux + systemd + nginx + root）完整执行 deploy/install.sh 也**未实跑**
+//   （见 docs/deployment.md §13 U-3）。
+//
+// 溯源需求（逐条标在用例上）：
+//   R-OPS-01 可移植：不能依赖联网 npm install 或原生编译；换台机器就能跑
+//   R-OPS-02 跨平台稳定：组员 Mac/Windows、云主机 Linux 上跑同一份代码
+//   R-OPS-07 零 npm 依赖：后端只用 Node 标准库；前端无构建步骤
+//
+// P6 验收标准的对应关系（**只认静态可判定的那部分**）：
+//   P6-13「全链路 + 跨平台」→ 本文件覆盖的是它的**静态可移植性部分**
+//        （零依赖 / 无构建 / 路径与行尾一致 / 无平台分支 / 迁移编号唯一 / 版本下限自洽）。
+//        它的**实机部分**（拷到另一台机器跑三条命令）本轮未覆盖。
+//   P6-12「公网演示 URL 可访问」→ 本文件不涉及（P6-12 要等真机发布后人工验）。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
 import { join, dirname, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { assertDomainIsBrowserSafe } from '../scripts/build-demo.js';
+import { stripComments } from '../test-helpers/strip-comments.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const platformDir = join(here, '..');
 const repoRoot = join(platformDir, '..');
+
+/** 会被扫到的文本文件后缀（源码 / 配置 / 规则 / 脚本 / 文档）。 */
+const TEXT_EXT = new Set([
+  '.js', '.json', '.sh', '.sql', '.md', '.yml', '.yaml', '.conf', '.service', '.txt', '.html', '.css',
+]);
+
+/** 源码目录（只扫这三个：运行时代码 + 脚本 + 前端）。 */
+const CODE_DIRS = ['src', 'scripts', 'web'];
 
 function walk(dir, out = []) {
   for (const e of readdirSync(dir, { withFileTypes: true })) {
@@ -7356,57 +8051,396 @@ function walk(dir, out = []) {
   return out;
 }
 
-test('零 npm 依赖：没有 node_modules、没有 package-lock.json', () => {
-  assert.equal(existsSync(join(platformDir, 'node_modules')), false);
+/** 相对仓库根的文件路径（报错信息里用，跨平台统一用 '/' 分隔）。 */
+function relOf(file) {
+  return relative(repoRoot, file).split(sep).join('/');
+}
+
+/** 抽出源码里的 import 说明符（静态 import / export from / 动态 import / require）。 */
+function importSpecifiers(code) {
+  const text = stripComments(code, { blankRegex: true });
+  const specs = [];
+  const re1 = /(?:^|[\n;])\s*(?:import|export)\b[^;'"`]*?\bfrom\s*['"]([^'"]+)['"]/g;
+  const re2 = /(?:^|[\n;])\s*import\s*['"]([^'"]+)['"]/g;
+  const re3 = /\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
+  const re4 = /\brequire\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
+  for (const re of [re1, re2, re3, re4]) {
+    let m;
+    while ((m = re.exec(text)) !== null) specs.push(m[1]);
+  }
+  return specs;
+}
+
+/** 一行号 → 文本行（1 基）。 */
+function lineAt(src, index) {
+  let line = 1;
+  for (let i = 0; i < index && i < src.length; i += 1) if (src[i] === '\n') line += 1;
+  return line;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// 1. 零 npm 依赖（零构建 / 零原生编译）
+// ═══════════════════════════════════════════════════════════════════════
+
+test('R-OPS-01/07：零 npm 依赖 —— 没有 node_modules / 锁文件 / dependencies', () => {
+  assert.equal(existsSync(join(platformDir, 'node_modules')), false, 'platform/ 下不允许有 node_modules');
   assert.equal(existsSync(join(platformDir, 'package-lock.json')), false);
+  assert.equal(existsSync(join(platformDir, 'npm-shrinkwrap.json')), false);
+  assert.equal(existsSync(join(platformDir, 'yarn.lock')), false);
+  assert.equal(existsSync(join(platformDir, 'pnpm-lock.yaml')), false);
+  assert.equal(existsSync(join(repoRoot, 'node_modules')), false, '仓库根下也不允许有 node_modules');
+
   const pkg = JSON.parse(readFileSync(join(platformDir, 'package.json'), 'utf8'));
-  assert.equal(pkg.dependencies, undefined);
-  assert.equal(pkg.devDependencies, undefined);
+  assert.equal(pkg.dependencies, undefined, '禁止新增 dependencies');
+  assert.equal(pkg.devDependencies, undefined, '禁止新增 devDependencies');
+  assert.equal(pkg.peerDependencies, undefined, '禁止新增 peerDependencies');
+  assert.equal(pkg.optionalDependencies, undefined, '禁止新增 optionalDependencies');
+  assert.equal(pkg.type, 'module', '必须是 ESM（"type": "module"）');
 });
 
-test('领域层不得依赖 Node 内置模块（跨平台 + 浏览器双重约束）', () => {
+test('R-OPS-01/07：零构建、零原生编译（无 gyp / .node / 安装期脚本）', () => {
+  const offenders = [];
+  for (const f of walk(platformDir)) {
+    const base = f.split(sep).pop();
+    if (base === 'binding.gyp' || base.endsWith('.node')) offenders.push(relOf(f));
+  }
+  assert.deepEqual(offenders, [], `不允许出现原生编译产物/描述：${offenders.join('、')}`);
+
+  const pkg = JSON.parse(readFileSync(join(platformDir, 'package.json'), 'utf8'));
+  for (const hook of ['preinstall', 'install', 'postinstall', 'prepare', 'prepublish']) {
+    assert.equal(pkg.scripts?.[hook], undefined, `package.json 不得有安装期脚本 ${hook}（会触发联网/本地构建）`);
+  }
+  // 「无构建步骤」：前端产物由 node scripts/build-demo.js 直接产出（纯拷贝 + 拼字符串），
+  // 没有任何打包器配置（webpack / vite / rollup / esbuild …）。
+  for (const name of ['webpack.config.js', 'vite.config.js', 'rollup.config.js', 'esbuild.config.js', 'tsconfig.json']) {
+    assert.equal(existsSync(join(platformDir, name)), false, `不允许出现构建配置 ${name}（本项目零构建）`);
+  }
+});
+
+test('R-OPS-01：源码只 import Node 内置模块与相对路径（无第三方、无绝对路径 import）', () => {
+  const violations = [];
+  const absolutes = [];
+  for (const dir of CODE_DIRS) {
+    for (const f of walk(join(platformDir, dir))) {
+      if (!f.endsWith('.js')) continue;
+      const code = readFileSync(f, 'utf8');
+      for (const spec of importSpecifiers(code)) {
+        if (spec.startsWith('node:')) continue;
+        if (spec.startsWith('.')) continue;
+        if (spec.startsWith('/')) {
+          absolutes.push(`${relOf(f)} → ${spec}`);
+          continue;
+        }
+        violations.push(`${relOf(f)} → ${spec}`);
+      }
+    }
+  }
+  assert.deepEqual(violations, [], `发现第三方依赖：${violations.join('、')}`);
+  assert.deepEqual(absolutes, [], `发现绝对路径 import：${absolutes.join('、')}`);
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// 2. 领域层：浏览器同构前提（P6 Task 5 的硬约束）
+// ═══════════════════════════════════════════════════════════════════════
+
+test('R-OPS-01/02：领域层不 import 任何 Node 内置模块（浏览器里跑同一套引擎的前提）', () => {
   const violations = assertDomainIsBrowserSafe(join(platformDir, 'src', 'domain'));
   assert.deepEqual(violations, [], violations.join('；'));
 });
 
-test('所有 shell 脚本都 set -euo pipefail 且不依赖当前工作目录', () => {
-  const scripts = walk(platformDir).filter((f) => f.endsWith('.sh'));
-  assert.ok(scripts.length > 0, '至少要有一个 shell 脚本');
-  for (const f of scripts) {
-    const code = readFileSync(f, 'utf8');
-    assert.match(code, /^set -euo pipefail$/m, `${relative(repoRoot, f)} 缺 set -euo pipefail`);
+test('R-OPS-01/02：领域层是纯函数 —— 不读时钟、不用随机数（剥掉注释后扫）', () => {
+  const domainDir = join(platformDir, 'src', 'domain');
+  const offenders = [];
+  for (const name of readdirSync(domainDir).filter((n) => n.endsWith('.js'))) {
+    const raw = readFileSync(join(domainDir, name), 'utf8');
+    // ⚠️ 必须先剥注释：领域层每个文件的头注释都写着「无 Date.now() / Math.random()」，
+    //    不剥就会把**声明**当成**使用**（仓库里的既有约定，见 test-helpers/strip-comments.js）。
+    const code = stripComments(raw);
+    if (/Date\.now\s*\(\s*\)/.test(code)) offenders.push(`${name}: Date.now()`);
+    if (/Math\.random\s*\(\s*\)/.test(code)) offenders.push(`${name}: Math.random()`);
+    if (/new\s+Date\s*\(\s*\)/.test(code)) offenders.push(`${name}: new Date()（不传参 = 读当前时钟）`);
+    if (/\bprocess\./.test(code)) offenders.push(`${name}: process.*（领域层没有进程概念）`);
   }
-  const install = readFileSync(join(platformDir, 'deploy', 'install.sh'), 'utf8');
-  assert.match(install, /\$\(cd "\$\(dirname "\$0"\)" && pwd\)/, 'install.sh 必须用脚本自身位置定位');
+  assert.deepEqual(offenders, [], `领域层必须是纯函数（时间与随机数一律由参数传入）：${offenders.join('、')}`);
 });
 
-test('仓库里没有写死的本机绝对路径（换机器就能跑）', () => {
-  const files = walk(platformDir).filter((f) => /\.(js|json|sh|md|yml|service|conf)$/.test(f));
+/**
+ * 领域层不得使用 **Node 专属全局**。
+ *
+ * ⚠️ 为什么这条必须单独有（`assertDomainIsBrowserSafe` 抓不到）：
+ *   `scripts/build-demo.js` 的浏览器安全守卫**只看 import 说明符**
+ *   （node: 前缀 ⇒ 违规；裸模块名 ⇒ 违规；相对导入指不到文件 ⇒ 违规）。
+ *   而 `Buffer` / `process` / `__dirname` / `__filename` / `require` 是
+ *   **不 import 就能用**的全局量 ⇒ 守卫一个都抓不到。
+ *   而 build-demo.js 会把**整个** `src/domain/` 目录**原样拷进浏览器产物**
+ *   （<out>/src/domain/*.js）⇒ 领域层里出现一个 `Buffer.from(...)`
+ *   就等于演示站一跑就 `ReferenceError: Buffer is not defined`。
+ *   （这个缺口已登记在 P6 Task 8 台账 G-2：**守卫本身**要不要补，由上游处置。）
+ *
+ * ⚠️ 为什么先剥注释：领域层每个文件的头注释都写着「无 Date.now() / Math.random()」，
+ *   注释里提到某个 token ≠ 代码里用了它（否则合法注释会造成假红）。
+ *   `stripComments` 保持行号不变 ⇒ 报错能定位到**行**。
+ */
+test('R-OPS-01/02：领域层不得使用 Node 专属全局（Buffer / process / __dirname / __filename / require）', () => {
+  const domainDir = join(platformDir, 'src', 'domain');
+  const offenders = [];
+  for (const name of readdirSync(domainDir).filter((n) => n.endsWith('.js')).sort()) {
+    const raw = readFileSync(join(domainDir, name), 'utf8');
+    const code = stripComments(raw, { blankRegex: true });
+    const lines = code.split('\n');
+    for (let i = 0; i < lines.length; i += 1) {
+      const line = lines[i];
+      const hits = [];
+      if (/\bBuffer\b/.test(line)) hits.push('Buffer');
+      if (/\bprocess\s*\./.test(line)) hits.push('process.');
+      if (/\b__dirname\b/.test(line)) hits.push('__dirname');
+      if (/\b__filename\b/.test(line)) hits.push('__filename');
+      if (/\brequire\s*\(/.test(line)) hits.push('require(');
+      for (const token of hits) offenders.push(`src/domain/${name}:${i + 1} 用了 ${token}`);
+    }
+  }
+  assert.deepEqual(
+    offenders, [],
+    `领域层不得使用 Node 专属全局（浏览器里不存在 ⇒ 演示站直接白屏）：${offenders.join('、')}`,
+  );
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// 3. 路径与平台假设
+// ═══════════════════════════════════════════════════════════════════════
+
+test('R-OPS-02：路径一律用 node:path 拼 —— 无字符串拼接路径、无 __dirname/__filename', () => {
+  const offenders = [];
+  for (const dir of CODE_DIRS) {
+    for (const f of walk(join(platformDir, dir))) {
+      if (!f.endsWith('.js')) continue;
+      const raw = readFileSync(f, 'utf8');
+      const code = stripComments(raw, { blankRegex: true });
+      // ① 字符串字面量拼路径：'…' + '/' + x / x + '\\' + '…'
+      if (/['"]\s*\+\s*[A-Za-z_$]/.test(code) && /['"]\s*\+\s*['"]\s*[\\/]/.test(code)) {
+        offenders.push(`${relOf(f)}: 字符串字面量拼路径`);
+      }
+      if (/\+\s*['"][\\/]/.test(code) || /['"][\\/]['"]\s*\+/.test(code)) {
+        offenders.push(`${relOf(f)}: 用 '/' 或 '\\\\' 拼路径（应改用 node:path）`);
+      }
+      // ② ESM 里没有 __dirname / __filename（用了就是 ReferenceError）
+      if (/\b__dirname\b|\b__filename\b/.test(code)) {
+        offenders.push(`${relOf(f)}: 用了 __dirname/__filename（ESM 没有这两个全局量）`);
+      }
+      // ③ 用了 node:path 的函数，就必须真的 import 自 node:path
+      const usesPathHelper = /(^|[^.\w])(join|resolve|dirname|basename|relative|extname|isAbsolute)\s*\(/.test(code);
+      if (usesPathHelper && !/from\s*['"]node:path['"]/.test(code)) {
+        offenders.push(`${relOf(f)}: 用了路径函数但没 import node:path`);
+      }
+    }
+  }
+  assert.deepEqual(offenders, [], offenders.join('；'));
+});
+
+test('R-OPS-02：没有平台分支（process.platform / os.platform 只允许出现在有注释的降级处）', () => {
+  const PATTERN = /process\.(platform|arch)\b|\bos\.(platform|type|release)\s*\(/g;
+  const PLATFORM_WORDS = ['linux', 'Linux', 'win32', 'Windows', 'darwin', 'macOS'];
+  const runtimeOffenders = [];
+  const uncommented = [];
+
+  for (const dir of CODE_DIRS) {
+    for (const f of walk(join(platformDir, dir))) {
+      if (!f.endsWith('.js')) continue;
+      const raw = readFileSync(f, 'utf8');
+      const code = stripComments(raw, { blankRegex: true });
+      const lines = code.split('\n');
+      for (let i = 0; i < lines.length; i += 1) {
+        PATTERN.lastIndex = 0;
+        if (!PATTERN.test(lines[i])) continue;
+        const rel = relOf(f);
+        // 运行时（src/ + web/）不许有平台分支；scripts/ 只允许「有注释的降级」
+        if (dir !== 'scripts') {
+          runtimeOffenders.push(`${rel}:${i + 1} ${lines[i].trim()}`);
+          continue;
+        }
+        // 降级必须在附近有注释说明（允许：Linux 上再兜底 systemd / Windows 上跳过 …）
+        const window = raw.split('\n').slice(Math.max(0, i - 20), i + 5).join('\n');
+        if (!PLATFORM_WORDS.some((w) => window.includes(w))) {
+          uncommented.push(`${rel}:${i + 1} ${lines[i].trim()}`);
+        }
+      }
+    }
+  }
+  assert.deepEqual(runtimeOffenders, [], `运行时代码不得有平台分支：${runtimeOffenders.join('、')}`);
+  assert.deepEqual(uncommented, [], `脚本里的平台分支必须有注释说明降级理由：${uncommented.join('、')}`);
+});
+
+test('R-OPS-01：仓库里没有写死的本机绝对路径（换台机器就能跑）', () => {
+  // ⚠️ 扫描范围**不含 test/ 与 test-helpers/**：
+  //    测试文件里合法地存在这些字符串（负例夹具、守卫自身的匹配模式），
+  //    扫它们会自我误报。要发布的是运行时代码与部署资产 —— 那才是「换台机器要能跑」的东西。
+  const files = walk(platformDir).filter((f) => {
+    const rel = relOf(f);
+    if (rel.startsWith('platform/test/') || rel.startsWith('platform/test-helpers/')) return false;
+    return /\.(js|json|sh|md|yml|yaml|service|conf|txt|sql)$/.test(f);
+  });
   const offenders = [];
   for (const f of files) {
     const code = readFileSync(f, 'utf8');
-    if (code.includes('/Users/') || code.includes('/Volumes/')) {
-      offenders.push(relative(repoRoot, f));
+    // Windows 盘符必须带词边界（'C:\\dir' 命中；'PORT:\\s*' 这种正则片段不命中）
+    if (code.includes('/Users/') || code.includes('/Volumes/') || /\b[A-Za-z]:[\\/]/.test(code)) {
+      offenders.push(relOf(f));
     }
   }
   assert.deepEqual(offenders, [], `这些文件里写死了本机路径：${offenders.join('、')}`);
 });
 
-test('部署资产里没有硬编码口令', () => {
+// ═══════════════════════════════════════════════════════════════════════
+// 4. 换行符 / 编码（跨平台一致）
+// ═══════════════════════════════════════════════════════════════════════
+
+test('R-OPS-02：仓库里的文本资产统一 LF、无 BOM、合法 UTF-8', () => {
+  const crlf = [];
+  const bom = [];
+  const badUtf8 = [];
+  const decoder = new TextDecoder('utf-8', { fatal: true });
+
+  for (const f of walk(platformDir)) {
+    const ext = f.slice(f.lastIndexOf('.'));
+    if (!TEXT_EXT.has(ext)) continue;
+    const buf = readFileSync(f);
+    if (buf.includes(0x0d)) crlf.push(relOf(f));
+    if (buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) bom.push(relOf(f));
+    try {
+      decoder.decode(buf);
+    } catch {
+      badUtf8.push(relOf(f));
+    }
+  }
+
+  assert.deepEqual(crlf, [], `这些文件含 CR（CRLF）—— Windows 签出后 shell 脚本会挂：${crlf.join('、')}`);
+  assert.deepEqual(bom, [], `这些文件带 UTF-8 BOM —— JSON.parse 会直接抛错：${bom.join('、')}`);
+  assert.deepEqual(badUtf8, [], `这些文件不是合法 UTF-8：${badUtf8.join('、')}`);
+});
+
+test('R-OPS-02：iCal（若已实现）必须显式用 CRLF 行尾；本分支尚未实现 ⇒ 该要求归 P5 Task 5', () => {
+  const sources = [];
+  for (const dir of CODE_DIRS) {
+    for (const f of walk(join(platformDir, dir))) {
+      if (!f.endsWith('.js')) continue;
+      const code = readFileSync(f, 'utf8');
+      if (code.includes('VCALENDAR') || code.includes('BEGIN:VEVENT')) sources.push(f);
+    }
+  }
+  if (sources.length === 0) {
+    // 本分支（feat/p6-e2e，从 main 切出）**没有** iCal 导出实现 ——
+    // 那是 P5 Task 5（feat/p5-pools 分支）的产物，还没进 main。
+    // ⇒ 这一条在这里**不假装已验**；等 iCal 落地后，本用例会自动开始检查 CRLF。
+    assert.ok(true, '本分支无 iCal 实现（CRLF 行尾要求归 P5 Task 5，未覆盖）');
+    return;
+  }
+  const offenders = [];
+  for (const f of sources) {
+    const code = readFileSync(f, 'utf8');
+    // iCal 规范要求 CRLF 行尾：生成器必须显式写 \r\n
+    if (!/\\r\\n/.test(code)) offenders.push(relOf(f));
+  }
+  assert.deepEqual(offenders, [], `iCal 生成器必须显式用 CRLF（\\r\\n）：${offenders.join('、')}`);
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// 5. 迁移编号唯一（与 `ls db/migrations | cut -d_ -f1 | sort | uniq -d` 为空等价）
+// ═══════════════════════════════════════════════════════════════════════
+
+test('R-OPS-01：迁移编号唯一且连续（001–006 不得重号）', () => {
+  const dir = join(platformDir, 'db', 'migrations');
+  const names = readdirSync(dir).filter((n) => n.endsWith('.sql')).sort();
+  assert.ok(names.length > 0, '迁移目录不能是空的');
+
+  const versions = names.map((n) => {
+    const m = n.match(/^(\d+)_/);
+    assert.ok(m, `迁移文件名必须以「版本号_」开头：${n}`);
+    return Number(m[1]);
+  });
+  const dup = versions.filter((v, i) => versions.indexOf(v) !== i);
+  assert.deepEqual([...new Set(dup)], [], `迁移版本号重号了：${[...new Set(dup)].join('、')}`);
+
+  // 连续：从 1 开始、逐个 +1（跳号会让「按版本排序执行」的语义失真）
+  const sorted = [...versions].sort((a, b) => a - b);
+  for (let i = 0; i < sorted.length; i += 1) {
+    assert.equal(sorted[i], i + 1, `迁移版本号必须从 1 开始连续（实际：${sorted.join('、')}）`);
+  }
+  // 编号与文件名里的版本号必须一致（人读的编号 = 执行的序号）
+  for (const n of names) {
+    const num = Number(n.match(/^(\d+)_/)[1]);
+    assert.equal(String(num).padStart(3, '0'), n.match(/^(\d+)_/)[1], `迁移文件名里的编号必须补零到三位：${n}`);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// 6. 运行时下限自洽（engines.node 与实际用到的 API 一致）
+// ═══════════════════════════════════════════════════════════════════════
+
+test('R-OPS-01：engines.node 下限与实际用到的 API 一致（不用 Node-24-only API）', () => {
+  const pkg = JSON.parse(readFileSync(join(platformDir, 'package.json'), 'utf8'));
+  assert.equal(pkg.engines?.node, '>=22.16.0', '运行时下限必须是 >=22.16.0（node:sqlite 的 backup() API 就是 22.16.0 引入的）');
+
+  const declared = pkg.engines.node.replace(/^[>=\s]*/, '').trim();
+  const [major, minor, patch] = declared.split('.').map(Number);
+
+  // 实际用到的、**有版本门槛**的 Node 能力（门槛来自 Node 官方版本历史）
+  const REQUIRED = [
+    { feature: 'node:sqlite', since: [22, 5, 0], why: 'node:sqlite 自 22.5.0 引入（22.13.0 起不再需要实验标志）' },
+    { feature: 'sqlite.backup()', since: [22, 16, 0], why: '备份脚本依赖的一致性备份 API，22.16.0 引入' },
+  ];
+  for (const req of REQUIRED) {
+    const ok = major > req.since[0]
+      || (major === req.since[0] && (minor > req.since[1]
+        || (minor === req.since[1] && patch >= req.since[2])));
+    assert.ok(ok, `声明的下限 ${declared} 低于实际用到的 ${req.feature}（需要 ≥ ${req.since.join('.')}：${req.why}）`);
+  }
+
+  // ⛔ URLPattern 是 Node 24 才有的（router.js 的注释里写着这条纪律）——
+  //    用它就会抬高运行时门槛 = 破坏「零依赖可移植」。
+  const offenders = [];
+  for (const dir of CODE_DIRS) {
+    for (const f of walk(join(platformDir, dir))) {
+      if (!f.endsWith('.js')) continue;
+      const code = stripComments(readFileSync(f, 'utf8'), { blankRegex: true });
+      if (/\bURLPattern\b/.test(code)) offenders.push(relOf(f));
+    }
+  }
+  assert.deepEqual(offenders, [], `URLPattern 是 Node-24-only，Node 22 上不存在：${offenders.join('、')}`);
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// 7. 部署资产的跨平台纪律
+// ═══════════════════════════════════════════════════════════════════════
+
+test('R-OPS-05：shell 脚本都 set -euo pipefail，install.sh 用脚本自身位置定位', () => {
+  const scripts = walk(platformDir).filter((f) => f.endsWith('.sh'));
+  assert.ok(scripts.length > 0, '至少要有一个 shell 脚本');
+  for (const f of scripts) {
+    const code = readFileSync(f, 'utf8');
+    assert.match(code, /^set -euo pipefail$/m, `${relOf(f)} 缺 set -euo pipefail`);
+    // 解释器必须是 /usr/bin/env bash（不是 /bin/sh —— dash 的语法子集更窄）
+    assert.match(code, /^#!\/usr\/bin\/env bash$/m, `${relOf(f)} 的解释器必须是 #!/usr/bin/env bash`);
+  }
+  const install = readFileSync(join(platformDir, 'deploy', 'install.sh'), 'utf8');
+  assert.match(install, /\$\(cd "\$\(dirname "\$0"\)" && pwd\)/, 'install.sh 必须用脚本自身位置定位');
+});
+
+test('R-OPS-05：部署资产里没有硬编码口令', () => {
   for (const name of ['install.sh', 'heikesong.service', 'nginx.conf', 'docker-compose.yml']) {
     const code = readFileSync(join(platformDir, 'deploy', name), 'utf8');
     assert.doesNotMatch(code, /PASSWORD\s*=\s*["'][^"'$]/, `${name} 里出现了硬编码口令`);
     assert.doesNotMatch(code, /password\s*[:=]\s*["'][^"'$]/i, `${name} 里出现了硬编码口令`);
   }
-});
-
-test('领域层是纯函数：不碰 IO、不读时钟、不用随机数', () => {
-  const domainDir = join(platformDir, 'src', 'domain');
-  for (const name of readdirSync(domainDir).filter((n) => n.endsWith('.js'))) {
-    const code = readFileSync(join(domainDir, name), 'utf8');
-    assert.doesNotMatch(code, /Date\.now\(\)/, `${name} 用了 Date.now()（时间必须由参数传入）`);
-    assert.doesNotMatch(code, /Math\.random\(\)/, `${name} 用了 Math.random()（随机数必须由参数传入）`);
-  }
+  // 管理员口令必须来自环境变量或交互输入，**不得有兜底默认值**：
+  //   ① `ADMIN_PASSWORD:-<字面量>` = shell 兜底默认值（空默认值 ${ADMIN_PASSWORD:-} 是「交互读取」，允许）
+  //   ② `ADMIN_PASSWORD="<字面量>"`  = 写死的口令（透传变量 `$password` 不算）
+  const install = readFileSync(join(platformDir, 'deploy', 'install.sh'), 'utf8');
+  assert.match(install, /ADMIN_PASSWORD/, 'install.sh 必须从环境变量读 ADMIN_PASSWORD');
+  assert.doesNotMatch(install, /ADMIN_PASSWORD:-[^}\s]/, 'install.sh 不得给 ADMIN_PASSWORD 兜底默认值');
+  assert.doesNotMatch(
+    install, /ADMIN_PASSWORD\s*=\s*["'](?!\$\{)[^"'$]+["']/,
+    'install.sh 不得把管理员口令写成字面量',
+  );
 });
 ```
 
@@ -7431,7 +8465,10 @@ Expected: 全部通过（0 fail）
 # 在源机器
 cd /path/to/heikesong && git add -A && git commit -m "chore(P6): 跨平台复现基线"
 # 把 platform/ 拷到另一台机器（Mac / Windows / Linux 都行）
+# ⚠️ 还要把【仓库根的 .gitignore】一起带上：platform/test/demo-static.test.js 会读它
+#    （只拷 platform/ 时该用例 ENOENT 失败 —— 实证见 P6 Task 8 台账 D8-5 / G-2）
 scp -r platform/ other-machine:/tmp/platform
+scp .gitignore other-machine:/tmp/.gitignore
 # 在另一台机器上，只跑这三条命令（不联网、不 npm install）
 cd /tmp/platform
 node scripts/migrate.js
@@ -8615,3 +9652,142 @@ nginx 在**最后**。机器上没装 nginx 时，脚本会先把上面**全部*
    （`check_ttl_days` 的上界判定与提示文案都由它驱动）。
 3. **F-8 的两条 systemd 命令未在真机跑过**（macOS 无 systemd）⇒ 手册 §13 U-8 已登记。
 4. **M-5 故意不改**（历史台账保留旧口径有审计价值）—— 检索时注意别当现行口径。
+
+## Task 8 实施台账（2026-10-21）
+
+> 本节是 **P6 Task 8（端到端与跨平台验收）** 的实施记录：
+> 规格缺陷清单与处置、逐字回写位置、实跑证据、变异测试、计划块逐字核验，
+> 以及**未覆盖项与理由**。
+>
+> **编号约定**：本计划已有 `D1-*`（Task 1）/ `D2-*`（Task 2 预审）/ `D3-*`（Task 3）/ `D4-*`（Task 4）/
+> `D5-*`（Task 5）/ `D6-*`（Task 6）/ `D7-*`（Task 7）与两轮部署资产修复轮（`F-5` / `F-7` / `F-9` 等）。
+> **本轮用 `D8-*`**（不重号）。
+>
+> **产出边界**：本 Task **只新建两个测试文件** ——
+> `platform/test/p6-e2e.test.js`（全链路验收）与 `platform/test/portability.test.js`（跨平台可移植性验收）。
+> **没有改 `platform/` 下的任何实现**；发现的实现缺陷全部登记在 B 节与 G 节，交上游处置。
+>
+> ⚠️ **诚实性声明（这一条比任何断言都重要）**：
+> 本机是 **macOS（darwin 27.0.0 arm64）、Node v22.23.2**。
+> **Linux / ext4 与 Windows 本轮没有跑过**；**真机（Linux + systemd + nginx + root）的
+> `deploy/install.sh` 完整执行也仍未实跑**（见 `docs/deployment.md` §13 U-3）。
+> ⇒ `portability.test.js` 断言的**全部**是「代码里能静态判定的可移植性事实」，
+>    **不写**「在 Windows 上验证过」这种没做过的断言；未覆盖项逐条列在 G 节。
+
+### A. 实施方法（先跑后派）
+
+1. 把规格 Task 8 的两个代码块**原样抽到** `/tmp/p6-t8/`（独立工程：`/tmp/p6-t8/platform` = platform 整树副本），
+   **一个字节都没改**，先按 Step 2 跑 → 规格原样的用例**红**（缺文件 / 断言与真实数据形状不符，见 B 节）。
+2. 在独立工程里**逐条修正规格断言**（不动实现），跑到全绿：
+   - 修正后的 `p6-e2e.test.js`：**4 例全绿**；
+   - 修正后的 `portability.test.js`：**15 例全绿**。
+3. 落盘到工作树 `platform/test/`，再跑**全量**：`node --disable-warning=ExperimentalWarning --test`
+   → **1231 例 / 1230 通过 / 1 跳过 / 0 失败**（Task 6 基线 1212/1211/1/0 ⇒ 本轮 **+19 例**）。
+4. 变异检验（脚本 `/tmp/p6-mutate/t8.mjs`，**指向已落地的两个测试文件**，跑在**副本**上）→ 见 E 节。
+5. 计划块**逐字回写**（用仓内工具 `docs/tools/plan-block-sync.mjs`，定位信号与核验同源）→ 见 C / F 节。
+6. 提交：`git add` 显式路径 + `git commit -m … -- <paths>`。
+
+### B. 规格缺陷清单
+
+| # | 级别 | 规格缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| D8-1 | **Important** | **计划 Task 8 的 e2e 代码块断言 `computed.teams.length === seed.teams.length`** —— 但同一个代码块里刚 `POST /api/teams` 建了一支队，而演示适配器的建队路径会 `s.teams.push(team)` ⇒ 名册从 5 支变 **6** 支 | 独立工程实跑：按规格原样写，断言拿到 `5 !== 6` | 计划代码块**逐字回写**为 `seed.teams.length + 1`，并在注释里写清「为什么是 +1」（建队进名册） |
+| D8-2 | **Important** | **计划 Task 8 的路由清单核验用例里 `norm` 产出 `:*`，而期望清单写的是 `*`** ⇒ 两边永不相等 ⇒ **11 条真实存在的路由被报成「缺失」** | 独立工程实跑：`正式服务缺少这些路由：GET /api/teams/*、POST /api/stages/*/reviews、…`（11 条）；这 11 条在 `app.router.list()` 里**全都存在** | `norm` 改为 `s.replace(/:[A-Za-z_][A-Za-z0-9_]*/g, '*')`；计划代码块逐字回写 |
+| D8-3 | **Important** | **计划 Task 8 的 e2e 代码块用 `api.get('/api/public/leaderboard?…')` 断言「公开榜有行」，但没断言「无 token ⇒ 403」** —— 而**演示适配器**缺 token 时抛的是 **401**（`UNAUTHENTICATED`），**正式服务**按契约抛 **403 `PUBLIC_TOKEN_MISSING`**（`src/services/public-api.js` 的注释明写「四种失败一律 403，不返回 401」） | 独立工程实跑：演示适配器 `dispatch` 里 `if (!query.token) throw httpError(401, 'UNAUTHENTICATED', …)` | 测试**按契约把 403 钉在正式服务上**（`403` + `PUBLIC_TOKEN_MISSING` + 无效 token 的 `PUBLIC_TOKEN_INVALID`）；演示适配器那条**只断言「必须有 token」这条不变式**、**不把 401 固化成契约**（否则上游修成 403 时本测试会假红）。差异登记在 G-1 |
+| D8-4 | Minor | **计划 Task 8 的代码块没有把「正式服务的报名」与「演示适配器的报名」区分开** —— 两边的**响应形状不同**（正式：`grading.explain` / `status='submitted'`；演示：顶层 `explain` / `status='accepted'\|'rejected'`） | 探针 `/tmp/p6-proof/t8-demo-shape.mjs` 实跑输出（见 G-1） | 测试里**各自按各自的形状断言**（并写清差异出处）；**不假装两者同源**。形状差异本身登记在 G-1 |
+| D8-5 | **Important** | **计划 Task 8 的 Step 4「跨平台复现」配方按字面执行跑不通** —— 它说「把 `platform/` 拷到另一台机器，只跑 `node scripts/migrate.js` / `node --test` / `node scripts/build-demo.js`」，但 `platform/test/demo-static.test.js` 会读**仓库根**的 `.gitignore`（`join(here,'..','..','.gitignore')`）⇒ **只拷 `platform/` 时该用例 ENOENT 失败** | 独立工程 `/tmp/p6-t8`（只含 `platform/`）跑全量 ⇒ `not ok 310 - package.json 必须登记 P6 的脚本，.gitignore 必须忽略产物目录`，`error: ENOENT … open '/private/tmp/p6-t8/.gitignore'` | 计划代码块**逐字回写**时在 Step 4 的代码块里**加一行注释**说明「只拷 `platform/` 时 `test/demo-static.test.js` 需要仓库根的 `.gitignore` ⇒ 请连 `.gitignore` 一起拷，或改该用例不依赖仓库根」。**用例本身归 P6 Task 6 所有，本 Task 不改**（见 G-2） |
+
+### C. 逐字回写位置（本轮改动的计划代码块）
+
+| 计划位置 | 改动 |
+|---|---|
+| Task 8 Step 1 的 `platform/test/p6-e2e.test.js` 块（第 7207–7333 行） | **整块替换**为落地后的 `platform/test/p6-e2e.test.js`（含 D8-1 / D8-2 / D8-3 / D8-4 的修正与扩充） |
+| Task 8 Step 1 的 `platform/test/portability.test.js` 块（第 7337–7411 行） | **整块替换**为落地后的 `platform/test/portability.test.js`（含父代理追加的「领域层不得使用 Node 专属全局」一条） |
+| Task 8 Step 4 的 bash 块（第 7429–7440 行） | 加一行注释（D8-5：`.gitignore` 的依赖） |
+
+> 回写方式：`node docs/tools/plan-block-sync.mjs <plan> platform test/p6-e2e.test.js test/portability.test.js`
+> （该工具的定位信号 = 代码块首行文件头注释 / 围栏前的路径行，**核验与同步同源**）。
+
+### D. 实跑证据（2026-10-21）
+
+| # | 跑了什么 | 观察到 |
+|---|---|---|
+| E1 | `cd platform && node --disable-warning=ExperimentalWarning --test`（**无参**，cwd 发现） | **1231 例 / 1230 通过 / 0 失败 / 1 跳过**（基线 1212/1211/1/0 ⇒ **+19 例**：e2e 4 例 + portability 15 例） |
+| E2 | `cd platform && node --disable-warning=ExperimentalWarning --test test/p6-e2e.test.js` | **4 例 / 4 通过**（演示线全链路 / 正式服务全链路 / R-OPS-13+14 / 路由清单） |
+| E3 | `cd platform && node --disable-warning=ExperimentalWarning --test test/portability.test.js` | **15 例 / 15 通过** |
+| E4 | `cd platform && node scripts/audit-scan.js; echo "退出码=$?"` | **退出码 0**（词条 15 条、扫描 219 个文件、发布产物 `platform/web/dist` 58 个文件也过闸） |
+| E5 | 独立工程 `/tmp/p6-t8`（**只含 `platform/`**）跑全量 | **1 例红**：`test/demo-static.test.js` 读不到**仓库根**的 `.gitignore` ⇒ D8-5 的实证 |
+| E6 | 探针 `/tmp/p6-proof/t8-demo-shape.mjs`（演示适配器 vs 正式服务的响应形状） | 报名：演示返回**无** `grading` ⇒ 前端 `web/views/registration.js` 读到的 `reg.grading.score` = **undefined**、`reg.grading.explain` = **undefined**（渲染成空列表）、`reg.grading.accepted` = **undefined**（页面会显示「本级不接收，可向组委会提交申诉。」）；组队：演示给 `memberIds`，前端 `summarizeTeam` 读到 **成员 0 人 / 固定里程碑 0 项**；三池：演示给 `{kind, rows}`，正式给 `{projects}` ⇒ 见 G-1 |
+| E7 | 判别性实证（父代理追加的那条）：在 `/tmp` 副本里造两个假领域层文件 —— 一个**只在注释里**提「Buffer」、一个**真的用** `Buffer.from(...)` | 前者**不触发**、后者**触发**并报出 `src/domain/__probe_real.js:2 用了 Buffer`（文件 + 行号 + token 三件套）⇒ 断言既不误伤合法注释，也真能抓住违规 |
+| E8 | 同一副本里跑 `assertDomainIsBrowserSafe('./src/domain')` | **违规数 = 0** ⇒ 证实该守卫**只查 import、查不到 Node 专属全局** ⇒ G-3 的缺口实证 |
+
+### E. 变异测试（脚本 `/tmp/p6-mutate/t8.mjs`，指向**已落地**的两个测试文件）
+
+> 跑法：每个变异体都 `cp -R` 造**副本**再改，**绝不碰工作树**；
+> 变异锚点命中数必须 **=== 1**（0 次或 >1 次都算缺口并报出来）。
+
+| 结果 | 数量 |
+|---|---|
+| 杀（测试变红） | **22** |
+| 存活 | **0** |
+| 锚点错误 | **0** |
+| 缺口 | **0** |
+
+被杀掉的变异体（按被测能力分组）：
+
+| 组 | 变异体 | 杀它的断言 |
+|---|---|---|
+| 演示线 | M1 组队人数下限失效 / M2 公开榜不再要 token / M3 战绩卡带出签字人 / M4 榜单带出企业名 | 演示线的 4 条判别性断言（组队被拒 / 公开榜拒绝无 token / 字段白名单 / 企业名不公示） |
+| 正式线 | M5 公开 API 缺 token 回 401 / M6 段位榜门槛降到 D / M7 发榜不幂等 / M8 完成任务写积分流水 / M9 报名等级恒为 S / M10 战绩卡带出签字人 / M11 允许替别人加入队伍 / M12 评委能给自评席维度打分 / M13 D 段段位对非成员返 200 | 正式线的 9 条判别性断言（含「任务完成 ≠ 赛段交付物得分」「D 段不公示」「无 token ⇒ 403」） |
+| 可移植性 | M14 领域层用 `Buffer` / M15 领域层读时钟 / M16 迁移编号重号 / M17 新增 npm 依赖 / M18 降低 `engines.node` / M19 import 第三方 / M20 写死本机绝对路径 / M21 源码改成 CRLF / M22 运行时代码出现 `process.platform` | `portability.test.js` 的 9 条对应断言（含父代理追加的「领域层不得使用 Node 专属全局」） |
+
+### F. 计划块逐字核验
+
+| 核验项 | 结果 |
+|---|---|
+| `node docs/tools/plan-block-sync.mjs --verify <plan> platform test/p6-e2e.test.js test/portability.test.js` | ✅ 两个文件都「逐字一致」 |
+| `node /tmp/p3fix/plan-blocks.mjs <plan> platform` | ✅ 通过（该脚本按「计划块 ↔ 真实文件」逐块比对） |
+| `node /tmp/p3fix/block-by-path.mjs <plan> platform test/p6-e2e.test.js test/portability.test.js` | ✅ 两个路径都定位到**唯一**代码块并逐字一致 |
+| 计划 Task 8 的 Step 2 / Step 3 验收命令 | Step 2「期望失败」由本轮先跑后派实证（独立工程里规格原样的用例红）；Step 3「全部通过（0 fail）」= E1 |
+| 计划 Task 8 的**其余**代码块与文件 | ✅ 未受影响，仍一致（只替换了 Task 8 的两个块 + Step 4 的一行注释） |
+| 本轮**是否引入**新的不一致 | ❌ **没有**。用同步前的备份（`/tmp/p6-t8/plan-before-sync.md`）跑同一个 `plan-blocks.mjs` 做对照：同步**前** `test/p6-e2e.test.js` / `test/portability.test.js` 是「❌不一致」，同步**后** 是「✅一致」；另有 **3 条既有的不一致**（`web/seed/demo-data.js` 无实现、`package.js` 无实现、`src/server.js` 整文件块❌）**同步前后完全一样** ⇒ 属**前序 Task 的历史遗留**，不在本 Task 范围 |
+
+### G. 遗留 / 未覆盖项（需上游注意）
+
+1. **G-1（实现缺陷 · Task 5 的产物）**：`web/api.demo.js` 的响应形状与正式服务**不同源**，
+   而 `web/api.demo.js` 自己的文件头写着「⚠️ 接口形状必须与 `web/api.js`（真实后端）一致 —— 否则前端要写两套」。
+   实测（E6）：① 报名 —— 演示返回**顶层** `explain`、**没有** `grading` 对象，而前端
+   `web/views/registration.js` 读的是 `reg.grading.score / reg.grading.explain / reg.grading.accepted`
+   ⇒ 演示站的报名结果页会显示「**总分 undefined 分**」+ 空的可解释明细 + 「本级不接收…」（哪怕判的是 S 级）；
+   ② 组队 —— 演示返回 `memberIds`，没有 `members[] / memberCount / milestones`，
+   而前端 `web/views/team.js` 的 `summarizeTeam` 读的是 `team.members` ⇒ 演示站队伍页显示「**成员 0 人｜固定里程碑 0 项**」；
+   ③ 状态语义 —— 正式服务报名状态是 `submitted`（待组委会分级），演示直接写 `accepted / rejected`；
+   ④ 公开榜 —— 演示缺 token 抛 **401**，正式按契约抛 **403 `PUBLIC_TOKEN_MISSING`**；
+   ⑤ 合规同意（R-ENT-12）—— 正式服务缺 `consent.accepted` 硬拦 **400 `CONSENT_REQUIRED`**，演示**不查**；
+   ⑥ 三池 —— 演示返回 `{kind, rows}`，正式返回 `{projects / talents / resources}`（目前前端没有三池页 ⇒ 暂无用户可见影响）。
+   **本 Task 不改实现**（`web/api.demo.js` 归 P6 Task 5 所有）⇒ 交上游处置。
+   ⇒ 顺带说明：`test/demo-parity.test.js` 的 parity 只覆盖**计算**路径，**不覆盖响应形状** ⇒ 这类漂移目前无人看守。
+2. **G-2（测试缺陷 · P6 Task 6 的产物）**：`platform/test/demo-static.test.js` 读**仓库根**的 `.gitignore`
+   ⇒ 「只把 `platform/` 拷到另一台机器」这条 P6-13 配方按字面跑会红（E5）。
+   本 Task 的 `portability.test.js` **不依赖仓库根**（它的路径基准全部由 `import.meta.url` 推出）⇒ 本 Task 的两条用例在「只拷 platform/」的副本里照样能跑。
+   修法（两条都可行，交上游选）：① 该用例改成不依赖仓库根（`.gitignore` 的断言挪到仓库级用例）；② 计划 Step 4 改成「连仓库根的 `.gitignore` 一起拷」。
+3. **G-3（守卫缺口 · P6 Task 6 的产物）**：`scripts/build-demo.js` 的 `assertDomainIsBrowserSafe()` **只查 import 说明符**，
+   查不到**不 import 就能用**的 Node 专属全局（`Buffer` / `process` / `__dirname` / `__filename` / `require`）
+   ⇒ 而它会把**整个** `src/domain/` 原样拷进浏览器产物 ⇒ 领域层里出现一个 `Buffer.from(...)` 就等于演示站一跑就
+   `ReferenceError: Buffer is not defined`（E8 已实证该守卫对这类违规返回 0 违规）。
+   **本 Task 已在 `portability.test.js` 里补上「领域层不得使用 Node 专属全局」一条**（带文件 + 行号 + token 定位，E7 已实证其判别力），
+   但**没有改 `scripts/build-demo.js`**（文件归属：P6 Task 6 建立的，后续阶段只能 Modify 不得重建）⇒ 建议上游在守卫里补同样的扫描（构建期即失败）。
+4. **G-4（未覆盖）**：**P6-12「公网演示 URL 可访问」本轮无法自动验收** —— 需要真机发布后用浏览器打开公网 URL
+   （页面能加载 / 能登录 / 能点「计算」并看到 trace 与破同分链）。本轮只验了「演示线在**浏览器同一套引擎**里真跑」（`createDemoApi` + 真实规则引擎 + 真实种子），
+   **没有**发布到任何公网地址，**也没有**在真实浏览器里点过。
+5. **G-5（未覆盖）**：**P6-13 的实机部分本轮未做** —— 「把 `platform/` 拷到另一台机器，只跑 `migrate` / `test` / `build-demo` 三条命令」
+   需要**第二台机器**。本机是 macOS（darwin 27.0.0 arm64）⇒ **Linux / ext4 与 Windows 都没跑过**。
+   本轮覆盖的是 P6-13 的**静态可移植性部分**（`portability.test.js` 的 15 条：零依赖 / 零构建 / 路径与行尾一致 / 无平台分支 / 迁移编号唯一 / 版本下限自洽）。
+6. **G-6（未覆盖）**：**iCal 导出的 CRLF 行尾本轮没法验** —— iCal 导出是 **P5 Task 5** 的产物（`feat/p5-pools` 分支），**还没进 main**；
+   本分支里 `grep -rn "VCALENDAR" platform/src platform/scripts platform/web` **零命中**。
+   ⇒ `portability.test.js` 里那一条写成**前向守卫**：现在检测不到 iCal 实现就如实标注「该要求归 P5 Task 5，未覆盖」；
+   iCal 一旦进 main，该用例**自动开始**要求生成器显式用 `\r\n`。
+7. **G-7（未覆盖）**：**真机（Linux + systemd + nginx + root）的 `deploy/install.sh` 完整执行本轮仍未实跑**
+   （见 `docs/deployment.md` §13 U-3）—— 本 Task 的两个测试文件**不假装**跑过它。
+8. **G-8（未覆盖）**：**本轮没有把 `platform/` 拷到第二台机器做「另一台机器上跑三条命令」的复现**（无第二台机器），
+   也**没有**在 Windows 上做任何实测 —— 跨平台结论**只来自代码的静态事实**。
