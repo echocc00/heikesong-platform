@@ -24,6 +24,7 @@ import { registerTeamRoutes } from './http/routes/team.js';
 import { registerReviewRoutes } from './http/routes/review.js';
 import { registerMilestoneRoutes } from './http/routes/milestone.js';
 import { registerBehaviorRoutes } from './http/routes/behavior.js';
+import { registerAuditRoutes } from './http/routes/audit.js';
 import { getLeaderboard, getRollingLeaderboard } from './services/leaderboard.js';
 import { getPerformanceCard } from './services/performance-card.js';
 import { getTeamTier, getTierBoard } from './services/tier.js';
@@ -141,6 +142,8 @@ export function createApp({ db, rules, webDir }) {
   const secureCookies = process.env.NODE_ENV === 'production';
 
   router.add('GET', '/api/health', async () => ({ ok: true, at: new Date().toISOString() }));
+  // P4 审计 API（7 个接口 + 申诉列表）：计算快照 / 复算 diff / 审计日志 / 复核队列 / 申诉
+  registerAuditRoutes(router, { db, rules });
 
   // ── P3 榜单与积分 ───────────────────────────────────────────
   // ⚠️ 路由优先级由 P0 的 router **逐段比较**决定：静态段胜参数段
@@ -349,6 +352,11 @@ export function createApp({ db, rules, webDir }) {
         //    响应体是 {"code":"BAD_REQUEST","message":"users.phone UNIQUE constraint failed"}
         //    —— code 挡住了，message 没挡住。
         const message = err instanceof AppError ? err.message : '请求无效';
+        // ── P4 追加：限频要带 Retry-After，调用方才知道多久能重试（不静默丢包）──
+        const extraHeaders = {};
+        if (code === 'RATE_LIMITED' && err.detail?.retryAfterSeconds) {
+          extraHeaders['Retry-After'] = String(err.detail.retryAfterSeconds);
+        }
         if (status === 413) {
           // 请求体超限：连接已不可用 → 关掉，不复用
           json(res, 413, { error: { code, message } }, { Connection: 'close' });
@@ -356,7 +364,7 @@ export function createApp({ db, rules, webDir }) {
         }
         // detail 同理：**只透传 AppError 的 detail** —— detail 可能含表名 / 列名
         //（问卷缺项说明是我们自己写的文案，可给前端看；裸 Error 的 detail 不行）。
-        error(res, status, code, message, err instanceof AppError ? err.detail : undefined);
+        error(res, status, code, message, err instanceof AppError ? err.detail : undefined, extraHeaders);
       }
       return;
     }

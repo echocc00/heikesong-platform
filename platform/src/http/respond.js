@@ -21,6 +21,8 @@ export function text(res, status, body, contentType = 'text/plain; charset=utf-8
   res.end(body);
 }
 
-export function error(res, status, code, message, detail) {
-  json(res, status, { error: { code, message, ...(detail ? { detail } : {}) } });
+// ⛔ P4 追加（第 6 参 extraHeaders，向后兼容）：限频要返回 429 + Retry-After 响应头，
+//    调用方拿不到 res.writeHead 的二次机会，所以错误响应也必须能带自定义头。
+export function error(res, status, code, message, detail, extraHeaders = {}) {
+  json(res, status, { error: { code, message, ...(detail ? { detail } : {}) } }, extraHeaders);
 }

@@ -37,6 +37,8 @@ import { reviewEvents } from '../sse.js';
 import { getStage, getStageJudge, listStageTeams } from '../../db/repo/stages.js';
 import { getTeamWithPackage } from '../../db/repo/teams.js';
 import { listActiveMembers } from '../../db/repo/teamMembers.js';
+import { loadOptionalModule } from '../optional-module.js';
+import { fileURLToPath } from 'node:url';
 
 function requireUser(ctx) {
   if (!ctx.user) {
@@ -107,6 +109,46 @@ function assertJudgeDimensions(ctx, items) {
   }
 }
 
+/**
+ * ⛔ P4 跨阶段接线（P4 Task 6）：把 review-state 返回的**分数数组**过一遍
+ *    filterVisibleScores({ db, stageId, viewer, scores })。
+ *
+ * ⚠️ 两处必须说清楚：
+ *  ① **过滤发生在 API 层**，不是前端隐藏 —— 设计文档 §6.6：「前端隐藏 = 数据已泄露」。
+ *  ② 过滤模块（Task 5 的 `src/services/review-state.js`）由**并行 Task** 落地，
+ *     静态 import 会让整个平台在它落地前**加载不了**（server.js 顶层 import 失败
+ *     → createApp 抛错 → 全站 500）→ 改成**动态 import**：
+ *       · **没有分数可过滤**（当前 P2 的 getReviewState 不返回分数）→ 原样放行
+ *         （没有分数 = 没有可泄露的东西，过滤是恒等的）；
+ *       · **有分数但过滤模块缺失** → 503（fail closed：宁可报错，
+ *         也绝不把未过滤的分数发出去）。
+ *
+ * ⚠️ 终审修正（Important，I-2）：**只把「目标模块真不存在」当成缺失**。
+ *    模块在场但加载期崩了（语法错 / 传递依赖缺失）→ **抛出去**，
+ *    绝不装成「模块未就绪」—— 后者会让排查指向错误方向。判据见 optional-module.js。
+ */
+const REVIEW_STATE_URL = new URL('../../services/review-state.js', import.meta.url).href;
+const REVIEW_STATE_PATH = fileURLToPath(REVIEW_STATE_URL);
+
+export async function applyScoreVisibility({ db, stageId, viewer, state }) {
+  const scores = Array.isArray(state?.scores) ? state.scores : [];
+  if (!scores.length) return state;
+  const mod = await loadOptionalModule(REVIEW_STATE_URL, REVIEW_STATE_PATH);
+  const filterVisibleScores = mod?.filterVisibleScores;
+  if (typeof filterVisibleScores !== 'function') {
+    return {
+      status: 503,
+      body: {
+        error: {
+          code: 'SCORE_VISIBILITY_UNAVAILABLE',
+          message: '分数可见性过滤模块尚未就绪，拒绝返回未过滤的分数',
+        },
+      },
+    };
+  }
+  return { ...state, scores: filterVisibleScores({ db, stageId, viewer, scores }) };
+}
+
 export function registerReviewRoutes(router) {
   router.add('POST', '/api/stages/:stageId/reviews', async (ctx) => {
     requireStageCapability(ctx, 'score:write');
@@ -157,11 +199,16 @@ export function registerReviewRoutes(router) {
     const stateDimensions = (stateConfig?.dimensions ?? [])
       .filter((d) => d.seat === 'judge')
       .map((d) => d.key);
-    return getReviewState({
+    return applyScoreVisibility({
       db: ctx.db,
       stageId: ctx.params.stageId,
-      viewer: { userId: ctx.user.id, isAdmin: isCommittee(ctx) },
-      dimensions: stateDimensions,
+      viewer: ctx.user,
+      state: await getReviewState({
+        db: ctx.db,
+        stageId: ctx.params.stageId,
+        viewer: { userId: ctx.user.id, isAdmin: isCommittee(ctx) },
+        dimensions: stateDimensions,
+      }),
     });
   });
 

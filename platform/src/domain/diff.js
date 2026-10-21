@@ -31,6 +31,22 @@ function arrayKey(item, index) {
   return String(index);
 }
 
+/**
+ * 给数组的每个元素算一个**唯一**的 path 键。
+ *
+ * ⛔ 父代理预审修正（Important，P4-11）：同一个数组里**可以出现重复的业务主键**
+ *    （例如 `scoreStage` 的 `warnings` 里多条告警的 `teamId` 相同）。
+ *    直接用主键当 path ⇒ 多条告警共用同一个 path ⇒
+ *    差异被记到同一条上（「这一条变了」其实是「那一条变了」）⇒ 差异**无法定位**。
+ *    ⇒ 键重复时**回退到下标**，保证 path 唯一。
+ */
+function arrayKeys(items) {
+  const keys = items.map((it, i) => arrayKey(it, i));
+  const counts = new Map();
+  for (const k of keys) counts.set(k, (counts.get(k) ?? 0) + 1);
+  return keys.map((k, i) => (counts.get(k) > 1 ? String(i) : k));
+}
+
 export function diffValues(before, after, { path = '', depth = 0, maxDepth = 12 } = {}) {
   const out = [];
   walk(before, after, path, depth, maxDepth, out);
@@ -65,8 +81,10 @@ function walk(before, after, path, depth, maxDepth, out) {
 
   if (Array.isArray(before) && Array.isArray(after)) {
     const len = Math.max(before.length, after.length);
+    const beforeKeys = arrayKeys(before);
+    const afterKeys = arrayKeys(after);
     for (let i = 0; i < len; i += 1) {
-      const key = arrayKey(before[i] ?? after[i], i);
+      const key = beforeKeys[i] ?? afterKeys[i] ?? String(i);
       walk(before[i], after[i], `${path}[${key}]`, depth + 1, maxDepth, out);
     }
     return;
