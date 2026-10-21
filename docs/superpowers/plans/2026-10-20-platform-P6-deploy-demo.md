@@ -3708,6 +3708,7 @@ git commit -m "feat(P6): 演示种子数据（每条 trace 分支都有触发器
 - Modify: `platform/web/api.demo.js`（P0 建的 3 接口桩 → 完整流程）
 - Test: `platform/test/demo-engine.test.js`
 - Test: `platform/test/demo-parity.test.js`
+- Modify: `platform/test/leaderboard-web.test.js`（P0 的演示适配器用例：适配器换成「浏览器内真跑规则引擎」的版本后，改为显式注入种子与规则 —— 断言一条没少，还多了两条；见 Task 5 台账 D5-05）
 
 **Interfaces:**
 - Consumes（**只读消费**，不改签名）：
@@ -3727,6 +3728,7 @@ git commit -m "feat(P6): 演示种子数据（每条 trace 分支都有触发器
   - `demoTeamsRoster(state)` → `[{ teamId, packageEnterpriseId, isFreeBrief }]`
   - `runDemoCompute({ state, rules, stageId })` → `{ computationId, teams, warnings, trace, ordered, chain, points, selfEvalFlags }`
   - `demoLeaderboard({ state, rules, scope, viewer })`
+  - `demoTierBoard({ state, rules, viewer })` / `demoRollingLeaderboard({ state, rules, viewer })`（段位榜 / 滚动总榜，形状对齐正式服务）
   - `demoTier({ state, rules, teamId })`
   - `demoPerformanceCard({ state, rules, teamId })`
   - `demoPools({ state, rules, kind })`
@@ -3752,6 +3754,24 @@ git commit -m "feat(P6): 演示种子数据（每条 trace 分支都有触发器
 `platform/test/demo-engine.test.js`：
 
 ```javascript
+// platform/test/demo-engine.test.js —— 演示版适配器（浏览器内真实运行规则引擎）
+//
+// 规则溯源：
+//   - 「演示版 = 静态站 + 浏览器内跑同一套规则引擎」→ P6 计划 Task 5【本 Task 的灵魂】+ 设计文档 §14.3
+//   - 「同分 → 互评破同分」→ S7 §3.3 + 冲突裁决 C-03
+//   - 「归一化降级告警不静默」→ S7 §3.1 + C-05
+//   - 「R2 缺双签 → 企业项按 0 分计」→ S7 §2.4 R2
+//   - 「自评差异三档」→ S7 §4.3 + R-JDG-13
+//   - 「段位 = 里程碑 + 数据/原型 + 业务部门签字」→ S10 §2.2 + R-PTS-01~04
+//   - 「行为分只做垫底排序、不进总分」→ S10 §3.3 + R-PTS-08
+//   - 「可见性在 API 层过滤（C 段及以上公示，D 段只给本人进度卡）」→ S10 §0.3 + 冲突裁决 C-02
+//
+// ⚠️ 本文件的断言全部落在**引擎的输出**上，不是种子里的自述 ——
+//    种子（web/seed/demo-data.json）只是「每条分支的触发器」，分支有没有真的发生由这里判定。
+//
+// ⚠️ 判别性纪律：凡是「两种算法会给出同样结果」的期望值都不算数 ——
+//    本文件用**构造出来的反例数据**（互评改同分 / 抹掉自评 / 段位标志与 criteria 矛盾）
+//    保证每条断言都能区分「真按规则算」与「凑答案」。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -3893,8 +3913,13 @@ test('演示适配器：完整流程走通（登录 → 报名 → 组队 → �
   assert.equal(health.ok, true);
   assert.equal(health.demo, true);
 
-  const me = await api.get('/api/me');
-  assert.equal(me.status, 401, '未登录时 /api/me 必须 401');
+  // ⚠️ 未登录必须【抛错】而不是返回 { status: 401 } ——
+  //    真实后端 web/api.js 在 !res.ok 时抛错，web/app.js 的 restoreSession() 也靠 catch 兜 401。
+  await assert.rejects(
+    () => api.get('/api/me'),
+    (err) => err.status === 401 && err.code === 'UNAUTHENTICATED',
+    '未登录时 /api/me 必须以 401 拒绝',
+  );
 
   const login = await api.post('/api/auth/login', { name: '演示管理员' });
   assert.equal(login.user.name, '演示管理员');
@@ -3942,29 +3967,335 @@ function makeStorage() {
     removeItem: (k) => m.delete(k),
   };
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// 【实施补记 2026-10-21】规格的 12 个用例【逐字保留】（只改了 /api/me 的 401 断言形式，
+// 见 D5-02）+ 追加 12 个**判别性**用例。
+//
+// 为什么必须追加：规格的 12 个用例里有一半是「存在性」断言（有条目、非空、7 类齐全）——
+// 它们证明「适配器把数据搬过去了」，证明不了「算出来的是不是规则该给的结果」。
+// 而本 Task 的灵魂恰恰是后者：演示版必须与正式系统**逐字段一致**。
+// ⇒ 追加用例全部用**构造出来的反例数据**（互评改成同分 / 抹掉自评 / 段位标志与 criteria 矛盾），
+//    保证「按规则算」与「凑答案」两种实现会被区分开。
+// ═══════════════════════════════════════════════════════════════════════
+
+test('追加·破同分告警不被丢弃（tiebreak_extra 不可用必须显式告警）', () => {
+  const state = fresh();
+  const out = runDemoCompute({ state, rules, stageId: 'stage_final' });
+  assert.ok(Array.isArray(out.tiebreakWarnings), '必须单独给出破同分链的告警');
+  const hit = out.tiebreakWarnings.find((w) => w.code === 'tiebreak_key_unusable');
+  assert.ok(hit, '种子里没有 tiebreakExtra ⇒ 这一级不可用，必须告警（不静默当 0 分）');
+});
+
+test('追加·榜单告警按正式口径合并（计算告警 + 破同分告警，各带 source 标签）', () => {
+  const state = fresh();
+  runDemoCompute({ state, rules, stageId: 'stage_final' });
+  const lb = demoLeaderboard({ state, rules, scope: 'rank', viewer: null });
+  assert.ok(lb.warnings.length > 0, '榜单必须带告警');
+  assert.ok(lb.warnings.some((w) => w.source === 'computation'), '必须有计算告警');
+  assert.ok(lb.warnings.some((w) => w.source === 'tiebreak'), '必须有破同分告警');
+  for (const w of lb.warnings) assert.ok(w.code, '每条告警都要有 code');
+});
+
+test('追加·段位榜：C 段及以上公示，D 段只给本人进度卡（可见性在 API 层过滤）', () => {
+  const state = fresh();
+  runDemoCompute({ state, rules, stageId: 'stage_final' });
+  const board = demoLeaderboard({ state, rules, scope: 'tier', viewer: null });
+  assert.equal(board.scope, 'tier');
+  const ids = board.rows.map((r) => r.teamId);
+  assert.ok(!ids.includes(seed.expectations.freeBriefTeam), 'D 段队伍不得出现在公示榜里');
+  assert.ok(ids.length > 0, 'C 段及以上必须有队伍');
+  for (const r of board.rows) assert.ok(r.tierRank >= 1, '公示行必须有段位名次');
+  // ⚠️ 排序口径：段位高的在前（S → A → B → C）—— 判别性：顺序错了这条会红
+  assert.equal(board.rows[0].tier, 'S', '段位最高的队伍必须排第一');
+  assert.deepEqual(board.rows.map((r) => r.tier), ['S', 'A', 'B', 'C'], '段位榜必须按段位从高到低');
+  // 本人视角：D 段队伍只出现在 selfProgress 里
+  const mine = demoLeaderboard({ state, rules, scope: 'tier', viewer: { id: 'u', teamId: seed.expectations.freeBriefTeam } });
+  assert.ok(mine.selfProgress, 'D 段本人必须拿到进度卡');
+  assert.equal(mine.selfProgress.teamId, seed.expectations.freeBriefTeam);
+  assert.ok(!mine.rows.some((r) => r.teamId === seed.expectations.freeBriefTeam), 'D 段不得进公示行');
+});
+
+test('追加·滚动总榜：scope=rolling，按积分排序', async () => {
+  const api = createDemoApi({ storage: makeStorage(), seed, rules });
+  await api.post('/api/stages/stage_final/compute', {});
+  const rolling = await api.get('/api/leaderboard/rolling');
+  assert.equal(rolling.scope, 'rolling', '滚动总榜的 scope 必须是 rolling');
+  assert.ok(rolling.rows.length > 0);
+  for (const r of rolling.rows) assert.equal(r.stages, 1);
+});
+
+test('追加·战绩卡形状与正式系统一致（achievedCount / total / benefits / neverUnlocks / signed）', () => {
+  const state = fresh();
+  const card = demoPerformanceCard({ state, rules, teamId: 't_delta' });
+  assert.equal(card.total, rules.milestones.items.length);
+  assert.equal(card.achievedCount, card.items.filter((i) => i.achieved).length);
+  assert.ok(Array.isArray(card.benefits), '必须有权益列表');
+  assert.ok(Array.isArray(card.neverUnlocks), '必须有「永不解锁」列表');
+  assert.ok(card.neverUnlocks.includes('奖金'), '永不解锁项必须与 rules.ranks 一致');
+  const signed = card.items.find((i) => i.key === 'pilot_contract');
+  assert.ok(signed, 'pilot_contract 必须在 7 类里程碑里');
+  assert.equal(signed.signed, true, '有业务部签字的里程碑必须显示已签');
+  // 撤销的签字不算已签
+  const revoked = fresh();
+  revoked.signoffs = revoked.signoffs.map((sg) => (sg.teamId === 't_delta' ? { ...sg, revokedAt: '2026-10-20T00:00:00Z' } : sg));
+  const card2 = demoPerformanceCard({ state: revoked, rules, teamId: 't_delta' });
+  assert.equal(card2.items.find((i) => i.key === 'pilot_contract').signed, false, '撤销的签字不算已签');
+});
+
+test('追加·打分矩阵搬运不得改动任何一格原始分（逐格相等）', () => {
+  const expected = [];
+  for (const [judgeId, byTeam] of Object.entries(seed.reviews)) {
+    for (const [teamId, byDim] of Object.entries(byTeam)) {
+      for (const [dimension, rawScore] of Object.entries(byDim)) {
+        expected.push(`${judgeId}|${teamId}|${dimension}|${rawScore}`);
+      }
+    }
+  }
+  const got = expandSubmissions(fresh()).map(
+    (s) => `${s.judgeId}|${s.teamId}|${s.dimension}|${s.rawScore}`,
+  );
+  assert.deepEqual(got.sort(), expected.sort(),
+    'submissions 必须与种子里的原始分【逐格相同】（整体平移 / 改一格都会被抓出来）');
+});
+
+test('追加·段位标志按 rules.criteria 推导，不采信数据里预置的标志（判别性）', () => {
+  // 反例数据：签字部门是「市场部」（rules.criteria 的业务关键词命中），
+  // 但数据里预置的 isBusinessDepartment 是 false。
+  //   按 criteria 推导 ⇒ 业务部门签字成立 ⇒ t_delta 是 S 段；
+  //   采信数据里的标志 ⇒ 没有业务签字 ⇒ t_delta 掉到 A 段。
+  const state = fresh();
+  state.signoffs = state.signoffs.map((s) => (
+    s.teamId === 't_delta' ? { ...s, department: '市场部', isBusinessDepartment: false } : s
+  ));
+  assert.equal(demoTier({ state, rules, teamId: 't_delta' }).tier, 'S',
+    '部门归类必须按 rules.criteria 判定（与正式系统 src/services/tier.js 同源）');
+
+  // 同理：isDataOrPrototype 也必须按 criteria 推导 ——
+  // ⚠️ 这里必须把该队**所有**数据/原型类里程碑的标志都改掉（只改一个不够：
+  //    t_gamma 还有 demo_ready 带标志 ⇒ 只翻一个时两种实现结果相同 ⇒ 抓不住）。
+  const state2 = fresh();
+  state2.milestones = state2.milestones.map((m) => (
+    m.teamId === 't_gamma' ? { ...m, isDataOrPrototype: false } : m
+  ));
+  assert.equal(demoTier({ state: state2, rules, teamId: 't_gamma' }).tier, 'A',
+    '「数据/原型」里程碑必须按 rules.criteria 判定');
+});
+
+test('追加·判别性反例：互评改成同分 ⇒ 破同分链不再在 peer 级分开（证明分离真的由互评驱动）', () => {
+  const state = fresh();
+  // 让 t_alpha 与 t_beta 收到的互评分相同 ⇒ peer 这一级区分不出来
+  state.peerReviews = state.peerReviews.map((p) => (
+    p.toTeamId === 't_alpha' || p.toTeamId === 't_beta' ? { ...p, score: 65 } : p
+  ));
+  const out = runDemoCompute({ state, rules, stageId: 'stage_final' });
+  const [a, b] = seed.expectations.tiedTeams;
+  const peer = out.chain.find((c) => c.key === 'peer');
+  assert.ok(!peer || !peer.usedBy.includes(a) || !peer.usedBy.includes(b),
+    '互评同分时，peer 级不得把两支队分开');
+  const behavior = out.chain.find((c) => c.key === 'behavior');
+  assert.ok(behavior && behavior.usedBy.includes(a) && behavior.usedBy.includes(b),
+    '互评同分时应当由行为分这一级兜底分开（链的下一级）');
+});
+
+test('追加·判别性反例：抹掉自评 ⇒ 总分必须变（证明自评席确实参与计分）', () => {
+  const withSelf = runDemoCompute({ state: fresh(), rules, stageId: 'stage_final' });
+  const state = fresh();
+  state.selfReviews = [];
+  const withoutSelf = runDemoCompute({ state, rules, stageId: 'stage_final' });
+  const sum = (out) => out.teams.map((t) => `${t.teamId}:${t.total}`).sort();
+  assert.notDeepEqual(sum(withoutSelf), sum(withSelf), '抹掉自评后总分必须变化（自评席是一席）');
+});
+
+test('追加·判别性反例：企业确认分不同 ⇒ 两支「同分」队伍的总分必须分开', () => {
+  const state = fresh();
+  state.enterpriseConfirmations = state.enterpriseConfirmations.map((c) => (
+    c.teamId === 't_beta' ? { ...c, rawScore: 60 } : c
+  ));
+  const out = runDemoCompute({ state, rules, stageId: 'stage_final' });
+  const [a, b] = seed.expectations.tiedTeams;
+  const ta = out.teams.find((t) => t.teamId === a);
+  const tb = out.teams.find((t) => t.teamId === b);
+  assert.notEqual(ta.total, tb.total, '企业确认分不同 ⇒ 总分必须不同（不能只看评委席）');
+});
+
+test('追加·浏览器可加载性：适配器与领域层不得依赖 Node 内置模块（否则浏览器跑不起来）', () => {
+  const platformDir = join(here, '..');
+  const files = [
+    join(platformDir, 'web', 'api.demo.js'),
+    ...['registration', 'solvability', 'scoring', 'enterprise-seat', 'self-eval', 'ranking',
+      'points', 'tier', 'behavior', 'visibility', 'util']
+      .map((f) => join(platformDir, 'src', 'domain', `${f}.js`)),
+  ];
+  for (const f of files) {
+    const src = readFileSync(f, 'utf8');
+    const specs = [...src.matchAll(/(?:from|import)\s*\(?\s*['"]([^'"]+)['"]/g)].map((x) => x[1]);
+    for (const spec of specs) {
+      assert.ok(!spec.startsWith('node:'), `${f} 不得 import Node 内置模块：${spec}`);
+      assert.ok(spec.startsWith('.'), `${f} 的 import 必须是相对路径（浏览器要能直接加载）：${spec}`);
+    }
+  }
+});
+
+test('追加·演示适配器与真实适配器接口形状一致（同名单方法）', async () => {
+  const demo = await import('../web/api.demo.js');
+  const real = await import('../web/api.js');
+  for (const k of ['get', 'post', 'patch', 'del', 'subscribe']) {
+    assert.equal(typeof demo.api[k], 'function', `演示适配器缺 ${k}`);
+    assert.equal(typeof real.api[k], 'function', `真实适配器缺 ${k}`);
+  }
+  assert.equal(typeof demo.createDemoApi, 'function', '必须能显式注入 seed / rules（测试与离线用）');
+});
+
+test('追加·演示数据落在 localStorage 里，重新打开浏览器能读回（不跨人共享但要能续上）', async () => {
+  const storage = makeStorage();
+  const api1 = createDemoApi({ storage, seed, rules });
+  await api1.post('/api/auth/login', { name: '演示管理员' });
+  assert.ok(storage.getItem('hks_demo_store_v1'), '登录后必须落盘');
+
+  const api2 = createDemoApi({ storage, seed, rules });
+  const me = await api2.get('/api/me');
+  assert.equal(me.user.name, '演示管理员', '重新打开后仍应是已登录状态');
+});
+
+test('追加·名次积分按 rules/points.json 发放（第一/二/三名 = 10/8/5）', () => {
+  const state = fresh();
+  const out = runDemoCompute({ state, rules, stageId: 'stage_final' });
+  const pts = new Map(out.points.map((p) => [p.teamId, p.points]));
+  assert.equal(pts.get('t_alpha'), rules.points.stagePoints[0], '第 1 名拿第一档积分');
+  assert.equal(pts.get('t_beta'), rules.points.stagePoints[1], '第 2 名拿第二档积分');
+  assert.equal(pts.get('t_gamma'), 0, '第 5 名没有名次积分');
+});
+
+test('追加·buildDemoState 必须是深拷贝：适配器的写路径不得改到调用方的种子对象', async () => {
+  const src = JSON.parse(readFileSync(join(here, '..', 'web', 'seed', 'demo-data.json'), 'utf8'));
+  const before = JSON.stringify(src);
+  const state = buildDemoState(src);
+  // 写路径：打分 / 组队 / 报名
+  state.reviews.j_lenient.t_alpha.innovation = 1;
+  state.teams.push({ id: 't_new', name: '新队', packageId: 'tp_retail', memberIds: [] });
+  state.registrations.push({ id: 'reg_x' });
+  assert.equal(JSON.stringify(src), before, '适配器的写路径把调用方的种子对象改了 ⇒ 同一份种子会算出不同结果');
+  // 再建一次状态，必须与原始种子逐字相同
+  const again = buildDemoState(src);
+  assert.equal(again.reviews.j_lenient.t_alpha.innovation, 88, '新状态必须来自未被污染的种子');
+});
 ```
 
 `platform/test/demo-parity.test.js`：
 
 ```javascript
+// platform/test/demo-parity.test.js —— 演示版（浏览器内跑的引擎）与正式引擎的**逐字段一致性**
+//
+// 本 Task 的灵魂：演示版 = 静态站 + 浏览器内跑【同一套规则引擎】。
+// ⇒ 这份测试是那个承诺的机器保证：同一份种子、同一份规则配置，
+//    「浏览器里跑的引擎」与「Node 里跑的引擎」必须给出【同一份结果】。
+//
+// ⚠️ 三方比对（不是两方）：
+//    ① 浏览器入口（getDemoRuntime：fetch 取种子与规则 → createDemoApi → POST /compute）
+//    ② Node 侧适配器路径（runDemoCompute）
+//    ③ 正式引擎（直接调 src/domain/scoring.js 的 scoreStage）
+//    ①②③ 必须逐字段一致 —— 只比 ①② 是自证（同一个函数比同一个函数），
+//    只比 ②③ 会漏掉「浏览器加载的配置不是同一份」这类漂移。
+//
+// ⚠️ 浮点比较：容差 EPS = 1e-9（**相对**容差：|a-b| ≤ eps × max(1,|a|,|b|)）。
+//    ⛔ 不用 === 比浮点（那是假红：同一份公式在不同求值顺序下的末位差异不是 bug）；
+//    ⛔ 也不用粗到没意义的容差（1e-6 以上会把「权重写错 0.001」这类真错放过去）。
+//    1e-9 相对容差 ≈ 分值 80 分上 8e-8 —— 远小于任何真实的口径差异，
+//    但远大于 IEEE754 双精度的舍入噪声。
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadRules } from '../src/config.js';
 import { scoreStage } from '../src/domain/scoring.js';
-import { buildDemoState, expandSubmissions, demoTeamsRoster, runDemoCompute } from '../web/api.demo.js';
+import {
+  buildDemoState, expandSubmissions, demoTeamsRoster, runDemoCompute,
+  demoSelfEvalFlags, demoTier, getDemoRuntime, DEMO_RULE_FILES,
+} from '../web/api.demo.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const seed = JSON.parse(readFileSync(join(here, '..', 'web', 'seed', 'demo-data.json'), 'utf8'));
-const { rules } = loadRules(join(here, '..', 'rules'));
+const platformDir = join(here, '..');
+const webDir = join(platformDir, 'web');
+const seed = JSON.parse(readFileSync(join(webDir, 'seed', 'demo-data.json'), 'utf8'));
+const { rules } = loadRules(join(platformDir, 'rules'));
 
-test('演示版与正式引擎逐字一致：同一输入 → 同一 teams / warnings / trace', () => {
-  const state = buildDemoState(seed);
+const EPS = 1e-9;   // 相对容差，见文件头说明
 
-  // 正式引擎：直接调 domain/scoring.js
-  const direct = scoreStage({
+// ── 容差比较工具 ────────────────────────────────────────────────
+
+function assertClose(actual, expected, path) {
+  const scale = Math.max(1, Math.abs(actual), Math.abs(expected));
+  assert.ok(
+    Math.abs(actual - expected) <= EPS * scale,
+    `${path}：${actual} 与 ${expected} 的差 ${Math.abs(actual - expected)} 超过容差 ${EPS * scale}`,
+  );
+}
+
+/** 递归比对：数字用容差，其余（字符串 / 布尔 / null / 数组结构 / 对象键集）必须逐字相同 */
+function assertDeepClose(actual, expected, path = '$') {
+  if (typeof actual === 'number' && typeof expected === 'number') {
+    assertClose(actual, expected, path);
+    return;
+  }
+  if (Array.isArray(actual) || Array.isArray(expected)) {
+    assert.ok(Array.isArray(actual) && Array.isArray(expected), `${path}：一边是数组一边不是`);
+    assert.equal(actual.length, expected.length, `${path}：数组长度不同`);
+    for (let i = 0; i < actual.length; i += 1) assertDeepClose(actual[i], expected[i], `${path}[${i}]`);
+    return;
+  }
+  if (actual && expected && typeof actual === 'object' && typeof expected === 'object') {
+    const ka = Object.keys(actual).sort();
+    const ke = Object.keys(expected).sort();
+    assert.deepEqual(ka, ke, `${path}：对象的键集不同`);
+    for (const k of ka) assertDeepClose(actual[k], expected[k], `${path}.${k}`);
+    return;
+  }
+  assert.deepEqual(actual, expected, `${path}：值不同`);
+}
+
+// ── 浏览器侧「规则加载」的 Node 等价物（复刻 web/api.demo.js 的 loadDemoRules）──
+// ⚠️ 这段复刻必须与 web/api.demo.js 的 loadDemoRules **逐字同形**（文件清单 + 分组方式），
+//    否则「浏览器加载的配置」与「正式系统加载的配置」会悄悄漂移 —— 那正是本测试要抓的东西。
+function loadRulesLikeBrowser() {
+  const loaded = {};
+  for (const [key, file] of Object.entries(DEMO_RULE_FILES)) {
+    loaded[key] = JSON.parse(readFileSync(join(platformDir, 'rules', file), 'utf8'));
+  }
+  return {
+    scoring: { initial: loaded.scoringInitial, final: loaded.scoringFinal },
+    tiebreak: loaded.tiebreak,
+    ranks: loaded.ranks,
+    behavior: loaded.behavior,
+    visibility: loaded.visibility,
+    registration: loaded.registration,
+    solvability: loaded.solvability,
+    milestones: loaded.milestones,
+    teamFormation: loaded.teamFormation,
+    points: loaded.points,
+    criteria: loaded.criteria,
+  };
+}
+
+/** fetch 桩：把浏览器里对静态产物的相对 URL 请求，落到磁盘上的真实文件 */
+function installFetchStub(roots) {
+  globalThis.fetch = async (url) => {
+    const rel = String(url).replace(/^\.\//, '');
+    for (const root of roots) {
+      const p = join(root, rel);
+      if (existsSync(p)) {
+        const body = readFileSync(p, 'utf8');
+        return { ok: true, status: 200, json: async () => JSON.parse(body) };
+      }
+    }
+    return { ok: false, status: 404, json: async () => ({}) };
+  };
+}
+
+/** 正式引擎的直调口径（与 src/services/compute.js 同一形状） */
+function directEngine(state) {
+  return scoreStage({
     config: rules.scoring.final,
     judges: seed.judges.map((j) => ({ judgeId: j.id, seat: j.seat })),
     submissions: expandSubmissions(state),
@@ -3973,13 +4304,201 @@ test('演示版与正式引擎逐字一致：同一输入 → 同一 teams / war
     teams: demoTeamsRoster(state),
     selfReviews: seed.selfReviews,
   });
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// 1. 规则配置同源：浏览器加载的 12 份配置 ≡ 正式系统 loadRules 加载的同一批文件
+// ═══════════════════════════════════════════════════════════════════════
+test('规则配置同源：浏览器侧的 12 份配置与正式系统 loadRules 的结果逐字相同', () => {
+  const browserRules = loadRulesLikeBrowser();
+  for (const key of Object.keys(browserRules)) {
+    assert.deepEqual(browserRules[key], rules[key], `规则 ${key} 在浏览器侧与正式系统不一致`);
+  }
+  // ⚠️ 正式系统还会加载 schedule / compliance / audit 三份（服务端专用，演示版用不到）——
+  //    它们【不得】影响演示口径，但也不能被浏览器侧悄悄换掉。
+  assert.ok(rules.schedule && rules.compliance && rules.audit, '正式系统的三份服务端配置必须存在');
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// 2. 浏览器入口真跑：getDemoRuntime() → fetch 取种子与规则 → POST /compute
+// ═══════════════════════════════════════════════════════════════════════
+test('浏览器入口路径可跑通：fetch 取种子与规则 → 计算 → 拿到结果', async () => {
+  installFetchStub([webDir, platformDir]);
+  const runtime = await getDemoRuntime();
+  const health = await runtime.get('/api/health');
+  assert.equal(health.ok, true);
+  assert.equal(health.demo, true);
+  assert.equal(health.ruleVersion, rules.tiebreak.version, '健康检查里的规则版本必须与正式规则一致');
+
+  const out = await runtime.post('/api/stages/stage_final/compute', {});
+  assert.ok(out.computationId);
+  assert.ok(out.teams.length > 0);
+  assert.ok(out.trace.normalization);
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// 3. 三方逐字段一致（浮点用容差）
+// ═══════════════════════════════════════════════════════════════════════
+test('演示版与正式引擎逐字一致：同一输入 → 同一 teams / warnings / trace', () => {
+  const state = buildDemoState(seed);
+
+  // 正式引擎：直接调 domain/scoring.js
+  const direct = directEngine(state);
 
   // 演示版：走完整适配器
   const demo = runDemoCompute({ state: buildDemoState(seed), rules, stageId: 'stage_final' });
 
-  assert.deepEqual(demo.teams, direct.teams, '演示版与正式引擎算出的每队分数必须完全一致');
-  assert.deepEqual(demo.warnings, direct.warnings, '告警必须完全一致');
-  assert.deepEqual(demo.trace, direct.trace, 'trace 必须完全一致');
+  assertDeepClose(demo.teams, direct.teams, '$.teams');
+  assert.deepEqual(demo.warnings, direct.warnings, '告警必须逐条一致');
+  assertDeepClose(demo.trace, direct.trace, '$.trace');
+});
+
+test('浏览器入口算出的结果 ≡ 正式引擎算出的结果（浮点容差 1e-9 相对）', async () => {
+  installFetchStub([webDir, platformDir]);
+  const runtime = await getDemoRuntime();
+  const browser = await runtime.post('/api/stages/stage_final/compute', {});
+
+  const direct = directEngine(buildDemoState(seed));
+  const node = runDemoCompute({ state: buildDemoState(seed), rules, stageId: 'stage_final' });
+
+  assertDeepClose(browser.teams, direct.teams, '$.teams');
+  assert.deepEqual(browser.warnings, direct.warnings, '告警必须逐条一致');
+  assertDeepClose(browser.trace, direct.trace, '$.trace');
+  assertDeepClose(browser.ordered, node.ordered, '$.ordered');
+  assertDeepClose(browser.chain, node.chain, '$.chain');
+  assertDeepClose(browser.points, node.points, '$.points');
+  assertDeepClose(browser.selfEvalFlags, node.selfEvalFlags, '$.selfEvalFlags');
+});
+
+test('破同分链、名次积分、自评差异、段位在浏览器入口与正式系统之间也一致', async () => {
+  installFetchStub([webDir, platformDir]);
+  const runtime = await getDemoRuntime();
+  const browser = await runtime.post('/api/stages/stage_final/compute', {});
+  const state = buildDemoState(seed);
+
+  // 自评差异：演示版自己算的那份，必须与引擎内部 detection 的口径一致
+  const flags = demoSelfEvalFlags({ state, threshold: 10 });
+  const browserFlags = browser.selfEvalFlags;
+  assertDeepClose(browserFlags, flags, '$.selfEvalFlags');
+
+  // 段位：适配器算的必须与领域层 computeTier 直算一致
+  for (const t of seed.teams) {
+    const viaAdapter = demoTier({ state, rules, teamId: t.id });
+    assert.equal(viaAdapter.tier, seed.expectations.tiers[t.id], `${t.id} 的段位与 expectations 不一致`);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// 4. 判别性反例：parity 断言必须**能失败**（否则是恒真断言）
+// ═══════════════════════════════════════════════════════════════════════
+test('判别性反例：喂不同的输入 ⇒ 演示版与正式引擎的结果必须不同（parity 断言不是恒真）', () => {
+  const broken = buildDemoState(seed);
+  // 故意抹掉自评：正式引擎吃 selfReviews，演示适配器不吃 ⇒ 两边必须分叉
+  broken.selfReviews = [];
+
+  const direct = directEngine(buildDemoState(seed));
+  const demo = runDemoCompute({ state: broken, rules, stageId: 'stage_final' });
+
+  const sum = (out) => out.teams.map((t) => `${t.teamId}:${t.total}`).sort();
+  assert.notDeepEqual(sum(demo), sum(direct),
+    '喂不同的输入却算出同样的结果 ⇒ parity 断言是恒真的，没有判别力');
+});
+
+test('判别性反例：同一份输入下，改「演示适配器的输入构造」必然让结果分叉', () => {
+  const state = buildDemoState(seed);
+  // 名册口径错（把自由命题队说成企业命题队）⇒ R4 不再触发 ⇒ 结果必然不同
+  const badRoster = demoTeamsRoster(state).map((t) => (
+    t.teamId === seed.expectations.freeBriefTeam ? { ...t, isFreeBrief: false } : t
+  ));
+  const direct = scoreStage({
+    config: rules.scoring.final,
+    judges: seed.judges.map((j) => ({ judgeId: j.id, seat: j.seat })),
+    submissions: expandSubmissions(state),
+    enterpriseConfirmations: seed.enterpriseConfirmations,
+    peerReviews: seed.peerReviews,
+    teams: badRoster,
+    selfReviews: seed.selfReviews,
+  });
+  const good = directEngine(state);
+  assert.notDeepEqual(
+    direct.teams.map((t) => t.total),
+    good.teams.map((t) => t.total),
+    '名册口径变了结果却一样 ⇒ 引擎对 R4 不敏感（分支没被触发）',
+  );
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// 5. 黄金值：种子的 expectations 就是这套引擎的期望输出
+// ═══════════════════════════════════════════════════════════════════════
+test('黄金值：expectations 里声明的每一条分支都在引擎输出里兑现（浮点用容差）', () => {
+  const e = seed.expectations;
+  const state = buildDemoState(seed);
+  const out = runDemoCompute({ state, rules, stageId: 'stage_final' });
+  const byCode = (code) => out.warnings.filter((w) => w.code === code);
+
+  // 同分两队：总分严格相等（构造保证）
+  const [a, b] = e.tiedTeams;
+  const ta = out.teams.find((t) => t.teamId === a);
+  const tb = out.teams.find((t) => t.teamId === b);
+  assertClose(ta.total, tb.total, `$.teams[${a}].total`);
+
+  // 破同分链在 peer 级分开
+  const peer = out.chain.find((c) => c.key === e.tiebreakSeparatedBy);
+  assert.ok(peer, `破同分链里必须用到 ${e.tiebreakSeparatedBy}`);
+  assert.ok(peer.usedBy.includes(a) && peer.usedBy.includes(b));
+
+  // 归一化降级
+  const fb = byCode('normalization_fallback').find((w) => w.dimension === e.unnormalizedDimension);
+  assert.ok(fb, `必须出现维度 ${e.unnormalizedDimension} 的归一化降级告警`);
+  assert.equal(out.trace.normalization[e.unnormalizedDimension].normalized, false);
+
+  // R2：缺双签 ⇒ 企业席按 0 分计
+  const r2 = byCode('R2_missing_dual_signature').find((w) => w.teamId === e.missingDualSignatureTeam);
+  assert.ok(r2, '必须出现 R2 告警');
+  assertClose(out.teams.find((t) => t.teamId === e.missingDualSignatureTeam).seatE, 0, '$.seatE');
+
+  // R4：自由命题 ⇒ 企业项由评委维度替代
+  const r4 = byCode('R4_free_brief_judge_scored').find((w) => w.teamId === e.freeBriefTeam);
+  assert.ok(r4, '必须出现 R4 告警');
+  const epsRow = out.teams.find((t) => t.teamId === e.freeBriefTeam);
+  const subDim = rules.scoring.final.freeBrief.judgeDimension;
+  assertClose(epsRow.seatE, epsRow.perDimension[subDim].mean, `$.teams[${e.freeBriefTeam}].seatE`);
+
+  // 自评三档
+  const hi = demoSelfEvalFlags({ state, threshold: 10 }).find((f) => f.teamId === e.selfEvalWrittenExplanationTeam);
+  const lo = demoSelfEvalFlags({ state, threshold: 10 }).find((f) => f.teamId === e.selfEvalJudgeQuestionTeam);
+  assert.equal(hi.action, 'written_explanation');
+  assert.ok(hi.d > 10);
+  assert.equal(lo.action, 'judge_question');
+  assert.ok(lo.d < -10);
+
+  // 段位
+  for (const [teamId, tier] of Object.entries(e.tiers)) {
+    assert.equal(demoTier({ state, rules, teamId }).tier, tier, `${teamId} 的段位应为 ${tier}`);
+  }
+
+  // 行为分（整数值 ⇒ 精确比较）
+  for (const [teamId, expected] of Object.entries(e.behaviorScores)) {
+    const info = demoTier({ state, rules, teamId });
+    assert.equal(info.behavior.total, expected, `${teamId} 的行为分应为 ${expected}`);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// 6. 浏览器入口的失败路径：取不到种子 / 缺规则必须【显式报错】，不静默退回空数据
+//    （静默降级 = 演示时看到一份空榜单却不知道为什么）
+// ═══════════════════════════════════════════════════════════════════════
+test('浏览器入口：种子取不到必须显式报错', async () => {
+  installFetchStub([webDir, platformDir]);
+  const { loadDemoSeed } = await import('../web/api.demo.js');
+  await assert.rejects(() => loadDemoSeed('./seed/not-exist.json'), /演示种子数据加载失败/);
+});
+
+test('浏览器入口：规则缺任何一份都必须显式报错（不静默用默认规则）', async () => {
+  const { loadDemoRules } = await import('../web/api.demo.js');
+  // 只挂 web/ 目录 ⇒ web/rules/ 不存在 ⇒ 12 份规则全部取不到
+  installFetchStub([webDir]);
+  await assert.rejects(() => loadDemoRules('./rules/'), /演示规则配置缺失/);
 });
 ```
 
@@ -4010,14 +4529,30 @@ Expected: FAIL —— `buildDemoState is not a function`（`web/api.demo.js` 还
 //
 // ⚠️ 服务层（src/services/*）做 SQL 编排，【不能】进浏览器。
 //    演示版对纯判定逻辑（组队校验）在本地做等价实现，并在注释里写明对应关系。
+//
+// ⚠️【领域层源码会不会泄到正式站？】—— 这是【两条不同的路】，互不影响：
+//    ① 后端那条 Demo 门（src/server.js）：DEMO_MODE=1 才把 /src/domain/* 与 /rules/* 挂上 HTTP。
+//       正式部署（systemd + nginx）必须保持 DEMO_MODE 关 ⇒ 领域层源码在正式站一律 404。
+//    ② 静态站这条：演示站把领域层【原样拷进产物目录】（浏览器要 import 它才能跑引擎）。
+//       演示站是【独立产物】，不与正式部署共用 nginx / systemd ⇒ 领域层源码只出现在演示站。
+//    ⇒ 演示站公开领域层源码是【有意的】（观众能看到算法原文，这正是演示的价值），
+//       但它【不会】出现在正式站上。两条路的开关互不干涉。
+//
+// ⚠️ 接口形状必须与 web/api.js（真实后端）一致 —— 否则前端要写两套。
+//    本文件每个端点的返回形状都对齐 src/services/* 的对应服务：
+//      /api/leaderboard/:stageId  → src/services/leaderboard.js（rank / business / personal 三种口径）
+//      /api/leaderboard/rolling   → src/services/leaderboard.js getRollingLeaderboard
+//      /api/leaderboard/tier      → src/services/tier.js getTierBoard
+//      /api/teams/:id/tier        → src/services/tier.js getTeamTier
+//      /api/teams/:id/performance-card → src/services/performance-card.js getPerformanceCard
 import { scoreRegistration, classifyLevel, validateRegistrationAnswers } from '../src/domain/registration.js';
 import { scoreSolvability } from '../src/domain/solvability.js';
 import { scoreStage } from '../src/domain/scoring.js';
 import { applyEnterpriseRules } from '../src/domain/enterprise-seat.js';
 import { detectSelfEvalDiff } from '../src/domain/self-eval.js';
 import { rankTeams } from '../src/domain/ranking.js';
-import { computeStagePoints } from '../src/domain/points.js';
-import { computeTier } from '../src/domain/tier.js';
+import { computeStagePoints, computePersonalPoints } from '../src/domain/points.js';
+import { computeTier, classifyDepartment, isDataOrPrototypeMilestone } from '../src/domain/tier.js';
 import { behaviorScore } from '../src/domain/behavior.js';
 import { applyVisibility } from '../src/domain/visibility.js';
 
@@ -4068,23 +4603,44 @@ function httpError(status, code, message) {
   return err;
 }
 
+/** 确定性比较：普通字典序（⛔ 不用 localeCompare —— 它依赖 locale 与 ICU 版本，跨机器可能不同） */
+function cmpStr(a, b) {
+  const x = String(a ?? '');
+  const y = String(b ?? '');
+  if (x === y) return 0;
+  return x < y ? -1 : 1;
+}
+
 // ── 状态 ────────────────────────────────────────────────────────
+
+/**
+ * 深拷贝种子。
+ * ⚠️ 为什么要拷贝：适配器有写路径（报名 / 组队 / 打分 / 计算），
+ *    如果 state 直接持有调用方传进来的种子对象的引用，写一次就把种子本身改了 ——
+ *    调用方（测试、浏览器端的 getDemoRuntime）手里的种子会跟着漂移，
+ *    「同一份种子算出同一份结果」这条前提当场失效。
+ *    种子是 JSON ⇒ 用 JSON 往返做深拷贝（零依赖、浏览器与 Node 行为一致）。
+ */
+function deepCopy(value) {
+  if (value === undefined || value === null) return value;
+  return JSON.parse(JSON.stringify(value));
+}
 
 export function buildDemoState(seed) {
   return {
-    meta: seed?.meta ?? {},
-    edition: seed?.edition ?? {},
-    users: seed?.users ?? [],
-    taskPackages: seed?.taskPackages ?? [],
-    judges: seed?.judges ?? [],
-    teams: seed?.teams ?? [],
-    reviews: seed?.reviews ?? {},
-    enterpriseConfirmations: seed?.enterpriseConfirmations ?? [],
-    peerReviews: seed?.peerReviews ?? [],
-    selfReviews: seed?.selfReviews ?? [],
-    milestones: seed?.milestones ?? [],
-    signoffs: seed?.signoffs ?? [],
-    behaviorEvents: seed?.behaviorEvents ?? [],
+    meta: deepCopy(seed?.meta) ?? {},
+    edition: deepCopy(seed?.edition) ?? {},
+    users: deepCopy(seed?.users) ?? [],
+    taskPackages: deepCopy(seed?.taskPackages) ?? [],
+    judges: deepCopy(seed?.judges) ?? [],
+    teams: deepCopy(seed?.teams) ?? [],
+    reviews: deepCopy(seed?.reviews) ?? {},
+    enterpriseConfirmations: deepCopy(seed?.enterpriseConfirmations) ?? [],
+    peerReviews: deepCopy(seed?.peerReviews) ?? [],
+    selfReviews: deepCopy(seed?.selfReviews) ?? [],
+    milestones: deepCopy(seed?.milestones) ?? [],
+    signoffs: deepCopy(seed?.signoffs) ?? [],
+    behaviorEvents: deepCopy(seed?.behaviorEvents) ?? [],
     registrations: [],
     computations: {},
     results: {},
@@ -4092,6 +4648,11 @@ export function buildDemoState(seed) {
   };
 }
 
+/**
+ * 把「评委 → 队伍 → 维度 → 原始分」的嵌套打分矩阵摊平成 submissions。
+ * ⚠️ 形状必须与真实写入方（src/services/review.js 落 stage_reviews 的形状）一致：
+ *    { judgeId, teamId, dimension, rawScore } —— 少一个字段，正式引擎会当成缺分。
+ */
 export function expandSubmissions(state) {
   const out = [];
   for (const [judgeId, byTeam] of Object.entries(state.reviews ?? {})) {
@@ -4135,7 +4696,10 @@ export function runDemoCompute({ state, rules, stageId = 'stage_final', now = nu
     selfReviews: state.selfReviews ?? [],
   });
 
-  // 企业席单独跑一遍（拿 seatE 明细，供破同分链的 enterprise_raw 用）
+  // 企业席单独跑一遍（拿 seatE 明细，供破同分链的 enterprise_raw 用）。
+  // ⚠️ 这是**纯函数**的重复调用，只为拿到明细供展示；计分与告警一律以 scoreStage 的返回为准
+  //    （scoreStage 内部已经调过一次 applyEnterpriseRules 并把 ent.warnings 并进 warnings ——
+  //    这里【不得】再把 enterprise.warnings 加一遍，否则同一条告警会出现两次）。
   const enterprise = applyEnterpriseRules({
     confirmations: state.enterpriseConfirmations ?? [],
     teams,
@@ -4190,11 +4754,16 @@ export function runDemoCompute({ state, rules, stageId = 'stage_final', now = nu
     stageId,
     computedAt: now ?? null,
     teams: scored.teams,
-    warnings: [...scored.warnings, ...(enterprise.warnings ?? [])],
+    // ⚠️ warnings = 【计算告警】（scoreStage 的返回），与正式引擎逐条一致 ⇒ parity 断言的对象。
+    //    破同分链自己的告警（tiebreak_key_unusable 等）单列 tiebreakWarnings ——
+    //    榜单层再按正式口径（src/services/leaderboard.js collectWarnings）合并并打 source 标签。
+    warnings: scored.warnings,
+    tiebreakWarnings: ranked.warnings ?? [],
     trace: scored.trace,
     enterprise: { seatE: enterprise.seatE, weights: enterprise.weights },
     ordered: ranked.ordered,
     chain: ranked.applied,
+    candidates,
     points,
     selfEvalFlags,
   };
@@ -4238,7 +4807,10 @@ export function demoTier({ state, rules, teamId }) {
       key: m.key,
       countsTowardTier: m.countsTowardTier !== false,
       achieved: m.achieved === true,
-      isDataOrPrototype: m.isDataOrPrototype === true,
+      // ⚠️ isDataOrPrototype 由【规则】判定，不采信数据里预置的标志：
+      //    真实系统在 src/services/tier.js 里按 rules.criteria.tier 推导 ——
+      //    演示版必须同源，否则「数据里的标志写错」时演示段位与正式段位会漂移。
+      isDataOrPrototype: isDataOrPrototypeMilestone(m.key, rules.criteria),
     }));
   const signoffs = (state.signoffs ?? [])
     .filter((s) => s.teamId === teamId)
@@ -4246,14 +4818,25 @@ export function demoTier({ state, rules, teamId }) {
       milestoneKey: s.milestoneKey,
       department: s.department,
       revokedAt: s.revokedAt ?? null,
-      isBusinessDepartment: s.isBusinessDepartment === true,
+      // ⚠️ 同上：部门归类按 rules.criteria.tier 的关键词判定（与正式系统同源）。
+      isBusinessDepartment: classifyDepartment(s.department, rules.criteria) === 'business',
     }));
   const tier = computeTier({ milestones, signoffs, ranksConfig: rules.ranks });
   const behavior = behaviorScore({
     events: (state.behaviorEvents ?? []).filter((e) => e.teamId === teamId),
     behaviorConfig: rules.behavior,
   });
-  return { ...tier, behavior };
+  const team = (state.teams ?? []).find((t) => t.id === teamId) ?? {};
+  return {
+    ...tier,
+    teamId,
+    teamName: team.name ?? teamId,
+    behavior,
+    progress: {
+      milestones: (rules.milestones?.items ?? []).map((def) => ({ key: def.key, label: def.label })),
+      milestoneCount: tier.milestoneCount,
+    },
+  };
 }
 
 export function demoPerformanceCard({ state, rules, teamId }) {
@@ -4261,12 +4844,16 @@ export function demoPerformanceCard({ state, rules, teamId }) {
   const team = (state.teams ?? []).find((t) => t.id === teamId) ?? {};
   const items = (rules.milestones?.items ?? []).map((def) => {
     const m = (state.milestones ?? []).find((x) => x.teamId === teamId && x.key === def.key);
-    const signoff = (state.signoffs ?? []).find((s) => s.teamId === teamId && s.milestoneKey === def.key);
+    // ⚠️ 撤销的签字不算「已签」（与正式系统 src/services/performance-card.js 同一口径）
+    const signoff = (state.signoffs ?? []).find(
+      (s) => s.teamId === teamId && s.milestoneKey === def.key && !s.revokedAt,
+    );
     return {
       key: def.key,
       label: def.label,
       confirmedBy: def.confirmedBy,
       achieved: m?.achieved === true,
+      signed: Boolean(signoff),
       countsTowardTier: def.countsTowardTier !== false,
       // ⛔ 只给部门，不给签字人：S10 §0.3「B 榜签字人不公开」
       signedByDepartment: signoff ? signoff.department : null,
@@ -4276,40 +4863,194 @@ export function demoPerformanceCard({ state, rules, teamId }) {
   return {
     teamId,
     teamName: team.name ?? teamId,
+    taskPackageId: team.packageId ?? null,
     tier: tierInfo.tier,
     milestoneCount: tierInfo.milestoneCount,
     businessSignoffCount: tierInfo.businessSignoffCount,
     items,
+    achievedCount: items.filter((i) => i.achieved).length,
+    total: items.length,
+    benefits: tierInfo.benefits ?? [],
+    neverUnlocks: tierInfo.neverUnlocks ?? [],
     behavior: tierInfo.behavior,
   };
 }
 
+/** 榜单告警：计算告警 + 破同分告警，按正式口径打 source 标签 */
+function collectDemoWarnings(result) {
+  const out = [];
+  for (const w of result?.warnings ?? []) out.push({ source: 'computation', ...w });
+  for (const w of result?.tiebreakWarnings ?? []) out.push({ source: 'tiebreak', ...w });
+  return out;
+}
+
 export function demoLeaderboard({ state, rules, scope = 'rank', viewer = null }) {
+  if (scope === 'tier') return demoTierBoard({ state, rules, viewer });
+  if (scope === 'rolling') return demoRollingLeaderboard({ state, rules, viewer });
+
   const stageId = state.lastStageId ?? 'stage_final';
   const result = state.results?.[stageId];
-  if (!result) return { scope, rows: [], demo: true, empty: true };
+  if (!result) return { scope, rows: [], warnings: [], demo: true, empty: true };
+  const warnings = collectDemoWarnings(result);
+
+  // B 榜（商业战绩）：里程碑进度公开，评分与签字人不公开
+  if (scope === 'business') {
+    const rows = (state.teams ?? []).map((t) => {
+      const items = (rules.milestones?.items ?? []).map((def) => {
+        const m = (state.milestones ?? []).find((x) => x.teamId === t.id && x.key === def.key);
+        const signed = (state.signoffs ?? []).some(
+          (s) => s.teamId === t.id && s.milestoneKey === def.key && !s.revokedAt,
+        );
+        return { key: def.key, label: def.label, achieved: signed, signed };
+      });
+      return {
+        teamId: t.id,
+        teamName: t.name ?? t.id,
+        taskPackageId: t.packageId ?? null,
+        milestones: items,
+        achievedCount: items.filter((i) => i.signed).length,
+        milestoneCount: items.length,
+      };
+    });
+    return applyVisibility({
+      payload: { scope, rows, warnings, demo: true },
+      viewer,
+      visibilityConfig: rules.visibility,
+      context: { scope, viewerTeamId: viewer?.teamId ?? null },
+    });
+  }
+
+  // 个人榜：终生上榜
+  if (scope === 'personal') {
+    const pointsByTeam = new Map((result.points ?? []).map((p) => [p.teamId, p.points]));
+    const ledger = [];
+    for (const t of state.teams ?? []) {
+      const pts = pointsByTeam.get(t.id) ?? 0;
+      for (const uid of t.memberIds ?? []) {
+        ledger.push({ userId: uid, kind: 'stage_rank', points: pts });
+      }
+    }
+    const personal = computePersonalPoints({ ledger, pointsConfig: rules.points });
+    const nameOf = (uid) => (state.users ?? []).find((u) => u.id === uid)?.name ?? null;
+    const rows = personal.rows.map((r) => ({ ...r, name: nameOf(r.userId) }));
+    return applyVisibility({
+      payload: { scope, rows, warnings, demo: true },
+      viewer,
+      visibilityConfig: rules.visibility,
+      context: { scope, viewerTeamId: viewer?.teamId ?? null },
+    });
+  }
+
+  // A 榜（赛段名次）
   const pointsByTeam = new Map((result.points ?? []).map((p) => [p.teamId, p.points]));
+  const packageRank = demoPackageRanks({ state, result, rules });
   const rows = result.ordered.map((row) => {
     const team = (state.teams ?? []).find((t) => t.id === row.teamId) ?? {};
     const tier = demoTier({ state, rules, teamId: row.teamId });
     return {
       teamId: row.teamId,
       teamName: team.name ?? row.teamId,
+      taskPackageId: team.packageId ?? null,
       rank: row.rank,
-      total: row.total,
       tiedWith: row.tiedWith ?? [],
+      packageRank: packageRank.get(row.teamId) ?? null,
       points: pointsByTeam.get(row.teamId) ?? 0,
+      total: row.total,
       tier: tier.tier,
+      enterpriseName: null,   // ⛔ 企业名不公示（S10 §8）
     };
   });
   // 可见性在【这一层】过滤（与服务端同一套规则）：
   //   rank 榜全员公开但不含企业名与互评来源；business 榜不含评分与签字人。
   // ⚠️ 段位榜（scope='tier'）另走 applyVisibility 的 tier 分支：C 段及以上公示，D 段只给本人进度卡。
   return applyVisibility({
-    payload: { scope, rows },
+    payload: { scope, rows, warnings, demo: true },
     viewer,
     visibilityConfig: rules.visibility,
     context: { scope, viewerTeamId: viewer?.teamId ?? null },
+  });
+}
+
+/** 包内名次（正式系统 src/services/leaderboard.js buildStageRanking 里同一口径：任务包内全量战队排名） */
+function demoPackageRanks({ state, result, rules }) {
+  const out = new Map();
+  const pkgOf = new Map((state.teams ?? []).map((t) => [t.id, t.packageId ?? null]));
+  const groups = new Map();
+  for (const c of result.candidates ?? []) {
+    const key = pkgOf.get(c.teamId) ?? '__none__';
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(c);
+  }
+  for (const [, list] of groups) {
+    const ranked = rankTeams({
+      teams: list,
+      tiebreakChain: rules.tiebreak.chain,
+      tiebreakData: { isFinal: true, byTeam: {} },
+      pointsConfig: rules.points,
+    });
+    for (const o of ranked.ordered) out.set(o.teamId, o.rank);
+  }
+  return out;
+}
+
+/**
+ * 段位榜（C-02）：C 段及以上公示队名与名次；D 段只给本人进度卡。
+ * ⚠️ 排序口径与 src/services/tier.js getTierBoard 一致：段位高 → 里程碑多 → 队伍编号（确定性兜底）。
+ */
+export function demoTierBoard({ state, rules, viewer = null }) {
+  const order = (rules.ranks?.tiers ?? []).map((t) => t.key);
+  const rows = (state.teams ?? []).map((t) => {
+    const info = demoTier({ state, rules, teamId: t.id });
+    return {
+      teamId: t.id,
+      teamName: t.name ?? t.id,
+      tier: info.tier,
+      tierRank: null,
+      milestoneCount: info.milestoneCount,
+      progress: {
+        milestones: (rules.milestones?.items ?? []).map((def) => ({ key: def.key, label: def.label })),
+        milestoneCount: info.milestoneCount,
+      },
+    };
+  }).sort((a, b) => {
+    const ia = order.indexOf(a.tier);
+    const ib = order.indexOf(b.tier);
+    if (ia !== ib) return ib - ia;                    // 段位高的在前
+    if (a.milestoneCount !== b.milestoneCount) return b.milestoneCount - a.milestoneCount;
+    return cmpStr(a.teamId, b.teamId);                // 确定性兜底（不用随机 id）
+  });
+  rows.forEach((r, i) => { r.tierRank = i + 1; });
+  return applyVisibility({
+    payload: { scope: 'tier', rows, warnings: [], demo: true },
+    viewer,
+    visibilityConfig: rules.visibility,
+    context: { scope: 'tier', viewerTeamId: viewer?.teamId ?? null, tierOrder: order },
+  });
+}
+
+/** 滚动总榜（全程公开） */
+export function demoRollingLeaderboard({ state, rules, viewer = null }) {
+  const stageId = state.lastStageId ?? 'stage_final';
+  const result = state.results?.[stageId];
+  if (!result) return { scope: 'rolling', rows: [], warnings: [], demo: true, empty: true };
+  const pointsByTeam = new Map((result.points ?? []).map((p) => [p.teamId, p.points]));
+  const rankByTeam = new Map((result.ordered ?? []).map((r) => [r.teamId, r.rank]));
+  const rows = (state.teams ?? []).map((t) => ({
+    teamId: t.id,
+    teamName: t.name ?? t.id,
+    taskPackageId: t.packageId ?? null,
+    points: pointsByTeam.get(t.id) ?? 0,
+    stages: 1,
+    bestRank: rankByTeam.get(t.id) ?? null,
+    tier: demoTier({ state, rules, teamId: t.id }).tier,
+  })).sort((a, b) => b.points - a.points
+    || (a.bestRank ?? 99) - (b.bestRank ?? 99)
+    || cmpStr(a.teamId, b.teamId));
+  return applyVisibility({
+    payload: { scope: 'rolling', rows, warnings: collectDemoWarnings(result), demo: true },
+    viewer,
+    visibilityConfig: rules.visibility,
+    context: { scope: 'rolling', viewerTeamId: viewer?.teamId ?? null },
   });
 }
 
@@ -4393,6 +5134,14 @@ export function demoTeamFormation({ team, state, rules }) {
   return { ok: errors.length === 0, errors };
 }
 
+/** 默认组长：成员里第一位 MBA 在籍者（⛔ 不用登录用户 —— 演示登录用户不在 users 表里） */
+function defaultCaptainId({ state, memberIds, me }) {
+  const mba = (state.users ?? []).find(
+    (u) => u.mbaStatus === 'mba' && (memberIds ?? []).includes(u.id),
+  );
+  return mba?.id ?? me?.id ?? null;
+}
+
 // ── API 层 ─────────────────────────────────────────────────────
 
 function parseQuery(path) {
@@ -4410,6 +5159,12 @@ export function createDemoApi({ storage = defaultStorage(), seed = null, rules =
     if (state) return state;
     const raw = storage.getItem(STORAGE_KEY);
     state = raw ? JSON.parse(raw) : buildDemoState(seed);
+    // ⛔ 旧结构/半截结构（浏览器里手工改过、或旧版本留下的）不能直接把适配器打挂 ——
+    //    缺哪个容器补哪个容器。
+    if (!state.computations || typeof state.computations !== 'object') state.computations = {};
+    if (!state.results || typeof state.results !== 'object') state.results = {};
+    if (!Array.isArray(state.registrations)) state.registrations = [];
+    if (!state.reviews || typeof state.reviews !== 'object') state.reviews = {};
     return state;
   };
   const persist = () => storage.setItem(STORAGE_KEY, JSON.stringify(state));
@@ -4479,12 +5234,13 @@ export function createDemoApi({ storage = defaultStorage(), seed = null, rules =
     }
     // 组队
     if (method === 'POST' && clean === '/api/teams') {
+      const memberIds = body?.memberIds ?? [];
       const team = {
         id: `team_demo_${(s.teams ?? []).length + 1}`,
         name: body?.name ?? '演示战队',
         packageId: body?.taskPackageId ?? null,
-        captainId: body?.captainId ?? s.me?.id ?? null,
-        memberIds: body?.memberIds ?? [],
+        captainId: body?.captainId ?? defaultCaptainId({ state: s, memberIds, me: s.me }),
+        memberIds,
         tier: 'D',
         status: 'forming',
       };
@@ -4544,8 +5300,14 @@ export function createDemoApi({ storage = defaultStorage(), seed = null, rules =
       return c;
     }
     // 榜单
+    // ⚠️ 顺序要紧：静态段 'tier' / 'rolling' 必须排在 '/api/leaderboard/:stageId' 之前，
+    //    否则段位榜会拿到赛段榜的形状（前端渲染成空段位列）。
+    //    这与后端 src/server.js 的路由口径一致（静态段优先于参数段），也与 P0 桩一致。
     if (method === 'GET' && clean === '/api/leaderboard/rolling') {
-      return demoLeaderboard({ state: s, rules: r, scope: 'rank', viewer: s.me });
+      return demoLeaderboard({ state: s, rules: r, scope: 'rolling', viewer: s.me });
+    }
+    if (method === 'GET' && clean === '/api/leaderboard/tier') {
+      return demoLeaderboard({ state: s, rules: r, scope: 'tier', viewer: s.me });
     }
     m = clean.match(/^\/api\/leaderboard\/([^/]+)$/);
     if (method === 'GET' && m) {
@@ -4638,7 +5400,7 @@ export const api = {
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cd platform && node --test test/demo-engine.test.js test/demo-parity.test.js`
-Expected: PASS（demo-engine 12 个 + demo-parity 1 个全过）
+Expected: PASS（demo-engine 27 个 + demo-parity 10 个全过）
 
 > ⚠️ **如果 `demo-parity.test.js` 报 `teams` 不一致**，说明演示版在某处自己又算了一遍分。
 > **修法**：删掉演示版里的重复计算，一律以 `scoreStage()` 的返回为准（`runDemoCompute` 里已经是这么写的）。
@@ -4647,8 +5409,8 @@ Expected: PASS（demo-engine 12 个 + demo-parity 1 个全过）
 - [ ] **Step 5: 提交**
 
 ```bash
-cd platform && git add web/api.demo.js test/demo-engine.test.js test/demo-parity.test.js
-git commit -m "feat(P6): 演示版适配器扩展为完整流程（浏览器内真实运行规则引擎）"
+cd platform && git add web/api.demo.js test/demo-engine.test.js test/demo-parity.test.js test/leaderboard-web.test.js
+git commit -m "feat(P6): 演示版适配器扩展为完整流程（浏览器内真实运行规则引擎）" -- web/api.demo.js test/demo-engine.test.js test/demo-parity.test.js test/leaderboard-web.test.js
 ```
 
 ---
@@ -6369,3 +7131,150 @@ nginx 在**最后**。机器上没装 nginx 时，脚本会先把上面**全部*
 - ⚠️ **Task 3 与 Task 4 的缺陷台账编号都用了 `D-01` 起的裸编号**（分属两个 Task 的台账），
   合并 P6 Task 4 分支时需要重编号（Task 3 → `D3-*`、Task 4 → `D4-*`）——
   这是**合并时要处理的事**，本轮不动（Task 4 的台账在另一个分支上）。
+
+## Task 5 实施台账（2026-10-21）
+
+> 本节是 Task 5（演示版适配器 · 浏览器内真实运行规则引擎）的实施记录：
+> **规格缺陷清单**、处置方式、逐字回写位置、实跑证据、parity 测试的**具体比对方式**、变异测试，
+> 以及**未改且需上游注意**的项。
+> 纪律：本计划 Task 5 的 **3 个代码块 = 最终实现的逐字副本**
+> （核验命令：`node /tmp/p6-mutate/t5-verify-blocks.mjs`）。
+>
+> **本 Task 的灵魂**：演示版 = 静态站 + 浏览器内跑【同一套规则引擎】⇒
+> 「演示好看、正式不一样」这件事必须被**机器**挡住 —— 这就是 `demo-parity.test.js` 的职责。
+> ⇒ 本 Task 的核心交付**不是**「适配器能跑」，而是**「浏览器里跑的引擎 ≡ Node 里跑的引擎」这件事有断言守着**。
+>
+> ⚠️ **领域层一行没改**：`platform/src/domain/**` 与 `platform/rules/**` 是 P1–P3 的产物，
+>    本 Task 只**消费**它们（浏览器里 import 的是同一批文件）。这是「演示 = 正式」的根本保证。
+
+### A. 实施方法（先跑后落盘）
+
+1. 把规格 Task 5 的三个代码块**原样抽到** `/tmp/p6-t5/spec/`（一个字节都没改）。
+2. 在 `/tmp/p6-t5/scratch/platform`（platform 整树副本）上跑**规格自带用例** → 红 2 条（D5-01 / D5-02 的实证）。
+3. 逐条定位规格缺陷 → 在 scratch 上改实现与用例 → 跑通（含 P0 的 `leaderboard-web.test.js` 断链）。
+4. 才落盘到 worktree → 单文件 → 全量 → 变异测试 → 计划块逐字回写与核验。
+
+### B. 规格缺陷清单
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| D5-01 | **Critical** | 规格的 `runDemoCompute` 把**企业席告警并了两次**：`scoreStage()` 内部已经调过一次 `applyEnterpriseRules` 并把 `ent.warnings` 并进自己的 warnings，规格又写了一遍 `[...scored.warnings, ...enterprise.warnings]` ⇒ 规格自带的 parity 用例（`deepEqual(demo.warnings, direct.warnings)`）**必然红** | 规格原样副本上跑：13 个用例 11 通过 / 2 失败；parity 用例的 `deepStrictEqual` 失败，demo 侧多出 `R2_missing_dual_signature`、`R4_free_brief_judge_scored` 两条 | `warnings` 只取 `scored.warnings`（= 正式引擎的返回）；企业席明细（`seatE` / `weights`）仍单独跑一次 `applyEnterpriseRules` —— 纯函数，只为展示，**不参与计分** |
+| D5-02 | **Critical** | 规格的**用例与规格的实现对 401 的口径自相矛盾**：用例写 `assert.equal(me.status, 401)`（要求**返回**一个对象），实现是 `throw httpError(401, ...)`（**抛错**） | 规格原样副本上 `demo-engine` 的「完整流程」用例红在 `未登录`（抛错 ⇒ 用例拿不到返回值） | 口径取**抛错**：真实后端 `web/api.js:14-19` 在 `!res.ok` 时抛错，前端 `web/app.js:74-82` 的 `restoreSession()` 也靠 `catch` 兜 401 ⇒ 抛错才与正式系统一致。用例改成 `assert.rejects(..., (err) => err.status === 401 && err.code === 'UNAUTHENTICATED')` |
+| D5-03 | **Critical** | 规格实现把**段位榜 / 滚动总榜的静态段路由丢了**：`/api/leaderboard/tier` 落到通用分支 ⇒ `scope` 变成 `'rank'`。这与 P0 的 `leaderboard-web.test.js`（断言 `tier.scope === 'tier'`）、后端 `src/server.js:153-161`（静态段优先于参数段）、以及 **P0 桩里专门写下的警告**（「顺序要紧：`tier` 必须排在 `/api/leaderboard/` 之前」）都冲突 | 规格原样副本上 P0 的 `leaderboard-web.test.js` 在 `/api/leaderboard/tier` 处拿到 `scope: 'rank'` | 补两条**显式分支**（`tier` / `rolling` 排在参数段之前，注释保留 P0 的顺序警告）；另新增 `demoTierBoard` / `demoRollingLeaderboard` 两个榜，形状分别对齐 `src/services/tier.js getTierBoard` 与 `src/services/leaderboard.js getRollingLeaderboard` |
+| D5-04 | **Critical** | 规格的默认组长取**登录用户** `demo_admin`，而它不在种子的 `users` 表里 ⇒ `rules/team-formation.json` 的 `captainMustBeMba` 判定必然失败（`组长不存在`）⇒ 规格自带的「完整流程」用例必然 400 | 规格原样副本上「完整流程」用例红在组队那一步（TEAM_FORMATION_INVALID） | 新增 `defaultCaptainId()`：默认组长 = **成员里第一位 MBA 在籍者**，找不到才回落登录用户。组队规则本身一字未改（组长必须 MBA 仍是硬门槛） |
+| D5-05 | **Critical** | P0 的 `leaderboard-web.test.js` 用的是演示适配器的**默认导出**（走 `fetch` 取种子）—— Node 的 `fetch` 不认相对 URL ⇒ `Failed to parse URL from ./seed/demo-data.json` ⇒ P0 用例必红 | 规格原样副本上全量：1013 例 / 1012 通过 / **1 失败**（就是这条） | **本 Task 唯一一处动 P0 测试**：该用例改为用 `createDemoApi({ storage, seed, rules })` **显式注入**种子与规则。断言一条没少，还多了两条（段位榜 / 滚动总榜必须真有队伍）。默认导出在浏览器里照旧可用（`web/app.js` 的 `?demo=1` 分支不受影响） |
+| D5-06 | **Important** | 战绩卡**形状与正式系统不一致**：规格返回 `{teamId, teamName, tier, milestoneCount, businessSignoffCount, items, behavior}`；正式系统 `src/services/performance-card.js` 返回 `{teamId, teamName, taskPackageId, items[{key,label,achieved,signed}], achievedCount, total, tier, benefits, neverUnlocks}`。前端 `web/views/card.js` 渲染 `achievedCount` / `total` / `benefits` / `neverUnlocks` / `signed` ⇒ 照规格实现前端会**渲染成空** | `web/views/card.js:5-12` 逐字段比对 | 对齐正式系统的形状（取**超集**：多出的字段不影响前端，少的字段会让前端渲染空） |
+| D5-07 | **Important** | 段位榜 / 滚动总榜缺字段（`tierRank` / `progress` / `points` / `stages` / `bestRank`）—— 与 D5-06 同理（`web/views/tier.js` 渲染 `r.tierRank` 与 `selfProgress.progress.milestones`） | `web/views/tier.js:7-13` 逐字段比对 | 同 D5-03：新增两个榜函数，形状对齐正式服务 |
+| D5-08 | **Important** | 规格让适配器**采信种子里预置的** `isDataOrPrototype` / `isBusinessDepartment` 标志；真实系统是在**服务层按 `rules.criteria` 推导**的（`src/services/tier.js` + 领域层 `classifyDepartment` / `isDataOrPrototypeMilestone`）⇒ 种子里的标志一旦写错，**演示段位与正式段位就漂移** | `src/services/tier.js` 的 `isBusinessDepartment ← 部门关键词 + unknownDepartmentCountsAsBusiness`；`src/domain/tier.js:9-30` 两个纯函数 | 适配器改为**按 `rules.criteria` 推导**（复用领域层那两个纯函数），并加**判别性用例**：把种子里与 criteria 矛盾的标志改掉，段位必须仍按 criteria 走 |
+| D5-09 | **Important** | 规格把**破同分链的告警整个丢了**（`runDemoCompute` 不返回 `ranked.warnings`）⇒ 演示版看不到「破同分键不可用」告警 —— 而 Task 4 台账 §H-3 明确要求「演示时应当显式展示这条告警」；且与正式系统 `src/services/leaderboard.js:129-135` 的告警口径（计算告警 + 破同分告警，各带 `source` 标签）不一致 | `src/services/leaderboard.js:129`（`source: 'computation'`）与 `:135`（`source: 'tiebreak'`） | 新增 `tiebreakWarnings` 字段（parity 断言的 `warnings` 仍只含计算告警，口径不变）；榜单层按正式口径**合并**并打 `source` 标签 |
+| D5-10 | **Important** | 规格的 `buildDemoState` 是**浅拷贝** ⇒ `state` 直接持有调用方种子的引用 ⇒ 适配器的**写路径**（打分 / 组队 / 报名）会改到种子本身 ⇒「同一份种子算出同一份结果」这条前提当场失效 | 规格原样副本上实测：e2e 用例的 `POST /api/stages/.../reviews` 把种子里 `j_lenient / t_alpha / innovation` 从 88 改成 91，**后续用例全被污染**（破同分告警用例、互评判别性用例连着红） | `buildDemoState` 对种子做 **JSON 往返深拷贝**（零依赖、浏览器与 Node 行为一致）；并加一条专属用例直接断言「写路径不得改到调用方的种子对象」 |
+| D5-11 | Minor | 存储键从 P0 的 `hks_demo_db` 改成 `hks_demo_store_v1` | P0 桩：键 `hks_demo_db`，结构 `{me, leaderboard, tiers, milestones, warnings}` | **改**（已改）：P0 桩的结构与新适配器完全不同（新的有 `teams` / `reviews` / `computations` / `results` …），旧键的数据无法复用；新键带版本号，便于以后改结构 |
+| D5-12 | Minor | 规格的 Step 5 提交命令**不带 `-- <paths>`** —— 违反「先 `git add <paths>`，再 `git commit -m "…" -- <paths>`」这条纪律 | 规格 Step 5 原文 | 补上 `-- web/api.demo.js test/demo-engine.test.js test/demo-parity.test.js test/leaderboard-web.test.js`（`-m` 仍在 `--` 之前） |
+| D5-13 | Minor | `SEED_URL = './seed/demo-data.json'` 与 `RULES_BASE = './rules/'` 的**相对基准不一致**：前者相对 `web/`（种子在 `web/seed/`），后者相对 `platform/`（规则在 `platform/rules/`）⇒ 静态站的产物目录必须**同时**满足两个基准 | 两个常量在 `web/api.demo.js` 顶部的定义 | **不改**（属 Task 6 的产物布局决策）：`loadDemoSeed(url)` / `loadDemoRules(base)` 都接受显式参数，Task 6 传对即可。登记为「需上游注意」（见 §H-2） |
+
+### C. 逐字回写位置（本轮改动的计划代码块）
+
+| 计划位置 | 改动 |
+|---|---|
+| Task 5 Files 段 | 追加 `platform/test/leaderboard-web.test.js`（P0 用例适配，见 D5-05） |
+| Task 5 Step 1 的 `platform/test/demo-engine.test.js` 代码块 | **整体回写**（规格 12 个用例逐字保留，只改 `/api/me` 的 401 断言形式，见 D5-02；追加 15 个判别性用例） |
+| Task 5 Step 1 的 `platform/test/demo-parity.test.js` 代码块 | **整体回写**（规格 1 个用例逐字保留 + 追加 9 个：规则同源、浏览器入口真跑、三方比对、判别性反例、黄金值、失败路径） |
+| Task 5 Step 3 的 `web/api.demo.js` 代码块 | **整体回写**（D5-01/03/04/06/07/08/09/10/11 的处置全部落在这里） |
+| Task 5 Step 4 的 Expected | `demo-engine 12 个 + demo-parity 1 个` → **`demo-engine 27 个 + demo-parity 10 个`**（实跑值） |
+| Task 5 Step 5 的命令 | 补 `-- <paths>`（D5-12） |
+
+> 回写脚本 `/tmp/p6-mutate/t5-plan-rewrite.mjs`：**按块在文档里的位置升序**处理，
+> 锚点用**块正文内容**定位，命中数必须 `=== 1`，否则报错退出。
+
+### D. 实跑证据
+
+| 项 | 结果 |
+|---|---|
+| 基线全量（实施前，本 worktree） | **981 / 981**（980 通过 + 1 跳过 + 0 失败） |
+| 规格原样三块 + 规格自带用例（独立工程 `/tmp/p6-t5/scratch`） | **13 个用例：11 通过 / 2 失败**（红的两条即 D5-01 / D5-02） |
+| 规格原样副本跑全量 | **1013 例 / 1012 通过 / 1 失败**（红的那条即 D5-05：P0 的演示适配器用例） |
+| 落盘后单文件 `node --test test/demo-engine.test.js` | **27 / 27 全绿** |
+| 落盘后单文件 `node --test test/demo-parity.test.js` | **10 / 10 全绿** |
+| 落盘后单文件 `node --test test/leaderboard-web.test.js` | **10 / 10 全绿**（P0 用例，适配后） |
+| 落盘后全量 `node --disable-warning=ExperimentalWarning --test` | **1018 / 1018**（1017 通过 + 1 跳过 + 0 失败；基线 981 + 本 Task 37） |
+
+### E. parity 测试的比对方式（浮点容差）
+
+`platform/test/demo-parity.test.js` 比的是**三方**（不是两方 —— 两方是自证）：
+
+| 方 | 是什么 | 怎么跑 |
+|---|---|---|
+| ① 浏览器入口 | `getDemoRuntime()` → `fetch` 取种子与规则 → `createDemoApi` → `POST /api/stages/stage_final/compute` | 用 `fetch` 桩把相对 URL 落到磁盘上的真实文件（`web/seed/demo-data.json` 与 `rules/*.json`），**浏览器入口代码原样执行** |
+| ② Node 侧适配器 | `runDemoCompute({ state, rules, stageId })` | 直接调 |
+| ③ 正式引擎 | `src/domain/scoring.js` 的 `scoreStage(...)` | 直接调（与 `src/services/compute.js` 同一形状） |
+
+- **逐字段比对**：`teams` / `warnings` / `trace` / `ordered` / `chain` / `points` / `selfEvalFlags`
+- **浮点容差**：`EPS = 1e-9` **相对**容差 —— `|a-b| ≤ EPS × max(1, |a|, |b|)`
+  - ⛔ 不用 `===` 比浮点（同一份公式在不同求值顺序下的末位差异不是 bug，`===` 是**假红**）
+  - ⛔ 也不用粗到没意义的容差（`1e-6` 以上会把「权重写错 0.001」这类真错放过去）
+  - `1e-9` 相对容差 ≈ 分值 80 分上 `8e-8`：远小于任何真实口径差异，远大于双精度舍入噪声
+- **结构严格**：数组长度、对象键集、字符串 / 布尔 / null 必须**逐字相同**（只有数字走容差）
+- **规则同源**：另有一条用例断言「浏览器侧加载的 12 份配置 ≡ 正式系统 `loadRules()` 的结果」——
+  抓住「浏览器加载的配置不是同一份」这类漂移（`loadDemoRules` 的文件清单与分组方式被逐字复刻在测试里）
+- **判别性反例**（parity 断言必须**能失败**）：
+  - 喂不同的输入（抹掉自评）⇒ 两边结果**必须**分叉 ⇒ 证明 parity 断言不是恒真
+  - 名册口径改错（把自由命题队说成企业命题队）⇒ R4 不触发 ⇒ 结果**必须**分叉 ⇒ 证明引擎对 R4 敏感
+- **黄金值**：`seed.expectations` 的每一条（tiedTeams / tiebreakSeparatedBy / unnormalizedDimension /
+  missingDualSignatureTeam / freeBriefTeam / 自评三档 / tiers / behaviorScores）逐条核对
+
+> ⚠️ **关于「冻结黄金值」**：本 Task **不**引入「把某支队伍的总分钉死成常量」的断言 ——
+> 那会让**规则配置一改就红**，属于上游规则变更的范畴，不是本 Task 该背的债。
+> 替代做法是「打分矩阵逐格相等」+「parity 三方一致」：既抓住搬运错误，又不与规则演进冲突。
+
+### F. 变异测试（脚本 `/tmp/p6-mutate/t5.mjs`，指向**已落地**的文件）
+
+| 轮次 | 变异体总数 | KILLED | SURVIVED | 锚点错误 | 处置 |
+|---|---|---|---|---|---|
+| 第 1 轮 | 25 | 23 | **2** | 0 | M10（「数据/原型」标志采信数据）**存活**：判别性用例只翻了该队**一个**里程碑的标志，而该队还有另一个带标志的里程碑 ⇒ 两种实现结果相同 ⇒ **用例数据不够判别**；M17（submissions 原始分 +1）**存活**：z-score 归一化对「全体原始分整体平移」不敏感 ⇒ 相对关系类断言抓不住它。⇒ 两条都是**用例缺陷**，不是实现缺陷 |
+| 第 2 轮 | **25** | **25** | **0** | 0 | M10：判别性用例改成把该队**全部**里程碑的 `isDataOrPrototype` 翻掉（只翻一个时两种实现等价 ⇒ 抓不住）；M17：补一条「打分矩阵搬运**逐格相等**」用例（比「冻结黄金值」更稳，且不与规则演进冲突）后重杀 |
+
+**最终：25 个变异体，25 个 KILLED，0 个存活，0 个锚点错误（锚点全部唯一命中）。**
+
+> 变异体清单见脚本里的 `MUTANTS` 数组，覆盖本 Task 的每一个改动点：
+> D5-01 回退（M01）、401 抛错（M02）、段位榜 / 滚动榜路由（M03/M04）、默认组长（M05）、
+> 战绩卡形状（M06/M07/M08/M09）、段位标志按 criteria 推导（M10/M11）、破同分告警（M12/M13）、
+> 种子深拷贝（M14）、破同分链输入（互评均值 M15 / 行为分 M16）、submissions 搬运（M17）、
+> 名册自由命题标记（M18）、段位榜排序与可见性（M19/M20）、query 解析（M21）、
+> 自评对比基准（M22）、名次积分配置（M23）、浏览器入口失败路径（M24/M25）。
+> 明细 JSON：`/tmp/p6-mutate/t5-results.json`。
+
+### G. 计划块逐字核验
+
+`node /tmp/p6-mutate/t5-verify-blocks.mjs` → **3/3 逐字一致**：
+
+| 块 | 结果 |
+|---|---|
+| `test/demo-engine.test.js` | 整文件块 ✅ 一致 |
+| `test/demo-parity.test.js` | 整文件块 ✅ 一致 |
+| `web/api.demo.js` | 整文件块 ✅ 一致 |
+
+> ⚠️ 共享核验脚本 `/tmp/p3fix/plan-blocks.mjs` 的 hint 正则把 `.json` 截成 `.js`（Task 4 已登记 D4-07），
+> 本 Task 的三个块都是 `.js`，共享脚本可见；为稳妥另用按**块正文锚点**定位的 `t5-verify-blocks.mjs` 复核。
+
+### H. 未改且需上游注意的项
+
+1. **Task 6 的 `scripts/build-demo.js` 必须把 `src/domain/**` 与 `rules/**` 原样拷进产物目录** ——
+   演示适配器用**相对路径** import 领域层（`../src/domain/scoring.js`），产物目录里没有这些文件浏览器就加载不了。
+   同时它要强制校验「领域层不得 import Node 内置模块」——
+   **这条本 Task 已经用静态断言守住了**（`demo-engine.test.js` 的「浏览器可加载性」用例：
+   扫 `web/api.demo.js` + 11 个领域层模块，任何 `node:` 或非相对 import 都会红）。
+2. **产物目录的相对基准**：`SEED_URL = './seed/demo-data.json'`（相对 `web/`）与
+   `RULES_BASE = './rules/'`（相对 `platform/`）**基准不同**（D5-13）⇒
+   Task 6 摆产物目录时必须同时满足两个基准，或者在 `index.html` 里显式传 `loadDemoSeed(url)` / `loadDemoRules(base)`。
+3. **领域层与规则配置一行没改**：`platform/src/domain/**`、`platform/rules/**` 本 Task 只读不改 ——
+   这正是「演示 = 正式」的根本保证（改领域层会同时波及正式链路）。
+4. **`platform/src/server.js` 没改**：`DEMO_MODE=1` 才挂 `/src/domain/*` 与 `/rules/*` 那道门保持原样（默认不挂 ⇒ 正式部署 404）。
+   ⚠️ 本 Task 的适配器在文件头**显式写明**了「静态站把领域层原样拷进产物目录」与「后端那条 Demo 门」是**两条不同的路**：
+   静态站是**独立产物**，不与正式部署共用 nginx / systemd ⇒ 领域层源码只出现在演示站上。
+5. **演示版数据不跨人共享**（各自浏览器 localStorage 独立）—— 无云主机条件下的客观边界，
+   已写进 `web/api.demo.js` 的文件头与本台账；正式版后端仍要按云主机部署资产准备好（Task 2）。
+6. **`web/api.demo.js` 的默认导出在 Node 里不可用**（`fetch` 不认相对 URL）⇒
+   Node 侧（测试 / 离线脚本）请用 `createDemoApi({ storage, seed, rules })` 显式注入；浏览器侧照旧用默认导出。
+7. **本 Task 只改了 P0 的一个测试文件**（`test/leaderboard-web.test.js` 的演示适配器用例，D5-05）：
+   断言一条没少、还多了两条；改动原因是 P0 桩被真实适配器取代 ⇒ 假数据桩的用法不再成立。
+
