@@ -6,24 +6,35 @@
 > [`../`](../)（待组委会确认 17 条）。
 >
 > **⛔ 跨阶段接口以 [`INTERFACES.md`](INTERFACES.md) 为唯一事实来源**。各计划里出现的签名、表结构、API 路径、规则文件名与它冲突时以它为准。
-> 其中 **§9 文件归属裁决表** 规定了每个文件与每张表的**唯一写入权**——六份计划并行写完后，这里出了 5 处文件归属冲突、1 处建表撞车、1 处错误模块参数顺序相反，全部按该表裁决。
+> 其中 **§9 文件归属裁决表** 规定了每个文件与每张表的**唯一写入权**——七份计划并行写完后，这里出了 5 处文件归属冲突、1 处建表撞车、1 处错误模块参数顺序相反，全部按该表裁决。
 
 ## 计划清单
 
 | 计划 | 阶段 | 交付物 | 依赖 | 计划文件 | 规模 |
 |---|---|---|---|---|---|
-| 1 | **P0 地基** | 能登录的空系统；配置改错则启动失败；权限骨架 | — | `2026-10-20-platform-P0-foundation.md` | 7 Task / 2388 行 |
-| 2 | **P1 报名与组队** | 报名→自动分级→组队→任务包认领 全链路 | P0 | `2026-10-20-platform-P1-registration-team.md` | 7 Task / 4456 行 |
-| 3 | **P2 评审引擎** | 能真实算分（z-score + 去极值 + 双签 + 回避 + 自评检测） | P1 | `2026-10-20-platform-P2-review-engine.md` | 8 Task / 4214 行 |
-| 4 | **P3 榜单与积分** | 能真实发榜（A/B/个人榜 + 段位 + 行为分隔离 + 战绩卡） | P2 | `2026-10-20-platform-P3-leaderboard-points.md` | 8 Task / 3171 行 |
-| 5 | **P4 审计与防作弊** | 榜单可复算（trace 抽屉 + 复算 diff）+ 限频 + 复核状态机 | P3 | `2026-10-20-platform-P4-audit-anticheat.md` | 8 Task / 4807 行 |
-| 6 | **P5 工作流与三池** | 任务清单与领取；三池底座接口；公开榜单 API + iCal | P4 | `2026-10-20-platform-P5-workflow-pools.md` | 6 Task / 3812 行 |
-| 7 | **P6 部署与演示版** | 云主机部署资产 + 公网演示 URL | P5 | `2026-10-20-platform-P6-deploy-demo.md` | 8 Task / 3948 行 |
+| 1 | **P0 地基** | 能登录的空系统；配置改错则启动失败；权限骨架 | — | `2026-10-20-platform-P0-foundation.md` | 7 Task / 7969 行 |
+| 2 | **P1 报名与组队** | 报名→自动分级→组队→任务包认领 全链路 | P0 | `2026-10-20-platform-P1-registration-team.md` | 7 Task / 7425 行 |
+| 3 | **P2 评审引擎** | 能真实算分（z-score + 去极值 + 双签 + 回避 + 自评检测） | P1 | `2026-10-20-platform-P2-review-engine.md` | 10 Task / 10633 行 |
+| 4 | **P3 榜单与积分** | 能真实发榜（A/B/个人榜 + 段位 + 行为分隔离 + 战绩卡） | P2 | `2026-10-20-platform-P3-leaderboard-points.md` | 8 Task / 6421 行 |
+| 5 | **P4 审计与防作弊** | 榜单可复算（trace 抽屉 + 复算 diff）+ 限频 + 复核状态机 | P3 | `2026-10-20-platform-P4-audit-anticheat.md` | 8 Task / 8784 行 |
+| 6 | **P5 工作流与三池** | 任务清单与领取；三池底座接口；公开榜单 API + iCal | P4 | `2026-10-20-platform-P5-workflow-pools.md` | 6 Task / 7046 行 |
+| 7 | **P6 部署与演示版** | 云主机部署资产 + 公网演示 URL | P5 | `2026-10-20-platform-P6-deploy-demo.md` | 8 Task / 7420 行 |
 
-合计 **52 个 Task**、**26 796 行**计划文档。
+合计 **54 个 Task**、**55 698 行**计划文档。
 
-**需求覆盖：96 条中 95 条有明确落地位置**（每条在对应计划的代码注释、规则文件或偏差表里标注了来源章节）。
-唯一未落地的是 **R-PTS-13（押金是负债不入营收）**——这是**财务科目口径**而非平台功能，且"中途不退部分去向"本身是规则空白。已在 `docs/requirements-traceability.md` 里显式声明**平台不实现**，并禁止任何人往平台里加"报名费/押金"字段或退费流程。**对空白规则写代码 = 凭空造规则**，所以这里留的是边界声明，不是待办。
+> 规模数字是**实施后**的实况（每份计划末尾都追加了父代理预审 / 修复轮 / 实施台账章节，所以比撰写期大）。
+> 复算：`wc -l docs/superpowers/plans/2026-10-20-platform-P*.md`。
+
+**需求覆盖：96 条里 94 条已落地且能从代码反查** —— 逐条的「落在哪 / 怎么验」见
+[`../requirement-implementation-map.md`](../requirement-implementation-map.md)（**机器生成**，
+生成器 [`../tools/requirement-map.py`](../tools/requirement-map.py) 可复算；另有
+[`../requirements-traceability.md`](../requirements-traceability.md) 记「它从哪来」）。
+剩下 2 条：
+
+| 需求 | 状态 | 说明 |
+|---|---|---|
+| R-PTS-13 押金是负债不入营收 | ⚪ **平台不实现** | **财务科目口径**而非平台功能，且「中途不退部分去向」本身是规则空白。已在 `docs/requirements-traceability.md` 里显式声明**平台不实现**，并禁止任何人往平台里加「报名费 / 押金」字段或退费流程。**对空白规则写代码 = 凭空造规则**，所以这里留的是边界声明，不是待办 |
+| R-OPS-06 公网可访问 | ⬜ **计划中** | 部署资产（`deploy/`）、备份恢复、演示版静态站构建都已落地；**只差真机发布**这一步（需云主机 + 用户明确确认）。P6 计划与 `docs/deployment.md` 已把发布流程写全 |
 
 另有两个需求**只占位不启用**（代码路径存在但恒不生效，等组委会拍板口径）：
 
@@ -83,24 +94,32 @@ SQL 边界    所有 SQL 收进 src/db/repo/；handler 内禁止裸 SQL
 
 ```
 platform/
-├── package.json            scripts: start / test / migrate / seed / backup / audit
-├── rules/                  9 份声明式规则配置（P1–P5 各追加自己的）
+├── package.json            scripts: start / test / migrate / seed（四个都带 --disable-warning=ExperimentalWarning）
+├── rules/                  17 份声明式规则配置（各阶段追加自己的）
 ├── src/
 │   ├── server.js           进程入口
 │   ├── config.js           配置加载 + fail-fast 校验
+│   ├── errors.js           AppError（status-first，全项目唯一错误类型）
 │   ├── http/               router respond body static sse
 │   ├── auth/               password session permissions
-│   ├── db/                 sqlite migrate + repo/
-│   ├── domain/             scoring ranking points visibility registration solvability（纯函数）
-│   ├── services/           registration team review leaderboard enterprise workflow
-│   └── audit/              log snapshot
+│   ├── db/                 sqlite migrate tx + repo/
+│   ├── domain/             22 个纯函数模块（scoring ranking points visibility registration
+│   │                       solvability tier behavior normalization trim enterprise-seat …）
+│   ├── services/           19 个服务层模块（registration team review leaderboard milestone
+│   │                       workflow pools compute audit …）
+│   ├── audit/              log snapshot
+│   └── runtime/            pidfile
 ├── web/                    index.html app router store api api.demo styles.css views/
 ├── db/migrations/          001_init.sql 002_registration.sql 003_review.sql
 │                           004_leaderboard.sql 005_audit.sql 006_pools.sql
 ├── test/                   *.test.js
-├── scripts/                migrate seed backup audit-scan forbidden.txt
-└── deploy/                 heikesong.service nginx.conf docker-compose.yml install.sh
+├── scripts/                migrate seed backup restore audit-scan forbidden.txt
+└── deploy/                 heikesong.service nginx.conf nginx-http2-compat.sh
+                            docker-compose.yml install.sh
 ```
+
+> 目录结构是**实施后**的实况。P6 Task 6 还会再加 `web/dist/`（构建产物目录，**不入库**）与
+> `scripts/build-demo.js` / `scripts/serve-demo.js`。
 
 ## 迁移版本号是全局唯一序位
 
@@ -131,7 +150,7 @@ feat(P<n>): <动词短语>
 
 ## 计划撰写期的验证记录
 
-六份计划不是"写完就交"，各自做了可执行性验证：
+七份计划不是"写完就交"，各自做了可执行性验证（下面是**撰写期**的记录）：
 
 | 计划 | 验证动作 | 结果 |
 |---|---|---|
@@ -142,7 +161,7 @@ feat(P<n>): <动词短语>
 | P5 | 迁移 + 种子逐字抽出在内存 SQLite 建库，6 个种子块全插成功；34 条 SQL 全部 `EXPLAIN` 通过 | 通过；按上游真实 DDL 修正 3 处会违反外键/唯一索引的种子 |
 | P6 | 23 个 JS 块 `node --check` + 全部 JSON 可解析 + 18 个 bash 块 `bash -n`；**实跑**备份/恢复脚本 | 22/23 通过（唯一失败是有意的就地替换片段）；备份恢复 **8/8 测试通过**，跑出并修掉 2 个真 bug |
 
-**跨计划一致性校验**（六份齐备后统一执行）：
+**跨计划一致性校验**（七份齐备后统一执行）：
 
 - ✅ 迁移编号 001–006 一一对应，无抢号
 - ✅ 同一文件被两个阶段声明 `Create`：**已从 5 处降到 0**
