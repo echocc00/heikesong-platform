@@ -1443,7 +1443,8 @@ import { openDatabase } from '../src/db/sqlite.js';
 import { applyMigrations } from '../src/db/migrate.js';
 import { checkRateLimit, assertRateLimit } from '../src/services/rate-limit.js';
 import { withIdempotency } from '../src/services/idempotency.js';
-import { countBucket } from '../src/db/repo/rate-limit.js';
+import { countBucket, incrementBucket } from '../src/db/repo/rate-limit.js';
+import { insertIdempotency } from '../src/db/repo/idempotency.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrationsDir = join(here, '..', 'db', 'migrations');
@@ -1612,6 +1613,240 @@ test('幂等：业务函数失败时不留下幂等记录（可以重试）', ()
   close();
   rmSync(dataDir, { recursive: true, force: true });
 });
+
+test('限频：缺 subjectKey / rule 一律 400（不静默放行）', () => {
+  const { db, close, dataDir } = setup();
+  assert.throws(
+    () => checkRateLimit({ db, rule: 'slidingOnly', now: '2026-10-20T00:00:00.000Z', limits: LIMITS }),
+    (e) => e.status === 400 && e.code === 'INVALID_REQUEST',
+  );
+  assert.throws(
+    () => checkRateLimit({ db, subjectKey: 'u1', now: '2026-10-20T00:00:00.000Z', limits: LIMITS }),
+    (e) => e.status === 400 && e.code === 'INVALID_REQUEST',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('layers：每层都要报出 layer / count / max / allowed', () => {
+  const { db, close, dataDir } = setup();
+  const r = checkRateLimit({
+    db, subjectKey: 'appeal:u1', rule: 'slidingOnly', now: '2026-10-20T00:00:00.000Z', limits: LIMITS,
+  });
+  const sliding = r.layers.find((l) => l.layer === 'sliding');
+  assert.equal(sliding.count, 0);
+  assert.equal(sliding.max, 3);
+  assert.equal(sliding.allowed, true);
+  assert.ok(r.layers.some((l) => l.layer === 'perMinute'), '每分钟配额也要单独成层');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('subjects：限频层可以指定用哪个 subject 维度计数', () => {
+  const { db, close, dataDir } = setup();
+  const now = '2026-10-20T00:00:00.000Z';
+  const limits = { judgeSubmit: { sliding: { seconds: 60, max: 2, subject: 'judge' } } };
+  for (let i = 0; i < 2; i += 1) {
+    const r = checkRateLimit({
+      db, subjectKey: 'stage:s1', rule: 'judgeSubmit', now, limits, subjects: { judge: 'judge:u1' },
+    });
+    assert.equal(r.allowed, true, `第 ${i + 1} 次应放行`);
+  }
+  const blocked = checkRateLimit({
+    db, subjectKey: 'stage:s1', rule: 'judgeSubmit', now, limits, subjects: { judge: 'judge:u1' },
+  });
+  assert.equal(blocked.allowed, false, '必须按 judge 维度计数，而不是按默认 subjectKey');
+
+  const bucket = `s:${Math.floor(Date.parse(now) / 1000)}`;
+  assert.equal(countBucket(db, { subjectKey: 'judge:u1', rule: 'sliding:judgeSubmit', bucket }), 2);
+  assert.equal(
+    countBucket(db, { subjectKey: 'stage:s1', rule: 'sliding:judgeSubmit', bucket }),
+    0,
+    '默认 subject 不得被计数',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('滑动窗口：窗口滑出后配额自动恢复', () => {
+  const { db, close, dataDir } = setup();
+  const t0 = '2026-10-20T00:00:00.000Z';
+  for (let i = 0; i < 3; i += 1) {
+    assert.equal(
+      checkRateLimit({ db, subjectKey: 'appeal:u1', rule: 'slidingOnly', now: t0, limits: LIMITS }).allowed,
+      true,
+    );
+  }
+  assert.equal(
+    checkRateLimit({ db, subjectKey: 'appeal:u1', rule: 'slidingOnly', now: t0, limits: LIMITS }).allowed,
+    false,
+  );
+  // 61 秒后：最早那次的记录已滑出 60 秒窗口 ⇒ 配额必须恢复
+  const later = '2026-10-20T00:01:01.000Z';
+  assert.equal(
+    checkRateLimit({ db, subjectKey: 'appeal:u1', rule: 'slidingOnly', now: later, limits: LIMITS }).allowed,
+    true,
+    '窗口滑出后必须恢复放行',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('提交锁：锁到期后可以再次获取', () => {
+  const { db, close, dataDir } = setup();
+  const limits = { lockOnly: { lock: { seconds: 5 } } };
+  const t0 = '2026-10-20T00:00:00.000Z';
+  assert.equal(checkRateLimit({ db, subjectKey: 'appeal:u1', rule: 'lockOnly', now: t0, limits }).allowed, true);
+  const blocked = checkRateLimit({ db, subjectKey: 'appeal:u1', rule: 'lockOnly', now: '2026-10-20T00:00:01.000Z', limits });
+  assert.equal(blocked.allowed, false);
+  assert.ok(blocked.retryAfterSeconds >= 1);
+  assert.equal(
+    checkRateLimit({ db, subjectKey: 'appeal:u1', rule: 'lockOnly', now: '2026-10-20T00:00:06.000Z', limits }).allowed,
+    true,
+    '锁过期后必须重新放行',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('被拒绝的请求不消耗配额（只有放行的请求才计数）', () => {
+  const { db, close, dataDir } = setup();
+  const now = '2026-10-20T00:00:00.000Z';
+  for (let i = 0; i < 3; i += 1) {
+    checkRateLimit({ db, subjectKey: 'appeal:u1', rule: 'slidingOnly', now, limits: LIMITS });
+  }
+  const bucket = `s:${Math.floor(Date.parse(now) / 1000)}`;
+  assert.equal(countBucket(db, { subjectKey: 'appeal:u1', rule: 'sliding:slidingOnly', bucket }), 3);
+  const blocked = checkRateLimit({ db, subjectKey: 'appeal:u1', rule: 'slidingOnly', now, limits: LIMITS });
+  assert.equal(blocked.allowed, false);
+  assert.equal(
+    countBucket(db, { subjectKey: 'appeal:u1', rule: 'sliding:slidingOnly', bucket }),
+    3,
+    '被拒绝的请求不得消耗配额',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('remaining 随配额消耗递减（放行后还能再做几次）', () => {
+  const { db, close, dataDir } = setup();
+  const now = '2026-10-20T00:00:00.000Z';
+  const a = checkRateLimit({ db, subjectKey: 'appeal:u1', rule: 'slidingOnly', now, limits: LIMITS });
+  assert.equal(a.remaining, 2, '滑动窗口还剩 2 次（3 - 已用 1）');
+  const b = checkRateLimit({ db, subjectKey: 'appeal:u1', rule: 'slidingOnly', now, limits: LIMITS });
+  assert.equal(b.remaining, 1);
+  const c = checkRateLimit({ db, subjectKey: 'appeal:u1', rule: 'slidingOnly', now, limits: LIMITS });
+  assert.equal(c.remaining, 0);
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('每分钟配额：超限给出本分钟剩余秒数，且计数落在 m:<epoch分> 桶', () => {
+  const { db, close, dataDir } = setup();
+  const limits = { m: { perMinute: { max: 1 } } };
+  const now = '2026-10-20T00:00:10.000Z';
+  assert.equal(checkRateLimit({ db, subjectKey: 'x:1', rule: 'm', now, limits }).allowed, true);
+  const blocked = checkRateLimit({ db, subjectKey: 'x:1', rule: 'm', now: '2026-10-20T00:00:20.000Z', limits });
+  assert.equal(blocked.allowed, false);
+  assert.equal(blocked.retryAfterSeconds, 40, '本分钟还剩 40 秒');
+  const bucket = `m:${Math.floor(Date.parse(now) / 60_000)}`;
+  assert.equal(countBucket(db, { subjectKey: 'x:1', rule: 'minute:m', bucket }), 1, '分钟桶必须按 epoch 分对齐');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('评委级每小时配额：超限给出本小时剩余秒数，且计数落在 h:<epoch时> 桶', () => {
+  const { db, close, dataDir } = setup();
+  const now = '2026-10-20T00:00:00.000Z';
+  for (let i = 0; i < 4; i += 1) {
+    checkRateLimit({ db, subjectKey: 'judge:u1', rule: 'judgeHourly', now, limits: LIMITS });
+  }
+  const blocked = checkRateLimit({ db, subjectKey: 'judge:u1', rule: 'judgeHourly', now, limits: LIMITS });
+  assert.equal(blocked.allowed, false);
+  assert.equal(blocked.retryAfterSeconds, 3600, '本小时还剩 3600 秒');
+  const bucket = `h:${Math.floor(Date.parse(now) / 3_600_000)}`;
+  assert.equal(countBucket(db, { subjectKey: 'judge:u1', rule: 'hour:judgeHourly', bucket }), 4, '小时桶必须按 epoch 时对齐');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('滑动窗口：retryAfterSeconds 指向最早那次滑出窗口的时刻', () => {
+  const { db, close, dataDir } = setup();
+  const limits = { s: { sliding: { seconds: 60, max: 2 } } };
+  const t0 = '2026-10-20T00:00:00.000Z';
+  checkRateLimit({ db, subjectKey: 'a:1', rule: 's', now: t0, limits });
+  checkRateLimit({ db, subjectKey: 'a:1', rule: 's', now: '2026-10-20T00:00:30.000Z', limits });
+  const blocked = checkRateLimit({ db, subjectKey: 'a:1', rule: 's', now: '2026-10-20T00:00:30.000Z', limits });
+  assert.equal(blocked.allowed, false);
+  assert.equal(blocked.retryAfterSeconds, 30, '最早那次在 00:01:00 滑出窗口 ⇒ 还差 30 秒');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('幂等：缺 key / scope 一律 400', () => {
+  const { db, close, dataDir } = setup();
+  assert.throws(
+    () => withIdempotency({ db, scope: 'appeal.submit' }, () => ({ ok: true })),
+    (e) => e.status === 400 && e.code === 'INVALID_REQUEST',
+  );
+  assert.throws(
+    () => withIdempotency({ db, key: 'req_1' }, () => ({ ok: true })),
+    (e) => e.status === 400 && e.code === 'INVALID_REQUEST',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('幂等：业务失败时业务副作用一并回滚（不能留下「做了一半」的账）', () => {
+  const { db, close, dataDir } = setup();
+  const now = '2026-10-20T00:00:00.000Z';
+  assert.throws(
+    () => withIdempotency({ db, key: 'req_roll', scope: 'appeal.submit', requestId: 'req_roll', now }, () => {
+      incrementBucket(db, { subjectKey: 'appeal:u1', rule: 'side:effect', bucket: 'b1', now });
+      throw new Error('业务失败');
+    }),
+    /业务失败/,
+  );
+  assert.equal(
+    countBucket(db, { subjectKey: 'appeal:u1', rule: 'side:effect', bucket: 'b1' }),
+    0,
+    '业务副作用必须随幂等键一起回滚',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('幂等：并发下别人先写入了 → 以库里的首次响应为准', () => {
+  const { db, close, dataDir } = setup();
+  const now = '2026-10-20T00:00:00.000Z';
+  let calls = 0;
+  const fn = () => {
+    calls += 1;
+    // 模拟「另一个请求抢先写入了同一个幂等键」
+    insertIdempotency(db, {
+      key: 'req_c', scope: 'appeal.submit', requestId: 'req_c', response: { accepted: true, by: 'other' }, now,
+    });
+    return { accepted: true, by: 'self' };
+  };
+  const r = withIdempotency({ db, key: 'req_c', scope: 'appeal.submit', requestId: 'req_c', now }, fn);
+  assert.equal(calls, 1);
+  assert.equal(r.replayed, true, '键已被别人占用 ⇒ 必须按重放处理');
+  assert.deepEqual(r.result, { accepted: true, by: 'other' }, '以库里的首次响应为准');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('幂等：重放返回的 storedAt 是首次落库的时间', () => {
+  const { db, close, dataDir } = setup();
+  const t0 = '2026-10-20T00:00:00.000Z';
+  const t1 = '2026-10-20T00:05:00.000Z';
+  const first = withIdempotency({ db, key: 'req_t', scope: 'appeal.submit', requestId: 'req_t', now: t0 }, () => ({ ok: true }));
+  const second = withIdempotency({ db, key: 'req_t', scope: 'appeal.submit', requestId: 'req_t', now: t1 }, () => ({ ok: true }));
+  assert.equal(first.storedAt, t0);
+  assert.equal(second.storedAt, t0, '重放必须返回首次落库时间');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -1665,12 +1900,9 @@ Expected: FAIL —— `Cannot find module '../src/services/rate-limit.js'`
 }
 ```
 
-`platform/src/config.js`（修改：加载并校验第 10 份规则）：
+`platform/src/config.js` —— 修改处 1（`FILES` 增加 `audit`）：
 
-```text
-（以下是并入 platform/src/config.js 对应位置的【片段】，不是独立文件）
-
-// src/config.js —— 修改处 1：FILES 增加 audit
+```javascript
 const FILES = {
   scoringInitial: 'scoring-initial.json',
   scoringFinal: 'scoring-final.json',
@@ -1681,29 +1913,39 @@ const FILES = {
   registration: 'registration-scoring.json',
   solvability: 'solvability.json',
   milestones: 'milestones.default.json',
-  teamFormation: 'team-formation.json',   // ← P1 加的（不是 P0 的，别删）
-  schedule: 'schedule.json',               // ← P1 加的（不是 P0 的，别删）
-  compliance: 'compliance.json',           // ← P1 加的（不是 P0 的，别删）
+  teamFormation: 'team-formation.json',
+  schedule: 'schedule.json',
+  compliance: 'compliance.json',
+  points: 'points.json',
+  criteria: 'criteria.json',
   audit: 'audit.json',                     // ← P4 新增
 };
+```
 
-// src/config.js —— 修改处 2：grouped 增加 audit
-const grouped = {
-  scoring: { initial: rules.scoringInitial, final: rules.scoringFinal },
-  tiebreak: rules.tiebreak,
-  ranks: rules.ranks,
-  behavior: rules.behavior,
-  visibility: rules.visibility,
-  registration: rules.registration,
-  solvability: rules.solvability,
-  milestones: rules.milestones,
-  teamFormation: rules.teamFormation,     // ← P1 加的（不是 P0 的，别删）
-  schedule: rules.schedule,                // ← P1 加的（不是 P0 的，别删）
-  compliance: rules.compliance,            // ← P1 加的（不是 P0 的，别删）
-  audit: rules.audit,                      // ← P4 新增
-};
+`platform/src/config.js` —— 修改处 2（`grouped` 增加 `audit`）：
 
-// src/config.js —— 修改处 3：validateRules 末尾追加（fail-fast，校验不过拒绝启动）
+```javascript
+  const grouped = {
+    scoring: { initial: rules.scoringInitial, final: rules.scoringFinal },
+    tiebreak: rules.tiebreak,
+    ranks: rules.ranks,
+    behavior: rules.behavior,
+    visibility: rules.visibility,
+    registration: rules.registration,
+    solvability: rules.solvability,
+    milestones: rules.milestones,
+    teamFormation: rules.teamFormation,
+    schedule: rules.schedule,
+    compliance: rules.compliance,
+    points: rules.points,
+    criteria: rules.criteria,
+    audit: rules.audit,                    // ← P4 新增
+  };
+```
+
+`platform/src/config.js` —— 修改处 3（`validateRules` 末尾追加 audit 的**内容**校验，插在 `return errors;` 之前）：
+
+```javascript
   // ── 审计与防作弊（P4）────────────────────────────────────
   const audit = rules.audit;
   if (!audit) {
@@ -1719,8 +1961,12 @@ const grouped = {
         if (layer !== 'lock' && !(Number.isInteger(l.max) && l.max > 0)) {
           errors.push(`audit.rateLimit.${name}.${layer}.max 必须是正整数`);
         }
-        if (layer !== 'lock' && !(Number.isInteger(l.seconds) && l.seconds > 0)) {
-          errors.push(`audit.rateLimit.${name}.${layer}.seconds 必须是正整数`);
+        // ⚠️ perMinute / perHour 的窗口长度是**结构决定的**（一分钟 / 一小时）——
+        //    服务层写死 60_000 / 3_600_000 毫秒，配置里没有、也**不该有** seconds：
+        //    配了也不会生效（配置说了不算 = 说谎）。
+        //    只有滑动窗口（sliding）的窗口长度与提交锁（lock）的持有时长是可配的。
+        if (layer === 'sliding' && !(Number.isInteger(l.seconds) && l.seconds > 0)) {
+          errors.push(`audit.rateLimit.${name}.sliding.seconds 必须是正整数`);
         }
       }
     }
@@ -1738,6 +1984,7 @@ const grouped = {
       errors.push('audit.reviewState.appealAllowedTiers 不得为空');
     }
   }
+
 ```
 
 > **【2026-10-21 漂移审计修正 I-2】** **version 一致性校验这一步【不需要改】** ——
@@ -1753,10 +2000,20 @@ const grouped = {
 > **改成什么**：本步**只**做三件事 —— ① `FILES` 加 `audit`；② `grouped` 加 `audit`；
 > ③ `validateRules` 末尾追加 audit 的**内容**校验段。version 校验一个字都不动。
 > **⚠️ 本次一并订正了「修改处 1 / 2」的原文**：原来贴的是 **P0 的 9 项** `FILES` / `grouped`，
-> 但基线的 `FILES` 已经有 **P1 加的 3 份**（`teamFormation` / `schedule` / `compliance`）。
-> 实施者若照原文**整块替换**，会把 P1 的三份配置**删掉** → `FILES` 变成 10 份而 `grouped`
-> 里的配置份数对不上 `expectedCount` → 报「规则配置应有 10 份，实际只识别到 13 份」
-> → **拒绝启动**。故上面已把 P1 的三份补回并标注「不是 P0 的，别删」。
+> 但基线的 `FILES` 已经有 **P1 加的 3 份**（`teamFormation` / `schedule` / `compliance`），
+> **P3 又加了 2 份**（`points` / `criteria`）。实施者若照原文**整块替换**，会把这些配置**删掉**
+> → `FILES` 份数与 `grouped` 对不上 `expectedCount`，且 `rules.points` / `rules.criteria`
+> 变成 `undefined` → 报「points 缺失 / criteria.tier 缺失 / criteria.mvp.tiebreak 缺失」
+> → **拒绝启动**。
+> **【2026-10-21 Task 3 预审修正 · 见台账 P4-7】**：上面三块「修改处 1 / 2 / 3」已从
+> 「一个 `text` 大块（整块替换语义）」改成**三块独立代码块**，每块都是**从落地实现里逐字切出的
+> 连续片段**（`FILES` 17 行 / `grouped` 16 行 / 校验段 39 行）—— 实施者只需**按位置插入**，
+> 不会再有「照抄整块把别人的配置删掉」的事故；P1 的 3 份与 P3 的 2 份都在块里。
+> **【2026-10-21 Task 3 预审修正 · 见台账 P4-6】**：「修改处 3」的校验段也已订正 ——
+> `seconds` **只对 `lock` 与 `sliding` 必填**；`perMinute` / `perHour` 的窗口长度是**结构决定的**
+> （一分钟 / 一小时，服务层写死 `60_000` / `3_600_000` 毫秒），配置里没有也不该有 `seconds`
+> （配了也不生效 = 配置说了不算 = 说谎）。按原文字面实施 ⇒ 规格自带的 `rules/audit.json`
+> 通不过规格自带的校验段 ⇒ **拒绝启动**。
 > **⚠️ 硬前提**：`rules/audit.json` **必须带 `"id": "audit"`**（识别「一份配置」用的是 `id`
 > 而不是 `version`）；P4 落地时 `FILES` 为 **15** 份（P0 的 9 + P1 的 3 + P3 的 2 + P4 的 1），识别到的配置份数也必须是 15。
 > **依据**：基线 `platform/src/config.js` + 漂移审计报告 I-2 与 D-3。
@@ -1940,6 +2197,21 @@ export function assertRateLimit(args) {
 // 依据：设计文档 §11.1「重复提交 / 并发灌分 → 幂等键（request_id 唯一）」
 //   借鉴 hack-the-back app/services/judging.py 的幂等思路（MIT），只读思路独立实现。
 //   ⛔ 同一 request_id 重复提交只生效一次，且重复请求返回【首次的响应】——不是重新算一遍。
+//
+// ⚠️ **这不是 P2 的 `src/db/repo/request-keys.js`（`claimRequestKey`）** —— 两者看着像，
+//    却是**两个不同的能力**，别当重复造轮子：
+//    · P2 `review_request_keys`：**只抢键**。抢到 = 首次生效，抢不到 = 重复请求 → 直接短路，
+//      幂等键表里**不存业务响应**。用于「一次批量提交写多行、它们共用同一个 request_id」
+//      的评审场景（键建在业务表的 request_id 列上会插不进第二批）。
+//    · P4 `idempotency_keys`：**存业务响应**。首次执行完把响应 JSON 落库，重复请求
+//      **原样返回首次的响应**（调用方不需要再问一次「上次到底成没成」）。
+//    一句话：P2 管「别重复写」，P4 管「重复写时也要能给出同样的答复」。
+//
+// ⚠️ **响应是 JSON 往返**：首次调用返回的是业务函数的**原始返回值**，
+//    重放返回的是**落库后再解析**的那份（`JSON.parse(response_json)`）。
+//    对 JSON 安全的载荷两者完全一致；对 `undefined` / `Date` / `Map` 这类值会不同
+//    （`undefined` 落库成 NULL、重放拿到 `null`）。HTTP 层本来就只吐 JSON，
+//    所以对外无感；调用方若直接读对象字段，请只用 JSON 安全的返回值。
 import { withTransaction } from '../db/tx.js';
 import { findIdempotency, insertIdempotency } from '../db/repo/idempotency.js';
 import { badRequest } from '../errors.js';
@@ -1978,7 +2250,7 @@ export function withIdempotency({ db, key, scope, requestId = null, now = new Da
 - [ ] **Step 6: 运行测试确认通过**
 
 Run: `cd platform && node --test test/rate-limit.test.js`
-Expected: PASS（10 个测试全过：rate-limit.test.js 10）
+Expected: PASS（24 个测试全过：rate-limit.test.js 24）
 
 > **【2026-10-21 漂移审计修正 M-1】** **原来错在哪**：本计划两处「Expected: PASS」的条数声明
 > 与代码块里实际的 `test(` 数量不符 —— `rate-limit.test.js` 声明 **11** 实为 **10**、
@@ -1998,6 +2270,89 @@ Expected: PASS（10 个测试全过：rate-limit.test.js 10）
 cd platform && git add src/services/rate-limit.js src/services/idempotency.js rules/audit.json src/config.js test/rate-limit.test.js
 git commit -m "feat(P4): 三层限频（落库）+ 评委级小时配额 + 幂等键执行器"
 ```
+
+## Task 3 父代理预审修正台账（2026-10-21）
+
+> Task 3 = **限频三层（滑动窗口 + 提交锁 + 每分钟配额）+ 评委级每小时配额 + 幂等键执行器**。
+> 实施前做了一次**独立工程实跑**（把规格的代码块抽到 `/tmp/p4t3/` 的副本里跑通再落盘 —— 「先跑后派」）：
+> 规格自带的 `rate-limit.test.js`（10 条）**一次就全绿**（`/tmp/p4t3/scratch1`）；
+> 但在接入 `src/config.js` 时**实证了 2 处 Critical 级规格缺陷**（照字面实施 ⇒ 服务器**拒绝启动**）。
+> 实施完成后做**变异检验**：变异体 **30** 个 → **KILLED 30 / 存活 0 / 等价 0 / 有效缺口 0**。
+>
+> **编号约定**：本段沿用 Task 1 台账的「**规格缺陷**编号」序列（`P4-1..P4-5`），从 **P4-6** 起续编；
+> 后续任务（Task 4 及以后）请从 **P4-8** 起续编，避免撞号。
+> ⚠️ **两套号别混**：本台账的 `P4-x` 是**规格缺陷编号**；文末「P4 验收标准」表里的 `P4-1..P4-11`
+> 是**验收项编号**（P4-6 = 「PENDING_REVIEW 分数不可见」、P4-7 = 「检测 ≠ 处罚」）——
+> 两套号**各指各的**，读台账时以「### 一、预审发现的规格缺陷」这张表为准。
+> 本段的 `L-1` / `L-2` 是「**已登记的已知限制**」编号，与上面两套都不同。
+
+### 一、预审发现的规格缺陷（**规格自带代码块里的错**，不是实现跑偏）
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| **P4-6** | **Critical** | **规格自带的 `rules/audit.json` 通不过规格自带的 `validateRules` 校验段 ⇒ `loadRules()` 抛错 ⇒ 服务器拒绝启动。** 根因：校验段要求 `perMinute` / `perHour` 两层**也必须声明 `seconds`**，但规格自己的 `audit.json` 里这两层**只有 `max`**（`perMinute: { max: 5 }` / `perHour: { max: 200 }`）；而且这两层的窗口长度是**结构决定的**（一分钟 / 一小时），服务层写死 `60_000` / `3_600_000` 毫秒 —— 配置里**配了也不会生效** | `node /tmp/p4t3/probe-config.mjs`（步骤 2：FILES/grouped 已补正、校验段仍按规格字面）→<br>`❌ loadRules 抛错：规则配置校验失败，拒绝启动：`<br>`  - audit.rateLimit.appealSubmit.perMinute.seconds 必须是正整数`<br>`  - audit.rateLimit.reviewSubmit.perMinute.seconds 必须是正整数`<br>`  - audit.rateLimit.judgeHourly.perHour.seconds 必须是正整数` | **改规格，不迁就实现**：校验段改成「`seconds` 只对 `lock` 与 `sliding` 必填」；`perMinute` / `perHour` 不再要求 `seconds`，并在块内注明「这两层的窗口是结构决定的，配了也不生效 —— 配置说了不算 = 说谎」。规格与实现**同一份文本**（计划「修改处 3」块 39 行与 `src/config.js` 逐字一致，`fragment-check.mjs` ✅） |
+| **P4-7** | **Critical** | **规格的「修改处 1 / 2」（`FILES` / `grouped`）是**过期**的**：只列了 P0 的 9 项 + P1 的 3 项 + P4 的 1 项 = **13 份**，**漏掉 P3 加的 `points` / `criteria` 两份**（基线 `FILES` 实为 14 份，加 P4 的 1 份 = 15 份）。照原文**整块替换** ⇒ P3 的两份被删 ⇒ `rules.points` / `rules.criteria` 变 `undefined` ⇒ 报「points 缺失 / criteria.tier 缺失 / criteria.mvp.tiebreak 缺失」⇒ **拒绝启动**；更糟的是这两块**永远不可能与正确实现逐字一致**（正确实现必须含 P3 的两份）⇒「计划 = 规格」这条纪律本身被打破 | `node /tmp/p4t3/probe-config.mjs`（步骤 1：按规格字面整块替换）→<br>`❌ loadRules 抛错：规则配置校验失败，拒绝启动：`<br>`  - points 缺失`<br>`  - criteria.tier 缺失`<br>`  - criteria.mvp.tiebreak 缺失或为空`<br>`（另有 3 条 `perMinute.seconds` 错误 ⇒ 见 P4-6） | **改规格**：把「修改处 1 / 2 / 3」从一个 `text` 大块（整块替换语义）拆成**三块独立代码块**，每块都是**从落地实现里逐字切出的连续片段**（`FILES` 17 行 / `grouped` 16 行 / 校验段 39 行）—— 实施者只需**按位置插入**，不会再误删别人的配置；`fragment-check.mjs` **3/3 ✅** |
+
+### 二、已登记的已知限制（**未改规格**：不导致任何计划用例变红，故按「最小一致改动」只登记不改）
+
+| # | 级别 | 限制 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| **L-1** | Minor | **幂等的响应是「JSON 往返」**：首次调用返回业务函数的**原始返回值**，重放返回**落库后再解析**的那份。JSON 安全的载荷两者完全一致；`undefined` 会落库成 `NULL`、重放拿到 `null`（`deepEqual(undefined, null)` 为假）。`Date` / `Map` 同理（首次是对象、重放是字符串 / `{}`） | `node --disable-warning=ExperimentalWarning -e "…withIdempotency(…, () => undefined)…"` →<br>`OK {"replayed":false,"storedAt":"…"}`（`insertIdempotency` 的默认参数 `response = null` 兜住了 `undefined`，**不会**触发 node:sqlite 的 `Provided value cannot be bound to SQLite parameter 1`）；重放时 `result` 为 `null` | **不改实现**：HTTP 层本来就只吐 JSON ⇒ 对外无感；调用方若直接读对象字段，只用 JSON 安全的返回值。已在 `src/services/idempotency.js` 头部注释写明这条边界 |
+| **L-2** | Minor | **只配 `lock`、不配配额层的 profile ⇒ `remaining` = `Math.min(...[])` = `Infinity`**（`JSON.stringify` 后成 `null`）。出厂的 `rules/audit.json` 每个 profile 都带配额层 ⇒ 线上不可达；`rules/audit.json` 之外的临时 profile 可达 | `checkRateLimit({ db, subjectKey: 'x', rule: 'lockOnly', limits: { lockOnly: { lock: { seconds: 5 } } } })` → `remaining === Infinity` | **不改实现**（`remaining` 在「无配额层」时的语义本身没定义 —— 填 0 是「没有剩余次数」、填 `null` 是「不适用」，都得改接口契约）；本阶段只登记，**并提醒 Task 6 的 HTTP 层**：若要把 `remaining` 直接序列化给客户端，先决定这个分支的口径 |
+
+### 三、变异检验（**独立变异测试**，脚本 `/tmp/p4t3/mutate.mjs`）
+
+> 变异体 **30** 个，在 `/tmp/p4t3/` 的**独立副本**上跑**已落地**的 `platform/test/rate-limit.test.js`，
+> **测试必须失败才算杀灭**（KILLED）。脚本内置三道闸：
+> ① **锚点唯一性**：锚点在目标文件里必须**恰好命中 1 次**（命中 2 次即判 `ANCHOR_INVALID`，不出变异体）；
+> ② **语法自检**：变异后文件必须仍能被 `node --check` 解析（坏变异体判 `BROKEN`，**不计入杀灭**）；
+> ③ **基线闸**：未变异时测试文件必须全绿，否则整轮作废（「存活」不可信）。
+> 首轮有 **2 条锚点命中 2 次**（M05 `windowSeconds:` 行、M23 `replayed: true` 行），
+> 按纪律「命中 2 次要加长上下文」加长锚点后两条都被杀灭。
+
+| 覆盖面 | 变异体 | 结果 |
+|---|---|---|
+| 限频三层判定（未配置即报错 / 滑动窗口 / 每分钟 / 每小时） | M01–M04 | 4/4 KILLED |
+| 窗口与桶的时间口径（秒当毫秒 / 60 秒当 120 秒 / 3600 秒当 7200 秒） | M05、M11、M12 | 3/3 KILLED |
+| 提交锁（不取锁 / 取到锁当没取到 / 仓库层锁永不过期） | M06、M07、M29 | 3/3 KILLED |
+| 配额落库（滑动 / 分钟 / 小时三层各一条） | M08–M10 | 3/3 KILLED |
+| `subjects` 维度（一律按默认 `subjectKey` 计数） | M13 | 1/1 KILLED |
+| `retryAfterSeconds` 口径（滑动固定值 / 分钟恒 1 / 小时恒 1） | M14、M18、M19 | 3/3 KILLED |
+| `remaining` 口径（少减一次 / 取最大而非最小） | M15、M16 | 2/2 KILLED |
+| 「只有放行的请求才消耗配额」 | M17 | 1/1 KILLED |
+| `assertRateLimit` 抛 429（静默丢包） | M20 | 1/1 KILLED |
+| 幂等（不查旧键 / 响应不返回 / 重放标志 / scope 不参与查询 / 不包事务 / 并发抢先写入不采信库里响应 / `storedAt` 不是首次落库时间 / 缺 key 不报错） | M21–M28 | 8/8 KILLED |
+| 仓库层「滑动窗口不看窗口」 | M30 | 1/1 KILLED |
+
+**最终结果**：变异体 **30** → **KILLED 30 / SURVIVED 0 / BROKEN 0 / ANCHOR_INVALID 0**；
+**等价变异体 0**（无「杀不掉但也不影响行为」的项需要标注）、**不可观测变异体 0**、**有效缺口 0**。
+
+> 变异脚本里 **M29 / M30** 这两条**故意打在 Task 1 的仓库层文件**上
+> （`src/db/repo/rate-limit.js`）—— 它们证明的是**服务层用例对底层行为有牙**：
+> 「锁会过期」「滑动窗口真的只看窗口内的计数」这两条如果没人守，服务层的用例会假绿。
+> 变异只在 `/tmp` 的副本上做，**不碰仓库文件**。
+
+### 四、测试条数口径与核验
+
+* **Task 3 测试条数**：`platform/test/rate-limit.test.js` = **24**
+  （**规格自带 10** + **变异检验补测 14**）。
+  补的 14 条全部是**判别性**用例（每条都对应上面某个变异体，补之前那条变异体会存活）：
+  `subjects` 维度 / 滑动窗口到期恢复 / 提交锁到期恢复 / 被拒请求不消耗配额 / `remaining` 递减 /
+  分钟桶键与 `retryAfterSeconds` / 小时桶键与 `retryAfterSeconds` / 滑动 `retryAfterSeconds` 精确值 /
+  限频入参 400 / 幂等入参 400 / 幂等业务副作用回滚 / 幂等并发抢先写入采信库里响应 / `storedAt` 首次落库时间 /
+  `layers` 形状。
+* **全量回归**：P4 全量 **750/750**（基线 **726** + Task 3 的 24）。
+  ⚠️ 父代理给的基线数字是 **723**；**实跑基线是 726**（Task 1 台账里写的 723 是补测前的旧数）。
+* **计划块逐字核验**：`node /tmp/p3fix/plan-blocks.mjs <plan> <platform>` ⇒
+  `test/rate-limit.test.js` **整文件块 ✅一致**（414 行）、
+  `src/services/rate-limit.js` **整文件块 ✅一致**（167 行）、
+  `src/services/idempotency.js` **整文件块 ✅一致**（52 行）；
+  `node /tmp/p4-proof/fragment-check.mjs <plan> <platform> src/config.js` ⇒ **3/3 ✅**。
+* ⚠️ **核验工具的一个盲点**（工具问题，不是规格问题）：`plan-blocks.mjs` 的 hint 正则里
+  扩展名分支是 `(?:js|html|css|sql|json)`，**`js` 排在 `json` 前面** ⇒ 它对 `rules/audit.json`
+  的 hint 会**截断成 `rules/audit.js`**（`.json` 的前两个字母正好是 `js`）⇒ 该块永远显示「无实现」。
+  该文件改用**直接逐字比对**核验：计划行 1861 的 `json` 块与 `platform/rules/audit.json`
+  **逐字一致 = True**。
 
 ---
 

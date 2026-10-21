@@ -1,0 +1,39 @@
+{
+  "id": "audit",
+  "version": "2026-10-20",
+  "source": "设计文档 §11/§12 + 一页纸 §第 3 步 闸二 + 周报 2026-10-12~18 §4.2 教训 5",
+  "note": "所有阈值都是待组委会确认的机制件，必须配置化（溯源表结论：60 条机制件不得硬编码）",
+  "rateLimit": {
+    "appealSubmit": {
+      "lock": { "seconds": 5, "subject": "default" },
+      "sliding": { "seconds": 60, "max": 3, "subject": "default" },
+      "perMinute": { "max": 5, "subject": "default" }
+    },
+    "reviewSubmit": {
+      "lock": { "seconds": 5, "subject": "default" },
+      "sliding": { "seconds": 60, "max": 20, "subject": "default" },
+      "perMinute": { "max": 30, "subject": "default" }
+    },
+    "judgeHourly": {
+      "perHour": { "max": 200, "subject": "default" }
+    }
+  },
+  "antiCheat": {
+    "burst": { "windowSeconds": 60, "threshold": 5 },
+    "identicalPeer": { "minOverlap": 3 },
+    "lowVariance": { "min": 3, "max": 25 },
+    "multiAccount": { "keyFields": ["phone", "org"] },
+    "tiedMutualPeerRate": { "threshold": 0.8 }
+  },
+  "reviewState": {
+    "appealSubjectType": "team_result",
+    "appealAllowedTiers": ["D"]
+  },
+  "reverseAudit": {
+    "topN": 10,
+    "instruction": "电话回访 TOP 名单，确认签字人理解与签字内容一致（S7 §4.1 R-JDG-16）"
+  },
+  "retention": {
+    "archiveMonths": 6
+  }
+}
