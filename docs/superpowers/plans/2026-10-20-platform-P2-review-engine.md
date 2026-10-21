@@ -3464,9 +3464,26 @@ git commit -m "feat(P2): 自评差异检测、回避制度、互评资格与评�
     - 幂等：同一 `requestId` 重复提交只生效一次
     - 观察员 → 403；已回避该队 → 403
     - 写 `stage_reviews` + **增量**更新 `score_stats`（n / mean / sum_sq）
-  - `getReviewState({ db, stageId, viewer })` → `{ submitted, total, missing, dimensionProgress }`
+    - ⛔ **「抢幂等键」与「写数据」必须在同一个事务里**（父代理预审修正，Critical）：
+      原来抢键成功后写数据失败（如评委被回避 → 403），**键已经占住** →
+      客户端用同一个 `requestId` 重试会被判成「重复请求」而返回 `submitted: 0`
+      —— **评委以为提交成功了，实际一条都没落库**。
+      现在「抢键 + 写数据 + 更新统计 + 审计」在一个事务里，要么全成要么全回滚。
+    - ⛔ **同一个 `requestId` 用于不同内容 → 409**（`REQUEST_ID_REUSED`），
+      不静默继续写 —— 否则「这个 request 到底写了什么」永远说不清。
+    - ⛔ **分数必须在 0–100**（否则污染 `score_stats` 与后续归一化）→ 400 `SCORE_OUT_OF_RANGE`
+    - ⛔ **赛段不存在 → 404** `STAGE_NOT_FOUND`（不把外键原文漏给调用方）
+  - `getReviewState({ db, stageId, viewer, dimensions? })` → `{ submitted, total, missing, dimensionProgress }`
+    - ⚠️ **应交队伍必须来自赛段真实名册**（`listStageTeams`），⛔ 不是「已有打分记录里
+      出现过的队伍」—— 后者会让「完全没人打分的队」从名单里消失，
+      进度显示 100% 而实际有队没被评。
+    - ⚠️ `dimensions` 省略时取「已出现过的维度」；Task 8 的 API 层应显式传规则里的维度全集，
+      否则「从未有人评过的维度」不会出现在进度里。
   - `submitCalibration({ db, stageId, judgeId, items, now })` → `{ stageId, judgeId, submitted }`（写 `calibrations`，**不计入评分**）
-  - `submitPeerReviews({ db, stageId, items, requestId, now })` → `{ stageId, submitted }`
+  - `submitPeerReviews({ db, stageId, items, requestId, actorId?, now })` → `{ stageId, submitted }`
+    - ⚠️ **幂等键的 `subjectId` 用提交方（`actorId`）**，⛔ 不用 `items` 推导 ——
+      `items` 变了主体也变 → 键抢不到自己 → **幂等被绕过**。
+      没有 `actorId` 时主体退化成 `'*'`，靠「同 `requestId` 内容比对」兜住复用。
   - `submitSelfReviews({ db, stageId, teamId, items, requestId, now })` → `{ stageId, teamId, submitted }`
   - `declareRecusal({ db, stageId, judgeId, teamId, reason, actorId, now })` → recusal record
   - `writeAuditLog(db, { actorId, action, entity, entityId, detail, now })` → audit id
@@ -3476,6 +3493,15 @@ git commit -m "feat(P2): 自评差异检测、回避制度、互评资格与评�
 `platform/test/review-service.test.js`：
 
 ```javascript
+// platform/test/review-service.test.js —— 评审提交类用例
+//
+// 依据：P2 计划 Task 6「评分提交服务 + 幂等 + 增量 score_stats」
+// 溯源需求：R-JDG-09（回避留档）｜R-JDG-11（观察员无投票权）｜R-JDG-12（校准不计入评分）
+//          ｜R-JDG-13（自评）｜R-JDG-18（利益冲突声明）｜R-RNK-07（互评资格）
+//
+// ⚠️ **夹具必须建真实数据**（父代理预审修正，Important）：
+//    Task 1 补齐了引用型外键（`judge_id → users`、`team_id → teams`、`stage_id → stages`），
+//    原规格用的假 id（'j1' / 't1' / 'ed1'）**必然触发外键失败** —— 那只在「没有外键」时成立。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -3485,12 +3511,17 @@ import { fileURLToPath } from 'node:url';
 import { openDatabase } from '../src/db/sqlite.js';
 import { applyMigrations } from '../src/db/migrate.js';
 import { createUser } from '../src/db/repo/users.js';
+import { createEdition } from '../src/db/repo/editions.js';
+import { insertTeam } from '../src/db/repo/teams.js';
+import { insertStage, assignStageJudge } from '../src/db/repo/stages.js';
+import { claimRequestKey } from '../src/db/repo/request-keys.js';
 import {
   submitReviews,
   getReviewState,
   submitCalibration,
   submitPeerReviews,
   submitSelfReviews,
+  submitEnterpriseConfirmation,
   declareRecusal,
 } from '../src/services/review.js';
 
@@ -3502,35 +3533,54 @@ function setup() {
   const { db, close } = openDatabase({ dataDir });
   applyMigrations(db, migrationsDir);
 
+  // 真实届期 / 用户 / 战队 / 赛段 —— 外键要指向真实存在的行
+  const edition = createEdition(db, {
+    name: '首届', city: '上海', startsAt: '2026-10-01', endsAt: '2026-10-31', now: NOW,
+  });
   const judge = createUser(db, { name: '评委甲', phone: '13900000011', password: 'pw' });
   const observer = createUser(db, { name: '观察员', phone: '13900000012', password: 'pw' });
   const captain = createUser(db, { name: '队长', phone: '13900000013', password: 'pw' });
+  const captain2 = createUser(db, { name: '队长乙', phone: '13900000015', password: 'pw' });
   const admin = createUser(db, { name: '组委会', phone: '13900000014', password: 'pw' });
 
-  db.prepare(
-    `INSERT INTO stages (id, edition_id, "key", name, kind, starts_at, ends_at, scoring_config_key, status)
-     VALUES ('s1', 'ed1', 's1', '初赛', 'initial', '2026-10-01', '2026-10-10', 'initial', 'open')`,
-  ).run();
-  const seat = db.prepare(
-    'INSERT INTO stage_judges (stage_id, user_id, seat, scope_type, scope_id, assigned_at) VALUES (?, ?, ?, ?, ?, ?)',
-  );
-  seat.run('s1', judge.id, 'judge', 'global', null, NOW);
-  seat.run('s1', observer.id, 'observer', 'global', null, NOW);
-  db.prepare(
-    'INSERT INTO stages (id, edition_id, "key", name, kind, starts_at, ends_at, scoring_config_key, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-  ).run('s2', 'ed1', 's2', '决赛', 'final', '2026-10-26', '2026-10-28', 'final', 'open');
-  return { db, close, dataDir, judge, observer, captain, admin };
+  const teamA = insertTeam(db, {
+    editionId: edition.id, name: '甲队', captainId: captain.id, status: 'forming', now: NOW,
+  });
+  const teamB = insertTeam(db, {
+    editionId: edition.id, name: '乙队', captainId: captain2.id, status: 'forming', now: NOW,
+  });
+
+  const stage = insertStage(db, {
+    editionId: edition.id, key: 's1', name: '初赛', kind: 'initial',
+    startsAt: '2026-10-01', endsAt: '2026-10-10', scoringConfigKey: 'initial', status: 'open', now: NOW,
+  });
+  const stage2 = insertStage(db, {
+    editionId: edition.id, key: 's2', name: '决赛', kind: 'final',
+    startsAt: '2026-10-26', endsAt: '2026-10-28', scoringConfigKey: 'final', status: 'open', now: NOW,
+  });
+
+  // 分配评委 = 签署利益冲突声明（R-JDG-18 接线）
+  assignStageJudge(db, { stageId: stage.id, userId: judge.id, seat: 'judge', now: NOW });
+  assignStageJudge(db, { stageId: stage.id, userId: observer.id, seat: 'observer', now: NOW });
+
+  return { db, close, dataDir, edition, judge, observer, captain, captain2, admin, teamA, teamB, stage, stage2 };
+}
+
+function cleanup({ db, close, dataDir }) {
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
 }
 
 test('提交评分：写入 stage_reviews 并增量更新 score_stats', () => {
-  const { db, close, dataDir, judge } = setup();
+  const ctx = setup();
+  const { db, judge, teamA, teamB, stage } = ctx;
   const res = submitReviews({
     db,
-    stageId: 's1',
+    stageId: stage.id,
     judgeId: judge.id,
     items: [
-      { teamId: 't1', dimension: 'innovation', rawScore: 80 },
-      { teamId: 't2', dimension: 'innovation', rawScore: 60 },
+      { teamId: teamA.id, dimension: 'innovation', rawScore: 80 },
+      { teamId: teamB.id, dimension: 'innovation', rawScore: 60 },
     ],
     requestId: 'req-1',
     now: NOW,
@@ -3542,149 +3592,375 @@ test('提交评分：写入 stage_reviews 并增量更新 score_stats', () => {
   assert.ok(Math.abs(stat.mean - 70) < 1e-12);
   assert.ok(Math.abs(stat.sum_sq - (6400 + 3600)) < 1e-9);
 
-  close();
-  rmSync(dataDir, { recursive: true, force: true });
+  cleanup(ctx);
 });
 
 test('幂等：同一 requestId 重复提交只生效一次', () => {
-  const { db, close, dataDir, judge } = setup();
-  const items = [{ teamId: 't1', dimension: 'innovation', rawScore: 80 }];
-  submitReviews({ db, stageId: 's1', judgeId: judge.id, items, requestId: 'req-1', now: NOW });
-  const second = submitReviews({ db, stageId: 's1', judgeId: judge.id, items, requestId: 'req-1', now: NOW });
+  const ctx = setup();
+  const { db, judge, teamA, stage } = ctx;
+  const items = [{ teamId: teamA.id, dimension: 'innovation', rawScore: 80 }];
+  submitReviews({ db, stageId: stage.id, judgeId: judge.id, items, requestId: 'req-1', now: NOW });
+  const second = submitReviews({ db, stageId: stage.id, judgeId: judge.id, items, requestId: 'req-1', now: NOW });
   assert.equal(second.submitted, 0, '重复提交不产生新记录');
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM stage_reviews').get().n, 1);
   const stat = db.prepare('SELECT * FROM score_stats WHERE judge_id = ? AND dimension = ?').get(judge.id, 'innovation');
   assert.equal(stat.n, 1, 'score_stats 不得被重复累加');
-  close();
-  rmSync(dataDir, { recursive: true, force: true });
+  cleanup(ctx);
 });
 
 test('观察员无投票权 → 403', () => {
-  const { db, close, dataDir, observer } = setup();
+  const ctx = setup();
+  const { db, observer, teamA, stage } = ctx;
   assert.throws(
     () => submitReviews({
-      db, stageId: 's1', judgeId: observer.id,
-      items: [{ teamId: 't1', dimension: 'innovation', rawScore: 80 }],
+      db, stageId: stage.id, judgeId: observer.id,
+      items: [{ teamId: teamA.id, dimension: 'innovation', rawScore: 80 }],
       requestId: 'req-o', now: NOW,
     }),
     (err) => err.status === 403,
   );
-  close();
-  rmSync(dataDir, { recursive: true, force: true });
+  cleanup(ctx);
 });
 
 test('改分：同一 (评委,队伍,维度) 覆盖写，score_stats 同步修正', () => {
-  const { db, close, dataDir, judge } = setup();
+  const ctx = setup();
+  const { db, judge, teamA, stage } = ctx;
   submitReviews({
-    db, stageId: 's1', judgeId: judge.id,
-    items: [{ teamId: 't1', dimension: 'innovation', rawScore: 80 }],
+    db, stageId: stage.id, judgeId: judge.id,
+    items: [{ teamId: teamA.id, dimension: 'innovation', rawScore: 80 }],
     requestId: 'req-a', now: NOW,
   });
   submitReviews({
-    db, stageId: 's1', judgeId: judge.id,
-    items: [{ teamId: 't1', dimension: 'innovation', rawScore: 90 }],
+    db, stageId: stage.id, judgeId: judge.id,
+    items: [{ teamId: teamA.id, dimension: 'innovation', rawScore: 90 }],
     requestId: 'req-b', now: NOW,
   });
   const stat = db.prepare('SELECT * FROM score_stats WHERE judge_id = ? AND dimension = ?').get(judge.id, 'innovation');
   assert.equal(stat.n, 1);
   assert.ok(Math.abs(stat.mean - 90) < 1e-12);
   assert.ok(Math.abs(stat.sum_sq - 8100) < 1e-9);
-  close();
-  rmSync(dataDir, { recursive: true, force: true });
+  cleanup(ctx);
 });
 
 test('校准打分写入 calibrations，不进 stage_reviews（不计入评分）', () => {
-  const { db, close, dataDir, judge } = setup();
+  const ctx = setup();
+  const { db, judge, stage } = ctx;
   submitCalibration({
-    db, stageId: 's1', judgeId: judge.id,
+    db, stageId: stage.id, judgeId: judge.id,
     items: [{ dimension: 'innovation', rawScore: 50 }], now: NOW,
   });
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM calibrations').get().n, 1);
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM stage_reviews').get().n, 0);
-  close();
-  rmSync(dataDir, { recursive: true, force: true });
+  cleanup(ctx);
 });
 
 test('进度查询：返回已交/应交/缺谁/维度进度', () => {
-  const { db, close, dataDir, judge } = setup();
+  const ctx = setup();
+  const { db, judge, teamA, stage } = ctx;
   submitReviews({
-    db, stageId: 's1', judgeId: judge.id,
-    items: [{ teamId: 't1', dimension: 'innovation', rawScore: 80 }],
+    db, stageId: stage.id, judgeId: judge.id,
+    items: [{ teamId: teamA.id, dimension: 'innovation', rawScore: 80 }],
     requestId: 'req-1', now: NOW,
   });
-  const state = getReviewState({ db, stageId: 's1', viewer: { userId: judge.id, seat: 'judge' } });
+  const state = getReviewState({ db, stageId: stage.id, viewer: { userId: judge.id, seat: 'judge' } });
   assert.equal(state.submitted, 1);
   assert.ok(state.total >= 1);
   assert.ok(Array.isArray(state.missing));
   assert.ok('innovation' in state.dimensionProgress);
   assert.equal(state.dimensionProgress.innovation.submitted, 1);
-  close();
-  rmSync(dataDir, { recursive: true, force: true });
+  cleanup(ctx);
 });
 
 test('互评：一队对另一队只投一次；重复 requestId 幂等', () => {
-  const { db, close, dataDir, judge } = setup();
+  const ctx = setup();
+  const { db, judge, teamA, teamB, stage } = ctx;
   // 两队都已有真实交付物（评委已对其打分）→ 才有互评资格（R-RNK-07）
   submitReviews({
-    db, stageId: 's1', judgeId: judge.id,
+    db, stageId: stage.id, judgeId: judge.id,
     items: [
-      { teamId: 't1', dimension: 'innovation', rawScore: 80 },
-      { teamId: 't2', dimension: 'innovation', rawScore: 70 },
+      { teamId: teamA.id, dimension: 'innovation', rawScore: 80 },
+      { teamId: teamB.id, dimension: 'innovation', rawScore: 70 },
     ],
     requestId: 'r-1', now: NOW,
   });
-  const items = [{ fromTeamId: 't1', toTeamId: 't2', score: 70 }];
-  const first = submitPeerReviews({ db, stageId: 's1', items, requestId: 'p-1', now: NOW });
+  const items = [{ fromTeamId: teamA.id, toTeamId: teamB.id, score: 70 }];
+  const first = submitPeerReviews({ db, stageId: stage.id, items, requestId: 'p-1', now: NOW });
   assert.equal(first.submitted, 1);
-  const second = submitPeerReviews({ db, stageId: 's1', items, requestId: 'p-1', now: NOW });
+  const second = submitPeerReviews({ db, stageId: stage.id, items, requestId: 'p-1', now: NOW });
   assert.equal(second.submitted, 0);
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM peer_reviews').get().n, 1);
-  close();
-  rmSync(dataDir, { recursive: true, force: true });
+  cleanup(ctx);
 });
 
 test('无真实交付物的队伍不能参与互评（R-RNK-07）', () => {
-  const { db, close, dataDir, judge } = setup();
+  const ctx = setup();
+  const { db, judge, teamA, teamB, stage } = ctx;
   submitReviews({
-    db, stageId: 's1', judgeId: judge.id,
-    items: [{ teamId: 't1', dimension: 'innovation', rawScore: 80 }],
+    db, stageId: stage.id, judgeId: judge.id,
+    items: [{ teamId: teamA.id, dimension: 'innovation', rawScore: 80 }],
     requestId: 'r-1', now: NOW,
   });
   assert.throws(
     () => submitPeerReviews({
-      db, stageId: 's1', items: [{ fromTeamId: 't1', toTeamId: 't9', score: 70 }], requestId: 'p-2', now: NOW,
+      db, stageId: stage.id, items: [{ fromTeamId: teamA.id, toTeamId: teamB.id, score: 70 }], requestId: 'p-2', now: NOW,
     }),
     (err) => err.status === 403,
   );
-  close();
-  rmSync(dataDir, { recursive: true, force: true });
+  cleanup(ctx);
 });
 
 test('自评测提交并幂等', () => {
-  const { db, close, dataDir } = setup();
+  const ctx = setup();
+  const { db, teamA, stage } = ctx;
   const items = [{ dimension: 'innovation', rawScore: 85 }];
-  submitSelfReviews({ db, stageId: 's1', teamId: 't1', items, requestId: 's-1', now: NOW });
-  const again = submitSelfReviews({ db, stageId: 's1', teamId: 't1', items, requestId: 's-1', now: NOW });
+  submitSelfReviews({ db, stageId: stage.id, teamId: teamA.id, items, requestId: 's-1', now: NOW });
+  const again = submitSelfReviews({ db, stageId: stage.id, teamId: teamA.id, items, requestId: 's-1', now: NOW });
   assert.equal(again.submitted, 0);
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM self_reviews').get().n, 1);
-  close();
-  rmSync(dataDir, { recursive: true, force: true });
+  cleanup(ctx);
 });
 
 test('回避：留档后该评委不能再评该队', () => {
-  const { db, close, dataDir, judge, admin } = setup();
-  declareRecusal({ db, stageId: 's1', judgeId: judge.id, teamId: 't1', reason: '前雇主', actorId: admin.id, now: NOW });
+  const ctx = setup();
+  const { db, judge, teamA, stage, admin } = ctx;
+  declareRecusal({ db, stageId: stage.id, judgeId: judge.id, teamId: teamA.id, reason: '前雇主', actorId: admin.id, now: NOW });
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM recusal_records').get().n, 1);
   assert.throws(
     () => submitReviews({
-      db, stageId: 's1', judgeId: judge.id,
-      items: [{ teamId: 't1', dimension: 'innovation', rawScore: 80 }],
+      db, stageId: stage.id, judgeId: judge.id,
+      items: [{ teamId: teamA.id, dimension: 'innovation', rawScore: 80 }],
       requestId: 'req-r', now: NOW,
     }),
     (err) => err.status === 403,
   );
-  close();
-  rmSync(dataDir, { recursive: true, force: true });
+  cleanup(ctx);
+});
+
+// ── 父代理预审修正用例（2026-10-21）────────────────────────────────────
+
+test('R-JDG-18 接线：分配评委即签署利益冲突声明', () => {
+  // ⚠️ 原规格把 `conflict_declarations` 建好了、两列也留了，
+  //    却**没有任何代码写入** → 「评委须签署声明」在产品上静默失效，CI 全绿。
+  const ctx = setup();
+  const { db, judge, stage } = ctx;
+  const decls = db.prepare('SELECT * FROM conflict_declarations WHERE stage_id = ? AND judge_id = ?')
+    .all(stage.id, judge.id);
+  assert.equal(decls.length, 1, '分配评委后声明表必须多一行');
+  assert.equal(decls[0].has_conflict, 0);
+  assert.ok(decls[0].statement.length > 0, '声明正文不能为空');
+  const seat = db.prepare('SELECT * FROM stage_judges WHERE stage_id = ? AND user_id = ?')
+    .get(stage.id, judge.id);
+  assert.equal(seat.conflict_declared_at, NOW, '签署时间必须回填');
+  assert.equal(seat.conflict_declaration_id, decls[0].id, '声明 id 必须回填');
+  cleanup(ctx);
+});
+
+test('写数据失败时幂等键不得残留（否则重试会被静默吞掉）', () => {
+  // ⚠️ 原实现：先抢键再写数据。写数据失败（403）时**键已经占住** →
+  //    客户端用同一个 requestId 重试会被判成「重复请求」，
+  //    返回 submitted: 0 —— **评委以为提交成功了，实际一条都没落库**。
+  const ctx = setup();
+  const { db, judge, teamA, teamB, stage, admin } = ctx;
+  declareRecusal({ db, stageId: stage.id, judgeId: judge.id, teamId: teamA.id, reason: '前雇主', actorId: admin.id, now: NOW });
+  assert.throws(
+    () => submitReviews({
+      db, stageId: stage.id, judgeId: judge.id,
+      items: [{ teamId: teamA.id, dimension: 'innovation', rawScore: 80 }],
+      requestId: 'req-x', now: NOW,
+    }),
+    (err) => err.status === 403,
+  );
+  assert.equal(
+    db.prepare('SELECT COUNT(*) AS n FROM review_request_keys').get().n,
+    0,
+    '失败的事务不得留下幂等键',
+  );
+  // 换个没被回避的队，用**同一个** requestId 重试 → 必须真写进去
+  const retry = submitReviews({
+    db, stageId: stage.id, judgeId: judge.id,
+    items: [{ teamId: teamB.id, dimension: 'innovation', rawScore: 80 }],
+    requestId: 'req-x', now: NOW,
+  });
+  assert.equal(retry.submitted, 1, '重试必须真的写入，不能被幂等短路吞掉');
+  cleanup(ctx);
+});
+
+test('同一个 requestId 用于不同内容 → 409（响亮报错，不静默继续写）', () => {
+  const ctx = setup();
+  const { db, judge, teamA, teamB, stage } = ctx;
+  submitReviews({
+    db, stageId: stage.id, judgeId: judge.id,
+    items: [{ teamId: teamA.id, dimension: 'innovation', rawScore: 80 }],
+    requestId: 'req-dup', now: NOW,
+  });
+  assert.throws(
+    () => submitReviews({
+      db, stageId: stage.id, judgeId: judge.id,
+      items: [{ teamId: teamB.id, dimension: 'innovation', rawScore: 80 }],
+      requestId: 'req-dup', now: NOW,
+    }),
+    (err) => err.status === 409,
+  );
+  cleanup(ctx);
+});
+
+test('互评：同一个 requestId 用于不同内容 → 409（幂等键主体不能从 items 推导）', () => {
+  const ctx = setup();
+  const { db, judge, teamA, teamB, stage } = ctx;
+  submitReviews({
+    db, stageId: stage.id, judgeId: judge.id,
+    items: [
+      { teamId: teamA.id, dimension: 'innovation', rawScore: 80 },
+      { teamId: teamB.id, dimension: 'innovation', rawScore: 70 },
+    ],
+    requestId: 'r-1', now: NOW,
+  });
+  submitPeerReviews({
+    db, stageId: stage.id,
+    items: [{ fromTeamId: teamA.id, toTeamId: teamB.id, score: 70 }],
+    requestId: 'p-dup', now: NOW,
+  });
+  assert.throws(
+    () => submitPeerReviews({
+      db, stageId: stage.id,
+      items: [
+        { fromTeamId: teamA.id, toTeamId: teamB.id, score: 70 },
+        { fromTeamId: teamB.id, toTeamId: teamA.id, score: 60 },
+      ],
+      requestId: 'p-dup', now: NOW,
+    }),
+    (err) => err.status === 409,
+  );
+  cleanup(ctx);
+});
+
+test('分数越界 → 400（绝不让 1000 分污染 score_stats 与归一化）', () => {
+  const ctx = setup();
+  const { db, judge, teamA, stage } = ctx;
+  for (const bad of [1000, -1, NaN, Infinity]) {
+    assert.throws(
+      () => submitReviews({
+        db, stageId: stage.id, judgeId: judge.id,
+        items: [{ teamId: teamA.id, dimension: 'innovation', rawScore: bad }],
+        requestId: `req-bad-${String(bad)}`, now: NOW,
+      }),
+      (err) => err.status === 400,
+      `rawScore=${String(bad)} 必须被拒`,
+    );
+  }
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM score_stats').get().n, 0);
+  cleanup(ctx);
+});
+
+test('评分进度按赛段真实名册算（完全没人打分的队也必须计入）', () => {
+  // ⚠️ 原实现把「已有打分记录里出现过的队伍」当成「应交队伍」——
+  //    某个队完全没人打分时它根本不在名单里 → 进度显示 100% 而实际有队没被评。
+  const ctx = setup();
+  const { db, judge, teamA, teamB, stage } = ctx;
+  submitReviews({
+    db, stageId: stage.id, judgeId: judge.id,
+    items: [{ teamId: teamA.id, dimension: 'innovation', rawScore: 80 }],
+    requestId: 'req-1', now: NOW,
+  });
+  const state = getReviewState({ db, stageId: stage.id, viewer: { userId: judge.id, seat: 'judge' } });
+  assert.equal(state.total, 2, '两个队都应交 —— 乙队完全没人打分也算');
+  assert.equal(state.submitted, 1);
+  assert.equal(state.missing.length, 1);
+  assert.equal(state.missing[0].teamId, teamB.id);
+  cleanup(ctx);
+});
+
+test('赛段不存在 → 404（不把外键原文漏给调用方）', () => {
+  const ctx = setup();
+  const { db, judge } = ctx;
+  assert.throws(
+    () => submitReviews({
+      db, stageId: 'no-such-stage', judgeId: judge.id,
+      items: [], requestId: 'req-none', now: NOW,
+    }),
+    (err) => err.status === 404,
+  );
+  cleanup(ctx);
+});
+
+test('企业确认：空白签字内容 → 400（R-JDG-14）', () => {
+  const ctx = setup();
+  const { db, teamA, stage } = ctx;
+  assert.throws(
+    () => submitEnterpriseConfirmation({
+      db, stageId: stage.id, teamId: teamA.id, enterpriseId: 'E1',
+      dimension: 'enterprise', rawScore: 80, content: '   ', now: NOW,
+    }),
+    (err) => err.status === 400,
+  );
+  cleanup(ctx);
+});
+
+test('每次提交都留下审计日志', () => {
+  const ctx = setup();
+  const { db, judge, teamA, stage } = ctx;
+  submitReviews({
+    db, stageId: stage.id, judgeId: judge.id,
+    items: [{ teamId: teamA.id, dimension: 'innovation', rawScore: 80 }],
+    requestId: 'req-audit', now: NOW,
+  });
+  const rows = db.prepare('SELECT * FROM audit_log WHERE action = ?').all('review.submit');
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].entity, 'stage');
+  assert.equal(rows[0].entity_id, stage.id);
+  cleanup(ctx);
+});
+
+test('幂等键的 UNIQUE 兜底只认「唯一约束」，其它约束错必须继续往上抛', () => {
+  // ⚠️ 兜底正则若放宽成 /UNIQUE|constraint/i，「外键失败」会被**误判成重复请求**
+  //    → 静默吞掉（返回 submitted: 0），评委以为提交成功了。
+  //    P1 的 T-7 已经踩过一次同样的坑（registrations 的兜底正则被收紧）。
+  const ctx = setup();
+  const { db } = ctx;
+  assert.throws(
+    () => claimRequestKey(db, {
+      scope: 'review', stageId: 'no-such-stage', subjectId: 'x', requestId: 'r', now: NOW,
+    }),
+    /FOREIGN KEY/i,
+    '外键失败不得被当成「重复请求」',
+  );
+  cleanup(ctx);
+});
+
+test('进度：应交总数 = 队伍数 × 维度数（不能漏乘维度）', () => {
+  const ctx = setup();
+  const { db, judge, teamA, stage } = ctx;
+  submitReviews({
+    db, stageId: stage.id, judgeId: judge.id,
+    items: [
+      { teamId: teamA.id, dimension: 'innovation', rawScore: 80 },
+      { teamId: teamA.id, dimension: 'feasibility', rawScore: 70 },
+    ],
+    requestId: 'req-2d', now: NOW,
+  });
+  const state = getReviewState({ db, stageId: stage.id, viewer: { userId: judge.id, seat: 'judge' } });
+  assert.equal(state.total, 4, '2 队 × 2 维度 = 4');
+  assert.equal(state.submitted, 2);
+  cleanup(ctx);
+});
+
+test('不能给自己互评 → 400', () => {
+  const ctx = setup();
+  const { db, judge, teamA, stage } = ctx;
+  submitReviews({
+    db, stageId: stage.id, judgeId: judge.id,
+    items: [{ teamId: teamA.id, dimension: 'innovation', rawScore: 80 }],
+    requestId: 'r-1', now: NOW,
+  });
+  assert.throws(
+    () => submitPeerReviews({
+      db, stageId: stage.id,
+      items: [{ fromTeamId: teamA.id, toTeamId: teamA.id, score: 70 }],
+      requestId: 'p-self', now: NOW,
+    }),
+    (err) => err.status === 400,
+  );
+  cleanup(ctx);
 });
 ```
 
@@ -3702,9 +3978,15 @@ Expected: FAIL —— `Cannot find module '../src/services/review.js'`
 //
 // 依据：设计文档 §11（幂等 + 行锁 + 只接受当前分配）。
 //   ⛔ 一次批量提交会写入多行、它们共用同一个 request_id —— 所以幂等键不能直接建在
-//      业务表的 request_id 列上（那样第二批就插不进去）。
+//      业务表的 request_id 列上（那样第二批就插不进去了）。
 //   ✅ 正确做法：先在键表里「抢键」，抢到 = 首次生效；抢不到 = 重复请求 → 幂等短路。
 //      唯一约束在数据库层，因此并发下不会双写。
+//
+// ⚠️ 父代理预审修正（2026-10-21，Important）：
+//    「先抢键」与「写数据」必须放进**同一个事务** —— 否则写数据失败时键已经被占用，
+//    客户端用同一个 requestId 重试会被判成「重复请求」而**静默丢数据**
+//    （返回 submitted: 0，评委以为提交成功了，实际一条都没落库）。
+//    事务边界由服务层负责（src/services/review.js）。
 export function claimRequestKey(db, { scope, stageId, subjectId, requestId, now }) {
   try {
     db.prepare(
@@ -3713,7 +3995,9 @@ export function claimRequestKey(db, { scope, stageId, subjectId, requestId, now 
     ).run(scope, stageId, subjectId, requestId, now);
     return true;
   } catch (err) {
-    if (/UNIQUE|constraint/i.test(String(err.message))) return false; // 键已存在 = 重复请求
+    // ⚠️ 只认「唯一约束」这一种失败 —— 其他错误必须继续往上抛，
+    //    否则「磁盘满了」会被误判成「重复请求」。
+    if (/UNIQUE constraint failed: review_request_keys/i.test(String(err.message))) return false;
     throw err;
   }
 }
@@ -3731,14 +4015,23 @@ export function findRequestKey(db, { scope, stageId, subjectId, requestId }) {
 
 ```javascript
 // src/db/repo/stages.js — 赛段与评委席
+// 依据：设计文档 §5.2 / §12 + INTERFACES.md §3 + S7 §3.4（评委池与席构成）
 import { randomUUID } from 'node:crypto';
 
-export function insertStage(db, { editionId, key, name, kind, startsAt, endsAt, freezeAt = null, scoringConfigKey, status = 'draft', now }) {
+export function insertStage(db, {
+  editionId, key, name, kind, startsAt, endsAt, freezeAt = null, scoringConfigKey,
+  status = 'draft', now,
+}) {
   const id = randomUUID();
+  // ⚠️ `stages` 表**没有** created_at 列（created_at 在 stage_reviews / enterprise_confirmations
+  //    等「评分行为」表上，赛段本身不是行为）—— 所以这里**不能**多传一个 now，
+  //    否则参数个数与占位符对不上 → "column index out of range"。
+  //    `now` 保留在签名里是为了调用方接口统一（传不传都行）。
+  void now;
   db.prepare(
     `INSERT INTO stages (id, edition_id, "key", name, kind, starts_at, ends_at, freeze_at, scoring_config_key, status)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(id, editionId, key, name, kind, startsAt, endsAt, freezeAt, scoringConfigKey, status, now);
+  ).run(id, editionId, key, name, kind, startsAt, endsAt, freezeAt, scoringConfigKey, status);
   return getStage(db, id);
 }
 
@@ -3770,25 +4063,35 @@ export const DEFAULT_CONFLICT_STATEMENT =
  *    P1 Task 4 的 T4-5（未做六维评估也能签 A 级）**同一类病根**。
  *    现在：**分配评委即签署声明** —— 声明落 `conflict_declarations`，
  *    并把声明 id 与签署时间回填到 `stage_judges`。
+ *
+ * ⚠️ 两条 INSERT 必须在**同一个事务**里 —— 否则「声明写了但席位没写成」会留下孤儿声明。
  */
 export function assignStageJudge(db, {
   stageId, userId, seat, scopeType = 'global', scopeId = null, now, declaration = null,
 }) {
   const declarationId = randomUUID();
-  db.prepare(
-    `INSERT INTO conflict_declarations (id, stage_id, judge_id, declared_at, has_conflict, statement, signed_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    declarationId, stageId, userId, now,
-    declaration?.hasConflict === true ? 1 : 0,
-    declaration?.statement ?? DEFAULT_CONFLICT_STATEMENT,
-    now,
-  );
-  db.prepare(
-    `INSERT INTO stage_judges (stage_id, user_id, seat, scope_type, scope_id, assigned_at,
-                               conflict_declared_at, conflict_declaration_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(stageId, userId, seat, scopeType, scopeId, now, now, declarationId);
+  const nested = db.isTransaction === true;
+  if (!nested) db.exec('BEGIN IMMEDIATE');
+  try {
+    db.prepare(
+      `INSERT INTO conflict_declarations (id, stage_id, judge_id, declared_at, has_conflict, statement, signed_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      declarationId, stageId, userId, now,
+      declaration?.hasConflict === true ? 1 : 0,
+      declaration?.statement ?? DEFAULT_CONFLICT_STATEMENT,
+      now,
+    );
+    db.prepare(
+      `INSERT INTO stage_judges (stage_id, user_id, seat, scope_type, scope_id, assigned_at,
+                                 conflict_declared_at, conflict_declaration_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(stageId, userId, seat, scopeType, scopeId, now, now, declarationId);
+    if (!nested) db.exec('COMMIT');
+  } catch (err) {
+    if (!nested) db.exec('ROLLBACK');
+    throw err;
+  }
   return listStageJudges(db, stageId);
 }
 
@@ -3829,6 +4132,7 @@ export function listStageTeams(db, stageId) {
 
 ```javascript
 // src/db/repo/reviews.js — 评委打分、校准打分、增量统计
+// 依据：S7 §3.1（评委宽严归一化的原始分来源）+ 设计文档 §6.2 Step 2（mean/stdev 增量维护）
 import { randomUUID } from 'node:crypto';
 
 export function findReviewsByRequestId(db, { stageId, judgeId, requestId }) {
@@ -3974,11 +4278,17 @@ export function softDeleteEnterpriseConfirmation(db, id, now) {
 // src/db/repo/peer-reviews.js — 互评
 import { randomUUID } from 'node:crypto';
 
-export function findPeerReviewsByRequestId(db, { stageId, fromTeamId, requestId }) {
+export function findPeerReviewsByRequestId(db, { stageId, fromTeamId = null, requestId }) {
   if (!requestId) return [];
+  if (fromTeamId) {
+    return db
+      .prepare('SELECT * FROM peer_reviews WHERE stage_id = ? AND from_team_id = ? AND request_id = ?')
+      .all(stageId, fromTeamId, requestId);
+  }
+  // 赛段级查找：用于「同一个 requestId 是否被用于了不同内容」的判定
   return db
-    .prepare('SELECT * FROM peer_reviews WHERE stage_id = ? AND from_team_id = ? AND request_id = ?')
-    .all(stageId, fromTeamId, requestId);
+    .prepare('SELECT * FROM peer_reviews WHERE stage_id = ? AND request_id = ?')
+    .all(stageId, requestId);
 }
 
 export function findPeerReview(db, { stageId, fromTeamId, toTeamId }) {
@@ -4012,11 +4322,16 @@ export function listPeerReviews(db, stageId) {
 // src/db/repo/self-reviews.js — 自评测
 import { randomUUID } from 'node:crypto';
 
-export function findSelfReviewsByRequestId(db, { stageId, teamId, requestId }) {
+export function findSelfReviewsByRequestId(db, { stageId, teamId = null, requestId }) {
   if (!requestId) return [];
+  if (teamId) {
+    return db
+      .prepare('SELECT * FROM self_reviews WHERE stage_id = ? AND team_id = ? AND request_id = ?')
+      .all(stageId, teamId, requestId);
+  }
   return db
-    .prepare('SELECT * FROM self_reviews WHERE stage_id = ? AND team_id = ? AND request_id = ?')
-    .all(stageId, teamId, requestId);
+    .prepare('SELECT * FROM self_reviews WHERE stage_id = ? AND request_id = ?')
+    .all(stageId, requestId);
 }
 
 export function findSelfReview(db, { stageId, teamId, dimension }) {
@@ -4048,6 +4363,7 @@ export function listSelfReviews(db, stageId) {
 
 ```javascript
 // src/db/repo/recusals.js — 回避记录（R-JDG-09 留档）
+// 依据：S7 §4.2（回避必须留档，赛后 6 个月可查）
 import { randomUUID } from 'node:crypto';
 
 export function insertRecusal(db, { stageId, judgeId, teamId = null, reason, source = 'declared', auditBy = null, action = 'recused', now }) {
@@ -4085,7 +4401,7 @@ export function insertAuditLogRow(db, {
   entity = null,
   entityId = null,
   detailJson = null,
-  createdAt = new Date().toISOString(),
+  createdAt,
 }) {
   db.prepare(
     `INSERT INTO audit_log (id, actor_id, action, entity, entity_id, detail_json, created_at)
@@ -4170,6 +4486,23 @@ export function listAuditLog(db, { entity = null, entityId = null, limit = 100 }
 //   增量：写 stage_reviews 后增量更新 score_stats（n / mean / sum_sq），
 //         stdev 由 sum_sq 现算 —— 避免每次发榜全表重算（成本随评委数×队伍数相乘增长）。
 //   ⛔ 但每次发榜仍会做一次全量重算并落快照（可复算要求能从原始数据重放）。
+//
+// 【父代理预审修正 2026-10-21 —— 本文件有 6 处修正，读代码前先看这段】
+//   ① **「先抢键」与「写数据」必须同事务**：原来抢键成功后写数据失败（如评委被回避 → 403），
+//      键已经占住 → 客户端用同一个 requestId 重试会被判成「重复请求」，
+//      返回 `submitted: 0` —— **评委以为提交成功了，实际一条都没落库**。
+//      现在「抢键 + 写数据 + 更新统计 + 审计」在**一个事务**里，要么全成要么全回滚。
+//   ② **同一个 requestId 被用于不同内容 → 409 响亮报错**（原来静默继续写）。
+//      幂等的含义是「同一个 requestId 只生效一次」；若内容变了，那是**客户端复用 requestId**
+//      的 bug —— 静默写进去会让「这个 request 到底写了什么」永远说不清。
+//   ③ **分数没有 0–100 区间校验** → 评委提交 1000 分会污染 score_stats 与后续归一化。
+//      与 Task 4 的企业确认分同类。
+//   ④ **评分进度把「已有打分记录」当成「应评队伍」** —— 某个队**完全没人打分**时，
+//      它根本不在名单里 → 进度显示 100% 而实际有队没被评。必须用赛段真实队伍名册。
+//   ⑤ **赛段不存在 → 外键原文漏到调用方**。现在先校验 → 404。
+//   ⑥ **互评的幂等键主体不能从 items 推导**（原来用 fromTeams.join('+')）——
+//      items 变了主体也变 → 键抢不到自己 → 幂等被绕过。现在主体是提交方，
+//      并用「同 requestId 内容比对」兜住复用。
 import {
   findReviewsByRequestId,
   findReview,
@@ -4180,7 +4513,7 @@ import {
   insertCalibration,
   applyScoreStatDelta,
 } from '../db/repo/reviews.js';
-import { listStageJudges, getStageJudge } from '../db/repo/stages.js';
+import { listStageJudges, getStageJudge, getStage, listStageTeams } from '../db/repo/stages.js';
 import { claimRequestKey } from '../db/repo/request-keys.js';
 import { insertEnterpriseConfirmation, listEnterpriseConfirmations } from '../db/repo/enterprise-confirmations.js';
 import { findPeerReviewsByRequestId, findPeerReview, insertPeerReview, updatePeerReviewScore } from '../db/repo/peer-reviews.js';
@@ -4196,6 +4529,51 @@ function fail(status, code, message, detail) {
   //    裸 Error 不是 AppError → message 被替换成通用文案「请求无效」，
   //    计划里想给用户看的中文文案会被**吞掉**。
   return appError(status, code, message, detail || undefined);
+}
+
+/**
+ * 单事务执行：要么全成功，要么全回滚。
+ * ⛔ 用 `BEGIN IMMEDIATE`（不是默认的 DEFERRED）：立即取写锁，
+ *    避免「抢键」与「写数据」之间被另一个连接插进来。
+ */
+function inTransaction(db, fn) {
+  const nested = db.isTransaction === true;
+  if (!nested) db.exec('BEGIN IMMEDIATE');
+  try {
+    const out = fn();
+    if (!nested) db.exec('COMMIT');
+    return out;
+  } catch (err) {
+    if (!nested) db.exec('ROLLBACK');
+    throw err;
+  }
+}
+
+/** 同一 requestId 被用于**不同内容** → 409（响亮报错，不静默继续写） */
+function assertSameRequestContent({ prior, currentKeys, label }) {
+  const priorKeys = [...new Set(prior.map((p) => p.key))].sort();
+  const cur = [...new Set(currentKeys)].sort();
+  if (priorKeys.length !== cur.length || priorKeys.some((k, i) => k !== cur[i])) {
+    throw fail(
+      409,
+      'REQUEST_ID_REUSED',
+      `同一个 requestId 被用于了不同的${label}内容 —— 每次提交必须使用唯一的 requestId`,
+    );
+  }
+}
+
+/** 分数必须在 0–100（否则会污染 score_stats 与后续归一化） */
+function assertScoreInRange(score, label) {
+  if (typeof score !== 'number' || !Number.isFinite(score) || score < 0 || score > 100) {
+    throw fail(400, 'SCORE_OUT_OF_RANGE', `${label}必须是 0–100 之间的数字`, { score });
+  }
+  return score;
+}
+
+function assertStageExists(db, stageId) {
+  if (!getStage(db, stageId)) {
+    throw fail(404, 'STAGE_NOT_FOUND', '赛段不存在');
+  }
 }
 
 function assertVotingJudge(db, stageId, judgeId) {
@@ -4219,72 +4597,107 @@ function assertNotRecused(db, stageId, judgeId, teamId) {
 /**
  * 提交评委打分（幂等 + 增量 score_stats）。
  * @param {object} input
- * @param {number} input.items [{ teamId, dimension, rawScore }]
+ * @param {Array} input.items [{ teamId, dimension, rawScore }]
  */
 export function submitReviews({ db, stageId, judgeId, items = [], requestId = null, now }) {
+  assertStageExists(db, stageId);
   assertVotingJudge(db, stageId, judgeId);
 
-  // 幂等：先抢键。抢不到 = 同一次请求已经生效过 → 直接返回上次结果，不重复落数据
+  // 幂等快速路径：同一次请求已经生效过 → 直接返回上次结果，不重复落数据
   if (requestId) {
-    const claimed = claimRequestKey(db, { scope: 'review', stageId, subjectId: judgeId, requestId, now });
-    if (!claimed) {
-      const prior = findReviewsByRequestId(db, { stageId, judgeId, requestId });
+    const prior = findReviewsByRequestId(db, { stageId, judgeId, requestId });
+    if (prior.length) {
+      assertSameRequestContent({
+        prior: prior.map((r) => ({ key: `${r.team_id}::${r.dimension}` })),
+        currentKeys: items.map((i) => `${i.teamId}::${i.dimension}`),
+        label: '评分',
+      });
       return { stageId, judgeId, requestId, submitted: 0, items: prior };
     }
   }
 
-  const written = [];
-  // 按维度分桶的增量（新增分 / 被改分替换掉的旧分）——score_stats 必须同步修正
-  const byDimension = new Map();
-  const bucketOf = (dimension) => {
-    if (!byDimension.has(dimension)) byDimension.set(dimension, { added: [], removed: [] });
-    return byDimension.get(dimension);
-  };
-
-  for (const item of items) {
-    assertNotRecused(db, stageId, judgeId, item.teamId);
-    const bucket = bucketOf(item.dimension);
-    const existing = findReview(db, { stageId, judgeId, teamId: item.teamId, dimension: item.dimension });
-    if (existing) {
-      // 改分：覆盖写并同步修正统计量（n 不变，mean/sum_sq 修正）
-      updateReviewScore(db, { id: existing.id, rawScore: item.rawScore, now });
-      bucket.removed.push(existing.raw_score);
-      bucket.added.push(item.rawScore);
-    } else {
-      const row = insertReview(db, {
-        stageId, judgeId, teamId: item.teamId, dimension: item.dimension,
-        rawScore: item.rawScore, requestId, calibrated: 0, now,
-      });
-      written.push(row);
-      bucket.added.push(item.rawScore);
+  return inTransaction(db, () => {
+    // 抢键：抢不到 = 同一次请求已被另一次并发提交处理 → 幂等短路
+    if (requestId) {
+      const claimed = claimRequestKey(db, { scope: 'review', stageId, subjectId: judgeId, requestId, now });
+      if (!claimed) {
+        const prior = findReviewsByRequestId(db, { stageId, judgeId, requestId });
+        assertSameRequestContent({
+          prior: prior.map((r) => ({ key: `${r.team_id}::${r.dimension}` })),
+          currentKeys: items.map((i) => `${i.teamId}::${i.dimension}`),
+          label: '评分',
+        });
+        return { stageId, judgeId, requestId, submitted: 0, items: prior };
+      }
     }
-  }
 
-  // 增量更新 score_stats（stdev 由 sum_sq 现算）
-  for (const [dimension, bucket] of byDimension) {
-    applyScoreStatDelta(db, { judgeId, dimension, added: bucket.added, removed: bucket.removed, now });
-  }
+    const written = [];
+    // 按维度分桶的增量（新增分 / 被改分替换掉的旧分）——score_stats 必须同步修正
+    const byDimension = new Map();
+    const bucketOf = (dimension) => {
+      if (!byDimension.has(dimension)) byDimension.set(dimension, { added: [], removed: [] });
+      return byDimension.get(dimension);
+    };
 
-  writeAuditLog(db, {
-    actorId: judgeId, action: 'review.submit', entity: 'stage', entityId: stageId,
-    detail: { requestId, count: items.length }, now,
+    for (const item of items) {
+      assertNotRecused(db, stageId, judgeId, item.teamId);
+      assertScoreInRange(item.rawScore, '评委打分');
+      const bucket = bucketOf(item.dimension);
+      const existing = findReview(db, { stageId, judgeId, teamId: item.teamId, dimension: item.dimension });
+      if (existing) {
+        // 改分：覆盖写并同步修正统计量（n 不变，mean/sum_sq 修正）
+        updateReviewScore(db, { id: existing.id, rawScore: item.rawScore, now });
+        bucket.removed.push(existing.raw_score);
+        bucket.added.push(item.rawScore);
+      } else {
+        const row = insertReview(db, {
+          stageId, judgeId, teamId: item.teamId, dimension: item.dimension,
+          rawScore: item.rawScore, requestId, calibrated: 0, now,
+        });
+        written.push(row);
+        bucket.added.push(item.rawScore);
+      }
+    }
+
+    // 增量更新 score_stats（stdev 由 sum_sq 现算）
+    for (const [dimension, bucket] of byDimension) {
+      applyScoreStatDelta(db, { judgeId, dimension, added: bucket.added, removed: bucket.removed, now });
+    }
+
+    writeAuditLog(db, {
+      actorId: judgeId, action: 'review.submit', entity: 'stage', entityId: stageId,
+      detail: { requestId, count: items.length }, now,
+    });
+
+    return { stageId, judgeId, requestId, submitted: written.length, items: written };
   });
-
-  return { stageId, judgeId, requestId, submitted: written.length, items: written };
 }
 
-/** 评分进度：已交 / 应交 / 缺谁 / 维度进度 */
-export function getReviewState({ db, stageId, viewer }) {
+/**
+ * 评分进度：已交 / 应交 / 缺谁 / 维度进度
+ *
+ * ⚠️ **应交队伍必须来自赛段真实名册**（`listStageTeams`），
+ *    而不是「已有打分记录里出现过的队伍」—— 后者会让「完全没人打分的队」从名单里消失，
+ *    进度显示 100% 而实际有队没被评。
+ * ⚠️ **维度列表**默认取「已出现过的维度」；调用方（Task 8 的 API 层）可以传
+ *    `dimensions` 显式指定规则里的维度全集，否则「从未有人评过的维度」不会出现在进度里。
+ */
+export function getReviewState({ db, stageId, viewer, dimensions = null }) {
+  assertStageExists(db, stageId);
   const seat = viewer?.userId ? getStageJudge(db, stageId, viewer.userId) : null;
   const isAdmin = viewer?.isAdmin === true;
   const all = listReviews(db, { stageId });
   const cells = listReviewCells(db, stageId);
-  const teams = [...new Set(cells.map((c) => c.team_id))].sort();
-  const dimensions = [...new Set(cells.map((c) => c.dimension))].sort();
+  const observedTeams = [...new Set(cells.map((c) => c.team_id))].sort();
+  const observedDimensions = [...new Set(cells.map((c) => c.dimension))].sort();
+  // 赛段真实名册；名册为空时退回已出现的队伍（赛段还没建队的情况）
+  const roster = listStageTeams(db, stageId).map((t) => t.teamId);
+  const teams = roster.length ? roster : observedTeams;
+  const dimList = Array.isArray(dimensions) && dimensions.length ? [...dimensions].sort() : observedDimensions;
   const judges = listStageJudges(db, stageId).filter((j) => j.seat !== 'observer');
 
   const dimensionProgress = {};
-  for (const dim of dimensions) {
+  for (const dim of dimList) {
     const total = isAdmin ? judges.length * teams.length : teams.length;
     const submitted = all.filter((r) => r.dimension === dim && (isAdmin || r.judge_id === viewer.userId)).length;
     dimensionProgress[dim] = { submitted, total };
@@ -4294,7 +4707,7 @@ export function getReviewState({ db, stageId, viewer }) {
   if (isAdmin) {
     for (const j of judges) {
       for (const t of teams) {
-        for (const dim of dimensions) {
+        for (const dim of dimList) {
           const hit = all.find((r) => r.judge_id === j.user_id && r.team_id === t && r.dimension === dim);
           if (!hit) missing.push({ judgeId: j.user_id, teamId: t, dimension: dim });
         }
@@ -4302,7 +4715,7 @@ export function getReviewState({ db, stageId, viewer }) {
     }
   } else if (seat) {
     for (const t of teams) {
-      for (const dim of dimensions) {
+      for (const dim of dimList) {
         const hit = all.find((r) => r.judge_id === viewer.userId && r.team_id === t && r.dimension === dim);
         if (!hit) missing.push({ teamId: t, dimension: dim });
       }
@@ -4310,21 +4723,25 @@ export function getReviewState({ db, stageId, viewer }) {
   }
 
   const submitted = isAdmin ? all.length : all.filter((r) => r.judge_id === viewer?.userId).length;
-  const total = isAdmin ? judges.length * teams.length * dimensions.length : teams.length * dimensions.length;
+  const total = isAdmin ? judges.length * teams.length * dimList.length : teams.length * dimList.length;
   return { submitted, total, missing, dimensionProgress };
 }
 
 /** 校准打分（R-JDG-12）：写 calibrations，【不计入评分】 */
 export function submitCalibration({ db, stageId, judgeId, items = [], now }) {
+  assertStageExists(db, stageId);
   assertVotingJudge(db, stageId, judgeId);
-  for (const item of items) {
-    insertCalibration(db, { stageId, judgeId, dimension: item.dimension, rawScore: item.rawScore, now });
-  }
-  writeAuditLog(db, {
-    actorId: judgeId, action: 'review.calibrate', entity: 'stage', entityId: stageId,
-    detail: { count: items.length }, now,
+  return inTransaction(db, () => {
+    for (const item of items) {
+      assertScoreInRange(item.rawScore, '校准打分');
+      insertCalibration(db, { stageId, judgeId, dimension: item.dimension, rawScore: item.rawScore, now });
+    }
+    writeAuditLog(db, {
+      actorId: judgeId, action: 'review.calibrate', entity: 'stage', entityId: stageId,
+      detail: { count: items.length }, now,
+    });
+    return { stageId, judgeId, submitted: items.length };
   });
-  return { stageId, judgeId, submitted: items.length };
 }
 
 /** 企业确认（R2 双签 + R-JDG-14 签字必须有内容） */
@@ -4333,6 +4750,7 @@ export function submitEnterpriseConfirmation({ db, stageId, teamId, enterpriseId
   if (!content || !String(content).trim()) {
     throw fail(400, 'SIGNATURE_CONTENT_REQUIRED', '企业签字必须填写内容（解决了我方哪个具体环节 / 预计落地时间 / 我方投入角色）');
   }
+  assertScoreInRange(rawScore, '企业确认分');
   const row = insertEnterpriseConfirmation(db, {
     stageId, teamId, enterpriseId, dimension, rawScore, crossJudgeId, signatoryUserId, content, now,
   });
@@ -4343,84 +4761,132 @@ export function submitEnterpriseConfirmation({ db, stageId, teamId, enterpriseId
   return row;
 }
 
-/** 互评（幂等；资格由 checkPeerEligibility 把关） */
-export function submitPeerReviews({ db, stageId, items = [], requestId = null, now }) {
-  const fromTeams = [...new Set(items.map((i) => i.fromTeamId))].sort();
+/**
+ * 互评（幂等；资格由 checkPeerEligibility 把关）
+ *
+ * ⚠️ 幂等键的 `subjectId` 用**提交方**（actorId），⛔ 不用 items 推导 ——
+ *    items 变了主体也变 → 键抢不到自己 → 幂等被绕过。
+ *    主体退化成 '*' 时（没有 actorId），靠「同 requestId 内容比对」兜住复用。
+ */
+export function submitPeerReviews({ db, stageId, items = [], requestId = null, actorId = null, now }) {
+  assertStageExists(db, stageId);
+  const subject = actorId ?? '*';
+
   if (requestId) {
-    const subject = fromTeams.join('+');
-    const claimed = claimRequestKey(db, { scope: 'peer_review', stageId, subjectId: subject, requestId, now });
-    if (!claimed) {
-      const prior = fromTeams.flatMap((f) => findPeerReviewsByRequestId(db, { stageId, fromTeamId: f, requestId }));
+    const prior = findPeerReviewsByRequestId(db, { stageId, requestId });
+    if (prior.length) {
+      assertSameRequestContent({
+        prior: prior.map((r) => ({ key: `${r.from_team_id}->${r.to_team_id}` })),
+        currentKeys: items.map((i) => `${i.fromTeamId}->${i.toTeamId}`),
+        label: '互评',
+      });
       return { stageId, submitted: 0, items: prior };
     }
   }
 
-  // R-RNK-07：只对该赛段有真实交付物的队伍开放互评
-  // P2 阶段以「该赛段已有评委打分记录」作为「有真实交付物」的判据；
-  // P5 的任务清单落地后改为按交付物表判定（改这一处即可）。
-  const scoredTeams = [...new Set(listReviews(db, { stageId }).map((r) => r.team_id))].sort();
-  const eligibility = checkPeerEligibility({
-    teams: scoredTeams.map((teamId) => ({ teamId })),
-    deliverables: scoredTeams.map((teamId) => ({ teamId, hasRealDeliverable: true })),
-  });
-  const eligible = new Set(eligibility.eligible);
+  return inTransaction(db, () => {
+    if (requestId) {
+      const claimed = claimRequestKey(db, { scope: 'peer_review', stageId, subjectId: subject, requestId, now });
+      if (!claimed) {
+        const prior = findPeerReviewsByRequestId(db, { stageId, requestId });
+        assertSameRequestContent({
+          prior: prior.map((r) => ({ key: `${r.from_team_id}->${r.to_team_id}` })),
+          currentKeys: items.map((i) => `${i.fromTeamId}->${i.toTeamId}`),
+          label: '互评',
+        });
+        return { stageId, submitted: 0, items: prior };
+      }
+    }
 
-  const written = [];
-  for (const item of items) {
-    if (item.fromTeamId === item.toTeamId) {
-      throw fail(400, 'SELF_PEER_REVIEW', '不能给自己互评');
-    }
-    if (!eligible.has(item.fromTeamId) || !eligible.has(item.toTeamId)) {
-      throw fail(403, 'PEER_REVIEW_INELIGIBLE', '只有该赛段有真实交付物的队伍可参与互评');
-    }
-    const existing = findPeerReview(db, { stageId, fromTeamId: item.fromTeamId, toTeamId: item.toTeamId });
-    if (existing) {
-      updatePeerReviewScore(db, { id: existing.id, score: item.score, now });
-      written.push(existing);
-    } else {
-      written.push(insertPeerReview(db, {
-        stageId, fromTeamId: item.fromTeamId, toTeamId: item.toTeamId, score: item.score, requestId, now,
-      }));
-    }
-  }
+    // R-RNK-07：只对该赛段有真实交付物的队伍开放互评
+    // P2 阶段以「该赛段已有评委打分记录」作为「有真实交付物」的判据；
+    // P5 的任务清单落地后改为按交付物表判定（改这一处即可）。
+    const scoredTeams = [...new Set(listReviews(db, { stageId }).map((r) => r.team_id))].sort();
+    const eligibility = checkPeerEligibility({
+      teams: scoredTeams.map((teamId) => ({ teamId })),
+      deliverables: scoredTeams.map((teamId) => ({ teamId, hasRealDeliverable: true })),
+    });
+    const eligible = new Set(eligibility.eligible);
 
-  writeAuditLog(db, {
-    actorId: null, action: 'peer_review.submit', entity: 'stage', entityId: stageId,
-    detail: { requestId, count: items.length }, now,
+    const written = [];
+    for (const item of items) {
+      if (item.fromTeamId === item.toTeamId) {
+        throw fail(400, 'SELF_PEER_REVIEW', '不能给自己互评');
+      }
+      if (!eligible.has(item.fromTeamId) || !eligible.has(item.toTeamId)) {
+        throw fail(403, 'PEER_REVIEW_INELIGIBLE', '只有该赛段有真实交付物的队伍可参与互评');
+      }
+      assertScoreInRange(item.score, '互评分');
+      const existing = findPeerReview(db, { stageId, fromTeamId: item.fromTeamId, toTeamId: item.toTeamId });
+      if (existing) {
+        updatePeerReviewScore(db, { id: existing.id, score: item.score, now });
+        written.push(existing);
+      } else {
+        written.push(insertPeerReview(db, {
+          stageId, fromTeamId: item.fromTeamId, toTeamId: item.toTeamId, score: item.score, requestId, now,
+        }));
+      }
+    }
+
+    writeAuditLog(db, {
+      actorId, action: 'peer_review.submit', entity: 'stage', entityId: stageId,
+      detail: { requestId, count: items.length }, now,
+    });
+    return { stageId, submitted: written.length, items: written };
   });
-  return { stageId, submitted: written.length, items: written };
 }
 
 /** 自评测（幂等） */
 export function submitSelfReviews({ db, stageId, teamId, items = [], requestId = null, now }) {
+  assertStageExists(db, stageId);
   if (requestId) {
-    const claimed = claimRequestKey(db, { scope: 'self_review', stageId, subjectId: teamId, requestId, now });
-    if (!claimed) {
-      const prior = findSelfReviewsByRequestId(db, { stageId, teamId, requestId });
+    const prior = findSelfReviewsByRequestId(db, { stageId, teamId, requestId });
+    if (prior.length) {
+      assertSameRequestContent({
+        prior: prior.map((r) => ({ key: r.dimension })),
+        currentKeys: items.map((i) => i.dimension),
+        label: '自评',
+      });
       return { stageId, teamId, submitted: 0, items: prior };
     }
   }
-  const written = [];
-  for (const item of items) {
-    const existing = findSelfReview(db, { stageId, teamId, dimension: item.dimension });
-    if (existing) {
-      updateSelfReviewScore(db, { id: existing.id, rawScore: item.rawScore, now });
-      written.push(existing);
-    } else {
-      written.push(insertSelfReview(db, {
-        stageId, teamId, dimension: item.dimension, rawScore: item.rawScore, requestId, now,
-      }));
+  return inTransaction(db, () => {
+    if (requestId) {
+      const claimed = claimRequestKey(db, { scope: 'self_review', stageId, subjectId: teamId, requestId, now });
+      if (!claimed) {
+        const prior = findSelfReviewsByRequestId(db, { stageId, teamId, requestId });
+        assertSameRequestContent({
+          prior: prior.map((r) => ({ key: r.dimension })),
+          currentKeys: items.map((i) => i.dimension),
+          label: '自评',
+        });
+        return { stageId, teamId, submitted: 0, items: prior };
+      }
     }
-  }
-  writeAuditLog(db, {
-    actorId: null, action: 'self_review.submit', entity: 'team', entityId: teamId,
-    detail: { requestId, count: items.length }, now,
+    const written = [];
+    for (const item of items) {
+      assertScoreInRange(item.rawScore, '自评分');
+      const existing = findSelfReview(db, { stageId, teamId, dimension: item.dimension });
+      if (existing) {
+        updateSelfReviewScore(db, { id: existing.id, rawScore: item.rawScore, now });
+        written.push(existing);
+      } else {
+        written.push(insertSelfReview(db, {
+          stageId, teamId, dimension: item.dimension, rawScore: item.rawScore, requestId, now,
+        }));
+      }
+    }
+    writeAuditLog(db, {
+      actorId: null, action: 'self_review.submit', entity: 'team', entityId: teamId,
+      detail: { requestId, count: items.length }, now,
+    });
+    return { stageId, teamId, submitted: written.length, items: written };
   });
-  return { stageId, teamId, submitted: written.length, items: written };
 }
 
 /** 回避申报（R-JDG-09）：必须留档 */
 export function declareRecusal({ db, stageId, judgeId, teamId = null, reason, actorId = null, now }) {
+  assertStageExists(db, stageId);
   if (!reason || !String(reason).trim()) {
     throw fail(400, 'RECUSAL_REASON_REQUIRED', '回避必须填写原因（供应方 / 投资方 / 前雇主）');
   }
@@ -4433,14 +4899,12 @@ export function declareRecusal({ db, stageId, judgeId, teamId = null, reason, ac
   });
   return row;
 }
-
-export { listRecusals, listReviews, listEnterpriseConfirmations };
 ```
 
 - [ ] **Step 5: 运行测试确认通过**
 
 Run: `cd platform && node --test test/review-service.test.js`
-Expected: PASS（10 个测试全过：review-service.test.js 10）
+Expected: PASS（22 个测试全过：review-service.test.js 22）
 
 - [ ] **Step 6: 提交**
 
@@ -6682,6 +7146,57 @@ git commit -m "feat(P2): SSE 评审进度推送（src/http/sse.js + GET /api/sta
 **Task 5 的测试条数口径**：self-eval **7** + review-eligibility **12** + judge-pool **8** = **27**。
 
 **最终结果**：变异体 24 → **KILLED 23 / 等价变异体 1 / 有效缺口 0**；三个测试文件 **27/27**；P2 全量 **405/405**。
+
+---
+
+## Task 6 父代理预审修正台账（2026-10-21）
+
+> Task 6 是 P2 第一个**碰数据库**的任务，缺陷密度最高。
+> 规格自带的 **10 条用例全绿** —— 但预审发现 **2 Critical + 4 Important + 3 Minor**，
+> 全部在实现里修掉后再补 **12 条回归用例**；
+> 实施完成后做**变异检验**，变异体一度出现 **4 条存活**，补完后 **19/19 有效变异杀灭**
+> （另 1 条等价变异体）。
+
+### 一、预审发现的规格缺陷
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| **V-1** | **Critical** | **「抢幂等键」与「写数据」不在同一事务** —— 抢键成功后写数据失败（如评委被回避 → 403），**键已经占住** → 客户端用同一个 `requestId` 重试会被判成「重复请求」并返回 `submitted: 0` → **评委以为提交成功了，实际一条都没落库** | 实跑：先 `declareRecusal` 再提交 → 403；查 `review_request_keys` → **键已存在**；换一支没被回避的队用**同一个** `requestId` 重试 → `submitted: 0`，`stage_reviews` 仍是 0 行 | 「抢键 + 写数据 + 更新统计 + 审计」放进**同一个事务**（`BEGIN IMMEDIATE`），失败回滚。⚠️ 用 `IMMEDIATE` 而非默认的 `DEFERRED`：立即取写锁，避免抢键与写数据之间被另一个连接插进来 |
+| **V-2** | **Critical** | **`insertStage` 的参数个数与占位符对不上** —— `stages` 表**没有** `created_at` 列，但 INSERT 传了 11 个参数而只有 10 个占位符 | 实跑：建赛段 → `Error: column index out of range`，**全部 19 条用例一条都跑不起来** | 去掉多传的 `now`（`now` 保留在签名里只为调用方接口统一）。**这是计划规格里自带的 bug** |
+| **V-3** | **Important** | **测试夹具用假 id**（`'ed1'` / `'t1'` / `'t2'` / `'t9'`）→ Task 1 补齐外键后**必然失败** | 实跑：插入 `stage_reviews` 时 `FOREIGN KEY constraint failed` | 夹具改建**真实的**届期 / 用户 / 战队 / 赛段（与 P1 的 `migration-002.test.js` 对齐）。⚠️ Task 7 / Task 8 的夹具**同样必须改** |
+| **V-4** | **Important** | **同一个 `requestId` 用于不同内容 → 静默继续写** —— 幂等的含义是「只生效一次」，内容变了说明客户端复用了 `requestId`，是 bug；静默写进去会让「这个 request 到底写了什么」永远说不清 | 实跑：同 `requestId` 换成另一支队 → 直接写进去了 | 409 `REQUEST_ID_REUSED`（响亮报错），先比对上一次落库的内容键集合 |
+| **V-5** | **Important** | **评分进度把「已有打分记录」当成「应交队伍」** —— 某个队**完全没人打分**时它根本不在名单里 → 进度显示 100% 而实际有队没被评 | 实跑：2 支队只给 1 支打分 → `total = 1`（应为 2）、`missing = []` | 应交队伍改用赛段**真实名册**（`listStageTeams`） |
+| **V-6** | **Important** | **互评的幂等键主体从 `items` 推导**（`fromTeams.join('+')`）→ `items` 变了主体也变 → 键抢不到自己 → **幂等被绕过** | 实跑：同 `requestId` 换一批互评对象 → 又写进去了 | 主体改用**提交方**（`actorId`），没有时退化成 `'*'` 并靠内容比对兜住 |
+| **V-7** | Important | **分数没有 0–100 区间校验** → 评委提交 1000 分会污染 `score_stats` 与后续归一化 | 实跑：`rawScore: 1000` → 原样落库 | 400 `SCORE_OUT_OF_RANGE`（评委打分 / 校准 / 互评 / 自评 / 企业确认**五处**统一） |
+| **V-8** | Minor | **赛段不存在 → 外键原文漏到调用方** | 实跑：`stageId: 'no-such-stage'` → SQLite 原文 | 先校验赛段存在 → 404 `STAGE_NOT_FOUND`（与 P1「届期不存在 → 404」同款） |
+| **V-9** | Minor | **幂等键的 UNIQUE 兜底正则过宽** —— P1 的 T-7 已经踩过一次同样的坑 | 实跑：把 `request-keys.js` 的正则放宽成 `/UNIQUE\|constraint/i` → 「外键失败」被误判成「重复请求」而**静默吞掉** | 收紧为 `/UNIQUE constraint failed: review_request_keys/i`，其它约束错继续往上抛 |
+
+### 二、变异检验发现的实现盲区
+
+> 变异体 **20** 个（不开事务 / 不回滚 / 不查内容复用 / 摘掉分数校验 / 摘掉回避检查 /
+> 旧分不扣 / 新分不加 / 进度用已有记录 / 漏乘维度 / 摘掉互评资格 / 摘掉自评互评检查 /
+> 不写声明 / 不回填两列 / 不写审计 …）。变异脚本：`/tmp/p2t6/mutate.mjs`。
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| **V-10** | Minor | **幂等兜底正则的「只认唯一约束」零覆盖** —— 测试里没有任何一条会触发**非唯一约束**的失败 | 变异存活：放宽正则后 19 条用例全绿 | 补用例：直接调 `claimRequestKey` 传入不存在的 `stageId` → 必须抛 `FOREIGN KEY`，不得被当成「重复请求」 |
+| **V-11** | Minor | **进度的 `total` 漏乘维度数零覆盖** —— 测试里只有一个维度，乘不乘都一样 | 变异存活：`total` 不乘维度后全绿 | 补用例：2 队 × 2 维度 → `total = 4` |
+| **V-12** | Minor | **「不能给自己互评」零覆盖** | 变异存活：摘掉检查后全绿 | 补用例：`fromTeamId === toTeamId` → 400 |
+| — | — | **等价变异体 V04**（去掉幂等快速路径）：事务内 claim 键失败时同样幂等短路，快速路径只是省一次查询 | 变异存活 | **不是盲区**，标记为等价变异体、允许存活（已在变异脚本里显式标注） |
+
+### 三、刻意保持的行为（登记口径）
+
+| 行为 | 为什么这样 |
+|---|---|
+| **`submitPeerReviews` / `submitSelfReviews` 不校验「调用者是不是该队成员」** | 服务层签名里没有 actor 概念（互评的 actor 是「队」）。⚠️ **Task 8 的 API 层必须做这个校验** —— 否则任何登录用户都能替别的队伍互评 / 自评。已在 P2 计划里登记为 API 层的责任 |
+| **互评的「真实交付物」判据 = 「该赛段已有评委打分记录」** | P2 阶段没有交付物表（Task 5 的三池工作流在 P5）。⚠️ **P5 落地后要改这一处** —— 判据换成交付物表 |
+| **`submitCalibration` 不做幂等** | 校准分不计入评分，重复插入只影响校准记录数；⛔ 但校准记录是「赛后 6 个月可查」的留痕，将来若要统计校准次数需补幂等 |
+| **改分走「覆盖写 UPDATE」**（不是软删 + 新增） | `stage_reviews` 的 UNIQUE 是**非偏序**的（Task 1 已登记的陷阱）—— 软删不腾格子，所以改分只能覆盖写 |
+| **`audit_log` 的 SQL 唯一归宿是 `src/db/repo/audit-log.js`** | 全局约束「所有 SQL 收进 `src/db/repo/`」；`src/audit/log.js` 是**薄服务门面**，不含任何 SQL（P0 的 `sql-boundary.test.js` 会扫描并判违规） |
+
+**Task 6 的测试条数口径**：review-service **22**（规格自带 10 + 预审回归 12）。
+
+**最终结果**：变异体 20 → **KILLED 19 / 等价变异体 1 / 有效缺口 0**；`review-service.test.js` **22/22**；P2 全量 **427/427**。
 
 ---
 
