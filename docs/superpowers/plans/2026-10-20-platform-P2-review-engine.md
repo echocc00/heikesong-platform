@@ -2715,20 +2715,40 @@ git commit -m "feat(P2): 企业席 E 与 R1 分赛道 / R2 双签 / R3 封顶 / 
 - Produces:
   - `detectSelfEvalDiff({ selfReviews, judgeScores, threshold })` → `{ flags: [{ teamId, dimension, d, action }] }`
     - `d = 自评分 − 评委分`（同一尺度）；`|d| ≤ threshold` → 无 flag；`d > threshold` → `action='written_explanation'`；`d < −threshold` → `action='judge_question'`
+    - ⛔ `threshold` 必须是有限数（否则比较恒 false → **静默产出零 flag**，看上去像「所有自评都正常」）
+    - ⛔ `judgeScores` 每个 `(teamId, dimension)` **只能一条**（重复 → 抛错；
+      否则 Map.set 静默覆盖，结果取决于数组顺序 → 不可复算）
+    - ⚠️ `flags` 排序用**普通字典序**而非 `localeCompare` —— 后者依赖 locale 与 ICU 版本，
+      跨机器结果可能不同 → 破坏「可复算」（与 `trim.js` 一致）
   - `checkPeerEligibility({ teams, deliverables })` → `{ eligible, ineligible }`
     - `teams` = `[{ teamId }]`；`deliverables` = `[{ teamId, hasRealDeliverable }]`
     - 只有该赛段有**真实交付物**的队伍才可参与互评（R-RNK-07）
+    - ⚠️ `eligible` / `ineligible` 按队号字典序输出；`teams` 重复 → 去重；
+      `deliverables` 重复 → 抛错（不静默取最后一条）
   - `checkRecusal({ judge, team, recusalRecords })` → `{ recused, record? }`
-    - `judge` = `{ userId }`；`team` = `{ teamId }`；`recusalRecords` = `[{ judge_id, team_id, action, reason }]`
+    - `judge` = `{ userId }`；`team` = `{ teamId }`；`recusalRecords` = `[{ judge_id, team_id, action, reason, declared_at? }]`
+    - ⛔ **取最后一条匹配记录**（按 `declared_at`，缺省按数组顺序）——
+      回避记录是 **append-only** 的，「回避 → 复核 → 撤销」会留下**两条**；
+      取第一条会让 `action='reinstated'` 的那条**从未被读到** → **撤销功能整个是死的**
+    - ⚠️ `team_id` 为 `null` / `undefined` = **赛段级回避**，对该赛段所有队生效
   - `checkJudgePool({ judges, config })` → `{ ok, errors, stats }`
     - `judges` = `[{ judgeId, seat }]`；`config` = `rules.scoring.*.judgePool` 段
     - 观察员（`seat='observer'`）**无投票权**，不计入任何比例
+    - ⛔ **配置项必须是有限数**（否则 `Number('x')` = NaN → 对应校验**整条静默失效**）
+    - ⚠️ **席类型不在名单里的评委 → 报错 `unknown_seat`**（既不计入 voting 也不计入 observer，
+      `stats.total` 与 `voting + observer` 对不上却无告警，而且他们本该属于哪个席会影响占比判断）
+    - ⚠️ **重复 `judgeId` → 报错 `duplicate_judge`**（否则专家席/企业席占比算错），
+      且统计按**去重后**的人数算（`stats` 反映真实人数，`error` 标记问题）
 
 - [ ] **Step 1: 写失败的测试**
 
 `platform/test/self-eval.test.js`：
 
 ```javascript
+// platform/test/self-eval.test.js —— 自评测差异检测
+//
+// 依据：P2 计划 Task 5「自评测差异检测」
+// 溯源需求：R-JDG-13（d>10 要书面说明 / d<−10 只提问）
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { detectSelfEvalDiff } from '../src/domain/self-eval.js';
@@ -2778,11 +2798,66 @@ test('缺少对应评委分 → 不产生 flag（缺数据不当成异常）', (
   });
   assert.deepEqual(r.flags, []);
 });
+
+// ── 父代理预审修正用例（2026-10-21）────────────────────────────────────
+
+test('threshold 非法 → 响亮报错（绝不静默产出零 flag）', () => {
+  // ⚠️ 原实现：threshold='x' → NaN → `d > NaN` 恒 false → **静默零 flag**，
+  //    看上去像「所有自评都正常」。
+  for (const bad of ['x', NaN, Infinity, null]) {
+    if (bad === null) continue; // null = 缺省，走默认值 10，合法
+    assert.throws(
+      () => detectSelfEvalDiff({
+        selfReviews: [{ teamId: 't1', dimension: 'innovation', rawScore: 95 }],
+        judgeScores: JUDGE,
+        threshold: bad,
+      }),
+      /threshold/,
+      `threshold=${String(bad)} 必须报错`,
+    );
+  }
+});
+
+test('同一 (队伍,维度) 的评委分出现多条 → 响亮报错（不静默取最后一条）', () => {
+  // ⚠️ 原实现：Map.set 静默覆盖 → 结果取决于数组顺序 → 不可复算。
+  assert.throws(
+    () => detectSelfEvalDiff({
+      selfReviews: [{ teamId: 't1', dimension: 'innovation', rawScore: 95 }],
+      judgeScores: [
+        { teamId: 't1', dimension: 'innovation', score: 90 },
+        { teamId: 't1', dimension: 'innovation', score: 80 },
+      ],
+      threshold: 10,
+    }),
+    /队伍|维度/,
+  );
+});
+
+test('flags 排序用【普通字典序】而非 localeCompare（跨机器可复算）', () => {
+  // ⚠️ 原实现用 `localeCompare` → 依赖运行环境的 locale 与 ICU 版本，
+  //    同一份数据在不同机器上可能排出**不同顺序** → 破坏「可复算」。
+  //    ASCII 序：'1'(49) < '2'(50) < 'B'(66) < 'a'(97)，且 'T'(84) < 't'(116)。
+  const teams = ['tB', 'ta', 'T1', 't2', 't10'];
+  const r = detectSelfEvalDiff({
+    selfReviews: teams.map((teamId) => ({ teamId, dimension: 'innovation', rawScore: 95 })),
+    judgeScores: teams.map((teamId) => ({ teamId, dimension: 'innovation', score: 80 })),
+    threshold: 10,
+  });
+  assert.deepEqual(
+    r.flags.map((f) => f.teamId),
+    ['T1', 't10', 't2', 'tB', 'ta'],
+    '必须按普通字典序（ASCII）排序，不受 locale 影响',
+  );
+});
 ```
 
 `platform/test/review-eligibility.test.js`：
 
 ```javascript
+// platform/test/review-eligibility.test.js —— 互评资格 + 回避判定
+//
+// 依据：P2 计划 Task 5「回避制度 + 互评资格」
+// 溯源需求：R-RNK-07（互评资格门槛）｜R-JDG-09（回避制度，回避记录留档）
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { checkPeerEligibility, checkRecusal } from '../src/domain/review-eligibility.js';
@@ -2838,11 +2913,105 @@ test('撤回回避（action=reinstated）后不再视为回避', () => {
   });
   assert.equal(r.recused, false);
 });
+
+// ── 父代理预审修正用例（2026-10-21）────────────────────────────────────
+
+test('回避被撤销时，撤销必须生效（记录是 append-only 的，要取最后一条）', () => {
+  // ⚠️ 原实现：`for` 循环遇到**第一条**匹配记录就 return。
+  //    而 `recusal_records` 是 append-only 的 ——「回避 → 组委会复核 → 撤销」
+  //    会留下**两条**记录，于是取到的是第一条 `recused`，
+  //    `action='reinstated'` 的那条**从未被读到** → 撤销功能整个是死的。
+  //    规格自带的用例只给了**单条** reinstated 记录，正好掩盖了这一点。
+  const r = checkRecusal({
+    judge: { userId: 'u1' },
+    team: { teamId: 't1' },
+    recusalRecords: [
+      { judge_id: 'u1', team_id: 't1', action: 'recused', reason: '前雇主' },
+      { judge_id: 'u1', team_id: 't1', action: 'reinstated', reason: '已复核' },
+    ],
+  });
+  assert.equal(r.recused, false, '后一条 reinstated 必须覆盖前面的 recused');
+  assert.equal(r.record, undefined);
+});
+
+test('撤销之后又重新回避 → 以最后一条 recused 为准', () => {
+  const r = checkRecusal({
+    judge: { userId: 'u1' },
+    team: { teamId: 't1' },
+    recusalRecords: [
+      { judge_id: 'u1', team_id: 't1', action: 'reinstated', reason: '已复核' },
+      { judge_id: 'u1', team_id: 't1', action: 'recused', reason: '又查出了利益关系' },
+    ],
+  });
+  assert.equal(r.recused, true);
+  assert.equal(r.record.reason, '又查出了利益关系');
+});
+
+test('多条记录按 declared_at 取最新（不看数组顺序）', () => {
+  const r = checkRecusal({
+    judge: { userId: 'u1' },
+    team: { teamId: 't1' },
+    recusalRecords: [
+      { judge_id: 'u1', team_id: 't1', action: 'reinstated', reason: '已复核', declared_at: '2026-10-21T00:00:00.000Z' },
+      { judge_id: 'u1', team_id: 't1', action: 'recused', reason: '前雇主', declared_at: '2026-10-20T00:00:00.000Z' },
+    ],
+  });
+  assert.equal(r.recused, false, 'declared_at 更新的那条作数');
+});
+
+test('赛段级回避：team_id 为 undefined 也算（数据来源变化不漏判）', () => {
+  const r = checkRecusal({
+    judge: { userId: 'u1' },
+    team: { teamId: 't9' },
+    recusalRecords: [{ judge_id: 'u1', team_id: undefined, action: 'recused', reason: '赛段级' }],
+  });
+  assert.equal(r.recused, true);
+});
+
+test('teams 有重复 → 同一队只判一次（eligible 里不出现重复队号）', () => {
+  const r = checkPeerEligibility({
+    teams: [{ teamId: 't1' }, { teamId: 't1' }],
+    deliverables: [{ teamId: 't1', hasRealDeliverable: true }],
+  });
+  assert.deepEqual(r.eligible, ['t1']);
+  assert.deepEqual(r.ineligible, []);
+});
+
+test('eligible / ineligible 按队号字典序输出（与输入顺序无关）', () => {
+  // ⚠️ 规格自带那条用例的 teams 恰好已是字典序 → 排序**从来没被验证过**。
+  //    这里刻意把输入顺序打乱（tb,td,ta,tc）—— 否则「排序」与「不排序」结果一样。
+  const r = checkPeerEligibility({
+    teams: [{ teamId: 'tb' }, { teamId: 'td' }, { teamId: 'ta' }, { teamId: 'tc' }],
+    deliverables: [
+      { teamId: 'ta', hasRealDeliverable: true },
+      { teamId: 'tb', hasRealDeliverable: true },
+    ],
+  });
+  assert.deepEqual(r.eligible, ['ta', 'tb']);
+  assert.deepEqual(r.ineligible, ['tc', 'td']);
+});
+
+test('deliverables 有重复 → 响亮报错（不静默取最后一条）', () => {
+  assert.throws(
+    () => checkPeerEligibility({
+      teams: [{ teamId: 't1' }],
+      deliverables: [
+        { teamId: 't1', hasRealDeliverable: true },
+        { teamId: 't1', hasRealDeliverable: false },
+      ],
+    }),
+    /交付物/,
+  );
+});
 ```
 
 `platform/test/judge-pool.test.js`：
 
 ```javascript
+// platform/test/judge-pool.test.js —— 评委池规模与席构成校验
+//
+// 依据：P2 计划 Task 5「评委池校验」
+// 溯源需求：R-JDG-10（初赛每维度 ≥7 人 / 决赛 ≥9 人）｜R-JDG-11（席构成；观察员无投票权）
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { checkJudgePool } from '../src/domain/judge-pool.js';
@@ -2896,6 +3065,52 @@ test('观察员无投票权，不计入人数与占比', () => {
   assert.equal(withObs.stats.voting, without.stats.voting);
   assert.equal(withObs.stats.observer, 20);
 });
+
+// ── 父代理预审修正用例（2026-10-21）────────────────────────────────────
+
+test('配置项非法 → 响亮报错（绝不静默跳过对应校验）', () => {
+  // ⚠️ 原实现：`Number('x')` = NaN → `minJudges > 0` 恒 false →
+  //    **「人数不足」这条校验整条失效**，组委会会以为评委池合规。
+  for (const key of ['minJudgesPerDimension', 'minEnterpriseSeatShare', 'maxExpertSeatShare']) {
+    for (const bad of ['x', NaN, Infinity]) {
+      assert.throws(
+        () => checkJudgePool({ judges: pool(2, 1, 0), config: { ...CFG_INITIAL, [key]: bad } }),
+        new RegExp(key),
+        `${key}=${String(bad)} 必须报错`,
+      );
+    }
+  }
+});
+
+test('席类型写错的评委 → 报错（绝不静默消失）', () => {
+  // ⚠️ 原实现：既不计入 voting 也不计入 observer，
+  //    `stats.total` 与 `voting + observer` **对不上**，却没有任何告警 ——
+  //    而且这些评委本该属于哪个席会影响占比判断。
+  const r = checkJudgePool({
+    judges: [...pool(4, 5, 0), { judgeId: 'x1', seat: 'guest' }, { judgeId: 'x2', seat: 'guest' }],
+    config: CFG_INITIAL,
+  });
+  assert.equal(r.ok, false);
+  assert.ok(r.errors.some((e) => e.code === 'unknown_seat'));
+  assert.equal(r.stats.unknownSeat, 2);
+  // 账要能对上：total = voting + observer + unknown
+  assert.equal(
+    r.stats.total,
+    r.stats.voting + r.stats.observer + r.stats.unknownSeat,
+  );
+});
+
+test('重复 judgeId → 报错，且统计按去重后的人数算', () => {
+  // ⚠️ 原实现：重复的 judgeId 被当成两个人 → 专家席占比算错。
+  const r = checkJudgePool({
+    judges: [...pool(4, 5, 0), { judgeId: 'e1', seat: 'judge' }],
+    config: CFG_INITIAL,
+  });
+  assert.equal(r.ok, false);
+  assert.ok(r.errors.some((e) => e.code === 'duplicate_judge'));
+  assert.equal(r.stats.voting, 9, '统计必须按去重后的评委算');
+  assert.equal(r.stats.expert, 4);
+});
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -2919,6 +3134,15 @@ Expected: FAIL —— `Cannot find module '../src/domain/self-eval.js'`
 // → 所以本模块【只产出 flag】，不产出分数；分数的处理在 scoring.js 里按 action 显式执行。
 //
 // 纯函数：无 IO、无 Date.now()、无 Math.random()。
+//
+// 【父代理预审修正 2026-10-21 —— 本文件有 3 处修正，读代码前先看这段】
+//   ① `threshold` 非法（NaN / 字符串）→ 比较恒为 false → **静默产出零 flag**，
+//      看上去像「所有自评都正常」。现在 fail-fast 抛错。
+//   ② `judgeScores` 同一 (teamId, dimension) 出现多条 → **后者静默覆盖前者**，
+//      而结果取决于数组顺序 → 不可复算。现在响亮报错（契约前提：每格一条聚合分）。
+//   ③ `flags` 排序用 `localeCompare` → **依赖运行环境的 locale 与 ICU 版本**，
+//      同一份数据在不同机器上可能排出不同顺序 → 破坏「可复算」。
+//      现在改用与 `trim.js` 一致的普通字典序比较（ASCII 序）。
 
 export const SELF_EVAL_ACTIONS = Object.freeze({
   WRITTEN_EXPLANATION: 'written_explanation',
@@ -2929,13 +3153,26 @@ export const SELF_EVAL_ACTIONS = Object.freeze({
  * @param {object} input
  * @param {Array<{teamId:string, dimension:string, rawScore:number}>} input.selfReviews
  * @param {Array<{teamId:string, dimension:string, score:number}>} input.judgeScores 评委席同尺度分
+ *   ⚠️ **每个 (teamId, dimension) 只能一条**（重复 → 抛错）
  * @param {number} input.threshold 阈值（默认 10，配置在 rules/*.json）
  * @returns {{flags:Array<{teamId:string, dimension:string, d:number, action:string}>}}
  */
 export function detectSelfEvalDiff({ selfReviews = [], judgeScores = [], threshold = 10 } = {}) {
+  if (typeof threshold !== 'number' || !Number.isFinite(threshold)) {
+    throw new TypeError(
+      `自评差异检测的 threshold 非法：${JSON.stringify(threshold)}（必须是有限数）`,
+    );
+  }
+
   const judgeMap = new Map();
   for (const j of judgeScores) {
-    judgeMap.set(`${j.teamId}::${j.dimension}`, j.score);
+    const key = `${j.teamId}::${j.dimension}`;
+    if (judgeMap.has(key)) {
+      throw new TypeError(
+        `评委分里 (队伍 ${j.teamId}, 维度 ${j.dimension}) 出现多条 —— 每格只能有一条聚合分`,
+      );
+    }
+    judgeMap.set(key, j.score);
   }
 
   const flags = [];
@@ -2949,7 +3186,12 @@ export function detectSelfEvalDiff({ selfReviews = [], judgeScores = [], thresho
       flags.push({ teamId: s.teamId, dimension: s.dimension, d, action: SELF_EVAL_ACTIONS.JUDGE_QUESTION });
     }
   }
-  flags.sort((a, b) => a.teamId.localeCompare(b.teamId) || a.dimension.localeCompare(b.dimension));
+  // ⚠️ 用普通字典序而非 localeCompare —— 后者依赖 locale 与 ICU 版本，跨机器结果可能不同
+  flags.sort((a, b) => {
+    if (a.teamId !== b.teamId) return a.teamId < b.teamId ? -1 : 1;
+    if (a.dimension !== b.dimension) return a.dimension < b.dimension ? -1 : 1;
+    return 0;
+  });
   return { flags };
 }
 ```
@@ -2963,21 +3205,42 @@ export function detectSelfEvalDiff({ selfReviews = [], judgeScores = [], thresho
 //       + S7 §2.4 R5（R-JDG-09 回避制度：评委为供应方/投资方/前雇主必须回避，回避记录留档）
 //
 // 纯函数：无 IO、无 Date.now()、无 Math.random()。
+//
+// 【父代理预审修正 2026-10-21 —— 本文件有 3 处修正，读代码前先看这段】
+//   ① **回避的「撤销」永远失效**（本文件最严重的一处）：原实现 `for` 循环遇到**第一条**
+//      匹配记录就 return，而 `recusal_records` 是 **append-only** 的 ——
+//      「回避 → 组委会复核 → 撤销回避」会留下**两条**记录，
+//      于是取到的是第一条 `recused`，`action='reinstated'` 的那条**从未被读到**。
+//      规格自带的用例只给了**单条** reinstated 记录，正好掩盖了这一点。
+//      现在取**最后一条**匹配记录（按 `declared_at`，缺省按数组顺序）再判它的 action。
+//   ② `team_id` 为 `undefined` 时不当作赛段级回避（只有 `null` 才算）——
+//      数据来源变化就会漏判。现在 `null` / `undefined` 都算赛段级。
+//   ③ `teams` 有重复 → `eligible` 里出现重复队号；`deliverables` 有重复 → 后者静默覆盖前者。
+//      现在 teams 去重、deliverables 重复报错。
 
 /**
  * 互评资格：只对该赛段有真实交付物的队伍开放互评（R-RNK-07）。
  * @param {object} input
  * @param {Array<{teamId:string}>} input.teams
  * @param {Array<{teamId:string, hasRealDeliverable:boolean}>} input.deliverables
+ *   ⚠️ 同一队只能一条（重复 → 抛错）
  * @returns {{eligible:string[], ineligible:string[]}}
  */
 export function checkPeerEligibility({ teams = [], deliverables = [] } = {}) {
   const deliverableMap = new Map();
-  for (const d of deliverables) deliverableMap.set(d.teamId, !!d.hasRealDeliverable);
+  for (const d of deliverables) {
+    if (deliverableMap.has(d.teamId)) {
+      throw new TypeError(`互评资格：队伍 ${d.teamId} 有多条交付物记录 —— 数据异常`);
+    }
+    deliverableMap.set(d.teamId, !!d.hasRealDeliverable);
+  }
 
   const eligible = [];
   const ineligible = [];
+  const seen = new Set();
   for (const t of teams) {
+    if (seen.has(t.teamId)) continue; // 同一队只判一次
+    seen.add(t.teamId);
     if (deliverableMap.get(t.teamId)) eligible.push(t.teamId);
     else ineligible.push(t.teamId);
   }
@@ -2987,23 +3250,39 @@ export function checkPeerEligibility({ teams = [], deliverables = [] } = {}) {
 }
 
 /**
- * 回避判定：命中回避记录即不可评该队。
+ * 回避判定：命中**最新一条**回避记录即不可评该队。
  * @param {object} input
  * @param {{userId:string}} input.judge
  * @param {{teamId:string}} input.team
- * @param {Array<{judge_id:string, team_id:string|null, action:string, reason:string}>} input.recusalRecords
+ * @param {Array<{judge_id:string, team_id:string|null, action:string, reason:string, declared_at?:string}>} input.recusalRecords
+ *   ⚠️ 记录是 append-only 的：「回避 → 复核 → 撤销」会留下两条，**最后一条**才作数。
  * @returns {{recused:boolean, record?:object}}
  */
 export function checkRecusal({ judge, team, recusalRecords = [] } = {}) {
   if (!judge?.userId) return { recused: false };
-  for (const record of recusalRecords) {
-    if (record.judge_id !== judge.userId) continue;
-    if (record.action !== 'recused') continue; // reinstated = 已撤销
-    if (record.team_id === null || record.team_id === team?.teamId) {
-      return { recused: true, record };
-    }
-  }
-  return { recused: false };
+  const teamId = team?.teamId;
+
+  // 收集该评委对该队（或对该赛段整体）的全部记录
+  const matching = recusalRecords.filter((record) => {
+    if (record.judge_id !== judge.userId) return false;
+    const scope = record.team_id;
+    // team_id 为 null / undefined = 赛段级回避，对该赛段所有队生效
+    return scope === null || scope === undefined || scope === teamId;
+  });
+  if (!matching.length) return { recused: false };
+
+  // ⛔ 取**最后**一条：`action='reinstated'`（已撤销）必须能覆盖前面的 `recused`。
+  //    有 declared_at 就按时间取最新的；都没有就按数组顺序取靠后的。
+  const latest = matching.reduce((acc, r) => {
+    if (!acc) return r;
+    const a = acc.declared_at ?? '';
+    const b = r.declared_at ?? '';
+    if (a === b) return r;        // 时间相同 → 数组里靠后的更新
+    return b > a ? r : acc;       // 时间新的作数
+  }, null);
+
+  if (latest.action !== 'recused') return { recused: false };
+  return { recused: true, record: latest };
 }
 ```
 
@@ -3017,6 +3296,16 @@ export function checkRecusal({ judge, team, recusalRecords = [] } = {}) {
 // 规则数值全部来自 rules/scoring-*.json 的 judgePool 段（⛔ 不硬编码）。
 //
 // 纯函数：无 IO、无 Date.now()、无 Math.random()。
+//
+// 【父代理预审修正 2026-10-21 —— 本文件有 3 处修正，读代码前先看这段】
+//   ① **配置项非法时，对应的校验被静默跳过**：`Number('x')` = NaN，
+//      `minJudges > 0` 恒为 false → 「人数不足」这条校验**整条失效**，
+//      组委会会以为评委池合规。现在配置 fail-fast 抛错。
+//   ② **席类型写错的评委被静默消失**：既不计入 voting 也不计入 observer，
+//      `stats.total` 与 `voting + observer` **对不上**，却没有任何告警 ——
+//      而且这些评委本该属于哪个席会影响占比判断。现在报错 `unknown_seat`。
+//   ③ **重复 judgeId 被当成两个人** → 专家席/企业席占比算错。现在报错 `duplicate_judge`，
+//      且统计按**去重后**的评委算（stats 反映真实人数，error 标记问题）。
 
 /**
  * @param {object} input
@@ -3027,13 +3316,53 @@ export function checkRecusal({ judge, team, recusalRecords = [] } = {}) {
 export function checkJudgePool({ judges = [], config = {} } = {}) {
   const votingSeats = config.votingSeats ?? ['judge', 'enterprise'];
   const nonVotingSeats = config.nonVotingSeats ?? ['observer'];
-  const minJudges = Number(config.minJudgesPerDimension ?? 0);
-  const minEnterpriseShare = Number(config.minEnterpriseSeatShare ?? 0);
-  const maxExpertShare = Number(config.maxExpertSeatShare ?? 1);
+
+  // ── 配置 fail-fast（坏配置会让整条校验静默失效） ─────────────────────
+  const readNumber = (key, fallback, label) => {
+    const raw = config[key] ?? fallback;
+    if (typeof raw !== 'number' || !Number.isFinite(raw)) {
+      throw new TypeError(
+        `评委池配置项 ${key} 非法：${JSON.stringify(raw)}（必须是有限数）`,
+      );
+    }
+    return raw;
+  };
+  const minJudges = readNumber('minJudgesPerDimension', 0);
+  const minEnterpriseShare = readNumber('minEnterpriseSeatShare', 0);
+  const maxExpertShare = readNumber('maxExpertSeatShare', 1);
 
   const errors = [];
-  const voting = judges.filter((j) => votingSeats.includes(j.seat));
-  const nonVoting = judges.filter((j) => nonVotingSeats.includes(j.seat));
+
+  // ── 去重 + 识别异常数据 ──────────────────────────────────────────────
+  const seenIds = new Set();
+  const unique = [];
+  const duplicated = [];
+  for (const j of judges) {
+    if (seenIds.has(j.judgeId)) {
+      duplicated.push(j.judgeId);
+      continue;
+    }
+    seenIds.add(j.judgeId);
+    unique.push(j);
+  }
+  if (duplicated.length) {
+    errors.push({
+      code: 'duplicate_judge',
+      message: `评委名单里有 ${duplicated.length} 个重复的 judgeId：${[...new Set(duplicated)].join(', ')}`,
+    });
+  }
+
+  const knownSeats = new Set([...votingSeats, ...nonVotingSeats]);
+  const unknownSeat = unique.filter((j) => !knownSeats.has(j.seat));
+  if (unknownSeat.length) {
+    errors.push({
+      code: 'unknown_seat',
+      message: `有 ${unknownSeat.length} 名评委的席类型不在 votingSeats / nonVotingSeats 名单里：${[...new Set(unknownSeat.map((j) => j.seat))].join(', ')}`,
+    });
+  }
+
+  const voting = unique.filter((j) => votingSeats.includes(j.seat));
+  const nonVoting = unique.filter((j) => nonVotingSeats.includes(j.seat));
   const enterprise = voting.filter((j) => j.seat === 'enterprise');
   const expert = voting.filter((j) => j.seat === 'judge');
 
@@ -3074,6 +3403,7 @@ export function checkJudgePool({ judges = [], config = {} } = {}) {
       enterprise: enterprise.length,
       expert: expert.length,
       observer: nonVoting.length,
+      unknownSeat: unknownSeat.length,
       enterpriseShare,
       expertShare,
       perDimension,
@@ -3085,7 +3415,7 @@ export function checkJudgePool({ judges = [], config = {} } = {}) {
 - [ ] **Step 6: 运行测试确认通过**
 
 Run: `cd platform && node --test test/self-eval.test.js test/review-eligibility.test.js test/judge-pool.test.js`
-Expected: PASS（14 个测试全过：self-eval.test.js 4 + review-eligibility.test.js 5 + judge-pool.test.js 5）
+Expected: PASS（27 个测试全过：self-eval.test.js 7 + review-eligibility.test.js 12 + judge-pool.test.js 8）
 
 > **【2026-10-21 漂移审计修正 M-1】** 本计划的条数声明与代码块实测**逐条相符**（无需改数字），
 > 但格式与其他四份计划不一致。**改成什么**：把本计划**全部 8 处** `Expected: PASS` 统一成
@@ -6303,6 +6633,55 @@ git commit -m "feat(P2): SSE 评审进度推送（src/http/sse.js + GET /api/sta
 **Task 4 的测试条数口径**：enterprise-seat **19**（规格自带 6 + 预审回归 13）。
 
 **最终结果**：变异体 25 → **KILLED 25 / SURVIVED 0**；`enterprise-seat.test.js` **19/19**；P2 全量 **378/378**。
+
+---
+
+## Task 5 父代理预审修正台账（2026-10-21）
+
+> Task 5 含三个独立模块（自评差异 / 互评资格+回避 / 评委池校验），
+> 预审对每条规则的分支组合都做了探针。规格自带的 **14 条用例全绿** —— 但探针发现
+> **1 Critical + 4 Important + 3 Minor**，全部在实现里修掉后再补 **13 条回归用例**；
+> 实施完成后做**变异检验**，变异体一度出现 **2 条存活**，补完后 **23/23 有效变异杀灭**
+> （另 1 条等价变异体）。
+
+### 一、预审发现的规格缺陷
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| **N-1** | **Critical** | **回避的「撤销」永远失效** —— `checkRecusal` 的 `for` 循环遇到**第一条**匹配记录就 return，而 `recusal_records` 是 **append-only** 的：「回避 → 组委会复核 → 撤销」会留下**两条**记录，于是取到的是第一条 `recused`，`action='reinstated'` 的那条**从未被读到** | 探针：`[{recused}, {reinstated}]` → `{"recused":true}` —— **无论顺序如何结果都是回避中**。规格自带的用例只给了**单条** reinstated 记录，正好掩盖了这一点 | 取**最后一条**匹配记录（按 `declared_at`，缺省按数组顺序）再判它的 action。⚠️ 这条修正让「撤回回避」这个功能第一次真正生效 |
+| **N-2** | **Important** | **席类型写错的评委静默消失** —— 既不计入 voting 也不计入 observer，`stats.total` 与 `voting + observer` **对不上**，却没有任何告警；而且这些评委本该属于哪个席会影响占比判断 | 探针：9 voting + 2 个 `seat:'guest'` → `{"ok":true,"total":11,"voting":9,"observer":0,"errors":[]}` | 报错 `unknown_seat`；`stats.unknownSeat` 单独计数，账能对上 |
+| **N-3** | **Important** | **评委池的配置项非法 → 对应校验整条静默失效** —— `Number('x')` = NaN，`minJudges > 0` 恒 false → 「人数不足」这条校验**不执行** | 探针：`minJudgesPerDimension:'x'` + 只有 3 名评委 → errors 里**没有** `judge_pool_too_small` | 配置 fail-fast 抛错（同构于 Task 2/3） |
+| **N-4** | **Important** | **重复 judgeId 被当成两个人** → 专家席/企业席占比算错 | 探针：4 专家 + 5 企业 + 重复的 `e1` → `expert: 5`（应为 4） | 报错 `duplicate_judge`，且统计按**去重后**的人数算 |
+| **N-5** | **Important** | **自评的 `threshold` 非法 → 静默产出零 flag** —— `d > NaN` 恒 false，看上去像「所有自评都正常」 | 探针：`threshold:'x'` → `flags: []` | fail-fast 抛错 |
+| **N-6** | Minor | **自评的 `judgeMap` 重复键静默覆盖** —— 结果取决于数组顺序 → 不可复算 | 探针：两条评委分 90 / 80 → 用了 80（最后一条） | 响亮报错（契约前提：每格一条聚合分） |
+| **N-7** | Minor | **`flags` 排序用 `localeCompare`** → 依赖运行环境 locale 与 ICU 版本，同一份数据在不同机器上可能排出**不同顺序** → 破坏「可复算」 | 探针：`localeCompare` 得 `["T1","t10","t2","ta","tB"]`，普通字典序得 `["T1","t10","t2","tB","ta"]` | 改用与 `trim.js` 一致的普通字典序比较 |
+| **N-8** | Minor | **赛段级回避只认 `null` 不认 `undefined`** → 数据来源一变就漏判 | 探针：`team_id: undefined` → `recused: false` | `null` / `undefined` 都算赛段级 |
+| **N-9** | Minor | 互评的 `teams` 重复 → `eligible` 里出现重复队号；`deliverables` 重复 → 后者静默覆盖前者 | 探针：`teams:[t1,t1]` → `eligible:['t1','t1']` | teams 去重、deliverables 重复报错 |
+
+### 二、变异检验发现的实现盲区
+
+> 变异体 **24** 个（threshold 校验摘掉 / 重复检查摘掉 / 排序改回 localeCompare /
+> 回避取第一条 / reinstated 不解除 / 赛段级不生效 / 席类型不报错 / 重复 id 不报错 /
+> 占比分母换错 / 观察员算进 voting / ok 恒 true …）。
+> 变异脚本：`/tmp/p2t5/mutate.mjs`（三个模块共用一个 harness）。
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| **N-10** | Minor | **`eligible` / `ineligible` 的排序零覆盖** —— 规格那条用例的 teams **恰好已是字典序**，排序与不排序结果一样 | 变异存活：删掉两行 `.sort()` 后 27 条用例全绿 | 补用例：刻意把输入顺序打乱（`tb,td,ta,tc`）→ 断言输出按字典序 |
+| — | — | **等价变异体 S06**（缺评委分时也硬算 `d`）：`d` 变成 NaN，自然命不中阈值，**输出的 flag 完全相同** | 变异存活 | **不是盲区**，标记为等价变异体、允许存活（已在变异脚本里显式标注） |
+
+### 三、刻意保持的行为（登记口径）
+
+| 行为 | 为什么这样 |
+|---|---|
+| **`checkJudgePool` 用 `errors` 而不是抛错来处理「未知席 / 重复 id」** | 这个函数的契约就是 `{ok, errors, stats}` —— 「池子有问题」是**可预期的业务结果**，由调用方决定是否放行；而「配置项写坏」是**代码级错误**，只能抛（与 Task 2/3 一致） |
+| **`perDimension` 目前只有 `{all: voting.length}` 一个键** | 冲突裁决 C-05 第 1 条：专家席跨任务包评分 → 每个维度都覆盖**全部**有投票权的评委 → 「每维度人数」== 总有投票权人数。⚠️ 将来若改为「按维度分组配评委」，这个结构要跟着改 |
+| **互评资格里「没有交付物记录」与「交付物为 false」同样算不合格** | 缺记录本身就是「没有真实交付物」的默认读法（`deliverableMap.get()` 返回 undefined → falsy） |
+| **`detectSelfEvalDiff` 只产出 flag，不产出分数** | 机制归因（S7 §4.3）：自评一旦能加分就变成博弈项 → 只触发「解释」与「提问」。分数处理在 `scoring.js` 按 `action` 显式执行 |
+
+**Task 5 的测试条数口径**：self-eval **7** + review-eligibility **12** + judge-pool **8** = **27**。
+
+**最终结果**：变异体 24 → **KILLED 23 / 等价变异体 1 / 有效缺口 0**；三个测试文件 **27/27**；P2 全量 **405/405**。
 
 ---
 
