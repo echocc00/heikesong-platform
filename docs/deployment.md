@@ -519,6 +519,37 @@ node scripts/audit-scan.js
 - 一个域名 + **已签发**的 TLS 证书（certbot 签发即可，见 §9.5）
 - **单机**（见 §0.2：多机必须换 Postgres）
 
+#### ⚠️ 从 macOS 把代码拷到 Linux：**别让 `._*` 伴生文件跟过去**
+
+2026-10-21 在真机（Debian 12 / ext4）上实测踩到过：macOS 往**非 HFS 文件系统**
+（exFAT/FAT U 盘、或 `tar` 打进 Linux 的流）拷时，每个文件旁边会多出一个
+**AppleDouble 伴生文件** `._xxx`（资源叉载体，内容是二进制）：
+
+```
+$ node scripts/migrate.js
+Error: 迁移文件名必须形如 <版本号>_<名称>.sql: ._001_init.sql
+```
+
+✅ **推荐**（`scp` 不产生伴生文件）：
+
+```bash
+scp -r platform/ other-machine:/tmp/platform
+scp .gitignore other-machine:/tmp/.gitignore   # ⚠️ 仓库根这个也要（demo-static.test.js 会读它）
+```
+
+✅ 或者用 `tar` 但**必须**关掉 xattr / AppleDouble：
+
+```bash
+COPYFILE_DISABLE=1 tar -cf - --no-xattrs --exclude='._*' --exclude='.DS_Store' platform/ .gitignore \
+  | ssh other-machine 'mkdir -p /tmp/platform && tar -xf - -C /tmp'
+```
+
+⛔ **不要**用 `rsync`（默认带 xattr），也**不要**经 **exFAT/FAT U 盘**中转
+（那个格式**必然**生成 `._*`，而且 macOS 往里拷时也会自动造）。
+
+⇒ 代码侧**已有兜底**（`src/db/migrate.js` 跳过 `._*`、`scripts/build-demo.js` 丢弃 `._*`），
+但**正确做法仍是别把它们拷过去** —— 加固只是兜底。
+
 ### 9.2 先查前置条件（**都在动手之前查**）
 
 ```bash
@@ -735,12 +766,12 @@ heikesong-platform 启动于 http://127.0.0.1:8080（规则版本 2026-10-20）
 |---|---|---|
 | U-1 | **证书签发的完整流程未实跑** | 需要真实域名 + 公网 DNS。手册只把它当**前置条件**（`install.sh` 收 `CERT_PATH` / `KEY_PATH`），certbot 的命令按需自取（§9.6） |
 | U-2 | **Docker 形态未实跑** | 本 Task 环境无 Docker daemon。`deploy/docker-compose.yml` 的形态与注意事项写在 §2.4。⚠️ 它用的是 `network_mode: host` —— 那是 **Linux 宿主机的语义**；在 macOS / Windows 的 Docker Desktop 上容器拿的是 Linux 虚拟机的网络栈，宿主 `127.0.0.1:8080` 仍不通 |
-| U-3 | **`install.sh` 的完整执行未在真机实跑** | 需要 Linux + root + systemd + nginx。**沙箱实跑**已覆盖：fail-fast 三条（缺 nginx / TTL 非法 / Node 版本不足）、一次完整部署（所有落盘产物 + 自动降级 + 幂等重跑）、`nginx -t` 失败的两条回滚路径（见 §14 E9–E14） |
+| U-3 | **`install.sh` 的完整执行未在真机实跑** | 需要 Linux + root + systemd + nginx，且会**接管 nginx 站点**。**沙箱实跑**已覆盖：fail-fast 三条（缺 nginx / TTL 非法 / Node 版本不足）、一次完整部署（所有落盘产物 + 自动降级 + 幂等重跑）、`nginx -t` 失败的两条回滚路径（见 §14 E9–E14）。<br>⚠️ **2026-10-21 补充**：已在**真机**（Debian 12 / nginx 1.22.1 / systemd 252）上把它的**各个可独立验证的部分**验过：HTTP/2 自动降级判定、降级后站点配置的 `nginx -t` 语法校验、`heikesong.service` 的 `systemd-analyze verify`（零告警）—— 见 §14 E18–E20。**完整执行仍未做**，因为本机承载着既有业务（80 是 headscale 控制台的 `default_server`、443 被 xray 占用），跑它必须改端口并接管 nginx 站点，属于会动生产配置的动作 |
 | U-4 | ~~`nginx-http2-compat.sh` 的版本探测在真机上总是失败~~ **已修** | 原 `detect_version()` 的 sed 匹配不到 nginx 的真实输出格式 `nginx version: nginx/1.24.0`（版本号前带 `nginx/` 前缀）⇒ 真机总是走保守降级。**后果安全**（降级语法在所有版本都合法），但「≥ 1.25.1 保留 `http2 on;`」只有显式 `NGINX_VERSION` 才走得到。**已由父代理修复轮修掉**（2026-10-21）：解析式改为同时吃下带前缀/不带前缀两种形态，并补了走**真实自动探测路径**的回归用例（假 `nginx` 放 `PATH` 上）—— 见 §8.1 |
 | U-5 | **演示版构建 / 发布流程未实跑** | `scripts/build-demo.js` / `scripts/serve-demo.js` 是 **P6 Task 6** 的产物，**本 Task 时点尚未落地**。§8.5 写的是**目标流程**（接口以 P6 计划 Task 6 为准） |
 | U-6 | **多机 / Postgres 方案** | 超出本阶段范围。§0.2 与 §4 只把**边界**说清楚（多机必须换 Postgres，没有第三条路） |
 | U-7 | **计划代码块原样保留，未作改动** | 计划 Task 7 的 `docs/deployment.md` 代码块在本文件里**逐字连续**保留（§0–§7），补写内容全部落在 §8–§14。计划文档本身只**追加**了「Task 7 实施台账」一章 |
-| U-8 | **systemd 侧未在真机验证** | 本手册写作环境是 macOS（无 systemd）。§8.3 的「确认生效」三条命令里，②（`systemctl show -p EnvironmentFiles`）与 ③（读 `/proc/<pid>/environ`）**未在真机跑过** —— 但 ③ 读的是内核暴露的进程环境，语义不依赖 systemd 版本。⚠️ 刻意**不用** `systemctl show -p Environment`：那条**看不到** `EnvironmentFile=` 的内容（systemd issue #14723），会让人误判「环境文件没生效」 |
+| U-8 | **systemd 侧未在真机验证** | 本手册写作环境是 macOS（无 systemd）。§8.3 的「确认生效」三条命令里，②（`systemctl show -p EnvironmentFiles`）与 ③（读 `/proc/<pid>/environ`）**未在真机跑过** —— 但 ③ 读的是内核暴露的进程环境，语义不依赖 systemd 版本。⚠️ 刻意**不用** `systemctl show -p Environment`：那条**看不到** `EnvironmentFile=` 的内容（systemd issue #14723），会让人误判「环境文件没生效」。<br>⚠️ **2026-10-21 补充**：单元文件本身已在**真机 systemd 252** 上过 `systemd-analyze verify`（零告警，见 §14 E20）；仍未验证的是「**服务真跑起来之后**那三条确认命令」（那需要真的把服务装上并启动） |
 
 ---
 
@@ -751,7 +782,7 @@ heikesong-platform 启动于 http://127.0.0.1:8080（规则版本 2026-10-20）
 
 | # | 跑了什么 | 观察到 |
 |---|---|---|
-| E1 | `cd platform && node --disable-warning=ExperimentalWarning --test` | **1277 例 / 1276 通过 / 0 失败 / 1 跳过**（测于提交 `d8b6098`；基线 981/981）<br>⚠️ 数字是**测得时**的实况；后续阶段合入会变（用例数只增不减）⇒ **以实跑为准** |
+| E1 | `cd platform && node --disable-warning=ExperimentalWarning --test` | **1279 例 / 1278 通过 / 0 失败 / 1 跳过**（macOS / darwin arm64；测于提交 `25a7296`；基线 981/981）<br>⚠️ 数字是**测得时**的实况；后续阶段合入会变（用例数只增不减）⇒ **以实跑为准** |
 | E2 | `cd platform && node scripts/audit-scan.js` | **退出码 0**（词条 15 条、扫描 224 个文件、发布产物 `platform/web/dist` 另扫 60 个、0 违规） |
 | E3 | `DATA_DIR=<tmp>/data node scripts/migrate.js` | `迁移完成，当前版本 6`（本次应用 001–006 六个迁移） |
 | E4 | `node scripts/seed.js` 连跑两次 | 第一次「已创建管理员：13800000000」，第二次「管理员已存在」⇒ 幂等 |
@@ -768,6 +799,10 @@ heikesong-platform 启动于 http://127.0.0.1:8080（规则版本 2026-10-20）
 | E15 | 沙箱：会话天数取值矩阵（12 组） | 合法（`7/30`、`1/1`、**更严的 `7/3`**、带前导零 `007/030`）⇒ 放行；`0`、`abc`、`3.5`、`-1`、空串 ⇒ **退出码 1** + 人话提示；`99999999999999999999` ⇒ **退出码 1** + 「不能超过 3650 天」，**第一行没有 bash 的 `integer expression expected` 噪音** |
 | E16 | 沙箱：`nginx -t` 失败 + **预置软链指向别的文件** | 退出码 1；**软链被还原成部署前的指向**（`OTHER.conf` 没被删）；本次写入的站点文件已撤销；**没有预置软链**时软链同样撤销、`sites-enabled/` 为空 |
 | E17 | 变异检验（`/tmp/p6-mutate/t2fix2.mjs`） | **18 个变异体 / 18 KILLED / 0 存活 / 0 无效 / 0 锚点异常**；对照组（未改动副本）**22/22 全绿** |
+| E18 | **真机**（8.133.200.235 / Debian 12 / ext4 / Node v22.22.2 / nginx 1.22.1 / systemd 252）跑 `nginx-http2-compat.sh` | `nginx 1.22.1 < 1.25.1：已降级为 listen ... ssl http2;`；独立的 `http2 on;` 行**已消失** |
+| E19 | 真机上把降级后的站点配置（替换占位符 + 临时自签证书）喂给 `nginx -t -c <临时主配置>` | `syntax is ok` / `test is successful`（退出码 0）；**系统既有配置的 `nginx -t` 仍然正常**（本轮没写 `/etc/nginx/**`、没 reload） |
+| E20 | 真机上 `heikesong.service`（替换占位符后）`systemd-analyze verify` | 退出码 0、**零告警**（systemd 252） |
+| E21 | **真机跨平台复现**（P6 Task 8 Step 4 的原配方，三条命令） | `node scripts/migrate.js` ⇒ `迁移完成，当前版本 6`；`node --test` ⇒ **1279 例 / 1277 通过 / 0 失败 / 2 跳过**（2 跳过各有一条：Task 5 已落地故不适用；**以 root 跑、mode 000 也读得到**）；`node scripts/build-demo.js` ⇒ 产物 60 文件、**伴生文件 0 个** |
 
 ---
 
