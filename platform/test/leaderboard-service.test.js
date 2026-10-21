@@ -292,6 +292,26 @@ test('★ 观察员不能发榜（403）；发榜写快照+审计+积分流水�
   close(); rmSync(dataDir, { recursive: true, force: true });
 });
 
+test('★ 发榜可复算：快照里的名次能重放出同样的结果（P3-12 验收标准）', () => {
+  const { db, close, dataDir } = setup();
+  try {
+    publishLeaderboard({ db, editionId: 'ed_1', stageId: 'st_1', actorId: 'u_admin', now: NOW });
+    const snap = db.prepare("SELECT payload_json FROM leaderboard_snapshots WHERE scope = 'rank'").get();
+    assert.ok(snap, '要写 rank 快照');
+    const payload = JSON.parse(snap.payload_json);
+    assert.ok(payload.rows.length > 0, '快照里要有榜单行');
+    // 重放：快照的名次与积分必须与「重新算一遍」完全一致（可复算 = 跨机器重算同结果）
+    const fresh = getLeaderboard({ db, stageId: 'st_1', scope: 'rank', viewer: null });
+    assert.deepEqual(
+      payload.rows.map((r) => [r.teamId, r.rank, r.points]),
+      fresh.rows.map((r) => [r.teamId, r.rank, r.points]),
+      '快照必须能重放出同样的名次与积分',
+    );
+  } finally {
+    close(); rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
 test('★ 服务层返回体不含互评来源与行为分明细', () => {
   const { db, close, dataDir } = setup();
   const out = getLeaderboard({ db, stageId: 'st_1', scope: 'rank', viewer: null });

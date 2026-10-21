@@ -3359,6 +3359,26 @@ test('★ 观察员不能发榜（403）；发榜写快照+审计+积分流水�
   close(); rmSync(dataDir, { recursive: true, force: true });
 });
 
+test('★ 发榜可复算：快照里的名次能重放出同样的结果（P3-12 验收标准）', () => {
+  const { db, close, dataDir } = setup();
+  try {
+    publishLeaderboard({ db, editionId: 'ed_1', stageId: 'st_1', actorId: 'u_admin', now: NOW });
+    const snap = db.prepare("SELECT payload_json FROM leaderboard_snapshots WHERE scope = 'rank'").get();
+    assert.ok(snap, '要写 rank 快照');
+    const payload = JSON.parse(snap.payload_json);
+    assert.ok(payload.rows.length > 0, '快照里要有榜单行');
+    // 重放：快照的名次与积分必须与「重新算一遍」完全一致（可复算 = 跨机器重算同结果）
+    const fresh = getLeaderboard({ db, stageId: 'st_1', scope: 'rank', viewer: null });
+    assert.deepEqual(
+      payload.rows.map((r) => [r.teamId, r.rank, r.points]),
+      fresh.rows.map((r) => [r.teamId, r.rank, r.points]),
+      '快照必须能重放出同样的名次与积分',
+    );
+  } finally {
+    close(); rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
 test('★ 服务层返回体不含互评来源与行为分明细', () => {
   const { db, close, dataDir } = setup();
   const out = getLeaderboard({ db, stageId: 'st_1', scope: 'rank', viewer: null });
@@ -4470,7 +4490,7 @@ import { listEditions, getEdition } from './db/repo/editions.js';
 
 - [ ] **Step 7: 运行测试确认通过**
 
-Run: `cd platform && node --test test/leaderboard-service.test.js` → Expected: PASS（**23** 个测试全过：leaderboard-service.test.js 23 —— 规格自带 8 + 变异检验补测 7 + 规格缺陷补测 4 + Task 8 补测 4）
+Run: `cd platform && node --test test/leaderboard-service.test.js` → Expected: PASS（**24** 个测试全过：leaderboard-service.test.js 24 —— 规格自带 8 + 变异检验补测 7 + 规格缺陷补测 4 + Task 8 补测 5）
 
 - [ ] **Step 8: 提交**
 
@@ -5300,8 +5320,10 @@ points **27**（Task 3 的 24 + Task 7 补测 3）；leaderboard-migration **16*
 leaderboard-service **23**（Task 7 的 19 + Task 8 补测 4）。
 
 **最终结果**：变异体 26 → **KILLED 26 / 等价变异体 0 / 有效缺口 0**；
-`leaderboard-web.test.js` **9/9**、`leaderboard-service.test.js` **23/23**；P3 全量 **690/690**；
+`leaderboard-web.test.js` **9/9**、`leaderboard-service.test.js` **24/24**；P3 全量 **691/691**；
 `node scripts/migrate.js` 输出 `迁移完成，当前版本 4`。
+
+| **P3-34** | Minor | **验收标准 P3-12 的后半句「`leaderboard_snapshots.payload_json` 能重放出同样的名次」没有任何用例** —— 原用例只断言了「快照写了 3 条 + 幂等」，**没断言快照里的名次与重算一致**。而「可复算」恰恰是段位/积分这类数值结果**跨机器复算同结果**的保证（S-5 / R-RNK-10 的可追溯性） | 自查脚本按「P3 验收标准」逐条跑时发现：P3-12 的前两句（幂等、快照条数）有用例，第三句（能重放）**无覆盖** | 补一条用例：发榜后读 `scope='rank'` 的 `payload_json`，把快照里的 `[teamId, rank, points]` 与**重新算一遍**的 `getLeaderboard` 结果逐项比对 ⇒ 快照必须能重放出同样的名次 |
 
 ### 三、已知限制（明确不在本阶段解决）
 
