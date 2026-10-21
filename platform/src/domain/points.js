@@ -8,6 +8,7 @@
 //
 // ⛔ 本模块【不】产生任何影响段位或行为分的数值；行为分不在这里出现。
 import { cmpStr } from './util.js';
+import { computePersonalTotals } from './personal-points.js';
 
 /** 赛段名次积分：第 1/2/3 名 = 10/8/5，其余 0（任务书 §七 + R-STG-02，已定）。 */
 export function stagePointsFor(rank, pointsConfig) {
@@ -140,30 +141,30 @@ function compareMvp(a, b, tiebreak) {
 
 /**
  * 个人积分：赛段积分 + MVP 投决积分，终生上榜（任务书 §七 + R-RNK-10 + rules.points.personal）。
- * ⛔ kind='personal_rollup' 是派生快照，不参与累加（否则重复计分）。
+ *
+ * ⭐ **积分总额一律来自唯一计算点** `src/domain/personal-points.js`：
+ *    本函数只保留自己的 **1224 名次** 与输出形状，不再自己求和。
+ *    ⚠️ 为什么要改：R-RNK-10 曾有**两套独立实现**（本函数与
+ *    src/domain/pool-derive.js 的 aggregatePersonalPoints），读**不同的规则文件**、
+ *    按**不同的口径**算 —— 同一份流水能算出两个不同的名次
+ *    （实测：stage_rank=10 + personal_rollup=12 ⇒ 榜单算 10、人才池算 12；
+ *      kind=weird=99 ⇒ 榜单算 99、人才池算 0）。口径统一到一处才根治。
+ *    统一后的口径（唯一真源见 personal-points.js 文件头）：
+ *      ① 有 personal_rollup 行 → 以 rollup 为准（它是「已汇总」的快照），冲突时显式告警；
+ *      ② 否则 → atomic 白名单之和（rules.points.personal.atomicKinds）；
+ *      ③ 口径外的 kind → 不计入 + 告警；④ includeMvpVote=false → mvp 不计入；
+ *      ⑤ 无 userId 的行 → 跳过。
+ *    ⇒ 本函数与 aggregatePersonalPoints 对同一份流水给出的**每人 total 完全相同**。
  */
 export function computePersonalPoints({ ledger, pointsConfig }) {
   const personalCfg = pointsConfig?.personal || {};
   const lifetime = personalCfg.lifetime !== false;
   const includeMvpVote = personalCfg.includeMvpVote !== false;
 
-  const totals = new Map();
-  const kinds = new Map();
-  let excluded = 0;
-  for (const entry of Array.isArray(ledger) ? ledger : []) {
-    if (!entry || !entry.userId) continue;
-    const kind = entry.kind || 'unknown';
-    if (kind === 'personal_rollup') { excluded += 1; continue; }
-    if (kind === 'mvp' && !includeMvpVote) { excluded += 1; continue; }
-    const pts = Number(entry.points) || 0;
-    totals.set(entry.userId, (totals.get(entry.userId) || 0) + pts);
-    if (!kinds.has(entry.userId)) kinds.set(entry.userId, {});
-    const km = kinds.get(entry.userId);
-    km[kind] = (km[kind] || 0) + pts;
-  }
+  const { byUser, warnings, excludedEntries } = computePersonalTotals({ ledger, pointsConfig });
 
-  const rows = [...totals.entries()]
-    .map(([userId, total]) => ({ userId, total, byKind: kinds.get(userId) || {} }))
+  const rows = Object.entries(byUser)
+    .map(([userId, agg]) => ({ userId, total: agg.total, byKind: agg.byKind }))
     .sort((a, b) => b.total - a.total || cmpStr(a.userId, b.userId));
 
   let before = 0;
@@ -177,7 +178,7 @@ export function computePersonalPoints({ ledger, pointsConfig }) {
     r.rank = curRank;           // ⛔ 并列的行**也必须**拿到名次
     before += 1;
   }
-  return { lifetime, includeMvpVote, rows, excludedEntries: excluded };
+  return { lifetime, includeMvpVote, rows, excludedEntries, warnings };
 }
 
 /**

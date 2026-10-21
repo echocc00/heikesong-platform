@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -13,6 +13,8 @@ import {
 import {
   aggregatePersonalPoints, derivePoolProjects, derivePoolTalents, derivePoolResources,
 } from '../src/domain/pool-derive.js';
+import { computePersonalPoints } from '../src/domain/points.js';
+import * as poolSourcesRepo from '../src/db/repo/pool-sources.js';
 import { loadRules, validateRules } from '../src/config.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -521,13 +523,14 @@ test('规则口径：packageStatusFilter 只让白名单状态的任务包进资
   cleanup(db, close, dataDir);
 });
 
-test('规则口径：talentPointKinds 决定哪些 kind 计入积分', () => {
+test('规则口径：rules.points.personal.atomicKinds 决定哪些 kind 计入积分', () => {
   const { db, close, dataDir } = setup();
   syncPoolTalents({
     db,
     editionId: 'ed_1',
     now: NOW,
-    rules: { pools: { talentPointKinds: { atomic: ['stage_rank'], rollup: 'personal_rollup' } } },
+    // ⚠️ 口径的唯一规则来源是 rules.points.personal（不再是 rules.pools.talentPointKinds）
+    rules: { points: { personal: { atomicKinds: ['stage_rank'], rollupKind: 'personal_rollup' } } },
   });
   const row = db.prepare('SELECT total_points AS p FROM pool_talents WHERE user_id = ?').get('u_a');
   assert.equal(row.p, 18, '口径外只剩 stage_rank：10 + 8 = 18（默认口径是 23）');
@@ -716,13 +719,44 @@ test('规则校验：publicTokenTtlDays / publicScopes / talentTotalScope / task
     [{ ...rules.pools, publicScopes: ['leaderboard'] }, 'publicScopes'],
     [{ ...rules.pools, talentTotalScope: 'edition' }, 'talentTotalScope'],
     [{ ...rules.pools, taskEvidence: { ...rules.pools.taskEvidence, requireRunnableOrBlocker: false } }, 'requireRunnableOrBlocker'],
-    [{ ...rules.pools, talentPointKinds: { rollup: 'personal_rollup' } }, 'talentPointKinds'],
   ];
   for (const [pools, keyword] of bad) {
     const errors = validateRules({ ...rules, pools });
     assert.ok(
       errors.some((e) => e.includes(keyword)),
       `${keyword} 不合规必须报错（实际 ${JSON.stringify(errors)}）`,
+    );
+  }
+});
+
+test('★ 规则校验：交叉引用必须真实存在（引用不存在的取值一律拒绝启动）', () => {
+  const { rules } = loadRules(rulesDir);
+  // packageStatusFilter 写错一个拼写 ⇒ 过滤掉**全部**任务包 ⇒ 资源池空掉且不报任何错
+  const badPools = [
+    [{ ...rules.pools, packageStatusFilter: ['apprved'] }, 'packageStatusFilter 含不存在的任务包状态'],
+    [{ ...rules.pools, packageStatusFilter: 'approved' }, 'packageStatusFilter 必须是数组'],
+    [{ ...rules.pools, resourceKinds: ['nope'] }, 'resourceKinds 含不存在的资源类型'],
+    [{ ...rules.pools, resourceKinds: [] }, 'resourceKinds 必须是非空数组'],
+  ];
+  for (const [pools, keyword] of badPools) {
+    const errors = validateRules({ ...rules, pools });
+    assert.ok(
+      errors.some((e) => e.includes(keyword)),
+      `必须报「${keyword}」（实际 ${JSON.stringify(errors)}）`,
+    );
+  }
+  // 个人积分口径的规则来源（atomicKinds / rollupKind）必须指向真实的 kind
+  const badPoints = [
+    [{ ...rules.points, personal: { ...rules.points.personal, atomicKinds: [] } }, 'atomicKinds 必须是非空数组'],
+    [{ ...rules.points, personal: { ...rules.points.personal, atomicKinds: ['nope'] } }, 'atomicKinds 含不存在的积分 kind'],
+    [{ ...rules.points, personal: { ...rules.points.personal, rollupKind: '' } }, 'rollupKind 必须是非空字符串'],
+    [{ ...rules.points, personal: { ...rules.points.personal, rollupKind: 'nope' } }, 'rollupKind 引用了不存在的积分 kind'],
+  ];
+  for (const [points, keyword] of badPoints) {
+    const errors = validateRules({ ...rules, points });
+    assert.ok(
+      errors.some((e) => e.includes(keyword)),
+      `必须报「${keyword}」（实际 ${JSON.stringify(errors)}）`,
     );
   }
 });
@@ -753,5 +787,244 @@ test('领域纯函数：derivePoolResources 跳过软删的任务包', () => {
     ],
   });
   assert.equal(rows.length, 1);
-  assert.equal(rows[0].packageCount, 1, '软删的任务包不计入资源池');
+  assert.equal(rows[0].detail, 'A：p1', '软删的任务包不计入资源池（明细里只剩没软删的那条）');
+  assert.equal('packageCount' in rows[0], false, '契约的 pool_resources 没有这一列 ⇒ 不再产出算了就丢的字段');
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// P5 Task 3 修复轮（verifier 审查修复）新增用例
+//   · I-2：同刻并列的确定性（段位记录 / 报名记录）
+//   · I-1：变异口径的判别性用例（探针固定装置里原本缺的判别输入）
+//   · I-3：个人积分口径唯一化后的跨模块一致性
+//   · M-1：写后自检必须在事务内（不一致 ⇒ 回滚，脏值不落地）
+//   · M-2：跨届期连带写入要单独计数
+// ═══════════════════════════════════════════════════════════════════
+
+// ── I-2：同刻并列的确定性 ───────────────────────────────────────────
+
+test('★ 同刻的段位记录：按 rowid（写入次序）定先后，结果唯一且可复算', () => {
+  // ⚠️ 两条 computed_at **完全相同**的段位记录，且 id 的字典序与插入次序**故意相反**：
+  //    先插 'z-first-inserted'（字典序最大），后插 'a-second-inserted'（字典序最小）。
+  //    ⇒ 「按 id 排」会选中 z-first，「按插入次序排」会选中 a-second，两种实现结果不同
+  //    ⇒ 断言有判别力（不是「恰好相同」的无效断言）。
+  const { db, close, dataDir } = setup(`
+    INSERT INTO tier_records (id, team_id, tier, milestone_count, business_signoff_count,
+                              reasons_json, computed_at, deleted_at)
+    VALUES ('z-first-inserted', 'tm_1', 'A', 9, 9, '[]', '2026-10-20T00:00:00.000Z', NULL),
+           ('a-second-inserted', 'tm_1', 'B', 5, 5, '[]', '2026-10-20T00:00:00.000Z', NULL);
+  `);
+  syncPoolProjects({ db, editionId: 'ed_1', now: NOW });
+  const row = db.prepare('SELECT tier, business_value FROM pool_projects WHERE team_id = ?').get('tm_1');
+  assert.equal(row.tier, 'B', '同刻时取**后写入**的那条（rowid 兜底，与 repo/tiers.js 同口径）');
+  assert.equal(row.business_value, 5, '商业签字数跟着同一条走');
+  assert.notEqual(row.tier, 'A', '不能按 id 字典序选（那是随机 UUID 排出来的顺序，不可复算）');
+  // 再同步一次：结果必须稳定（幂等重建，不是「碰巧这次对了」）
+  syncPoolProjects({ db, editionId: 'ed_1', now: NOW });
+  const again = db.prepare('SELECT tier FROM pool_projects WHERE team_id = ?').get('tm_1');
+  assert.equal(again.tier, 'B', '重跑一次结果不变');
+  cleanup(db, close, dataDir);
+});
+
+test('★ 同刻的段位记录：结果与入参顺序无关（兜底键由行内 rowid 决定）', () => {
+  const tierRecords = [
+    { team_id: 'tm_1', tier: 'A', business_signoff_count: 9, computed_at: '2026-10-20T00:00:00.000Z', rowid: 11 },
+    { team_id: 'tm_1', tier: 'B', business_signoff_count: 5, computed_at: '2026-10-20T00:00:00.000Z', rowid: 12 },
+  ];
+  const teams = [{ id: 'tm_1', name: '一队', task_package_id: null, tier: 'C' }];
+  const forward = derivePoolProjects({ teams, tierRecords });
+  const backward = derivePoolProjects({ teams, tierRecords: [...tierRecords].reverse() });
+  assert.equal(forward[0].tier, 'B', 'rowid 大的那条算数');
+  assert.equal(backward[0].tier, 'B', '同一份数据换个顺序喂进来，结果必须一样');
+  assert.deepEqual(forward[0], backward[0], '整个派生行都必须一样（不只是 tier）');
+});
+
+test('★ 同刻的报名记录：结果与入参顺序无关（兜底键由行内 rowid 决定）', () => {
+  const registrations = [
+    { user_id: 'u_x', dimension_scores_json: '{"b":2}', created_at: '2026-10-20T00:00:00.000Z', rowid: 21 },
+    { user_id: 'u_x', dimension_scores_json: '{"a":1}', created_at: '2026-10-20T00:00:00.000Z', rowid: 22 },
+  ];
+  const base = {
+    users: [{ id: 'u_x', name: '甲', org: null, mba_status: 'other' }],
+    ledger: [{ user_id: 'u_x', kind: 'stage_rank', points: 5 }],
+  };
+  const forward = derivePoolTalents({ ...base, registrations });
+  const backward = derivePoolTalents({ ...base, registrations: [...registrations].reverse() });
+  assert.deepEqual(forward.rows[0].skills, [{ key: 'a', score: 1 }], 'rowid 大的那条算数');
+  assert.deepEqual(forward.rows[0].skills, backward.rows[0].skills, '同一份数据换个顺序喂进来，技能画像必须一样');
+});
+
+test('同一人同一届最多一条有效报名（部分唯一索引）—— 同刻并列在真实数据上不可能出现', () => {
+  const { db, close, dataDir } = setup();
+  assert.throws(
+    () => db.prepare(`
+      INSERT INTO registrations (id, edition_id, user_id, answers_json, dimension_scores_json,
+                                raw_score, level, level_final, decided_by, decided_at, decision_note,
+                                status, created_at, deleted_at)
+      VALUES ('rg_dup', 'ed_1', 'u_a', '{}', '{"a":1}', 10, 'S', 'S', 'u_c', '2026-10-01T00:00:00.000Z',
+              NULL, 'registered', '2026-10-01T00:00:00.000Z', NULL)
+    `).run(),
+    /UNIQUE constraint failed/,
+    '同一人同一届的有效报名只能有一条（这条约束是「同刻并列不可能出现」的根据）',
+  );
+  cleanup(db, close, dataDir);
+});
+
+// ── I-1：变异探针固定装置里原本缺的判别输入 ─────────────────────────
+
+test('★ user_id 为空的流水行被跳过（不产出 null 键）', () => {
+  // 真实写入方 src/db/repo/points.js 的 insertLedgerEntry 写的是 `userId ?? null`
+  // ⇒ points_ledger.user_id 是**可空**列（schema 里没有 NOT NULL），这条流水真实存在。
+  // 一旦不跳过，榜单上会多出一个 userId=null 的幽灵用户。
+  const { byUser } = aggregatePersonalPoints({
+    ledger: [
+      { user_id: null, kind: 'stage_rank', points: 7 },
+      { user_id: 'u_x', kind: 'stage_rank', points: 5 },
+    ],
+  });
+  assert.deepEqual(Object.keys(byUser), ['u_x'], '空 user_id 的行不能造出一个 null 键');
+  assert.equal(byUser.u_x.total, 5, '其余人的积分不受影响');
+});
+
+test('★ 画像分不是数字时按 0 计（不产生 NaN）', () => {
+  const { rows } = derivePoolTalents({
+    users: [{ id: 'u_x', name: '甲', org: null, mba_status: 'other' }],
+    ledger: [{ user_id: 'u_x', kind: 'stage_rank', points: 5 }],
+    registrations: [{ user_id: 'u_x', dimension_scores_json: '{"direction":"N/A"}', created_at: '2026-10-01' }],
+  });
+  assert.deepEqual(rows[0].skills, [{ key: 'direction', score: 0 }], '非数值画像分兜底 0，不是 NaN');
+});
+
+// ── I-3：个人积分口径唯一化后的跨模块一致性 ─────────────────────────
+
+test('★ 跨模块一致性：榜单与人才池对同一份流水给出的每人 total 完全相同', () => {
+  const { rules } = loadRules(rulesDir);
+  const ledger = [
+    { userId: 'u_x', kind: 'stage_rank', points: 10, stageId: 'st_1' },
+    { userId: 'u_x', kind: 'personal_rollup', points: 12, stageId: 'st_2' },
+    { userId: 'u_y', kind: 'weird', points: 99 },
+  ];
+  const agg = aggregatePersonalPoints({ ledger, pointsConfig: rules.points });
+  const board = computePersonalPoints({ ledger, pointsConfig: rules.points });
+  for (const row of board.rows) {
+    const same = agg.byUser[row.userId];
+    assert.ok(same, `人才池也必须有 ${row.userId}`);
+    assert.equal(row.total, same.total, `${row.userId} 的 total 两边必须完全相同`);
+  }
+  assert.equal(agg.byUser.u_x.total, 12, '有 rollup 行时以 rollup 为准（12，不是 10+12）');
+  assert.equal(agg.byUser.u_y.total, 0, '未知 kind 不计入');
+  assert.equal(board.rows.find((r) => r.userId === 'u_y')?.total, 0, '未知 kind 在榜单上也不计入');
+  assert.ok(!('null' in agg.byUser), '不产出 null 键');
+  assert.deepEqual(
+    board.rows.find((r) => r.userId === 'u_x').byKind,
+    { stage_rank: 10, personal_rollup: 12 },
+    '分项来源（byKind）必须真的给出来 —— 榜单要能看出分从哪来',
+  );
+  assert.equal(board.excludedEntries, 1, '口径外的那一行计入排除条数（不静默）');
+});
+
+test('★ 口径真的来自规则文件本身（rules/points.json 的 personal 组）', () => {
+  const { rules } = loadRules(rulesDir);
+  const { db, close, dataDir } = setup();
+  syncPoolTalents({ db, editionId: 'ed_1', now: NOW, rules: { points: rules.points } });
+  const row = db.prepare('SELECT total_points AS p FROM pool_talents WHERE user_id = ?').get('u_a');
+  // u_a 的流水：stage_rank 10 + mvp 5 + 另一届的 stage_rank 8 = 23
+  assert.equal(row.p, 23, '按仓库自带的规则文件算，u_a 是 23（mvp 与 roadshow 都在白名单里）');
+  cleanup(db, close, dataDir);
+});
+
+test('★ rollupKind 是配置项：真的被读到了（换成另一个合法 kind，口径就变）', () => {
+  const { db, close, dataDir } = setup(`
+    INSERT INTO points_ledger (id, edition_id, stage_id, team_id, user_id, kind, points, created_at)
+    VALUES ('pl_ub_rank', 'ed_1', 'st_1', 'tm_2', 'u_b', 'stage_rank', 4, '2026-10-10T00:00:00.000Z'),
+           ('pl_roll', 'ed_1', 'st_1', 'tm_2', 'u_b', 'mvp', 7, '2026-10-14T00:00:00.000Z');
+  `);
+  syncPoolTalents({
+    db,
+    editionId: 'ed_1',
+    now: NOW,
+    rules: { points: { personal: { atomicKinds: ['stage_rank', 'mvp'], rollupKind: 'mvp' } } },
+  });
+  // u_b 的流水：stage_rank 4 + mvp 7 —— rollupKind 指向 mvp ⇒ 以 mvp 之和（7）为准，不是 4+7
+  const row = db.prepare('SELECT total_points AS p FROM pool_talents WHERE user_id = ?').get('u_b');
+  assert.equal(row.p, 7, 'rollupKind=mvp ⇒ 以 mvp 之和为准（rollupKind 必须真的被读到）');
+  cleanup(db, close, dataDir);
+});
+
+test('★ 派生源读取必须把 rowid 带出来（域函数同刻并列的兜底键）', () => {
+  const { db, close, dataDir } = setup();
+  const tiers = poolSourcesRepo.listEditionTierRecords(db, 'ed_1');
+  assert.equal(tiers.length, 2);
+  for (const r of tiers) {
+    assert.ok(Number.isFinite(r.rowid), '段位记录必须带 rowid —— 域函数靠它做同刻并列的显式比较');
+  }
+  const regs = poolSourcesRepo.listEditionRegistrations(db, 'ed_1');
+  assert.equal(regs.length, 1);
+  for (const r of regs) {
+    assert.ok(Number.isFinite(r.rowid), '报名记录必须带 rowid');
+  }
+  cleanup(db, close, dataDir);
+});
+
+test('★ 派生源读取的排序：同刻并列必须有确定性兜底键（⛔ 不得用随机 UUID 的 id 列）', () => {
+  // ⚠️ 这是**源码扫描**测试（不是行为测试）：排序键相等时 SQLite **不保证**返回顺序，
+  //    而「不保证」的东西没法用行为断言钉住 —— 只能把「必须带兜底键」这条纪律本身钉住。
+  //    背景：points_ledger / tier_records / registrations 的 id 列全是 randomUUID()
+  //    （src/db/repo/points.js、tiers.js、registrations.js 的头部注释同款纪律），
+  //    拿它当排序兜底键 ⇒ 同一批写入的记录顺序逐次运行都不同 ⇒ 不可复算。
+  const src = readFileSync(join(here, '..', 'src', 'db', 'repo', 'pool-sources.js'), 'utf8');
+  const orders = [...src.matchAll(/ORDER BY ([^\n`]+)/g)].map((m) => m[1].trim());
+  assert.ok(orders.length >= 4, `扫描器必须真的扫到 ORDER BY（防「一条都不判违规」的假绿）：${JSON.stringify(orders)}`);
+  for (const o of orders) {
+    assert.ok(
+      !/(computed_at|created_at)[^,]*,\s*id\s*$/.test(o),
+      `ORDER BY ${o} 用了 id 列当兜底键 —— 那三张表的 id 是 randomUUID（顺序逐次运行都不同）`,
+    );
+  }
+  for (const needle of [
+    'ORDER BY tr.team_id, tr.computed_at, tr.rowid',
+    'FROM registrations WHERE edition_id = ? ORDER BY user_id, created_at, rowid',
+    'FROM points_ledger WHERE user_id = ? ORDER BY created_at, rowid',
+  ]) {
+    assert.ok(src.includes(needle), `pool-sources.js 必须保留确定性兜底键：${needle}`);
+  }
+});
+
+// ── M-1：写后自检必须在事务内 ───────────────────────────────────────
+
+test('★ 写后自检不一致时：脏值必须被回滚（自检在 withTransaction 内）', () => {
+  const { db, close, dataDir } = setup();
+  syncPoolTalents({ db, editionId: 'ed_1', now: NOW });
+  const before = db.prepare('SELECT total_points AS p FROM pool_talents WHERE user_id = ?').get('u_a');
+  db.exec(`
+    CREATE TRIGGER trg_corrupt AFTER UPDATE ON pool_talents
+    BEGIN
+      UPDATE pool_talents SET total_points = total_points + 1 WHERE rowid = NEW.rowid;
+    END;
+  `);
+  assert.throws(
+    () => syncPoolTalents({ db, editionId: 'ed_1', now: NOW }),
+    (e) => e?.status === 500 && e?.code === 'POOL_TALENT_POINTS_MISMATCH',
+  );
+  const after = db.prepare('SELECT total_points AS p FROM pool_talents WHERE user_id = ?').get('u_a');
+  assert.equal(
+    after.p, before.p,
+    '不一致时整批写入必须回滚 —— 自检在事务外的话，脏值已经提交了',
+  );
+  cleanup(db, close, dataDir);
+});
+
+// ── M-2：跨届期连带写入要单独计数 ───────────────────────────────────
+
+test('同步计数：跨届期连带写入单独计数（updatedOtherEditions）', () => {
+  const { db, close, dataDir } = setup();
+  syncPoolTalents({ db, editionId: 'ed_1', now: NOW });
+  // u_a 的积分流水跨 ed_1 / ed_2 两届 ⇒ 同步任一届都会把两届的行都刷新
+  const second = syncPoolTalents({ db, editionId: 'ed_2', now: NOW });
+  assert.equal(second.inserted, 1, '本届时新建一行');
+  assert.equal(second.updated, 0, '本届时没有可更新的行');
+  assert.equal(second.updatedOtherEditions, 1, '别届期被连带刷新的那一行单独计数（原来完全不计数）');
+  const third = syncPoolTalents({ db, editionId: 'ed_1', now: NOW });
+  assert.equal(third.updated, 1, '本届时那一行算 updated');
+  assert.equal(third.updatedOtherEditions, 1, '别届期那一行算 updatedOtherEditions（不混进 updated）');
+  cleanup(db, close, dataDir);
 });

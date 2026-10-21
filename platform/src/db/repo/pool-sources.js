@@ -4,6 +4,15 @@
 //   pool_talents   ← points_ledger 聚合（+ users / registrations 取档案）
 //   pool_resources ← task_packages（企业侧资源）
 // ⛔ 只读。本文件不写任何表 —— 派生源是上游阶段的事实，本阶段只能读。
+//
+// ⚠️ 排序兜底键一律用 **SQLite 隐式 rowid**（写入次序），⛔ 不用 `id` 列：
+//    这几张表的 id 全是 randomUUID()（src/db/repo/points.js、tiers.js、registrations.js
+//    的头部注释都写明了同一条纪律）—— 拿随机 UUID 当排序键 ⇒ 同一批写入的记录
+//    顺序逐次运行都不同 ⇒ 榜单不可复算。
+//    依据：硬约束「任何排序兜底键不得用随机 UUID」+ src/db/repo/points.js 的
+//    `ORDER BY created_at ASC, rowid ASC` 同款口径。
+//    ⛔ rowid 必须**同时**出现在 SELECT 里：域函数要靠它做同刻记录的显式比较，
+//    这样「同一份数据无论以什么顺序喂进纯函数，结果都一样」。
 export function getEdition(db, editionId) {
   return db.prepare('SELECT * FROM editions WHERE id = ?').get(editionId) ?? null;
 }
@@ -57,14 +66,20 @@ export function listStageResultsWithTeams(db, stageId) {
 }
 
 // tier_records 没有 edition_id → 通过 teams 关联到届期
+// ⚠️ ORDER BY 必须带**兜底键**：同一支队的两条段位记录可能 computed_at 完全相同
+//    （tier_records 没有 (team_id, computed_at) 唯一约束，重算日志天然允许同刻）。
+//    排序键相等时 SQLite **不保证**返回顺序 ⇒ 「取哪条」本来是不确定的。
+//    兜底键用 rowid（写入次序）⇒ 与 src/db/repo/tiers.js 的
+//    `ORDER BY computed_at DESC, rowid DESC` 同一口径（同刻时后写入的那条算数）。
 export function listEditionTierRecords(db, editionId) {
   return db
     .prepare(
-      `SELECT tr.team_id, tr.tier, tr.milestone_count, tr.business_signoff_count, tr.computed_at, tr.deleted_at
+      `SELECT tr.team_id, tr.tier, tr.milestone_count, tr.business_signoff_count, tr.computed_at, tr.deleted_at,
+              tr.rowid AS rowid
          FROM tier_records tr
          JOIN teams t ON t.id = tr.team_id
         WHERE t.edition_id = ?
-        ORDER BY tr.team_id, tr.computed_at`,
+        ORDER BY tr.team_id, tr.computed_at, tr.rowid`,
     )
     .all(editionId);
 }
@@ -73,7 +88,7 @@ export function listEditionLedger(db, editionId) {
   return db
     .prepare(
       `SELECT id, edition_id, stage_id, team_id, user_id, kind, points, created_at
-         FROM points_ledger WHERE edition_id = ? ORDER BY user_id, created_at, id`,
+         FROM points_ledger WHERE edition_id = ? ORDER BY user_id, created_at, rowid`,
     )
     .all(editionId);
 }
@@ -83,7 +98,7 @@ export function listUserLedger(db, userId) {
   return db
     .prepare(
       `SELECT id, edition_id, stage_id, team_id, user_id, kind, points, created_at
-         FROM points_ledger WHERE user_id = ? ORDER BY created_at, id`,
+         FROM points_ledger WHERE user_id = ? ORDER BY created_at, rowid`,
     )
     .all(userId);
 }
@@ -101,8 +116,9 @@ export function listAllUsers(db) {
 export function listEditionRegistrations(db, editionId) {
   return db
     .prepare(
-      `SELECT id, user_id, dimension_scores_json, level, created_at, deleted_at
-         FROM registrations WHERE edition_id = ? ORDER BY user_id, created_at`,
+      `SELECT id, user_id, dimension_scores_json, level, created_at, deleted_at,
+              rowid AS rowid
+         FROM registrations WHERE edition_id = ? ORDER BY user_id, created_at, rowid`,
     )
     .all(editionId);
 }

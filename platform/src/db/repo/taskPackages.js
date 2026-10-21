@@ -9,6 +9,17 @@ const UPDATABLE = new Set([
   'commitment', 'agreement', 'approved_by', 'approved_at', 'meta_json',
 ]);
 
+/**
+ * task_packages.status 的**取值域**。
+ * 唯一写入方是 src/services/taskPackage.js 的状态机：
+ *   submitted → assessed → published | returned →（补短板后）assessed → …
+ * （该服务里的 ASSESSABLE / APPROVABLE 是本表的子集。）
+ * ⚠️ 为什么要把它单列一份：配置里 rules.pools.packageStatusFilter 会**按 status 过滤**，
+ *    写错一个拼写 ⇒ 过滤掉全部任务包 ⇒ 资源池空掉且**不报任何错**。
+ *    src/config.js 的 fail-fast 交叉引用校验读的就是这份清单。
+ */
+export const TASK_PACKAGE_STATUSES = ['submitted', 'assessed', 'returned', 'published'];
+
 export function createTaskPackage(db, {
   editionId,
   enterpriseId = null,

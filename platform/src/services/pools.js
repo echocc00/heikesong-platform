@@ -87,7 +87,10 @@ export function syncPoolProjects({ db, editionId, now, rules }) {
 export function syncPoolTalents({ db, editionId, now, rules }) {
   const at = nowIso(now);
   requireEdition(editionId);
-  const pointsConfig = rules?.pools;
+  // ⚠️ 个人积分口径的**唯一规则来源**是 rules.points（personal 组）：
+  //    规则曾散在 rules.pools.talentPointKinds 与 rules.points.personal 两处，
+  //    两处口径还不一样 ⇒ 现在只认 rules.points（见 src/domain/personal-points.js）。
+  const pointsConfig = rules?.points;
 
   const editionUsers = srcRepo.listEditionUsers(db, editionId);
   const ledger = [];
@@ -100,7 +103,7 @@ export function syncPoolTalents({ db, editionId, now, rules }) {
     pointsConfig,
   });
 
-  const result = withTransaction(db, () => {
+  return withTransaction(db, () => {
     const allRows = poolRepo.listPoolTalentRows(db, null);
     const rowsOfUser = new Map();
     for (const r of allRows) {
@@ -109,6 +112,10 @@ export function syncPoolTalents({ db, editionId, now, rules }) {
     }
     let inserted = 0;
     let updated = 0;
+    // 跨届期连带写入的计数：同一个人**别的届期**的行也被一起刷新了
+    // （保证「同一人在任何一行里的积分都相同」）—— 这部分写入原来**不计数**，
+    // 同步结果里看不见 ⇒ 误以为「什么都没写」。单列一个计数，不混进 updated。
+    let updatedOtherEditions = 0;
     for (const row of rows) {
       const mine = rowsOfUser.get(row.userId) ?? [];
       const inThisEdition = mine.find((r) => r.edition_id === editionId);
@@ -148,6 +155,7 @@ export function syncPoolTalents({ db, editionId, now, rules }) {
           stagesJoined: row.stagesJoined,
           skillsJson: JSON.stringify(row.skills),
         });
+        updatedOtherEditions += 1;
       }
     }
     // 本届时不再成立的人（没有积分记录了）从本届时移除
@@ -159,24 +167,28 @@ export function syncPoolTalents({ db, editionId, now, rules }) {
       poolRepo.deletePoolTalent(db, r.id);
       removed += 1;
     }
-    return { editionId, inserted, updated, removed, total: rows.length, at, warnings };
-  });
 
-  // ⭐ 唯一真源自检：写入后用【同一个】纯函数重算比对
-  for (const r of poolRepo.listPoolTalentRows(db, editionId)) {
-    const expect = aggregatePersonalPoints({
-      ledger: srcRepo.listUserLedger(db, r.user_id),
-      pointsConfig,
-    }).byUser[r.user_id];
-    if (!expect || Math.abs(expect.total - r.total_points) > 1e-9) {
-      throw appError(
-        500,
-        'POOL_TALENT_POINTS_MISMATCH',
-        `人才池积分与积分流水不一致：${r.user_id}（派生值必须只有一个计算点）`,
-      );
+    // ⭐ 唯一真源自检：写入后用【同一个】纯函数重算比对。
+    // ⚠️ **必须在 withTransaction 回调内**：放在事务外时，事务已经 RELEASE，
+    //    此时抛错只能让调用方看到 500，**脏值已经提交**（自检形同虚设）。
+    //    放在事务内抛错 ⇒ SAVEPOINT 回滚 ⇒ 脏值一条都不落地。
+    for (const r of poolRepo.listPoolTalentRows(db, editionId)) {
+      const expect = aggregatePersonalPoints({
+        ledger: srcRepo.listUserLedger(db, r.user_id),
+        pointsConfig,
+      }).byUser[r.user_id];
+      if (!expect || Math.abs(expect.total - r.total_points) > 1e-9) {
+        throw appError(
+          500,
+          'POOL_TALENT_POINTS_MISMATCH',
+          `人才池积分与积分流水不一致：${r.user_id}（派生值必须只有一个计算点）`,
+        );
+      }
     }
-  }
-  return result;
+    return {
+      editionId, inserted, updated, updatedOtherEditions, removed, total: rows.length, at, warnings,
+    };
+  });
 }
 
 /** 资源池同步：task_packages → pool_resources（按企业 × 类型分组）。 */

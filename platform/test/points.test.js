@@ -101,30 +101,37 @@ test('★ computePersonalPoints：终生上榜 + MVP 投决积分可开关 + 122
     { id: 'l1', userId: 'u_1', kind: 'stage_rank', points: 10 },
     { id: 'l2', userId: 'u_1', kind: 'mvp', points: 31 },
     { id: 'l3', userId: 'u_2', kind: 'stage_rank', points: 10 },
-    { id: 'l4', userId: 'u_3', kind: 'personal_rollup', points: 99 },   // 派生快照，不重复累加
+    { id: 'l4', userId: 'u_3', kind: 'personal_rollup', points: 99 },   // 汇总快照：有它就以它为准
     { id: 'l5', userId: 'u_4', kind: 'stage_rank', points: 10 },
     { id: 'l6', userId: 'u_5', kind: 'stage_rank', points: 5 },
   ];
   const on = computePersonalPoints({ ledger, pointsConfig: P });
   assert.equal(on.lifetime, true);
   assert.equal(on.includeMvpVote, true);
-  assert.equal(on.rows[0].userId, 'u_1');
-  assert.equal(on.rows[0].total, 41, '赛段积分 + MVP 投决积分');
-  assert.equal(on.rows[0].byKind.stage_rank, 10);
-  assert.equal(on.rows[0].byKind.mvp, 31);
-  assert.ok(!on.rows.some((r) => r.userId === 'u_3'), 'personal_rollup 不参与累加');
-  assert.equal(on.excludedEntries, 1, 'personal_rollup 计入排除条数');
-  // 1224 式并列：u_2 与 u_4 都是 10 分 → 并列第 2；下一个（u_5，5 分）名次跳到 4
-  assert.deepEqual(on.rows.map((r) => r.rank), [1, 2, 2, 4], '同分并列 → 1224（并列后名次跳号）');
+  // ⚠️ 口径（P5 修复轮 I-3 统一后的**唯一**口径，见 src/domain/personal-points.js）：
+  //    「有 personal_rollup 行 ⇒ 以 rollup 为准；否则 ⇒ atomic 白名单之和」。
+  //    原来本函数**排除** personal_rollup、且**任何 kind 都计入** —— 与人才池那套
+  //    口径算出的是两个不同的名次（同一份流水 ⇒ 两处不一致）。
+  assert.equal(on.rows[0].userId, 'u_3', 'rollup 99 分排第一');
+  assert.equal(on.rows[0].total, 99, '有 rollup 行时以 rollup 为准（不是 10+99 也不是 0）');
+  assert.equal(on.rows[0].byKind.personal_rollup, 99, '分项来源看得见');
+  const u1 = on.rows.find((r) => r.userId === 'u_1');
+  assert.equal(u1.total, 41, '赛段积分 + MVP 投决积分');
+  assert.equal(u1.byKind.stage_rank, 10);
+  assert.equal(u1.byKind.mvp, 31);
+  assert.equal(on.excludedEntries, 0, 'rollup 行与 atomic 行都已被计入（rollup 决定 total、atomic 进 breakdown）');
+  // 1224 式并列：u_2 与 u_4 都是 10 分 → 并列第 3；下一个（u_5，5 分）名次跳到 5
+  assert.deepEqual(on.rows.map((r) => r.rank), [1, 2, 3, 3, 5], '同分并列 → 1224（并列后名次跳号）');
 
   const off = computePersonalPoints({
-    ledger, pointsConfig: { ...P, personal: { lifetime: true, includeMvpVote: false } },
+    ledger, pointsConfig: { ...P, personal: { ...P.personal, lifetime: true, includeMvpVote: false } },
   });
-  assert.equal(off.rows[0].total, 10, '关闭 MVP 投决积分后只剩赛段积分');
-  assert.equal(off.excludedEntries, 2, '关掉 MVP 投决后，personal_rollup 与 mvp 两类都计入排除');
+  const u1off = off.rows.find((r) => r.userId === 'u_1');
+  assert.equal(u1off.total, 10, '关闭 MVP 投决积分后只剩赛段积分');
+  assert.equal(off.excludedEntries, 1, '只有被关掉的 mvp 那一行没被计入');
   assert.equal(off.includeMvpVote, false);
-  // 关掉 MVP 投决后 u_1 / u_2 / u_4 都是 10 分 → 三方并列第 1，u_5（5 分）名次跳到 4
-  assert.deepEqual(off.rows.map((r) => r.rank), [1, 1, 1, 4], '三方并列 → 同名次，下一名跳号');
+  // 关掉 MVP 投决后 u_1 / u_2 / u_4 都是 10 分 → 三方并列第 2，u_5（5 分）名次跳到 5
+  assert.deepEqual(off.rows.map((r) => r.rank), [1, 2, 2, 2, 5], '三方并列 → 同名次，下一名跳号');
 });
 
 test('★ R-JDG-20：并列共享奖金，总额不变', () => {
@@ -357,21 +364,27 @@ test('computePersonalPoints：同分时按 userId 码位序稳定排序（不靠
   assert.deepEqual(out.rows.map((r) => r.userId), ['u_a', 'u_b']);
 });
 
-test('computePersonalPoints：无 userId 的条目不参与累加；无 kind 记为 unknown', () => {
+test('computePersonalPoints：无 userId 的条目不参与累加；口径外的 kind 不计入并告警', () => {
   const out = computePersonalPoints({
     ledger: [
       { id: 'l1', kind: 'stage_rank', points: 5 },          // 没有 userId → 跳过
-      { id: 'l2', userId: 'u_1', points: 7 },              // 没有 kind → unknown
+      { id: 'l2', userId: 'u_1', points: 7 },              // 没有 kind → unknown（不在白名单里）
       { id: 'l3', userId: 'u_2' },                         // 缺 points → 按 0 计
     ],
     pointsConfig: P,
   });
   assert.equal(out.rows.length, 2);
   assert.equal(out.rows[0].userId, 'u_1');
-  assert.equal(out.rows[0].total, 7);
-  assert.equal(out.rows[0].byKind.unknown, 7);
+  // ⚠️ 口径（P5 修复轮 I-3 统一后）：口径外的 kind **不计入**（原来本函数是「任何 kind 都计入」）
+  assert.equal(out.rows[0].total, 0, 'unknown 不在白名单里 ⇒ 不计入（不是 7）');
+  assert.deepEqual(out.rows[0].byKind, {}, '没被计入的 kind 不进 byKind');
   assert.equal(out.rows[1].userId, 'u_2');
   assert.equal(out.rows[1].total, 0, '缺 points 按 0 计（不产生 NaN）');
+  assert.equal(out.excludedEntries, 3, '三行都没被计入：l1 无 userId、l2 与 l3 的 kind 是 unknown');
+  assert.ok(
+    out.warnings.some((w) => w.code === 'points_kind_ignored' && w.userId === 'u_1' && w.kind === 'unknown'),
+    '口径外的 kind 必须显式告警（不静默），且 kind 要能看出是什么',
+  );
 });
 
 test('★ computePrizeShares：奖金表缺该名次时按 0 计（总额不产生 NaN）', () => {

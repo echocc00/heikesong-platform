@@ -5,7 +5,12 @@
   "stagePoints": [10, 8, 5],
   "stagePointsOnlyTopN": 3,
   "mvp": { "stagesCounted": 4, "roadshowWeight": 1.0, "perPackage": 1 },
-  "personal": { "lifetime": true, "includeMvpVote": true },
+  "personal": {
+    "lifetime": true,
+    "includeMvpVote": true,
+    "atomicKinds": ["stage_rank", "mvp", "roadshow"],
+    "rollupKind": "personal_rollup"
+  },
   "tieRankStyle": "1224",
   "prizeStructure": {
     "resourceToCashRatio": 1.55,
