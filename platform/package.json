@@ -8,6 +8,11 @@
     "start": "node --disable-warning=ExperimentalWarning src/server.js",
     "test": "node --disable-warning=ExperimentalWarning --test",
     "migrate": "node --disable-warning=ExperimentalWarning scripts/migrate.js",
-    "seed": "node --disable-warning=ExperimentalWarning scripts/seed.js"
+    "seed": "node --disable-warning=ExperimentalWarning scripts/seed.js",
+    "backup": "node --disable-warning=ExperimentalWarning scripts/backup.js",
+    "restore": "node --disable-warning=ExperimentalWarning scripts/restore.js",
+    "build:demo": "node --disable-warning=ExperimentalWarning scripts/build-demo.js",
+    "serve:demo": "node --disable-warning=ExperimentalWarning scripts/serve-demo.js",
+    "audit": "node --disable-warning=ExperimentalWarning scripts/audit-scan.js"
   }
 }

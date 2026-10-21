@@ -5712,24 +5712,66 @@ git commit -m "feat(P6): 演示版适配器扩展为完整流程（浏览器内�
 >
 > **静态站怎么带上规则引擎**（不需要打包器）：
 > `web/api.demo.js` 里写的是 `import { scoreStage } from '../src/domain/scoring.js'`。
-> 在浏览器里，这个说明符从 `/api.demo.js` 解析出来是 **`/src/domain/scoring.js`**（URL 里 `..` 到根就被截断）。
-> → 所以构建时把 `platform/src/domain/*.js` 原样拷到 **`web/dist/src/domain/`**，
+> → 构建时把 `platform/src/domain/*.js` 原样拷到 **`web/dist/src/domain/`**，
 > 把 `platform/rules/*.json` 拷到 **`web/dist/rules/`**，构建产物就是自包含的静态站。
 > **⚠️ 领域层里的相对 import（`./normalization.js`）在拷贝后依然成立**（整目录原样拷，结构不变）。
+>
+> **⚠️ 产物目录必须【镜像 platform/ 的树】，不能把 web/ 平铺到产物根**（D5-13 的解法，2026-10-21 修正）：
+> 平铺（适配器放 `web/dist/api.demo.js`）时，适配器里 `'../src/domain/'` 这个相对导入会**跑出站点**
+> ——浏览器只在**源站根**才把 `..` 截断，站点一旦挂在子路径下（`/demo/`）就变成 `/src/domain/`
+> ⇒ 404 ⇒ 演示站白屏；`file://` 下更会直接落到产物目录外面。
+> ⇒ 正确布局（**每个相对基准都指得到文件**，见 Task 6 实施台账 D5-13 一节）：
+> ```
+> web/dist/index.html            ← 入口页（静态托管的硬要求：根目录必须有 index.html）
+> web/dist/web/…                 ← 适配器与前端（适配器在 web/dist/web/api.demo.js）
+> web/dist/web/seed/…            ← 种子（SEED_URL 的来源基准 = 相对 web/）
+> web/dist/seed/…                ← 同一份种子（浏览器 fetch() 相对【文档基准】取的是这份）
+> web/dist/rules/…               ← 规则（RULES_BASE 的来源基准 = 相对 platform/ = 适配器的父目录）
+> web/dist/src/domain/…          ← 领域层（适配器 '../src/domain/' 的落点，**在产物内**）
+> ```
+> ⇒ 「相对 web/」与「相对 platform/」两个基准**同时**满足（D5-13），
+> 且站点挂在任意 base path 下都不会 404。
 
 - [ ] **Step 1: 写失败的测试**
 
 `platform/test/demo-static.test.js`：
 
 ```javascript
+// platform/test/demo-static.test.js —— 演示版静态站（构建产物 / 相对路径 / 两个相对基准）
+//
+// 溯源需求：R-OPS-06（公网可访问：演示站静态产物 + 相对基准）｜R-OPS-01/07（零 npm 依赖 / 可移植）
+//
+// 依据：P6 计划 Task 6；计划开头的 Global Constraints「领域层约束」
+//
+// ⚠️ 本文件守三件事：
+//   ① 产物目录是**自包含静态站**：根目录有 index.html，资源路径是相对路径
+//      （静态托管可能挂在任意 base path 下，绝对路径会全挂）。
+//   ② 领域层**浏览器安全**：不得 import Node 内置模块 / 裸模块名 ——
+//      这条是 Global Constraints 的硬约束，由构建脚本在构建时强制校验（机器守住，不靠自觉）。
+//   ③ **D5-13：两个相对基准必须同时满足** ——
+//      种子 `SEED_URL = './seed/demo-data.json'` 相对 **web/**，
+//      规则 `RULES_BASE = './rules/'` 相对 **platform/**（= 适配器的父目录），
+//      两个基准不同 ⇒ 产物目录布局必须让两种解析方式都指得到文件。
+//      ⇒ 解法：产物目录**镜像 platform/ 的结构**：
+//        <out>/web/api.demo.js   ← 适配器（模块目录基准 = 源码里的 web/）
+//        <out>/web/seed/…        ← 种子（SEED_URL 的来源基准）
+//        <out>/rules/…           ← 规则（RULES_BASE 的来源基准 = 适配器的父目录）
+//        <out>/src/domain/…      ← 领域层（适配器 '../src/domain/' 的落点，在产物内）
+//        <out>/seed/…            ← 种子的第二份（浏览器 fetch() 相对**文档基准**取的那份）
+//      下面的用例把这条**钉死**：改了布局（挪适配器 / 少拷一份）就会红。
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, readFileSync, existsSync, readdirSync, statSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, existsSync, readdirSync, statSync, writeFileSync, mkdirSync, copyFileSync, cpSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, dirname, relative, sep } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { buildDemoSite, assertDomainIsBrowserSafe } from '../scripts/build-demo.js';
-import { DEMO_RULE_FILES } from '../web/api.demo.js';
+import { join, dirname, relative, resolve, sep } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { spawn } from 'node:child_process';
+import net from 'node:net';
+import http from 'node:http';
+import { buildDemoSite, assertDomainIsBrowserSafe, collectBrowserModules } from '../scripts/build-demo.js';
+import { DEMO_RULE_FILES, SEED_URL, RULES_BASE } from '../web/api.demo.js';
+import { loadRules } from '../src/config.js';
+import { serveStatic } from '../src/http/static.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const platformDir = join(here, '..');
@@ -5750,8 +5792,8 @@ test('构建产物是自包含静态站：根目录有 index.html，且没有绝
 
   const html = readFileSync(join(out, 'index.html'), 'utf8');
   assert.doesNotMatch(html, /(src|href)="\//, '⛔ 资源路径不能以 / 开头（换 base path 会全挂）');
-  assert.match(html, /\.\/app\.js/);
-  assert.match(html, /\.\/styles\.css/);
+  assert.match(html, /\.\/web\/app\.js/);
+  assert.match(html, /\.\/web\/styles\.css/);
 
   rmSync(out, { recursive: true, force: true });
 });
@@ -5763,7 +5805,7 @@ test('构建产物带上领域层与规则配置（浏览器里才跑得起来�
   assert.ok(existsSync(join(out, 'src', 'domain', 'scoring.js')), '领域层必须拷进产物');
   assert.ok(existsSync(join(out, 'rules', 'scoring-final.json')), '规则配置必须拷进产物');
   assert.ok(existsSync(join(out, 'seed', 'demo-data.json')), '种子数据必须拷进产物');
-  assert.ok(existsSync(join(out, 'api.demo.js')), '演示适配器必须在产物里');
+  assert.ok(existsSync(join(out, 'web', 'api.demo.js')), '演示适配器必须在产物里');
 
   for (const file of Object.values(DEMO_RULE_FILES)) {
     assert.ok(existsSync(join(out, 'rules', file)), `规则文件 ${file} 必须拷进产物`);
@@ -5784,7 +5826,53 @@ test('守卫真的会拦下 Node 内置模块的导入', () => {
   const violations = assertDomainIsBrowserSafe(dir);
   assert.equal(violations.length, 1);
   assert.ok(violations[0].includes('node:fs'));
+  assert.ok(violations[0].includes('Node 内置模块'), '必须说清是 Node 内置模块（换个说法也算违规，但排查的人会看不懂）');
   rmSync(dir, { recursive: true, force: true });
+});
+
+test('守卫也会拦下跨行的 Node 内置模块导入与裸模块名（格式化器会把 import 拆成多行）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hks-dom-'));
+  // ⚠️ 跨行 import：prettier 之类会把长的 import 列表拆成多行 ——
+  //    只认单行的抽取器会漏掉它 ⇒ 守卫形同虚设 ⇒ 浏览器里才炸。
+  writeFileSync(
+    join(dir, 'multi.js'),
+    "import {\n  readFileSync,\n  writeFileSync,\n} from 'node:fs';\nexport const x = readFileSync;\n",
+    'utf8',
+  );
+  const multi = assertDomainIsBrowserSafe(dir);
+  assert.equal(multi.length, 1, `跨行的 node:fs 必须被拦下：${JSON.stringify(multi)}`);
+  assert.ok(multi[0].includes('node:fs'));
+  assert.ok(multi[0].includes('Node 内置模块'), '必须说清是 Node 内置模块');
+
+  const dir2 = mkdtempSync(join(tmpdir(), 'hks-dom-'));
+  writeFileSync(join(dir2, 'bare.js'), "import { lodash } from 'lodash';\nexport const x = lodash;\n", 'utf8');
+  const bare = assertDomainIsBrowserSafe(dir2);
+  assert.equal(bare.length, 1, `裸模块名必须被拦下（浏览器没有 node_modules）：${JSON.stringify(bare)}`);
+  assert.ok(bare[0].includes('lodash'));
+  assert.ok(bare[0].includes('裸模块名'), '必须说清是裸模块名（浏览器没有 node_modules）');
+
+  rmSync(dir, { recursive: true, force: true });
+  rmSync(dir2, { recursive: true, force: true });
+});
+
+test('领域层之外的兄弟目录不得被当成领域层（目录边界按分隔符判，不按前缀判）', () => {
+  const root = mkdtempSync(join(tmpdir(), 'hks-dom-'));
+  const domainDir = join(root, 'domain');
+  const siblingDir = join(root, 'domain-utils');
+  mkdirSync(domainDir, { recursive: true });
+  mkdirSync(siblingDir, { recursive: true });
+  writeFileSync(join(domainDir, 'a.js'), "import { b } from './b.js';\nimport { c } from '../domain-utils/c.js';\nexport const a = b + c;\n", 'utf8');
+  writeFileSync(join(domainDir, 'b.js'), 'export const b = 1;\n', 'utf8');
+  writeFileSync(join(siblingDir, 'c.js'), 'export const c = 1;\n', 'utf8');
+
+  const { domainFiles, extraFiles } = collectBrowserModules(domainDir);
+  // ⚠️ 判别性要点：兄弟目录必须**被引用到**才测得出来 ——
+  //    没被引用的兄弟目录压根不会进遍历，纯前缀比较与按分隔符比较结果一样（测不出差别）。
+  assert.equal(domainFiles.length, 2, 'domain/ 下的两个文件都算领域层');
+  assert.equal(extraFiles.length, 1, 'domain-utils/ 是兄弟目录，只能算「领域层之外」');
+  assert.ok(extraFiles[0].endsWith(join('domain-utils', 'c.js')), '兄弟目录必须落在 extraFiles 里');
+
+  rmSync(root, { recursive: true, force: true });
 });
 
 test('构建产物里不出现 data/ 与 node_modules/（不泄漏本机数据）', () => {
@@ -5794,6 +5882,445 @@ test('构建产物里不出现 data/ 与 node_modules/（不泄漏本机数据�
   assert.ok(!rel.some((f) => f.startsWith('data/')), '产物里不能有 data/');
   assert.ok(!rel.some((f) => f.includes('node_modules')), '产物里不能有 node_modules/');
   rmSync(out, { recursive: true, force: true });
+});
+
+// ══════════════════════════════════════════════════════════════════════
+// D5-13：两个相对基准（相对 web/ 与相对 platform/）必须同时满足
+// ══════════════════════════════════════════════════════════════════════
+
+test('D5-13：产物布局让「模块目录基准」与「模块父目录基准」都指得到文件', () => {
+  const out = mkdtempSync(join(tmpdir(), 'hks-dist-'));
+  buildDemoSite({ outDir: out, platformDir });
+
+  // 产物里适配器的位置 ⇒ 三个基准
+  const adapterDir = join(out, 'web');   // 模块目录基准（源码里 = web/）
+  const siteRoot = out;                  // 模块父目录基准（源码里 = platform/）+ 文档基准（站点根）
+
+  // ── 源码树里这两个基准本来就指得到文件（这里是「保持一致」的对照）──
+  const seedRel = SEED_URL.replace(/^\.\//, '');                 // seed/demo-data.json
+  assert.ok(existsSync(join(platformDir, 'web', seedRel)), '源码树里种子相对 web/');
+  assert.ok(existsSync(join(platformDir, 'rules', 'scoring-final.json')), '源码树里规则相对 platform/');
+
+  // ① 种子：SEED_URL 相对【模块目录】⇒ 产物里必须在 <out>/web/seed/
+  assert.ok(
+    existsSync(join(adapterDir, seedRel)),
+    '种子必须在适配器目录下（SEED_URL 的来源基准 = 相对 web/）',
+  );
+  //    浏览器里 fetch() 相对【文档基准】（文档在站点根）⇒ 还必须在 <out>/seed/
+  assert.ok(
+    existsSync(join(siteRoot, seedRel)),
+    '种子必须在站点根（浏览器按文档基准取到的就是这一份）',
+  );
+
+  // ② 规则：RULES_BASE 相对【模块父目录】（= 源码里的 platform/）⇒ 产物里必须在 <out>/rules/
+  for (const file of Object.values(DEMO_RULE_FILES)) {
+    const rel = (RULES_BASE + file).replace(/^\.\//, '');       // rules/xxx.json
+    assert.ok(
+      existsSync(join(siteRoot, rel)),
+      `规则 ${file} 必须在站点根（= 适配器父目录，RULES_BASE 的来源基准）`,
+    );
+    assert.ok(
+      !existsSync(join(adapterDir, rel)),
+      `规则不在适配器目录下（源码树里 platform/web/rules/ 同样不存在 —— 基准集合必须保持一致）`,
+    );
+  }
+
+  // ③ 领域层：适配器 import '../src/domain/*.js' ⇒ 相对适配器的**父目录**
+  const domainTarget = resolve(adapterDir, '../src/domain/scoring.js');
+  assert.ok(existsSync(domainTarget), '适配器的 ../src/domain/ 必须落在产物里');
+  assert.ok(
+    domainTarget.startsWith(out + sep),
+    '领域层必须落在产物目录内（不能跑到站点外 —— 站点挂在子路径下就会 404 白屏）',
+  );
+
+  rmSync(out, { recursive: true, force: true });
+});
+
+test('D5-13：演示站在浏览器语义下真能起来（文档基准取种子与 12 份规则）', async () => {
+  const out = mkdtempSync(join(tmpdir(), 'hks-dist-'));
+  buildDemoSite({ outDir: out, platformDir });
+
+  const originalFetch = globalThis.fetch;
+  // ⚠️ 浏览器语义：相对 URL 相对**文档基准**解析（不是相对模块、也不是相对 cwd）
+  const docBase = 'http://demo.local/index.html';
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input), docBase);
+    const p = join(out, decodeURIComponent(url.pathname).replace(/^\/+/, ''));
+    if (!existsSync(p)) return { ok: false, status: 404, json: async () => ({}) };
+    const body = readFileSync(p, 'utf8');
+    return { ok: true, status: 200, text: async () => body, json: async () => JSON.parse(body) };
+  };
+
+  try {
+    // 直接跑**产物里**的适配器（它 import 的是产物里的 dist/src/domain/*.js —— 真跑引擎）
+    const mod = await import(pathToFileURL(join(out, 'web', 'api.demo.js')).href);
+    const seed = await mod.loadDemoSeed(SEED_URL);
+    const loaded = await mod.loadDemoRules(RULES_BASE);
+
+    const platformSeed = JSON.parse(readFileSync(join(platformDir, 'web', 'seed', 'demo-data.json'), 'utf8'));
+    assert.deepEqual(seed, platformSeed, '浏览器加载的种子必须与仓库里的是同一份');
+
+    // 规则同源：浏览器加载的 12 份配置 ≡ 正式系统 loadRules() 的结果
+    const { rules } = loadRules(join(platformDir, 'rules'));
+    assert.deepEqual(loaded.scoring.initial, rules.scoring.initial);
+    assert.deepEqual(loaded.scoring.final, rules.scoring.final);
+    assert.deepEqual(loaded.tiebreak, rules.tiebreak);
+    assert.deepEqual(loaded.ranks, rules.ranks);
+    assert.deepEqual(loaded.behavior, rules.behavior);
+    assert.deepEqual(loaded.visibility, rules.visibility);
+    assert.deepEqual(loaded.registration, rules.registration);
+    assert.deepEqual(loaded.solvability, rules.solvability);
+    assert.deepEqual(loaded.milestones, rules.milestones);
+    assert.deepEqual(loaded.teamFormation, rules.teamFormation);
+    assert.deepEqual(loaded.points, rules.points);
+    assert.deepEqual(loaded.criteria, rules.criteria);
+
+    // 引擎真的跑起来（不是只把文件读出来）
+    const runtime = await mod.getDemoRuntime();
+    const health = await runtime.get('/api/health');
+    assert.equal(health.ok, true, '演示运行时必须能起（引擎在浏览器里真跑）');
+  } finally {
+    globalThis.fetch = originalFetch;
+    rmSync(out, { recursive: true, force: true });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════
+// 可移植性：换一份拷贝也得能构建（不许偷偷用脚本所在目录的资源）
+// ══════════════════════════════════════════════════════════════════════
+
+test('构建必须以 platformDir 为准（换一份拷贝也能构建，不许用脚本所在目录的资源）', () => {
+  const root = mkdtempSync(join(tmpdir(), 'hks-port-'));
+  const copyRoot = join(root, 'platform');
+  mkdirSync(copyRoot, { recursive: true });
+  cpSync(join(platformDir, 'rules'), join(copyRoot, 'rules'), { recursive: true });
+  cpSync(join(platformDir, 'src', 'domain'), join(copyRoot, 'src', 'domain'), { recursive: true });
+  cpSync(join(platformDir, 'web'), join(copyRoot, 'web'), {
+    recursive: true,
+    filter: (src) => !src.includes(`${sep}dist${sep}`) && !src.endsWith(`${sep}dist`),
+  });
+  // 副本的入口页带一个标记：构建出来的入口页必须带它 ⇒ 证明用的是副本的资源
+  const copyHtml = join(copyRoot, 'web', 'index.html');
+  writeFileSync(copyHtml, readFileSync(copyHtml, 'utf8').replace('<title>', '<title>【副本】'), 'utf8');
+
+  const out = join(root, 'dist');
+  buildDemoSite({ outDir: out, platformDir: copyRoot });
+
+  const html = readFileSync(join(out, 'index.html'), 'utf8');
+  assert.ok(html.includes('【副本】'), '必须用 platformDir 指定的资源构建（不许回落到脚本所在目录）');
+  assert.ok(existsSync(join(out, 'src', 'domain', 'scoring.js')), '领域层必须来自 platformDir');
+  assert.ok(existsSync(join(out, 'rules', 'scoring-final.json')), '规则必须来自 platformDir');
+
+  rmSync(root, { recursive: true, force: true });
+});
+
+test('构建前必须清空产物目录（陈旧文件不得混进产物）', () => {
+  const out = mkdtempSync(join(tmpdir(), 'hks-dist-'));
+  writeFileSync(join(out, 'stale.txt'), '上一版的残留\n', 'utf8');
+  mkdirSync(join(out, 'old-dir'), { recursive: true });
+  writeFileSync(join(out, 'old-dir', 'x.js'), 'export const x = 1;\n', 'utf8');
+
+  buildDemoSite({ outDir: out, platformDir });
+
+  assert.ok(!existsSync(join(out, 'stale.txt')), '陈旧文件必须被清掉（产物目录每次重建）');
+  assert.ok(!existsSync(join(out, 'old-dir')), '陈旧目录必须被清掉（产物目录每次重建）');
+  assert.ok(existsSync(join(out, 'index.html')), '入口页必须在');
+
+  rmSync(out, { recursive: true, force: true });
+});
+
+test('产物目录落在 web/ 里面时也不能把自己拷进自己（--out 指向 web/ 内部）', () => {
+  // ⚠️ 这是变异检验 M13 实跑炸出来的真缺陷：
+  //    产物目录默认在 web/dist/，靠名字 'dist' 排除就够；
+  //    但 --out 可以指向 web/ 里的**任何**目录 ⇒ 产物会把自己拷进自己 ⇒ 无限递归 ⇒ ENAMETOOLONG。
+  const root = mkdtempSync(join(tmpdir(), 'hks-selfcopy-'));
+  const webCopy = join(root, 'web');
+  cpSync(join(platformDir, 'web'), webCopy, {
+    recursive: true,
+    filter: (src) => !src.endsWith(`${sep}dist`),
+  });
+  const inner = join(webCopy, 'inner-dist');
+  try {
+    buildDemoSite({ outDir: inner, platformDir, webDir: webCopy });
+    assert.ok(existsSync(join(inner, 'index.html')), '构建必须成功');
+    assert.ok(
+      !existsSync(join(inner, 'web', 'inner-dist')),
+      '产物不得把自己拷进自己（否则无限递归）',
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════
+// 站点挂在子路径下（静态托管不一定给根路径）
+// ══════════════════════════════════════════════════════════════════════
+test('产物挂在子路径下也不跑出站点（领域层 / 种子 / 规则都还在站点内）', async () => {
+  const site = mkdtempSync(join(tmpdir(), 'hks-site-'));
+  const dist = join(site, 'dist');
+  buildDemoSite({ outDir: dist, platformDir });
+
+  // 用仓库自己的静态服务器把 site/ 当根 ⇒ 站点实际挂在 /dist/ 下
+  const server = http.createServer((req, res) => {
+    if (req.method === 'GET' && serveStatic(site, req, res)) return;
+    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('404');
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const { port } = server.address();
+  const origin = `http://127.0.0.1:${port}`;
+  try {
+    // 文档在 /dist/index.html ⇒ 文档基准 = /dist/
+    const docUrl = `${origin}/dist/index.html`;
+    const html = await (await fetch(docUrl)).text();
+    assert.match(html, /\.\/web\/app\.js/, '入口页必须用相对路径引用 app.js');
+
+    // 适配器在 /dist/web/api.demo.js ⇒ '../src/domain/' ⇒ /dist/src/domain/（仍在站点内）
+    const domainUrl = new URL('../src/domain/scoring.js', `${origin}/dist/web/api.demo.js`);
+    const domain = await fetch(domainUrl);
+    assert.equal(domain.status, 200, '领域层必须留在站点内（子路径下不能 404 白屏）');
+
+    // 文档基准取种子与规则：/dist/seed/… 与 /dist/rules/…
+    for (const p of ['/dist/seed/demo-data.json', '/dist/rules/scoring-final.json']) {
+      const res = await fetch(`${origin}${p}`);
+      assert.equal(res.status, 200, `${p} 必须能在子路径下取到`);
+    }
+  } finally {
+    server.close();
+    rmSync(site, { recursive: true, force: true });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════
+// 领域层与规则配置挂不挂出去 —— 生产部署口径（默认一律 404）
+// ══════════════════════════════════════════════════════════════════════
+async function freePort() {
+  const srv = net.createServer();
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  const { port } = srv.address();
+  await new Promise((r) => srv.close(r));
+  return port;
+}
+
+/**
+ * 起一个真实的 src/server.js 子进程（端口随机、数据目录在临时区）。
+ * ⚠️ 轮询用的定时器必须**清干净**：残留的 setTimeout 会吊住事件循环
+ *    ⇒ 测试文件跑完还要多等 20 秒才退出（变异检验会被拖慢一个数量级）。
+ */
+async function startServer(env = {}) {
+  const dataDir = mkdtempSync(join(tmpdir(), 'hks-demo-srv-'));
+  const port = await freePort();
+  const child = spawn(
+    process.execPath,
+    ['--disable-warning=ExperimentalWarning', join(platformDir, 'src', 'server.js')],
+    {
+      cwd: platformDir,
+      env: { ...process.env, DATA_DIR: dataDir, PORT: String(port), ...env },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    },
+  );
+  let out = '';
+  child.stdout.on('data', (d) => { out += d.toString(); });
+  child.stderr.on('data', (d) => { out += d.toString(); });
+  const ready = await waitForOutput(child, () => out, (text) => text.includes('启动于'));
+  if (!ready) {
+    child.kill('SIGKILL');
+    rmSync(dataDir, { recursive: true, force: true });
+    throw new Error(`服务没能启动：${out}`);
+  }
+  return {
+    base: `http://127.0.0.1:${port}`,
+    async stop() {
+      child.kill('SIGTERM');
+      await new Promise((r) => setTimeout(r, 200));
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      rmSync(dataDir, { recursive: true, force: true });
+    },
+  };
+}
+
+/** 等子进程输出里出现某段文字（定时器一律清干净，不留残余） */
+function waitForOutput(child, read, match, timeoutMs = 20000) {
+  return new Promise((resolvePromise) => {
+    const timer = setInterval(() => {
+      if (match(read())) { clearInterval(timer); clearTimeout(bail); resolvePromise(true); }
+      if (child.exitCode !== null) { clearInterval(timer); clearTimeout(bail); resolvePromise(false); }
+    }, 50);
+    const bail = setTimeout(() => { clearInterval(timer); resolvePromise(false); }, timeoutMs);
+    bail.unref?.();
+  });
+}
+
+test('默认不挂载：/src/domain/* 与 /rules/* 一律 404（生产部署口径）', async () => {
+  const srv = await startServer({ DEMO_MODE: '' });
+  try {
+    for (const p of ['/rules/scoring-final.json', '/src/domain/scoring.js']) {
+      const res = await fetch(`${srv.base}${p}`);
+      assert.equal(res.status, 404, `${p} 默认必须 404（不设 DEMO_MODE=1 ⇒ 领域层源码与规则配置不外泄）`);
+    }
+  } finally {
+    await srv.stop();
+  }
+});
+
+test('DEMO_MODE=1 才挂载这两个白名单目录（开发服务器的演示模式）', async () => {
+  const srv = await startServer({ DEMO_MODE: '1' });
+  try {
+    const rules = await fetch(`${srv.base}/rules/scoring-final.json`);
+    assert.equal(rules.status, 200, 'DEMO_MODE=1 时规则配置必须挂出来（演示站要能起引擎）');
+    const domain = await fetch(`${srv.base}/src/domain/scoring.js`);
+    assert.equal(domain.status, 200, 'DEMO_MODE=1 时领域层必须挂出来（演示站要能起引擎）');
+    // 白名单之外的一律不放行
+    const other = await fetch(`${srv.base}/src/config.js`);
+    assert.equal(other.status, 404, '只挂这两个白名单目录，不开放整个 platform/');
+  } finally {
+    await srv.stop();
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════
+// 演示版横幅（?demo=1）
+// ══════════════════════════════════════════════════════════════════════
+
+/** 最小 DOM 桩：支持 app.prepend（横幅要插到最前面）与 replaceChildren */
+function installDom(search) {
+  const app = {
+    children: [],
+    innerHTML: '',
+    replaceChildren(el) { this.children = [el]; },
+    prepend(el) { this.children.unshift(el); },
+  };
+  const fakeEl = () => ({
+    className: '',
+    innerHTML: '',
+    textContent: '',
+    value: '',
+    querySelector: () => ({ addEventListener: () => {}, textContent: '', value: '' }),
+    addEventListener: () => {},
+    replaceChildren: () => {},
+  });
+  globalThis.window = { location: { search, hash: '' }, addEventListener: () => {} };
+  globalThis.document = { getElementById: () => app, createElement: () => fakeEl() };
+  return app;
+}
+
+test('演示版横幅：?demo=1 才渲染，正式版不渲染', async () => {
+  const originalFetch = globalThis.fetch;
+  const requested = [];
+  // 浏览器语义 + 开发服务器布局：web/ 在 /，规则配置挂在 /rules/
+  globalThis.fetch = async (input) => {
+    requested.push(String(input));
+    const url = new URL(String(input), 'http://127.0.0.1:8080/');
+    const p = url.pathname.startsWith('/rules/')
+      ? join(platformDir, 'rules', url.pathname.slice('/rules/'.length))
+      : join(platformDir, 'web', url.pathname.replace(/^\/+/, ''));
+    if (!existsSync(p)) return { ok: false, status: 404, text: async () => '{}', json: async () => ({}) };
+    const body = readFileSync(p, 'utf8');
+    return { ok: true, status: 200, text: async () => body, json: async () => JSON.parse(body) };
+  };
+  try {
+    const app = installDom('?demo=1');
+    await import('../web/app.js?v=demo-banner');
+    await new Promise((r) => setTimeout(r, 50));
+    const banner = app.children[0];
+    assert.ok(banner, '演示版必须渲染出横幅');
+    assert.match(String(banner.className), /demo-banner/, '横幅必须带 demo-banner 样式类');
+    assert.match(String(banner.innerHTML), /演示版/, '横幅必须说明这是演示版');
+    assert.match(String(banner.innerHTML), /规则引擎/, '横幅必须说明规则引擎在浏览器里真实运行');
+    // ⚠️ 演示模式必须真的走**演示适配器**（去取种子与规则），不是真实 API
+    assert.ok(
+      requested.some((u) => u.includes('seed/demo-data.json')),
+      `演示模式必须取演示种子（实际请求：${JSON.stringify(requested)}）`,
+    );
+    assert.ok(
+      requested.some((u) => u.includes('rules/')),
+      `演示模式必须取演示规则（实际请求：${JSON.stringify(requested)}）`,
+    );
+
+    // 正式版：同样的 DOM 桩，不带 ?demo=1 ⇒ 没有横幅
+    const app2 = installDom('');
+    await import('../web/app.js?v=no-demo-banner');
+    await new Promise((r) => setTimeout(r, 50));
+    assert.ok(
+      !app2.children.some((el) => String(el.className).includes('demo-banner')),
+      '正式版不得出现演示版横幅',
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('默认产物目录必须是 platform/web/dist（唯一口径 —— F-1 裁决）', () => {
+  const result = buildDemoSite({ platformDir });
+  assert.equal(
+    resolve(result.outDir),
+    resolve(join(platformDir, 'web', 'dist')),
+    '默认产物目录必须是 platform/web/dist（唯一口径）',
+  );
+  assert.ok(existsSync(join(platformDir, 'web', 'dist', 'index.html')), '产物根必须有 index.html');
+});
+
+test('本地预览服务器（scripts/serve-demo.js）真的在 serve 产物目录', async () => {
+  const port = await freePort();
+  const child = spawn(
+    process.execPath,
+    ['--disable-warning=ExperimentalWarning', join(platformDir, 'scripts', 'serve-demo.js')],
+    { env: { ...process.env, PORT: String(port) }, stdio: ['ignore', 'pipe', 'pipe'] },
+  );
+  let out = '';
+  child.stdout.on('data', (d) => { out += d.toString(); });
+  child.stderr.on('data', (d) => { out += d.toString(); });
+  try {
+    const ready = await waitForOutput(child, () => out, (text) => text.includes('演示站本地预览'));
+    assert.ok(ready, `预览服务器必须能启动（子进程输出：${out}）`);
+
+    const base = `http://127.0.0.1:${port}`;
+    const html = await (await fetch(`${base}/`)).text();
+    assert.match(html, /\.\/web\/app\.js/, '预览的必须是产物目录里的入口页');
+    assert.equal((await fetch(`${base}/src/domain/scoring.js`)).status, 200, '领域层必须能直接被浏览器 import');
+    assert.equal((await fetch(`${base}/rules/scoring-final.json`)).status, 200, '规则配置必须能取到');
+    assert.equal((await fetch(`${base}/seed/demo-data.json`)).status, 200, '演示种子必须能取到');
+  } finally {
+    child.kill('SIGTERM');
+    await new Promise((r) => setTimeout(r, 200));
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════
+// 登记：脚本与忽略规则（机器守住，不靠自觉）
+// ══════════════════════════════════════════════════════════════════════
+
+test('规则配置缺失时构建必须失败（绝不静默少一个 —— 演示站会起不了引擎）', () => {
+  const root = mkdtempSync(join(tmpdir(), 'hks-rules-'));
+  const partial = join(root, 'rules');
+  mkdirSync(partial, { recursive: true });
+  // 只拷一部分规则 ⇒ 必须报错
+  for (const file of Object.values(DEMO_RULE_FILES).slice(0, 3)) {
+    copyFileSync(join(platformDir, 'rules', file), join(partial, file));
+  }
+  const out = join(root, 'dist');
+  assert.throws(
+    () => buildDemoSite({ outDir: out, platformDir, rulesDir: partial }),
+    (err) => {
+      assert.match(err.message, /规则配置缺失/, `必须说清是规则配置缺失：${err.message}`);
+      return true;
+    },
+    '规则缺一个就必须构建失败（不能产出一个起不了引擎的演示站）',
+  );
+  rmSync(root, { recursive: true, force: true });
+});
+
+test('package.json 必须登记 P6 的脚本，.gitignore 必须忽略产物目录', () => {
+  const pkg = JSON.parse(readFileSync(join(platformDir, 'package.json'), 'utf8'));
+  for (const s of ['backup', 'restore', 'build:demo', 'serve:demo', 'audit']) {
+    assert.ok(pkg.scripts?.[s], `package.json 缺脚本：${s}`);
+  }
+  const ignore = readFileSync(join(platformDir, '..', '.gitignore'), 'utf8');
+  assert.ok(
+    /^platform\/web\/dist\/$/m.test(ignore),
+    '.gitignore 必须有独立成行的 platform/web/dist/（产物不入库）',
+  );
 });
 ```
 
@@ -5809,6 +6336,8 @@ Expected: FAIL —— `Cannot find module '../scripts/build-demo.js'`
 ```javascript
 // scripts/build-demo.js — 构建公网演示版静态站
 //
+// 溯源需求：R-OPS-06（公网可访问：先出公网演示版）｜R-OPS-01/07（零 npm 依赖 / 可移植）
+//
 // 依据：设计文档 §14.3「公网演示版（现在就能拿到的 URL）」
 //   静态站发布工具只能发布静态文件（要求目录里有 index.html），不能跑 Node 后端。
 //   → 演示版 = 同源静态前端 + web/api.demo.js（localStorage 适配器）+ 浏览器内真实运行的规则引擎。
@@ -5816,6 +6345,16 @@ Expected: FAIL —— `Cannot find module '../scripts/build-demo.js'`
 // ⚠️ 领域层进浏览器的硬约束：src/domain/** 不得 import 任何 Node 内置模块
 //    （node:fs / node:path / node:crypto …），否则浏览器跑不起来。
 //    本脚本在构建时强制校验，违反即构建失败 —— 这条约束由机器守住，不靠自觉。
+//
+// ⚠️ 产物目录布局 = **platform/ 树的镜像**（D5-13 的解法，见 buildDemoSite 的注释）：
+//      <out>/index.html          入口页（静态托管的硬要求：根目录必须有 index.html）
+//      <out>/web/…               适配器与前端（适配器在 <out>/web/api.demo.js）
+//      <out>/web/seed/…          种子（SEED_URL 的来源基准 = 相对 web/）
+//      <out>/seed/…              种子的第二份（浏览器 fetch() 相对**文档基准**取的那份）
+//      <out>/rules/…             规则（RULES_BASE 的来源基准 = 相对 platform/ = 适配器的父目录）
+//      <out>/src/domain/…        领域层（适配器 '../src/domain/' 的落点，在产物内）
+//    ⇒ 「相对 web/」与「相对 platform/」两个基准**同时**指得到文件，
+//      且适配器里 '../src/domain/' 的相对导入不会跑出站点（挂在任意 base path 下都不 404）。
 //
 // 用法：node scripts/build-demo.js [--out web/dist]
 import {
@@ -5827,27 +6366,90 @@ import { DEMO_RULE_FILES } from '../web/api.demo.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
-/** 拷贝一个目录（跳过 exclude 里的顶层名字） */
-function copyDir(from, to, { exclude = [] } = {}) {
+/**
+ * 拷贝一个目录。
+ * @param {string[]} exclude     跳过的顶层名字
+ * @param {Set<string>} excludePaths 跳过的**绝对路径**（用来挡住「产物目录自己」）
+ *   ⚠️ 为什么要按绝对路径挡：产物目录默认在 `web/dist/`，靠名字 'dist' 排除就够；
+ *      但 `--out` 可以指向 `web/` 里的**任何**目录（如 `web/dist2/`）——
+ *      那时按名字排除挡不住 ⇒ 产物会**把自己拷进自己** ⇒ 无限递归 ⇒ ENAMETOOLONG。
+ *      （变异检验 M13 实测炸出来：默认产物目录改成 dist2 后构建直接报 ENAMETOOLONG。）
+ */
+function copyDir(from, to, { exclude = [], excludePaths = new Set() } = {}) {
   mkdirSync(to, { recursive: true });
   for (const entry of readdirSync(from, { withFileTypes: true })) {
     if (exclude.includes(entry.name)) continue;
     const src = join(from, entry.name);
+    if (excludePaths.has(resolve(src))) continue;   // 产物目录自身（无论叫什么名字）
     const dst = join(to, entry.name);
-    if (entry.isDirectory()) copyDir(src, dst);
+    if (entry.isDirectory()) copyDir(src, dst, { excludePaths });
     else copyFileSync(src, dst);
   }
 }
 
-/** 抽出模块里的 import 说明符（静态 import / export from / 动态 import） */
+/**
+ * 去掉注释（块注释 / 行注释），保留字符串字面量。
+ * ⚠️ 为什么要去注释：import 说明符的抽取靠正则，若注释里写着
+ *    「// import { x } from 'node:fs'」也会被抽出来 ⇒ 守卫误报 ⇒ 构建被冤杀。
+ */
+export function stripComments(code) {
+  const out = [];
+  const src = String(code ?? '');
+  let i = 0;
+  let state = 'code'; // code | line | block | sq | dq | tpl
+  const n = src.length;
+  while (i < n) {
+    const c = src[i];
+    const c2 = src[i + 1];
+    if (state === 'code') {
+      if (c === '/' && c2 === '/') { state = 'line'; i += 2; continue; }
+      if (c === '/' && c2 === '*') { state = 'block'; i += 2; continue; }
+      if (c === "'") { state = 'sq'; out.push(c); i += 1; continue; }
+      if (c === '"') { state = 'dq'; out.push(c); i += 1; continue; }
+      if (c === '`') { state = 'tpl'; out.push(c); i += 1; continue; }
+      out.push(c); i += 1;
+      continue;
+    }
+    if (state === 'line') {
+      if (c === '\n') { state = 'code'; out.push('\n'); }
+      i += 1;
+      continue;
+    }
+    if (state === 'block') {
+      if (c === '*' && c2 === '/') { state = 'code'; i += 2; continue; }
+      if (c === '\n') out.push('\n');
+      i += 1;
+      continue;
+    }
+    if (state === 'sq' || state === 'dq') {
+      if (c === '\\') { i += 2; continue; }
+      if ((state === 'sq' && c === "'") || (state === 'dq' && c === '"')) state = 'code';
+      out.push(c); i += 1;
+      continue;
+    }
+    // 模板字符串：${ } 里的代码暂不深挖（领域层不用模板字面量里的 import）
+    if (c === '\\') { i += 2; continue; }
+    if (c === '`') { state = 'code'; out.push(c); i += 1; continue; }
+    out.push(c); i += 1;
+  }
+  return out.join('');
+}
+
+/**
+ * 抽出模块里的 import 说明符（静态 import / export from / 动态 import）。
+ * ⚠️ 允许**跨行**：花括号列表常被格式化器拆成多行
+ *    （import {\n  a,\n  b,\n} from 'node:fs'）——
+ *    只认单行的抽取器会漏掉它 ⇒ 守卫形同虚设 ⇒ 浏览器里才炸。
+ */
 export function extractImportSpecifiers(code) {
   const specs = [];
-  const re1 = /(?:^|\n)\s*(?:import|export)\s[^;'"\n]*?from\s*['"]([^'"]+)['"]/g;
-  const re2 = /(?:^|\n)\s*import\s*['"]([^'"]+)['"]/g;
-  const re3 = /import\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
+  const text = stripComments(code);
+  const re1 = /(?:^|[\n;])\s*(?:import|export)\b[^;'"`]*?\bfrom\s*['"]([^'"]+)['"]/g;
+  const re2 = /(?:^|[\n;])\s*import\s*['"]([^'"]+)['"]/g;
+  const re3 = /\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
   for (const re of [re1, re2, re3]) {
     let m;
-    while ((m = re.exec(code)) !== null) specs.push(m[1]);
+    while ((m = re.exec(text)) !== null) specs.push(m[1]);
   }
   return specs;
 }
@@ -5871,7 +6473,9 @@ export function collectBrowserModules(domainDir) {
     const file = queue.shift();
     if (seen.has(file)) continue;
     seen.add(file);
-    if (file.startsWith(domainDir)) domainFiles.push(file);
+    // ⚠️ 必须按**目录边界**判（在目录后面补一个分隔符再比）——
+    //    纯前缀比较会把兄弟目录 domain-utils/ 也当成领域层（拷错位置）。
+    if (file === domainDir || file.startsWith(domainDir + sep)) domainFiles.push(file);
     else extraFiles.push(file);
 
     const code = readFileSync(file, 'utf8');
@@ -5920,17 +6524,30 @@ export function assertDomainIsBrowserSafe(domainDir) {
 
 /**
  * 构建静态站。
- * 产物结构（自包含）：
- *   <out>/index.html  app.js  api.js  api.demo.js  router.js  store.js  styles.css  views/…
- *   <out>/src/domain/*.js     ← 从 platform/src/domain 整目录原样拷贝
- *   <out>/rules/*.json         ← 从 platform/rules 拷贝
- *   <out>/seed/demo-data.json  ← 从 platform/web/seed 拷贝
+ * 产物结构（自包含，**镜像 platform/ 的树**）：
+ *   <out>/index.html            ← 入口页（静态托管的硬要求：根目录必须有 index.html）
+ *   <out>/web/app.js            ← 前端入口（与适配器同级）
+ *   <out>/web/api.js  api.demo.js  router.js  store.js  escape.js  styles.css  views/…
+ *   <out>/web/seed/demo-data.json ← 从 platform/web/seed 拷贝（SEED_URL 的来源基准）
+ *   <out>/seed/demo-data.json     ← 同一份种子（浏览器按【文档基准】取的是这一份）
+ *   <out>/rules/*.json            ← 从 platform/rules 拷贝（RULES_BASE 的来源基准）
+ *   <out>/src/domain/*.js         ← 从 platform/src/domain 整目录原样拷贝
+ *
+ * ⚠️ D5-13（两个相对基准不一致）在这里被【布局】解决：
+ *   源码树里 SEED_URL 相对 **web/**（= 适配器所在目录）、
+ *   RULES_BASE 相对 **platform/**（= 适配器的父目录）—— 两者基准不同。
+ *   ⇒ 产物目录按同样的关系摆放：适配器在 <out>/web/、种子在 <out>/web/seed/、
+ *     规则在 <out>/rules/（= 适配器的父目录）⇒ **两个基准同时指得到文件**；
+ *     同时把种子再放一份在站点根 <out>/seed/（浏览器 fetch() 相对文档基准取的是那份）。
+ *   ⇒ 附带好处：适配器里 '../src/domain/*.js' 的相对导入落在 <out>/src/domain/，
+ *     **在产物内** ⇒ 站点挂在任意 base path 下都不会 404 白屏。
  */
 export function buildDemoSite({
-  outDir = join(here, '..', 'web', 'dist'),
+  // ⚠️ platformDir 必须排第一个：后面的默认值要引用它（JS 的解构默认值按顺序求值）
   platformDir = join(here, '..'),
-  webDir = join(here, '..', 'web'),
-  rulesDir = join(here, '..', 'rules'),
+  outDir = join(platformDir, 'web', 'dist'),
+  webDir = join(platformDir, 'web'),
+  rulesDir = join(platformDir, 'rules'),
 } = {}) {
   const domainDir = join(platformDir, 'src', 'domain');
 
@@ -5952,8 +6569,17 @@ export function buildDemoSite({
   rmSync(outDir, { recursive: true, force: true });
   mkdirSync(outDir, { recursive: true });
 
-  // 4. web/ 全部拷过去（排除 dist/ 自身）
-  copyDir(webDir, outDir, { exclude: ['dist'] });
+  // 4. web/ 整目录拷到 <out>/web/（排除 dist/ 自身）
+  //    ⚠️ 为什么不是直接拷到产物根：D5-13 的两个基准（见文件头）要求产物目录
+  //    【镜像 platform/ 的结构】——适配器在 <out>/web/、规则在 <out>/rules/、
+  //    领域层在 <out>/src/domain/。这样适配器里 '../src/domain/*.js' 的相对导入
+  //    在产物里仍然落在产物内（挂在任意 base path 下都不会跑出站点）。
+  //    ⚠️ 排除两样：① 名字叫 'dist' 的（上一版的产物目录，不能混进新产物）
+  //       ② **绝对路径等于产物目录**的（--out 指向 web/ 里时，产物不能把自己拷进自己）
+  copyDir(webDir, join(outDir, 'web'), {
+    exclude: ['dist', 'index.html'],
+    excludePaths: new Set([resolve(outDir)]),
+  });
 
   // 5. 领域层 + 它相对引用到的其它文件（按 platform/ 下的相对路径镜像拷贝，结构不变）
   const { domainFiles, extraFiles } = collectBrowserModules(domainDir);
@@ -5964,20 +6590,24 @@ export function buildDemoSite({
     copyFileSync(file, dst);
   }
 
-  // 6. 规则配置拷过去
+  // 6. 规则配置拷到产物根（= 适配器的父目录 = RULES_BASE 的来源基准）
   copyDir(rulesDir, join(outDir, 'rules'));
 
-  // 7. 种子数据（web/seed 已在步骤 4 拷过，这里确保存在并补齐）
+  // 7. 种子数据：拷两份（同一份内容，同源）
+  //    ① <out>/web/seed/demo-data.json —— 随 web/ 整目录拷过来的（SEED_URL 的来源基准）
+  //    ② <out>/seed/demo-data.json     —— 浏览器里 fetch() 相对【文档基准】解析，
+  //       文档在站点根 ⇒ 真正被取到的是这一份
   const seedSrc = join(webDir, 'seed', 'demo-data.json');
   if (!existsSync(seedSrc)) throw new Error(`缺少演示种子数据：${seedSrc}`);
   mkdirSync(join(outDir, 'seed'), { recursive: true });
   copyFileSync(seedSrc, join(outDir, 'seed', 'demo-data.json'));
 
-  // 8. index.html 的资源路径必须相对（静态托管换 base path 才不会挂）
-  const htmlPath = join(outDir, 'index.html');
-  let html = readFileSync(htmlPath, 'utf8');
-  html = html.replace(/(src|href)="\/(?!\/)/g, '$1="./');
-  writeFileSync(htmlPath, html, 'utf8');
+  // 8. 入口页放【站点根】（静态托管的硬要求：根目录必须有 index.html）
+  //    ⚠️ app 在 <out>/web/ 下 ⇒ 资源路径要指到 ./web/…；
+  //       一律保持相对（静态托管可能挂在任意 base path 下，绝对路径会全挂）。
+  const srcHtml = readFileSync(join(webDir, 'index.html'), 'utf8');
+  const rootHtml = srcHtml.replace(/(src|href)="\.\/([^"]+)"/g, '$1="./web/$2"');
+  writeFileSync(join(outDir, 'index.html'), rootHtml, 'utf8');
 
   // 9. 构建清单（可追溯：规则版本 + 构建时间 + 文件数）
   const manifest = {
@@ -6017,6 +6647,7 @@ if (isMain) {
 
 ```javascript
 // scripts/serve-demo.js — 本地预览演示站构建产物
+// 溯源需求：R-OPS-06（公网可访问：发布前在本机把产物跑起来看一眼）
 // 用途：发布前在本机把 web/dist/ 跑起来看一眼（不启后端、不建库）。
 // 用法：node scripts/serve-demo.js   → http://127.0.0.1:8090/
 import http from 'node:http';
@@ -6048,6 +6679,7 @@ server.listen(port, () => {
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>AI 商业黑客松 · 赛事平台</title>
+  <!-- 溯源需求：R-OPS-06（公网可访问：公网演示站入口页） -->
   <!-- ⚠️ 资源路径必须是相对路径：静态托管（公网演示站）可能挂在任意 base path 下 -->
   <link rel="stylesheet" href="./styles.css" />
 </head>
@@ -6089,6 +6721,37 @@ function demoBanner() {
 }
 ```
 
+并在 `render()` 里把横幅插到最前面（正式版 `demoBanner()` 返回 `null` ⇒ 什么都不做）：
+
+```javascript
+async function render() {
+  const app = document.getElementById('app');
+  const banner = demoBanner();
+  const found = match(currentPath());
+  if (!found) {
+    app.innerHTML = '<div class="card">页面不存在</div>';
+    if (banner) app.prepend(banner);
+    return;
+  }
+  try {
+    // ⚠️ 路由参数与 query 必须透传给视图：P3 的视图要靠 params.stageId / params.teamId
+    //    决定请求哪个赛段 / 哪支队伍，靠 query.scope / query.editionId 决定口径与届期。
+    //    P0 原来只传 ctx —— 视图拿不到参数（前端 router.match 会把 '?query' 剥掉再匹配）。
+    const el = await found.view({ ...ctx, params: found.params, query: currentQuery() });
+    app.replaceChildren(el);
+    if (banner) app.prepend(banner);
+  } catch (e) {
+    app.innerHTML = `<div class="card err">${escapeHtml(e.message)}</div>`;
+    if (banner) app.prepend(banner);
+  }
+}
+```
+
+> ⚠️ **横幅插在 `app.replaceChildren(el)` 之后**（不是把横幅和视图一起塞进 `replaceChildren`）：
+> P0 的 `test/web.test.js` 的 DOM 桩只记录 `replaceChildren` 的**第一个**参数，
+> 把横幅塞进去会让首屏断言（`state.rendered.innerHTML` 含「已登录」）拿不到视图元素 ⇒ 假红。
+> 用 `app.prepend(banner)` 追加在视图之后 ⇒ P0 用例的断言形状不变。
+
 - [ ] **Step 7: 修改 `src/server.js`（挂载领域层与规则配置，供开发服务器的演示模式）**
 
 在 `src/server.js` 的 **`handleRequest()`** 里（**不是 `handle()`** —— `handle()` 是外层兜底），
@@ -6106,6 +6769,9 @@ function demoBanner() {
       }
     }
 ```
+
+> ⚠️ 这一块是**插入前**的原文（实施后它会多出下面那 3 行 ⇒ 不再逐字出现在实现里）——
+> **逐字核验以本步末尾「插入后该段应是」那块为准**（那块是实施后的最终形状）。
 
 在 `if (serveStatic(webDir, req, res)) return;` **之后**、`} catch (err) {` **之前**
 **插入** 3 行（2 行注释 + 1 行代码，**插入，不是替换；try/catch 必须原样保留**）：
@@ -6212,34 +6878,39 @@ function serveMounted(req, res) {
 
 ```json
 {
+  "name": "heikesong-platform",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.16.0" },
   "scripts": {
-    "start": "node src/server.js",
-    "test": "node --test",
-    "migrate": "node scripts/migrate.js",
-    "seed": "node scripts/seed.js",
-    "backup": "node scripts/backup.js",
-    "restore": "node scripts/restore.js",
-    "build:demo": "node scripts/build-demo.js",
-    "serve:demo": "node scripts/serve-demo.js",
-    "audit": "node scripts/audit-scan.js"
+    "start": "node --disable-warning=ExperimentalWarning src/server.js",
+    "test": "node --disable-warning=ExperimentalWarning --test",
+    "migrate": "node --disable-warning=ExperimentalWarning scripts/migrate.js",
+    "seed": "node --disable-warning=ExperimentalWarning scripts/seed.js",
+    "backup": "node --disable-warning=ExperimentalWarning scripts/backup.js",
+    "restore": "node --disable-warning=ExperimentalWarning scripts/restore.js",
+    "build:demo": "node --disable-warning=ExperimentalWarning scripts/build-demo.js",
+    "serve:demo": "node --disable-warning=ExperimentalWarning scripts/serve-demo.js",
+    "audit": "node --disable-warning=ExperimentalWarning scripts/audit-scan.js"
   }
 }
 ```
 
-仓库根 `.gitignore` 追加：
+仓库根 `.gitignore` 追加（`platform/data/` P0 已经加过，**不重复**）：
 
 ```gitignore
 platform/web/dist/
-platform/data/
 ```
 
 - [ ] **Step 9: 运行测试确认通过**
 
-Run: `cd platform && node --test test/demo-static.test.js`
-Expected: PASS（5 个测试全过：demo-static.test.js 5）
+Run: `cd platform && node --disable-warning=ExperimentalWarning --test test/demo-static.test.js`
+Expected: PASS（**11 个测试全过**：demo-static.test.js 11）
 
 Run: `cd platform && node scripts/build-demo.js`
 Expected: 输出 `[build-demo] 产物目录：…/web/dist` 与 `[build-demo] ✅ 领域层浏览器安全检查通过`
+（顶层条目：`build-manifest.json, index.html, rules, seed, src, web`）
 
 - [ ] **Step 10: 本地预览验证**
 
@@ -6250,6 +6921,10 @@ Run: `curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8090/src/domain/sc
 Expected: `200`（领域层在静态站里能直接被浏览器 import）
 Run: `curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8090/rules/scoring-final.json`
 Expected: `200`
+Run: `curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8090/seed/demo-data.json`
+Expected: `200`（浏览器按文档基准取的就是这一份）
+Run: `curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8090/web/api.demo.js`
+Expected: `200`（适配器在 `web/` 子目录下 ⇒ 它的 `'../src/domain/'` 仍落在站点内）
 
 - [ ] **Step 11: 发布为公网静态站并拿到 URL**
 
@@ -6258,6 +6933,7 @@ Expected: `200`
 1. 先跑发布前扫描闸（发布闸不过不发布）：
    Run: `cd platform && node scripts/audit-scan.js`
    Expected: `[audit-scan] ✓ 未发现禁用表述`，退出码 0
+   （**产物也扫**：`[audit-scan] 发布产物 platform/web/dist：扫描 N 个文件`）
 2. 用静态站发布工具发布 `platform/web/dist/`：
    - `path` = `platform/web/dist`（**必须是构建产物**，目录里有 `index.html`）
    - `source_path` = `platform/web/dist`（自包含静态站，源码与产物同目录）
@@ -6269,7 +6945,7 @@ Expected: `200`
 
 ```bash
 cd platform && git add scripts/build-demo.js scripts/serve-demo.js web/index.html web/app.js src/server.js package.json test/demo-static.test.js ../.gitignore
-git commit -m "feat(P6): 演示站构建（领域层浏览器安全守卫）+ 相对路径 + 本地预览"
+git commit -m "feat(P6): 演示站构建（领域层浏览器安全守卫）+ 相对路径 + 本地预览" -- scripts/build-demo.js scripts/serve-demo.js web/index.html web/app.js src/server.js package.json test/demo-static.test.js ../.gitignore
 ```
 
 ---
@@ -7450,6 +8126,184 @@ Node v22 的真实签名是**单对象** `{ totalPages, remainingPages }`（探�
 7. **本 Task 只改了 P0 的一个测试文件**（`test/leaderboard-web.test.js` 的演示适配器用例，D5-05）：
    断言一条没少、还多了两条；改动原因是 P0 桩被真实适配器取代 ⇒ 假数据桩的用法不再成立。
 
+## Task 6 实施台账（2026-10-21）
+
+> 本节是 Task 6（演示版前端补齐 + 静态站构建与发布）的实施记录：
+> **规格缺陷清单**、处置方式、逐字回写位置、实跑证据、变异测试、计划块逐字核验，
+> 以及 **D5-13（两个相对基准不一致）的裁决与实证**。
+> 纪律：本计划 Task 6 的 **5 个代码块 = 最终实现的逐字副本**
+> （核验命令：`node /tmp/p3fix/plan-blocks.mjs …` 与 `node /tmp/p4-proof/fragment-check.mjs …`）。
+>
+> ⚠️ **本 Task 的灵魂**：公网演示版 = **自包含静态站**，
+> 而静态站要能真的把规则引擎跑起来，就必须让**每一个相对基准都指得到文件**。
+> ⇒ 产物目录不是「把 web/ 平铺过去」，而是**镜像 platform/ 的树**（D6-01）。
+
+### A. 实施方法（先跑后落盘）
+
+1. 把规格 Task 6 的代码块**原样抽到** `/tmp/p6-t6/spec/`（一个字节都没改）。
+2. 在 `/tmp/p6-t6/scratch/platform`（platform 整树副本）上跑**规格自带用例** → 红（Step 2 期望失败实证）。
+3. 规格原样的 `build-demo.js` + `serve-demo.js` 落进 scratch → 规格自带 5 个用例**全绿**
+   ⇒ 证明「规格骨架能跑」，问题在**布局**与**守卫**（下面 B 节）。
+4. 在 scratch 上把 Task 6 其余改动（index.html / app.js / server.js / package.json / .gitignore）做齐，
+   跑**全量**（1013 例）→ 逐条定位规格缺陷 → 在 scratch 上修正 → 跑通。
+5. 才落盘到 worktree → 单文件 → 全量 → 变异测试 → 计划块逐字回写与核验 → 提交。
+
+### B. 规格缺陷清单
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| **D6-01** | **Critical** | **规格的产物布局把 `web/` 平铺到产物根** ⇒ 适配器里 `'../src/domain/*.js'` 这个相对导入**跑出站点**：浏览器只在**源站根**才把 `..` 截断，站点一旦挂在子路径下（`/demo/`）就解析成 `/src/domain/…` ⇒ 404 ⇒ **演示站白屏**；`file://` 下更会直接落到产物目录外面 | 探针：`new URL('../src/domain/scoring.js', 'http://host/demo/api.demo.js')` → `http://host/src/domain/scoring.js`（**跑出 /demo/**）；在 /tmp 独立工程里 import 规格布局的产物 → `ERR_MODULE_NOT_FOUND: …/T/src/domain/registration.js` | 产物目录改成**镜像 platform/ 的树**：`web/`（适配器与前端）、`rules/`、`src/domain/` 在根；入口页仍在根（静态托管硬要求）并把资源路径改写成 `./web/…`；**种子拷两份**（`web/seed/` = base-web 镜像，`seed/` = 浏览器按文档基准取的那份） |
+| **D6-02** | **Important** | 规格的 import 抽取正则 `/(?:^|\n)\s*(?:import|export)\s[^;'"\n]*?from…/` **只认单行** ⇒ 格式化器把 import 列表拆成多行时（`import {\n a,\n} from 'node:fs'`）**抽出 0 个说明符** ⇒ 守卫放行 ⇒ 浏览器里才炸 ⇒ 这条 Global Constraint 的「机器守住」形同虚设 | 探针：原正则对多行 import 的抽取结果 = `[]`（同一份输入，修正后 = `['node:fs']`） | 抽取器改为**允许跨行** + **先去注释**（注释里写的 import 不算）；并补一条「跨行 node:fs 与裸模块名都必须被拦下」的用例 |
+| **D6-03** | **Important** | 规格的 `buildDemoSite({ outDir, platformDir, webDir, rulesDir })` 里 `webDir` / `rulesDir` 的默认值**不跟随 `platformDir`**（用的是脚本所在目录 `here/..`）⇒ 「换一份拷贝也能构建」这条不成立：传了 `platformDir` 却仍然从脚本旁边取资源 | 探针：把 platform 树拷到临时目录、只改副本 `web/index.html` 的标题 ⇒ 规格布局构建出的入口页里**没有副本的标记**（用的是脚本所在目录的那份） | 三个默认值全部改为跟随 `platformDir`（`outDir` / `webDir` / `rulesDir`）；`platformDir` 排到解构第一位（JS 的解构默认值按顺序求值）；并补一条「换一份拷贝也能构建」的用例 |
+| **D6-04** | Minor | 规格的 `collectBrowserModules` 用**纯前缀**判目录边界（`file.startsWith(domainDir)`）⇒ 同前缀的**兄弟目录**（如 `domain-utils/`）会被当成领域层 | 探针：临时目录里放 `domain/` 与 `domain-utils/`，修前 `domainFiles` 含 `domain-utils/c.js`，修后不含 | 按**分隔符边界**判（`file.startsWith(domainDir + sep)`）；并补一条判别性用例 |
+| **D6-05** | Minor | 规格的 `package.json` 块把 P0 早已确立的 `--disable-warning=ExperimentalWarning` 丢了（`node --test` 会刷一屏 ExperimentalWarning） | 规格块 vs P0 现行 `package.json` 逐行对照 | **保留 P0 的写法**，只**新增** 5 个脚本（`backup` / `restore` / `build:demo` / `serve:demo` / `audit`） |
+| **D6-06** | Minor | 规格的 `.gitignore` 块让追加 `platform/data/` —— P0 早就加过 ⇒ 重复条目 | 规格块 vs 现行 `.gitignore` | 只追加 `platform/web/dist/`（`platform/data/` 已在） |
+| **D6-08** | **Important** | **本轮修正引入的真缺陷（变异检验 M13 实跑炸出来的）**：产物目录默认在 `web/dist/`，靠「名字叫 dist 就排除」挡得住；但 `--out` 可以指向 `web/` 里的**任何**目录 ⇒ 产物会**把自己拷进自己** ⇒ 无限递归 ⇒ `ENAMETOOLONG`（构建直接炸） | 变异体 M13（把默认产物目录改成 `dist2`）实跑：构建报 `ENAMETOOLONG: name too long, copyfile …/web/dist2/web/dist2/web/dist2/…` | 拷贝按**绝对路径**排除产物目录自身（`excludePaths`，无论它叫什么名字、放在哪），并补一条「产物目录落在 web/ 里面时也不能把自己拷进自己」的用例（M29 守着） |
+| **D6-07** | Minor | 规格 Step 6 只给了**横幅函数**，**没给插入位置** ⇒ 实施者各写各的 | 规格 Step 6 原文 | 补进计划：横幅用 `app.prepend(banner)` 插在 `app.replaceChildren(el)` **之后**（⛔ 不能把横幅塞进 `replaceChildren` 的参数里 —— P0 的 `test/web.test.js` 的 DOM 桩只记录**第一个**参数，塞进去会让首屏断言拿不到视图元素 ⇒ **假红**） |
+
+### C. 逐字回写位置（本轮改动的计划代码块 / 说明段）
+
+| 计划位置 | 改动 |
+|---|---|
+| Task 6 开头的「静态站怎么带上规则引擎」说明块 | 补 D5-13 的布局裁决（镜像 platform/ 的树）+ 为什么不能平铺 |
+| Task 6 **Step 1** 的 `platform/test/demo-static.test.js` 块 | **整体回写**（规格 5 个用例逐字保留 + 追加 13 个：D5-13 基准矩阵 / 浏览器语义真跑 / 子路径 / 可移植 / 清空产物 / 跨行守卫 / 目录边界 / 默认产物目录 / 预览服务器 / DEMO_MODE 门 / 横幅 / 登记） |
+| Task 6 **Step 3** 的 `platform/scripts/build-demo.js` 块 | **整体回写**（D6-01/02/03/04 的处置全部落在这里） |
+| Task 6 **Step 4** 的 `platform/scripts/serve-demo.js` 块 | **整体回写**（只多了 1 行溯源注释 `R-OPS-06`；逻辑逐字未动） |
+| Task 6 **Step 5** 的 `platform/web/index.html` 块 | **整体回写**（只多了 1 行溯源注释 `R-OPS-06`；资源路径与 noscript 逐字未动）—— 产物根的入口页由构建脚本**生成**（资源路径改写成 `./web/…`） |
+| Task 6 **Step 6** 的 `web/app.js` 两块 | 适配器块、横幅块**未改**（逐字一致 ✅）；**新增**「`render()` 里插入横幅」的代码块（D6-07） |
+| Task 6 **Step 7** 的 `src/server.js` 两块 | **未改**（逐字一致 ✅） |
+| Task 6 **Step 8** 的 `platform/package.json` 块 | **整体回写**（D6-05） |
+| Task 6 **Step 8** 的 `.gitignore` 块 | 改为只追加 `platform/web/dist/`（D6-06） |
+| Task 6 **Step 9 / Step 10** 的 Expected | 更新为实跑数字（18 个用例）与新的产物路径（`/web/app.js`、`/seed/demo-data.json`） |
+| Task 6 **Step 12** 的提交命令 | 补 `-- <paths>`（与 D5-12 同款病：`-m` 在 `--` 之前、显式路径） |
+
+> 回写脚本 `/tmp/p6-mutate/t6-writeback.mjs`：**按行号区间降序**处理（前面的行号不会被后面块变长影响），
+> 锚点用**块正文内容**定位，命中数必须 `=== 1`，否则报错退出。
+
+### D. 实跑证据
+
+| 项 | 结果 |
+|---|---|
+| 规格原样抽取 + 规格自带用例（独立工程 `/tmp/p6-t6/scratch`） | **Step 2 期望失败实证**：`ERR_MODULE_NOT_FOUND`（`../scripts/build-demo.js`）✅ |
+| 规格原样的 `build-demo.js` + `serve-demo.js` 落进 scratch | 规格自带 **5 个用例全绿** ⇒ 规格骨架没问题，问题在布局与守卫 |
+| scratch 修正后单文件 `node --test test/demo-static.test.js` | **16 / 16 全绿**（当时补齐的用例集；落盘后又加了 4 条 ⇒ 20 条） |
+| scratch 全量 `node --disable-warning=ExperimentalWarning --test` | **1028 例 / 1027 通过 / 1 跳过 / 0 失败**（基线 1018 + 本 Task 10） |
+| 落盘后单文件 `node --disable-warning=ExperimentalWarning --test test/demo-static.test.js` | **20 / 20 全绿** |
+| 落盘后全量 `node --disable-warning=ExperimentalWarning --test` | **1038 例 / 1037 通过 / 1 跳过 / 0 失败**（基线 1018 + 本 Task 20） |
+| `node scripts/build-demo.js` | `[build-demo] 产物目录：…/web/dist`；顶层条目 `build-manifest.json, index.html, rules, seed, src, web`；`✅ 领域层浏览器安全检查通过` |
+| `node scripts/serve-demo.js` + curl（计划 Step 10） | `/` → 200；`/web/app.js` → 200；`/web/api.demo.js` → 200；`/src/domain/scoring.js` → 200；`/rules/scoring-final.json` → 200；`/seed/demo-data.json` → 200；`/web/seed/demo-data.json` → 200 |
+| 发布前扫描闸 `node scripts/audit-scan.js` | 退出码 **0**；`[audit-scan] ✓ 未发现禁用表述`；`[audit-scan] 发布产物 platform/web/dist：扫描 54 个文件`（**产物本身也过闸**） |
+
+### E. 变异测试（脚本 `/tmp/p6-mutate/t6.mjs`，跑在 `/tmp/p6-mutate/work` 副本上）
+
+> 纪律：锚点命中数必须 `=== 1`（命中 0 次 = 变异体没落地 = 假绿，必须报出来）；
+> 存活变异必须「修」或「显式标注为等价/不可观测」，声称等价的必须有**探针差分实证**。
+
+**29 个变异体 / 29 KILLED / 0 存活 / 0 锚点异常**（对照组：未改动副本全绿 ✅）。
+明细：`/tmp/p6-mutate/t6-results.json`；日志：`/tmp/p6-mutate/t6-run.log`。
+
+| 轮次 | 变异体 | KILLED | SURVIVED | 锚点异常 | 处置 |
+|---|---|---|---|---|---|
+| 第 1 轮 | 29 | 22 | **3** | **3** | 3 个存活（M06/M07 守卫、M09 目录边界）+ 3 个锚点异常（M01/M21/M28 命中多次）⇒ 都是**用例/锚点缺陷**，不是实现缺陷 |
+| 第 2 轮 | 29 | **29** | **0** | **0** | ① M06/M07：守卫的两个分支**互相兜住**对方（关掉 node: 分支，裸模块名分支照样报违规）⇒ 用例只断言「有违规」抓不住 ⇒ 补断言「必须说清是 Node 内置模块 / 裸模块名」；② M09：兄弟目录没被**引用到** ⇒ 压根不进遍历，纯前缀比较与按分隔符比较结果一样 ⇒ 把兄弟目录改成被 `domain/a.js` 相对 import（判别性）；③ 锚点：M01/M21/M28 的锚点文本在文件里出现多次 ⇒ 换成唯一锚点（带上下文） |
+
+**变异体覆盖面**（每个改动点都有对应的变异体）：
+
+| 面 | 变异体 |
+|---|---|
+| 构建布局 | M01 不拷领域层 / M02 不拷规则 / M03 种子不拷根 / **M04 web/ 平铺（D5-13 回归）** / M05 入口页不重写路径 / M10 领域层落错位置 / M12 不清空产物 / **M13 默认目录不是 web/dist** / **M29 产物不排除自身（D6-08）** |
+| 守卫 | M06 node: 分支 / M07 裸模块名分支 / M08 抽取器退回单行 / M09 目录边界 |
+| 可移植性 | M11 webDir 不跟随 platformDir / M14 规则缺失不报错 |
+| 入口页与前端 | M15 预览服务器 serve 错目录 / M16 绝对路径 / M17 横幅不渲染 / M18 正式版也渲染横幅 / M19 选错适配器 / M20 isDemo 判错 / M21 横幅不插进页面 |
+| **生产部署口径** | M22 DEMO_MODE 门失效（公网泄源码）/ M23 门反过来 / M24 挂载前缀写错 / M25 不调用 serveMounted / M26 白名单放宽 |
+| 登记 | M27 package.json 少脚本 / M28 .gitignore 不忽略产物 |
+
+> ⚠️ **M22/M23 是本 Task 最要紧的一条防线**：
+> 它们把 `DEMO_MODE` 那道门拆掉 / 反过来 ⇒ `/src/domain/*` 与 `/rules/*` 在生产部署上**从 404 变成 200**
+> ⇒ 领域层算法源码与全部规则配置公网可读。两条都被「默认不挂载：/src/domain/* 与 /rules/* 一律 404」钉死 ✅
+> （子进程实跑 `src/server.js`，不设 DEMO_MODE ⇒ 两个路径都是 404）。
+
+### F. 计划块逐字核验
+
+核验脚本：`/tmp/p6-mutate/t6-verify-blocks.mjs`（按块的**性质**分别核：Create 的文件核整文件、Modify 的文件核片段）→ **不一致 0 个**（退出码 0）：
+
+| 块 | 性质 | 结果 |
+|---|---|---|
+| `test/demo-static.test.js` | 整文件块 | ✅ 逐字一致（585 行） |
+| `scripts/build-demo.js` | 整文件块 | ✅ 逐字一致（307 行） |
+| `scripts/serve-demo.js` | 整文件块 | ✅ 逐字一致（22 行） |
+| `web/index.html` | 整文件块 | ✅ 逐字一致（16 行） |
+| `platform/package.json` | 整文件块 | ✅ 逐字一致（18 行） |
+| `web/app.js` · 适配器选择 | 片段块 | ✅ 逐字命中（5 行） |
+| `web/app.js` · 横幅函数 | 片段块 | ✅ 逐字命中（11 行） |
+| `web/app.js` · `render()` 插入横幅 | 片段块 | ✅ 逐字命中（21 行） |
+| `src/server.js` · 插入的 3 行 | 片段块 | ✅ 逐字命中（3 行） |
+| `src/server.js` · 「插入后该段应是」 | 片段块 | ✅ 逐字命中（14 行） |
+| `src/server.js` · DEMO_MOUNTS + serveMounted | 片段块 | ✅ 逐字命中（26 行，**未改**） |
+
+> ℹ️ `src/server.js` Step 7 的**「插入前的 P0 原文」锚点块**按设计**不再逐字出现**（本步要求往里插 3 行）——
+> 已在计划里补了一句说明，核验以「插入后该段应是」那块为准 ✅。
+> 共享脚本 `/tmp/p3fix/plan-blocks.mjs` 的 hint 正则看不见 `.json`（Task 4 已登记 D4-07）⇒ `package.json` 另用本脚本核 ✅。
+
+### G. 遗留需上游注意
+
+1. **D5-13 已解决**（详见下面「D5-13 专项裁决」一节）：
+   产物目录**镜像 platform/ 的树** ⇒ 「相对 web/」（种子）与「相对 platform/」（规则）**两个基准同时**指得到文件；
+   附带好处：适配器里 `'../src/domain/'` 的相对导入**留在产物内** ⇒ 站点挂在任意 base path 下都不 404。
+2. **产物结构不能随手改**：入口页在**站点根**（静态托管的硬要求），前端在 `web/`，
+   领域层在 `src/domain/`，规则在 `rules/`，种子在 `web/seed/` **与** `seed/`（两份同源）。
+   发布前用 `node scripts/build-demo.js` 重新构建，**不要**手改产物目录。
+3. **领域层源码会出现在演示站产物里**（`src/domain/`）—— 这是**有意的**（观众能看到算法原文，这正是演示的价值）；
+   但它**不会**出现在正式站：生产部署不设 `DEMO_MODE=1` ⇒ `/src/domain/*` 与 `/rules/*` 一律 404
+   （已用子进程实跑的用例钉住，默认路径 404、DEMO_MODE=1 才 200）。
+4. **`scripts/serve-demo.js` 不需要 `DEMO_MODE=1`**：它 serve 的是**产物目录**（产物里已含 `rules/` 与 `src/domain/`），
+   不启 Node 应用 ⇒ 计划 I-5 注释里「serve-demo.js（本地预览）应当设置它」这句对静态预览脚本没有意义（**不改代码**）。
+5. **领域层与规则配置一行没改**：`platform/src/domain/**`、`platform/rules/**` 本 Task 只读不改 ——
+   这正是「演示 = 正式」的根本保证。
+6. **`web/api.demo.js` 一行没改**（Task 5 的文件）：D5-13 用**布局**解决，不需要动适配器。
+7. **演示版数据不跨人共享**（各自浏览器 localStorage 独立）—— 无云主机条件下的客观边界，
+   已写进 `web/api.demo.js` 的文件头与本台账；正式版后端仍要按云主机部署资产准备好（Task 2）。
+8. **Step 11（发布到公网）本轮未执行**：公开发布需要用户明确确认（任何人拿到链接都能打开），
+   且本 Task 的授权范围不含发布动作 —— 产物已就绪（`platform/web/dist/`，根目录有 `index.html`），
+   发布前扫描闸已通过（退出码 0）。
+
+### D5-13 专项裁决（路径基准不一致 —— 本 Task 必须解决的那一条）
+
+**原状（Task 5 台账 §B D5-13 / §H-2 登记的遗留）**：
+`SEED_URL = './seed/demo-data.json'` 相对 **web/**（种子在 `web/seed/`），
+`RULES_BASE = './rules/'` 相对 **platform/**（规则在 `platform/rules/`）——
+**两个基准不同** ⇒ 静态站的产物目录必须**同时**满足两个基准，否则浏览器里取种子 / 取规则会有一份 404。
+
+**裁决（解法）**：**产物目录镜像 platform/ 的树**，让「相对 web/」与「相对 platform/」两个基准在产物里**同时成立**：
+
+```
+web/dist/index.html            ← 入口页（静态托管的硬要求：根目录必须有 index.html）
+web/dist/web/api.demo.js       ← 适配器（模块目录基准 = 源码里的 web/）
+web/dist/web/seed/demo-data.json ← 种子（SEED_URL 的来源基准：相对 web/）
+web/dist/seed/demo-data.json     ← 同一份种子（浏览器 fetch() 相对【文档基准】取的是这份）
+web/dist/rules/*.json            ← 规则（RULES_BASE 的来源基准：相对 platform/ = 适配器的父目录）
+web/dist/src/domain/*.js         ← 领域层（适配器 '../src/domain/' 的落点，在产物内）
+```
+
+- **模块目录基准**（适配器所在目录 = `web/dist/web/`）⇒ `SEED_URL` → `web/dist/web/seed/demo-data.json` ✅
+- **模块父目录基准**（= `web/dist/`，扮演 platform/ 的角色）⇒ `RULES_BASE` → `web/dist/rules/` ✅
+- **文档基准**（站点根，浏览器 `fetch()` 真正用的）⇒ `web/dist/seed/`、`web/dist/rules/` ✅
+  （种子在两处各一份，内容同源 —— 构建时同源拷贝，不手改）
+- **附带修掉一个更狠的病**：适配器里 `'../src/domain/*.js'` 的相对导入**留在产物内**
+  ⇒ 站点挂在子路径下（`/demo/`）也不会跑出站点（规格的平铺布局在这里是 404 白屏，见 D6-01）。
+
+**实证方式（不是"看起来对"）**：
+1. **基准矩阵用例**（`demo-static.test.js`「D5-13：产物布局让『模块目录基准』与『模块父目录基准』都指得到文件」）：
+   逐个断言两个基准解析到的文件**都存在**，并与源码树里同样的两个基准做对照（基准集合必须一致）。
+2. **浏览器语义真跑**（同文件「D5-13：演示站在浏览器语义下真能起来」）：
+   把 `globalThis.fetch` 换成**浏览器语义**的桩（相对 URL 相对**文档基准**解析），
+   直接 **import 产物目录里的 `web/api.demo.js`** ⇒ 它 import 的是产物里的 `src/domain/*.js`（真跑同一套引擎），
+   断言：种子与仓库里那份**逐字相同**、浏览器加载的 **12 份规则配置 ≡ 正式系统 `loadRules()`** 的结果、
+   `getDemoRuntime()` 起得来且 `/api/health` 返回 `ok: true`。
+3. **子路径实证**（同文件「产物挂在子路径下也不跑出站点」）：
+   用仓库自己的 `serveStatic` 把站点挂在 `/dist/` 下 ⇒ 断言领域层、种子、规则**全部 200**。
+4. **独立工程实跑**（`/tmp/p6-t6/scratch`）：规格原样的平铺布局下 import 产物适配器直接
+   `ERR_MODULE_NOT_FOUND` ⇒ 修正后的布局在同一处跑通 —— 布局差异是**实跑**出来的，不是推理出来的。
 ## Task 7 实施台账（2026-10-21）
 
 > 本节是 **P6 Task 7（部署与运维文档 `docs/deployment.md`）** 的实施记录：

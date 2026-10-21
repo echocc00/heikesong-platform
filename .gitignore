@@ -7,6 +7,9 @@ platform/data/
 *.db-wal
 *.db-shm
 
+# P6：演示站构建产物（唯一产物目录 = platform/web/dist/，不入库）
+platform/web/dist/
+
 # 隔离工作区（git worktree）—— 实现代码在分支上开发，不直接落 main
 .worktrees/
 
