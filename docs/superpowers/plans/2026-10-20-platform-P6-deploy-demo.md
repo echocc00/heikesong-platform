@@ -6369,3 +6369,99 @@ nginx 在**最后**。机器上没装 nginx 时，脚本会先把上面**全部*
 - ⚠️ **Task 3 与 Task 4 的缺陷台账编号都用了 `D-01` 起的裸编号**（分属两个 Task 的台账），
   合并 P6 Task 4 分支时需要重编号（Task 3 → `D3-*`、Task 4 → `D4-*`）——
   这是**合并时要处理的事**，本轮不动（Task 4 的台账在另一个分支上）。
+---
+
+## Task 7 实施台账（2026-10-21）
+
+> 本节是 **P6 Task 7（部署与运维文档 `docs/deployment.md`）** 的实施记录：
+> 规格缺陷清单与处置、实跑证据、手册与 **F-1 ~ F-4** 的逐条对账结果、**未覆盖的项与理由**。
+>
+> **编号约定**：本计划已有四个台账用过 `D-` 开头且已重编号为 `D1-*`（Task 1）/ `D2-*`（Task 2 预审）/
+> `D3-*`（Task 3）/ `D4-*`（Task 4）；**本轮用 `D7-*`**。
+> 手册 `docs/deployment.md` 内部的「未覆盖项」表用 `U-*` 编号（`U-1` ~ `U-7`），
+> **与本台账的 `D7-*` 是两套编号，不要混用**。
+>
+> **产出边界**：本 Task **只创建 `docs/deployment.md`**（+ 追加本台账）。
+> **没有碰** `platform/` 下的任何代码、部署资产、测试。
+
+### A. 规格缺陷清单与处置
+
+| # | 级别 | 规格缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| D7-1 | **Important** | **计划 Task 7 的骨架把 §5 的演示版构建命令写成了「现在就能跑」** —— 但 `scripts/build-demo.js` / `scripts/serve-demo.js` 是 **P6 Task 6** 的产物，此刻**尚未落地** | `ls platform/scripts/build-demo.js` → `No such file or directory`；`scripts/serve-demo.js` 同样不存在；`ls -d platform/web/dist platform/web/assets` → 两个都不存在 | **计划代码块逐字保留**（不改规格），但手册顶部加「**阅读须知**」明确声明：§5 的两条命令**此刻跑不通**，§8.5 写全了 Task 6 落地后的**构建 / 产物位置 / 本地预览 / 扫描闸 / 发布**流程 + 一张状态声明表 |
+| D7-2 | **Important** | **计划 §2.2 的 `install.sh` 步骤清单没有反映 F-2 / F-3 / F-4 修复后的行为**（清单里没有 nginx 前置检查、没有失败回滚、没有版本自动降级、没有绝对过期天数字段） | 逐条对读 `platform/deploy/install.sh`：`require_nginx` 在 `main()` **最前**（第 341 行）→ `validate_session_ttls`（342）→ … → `write_nginx_site`（358）先跑兼容脚本、再备份旧站点、再 `if ! nginx -t` | 计划代码块逐字保留；手册 **§8.1 – §8.4** 逐条写清修复后的真实行为，**每条都带实跑输出** |
+| D7-3 | **Important** | **计划 §1 的环境变量清单不全** —— 只列 `PORT` / `DATA_DIR` / `SESSION_TTL_DAYS`，漏了 `SESSION_ABSOLUTE_TTL_DAYS` | `src/auth/session.js` 第 23 行 `DEFAULT_ABSOLUTE_TTL_DAYS = 30`，第 36 行读 `process.env.SESSION_ABSOLUTE_TTL_DAYS`；F-3 后 `install.sh` 的 `write_env_file()` 也显式写它 | 计划代码块逐字保留；手册 **§10** 给出完整速查表（**9 个变量** + 「改了怎么生效」列 + 端口 8080 的「四处同一口径」清单） |
+| D7-4 | **Critical（后果安全）** | **`nginx-http2-compat.sh` 的 `detect_version()` 解析不了真实 nginx 的版本输出** —— 脚本用 `sed -n 's\|^nginx version: \([0-9][0-9.]*\).*\|\1\|p'`，要求版本号**紧跟** `nginx version: ` 后是一个数字；而 nginx 的**真实输出**是 `nginx version: nginx/1.24.0`（版本号前带 `nginx/` 前缀）⇒ **匹配不到** | `printf 'nginx version: nginx/1.24.0\n' \| sed -n 's\|^nginx version: \([0-9][0-9.]*\).*\|\1\|p'` → **空**；沙箱里跑完整 `install.sh`，兼容脚本打印「**[nginx-compat] nginx 未探测到（按需降级处理）** < 1.25.1：已降级为 `listen ... ssl http2;`」 | 手册 **§8.1 如实写明**：真机上自动探测**总是失败** ⇒ 总是走保守降级；**后果安全**（`listen ... ssl http2;` 在**所有**版本都合法，部署不会因此失败）；但「≥ 1.25.1 保留 `http2 on;`」这条分支在真机上**只有显式给 `NGINX_VERSION` 才走得到**。**本 Task 不修**（`platform/` 不在本 Task 归属内）—— 一行修法写进手册 §8.1 与本台账 E 节，供上游处理 |
+| D7-5 | Minor | **计划 §2.4 没提 `network_mode: host` 在 Docker Desktop（macOS / Windows）上宿主仍不通** | `deploy/docker-compose.yml` 第 26–27 行自己写明「host 网络只保证 Linux 宿主机的语义；Docker Desktop（macOS/Windows）上容器拿到的是 Linux 虚拟机的网络栈，宿主机 127.0.0.1:8080 仍不通」 | 计划代码块逐字保留；手册 §13 **U-2** 登记为边界（本 Task 环境无 Docker daemon，未实跑） |
+| D7-6 | Minor | **计划 Task 7 Step 2 的期望值 `backup()` = 2 与最终文件实际 3 不符** | `grep -c "single writer at a time" docs/deployment.md` → `1`；`grep -c "proxy_buffering off"` → `1`；`grep -c "backup()"` → `3` | 计划写的是「三个数字都 ≥ 1」，`3 ≥ 1` **通过**。**不为了凑「2」而删内容**（第三个 `backup()` 出现在 §8.1/§12 的实跑证据上下文里） |
+| D7-7 | — | **计划 Task 7 的代码块与最终文件的对应关系需要写清** | 程序化核验：计划第 5259–5470 行（`markdown` 围栏内）在 `docs/deployment.md` 里是**逐字连续**的片段（起始字节下标 **963**）；§0 段（`## 0.` → `## 1.`）单独核验同样**逐字包含** | **不改计划规格**（计划块原样保留）；补写内容**全部**落在手册 §8 – §14。计划文档本身只**追加**了本台账一章，**未改动** Task 7 的代码块 |
+
+### B. 实跑证据（2026-10-21）
+
+> 全部在**临时目录**（`mktemp -d`）里做，不碰工作树的库文件。
+> 环境：macOS（darwin 27.0.0 arm64）、Node **v22.23.2**、**本机没装 nginx**
+> （正好用来验证降级路径与「探测不到版本」的保守路径）。
+
+| # | 跑了什么 | 观察到 |
+|---|---|---|
+| E1 | `cd platform && node --disable-warning=ExperimentalWarning --test` | **981 例 / 980 通过 / 0 失败 / 1 跳过**（基线 981/981） |
+| E2 | `cd platform && node scripts/audit-scan.js` | **退出码 0**（词条 15 条、扫描 142 个文件、0 违规） |
+| E3 | `DATA_DIR=<tmp>/data node scripts/migrate.js` | `迁移完成，当前版本 5`（本次应用 001–005 五个迁移） |
+| E4 | `node scripts/seed.js` 连跑两次 | 第一次「已创建管理员：13800000000」，第二次「管理员已存在」⇒ 幂等 |
+| E5 | `node scripts/backup.js` / `--out` / `--keep-days --keep-count` | 全部退出码 0；输出 `[backup] 完成：app-<UTC>.db（<字节> 字节，<页> 页）` |
+| E6 | `node scripts/restore.js`（活 pid / pid 文件坏 / 成功） | 活 pid ⇒ **拒绝**（`服务仍在运行，拒绝恢复（pid 文件显示进程 N 仍在运行）`）；pid 不可解析 ⇒ **保守判为在跑并拒绝**（`pid 文件存在但内容无法解析，无法确认服务已停止`）；成功 ⇒ 旧库留存 + **删旧 `-wal` / `-shm`** + 新库就位 |
+| E7 | `node src/server.js` + `curl -s http://127.0.0.1:8080/api/health` | `{"ok":true,"at":"2026-10-21T08:04:57.542Z"}`；启动日志 `heikesong-platform 启动于 http://127.0.0.1:8080（规则版本 2026-10-20）` |
+| E8 | `bash deploy/nginx-http2-compat.sh` × 4 个 `NGINX_VERSION` + 不探测 | 1.18.0 / 1.24.0 ⇒ **双 listen 行都降级**；1.25.1 / 2.0.0 ⇒ **保留 `http2 on;`**；不探测 ⇒ 降级（**端口 80 的 listen 不受影响**） |
+| E9 | 沙箱 `install.sh`：**PATH 里没有 nginx** + 设了 `SERVER_NAME` | 退出码 **1**，错误信息明确，**沙箱目录零改动**（`find` 结果为空）⇒ F-2 前置检查**在动任何东西之前**就拒绝 |
+| E10 | 沙箱 `install.sh`：`SESSION_TTL_DAYS=abc` / `SESSION_ABSOLUTE_TTL_DAYS=0` / `SESSION_TTL_DAYS=3.5` | 三次都退出码 **1**、**沙箱目录零改动** ⇒ F-3 的 fail-fast **在动任何东西之前**就拒绝 |
+| E11 | 沙箱 `install.sh`：**完整部署**（nginx 桩 = 1.24.0） | 退出码 **0**；环境文件 = `PORT` / `DATA_DIR` / `SESSION_TTL_DAYS=7` / **`SESSION_ABSOLUTE_TTL_DAYS=30`** / `NODE_ENV=production`；站点配置**自动降级**成 `listen 443 ssl http2;` + `listen [::]:443 ssl http2;`；`alias .../web/assets/` 是**预留位** |
+| E12 | 沙箱 `install.sh`：**连跑两次** | 两次退出码 **0**；第二次「本次无新迁移」「管理员已存在：13800000000」⇒ **幂等** |
+| E13 | 沙箱 `install.sh`：`nginx -t` 失败（**有旧配置** / **无旧配置**） | 有旧 ⇒ `已回滚到上一版 nginx 站点配置` 且站点文件内容回到部署前；无旧 ⇒ `已撤销本次 nginx 站点配置（此前没有旧配置）` 且**站点文件与软链都不存在**、`sites-enabled/` 为空 |
+
+> 沙箱做法：`PATH` 里放 `id`（`id -u` 返回 0，模拟 root）/ `nginx` / `systemctl` / `useradd` / `runuser` 五个**桩命令**，
+> 并把 `APP_DIR` / `DATA_DIR` / `ENV_FILE` / `NGINX_SITE` / `NGINX_LINK` / `SYSTEMD_UNIT_DIR` 全部指向 `mktemp -d` 出来的临时目录 ——
+> **真机路径（`/opt` / `/etc` / `/var`）一个字节都没被写到**。
+
+### C. 手册与 F-1 ~ F-4 的逐条对账
+
+| 修复项 | 修复后的真实行为（实跑取证） | 手册写在哪 | 对账结论 |
+|---|---|---|---|
+| **F-1** 前端产物目录口径 | 唯一构建产物目录 = `platform/web/dist/`（Task 6 的 `build-demo.js --out web/dist` 产出，**走独立发布通道，不经 nginx**）；nginx 的 `location /assets/ { alias __APP_DIR__/web/assets/; }` 是**预留**的带哈希静态资源位，**本仓库无任何构建步骤产出它**，目录不存在时该前缀返 404、不影响其它路径；`install.sh` 的 rsync **两个都排除** | 手册 **§8.4**（含一张「目录 / 是什么 / 由谁产出 / 走不走 nginx」对照表） | ✅ 一致。**手册没有把 `web/assets/` 说成「构建产物目录」** |
+| **F-2** nginx 前置检查与回滚 | `require_nginx()` 在 `main()` **最前**（动任何东西之前）⇒ 缺 nginx **当场明确拒绝**；`nginx -t` 失败 ⇒ 有旧配置就 `mv` 还原、没旧配置就**撤销站点文件与软链** ⇒ 坏配置不会留在 `sites-enabled` 里毒化下一次 reload | 手册 **§8.2**（两条分支各带实跑输出 + 事后 `sites-enabled/` 为空的核对） | ✅ 一致 |
+| **F-3** 会话环境变量 | 环境文件**显式**写 `SESSION_ABSOLUTE_TTL_DAYS`（默认 **30**，与 `src/auth/session.js` 的 `DEFAULT_ABSOLUTE_TTL_DAYS` 同源）与 `SESSION_TTL_DAYS`（默认 **7**）；两个天数**必须是正整数**，否则 `install.sh` **fail-fast 报错**（代码侧是静默回退到默认值，环境文件写错没人会发现）；**改完必须重启服务**（systemd 在服务启动时读 `EnvironmentFile`） | 手册 **§8.3**（完整说明 + 「改了怎么生效」的命令 + 确认生效的查法）、**§10**（速查表） | ✅ 一致 |
+| **F-4** nginx 版本 | **已自动化，不需要人手工改语法**：`install.sh` 先跑 `deploy/nginx-http2-compat.sh`，按**目标机**的 nginx 版本自动决定：≥ 1.25.1 保留 `http2 on;`、< 1.25.1 自动降级成 `listen ... ssl http2;`（所有版本都合法）、探测不到时按需降级（保守）；`NGINX_VERSION` 可覆盖探测结果（用于预演 / 测试） | 手册 **§8.1**（含决策表、查版本的方法、`NGINX_VERSION` 覆盖用法、4 个版本的实跑输出） | ✅ 一致 —— **但追加了一条如实说明**：自动探测在真机上**总是失败**（见 D7-4） |
+
+### D. 计划块核验结果
+
+| 核验项 | 结果 |
+|---|---|
+| 计划 Task 7 的 `markdown` 代码块（计划第 5259–5470 行）在 `docs/deployment.md` 里**逐字连续**存在 | ✅ 是（起始字节下标 **963**；块前 30 行 = 阅读须知，块后 504 行 = §8–§14） |
+| §0 段（`## 0. 三条必须先知道的硬约束` → `## 1. 本地 / 内网`）**逐字**包含 | ✅ 是 |
+| 计划 Task 7 Step 2 的验收命令 | `single writer at a time` → **1**；`proxy_buffering off` → **1**；`backup()` → **3**（计划期望 1 / 1 / 2，判据是「都 ≥ 1」⇒ 通过；见 D7-6） |
+| 计划 Task 7 的代码块**本身有没有被改** | ❌ **没改**（只追加了本台账一章） |
+| `docs/deployment.md` 是不是唯一产出 | ✅ 是（本 Task 只新增这一个文件 + 追加本台账；**`platform/` 下一个字节都没动**） |
+
+### E. 遗留（交给上游，本 Task 不处理）
+
+- **D7-4 是唯一的代码级遗留**：`deploy/nginx-http2-compat.sh` 的 `detect_version()` 解析不了真实 nginx 的
+  `nginx version: nginx/1.24.0` 格式 ⇒ 真机总是走保守降级。**后果安全**（降级语法处处合法），
+  但「≥ 1.25.1 保留 `http2 on;`」只有显式 `NGINX_VERSION` 才走得到。
+  一行修法：
+
+  ```bash
+  # 现状（匹配不到）
+  sed -n 's|^nginx version: \([0-9][0-9.]*\).*|\1|p'
+  # 修法（把可选的 "nginx/" 前缀吃掉）
+  sed -n 's|^nginx version: nginx/\?\([0-9][0-9.]*\).*|\1|p'
+  ```
+
+  ⇒ 修完要重跑 `platform/test/deploy-assets.test.js` 与 F-4 的变异检验。
+  **本 Task 明确不改** —— 本 Task 的文件归属只有 `docs/deployment.md`（+ 计划文档）。
+
+### F. 偏离与遗留（Task 7 自身）
+
+- 本 Task **新增**了 `docs/deployment.md`（计划 Task 7 Files 段已列）。
+- 本 Task **追加**了本章台账（`D7-*` 编号，承接 `D1-*` / `D2-*` / `D3-*` / `D4-*` 的序列）。
+- 手册内部的「未覆盖项」表用 `U-1` ~ `U-7` 编号，**与本台账的 `D7-*` 是两套编号**（不要混用）。
+- ⚠️ 手册 §5 与 §7（计划骨架里的演示版构建命令）**保留原样未改**，其「此刻跑不通」的状态由手册顶部的
+  「**阅读须知**」与 §8.5 承载 —— 理由见 D7-1。
