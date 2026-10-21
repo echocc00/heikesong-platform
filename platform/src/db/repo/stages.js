@@ -101,7 +101,7 @@ export function listStageTeams(db, stageId) {
        LEFT JOIN task_packages tp ON tp.id = t.task_package_id
        WHERE t.edition_id = (SELECT edition_id FROM stages WHERE id = ?)
          AND t.deleted_at IS NULL
-       ORDER BY t.id`,
+       ORDER BY t.created_at, t.rowid`,
     )
     .all(stageId)
     .map((r) => ({
