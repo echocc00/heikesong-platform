@@ -6914,9 +6914,13 @@ const CAPABILITIES = [
   ['score:write', '写入评分'],
   ['score:read', '读取评分'],
   ['peer_review:write', '互评'],
+  ['self_review:write', '提交本队自评'],
   ['signoff:create', '企业里程碑签字'],
+  ['behavior:write', '提交行为分记录（周进度 / workshop 产出 / 企业对接会）'],
   ['stage:compute', '触发计算发榜'],
   ['audit:read', '读取审计与计算快照'],
+  ['audit:write', '裁决复核项与申诉'],
+  ['appeal:write', '提交申诉'],
   ['pool:read', '读取三池'],
   ['pool:write', '维护三池'],
 ];
@@ -6937,11 +6941,12 @@ const EDITION_NAME = '首届 · 上海';
 const ROLE_CAPABILITIES = [
   ['admin', 'registration:review'], ['admin', 'team:read'], ['admin', 'team:manage'],
   ['admin', 'task_package:read'], ['admin', 'task_package:approve'], ['admin', 'score:read'],
-  ['admin', 'stage:compute'], ['admin', 'audit:read'], ['admin', 'pool:read'], ['admin', 'pool:write'],
-  ['captain', 'registration:write'], ['captain', 'team:create'], ['captain', 'team:read'],
+  ['admin', 'stage:compute'], ['admin', 'audit:read'], ['admin', 'audit:write'], ['admin', 'appeal:write'], ['admin', 'pool:read'], ['admin', 'pool:write'],
+  ['captain', 'registration:write'], ['captain', 'team:create'], ['captain', 'team:read'], ['captain', 'behavior:write'],
   ['captain', 'team:manage'], ['captain', 'pool:read'], ['captain', 'task_package:read'],
-  ['member', 'registration:write'], ['member', 'team:read'], ['member', 'pool:read'],
-  ['member', 'task_package:read'],
+  ['captain', 'peer_review:write'], ['captain', 'self_review:write'], ['captain', 'appeal:write'],
+  ['member', 'registration:write'], ['member', 'team:read'], ['member', 'pool:read'], ['member', 'behavior:write'],
+  ['member', 'task_package:read'], ['member', 'peer_review:write'], ['member', 'self_review:write'],
   ['judge', 'score:write'], ['judge', 'score:read'], ['judge', 'peer_review:write'], ['judge', 'task_package:read'],
   ['enterprise', 'score:write'], ['enterprise', 'score:read'], ['enterprise', 'signoff:create'],
   ['enterprise', 'task_package:read'], ['enterprise', 'task_package:write'], ['enterprise', 'pool:read'],
@@ -7423,3 +7428,37 @@ git commit -m "feat(P1): 端到端串联与种子扩充（报名→分级→建�
 ---
 
 *配套：`../specs/2026-10-20-heikesong-platform-design.md`｜`../requirements-traceability.md`｜`../rule-decisions.md`｜`../`*
+## 计划块逐字同步台账（2026-10-21 · 漂移审计统一同步轮）
+
+> **背景**：计划里的代码块是「该文件**当前实现**的逐字副本」。后续阶段按
+> 「**最早建立者 owns、后续阶段 Modify（追加）不得重建**」改了实现，owning 阶段的计划块就会漂移。
+> 本轮用 `docs/tools/plan-block-audit.mjs`（**可复算**）判定 C 类漂移，并分两档处置：
+>
+> - **真重写（C-RW）**：实现被后续阶段**重写**（改动落在既有行上）⇒ 计划块**必须逐字同步**回本计划；
+> - **良性扩展（C-EXT）**：后续阶段只是**追加**（结构性现象）⇒ 计划块**保持原样**，只在此记明「谁追加了什么」。
+>
+> **同步工具**：`docs/tools/plan-block-sync.mjs`（定位信号与 `--verify` **同源**，避免外部脚本的定位歧义）。
+> 本轮同步后漂移审计从 **C-RW 9 条 → 0 条**、A 类从 **184 → 192**。
+
+### 真重写（已逐字同步）
+
+| 编号 | 文件 | 漂移来源（哪个后续阶段改了什么） | 同步后行数 | 核验 |
+|---|---|---|---|---|
+| SYNC-4 | `scripts/seed.js` | P0 修复轮（I-3 零依赖 import 守卫、I-7 裸 SQL 全部下沉仓储层）→ P1 端到端串联与种子扩充 → P2 `scoreStage` → P3 终审修复轮（个人积分榜 / MVP / 滚动榜告警）→ P4 审计 API 的种子位 | 293 | `--verify` 逐字一致 |
+
+> **注意**：种子里的**能力点**在 P2 之后被扩过一轮（`peer_review:write` / `self_review:write` /
+> `behavior:write` / `audit:write` / `appeal:write`），本计划块原本停留在 P1 的旧能力表 ——
+> 这正是「同步」要消掉的漂移，而不是新需求。
+
+### 良性扩展（仅记录，计划块保持原样）
+
+| 编号 | 文件 | 后续阶段的追加内容 |
+|---|---|---|
+| SYNC-14 | `src/db/repo/taskPackages.js` | P1 修复轮（兜底排序键从随机 UUID 改为 `rowid`）；P5 Task 3 修复轮（三池派生相关追加） |
+| SYNC-15 | `src/db/repo/teams.js` | P1 修复轮（同上：`rowid` 兜底键）；P2 追加赛段名册相关查询 |
+| SYNC-16 | `src/services/team.js` | P1 Task 4 独立评审处置与 Task 5 战队成员管理；P3 终审修复轮（个人积分榜相关写入通路） |
+
+> ⚠️ **口径**：C-EXT 的「良性」指**结构上**是追加，不等于内容永远不变。
+> 漂移审计可随时复算：`node docs/tools/plan-block-audit.mjs platform`。
+> 若某个文件后续被**重写**（而非追加），它会自动从 C-EXT 升到 C-RW，届时必须再做一次同步。
+

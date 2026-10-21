@@ -211,7 +211,15 @@ test('rules/points.json 与 INTERFACES.md §4 一致（10/8/5 · 前 3 名 · MV
   assert.deepEqual(rules.points.stagePoints, [10, 8, 5]);
   assert.equal(rules.points.stagePointsOnlyTopN, 3);
   assert.deepEqual(rules.points.mvp, { stagesCounted: 4, roadshowWeight: 1.0, perPackage: 1 });
-  assert.deepEqual(rules.points.personal, { lifetime: true, includeMvpVote: true });
+  // ⚠️ personal 组在 P5 修复轮（I-3）里多了两项：atomicKinds / rollupKind ——
+  //    个人积分口径的**唯一规则来源**（原来散在 rules.pools.talentPointKinds 与
+  //    rules.points.personal 两处，两处口径还不一样）。
+  assert.deepEqual(rules.points.personal, {
+    lifetime: true,
+    includeMvpVote: true,
+    atomicKinds: ['stage_rank', 'mvp', 'roadshow'],
+    rollupKind: 'personal_rollup',
+  });
   assert.equal(rules.points.tieRankStyle, '1224');
   assert.equal(rules.points.fallbackPolicy.enabled, false, 'R-JDG-21 权重回退默认关闭');
   assert.equal(rules.points.fallbackPolicy.enterpriseWeight, 0.15);
@@ -1368,30 +1376,37 @@ test('★ computePersonalPoints：终生上榜 + MVP 投决积分可开关 + 122
     { id: 'l1', userId: 'u_1', kind: 'stage_rank', points: 10 },
     { id: 'l2', userId: 'u_1', kind: 'mvp', points: 31 },
     { id: 'l3', userId: 'u_2', kind: 'stage_rank', points: 10 },
-    { id: 'l4', userId: 'u_3', kind: 'personal_rollup', points: 99 },   // 派生快照，不重复累加
+    { id: 'l4', userId: 'u_3', kind: 'personal_rollup', points: 99 },   // 汇总快照：有它就以它为准
     { id: 'l5', userId: 'u_4', kind: 'stage_rank', points: 10 },
     { id: 'l6', userId: 'u_5', kind: 'stage_rank', points: 5 },
   ];
   const on = computePersonalPoints({ ledger, pointsConfig: P });
   assert.equal(on.lifetime, true);
   assert.equal(on.includeMvpVote, true);
-  assert.equal(on.rows[0].userId, 'u_1');
-  assert.equal(on.rows[0].total, 41, '赛段积分 + MVP 投决积分');
-  assert.equal(on.rows[0].byKind.stage_rank, 10);
-  assert.equal(on.rows[0].byKind.mvp, 31);
-  assert.ok(!on.rows.some((r) => r.userId === 'u_3'), 'personal_rollup 不参与累加');
-  assert.equal(on.excludedEntries, 1, 'personal_rollup 计入排除条数');
-  // 1224 式并列：u_2 与 u_4 都是 10 分 → 并列第 2；下一个（u_5，5 分）名次跳到 4
-  assert.deepEqual(on.rows.map((r) => r.rank), [1, 2, 2, 4], '同分并列 → 1224（并列后名次跳号）');
+  // ⚠️ 口径（P5 修复轮 I-3 统一后的**唯一**口径，见 src/domain/personal-points.js）：
+  //    「有 personal_rollup 行 ⇒ 以 rollup 为准；否则 ⇒ atomic 白名单之和」。
+  //    原来本函数**排除** personal_rollup、且**任何 kind 都计入** —— 与人才池那套
+  //    口径算出的是两个不同的名次（同一份流水 ⇒ 两处不一致）。
+  assert.equal(on.rows[0].userId, 'u_3', 'rollup 99 分排第一');
+  assert.equal(on.rows[0].total, 99, '有 rollup 行时以 rollup 为准（不是 10+99 也不是 0）');
+  assert.equal(on.rows[0].byKind.personal_rollup, 99, '分项来源看得见');
+  const u1 = on.rows.find((r) => r.userId === 'u_1');
+  assert.equal(u1.total, 41, '赛段积分 + MVP 投决积分');
+  assert.equal(u1.byKind.stage_rank, 10);
+  assert.equal(u1.byKind.mvp, 31);
+  assert.equal(on.excludedEntries, 0, 'rollup 行与 atomic 行都已被计入（rollup 决定 total、atomic 进 breakdown）');
+  // 1224 式并列：u_2 与 u_4 都是 10 分 → 并列第 3；下一个（u_5，5 分）名次跳到 5
+  assert.deepEqual(on.rows.map((r) => r.rank), [1, 2, 3, 3, 5], '同分并列 → 1224（并列后名次跳号）');
 
   const off = computePersonalPoints({
-    ledger, pointsConfig: { ...P, personal: { lifetime: true, includeMvpVote: false } },
+    ledger, pointsConfig: { ...P, personal: { ...P.personal, lifetime: true, includeMvpVote: false } },
   });
-  assert.equal(off.rows[0].total, 10, '关闭 MVP 投决积分后只剩赛段积分');
-  assert.equal(off.excludedEntries, 2, '关掉 MVP 投决后，personal_rollup 与 mvp 两类都计入排除');
+  const u1off = off.rows.find((r) => r.userId === 'u_1');
+  assert.equal(u1off.total, 10, '关闭 MVP 投决积分后只剩赛段积分');
+  assert.equal(off.excludedEntries, 1, '只有被关掉的 mvp 那一行没被计入');
   assert.equal(off.includeMvpVote, false);
-  // 关掉 MVP 投决后 u_1 / u_2 / u_4 都是 10 分 → 三方并列第 1，u_5（5 分）名次跳到 4
-  assert.deepEqual(off.rows.map((r) => r.rank), [1, 1, 1, 4], '三方并列 → 同名次，下一名跳号');
+  // 关掉 MVP 投决后 u_1 / u_2 / u_4 都是 10 分 → 三方并列第 2，u_5（5 分）名次跳到 5
+  assert.deepEqual(off.rows.map((r) => r.rank), [1, 2, 2, 2, 5], '三方并列 → 同名次，下一名跳号');
 });
 
 test('★ R-JDG-20：并列共享奖金，总额不变', () => {
@@ -1624,21 +1639,27 @@ test('computePersonalPoints：同分时按 userId 码位序稳定排序（不靠
   assert.deepEqual(out.rows.map((r) => r.userId), ['u_a', 'u_b']);
 });
 
-test('computePersonalPoints：无 userId 的条目不参与累加；无 kind 记为 unknown', () => {
+test('computePersonalPoints：无 userId 的条目不参与累加；口径外的 kind 不计入并告警', () => {
   const out = computePersonalPoints({
     ledger: [
       { id: 'l1', kind: 'stage_rank', points: 5 },          // 没有 userId → 跳过
-      { id: 'l2', userId: 'u_1', points: 7 },              // 没有 kind → unknown
+      { id: 'l2', userId: 'u_1', points: 7 },              // 没有 kind → unknown（不在白名单里）
       { id: 'l3', userId: 'u_2' },                         // 缺 points → 按 0 计
     ],
     pointsConfig: P,
   });
   assert.equal(out.rows.length, 2);
   assert.equal(out.rows[0].userId, 'u_1');
-  assert.equal(out.rows[0].total, 7);
-  assert.equal(out.rows[0].byKind.unknown, 7);
+  // ⚠️ 口径（P5 修复轮 I-3 统一后）：口径外的 kind **不计入**（原来本函数是「任何 kind 都计入」）
+  assert.equal(out.rows[0].total, 0, 'unknown 不在白名单里 ⇒ 不计入（不是 7）');
+  assert.deepEqual(out.rows[0].byKind, {}, '没被计入的 kind 不进 byKind');
   assert.equal(out.rows[1].userId, 'u_2');
   assert.equal(out.rows[1].total, 0, '缺 points 按 0 计（不产生 NaN）');
+  assert.equal(out.excludedEntries, 3, '三行都没被计入：l1 无 userId、l2 与 l3 的 kind 是 unknown');
+  assert.ok(
+    out.warnings.some((w) => w.code === 'points_kind_ignored' && w.userId === 'u_1' && w.kind === 'unknown'),
+    '口径外的 kind 必须显式告警（不静默），且 kind 要能看出是什么',
+  );
 });
 
 test('★ computePrizeShares：奖金表缺该名次时按 0 计（总额不产生 NaN）', () => {
@@ -6419,3 +6440,39 @@ P3 验收标准自查 **8/8 通过**。
 | 2 | **里程碑清单的固定时点 = 组队时** | `milestones` 表的行在**建队**时落一次（对齐 R-STG-03「里程碑报名时固定」）。**组队之后**新增的里程碑不会自动补进已有队伍 —— 补录归 **P5 的工作流** |
 | 3 | **赛段名册仍是届期级** | `stage_team` 表在 P3 建好了（Task 1 兑现 D-33），但**没有写入流程** —— 名册的登记时机（赛段开启时把该届参赛队登记进来）属 **P5 的工作流**（终审修复轮未改这一条） |
 | 4 | **企业签字的「撤回」有归属限制** | `POST /api/milestones/:id/signoff/withdraw` 要求 `signoff:create` 能力点（企业 / 企业管理员），且**只能撤回自己签的那条**（`signoffId` 必填且必须属于该里程碑）；**组委会（超管）可代撤**。撤回是**软删除**（置 `revoked_at`），撤回后该里程碑回到「未达成」，段位降档由**重算**体现 |
+## 计划块逐字同步台账（2026-10-21 · 漂移审计统一同步轮）
+
+> **背景**：计划里的代码块是「该文件**当前实现**的逐字副本」。后续阶段按
+> 「**最早建立者 owns、后续阶段 Modify（追加）不得重建**」改了实现，owning 阶段的计划块就会漂移。
+> 本轮用 `docs/tools/plan-block-audit.mjs`（**可复算**）判定 C 类漂移，并分两档处置：
+>
+> - **真重写（C-RW）**：实现被后续阶段**重写**（改动落在既有行上）⇒ 计划块**必须逐字同步**回本计划；
+> - **良性扩展（C-EXT）**：后续阶段只是**追加**（结构性现象）⇒ 计划块**保持原样**，只在此记明「谁追加了什么」。
+>
+> **同步工具**：`docs/tools/plan-block-sync.mjs`（定位信号与 `--verify` **同源**，避免外部脚本的定位歧义）。
+> 本轮同步后漂移审计从 **C-RW 9 条 → 0 条**、A 类从 **184 → 192**。
+
+### 真重写（已逐字同步）
+
+| 编号 | 文件 | 漂移来源（哪个后续阶段改了什么） | 同步后行数 | 核验 |
+|---|---|---|---|---|
+| SYNC-7 | `test/leaderboard-migration.test.js` | P3 自身后续（榜单服务、战绩卡与 4 个榜单 API）→ P5 Task 3 修复轮（3 条 Important + 3 条 Minor） | 241 | `--verify` 逐字一致 |
+| SYNC-8 | `test/points.test.js` | P5 Task 3 修复轮 **I-3**：个人积分口径**唯一化**（`atomicKinds` / `rollupKind` 收进 `rules.points.personal`；「有 `personal_rollup` 行 ⇒ 以 rollup 为准，否则 ⇒ atomic 白名单之和」） | 398 | `--verify` 逐字一致 |
+
+> **注意**：SYNC-8 同步进来的**不是「多写了几行断言」，而是口径变了** ——
+> 原计划块断言「`personal_rollup` 不参与累加、任何 kind 都计入」，
+> 现行实现断言「有 rollup 行就以 rollup 为准、否则取 atomic 白名单之和」。
+> 两者在**同一份流水**下会算出**两个不同的名次**（这正是 I-3 要消灭的不一致）。
+
+### 良性扩展（仅记录，计划块保持原样）
+
+| 编号 | 文件 | 后续阶段的追加内容 |
+|---|---|---|
+| SYNC-17 | `src/domain/points.js` | P5 Task 3 修复轮（个人积分口径唯一化的**唯一计算点** `computePersonalTotals`） |
+| SYNC-18 | `src/services/milestone.js` | P3 终审修复轮（个人积分榜 / MVP / 滚动榜告警相关写入通路）；溯源注释补齐 |
+| SYNC-19 | `test/leaderboard-web.test.js` | P3 终审修复轮；P6 Task 5（演示版适配器扩展为完整流程） |
+
+> ⚠️ **口径**：C-EXT 的「良性」指**结构上**是追加，不等于内容永远不变。
+> 漂移审计可随时复算：`node docs/tools/plan-block-audit.mjs platform`。
+> 若某个文件后续被**重写**（而非追加），它会自动从 C-EXT 升到 C-RW，届时必须再做一次同步。
+

@@ -15,3 +15,6 @@ platform/web/dist/
 
 # SDD 执行期工作区（ledger / task brief / 评审包 / 报告）
 .superpowers/
+
+# 计划块同步工具的自动备份（docs/tools/plan-block-sync.mjs 每次同步前写一份 .bak）
+*.md.bak

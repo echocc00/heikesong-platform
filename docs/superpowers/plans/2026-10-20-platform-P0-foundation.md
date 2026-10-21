@@ -1624,7 +1624,7 @@ import { dirname, join } from 'node:path';
 
 const rulesDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'rules');
 
-test('仓库自带的 9 份规则配置能通过校验', () => {
+test('仓库自带的全部规则配置能通过校验', () => {
   const { rules } = loadRules(rulesDir);
   assert.deepEqual(validateRules(rules), []);
 });
@@ -1673,7 +1673,7 @@ test('破同分链必须以确定性兜底项结尾', () => {
   assert.ok(validateRules(broken).some((e) => e.includes('tiebreak')));
 });
 
-// ── 以下 6 条覆盖「9 份配置全部有内容校验」这条要求 ──────────────
+// ── 以下 6 条覆盖「每份配置都有内容校验」这条要求 ──────────────
 // 行为分 / 可见性 / 里程碑这三份配置如果只被读出来、不被校验，
 // 写错了也要等到 P2/P3 算分算榜时才发现 —— 那时榜单可能已经发出去了。
 
@@ -1725,7 +1725,7 @@ test('维度 key 重复会被拒绝', () => {
 
 // ── 以下 3 条来自实现者实测反馈的 3 条漏检（父代理裁决后采纳）──────────
 
-test('9 份配置的 version 必须一致（漂移会让计算 trace 说谎）', () => {
+test('全部配置的 version 必须一致（漂移会让计算 trace 说谎）', () => {
   const { rules } = loadRules(rulesDir);
   const broken = structuredClone(rules);
   broken.tiebreak.version = '2099-01-01';
@@ -1819,6 +1819,42 @@ test('权重合计的容差必须严格：合计 101% 也要被拒绝（终审 I
     errors.some((e) => e.includes('scoring.initial') && e.includes('权重合计')),
     `合计 101% 必须被拒绝，实际校验结果：${JSON.stringify(errors)}`,
   );
+});
+
+// ── 以下 4 条来自 P2 Task 8（新增字段的 fail-fast 校验）────────────────────
+
+test('P2：缺 judgePool 段会被拒绝（R-JDG-10 / R-JDG-11 的评委池构成必须配置化）', () => {
+  const { rules } = loadRules(rulesDir);
+  const broken = structuredClone(rules);
+  delete broken.scoring.initial.judgePool;
+  const errors = validateRules(broken);
+  assert.ok(errors.some((e) => e.includes('scoring.initial') && e.includes('judgePool')));
+});
+
+test('P2：judgePool 的占比必须在 0..1', () => {
+  const { rules } = loadRules(rulesDir);
+  const broken = structuredClone(rules);
+  broken.scoring.final.judgePool.minEnterpriseSeatShare = 1.5;
+  const errors = validateRules(broken);
+  assert.ok(errors.some((e) => e.includes('minEnterpriseSeatShare')));
+});
+
+test('P2：freeBrief.judgeDimension 必须指向一个评委席维度（R4 的替代维度）', () => {
+  const { rules } = loadRules(rulesDir);
+  const broken = structuredClone(rules);
+  broken.scoring.initial.freeBrief.judgeDimension = 'enterprise'; // 企业席维度不能当替代
+  const errors = validateRules(broken);
+  assert.ok(errors.some((e) => e.includes('freeBrief.judgeDimension')));
+});
+
+test('P2：归一化策略参数（trimmedIterations / bayesPriorStrength）非法会被拒绝', () => {
+  const { rules } = loadRules(rulesDir);
+  const broken = structuredClone(rules);
+  broken.scoring.initial.trimmedIterations = 0;
+  broken.scoring.final.bayesPriorStrength = -1;
+  const errors = validateRules(broken);
+  assert.ok(errors.some((e) => e.includes('trimmedIterations')));
+  assert.ok(errors.some((e) => e.includes('bayesPriorStrength')));
 });
 ```
 
@@ -2059,7 +2095,16 @@ Expected: FAIL —— `Cannot find module '../src/config.js'`
 //      "能读出 JSON" 不等于 "配置是对的"。漏检的那几份一旦写错，症状要到
 //      P2/P3 算分、算榜单时才爆出来 —— 而那时榜单可能已经发出去了。
 import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+// 交叉引用校验用的常量（fail-fast 的「引用真实存在」那一类）：
+//   · TASK_PACKAGE_STATUSES —— task_packages.status 的取值域（唯一写入方
+//     src/services/taskPackage.js 的状态机：submitted → assessed → published | returned）。
+//   · RESOURCE_KINDS —— 资源池的分组类型（唯一产生方 src/domain/pool-derive.js）。
+//   · LEDGER_POINT_KINDS —— points_ledger.kind 的取值域（契约 INTERFACES.md §4 明列）。
+// ⚠️ 这三个模块都是**叶子模块**（不 import 本文件）⇒ 不会形成循环依赖。
+import { TASK_PACKAGE_STATUSES } from './db/repo/taskPackages.js';
+import { RESOURCE_KINDS } from './domain/pool-derive.js';
 
 const FILES = {
   scoringInitial: 'scoring-initial.json',
@@ -2071,6 +2116,13 @@ const FILES = {
   registration: 'registration-scoring.json',
   solvability: 'solvability.json',
   milestones: 'milestones.default.json',
+  teamFormation: 'team-formation.json',
+  schedule: 'schedule.json',
+  compliance: 'compliance.json',
+  points: 'points.json',
+  criteria: 'criteria.json',
+  pools: 'pools.json',
+  audit: 'audit.json',                     // ← P4 新增
 };
 
 function readJson(path) {
@@ -2089,6 +2141,12 @@ const VALID_NORMALIZATIONS = ['zscore', 'median', 'trimmed', 'bayes'];
 const VALID_FALLBACKS = ['global', 'raw'];
 // 里程碑确认方只有两种：企业侧确认 / 评委确认
 const VALID_CONFIRMERS = ['enterprise', 'judge'];
+// points_ledger.kind 的取值域。
+// 依据：INTERFACES.md §4「points_ledger(id, edition_id, stage_id, team_id, user_id, kind, points, created_at)
+//        -- kind: stage_rank | mvp | roadshow | personal_rollup」。
+// ⛔ 这不是「随便列几个」：kind 写错一个字母 → 该笔积分被静默丢弃（口径外 kind
+//    只告警不计入）→ 榜单少一分且没人知道。配置里引用不存在的 kind 必须当场拒绝。
+const LEDGER_POINT_KINDS = new Set(['stage_rank', 'mvp', 'roadshow', 'personal_rollup']);
 
 function weightSum(dimensions) {
   return dimensions.reduce((a, d) => a + (typeof d.weight === 'number' ? d.weight : 0), 0);
@@ -2110,37 +2168,68 @@ function hasMissingKey(items) {
   return items.some((i) => typeof i.key !== 'string' || !i.key);
 }
 
-export function validateRules(rules) {
+/**
+ * 把配置对象摊平收集到 out。
+ * 「有 id 的是一份配置，没 id 的是命名空间」（scoring = { initial, final }）。
+ */
+function collectConfigObjects(value, out) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return;
+  if (typeof value.id === 'string') {
+    out.push(value);
+    return;
+  }
+  for (const inner of Object.values(value)) {
+    collectConfigObjects(inner, out);
+  }
+}
+
+/**
+ * 校验全部规则配置。**任何一条不通过都必须 fail-fast**（loadRules 会抛错拒绝启动）。
+ * @param {object} rules 分组后的配置（loadRules 传入）
+ * @param {number|null} [expectedCount] 应当存在的配置份数（loadRules 传 FILES 的键数）。
+ *   传了才能发现「整份配置没被识别到」；不传时只做 version 相关的检查。
+ */
+export function validateRules(rules, expectedCount = null) {
   const errors = [];
   const push = (msg) => errors.push(msg);
 
   // ── 版本号一致性 ─────────────────────────────────────────
-  // 9 份配置的 version 必须全等。version 会写进计算 trace（设计原则
+  // 所有配置的 version 必须全等。version 会写进计算 trace（设计原则
   // 「每次计算留 trace」）—— 版本号漂移 = 审计链在说谎：trace 上标注的版本
   // 与实际生效的规则对不上，事后复算无法自证。
-  const versionValues = [
-    rules?.scoring?.initial?.version,
-    rules?.scoring?.final?.version,
-    rules?.tiebreak?.version,
-    rules?.ranks?.version,
-    rules?.behavior?.version,
-    rules?.visibility?.version,
-    rules?.registration?.version,
-    rules?.solvability?.version,
-    rules?.milestones?.version,
-  ].filter((v) => v !== undefined && v !== null && v !== '');
-  // 9 份必须**都有** version —— 只校验「存在的那几份全等」是不够的：
-  // 缺一份时 loadRules 对外报的 version 会取到别人的值，等于说谎。
-  if (versionValues.length < 9) {
-    push(`规则配置有 ${9 - versionValues.length} 份缺少 version 字段`);
+  //
+  // ⚠️ 2026-10-21 修正（P1 Task 3 验收发现，与 P2–P6 漂移审计的 I-2 同一条）：
+  //    原来这里是**硬编码的 9 项**列表 —— P1 新增 3 份配置（teamFormation /
+  //    schedule / compliance）之后，它们的 version 漂移**根本不会被发现**，
+  //    这条校验对新增配置形同虚设（实跑：把新配置改成一个异版本号，零报错）。
+  //    改成**自动派生**：按「有 id 的就是一份配置」把配置对象摊平，
+  //    加多少份配置都自动覆盖 —— 不再需要改这里。
+  //
+  //    「有 id 的是配置，没 id 的是命名空间」（如 scoring = { initial, final }）。
+  //    用 id 而不是 version 做识别：一份配置**缺了 version** 时仍能被认出来，
+  //    否则它会被当成命名空间 → 「缺少 version」这条检查反而失效。
+  const configObjects = [];
+  for (const value of Object.values(rules ?? {})) {
+    collectConfigObjects(value, configObjects);
   }
-  if (versionValues.length > 1) {
-    const distinct = [...new Set(versionValues)];
-    // ⚠️ distinct 是**数组**（Set 被展开），判重数用 .length —— 用 .size 会拿到
-    //    undefined，比较恒为 false，这条校验会静默失效。
-    if (distinct.length > 1) {
-      push(`规则配置 version 不一致：${distinct.join(' / ')} —— 9 份配置必须同版本`);
-    }
+  const configCount = configObjects.length;
+  // 每份都必须**有** version —— 只校验「存在的那几份全等」是不够的：
+  // 缺一份时 loadRules 对外报的 version 会取到别人的值，等于说谎。
+  const missingVersion = configObjects.filter(
+    (c) => c.version === undefined || c.version === null || c.version === '',
+  ).length;
+  if (missingVersion > 0) {
+    push(`规则配置有 ${missingVersion} 份缺少 version 字段`);
+  }
+  // 份数对不上 = 有配置**没被识别到**（如整份配置读成了空对象）→ 必须报错。
+  if (expectedCount !== null && configCount !== expectedCount) {
+    push(`规则配置应有 ${expectedCount} 份，实际只识别到 ${configCount} 份`);
+  }
+  const distinct = [...new Set(configObjects.map((c) => c.version).filter((v) => v !== undefined && v !== null && v !== ''))];
+  // ⚠️ distinct 是**数组**（Set 被展开），判重数用 .length —— 用 .size 会拿到
+  //    undefined，比较恒为 false，这条校验会静默失效。
+  if (distinct.length > 1) {
+    push(`规则配置 version 不一致：${distinct.join(' / ')} —— ${configCount} 份配置必须同版本`);
   }
 
   // ── 评分配置 ──────────────────────────────────────────────
@@ -2172,6 +2261,45 @@ export function validateRules(rules) {
     }
     if (typeof cfg.wEnterprise !== 'number' || cfg.wEnterprise < 0 || cfg.wEnterprise > 1) {
       push(`scoring.${key} wEnterprise 必须在 0..1`);
+    }
+    // ── P2 追加：评委池 / 自由命题替代维度 / 归一化策略参数 ──
+    // ⛔ 为什么要在这里 fail-fast（而不是等到运行时才报）：
+    //    这些字段直接决定「谁有投票权」「自由命题组的企业项由谁顶」——
+    //    写错时不会崩，会**静默算出一份错的榜单**（与「权重合计≠100% 拒绝启动」同一类病）。
+    const pool = cfg.judgePool;
+    if (!pool) {
+      push(`scoring.${key} 缺少 judgePool 段（R-JDG-10 / R-JDG-11）`);
+    } else {
+      if (!(Number(pool.minJudgesPerDimension) > 0)) {
+        push(`scoring.${key} judgePool.minJudgesPerDimension 必须 > 0`);
+      }
+      if (Number(pool.minEnterpriseSeatShare) < 0 || Number(pool.minEnterpriseSeatShare) > 1) {
+        push(`scoring.${key} judgePool.minEnterpriseSeatShare 必须在 0..1`);
+      }
+      if (Number(pool.maxExpertSeatShare) < 0 || Number(pool.maxExpertSeatShare) > 1) {
+        push(`scoring.${key} judgePool.maxExpertSeatShare 必须在 0..1`);
+      }
+      if (!Array.isArray(pool.votingSeats) || !pool.votingSeats.length) {
+        push(`scoring.${key} judgePool.votingSeats 缺失`);
+      }
+      if (!Array.isArray(pool.nonVotingSeats) || !pool.nonVotingSeats.length) {
+        push(`scoring.${key} judgePool.nonVotingSeats 缺失`);
+      }
+    }
+    const demand = cfg.freeBrief?.judgeDimension;
+    if (!demand) {
+      push(`scoring.${key} 缺少 freeBrief.judgeDimension（R-JDG-08 R4）`);
+    } else if (!cfg.dimensions.some((d) => d.key === demand && d.seat === 'judge')) {
+      push(`scoring.${key} freeBrief.judgeDimension=${demand} 必须是一个评委席维度`);
+    }
+    if (cfg.selfEvalThreshold != null && Number(cfg.selfEvalThreshold) < 0) {
+      push(`scoring.${key} selfEvalThreshold 必须 ≥ 0`);
+    }
+    if (cfg.trimmedIterations != null && !(Number.isInteger(cfg.trimmedIterations) && cfg.trimmedIterations >= 1)) {
+      push(`scoring.${key} trimmedIterations 必须是 ≥1 的整数`);
+    }
+    if (cfg.bayesPriorStrength != null && !(Number.isFinite(cfg.bayesPriorStrength) && cfg.bayesPriorStrength >= 0)) {
+      push(`scoring.${key} bayesPriorStrength 必须是 ≥0 的有限数`);
     }
     if (!VALID_NORMALIZATIONS.includes(cfg.normalizationStrategy)) {
       push(`scoring.${key} normalizationStrategy 非法`);
@@ -2314,6 +2442,32 @@ export function validateRules(rules) {
       }
     }
   }
+  // ⚠️ 2026-10-21 独立评审修正（Minor M-2：**vetoes 完全没有校验**）：
+  //    原来这里只校验 dimensions 与 grades，`solvability.vetoes` 一个字都没查 ——
+  //    否决项写成空数组、或两条同名、或 `auto.dimension` 指向一个不存在的维度，
+  //    全都能通过校验、直到算分时才出问题（或者干脆**静默失效**）。
+  //    现在校验：非空、key 唯一、label 非空、`auto` 的形状与指向的维度存在。
+  if (!Array.isArray(sol?.vetoes) || sol.vetoes.length === 0) {
+    push('solvability.vetoes 缺失或为空（R-ENT-07 三条一票否决）');
+  } else if (hasBadItem(sol.vetoes)) {
+    push('solvability.vetoes 含非对象元素');
+  } else if (hasDuplicateKeys(sol.vetoes)) {
+    push('solvability.vetoes 存在重复 key');
+  } else {
+    const dimensionKeys = new Set((sol.dimensions ?? []).map((d) => d.key));
+    for (const v of sol.vetoes) {
+      if (typeof v.label !== 'string' || !v.label) {
+        push(`solvability.vetoes ${v.key} 缺少 label`);
+      }
+      if (v.auto === undefined || v.auto === null) continue;
+      if (typeof v.auto !== 'object' || typeof v.auto.dimension !== 'string'
+        || typeof v.auto.equals !== 'number') {
+        push(`solvability.vetoes ${v.key} 的 auto 必须是 { dimension: string, equals: number }`);
+      } else if (dimensionKeys.size && !dimensionKeys.has(v.auto.dimension)) {
+        push(`solvability.vetoes ${v.key} 的 auto.dimension 引用了不存在的维度 ${v.auto.dimension}`);
+      }
+    }
+  }
 
   // ── 行为分 ───────────────────────────────────────────────
   // 行为分只用于破同分、不进总分（分轨强制）；但它仍有自己的阈值与上限，必须校验。
@@ -2328,6 +2482,14 @@ export function validateRules(rules) {
     if (typeof behavior.completionThreshold !== 'number'
       || behavior.completionThreshold < 0 || behavior.completionThreshold > 100) {
       push('behavior.completionThreshold 必须在 0..100');
+    }
+    // ⚠️ sortUse **不是可配置项**，它是 R-PTS-08 的硬保证：行为分只能做破同分，
+    //    绝不能变成主评分（决赛名次 0% / 奖金 0%）。
+    //    链不变量里的那处检查（assertChainInvariants）在生产链路上【拿不到 behaviorConfig】，
+    //    属于「建好却从不校验」的同款病根 —— 所以必须在这里 fail-fast：
+    //    配置被改成 'primary' 之类的值时**拒绝启动**，而不是带着违规口径上线。
+    if (behavior.sortUse !== 'tiebreak_only') {
+      push('behavior.sortUse 必须是 tiebreak_only（R-PTS-08：行为分只做破同分，不进总分/奖金）');
     }
     if (!Array.isArray(behavior.events) || behavior.events.length === 0) {
       push('behavior.events 缺失或为空');
@@ -2386,6 +2548,269 @@ export function validateRules(rules) {
     }
   }
 
+  // ── 组队规则（R-REG-02 / R-REG-04 / R-REG-05 已定，不可被配置改掉）──
+  const tf = rules.teamFormation;
+  if (!tf) {
+    errors.push('teamFormation 缺失');
+  } else {
+    if (!(tf.teamSize?.min >= 2)) {
+      errors.push('teamFormation.teamSize.min 必须 ≥ 2（R-REG-02 已定：不接受 1 人组队）');
+    }
+    if (tf.teamSize?.max < tf.teamSize?.min) {
+      errors.push('teamFormation.teamSize.max 必须 ≥ min');
+    }
+    if (tf.captainMustBeMba !== true) {
+      errors.push('teamFormation.captainMustBeMba 必须为 true（R-REG-05 已定：组长必须一堂 MBA 在籍）');
+    }
+    if (!(tf.teamsPerPackage?.min >= 1) || tf.teamsPerPackage?.max < tf.teamsPerPackage?.min) {
+      errors.push('teamFormation.teamsPerPackage 必须满足 1 ≤ min ≤ max（R-REG-01：每任务包 2–3 队）');
+    }
+    const mixSum = (tf.packageQuotaMix?.enterprise ?? 0) + (tf.packageQuotaMix?.free ?? 0);
+    if (Math.abs(mixSum - 1) > 1e-9) {
+      errors.push(`teamFormation.packageQuotaMix 合计 = ${mixSum.toFixed(4)}，必须等于 1`);
+    }
+    if (tf.singleMemberTriggersMerge !== true) {
+      errors.push('teamFormation.singleMemberTriggersMerge 必须为 true（R-REG-04 已定）');
+    }
+    if (!(tf.singleMemberMergeDeadlineDays > 0)) {
+      errors.push('teamFormation.singleMemberMergeDeadlineDays 必须为正整数');
+    }
+  }
+
+  // ── 赛程时间轴（R-STG-01）──
+  const stages = rules.schedule?.stages;
+  if (!Array.isArray(stages) || stages.length !== 5) {
+    errors.push('schedule.stages 必须是 5 个赛段（R-STG-01）');
+  } else {
+    // ⚠️ 父代理预审修正（规格自相矛盾，原实现会让服务器**拒绝启动**）：
+    //    原来判 `stages[i].start <= stages[i - 1].end`（要求严格递增），
+    //    但 R-STG-01 的赛段表本身就是**交接式相接**的：
+    //      S1 调研 10/1-10/10 → S2 任务 10/10-13 → S3 开发 10/13-25
+    //      → S4 路演 10/26-28 → S5 落地 10/29-31
+    //    （见 docs/requirements-traceability.md 的 R-STG-01 一行）
+    //    上一段的**结束当天就是下一段的开始日** → `start == 上一段 end` 恒成立
+    //    → 原规则会让计划自带的 schedule.json 校验失败 → **fail-fast 拒绝启动**
+    //    → P1 一上线就是死的。父代理预审实跑复现：18 条用例全红，
+    //    报错「schedule.stages 必须按时间递增（第 3 段）」。
+    //    正确的判据是**不许重叠**（`start < 上一段 end`），相接是合法的；
+    //    同时补一条「本段 end 不得早于本段 start」。
+    for (let i = 1; i < stages.length; i += 1) {
+      if (stages[i].start < stages[i - 1].end) {
+        errors.push(`schedule.stages 第 ${i + 1} 段与上一段时间重叠（R-STG-01）`);
+      }
+    }
+    for (const st of stages) {
+      if (st.end < st.start) {
+        errors.push(`schedule.stages ${st.key} 的结束日早于开始日`);
+      }
+    }
+  }
+
+  // ── 合规与 IP（R-ENT-11 / R-ENT-12）──
+  if (!rules.compliance?.redLines?.length) {
+    errors.push('compliance.redLines 不得为空（R-ENT-12 合规红线）');
+  }
+  if (!rules.compliance?.ipOwnership?.team) {
+    errors.push('compliance.ipOwnership.team 缺失（R-ENT-11 团队保留 IP）');
+  }
+
+  // ── 报名问卷（R-REG-11）──
+  const q = rules.registration?.questions;
+  if (!q?.dimensionItems) {
+    errors.push('registration.questions.dimensionItems 缺失（R-REG-11）');
+  } else {
+    for (const d of rules.registration.dimensions) {
+      const items = q.dimensionItems[d.key] ?? [];
+      if (items.length !== 5) {
+        errors.push(`registration.questions.dimensionItems.${d.key} 必须是 5 题（SABC v1 §六：3 维各 5 题）`);
+      }
+    }
+  }
+  const funnel = rules.registration?.funnel;
+  if (!Array.isArray(funnel) || funnel.length !== 5) {
+    errors.push('registration.funnel 必须是 5 阶段（R-REG-10）');
+  } else {
+    for (let i = 1; i < funnel.length; i += 1) {
+      const prev = funnel[i - 1].rate;
+      const cur = funnel[i].rate;
+      if (prev !== null && cur !== null && cur > prev) {
+        errors.push(`registration.funnel 必须逐级收窄（第 ${i + 1} 段）`);
+      }
+    }
+  }
+
+  // ── 任务卡配比（R-ENT-09）──
+  const tm = rules.solvability?.taskMix;
+  if (tm) {
+    const sum = (tm.enterprise ?? 0) + (tm.free ?? 0);
+    if (Math.abs(sum - 1) > 1e-9) {
+      errors.push(`solvability.taskMix 合计 = ${sum.toFixed(4)}，必须等于 1（R-ENT-09：70% B 端 + 30% 自由）`);
+    }
+    const splitSum = Object.values(tm.enterpriseGradeSplit ?? {}).reduce((a, b) => a + b, 0);
+    if (Object.keys(tm.enterpriseGradeSplit ?? {}).length && Math.abs(splitSum - (tm.enterprise ?? 0)) > 1e-9) {
+      errors.push(`solvability.taskMix.enterpriseGradeSplit 合计 = ${splitSum.toFixed(4)}，必须等于 enterprise = ${tm.enterprise}`);
+    }
+  }
+
+  // ── 名次积分（P3）────────────────────────────────────────
+  const pts = rules.points;
+  if (!pts) {
+    errors.push('points 缺失');
+  } else {
+    if (!Array.isArray(pts.stagePoints) || !pts.stagePoints.length) {
+      errors.push('points.stagePoints 缺失或为空');
+    } else if (Number.isFinite(pts.stagePointsOnlyTopN)
+      && pts.stagePointsOnlyTopN !== pts.stagePoints.length) {
+      errors.push(`points.stagePointsOnlyTopN=${pts.stagePointsOnlyTopN} 与 stagePoints 长度 ${pts.stagePoints.length} 不一致`);
+    }
+    if (pts.tieRankStyle !== '1224') errors.push(`points.tieRankStyle 必须是 "1224"（当前 ${pts.tieRankStyle}）`);
+    if (!pts.mvp || pts.mvp.perPackage !== 1) errors.push('points.mvp.perPackage 必须是 1（每个任务包 1 个 MVP，任务书 §七）');
+    if (!pts.personal || typeof pts.personal.lifetime !== 'boolean') errors.push('points.personal.lifetime 必须是布尔值');
+    // ── 个人积分口径的**唯一规则来源**（R-RNK-10）─────────────────────
+    // ⚠️ 这三项（atomicKinds / rollupKind / includeMvpVote）是个人积分口径的全部依据：
+    //    缺任何一项，口径就是**未定义**的（两处实现各按各的理解算 ⇒ 两个名次）。
+    //    原来 atomicKinds / rollupKind 散在 rules.pools.talentPointKinds 里，
+    //    而 rules.points.personal 只有 lifetime / includeMvpVote ⇒ 规则有两份、且不一致。
+    const personal = pts.personal;
+    if (personal) {
+      if (!Array.isArray(personal.atomicKinds) || personal.atomicKinds.length === 0) {
+        errors.push('points.personal.atomicKinds 必须是非空数组（个人积分的原子 kind 白名单）');
+      } else {
+        for (const k of personal.atomicKinds) {
+          if (!LEDGER_POINT_KINDS.has(k)) {
+            errors.push(`points.personal.atomicKinds 含不存在的积分 kind：${k}（合法取值：${[...LEDGER_POINT_KINDS].join(' / ')}）`);
+          }
+        }
+      }
+      if (typeof personal.rollupKind !== 'string' || !personal.rollupKind) {
+        errors.push('points.personal.rollupKind 必须是非空字符串（个人积分汇总快照的 kind）');
+      } else if (!LEDGER_POINT_KINDS.has(personal.rollupKind)) {
+        errors.push(`points.personal.rollupKind 引用了不存在的积分 kind：${personal.rollupKind}`);
+      }
+      if (personal.includeMvpVote !== undefined && typeof personal.includeMvpVote !== 'boolean') {
+        errors.push('points.personal.includeMvpVote 必须是布尔值');
+      }
+    }
+  }
+
+  // ── 段位附加条件（P3）────────────────────────────────────
+  const crit = rules.criteria;
+  if (!crit?.tier) {
+    errors.push('criteria.tier 缺失');
+  } else {
+    if (!Array.isArray(crit.tier.dataOrPrototypeMilestones) || !crit.tier.dataOrPrototypeMilestones.length) {
+      errors.push('criteria.tier.dataOrPrototypeMilestones 缺失或为空');
+    }
+    if (!Array.isArray(crit.tier.businessDepartmentKeywords) || !crit.tier.businessDepartmentKeywords.length) {
+      errors.push('criteria.tier.businessDepartmentKeywords 缺失或为空');
+    }
+  }
+
+  // ── MVP 决胜链（P3）──────────────────────────────────────
+  // ⛔ 综合分并列时必须有决胜链，且必须以确定性键收尾 —— 否则同分 MVP 由输入顺序决定，
+  //    换台机器重算可能选出不同的 MVP。
+  if (!crit?.mvp || !Array.isArray(crit.mvp.tiebreak) || !crit.mvp.tiebreak.length) {
+    errors.push('criteria.mvp.tiebreak 缺失或为空');
+  } else {
+    const known = new Set(['roadshow_points', 'team_id']);
+    for (const k of crit.mvp.tiebreak) {
+      if (!known.has(k)) errors.push(`criteria.mvp.tiebreak 含未知决胜键：${k}`);
+    }
+    if (crit.mvp.tiebreak.at(-1) !== 'team_id') {
+      errors.push('criteria.mvp.tiebreak 必须以 team_id 收尾（确定性兜底）');
+    }
+  }
+
+  // ── 审计与防作弊（P4）────────────────────────────────────
+  const audit = rules.audit;
+  if (!audit) {
+    errors.push('audit 缺失');
+  } else {
+    for (const [name, profile] of Object.entries(audit.rateLimit ?? {})) {
+      for (const layer of ['lock', 'sliding', 'perMinute', 'perHour']) {
+        const l = profile?.[layer];
+        if (!l) continue;
+        if (layer === 'lock' && !(Number.isInteger(l.seconds) && l.seconds > 0)) {
+          errors.push(`audit.rateLimit.${name}.lock.seconds 必须是正整数`);
+        }
+        if (layer !== 'lock' && !(Number.isInteger(l.max) && l.max > 0)) {
+          errors.push(`audit.rateLimit.${name}.${layer}.max 必须是正整数`);
+        }
+        // ⚠️ perMinute / perHour 的窗口长度是**结构决定的**（一分钟 / 一小时）——
+        //    服务层写死 60_000 / 3_600_000 毫秒，配置里没有、也**不该有** seconds：
+        //    配了也不会生效（配置说了不算 = 说谎）。
+        //    只有滑动窗口（sliding）的窗口长度与提交锁（lock）的持有时长是可配的。
+        if (layer === 'sliding' && !(Number.isInteger(l.seconds) && l.seconds > 0)) {
+          errors.push(`audit.rateLimit.${name}.sliding.seconds 必须是正整数`);
+        }
+      }
+    }
+    const lv = audit.antiCheat?.lowVariance;
+    if (!lv || !(Number.isFinite(lv.min) && Number.isFinite(lv.max)) || lv.min >= lv.max) {
+      errors.push('audit.antiCheat.lowVariance 必须满足 min < max');
+    }
+    if (!(Number.isInteger(audit.antiCheat?.identicalPeer?.minOverlap) && audit.antiCheat.identicalPeer.minOverlap >= 2)) {
+      errors.push('audit.antiCheat.identicalPeer.minOverlap 必须 ≥ 2（重叠项目太少没有判定力）');
+    }
+    if (!(Number.isInteger(audit.retention?.archiveMonths) && audit.retention.archiveMonths > 0)) {
+      errors.push('audit.retention.archiveMonths 必须是正整数（R-JDG-17 赛后 6 个月可查）');
+    }
+    if (!Array.isArray(audit.reviewState?.appealAllowedTiers) || audit.reviewState.appealAllowedTiers.length === 0) {
+      errors.push('audit.reviewState.appealAllowedTiers 不得为空');
+    }
+  }
+
+  // ── 三池与工作流（P5）────────────────────────────────────────────
+  const pools = rules.pools;
+  if (!pools) {
+    errors.push('pools 缺失');
+  } else {
+    // R-OPS-14：禁止岗位制——claimMode 只允许 self_claim_only，写别的值直接拒绝启动
+    if (pools.workflow?.claimMode !== 'self_claim_only') {
+      errors.push('pools.workflow.claimMode 必须是 self_claim_only（R-OPS-14 禁止岗位制，不允许其他取值）');
+    }
+    if (!Number.isInteger(pools.publicTokenTtlDays) || pools.publicTokenTtlDays <= 0) {
+      errors.push('pools.publicTokenTtlDays 必须是正整数');
+    }
+    if (!Array.isArray(pools.publicScopes) || !pools.publicScopes.includes('all')) {
+      errors.push('pools.publicScopes 必须包含 all');
+    }
+    // ⚠️ 交叉引用校验：配置里写的取值必须**真实存在**。
+    //    原来这一段只校验「形状」，不校验「引用」：
+    //    · packageStatusFilter 里写错一个 status 拼写 → 过滤掉**全部**任务包
+    //      → 资源池空掉，而且**不报任何错**（空集是合法结果）；
+    //    · resourceKinds 写错 → 与派生端（RESOURCE_KINDS）对不上，配置在骗人。
+    if (!Array.isArray(pools.packageStatusFilter)) {
+      errors.push('pools.packageStatusFilter 必须是数组（空数组 = 不按状态过滤）');
+    } else {
+      for (const st of pools.packageStatusFilter) {
+        if (!TASK_PACKAGE_STATUSES.includes(st)) {
+          errors.push(
+            `pools.packageStatusFilter 含不存在的任务包状态：${st}`
+            + `（合法取值：${TASK_PACKAGE_STATUSES.join(' / ')}）`,
+          );
+        }
+      }
+    }
+    if (!Array.isArray(pools.resourceKinds) || pools.resourceKinds.length === 0) {
+      errors.push('pools.resourceKinds 必须是非空数组');
+    } else {
+      for (const k of pools.resourceKinds) {
+        if (!RESOURCE_KINDS.includes(k)) {
+          errors.push(
+            `pools.resourceKinds 含不存在的资源类型：${k}`
+            + `（合法取值：${RESOURCE_KINDS.join(' / ')}）`,
+          );
+        }
+      }
+    }
+    if (pools.talentTotalScope !== 'lifetime') {
+      errors.push('pools.talentTotalScope 必须是 lifetime（R-RNK-10 个人积分终生上榜）');
+    }
+    if (!pools.taskEvidence?.requireRunnableOrBlocker) {
+      errors.push('pools.taskEvidence.requireRunnableOrBlocker 必须为 true（R-STG-04）');
+    }
+  }
   return errors;
 }
 
@@ -2405,9 +2830,16 @@ export function loadRules(rulesDir) {
     registration: rules.registration,
     solvability: rules.solvability,
     milestones: rules.milestones,
+    teamFormation: rules.teamFormation,
+    schedule: rules.schedule,
+    compliance: rules.compliance,
+    points: rules.points,
+    criteria: rules.criteria,
+    pools: rules.pools,
+    audit: rules.audit,                    // ← P4 新增
   };
 
-  const errors = validateRules(grouped);
+  const errors = validateRules(grouped, Object.keys(FILES).length);
   if (errors.length) {
     const list = errors.map((e) => `  - ${e}`).join('\n');
     throw new Error(`规则配置校验失败，拒绝启动：\n${list}`);
@@ -2419,6 +2851,19 @@ export function loadRules(rulesDir) {
   const version = versions.length ? versions[0] : 'unknown';
 
   return { rules: grouped, version };
+}
+
+// ── P3 追加：默认规则加载器 ────────────────────────────────────
+// 用途：服务层在调用方没有显式注入 rules 时用它，避免"静默用默认规则"的降级。
+// ⚠️ 只在没有注入时兜底；注入的 rules 优先（配置文件里的值永远是权威）。
+let defaultRulesCache = null;
+
+export function getDefaultRules() {
+  if (!defaultRulesCache) {
+    const dir = join(dirname(fileURLToPath(import.meta.url)), '..', 'rules');
+    defaultRulesCache = loadRules(dir).rules;
+  }
+  return defaultRulesCache;
 }
 ```
 
@@ -6529,6 +6974,7 @@ export function pipeFd(res, fd) {
 
 ```javascript
 // src/server.js — 进程入口 + 可测的应用装配
+// 溯源需求：R-OPS-06（演示模式挂载 /src/domain/* 与 /rules/*；⛔ 默认不挂 ⇒ 生产部署一律 404）
 // 依据：设计文档 §4.1 / §14.1
 import http from 'node:http';
 import { fileURLToPath } from 'node:url';
@@ -6538,16 +6984,60 @@ import { openDatabase } from './db/sqlite.js';
 import { applyMigrations } from './db/migrate.js';
 import { loadRules, validateRules } from './config.js';
 import { createRouter } from './http/router.js';
-import { json, error } from './http/respond.js';
+import { json, error, text } from './http/respond.js';
+import { registerWorkflowRoutes } from './http/routes/workflow.js';
+import { registerPoolsRoutes } from './http/routes/pools.js';
+import { registerPublicRoutes } from './http/routes/public.js';
 import { readJsonBody } from './http/body.js';
 import { serveStatic } from './http/static.js';
+import { parseSsePath, openSseStream, sendSseEvent, sendSseComment, reviewEvents } from './http/sse.js';
 import { createSession, resolveSession, revokeSession } from './auth/session.js';
 import { can } from './auth/permissions.js';
 import { verifyPassword, hashPassword } from './auth/password.js';
 import { getUserById, getCredentialsByPhone, toPublicUser } from './db/repo/users.js';
+import { getStage, getStageJudge } from './db/repo/stages.js';
 import { appError, AppError } from './errors.js';
+import { registerRegistrationRoutes, pickCurrentEdition } from './http/routes/registration.js';
+import { registerTaskPackageRoutes } from './http/routes/taskPackage.js';
+import { registerTeamRoutes } from './http/routes/team.js';
+import { registerReviewRoutes } from './http/routes/review.js';
+import { registerMilestoneRoutes } from './http/routes/milestone.js';
+import { registerBehaviorRoutes } from './http/routes/behavior.js';
+import { registerAuditRoutes } from './http/routes/audit.js';
+import { getLeaderboard, getRollingLeaderboard } from './services/leaderboard.js';
+import { getPerformanceCard } from './services/performance-card.js';
+import { getTeamTier, getTierBoard } from './services/tier.js';
+import { listEditions, getEdition } from './db/repo/editions.js';
+import { writePidFile, removePidFile } from './runtime/pidfile.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
+
+// 演示模式的静态挂载：/src/domain/* 与 /rules/* 在 platform/ 下，不在 web/ 下。
+// ⛔ 只读、只挂这两个白名单目录，不开放整个 platform/。
+//
+// ⚠️⛔ **默认不挂**（2026-10-21 漂移审计修正 I-5）：
+//    这两个目录里是**领域层算法源码**（打分 / 破同分 / 防作弊判定）与**全部规则配置**
+//    （权重表、破同分链、行为分、段位表）。无条件挂载 = 公网可读全部源码与配置。
+//    本阶段正是「部署到公网 + nginx + systemd」的阶段，所以这道门必须有。
+//    只有显式设了 DEMO_MODE=1 才挂；deploy/ 里的 systemd 与 docker-compose
+//    **不得**设 DEMO_MODE=1（生产部署下这两个路径一律 404）。
+const DEMO_MOUNTS = process.env.DEMO_MODE === '1' ? [
+  { prefix: '/src/domain/', dir: join(here, '..', 'src', 'domain') },
+  { prefix: '/rules/', dir: join(here, '..', 'rules') },
+] : [];
+
+function serveMounted(req, res) {
+  if (!DEMO_MOUNTS.length) return false;
+  for (const m of DEMO_MOUNTS) {
+    if (!req.url || !req.url.startsWith(m.prefix)) continue;
+    const rel = req.url.split('?')[0].slice(m.prefix.length);
+    if (!rel) continue;
+    // 浅拷贝一个只带 url/headers 的请求代理（serveStatic 只读这两个字段）
+    const proxy = { url: `/${rel}`, headers: req.headers || {} };
+    if (serveStatic(m.dir, proxy, res)) return true;
+  }
+  return false;
+}
 
 /**
  * ⛔ 评审修正（Important）：登录失败路径的**计时侧信道**。
@@ -6613,6 +7103,21 @@ export function domainCode(err, fallback) {
   return fallback;
 }
 
+/**
+ * 届期解析：显式传了 → 不存在就 404；没传 → 取【当届】（与 /api/registration-criteria 同一口径）。
+ * ⚠️ 「当届」= 尚未结束（ends_at >= 今天）的最早一届，都没有就退回最后一届（pickCurrentEdition）。
+ *    理由：榜单 / 段位榜都是「本届」视图，前端不必先查一遍届期再传进来。
+ */
+function resolveEditionId(db, editionId) {
+  if (editionId) {
+    if (!getEdition(db, editionId)) throw new AppError(404, 'EDITION_NOT_FOUND', '届期不存在');
+    return editionId;
+  }
+  const edition = pickCurrentEdition(listEditions(db));
+  if (!edition) throw new AppError(404, 'EDITION_NOT_FOUND', '尚无届期');
+  return edition.id;
+}
+
 export function createApp({ db, rules, webDir }) {
   // ⛔ 评审修正（Important）：webDir 缺失必须在**构造期**就拒绝。
   //    原来它在第一个静态请求上才炸（serveStatic 在 try/catch 之外）→
@@ -6628,11 +7133,48 @@ export function createApp({ db, rules, webDir }) {
   }
 
   const router = createRouter();
+  // 注册 P1 报名端点（提交 / 查询 / 列表 / 改级 / 公开筛选标准）
+  registerRegistrationRoutes({ router, db, rules });
+  // 注册 P1 任务卡端点（提交 / 列表 / 六维评估 / 分级签约）
+  registerTaskPackageRoutes({ router, db, rules });
+  // 注册 P1 战队端点（建队 / 我的战队 / 成员增删汰换 / 战队修改）
+  registerTeamRoutes({ router, db, rules });
+  // P2 评审 API（报名/组队等 P1 路由由 P1 追加，不要互相覆盖）
+  registerReviewRoutes(router);
+  // P3 写入路由（企业里程碑签字 / 行为分事件）
+  registerMilestoneRoutes(router);
+  registerBehaviorRoutes(router);
   // 生产环境 Cookie 加 Secure；开发环境不加（http://127.0.0.1 会被浏览器拒收）
   const secureCookies = process.env.NODE_ENV === 'production';
 
   router.add('GET', '/api/health', async () => ({ ok: true, at: new Date().toISOString() }));
+  // P4 审计 API（7 个接口 + 申诉列表）：计算快照 / 复算 diff / 审计日志 / 复核队列 / 申诉
+  registerAuditRoutes(router, { db, rules });
 
+  // ── P3 榜单与积分 ───────────────────────────────────────────
+  // ⚠️ 路由优先级由 P0 的 router **逐段比较**决定：静态段胜参数段
+  //    （P0 终审 C4-1 修的就是「比参数段个数」那个错版）。
+  //    ⇒ '/api/leaderboard/rolling' 与 '/api/leaderboard/tier' 都不会被
+  //    '/api/leaderboard/:stageId' 劫持。
+  router.add('GET', '/api/leaderboard/rolling', async (ctx) => {
+    const editionId = resolveEditionId(ctx.db, ctx.query.editionId);
+    return getRollingLeaderboard({ db: ctx.db, editionId, viewer: ctx.user, rules: ctx.rules });
+  });
+  // ⚠️ 静态段 'tier' 优先于参数段 ':stageId'（router 逐段比较：静态胜参数）
+  router.add('GET', '/api/leaderboard/tier', async (ctx) => {
+    const editionId = resolveEditionId(ctx.db, ctx.query.editionId);
+    return getTierBoard({ db: ctx.db, editionId, viewer: ctx.user, rules: ctx.rules });
+  });
+  router.add('GET', '/api/leaderboard/:stageId', async (ctx) => {
+    const scope = ctx.query.scope || 'rank';
+    return getLeaderboard({ db: ctx.db, stageId: ctx.params.stageId, scope, viewer: ctx.user, rules: ctx.rules });
+  });
+  router.add('GET', '/api/teams/:id/performance-card', async (ctx) => {
+    return getPerformanceCard({ db: ctx.db, teamId: ctx.params.id, viewer: ctx.user, rules: ctx.rules });
+  });
+  router.add('GET', '/api/teams/:id/tier', async (ctx) => {
+    return getTeamTier({ db: ctx.db, teamId: ctx.params.id, viewer: ctx.user, rules: ctx.rules });
+  });
   router.add('GET', '/api/me', async ({ user }) => {
     if (!user) {
       // ⛔ 终审修正（Important，I-5）：领域错误必须走 AppError。
@@ -6644,6 +7186,11 @@ export function createApp({ db, rules, webDir }) {
     }
     return { user: toPublicUser(user) };
   });
+
+  // ── P5 路由 ────────────────────────────────────────────────
+  registerWorkflowRoutes(router, { db, rules });
+  registerPoolsRoutes(router, { db, rules });
+  registerPublicRoutes(router, { db, rules });
 
   // ⛔ 预审修正（I7-1）：P0 原本**没有登录接口** → README 宣称的「能登录的空系统」不成立，
   //    Task 5 产出的 createSession 也没有任何调用方。补上登录/登出。
@@ -6706,6 +7253,54 @@ export function createApp({ db, rules, webDir }) {
         // ⛔ 预审修正（C4-2）：router.match 必须**在 try 块内**。
         //    原来它在 try 之外 → 畸形百分号编码抛出的 URIError 越过 catch
         //    → Node 默认未捕获异常退出 → 整个服务器进程死亡。
+        // ── P2：SSE（评审进度推送）────────────────────────────────
+        // ⚠️ 必须**独立于 router**，且**在 router.match 之前**：
+        //    P0 的 router handler 约定是「返回一个值 → server.js 统一 json() 序列化
+        //    并结束响应」；SSE 要**长期持有这条连接**（多次推帧）——
+        //    挂到 router 上会被 json() 提前收尾，客户端只收到第一帧就断。
+        //    放在 router.match 之前还有第二个原因：SSE 路径**不在 router 里**，
+        //    若先 match 会直接走 404 分支。
+        const ssePath = req.method === 'GET' ? parseSsePath(url) : null;
+        if (ssePath) {
+          const sseToken = parseCookie(req.headers?.cookie || '')['hk_session'];
+          const sseSession = sseToken ? resolveSession(db, sseToken) : null;
+          const sseUser = sseSession ? getUserById(db, sseSession.userId) : null;
+          if (!sseUser) {
+            error(res, 401, 'UNAUTHENTICATED', '未登录');
+            return;
+          }
+          // ⛔ 权限闸门（父代理预审修正）：**登录还不够**。
+          //    进度事件流会暴露「谁在什么时候提交了评分」——
+          //    任何登录用户都能订阅任意赛段 = 评委行踪可被任意账号看到。
+          //    与 review-state 同一套口径：组委会 / 有 score:read 的人 / 本赛段评委。
+          const sseStage = getStage(db, ssePath.stageId);
+          const sseIsJudge = sseStage
+            ? getStageJudge(db, ssePath.stageId, sseUser.id) != null
+            : false;
+          const sseAllowed = can(sseUser, 'score:read', { scopeType: 'stage', scopeId: ssePath.stageId }, db)
+            || can(sseUser, 'score:read', { scopeType: 'global' }, db)
+            || can(sseUser, 'stage:compute', { scopeType: 'stage', scopeId: ssePath.stageId }, db)
+            || can(sseUser, 'stage:compute', { scopeType: 'global' }, db)
+            || sseIsJudge;
+          if (!sseAllowed) {
+            error(res, 403, 'FORBIDDEN', '没有订阅评审进度的权限');
+            return;
+          }
+          openSseStream(res);
+          const topic = `stage:${ssePath.stageId}`;
+          reviewEvents.add(res, topic);
+          // ⛔ 客户端断开时必须摘掉订阅者 —— 否则连接泄漏，进程内存单调增长。
+          //    同一处把心跳定时器也清掉（否则定时器会一直跑）。
+          const heartbeat = setInterval(() => sendSseComment(res, 'ping'), 25000);
+          if (typeof heartbeat.unref === 'function') heartbeat.unref();
+          res.on('close', () => {
+            clearInterval(heartbeat);
+            reviewEvents.remove(res);
+          });
+          // 首帧必须给：EventSource 的 onopen 拿不到业务数据，客户端靠它确认订阅成功。
+          sendSseEvent(res, 'connected', { stageId: ssePath.stageId, at: new Date().toISOString() });
+          return;
+        }
         const match = router.match(req.method, url);
         if (!match) {
           // 畸形 URL 编码 → 400（请求本身非法）；真没这个接口 → 404
@@ -6736,6 +7331,11 @@ export function createApp({ db, rules, webDir }) {
           can: (capability, c) => can(user, capability, c, db),
         };
         const result = await match.handler(ctx);
+        // 原文响应（.ics 等）：P0 的 handler 统一 json() 序列化，这里走 text()
+        if (result && typeof result === 'object' && result.__rawText === true) {
+          text(res, 200, String(result.body ?? ''), result.contentType || 'text/plain; charset=utf-8');
+          return;
+        }
         // ⛔ 预审修正（I7-4）：handler 返回约定 ——
         //   undefined → 200（保持原行为）；{ status, body }（可选 headers）→ 按返回值应答。
         if (result && typeof result === 'object' && typeof result.status === 'number') {
@@ -6768,12 +7368,19 @@ export function createApp({ db, rules, webDir }) {
         //    响应体是 {"code":"BAD_REQUEST","message":"users.phone UNIQUE constraint failed"}
         //    —— code 挡住了，message 没挡住。
         const message = err instanceof AppError ? err.message : '请求无效';
+        // ── P4 追加：限频要带 Retry-After，调用方才知道多久能重试（不静默丢包）──
+        const extraHeaders = {};
+        if (code === 'RATE_LIMITED' && err.detail?.retryAfterSeconds) {
+          extraHeaders['Retry-After'] = String(err.detail.retryAfterSeconds);
+        }
         if (status === 413) {
           // 请求体超限：连接已不可用 → 关掉，不复用
           json(res, 413, { error: { code, message } }, { Connection: 'close' });
           return;
         }
-        error(res, status, code, message);
+        // detail 同理：**只透传 AppError 的 detail** —— detail 可能含表名 / 列名
+        //（问卷缺项说明是我们自己写的文案，可给前端看；裸 Error 的 detail 不行）。
+        error(res, status, code, message, err instanceof AppError ? err.detail : undefined, extraHeaders);
       }
       return;
     }
@@ -6783,6 +7390,9 @@ export function createApp({ db, rules, webDir }) {
     if (req.method === 'GET') {
       try {
         if (serveStatic(webDir, req, res)) return;
+        // 演示模式（DEMO_MODE=1）：领域层与规则配置不在 web/ 下，挂出去。
+        // ⚠️ serveStatic 的签名不变（webDir, req, res）——这里只换 webDir，不改它。
+        if (serveMounted(req, res)) return;
       } catch (err) {
         console.error('[server] 静态服务异常', err);
       }
@@ -6833,6 +7443,11 @@ if (isMain) {
 
   const { rules, version } = loadRules(rulesDir);
   const { db, close } = openDatabase({ dataDir });
+  // ── P6：写 pid 文件 ──────────────────────────────────────────
+  // 用途：让「恢复前必须先停服务」这条约束**可被机器检查**（scripts/restore.js 读它）。
+  // 依据：设计文档 §14.2【决策】恢复前置约束。
+  writePidFile(dataDir);
+  // ────────────────────────────────────────────────────────────
   applyMigrations(db, migrationsDir);
   const app = createApp({ db, rules, webDir });
 
@@ -6846,6 +7461,9 @@ if (isMain) {
   for (const sig of ['SIGINT', 'SIGTERM']) {
     process.on(sig, () => {
       server.close(() => {
+        // ── P6：退出前删 pid 文件（否则留下陈旧 pid）─────────────
+        removePidFile(dataDir);
+        // ────────────────────────────────────────────────────────
         close();
         process.exit(0);
       });
@@ -7967,3 +8585,37 @@ git commit -m "feat(P0): 静态服务、前端骨架、种子数据与服务器�
 ---
 
 *配套：`../specs/2026-10-20-heikesong-platform-design.md`｜`../requirements-traceability.md`｜`../rule-decisions.md`｜`../`*
+## 计划块逐字同步台账（2026-10-21 · 漂移审计统一同步轮）
+
+> **背景**：计划里的代码块是「该文件**当前实现**的逐字副本」。后续阶段按
+> 「**最早建立者 owns、后续阶段 Modify（追加）不得重建**」改了实现，owning 阶段的计划块就会漂移。
+> 本轮用 `docs/tools/plan-block-audit.mjs`（**可复算**）判定 C 类漂移，并分两档处置：
+>
+> - **真重写（C-RW）**：实现被后续阶段**重写**（改动落在既有行上）⇒ 计划块**必须逐字同步**回本计划；
+> - **良性扩展（C-EXT）**：后续阶段只是**追加**（结构性现象）⇒ 计划块**保持原样**，只在此记明「谁追加了什么」。
+>
+> **同步工具**：`docs/tools/plan-block-sync.mjs`（定位信号与 `--verify` **同源**，避免外部脚本的定位歧义）。
+> 本轮同步后漂移审计从 **C-RW 9 条 → 0 条**、A 类从 **184 → 192**。
+
+### 真重写（已逐字同步）
+
+| 编号 | 文件 | 漂移来源（哪个后续阶段改了什么） | 同步后行数 | 核验 |
+|---|---|---|---|---|
+| SYNC-1 | `src/config.js` | P1 规则加载与能力点校验 → P2 `scoreStage` 配置 → P3 004 迁移与名次积分规则 → P4 三层限频与评委级配额 → P5 三池派生同步与 Task 3 修复轮 I-3（个人积分口径唯一化） | 778 | `--verify` 逐字一致 |
+| SYNC-2 | `src/server.js` | P1 任务卡与战队管理 → P2 评审 API 与 SSE → P3 榜单路由 → P4 审计 API → P5 Task 4 公开榜路由 → P6 Task 6 演示模式静态挂载（`DEMO_MODE=1` 才挂 `/src/domain/*` 与 `/rules/*`） | 497 | `--verify` 逐字一致 |
+| SYNC-3 | `test/config.test.js` | P1 Task 3 父代理验收修正（能力点校验 / `detail` 透传 / `version` 自动派生 / 去裸 SQL）→ P2 `scoreStage` 配置 | 240 | `--verify` 逐字一致 |
+
+### 良性扩展（仅记录，计划块保持原样）
+
+| 编号 | 文件 | 后续阶段的追加内容 |
+|---|---|---|
+| SYNC-9 | `src/db/migrate.js` | P0 修复轮（迁移版本下界与描述符、文件名严格校验、同版本号排序确定性）；P6 Task 1 备份脚本读取迁移清单 |
+| SYNC-10 | `src/db/sqlite.js` | P0 修复轮（切 WAL 需独占锁 ⇒ 连接层自实现退避重试）；P4 终审修复轮（事务基础设施） |
+| SYNC-11 | `src/http/respond.js` | P4 审计 API 追加「原始文本响应」分支（`__rawText`） |
+| SYNC-12 | `test/migrate.test.js` | P0 终审修复轮（断言补强 + 注释订正）；P1 追加 002 迁移的数据模型用例 |
+| SYNC-13 | `web/app.js` | P0 修复轮（软链/存储型 XSS 边界与会话恢复）→ P1 前端三页 → P3 榜单页/段位榜/战绩卡 → P4 审计与 trace 抽屉 → P6 Task 6 演示站横幅 |
+
+> ⚠️ **口径**：C-EXT 的「良性」指**结构上**是追加，不等于内容永远不变。
+> 漂移审计可随时复算：`node docs/tools/plan-block-audit.mjs platform`。
+> 若某个文件后续被**重写**（而非追加），它会自动从 C-EXT 升到 C-RW，届时必须再做一次同步。
+

@@ -7657,16 +7657,27 @@ export function scoreStage({
 // ⚠️ 本文件**不含裸 SQL 之外的任何逻辑**，全部 SQL 收在此处（全局约束「SQL 边界」）。
 import { randomUUID } from 'node:crypto';
 
-export function nextRevision(db, { stageId, kind }) {
+export function nextRevision(db, { stageId, kind, teamId = null }) {
+  // ⚠️ **P4 扩展**（本函数由 P2 建立）：P4 需要「同一赛段内按队伍各自编号」，
+  //    所以加了一个**可选**的 teamId 收窄条件。
+  //    ⛔ 不传 teamId 时**行为与 P2 一字不差**（P2 的调用点
+  //       `nextRevision(db, { stageId, kind })` 不受影响）。
+  //    ⛔ 绝不在本文件里**再定义一个 nextRevision** —— 同名导出重复声明会让整个
+  //       模块抛 SyntaxError，`src/services/compute.js` 连带**整个平台**都加载不了。
+  const where = ['stage_id = ?', 'kind = ?'];
+  const params = [stageId, kind];
+  if (teamId != null) { where.push('team_id = ?'); params.push(teamId); }
   const row = db
-    .prepare('SELECT MAX(revision) AS rev FROM computation_snapshots WHERE stage_id = ? AND kind = ?')
-    .get(stageId, kind);
+    .prepare(`SELECT MAX(revision) AS rev FROM computation_snapshots WHERE ${where.join(' AND ')}`)
+    .get(...params);
   return (row?.rev ?? 0) + 1;
 }
 
 /** 三件套快照：input + output + trace（P4 的 recomputeAndDiff 依赖它重放） */
-export function insertSnapshot(db, { kind, editionId = null, stageId = null, teamId = null, ruleVersion, input, output, trace, revision, now }) {
-  const id = randomUUID();
+export function insertSnapshot(db, { kind, editionId = null, stageId = null, teamId = null, ruleVersion, input, output, trace, revision, now, id = randomUUID() }) {
+  // ⚠️ **P4 扩展**：加了可选的 `id`（默认仍是随机 UUID）——
+  //    P4 的审计留痕需要「自己指定 id 以便测试与外部引用」。
+  //    不传 id 时行为与 P2 一字不差。
   db.prepare(
     `INSERT INTO computation_snapshots
        (id, kind, edition_id, stage_id, team_id, rule_version, input_json, output_json, trace_json, revision, created_at)
@@ -7731,6 +7742,28 @@ export function upsertStageResult(db, { stageId, teamId, total, seatP, seatE, co
        seat_e = excluded.seat_e, computation_id = excluded.computation_id, created_at = excluded.created_at`,
   ).run(randomUUID(), stageId, teamId, total, seatP, seatE, computationId, now);
   return db.prepare('SELECT * FROM stage_results WHERE stage_id = ? AND team_id = ?').get(stageId, teamId);
+}
+
+// ── P4 追加：按「最近优先」列快照（审计列表用）────────────────────────
+// 依据：设计文档 §12「可复算：input + output + trace 三件套」
+//   ⛔ 重算走 revision + 1，旧 revision 保留（设计文档 §11.1「事后篡改」防护）。
+// ⚠️ 与 P2 的 listSnapshots 语义**不同**，不是同一件事的第二个名字：
+//    · listSnapshots(stageId)  =「某赛段的全部快照，按 revision 升序」→ 给**重放**用
+//    · listComputationRows()   =「最近的快照，倒序 + 可分页」→ 给**审计列表**用
+export function listComputationRows(db, { kind = null, stageId = null, limit = 50, offset = 0 } = {}) {
+  const where = [];
+  const params = [];
+  if (kind) { where.push('kind = ?'); params.push(kind); }
+  if (stageId) { where.push('stage_id = ?'); params.push(stageId); }
+  const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const total = db.prepare(`SELECT COUNT(*) AS n FROM computation_snapshots ${clause}`).get(...params).n;
+  // ⛔ 确定性排序：破并列键用 SQLite 隐式 `rowid`，**不用 `id`** ——
+  //    `id` 是 randomUUID() ⇒ 同 `created_at` 的两条记录**次序随机**。
+  //    全局约束同 `src/db/repo/audit-log.js`（P4-13 根因修复）。
+  const rows = db.prepare(
+    `SELECT * FROM computation_snapshots ${clause} ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?`,
+  ).all(...params, limit, offset);
+  return { rows, total };
 }
 ```
 
@@ -8081,6 +8114,8 @@ import { reviewEvents } from '../sse.js';
 import { getStage, getStageJudge, listStageTeams } from '../../db/repo/stages.js';
 import { getTeamWithPackage } from '../../db/repo/teams.js';
 import { listActiveMembers } from '../../db/repo/teamMembers.js';
+import { loadOptionalModule } from '../optional-module.js';
+import { fileURLToPath } from 'node:url';
 
 function requireUser(ctx) {
   if (!ctx.user) {
@@ -8151,6 +8186,46 @@ function assertJudgeDimensions(ctx, items) {
   }
 }
 
+/**
+ * ⛔ P4 跨阶段接线（P4 Task 6）：把 review-state 返回的**分数数组**过一遍
+ *    filterVisibleScores({ db, stageId, viewer, scores })。
+ *
+ * ⚠️ 两处必须说清楚：
+ *  ① **过滤发生在 API 层**，不是前端隐藏 —— 设计文档 §6.6：「前端隐藏 = 数据已泄露」。
+ *  ② 过滤模块（Task 5 的 `src/services/review-state.js`）由**并行 Task** 落地，
+ *     静态 import 会让整个平台在它落地前**加载不了**（server.js 顶层 import 失败
+ *     → createApp 抛错 → 全站 500）→ 改成**动态 import**：
+ *       · **没有分数可过滤**（当前 P2 的 getReviewState 不返回分数）→ 原样放行
+ *         （没有分数 = 没有可泄露的东西，过滤是恒等的）；
+ *       · **有分数但过滤模块缺失** → 503（fail closed：宁可报错，
+ *         也绝不把未过滤的分数发出去）。
+ *
+ * ⚠️ 终审修正（Important，I-2）：**只把「目标模块真不存在」当成缺失**。
+ *    模块在场但加载期崩了（语法错 / 传递依赖缺失）→ **抛出去**，
+ *    绝不装成「模块未就绪」—— 后者会让排查指向错误方向。判据见 optional-module.js。
+ */
+const REVIEW_STATE_URL = new URL('../../services/review-state.js', import.meta.url).href;
+const REVIEW_STATE_PATH = fileURLToPath(REVIEW_STATE_URL);
+
+export async function applyScoreVisibility({ db, stageId, viewer, state }) {
+  const scores = Array.isArray(state?.scores) ? state.scores : [];
+  if (!scores.length) return state;
+  const mod = await loadOptionalModule(REVIEW_STATE_URL, REVIEW_STATE_PATH);
+  const filterVisibleScores = mod?.filterVisibleScores;
+  if (typeof filterVisibleScores !== 'function') {
+    return {
+      status: 503,
+      body: {
+        error: {
+          code: 'SCORE_VISIBILITY_UNAVAILABLE',
+          message: '分数可见性过滤模块尚未就绪，拒绝返回未过滤的分数',
+        },
+      },
+    };
+  }
+  return { ...state, scores: filterVisibleScores({ db, stageId, viewer, scores }) };
+}
+
 export function registerReviewRoutes(router) {
   router.add('POST', '/api/stages/:stageId/reviews', async (ctx) => {
     requireStageCapability(ctx, 'score:write');
@@ -8201,11 +8276,16 @@ export function registerReviewRoutes(router) {
     const stateDimensions = (stateConfig?.dimensions ?? [])
       .filter((d) => d.seat === 'judge')
       .map((d) => d.key);
-    return getReviewState({
+    return applyScoreVisibility({
       db: ctx.db,
       stageId: ctx.params.stageId,
-      viewer: { userId: ctx.user.id, isAdmin: isCommittee(ctx) },
-      dimensions: stateDimensions,
+      viewer: ctx.user,
+      state: await getReviewState({
+        db: ctx.db,
+        stageId: ctx.params.stageId,
+        viewer: { userId: ctx.user.id, isAdmin: isCommittee(ctx) },
+        dimensions: stateDimensions,
+      }),
     });
   });
 
@@ -10631,3 +10711,34 @@ git commit -m "fix(P2): 终审修复 —— 进度分母用维度全集 / 评委
 ---
 
 *配套：`../specs/2026-10-20-heikesong-platform-design.md`｜`../requirements-traceability.md`｜`../rule-decisions.md`｜`../`*
+## 计划块逐字同步台账（2026-10-21 · 漂移审计统一同步轮）
+
+> **背景**：计划里的代码块是「该文件**当前实现**的逐字副本」。后续阶段按
+> 「**最早建立者 owns、后续阶段 Modify（追加）不得重建**」改了实现，owning 阶段的计划块就会漂移。
+> 本轮用 `docs/tools/plan-block-audit.mjs`（**可复算**）判定 C 类漂移，并分两档处置：
+>
+> - **真重写（C-RW）**：实现被后续阶段**重写**（改动落在既有行上）⇒ 计划块**必须逐字同步**回本计划；
+> - **良性扩展（C-EXT）**：后续阶段只是**追加**（结构性现象）⇒ 计划块**保持原样**，只在此记明「谁追加了什么」。
+>
+> **同步工具**：`docs/tools/plan-block-sync.mjs`（定位信号与 `--verify` **同源**，避免外部脚本的定位歧义）。
+> 本轮同步后漂移审计从 **C-RW 9 条 → 0 条**、A 类从 **184 → 192**。
+
+### 真重写（已逐字同步）
+
+| 编号 | 文件 | 漂移来源（哪个后续阶段改了什么） | 同步后行数 | 核验 |
+|---|---|---|---|---|
+| SYNC-5 | `src/db/repo/computations.js` | P4 审计数据模型（005 迁移、仓储层与错误/事务基础设施）→ P4 终审修复轮（4 条 Important + 7 条 Minor） | 113 | `--verify` 逐字一致 |
+| SYNC-6 | `src/http/routes/review.js` | P2 SSE 评审进度推送 → P2 终审修复（进度分母用维度全集 / 评委池校验接线 / 回避撤销写路径）→ P4 审计 API → P4 终审修复轮 | 386 | `--verify` 逐字一致 |
+
+> **注意**：`src/http/routes/review.js` 是本仓「**路由优先级 = 逐段比较**」的关键落点，
+> P4 的审计路由是**插在既有评审路由之间**的 —— 计划块原本停在 P2 终审修复轮，
+> 少了 P4 那几段会让读者以为评审路由与审计路由的相对次序是另一回事。
+
+### 良性扩展（仅记录，计划块保持原样）
+
+本计划本轮无 C-EXT 条目。
+
+> ⚠️ **口径**：C-EXT 的「良性」指**结构上**是追加，不等于内容永远不变。
+> 漂移审计可随时复算：`node docs/tools/plan-block-audit.mjs platform`。
+> 若某个文件后续被**重写**（而非追加），它会自动从 C-EXT 升到 C-RW，届时必须再做一次同步。
+
