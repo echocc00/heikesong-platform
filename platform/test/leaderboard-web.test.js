@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { leaderboardHtml } from '../web/views/leaderboard.js';
 import { tierHtml } from '../web/views/tier.js';
 import { cardHtml } from '../web/views/card.js';
+import { loadRules } from '../src/config.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -110,19 +111,32 @@ test('★ app.js 必须把路由参数与 query 透传给视图', () => {
 });
 
 test('★ 演示版适配器：段位榜分支必须排在赛段榜分支之前', async () => {
+  // ⚠️ 实施补记 2026-10-21（P6 Task 5，D5-03）：演示适配器从 P0 的「假数据桩」换成
+  //    「浏览器内真跑规则引擎的适配器」。默认导出的 api 走 fetch 取种子与规则
+  //    （浏览器里才对；Node 的 fetch 不认相对 URL ⇒ 报 "Failed to parse URL from ./seed/..."），
+  //    所以本用例改为【显式注入】种子与规则（createDemoApi）。
+  //    ⚠️ 断言一条没少，还多了两条（段位榜 / 滚动总榜必须真有队伍）——
+  //    「段位分支排在赛段分支之前」这条陷阱依然被守着（scope 断言 + rows 非空）。
   const store = new Map();
-  globalThis.localStorage = {
+  const storage = {
     getItem: (k) => (store.has(k) ? store.get(k) : null),
     setItem: (k, v) => store.set(k, v),
   };
-  const { api } = await import('../web/api.demo.js');
+  const seed = JSON.parse(readFileSync(join(here, '..', 'web', 'seed', 'demo-data.json'), 'utf8'));
+  const { rules } = loadRules(join(here, '..', 'rules'));
+  const { createDemoApi } = await import('../web/api.demo.js');
+  const api = createDemoApi({ storage, seed, rules });
+  await api.post('/api/stages/stage_final/compute', {});
+
   const tier = await api.get('/api/leaderboard/tier');
   assert.equal(tier.scope, 'tier', '段位榜不能被赛段榜分支吃掉');
+  assert.ok(tier.rows.length > 0, '段位榜要有队伍');
   const rolling = await api.get('/api/leaderboard/rolling');
   assert.equal(rolling.scope, 'rolling');
+  assert.ok(rolling.rows.length > 0, '滚动总榜要有队伍');
   const stage = await api.get('/api/leaderboard/st_1?scope=business');
   assert.equal(stage.scope, 'business');
-  const card = await api.get('/api/teams/t_a/performance-card');
+  const card = await api.get('/api/teams/t_alpha/performance-card');
   assert.ok(Array.isArray(card.items), '战绩卡要有 items');
 });
 
