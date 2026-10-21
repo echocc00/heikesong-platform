@@ -28,3 +28,44 @@ export function queryAuditLogRows(db, { entity = null, entityId = null, limit = 
   }
   return db.prepare('SELECT * FROM audit_log ORDER BY created_at DESC LIMIT ?').all(limit);
 }
+
+// ── P4 追加：带过滤条件的分页查询 + 取最后一次状态迁移 ────────────────
+// 依据：设计文档 §12（可复算）+ §11.2（迁移日志）；表由 P0 的 001_init.sql 建好。
+// ⚠️ P2 已建 insertAuditLogRow / queryAuditLogRows（写入 + 按 entity 列表）。
+//    本阶段只补两个**只读查询**：带过滤条件的分页查询 + 取最后一次状态迁移。
+export function queryAuditLog(db, {
+  action = null, entity = null, entityId = null, since = null, until = null,
+  limit = 100, offset = 0,
+} = {}) {
+  const where = [];
+  const params = [];
+  if (action) { where.push('action = ?'); params.push(action); }
+  if (entity) { where.push('entity = ?'); params.push(entity); }
+  if (entityId) { where.push('entity_id = ?'); params.push(entityId); }
+  if (since) { where.push('created_at >= ?'); params.push(since); }
+  if (until) { where.push('created_at <= ?'); params.push(until); }
+  const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const total = db.prepare(`SELECT COUNT(*) AS n FROM audit_log ${clause}`).get(...params).n;
+  const rows = db.prepare(
+    `SELECT * FROM audit_log ${clause} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`,
+  ).all(...params, limit, offset);
+  return { rows, total };
+}
+
+// 复核状态机的当前态：从最后一条迁移日志里取 to_state。
+// 依据：设计文档 §11.2「每次状态迁移写 audit_log(...)」——状态机的真值来源就是迁移日志。
+export function findLatestTransition(db, entity, entityId) {
+  const rows = db.prepare(
+    `SELECT detail_json, created_at FROM audit_log
+      WHERE entity = ? AND entity_id = ? AND action = 'review_state.transition'
+      ORDER BY created_at DESC, id DESC LIMIT 1`,
+  ).all(entity, entityId);
+  if (!rows.length) return null;
+  let detail = {};
+  try {
+    detail = rows[0].detail_json ? JSON.parse(rows[0].detail_json) : {};
+  } catch {
+    detail = {};
+  }
+  return { ...detail, at: rows[0].created_at };
+}

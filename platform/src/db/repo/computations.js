@@ -3,16 +3,27 @@
 // ⚠️ 本文件**不含裸 SQL 之外的任何逻辑**，全部 SQL 收在此处（全局约束「SQL 边界」）。
 import { randomUUID } from 'node:crypto';
 
-export function nextRevision(db, { stageId, kind }) {
+export function nextRevision(db, { stageId, kind, teamId = null }) {
+  // ⚠️ **P4 扩展**（本函数由 P2 建立）：P4 需要「同一赛段内按队伍各自编号」，
+  //    所以加了一个**可选**的 teamId 收窄条件。
+  //    ⛔ 不传 teamId 时**行为与 P2 一字不差**（P2 的调用点
+  //       `nextRevision(db, { stageId, kind })` 不受影响）。
+  //    ⛔ 绝不在本文件里**再定义一个 nextRevision** —— 同名导出重复声明会让整个
+  //       模块抛 SyntaxError，`src/services/compute.js` 连带**整个平台**都加载不了。
+  const where = ['stage_id = ?', 'kind = ?'];
+  const params = [stageId, kind];
+  if (teamId != null) { where.push('team_id = ?'); params.push(teamId); }
   const row = db
-    .prepare('SELECT MAX(revision) AS rev FROM computation_snapshots WHERE stage_id = ? AND kind = ?')
-    .get(stageId, kind);
+    .prepare(`SELECT MAX(revision) AS rev FROM computation_snapshots WHERE ${where.join(' AND ')}`)
+    .get(...params);
   return (row?.rev ?? 0) + 1;
 }
 
 /** 三件套快照：input + output + trace（P4 的 recomputeAndDiff 依赖它重放） */
-export function insertSnapshot(db, { kind, editionId = null, stageId = null, teamId = null, ruleVersion, input, output, trace, revision, now }) {
-  const id = randomUUID();
+export function insertSnapshot(db, { kind, editionId = null, stageId = null, teamId = null, ruleVersion, input, output, trace, revision, now, id = randomUUID() }) {
+  // ⚠️ **P4 扩展**：加了可选的 `id`（默认仍是随机 UUID）——
+  //    P4 的审计留痕需要「自己指定 id 以便测试与外部引用」。
+  //    不传 id 时行为与 P2 一字不差。
   db.prepare(
     `INSERT INTO computation_snapshots
        (id, kind, edition_id, stage_id, team_id, rule_version, input_json, output_json, trace_json, revision, created_at)
@@ -77,4 +88,23 @@ export function upsertStageResult(db, { stageId, teamId, total, seatP, seatE, co
        seat_e = excluded.seat_e, computation_id = excluded.computation_id, created_at = excluded.created_at`,
   ).run(randomUUID(), stageId, teamId, total, seatP, seatE, computationId, now);
   return db.prepare('SELECT * FROM stage_results WHERE stage_id = ? AND team_id = ?').get(stageId, teamId);
+}
+
+// ── P4 追加：按「最近优先」列快照（审计列表用）────────────────────────
+// 依据：设计文档 §12「可复算：input + output + trace 三件套」
+//   ⛔ 重算走 revision + 1，旧 revision 保留（设计文档 §11.1「事后篡改」防护）。
+// ⚠️ 与 P2 的 listSnapshots 语义**不同**，不是同一件事的第二个名字：
+//    · listSnapshots(stageId)  =「某赛段的全部快照，按 revision 升序」→ 给**重放**用
+//    · listComputationRows()   =「最近的快照，倒序 + 可分页」→ 给**审计列表**用
+export function listComputationRows(db, { kind = null, stageId = null, limit = 50, offset = 0 } = {}) {
+  const where = [];
+  const params = [];
+  if (kind) { where.push('kind = ?'); params.push(kind); }
+  if (stageId) { where.push('stage_id = ?'); params.push(stageId); }
+  const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const total = db.prepare(`SELECT COUNT(*) AS n FROM computation_snapshots ${clause}`).get(...params).n;
+  const rows = db.prepare(
+    `SELECT * FROM computation_snapshots ${clause} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`,
+  ).all(...params, limit, offset);
+  return { rows, total };
 }
