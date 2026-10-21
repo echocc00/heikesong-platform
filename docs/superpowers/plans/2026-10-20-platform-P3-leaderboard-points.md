@@ -1885,6 +1885,131 @@ test('部门归类与数据接入/原型交付识别', () => {
   assert.equal(isDataOrPrototypeMilestone('demo_ready', C), true);
   assert.equal(isDataOrPrototypeMilestone('revenue', C), false);
 });
+
+test('段位的展示字段：tierName / reasons / benefits / neverUnlocks 都来自配置', () => {
+  const out = computeTier({ milestones: ms(['problem_confirmed', 'data_connected', 'demo_ready']), signoffs: [], ranksConfig: R });
+  assert.equal(out.tier, 'A');
+  assert.equal(out.tierName, '接入', 'tierName 来自配置的中文名');
+  assert.deepEqual(out.benefits, R.benefits.A);
+  assert.deepEqual(out.neverUnlocks, ['奖金', '决赛名次']);
+  assert.deepEqual(out.reasons, ['milestones=3', 'data_or_prototype=2', 'tier=A']);
+
+  const d = computeTier({ milestones: [], signoffs: [], ranksConfig: R });
+  assert.equal(d.tierName, '出题');
+  assert.deepEqual(d.benefits, [], 'D 段配置里没有权益 → 空数组（不是 undefined）');
+  assert.deepEqual(d.reasons, ['milestones=0', 'tier=D'], '没有数据接入时不得凭空出现该理由');
+});
+
+test('配置缺字段时的容错：段位名 / 权益 / neverUnlocks 都不许是 undefined', () => {
+  const custom = { tiers: [{ key: 'D', name: 'D 档', minMilestones: 0 }] };
+  const out = computeTier({ milestones: [], signoffs: [], ranksConfig: custom });
+  assert.equal(out.tier, 'D');
+  assert.equal(out.tierName, 'D 档', '段位名来自配置，不许退回硬编码');
+  assert.deepEqual(out.benefits, []);
+  assert.deepEqual(out.neverUnlocks, [], '配置缺 neverUnlocks → 空数组');
+});
+
+test('★ 里程碑的取值口径：achieved 必须是 true、countsTowardTier 缺省计入', () => {
+  const out = computeTier({
+    milestones: [
+      { key: 'problem_confirmed', achieved: true },                  // 缺 countsTowardTier → 计入
+      { key: 'data_connected', achieved: 1, isDataOrPrototype: true }, // achieved=1 不是 true → 不计入
+      { key: 'demo_ready', achieved: true, isDataOrPrototype: true },
+    ],
+    signoffs: [], ranksConfig: R,
+  });
+  assert.equal(out.milestoneCount, 2, 'achieved=1 不是布尔 true → 不计入；缺 countsTowardTier → 计入');
+  assert.equal(out.tier, 'B', '2 个里程碑 → B 段（D0 / C1 / B2 / A3 / S5）');
+});
+
+test('缺 milestones / signoffs 参数时按空集处理（不崩）', () => {
+  const out = computeTier({ signoffs: [], ranksConfig: R });
+  assert.equal(out.tier, 'D');
+  assert.equal(out.milestoneCount, 0);
+  const out2 = computeTier({ milestones: ms(FIVE), ranksConfig: R });
+  assert.equal(out2.tier, 'A', '没有 signoffs → 最高只到 A');
+  assert.equal(out2.businessSignoffCount, 0);
+});
+
+test('部门归类的容错：大小写、配置里的大写关键词、缺 tier 段', () => {
+  assert.equal(classifyDepartment('BUSINESS', C), 'business', '关键词大小写不敏感');
+  assert.equal(classifyDepartment('biz', { tier: { businessDepartmentKeywords: ['BIZ'] } }), 'business',
+    '配置里的大写业务关键词也要能匹配');
+  assert.equal(classifyDepartment('tech', { tier: { technicalDepartmentKeywords: ['TECH'] } }), 'technical',
+    '配置里的大写技术关键词也要能匹配');
+  assert.equal(classifyDepartment('业务部门', {}), 'unknown', '配置缺 tier 段 → 一律 unknown');
+  assert.equal(classifyDepartment(undefined, C), 'unknown');
+  assert.equal(isDataOrPrototypeMilestone('data_connected', {}), false, '配置缺 tier 段 → 不认任何里程碑');
+});
+
+test('★ 没标 isBusinessDepartment 的签字不得算业务签字（S 段不得凭空达标）', () => {
+  const out = computeTier({
+    milestones: ms(FIVE),
+    signoffs: [{ milestoneKey: 'pilot_contract', department: '某部门', revokedAt: null }],   // 没有 isBusinessDepartment
+    ranksConfig: R,
+  });
+  assert.equal(out.businessSignoffCount, 0, '标志位缺失 ≠ 业务部门');
+  assert.equal(out.tier, 'A', 'S 段不得凭空达标');
+});
+
+test('★ 降级：两条规则同时命中时只降 1 档，原因两条都记', () => {
+  const both = applyTierDemotion({
+    tier: 'S', daysSinceLastActivity: 14,
+    revokedSignoffs: [{ milestoneKey: 'pilot_contract', revokedAt: '2026-10-20T00:00:00Z' }],
+    ranksConfig: R,
+  });
+  assert.equal(both.demoted, true);
+  assert.equal(both.tier, 'A', '只降 1 档（不叠加）');
+  assert.equal(both.reason, 'signoff_revoked+inactive_14days', '两条原因都要记');
+});
+
+test('降级的配置口径：onSignoffRevoked / inactiveDays / inactiveDropLevels / publishDemotion 都要生效', () => {
+  const base = { tiers: R.tiers, demotion: { ...R.demotion } };
+
+  const noRevoke = applyTierDemotion({
+    tier: 'S', daysSinceLastActivity: 0,
+    revokedSignoffs: [{ revokedAt: 'x' }],
+    ranksConfig: { ...base, demotion: { ...base.demotion, onSignoffRevoked: false } },
+  });
+  assert.equal(noRevoke.demoted, false, '配置关掉撤回降级 → 不降');
+
+  const noPublish = applyTierDemotion({
+    tier: 'B', daysSinceLastActivity: 14, revokedSignoffs: [],
+    ranksConfig: { ...base, demotion: { ...base.demotion, publishDemotion: false } },
+  });
+  assert.equal(noPublish.demoted, true);
+  assert.equal(noPublish.publish, false, '配置关掉公示 → 不公示');
+
+  const missing = applyTierDemotion({
+    tier: 'B', daysSinceLastActivity: 14, revokedSignoffs: [],
+    ranksConfig: { tiers: R.tiers, demotion: {} },
+  });
+  assert.equal(missing.demoted, true, '配置缺 inactiveDays → 兜底 14 天');
+  assert.equal(missing.tier, 'C', '配置缺 inactiveDropLevels → 兜底降 1 档');
+  assert.ok(missing.reason.includes('inactive_14days'));
+
+  const twoLevels = applyTierDemotion({
+    tier: 'C', daysSinceLastActivity: 14, revokedSignoffs: [],
+    ranksConfig: { ...base, demotion: { ...base.demotion, inactiveDropLevels: 2 } },
+  });
+  assert.equal(twoLevels.tier, 'D', '配置降 2 档 → 从 C 降到 D（不越界到 D 以下）');
+});
+
+test('降级：未命中的段位名回落到最低档，且不下探到 D 以下', () => {
+  const unknown = applyTierDemotion({ tier: 'X', daysSinceLastActivity: 0, revokedSignoffs: [], ranksConfig: R });
+  assert.equal(unknown.from, 'D', '未知段位按最低档处理');
+  assert.equal(unknown.demoted, false);
+
+  const floor = applyTierDemotion({ tier: 'D', daysSinceLastActivity: 99, revokedSignoffs: [{ revokedAt: 'x' }], ranksConfig: R });
+  assert.equal(floor.tier, 'D', 'D 段是地板');
+  assert.equal(floor.from, 'D');
+
+  const notYet = applyTierDemotion({ tier: 'B', daysSinceLastActivity: 13, revokedSignoffs: [], ranksConfig: R });
+  assert.equal(notYet.demoted, false);
+  assert.equal(notYet.reason, null, '没降级时原因必须是 null');
+  assert.equal(notYet.publish, false);
+  assert.equal(notYet.from, 'B');
+});
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -2003,7 +2128,7 @@ export function applyTierDemotion({ tier, daysSinceLastActivity, revokedSignoffs
 
 - [ ] **Step 4: 运行测试确认通过**
 
-Run: `cd platform && node --test test/tier.test.js` → Expected: PASS（7 个测试全过：tier.test.js 7）
+Run: `cd platform && node --test test/tier.test.js` → Expected: PASS（**16** 个测试全过：tier.test.js 16 —— 规格自带 7 + 变异检验补测 9；变异体 40 → KILLED 34 / 等价 6 / 有效缺口 0）
 
 - [ ] **Step 5: 提交**
 
@@ -3359,6 +3484,140 @@ function tierBoardRank(db, team, order) {
 }
 ```
 
+- [ ] **Step 5b: 段位计算接线（P3-15 修复 —— 段位引擎不许是死代码）**
+
+> **【为什么有这一步】** Task 4 的 `computeTier` / `applyTierDemotion` / `classifyDepartment` /
+> `isDataOrPrototypeMilestone` 若只有测试调用方，**整套段位引擎就是死代码** ——
+> `tier_records` 永远没有生产写入路径，`getTeamTier` 只能回落到兜底的 `'D'`，
+> R-PTS-01/02/03/05 全部落空。这与 P2 终审的 **I-2**（`checkJudgePool` 零调用方）、
+> P1 Task 3 的 **A1** 同一类病根：**能力被建好却从不校验 / 从不被调用**。
+> 本步把「段位怎么被算出来」写成可执行规格，而不是留一句「Consumes: computeTier」的悬空承诺。
+
+**段位口径（必须按这个口径实现，不许各写各的）**
+
+| 概念 | 口径 | 依据 |
+|---|---|---|
+| 里程碑「已达成」 | `requires_signoff = 0` → 已固定即达成；`requires_signoff = 1` → **必须有未撤回的企业签字**才算达成 | R-PTS-01「工作室能刷打卡，刷不到企业签字」 |
+| 「企业业务部门签字」 | `classifyDepartment(department) === 'business'`；`unknown` 按 `criteria.tier.unknownDepartmentCountsAsBusiness` 决定（出厂 `false`） | R-PTS-03 + `unknownDepartmentCountsAsBusiness` 这个配置项**不许形同虚设** |
+| 「撤回签字 → 降回对应档」 | **由「按未撤回签字重算段位」实现**（该里程碑不再达成 → 门槛不够 → 自然落到低一档） | R-PTS-04 |
+| 「连续 14 天零提交 → 降 1 档」 | 由 `applyTierDemotion` 承担，**相对本次重算出的段位**降 | R-PTS-04 |
+| 「提交」的时间口径 | 队伍**自己**的产出：行为分事件 / 里程碑固定 / 企业签字。⛔ **不含 `points_ledger`** —— 发榜会写积分流水，若把它算作提交，发榜就把「零提交」刷新掉了，降级规则永远不触发 | 降级规则不能被发榜动作自我豁免 |
+| 降级不叠加 | 撤回归档与闲置降档同时命中时**只降 1 档** | `applyTierDemotion` 的 `Math.max` 口径 |
+
+> ⚠️ **不要把 `revokedSignoffs` 喂给 `applyTierDemotion`**：撤回签字的影响已经由「重算」体现，
+> 再喂一次会**重复降级**（S → A 之后再 A → B）。生产链路里 `applyTierDemotion` 只负责闲置降档。
+
+**① `src/db/repo/tiers.js` 追加一个函数**（追加，不改已有函数）：
+
+```javascript
+/**
+ * 队伍最近一次「提交」的时间（R-PTS-04 降级规则里的「连续 N 天零提交」口径）。
+ * ⛔ 只算队伍**自己**的产出：行为分事件 / 里程碑固定 / 企业签字。
+ *    绝不算 points_ledger —— 发榜会写积分流水，算进去等于发榜把「零提交」刷新掉了，
+ *    降级规则就永远不触发（发榜自我豁免）。
+ */
+export function getTeamLastActivityAt(db, teamId) {
+  const row = db.prepare(`
+    SELECT MAX(t) AS last_at FROM (
+      SELECT MAX(created_at) AS t FROM behavior_events WHERE team_id = ?
+      UNION ALL SELECT MAX(fixed_at) FROM milestones WHERE team_id = ?
+      UNION ALL SELECT MAX(s.signed_at) FROM milestone_signoffs s JOIN milestones m ON s.milestone_id = m.id WHERE m.team_id = ?
+    )`).get(teamId, teamId, teamId);
+  return row?.last_at ?? null;
+}
+```
+
+**② `src/services/tier.js` 追加一个函数**（`getTeamTier` 保持不变；这是**新增**的写路径）：
+
+```javascript
+/**
+ * ★ 段位计算（唯一的生产入口）：里程碑 + 企业签字 → 段位 → 写 tier_records。
+ * ⚠️ 没有这个函数，Task 4 的整套段位引擎就只是死代码（队伍永远兜底 D 段）。
+ * ⛔ 域函数签名定死（不能加参数），所以「配置 → 标志位」的解析必须在这一层做：
+ *    isDataOrPrototype   ← rules.criteria.tier.dataOrPrototypeMilestones
+ *    isBusinessDepartment ← 部门关键词 + unknownDepartmentCountsAsBusiness
+ * @param record 是否写入 tier_records（发榜时写；只读查询用 false）
+ */
+export function computeTeamTier({ db, teamId, now, rules = null, record = true }) {
+  const R = rules || getDefaultRules();
+  const criteria = R.criteria || {};
+  const tierCfg = criteria.tier || {};
+  const milestones = tierRepo.listMilestonesByTeam(db, teamId);
+  const signoffs = tierRepo.listSignoffsByTeam(db, teamId);
+  const keyOf = new Map(milestones.map((m) => [m.id, m.key]));
+
+  const active = signoffs.filter((s) => !s.revoked_at);
+  const signedIds = new Set(active.map((s) => s.milestone_id));
+
+  const domainMilestones = milestones.map((m) => ({
+    key: m.key,
+    countsTowardTier: m.counts_toward_tier !== 0,
+    // R-PTS-01：默认 requires_signoff=1 → 必须有未撤回的企业签字才算达成
+    achieved: m.requires_signoff === 0 || signedIds.has(m.id),
+    isDataOrPrototype: isDataOrPrototypeMilestone(m.key, criteria),
+  }));
+
+  const domainSignoffs = active.map((s) => {
+    const kind = classifyDepartment(s.department, criteria);
+    const isBusinessDepartment = kind === 'business'
+      || (kind === 'unknown' && tierCfg.unknownDepartmentCountsAsBusiness === true);
+    return {
+      milestoneKey: keyOf.get(s.milestone_id) ?? null,
+      department: s.department,
+      revokedAt: null,
+      isBusinessDepartment,
+    };
+  });
+
+  const computed = computeTier({ milestones: domainMilestones, signoffs: domainSignoffs, ranksConfig: R.ranks });
+
+  // 闲置降档：相对**本次重算出的**段位降（不相对历史记录 → 不会每发一次榜再降一档）
+  const lastAt = tierRepo.getTeamLastActivityAt(db, teamId);
+  const at = now ?? new Date().toISOString();
+  const daysSinceLastActivity = lastAt
+    ? Math.max(0, Math.floor((Date.parse(at) - Date.parse(lastAt)) / 86400000))
+    : 0;
+  const demotion = applyTierDemotion({
+    tier: computed.tier,
+    daysSinceLastActivity,
+    revokedSignoffs: [],     // ⛔ 撤回归档已由「重算」体现，再喂一次会重复降级
+    ranksConfig: R.ranks,
+  });
+  const tier = demotion.demoted ? demotion.tier : computed.tier;
+
+  if (record) {
+    tierRepo.insertTierRecord(db, {
+      id: randomUUID(), teamId, tier,
+      milestoneCount: computed.milestoneCount,
+      businessSignoffCount: computed.businessSignoffCount,
+      reasonsJson: JSON.stringify([...computed.reasons, ...(demotion.demoted ? [demotion.reason] : [])]),
+      computedAt: at,
+    });
+  }
+  return { ...computed, tier, tierName: computed.tierName, demoted: demotion.demoted, demotionReason: demotion.reason, publish: demotion.publish };
+}
+```
+
+> ⚠️ 上面这段里的 `tierName` 必须取**最终档位**的名字（降级后档位可能变了）：
+> 落地时用 `R.ranks.tiers.find((t) => t.key === tier)?.name ?? tier`，
+> 不要直接透传 `computed.tierName`（那是降级**前**的名字）。
+
+**③ `src/services/leaderboard.js` 的 `publishLeaderboard` 里接入**（在 `const awarded = {` **之前**插入）：
+
+```javascript
+  // ★ 发榜前重算段位：段位记录是榜单快照与段位公示的依据，
+  //    不重算就永远是兜底的 D 段（P3-15）。
+  const tierUpdates = [];
+  for (const teamId of repo.listStageResultTeamIds(db, stageId)) {
+    tierUpdates.push(computeTeamTier({ db, teamId, now: createdAt, rules: R }));
+  }
+```
+
+> `repo.listStageResultTeamIds` 若仓储里没有，就用已有的 `repo.listStageResults(db, stageId)`
+> 取 `team_id` 去重（**不要为此新建一个仓储函数**：`listStageResults` 已经返回 `team_id`）。
+> `src/services/leaderboard.js` 顶部 import 区追加：
+> `import { computeTeamTier } from './tier.js';`
+
 - [ ] **Step 6: 修改 src/server.js（注册 4 个 P3 路由）**
 
 顶部 import 区追加：
@@ -3926,3 +4185,40 @@ git commit -m "feat(P3): 榜单页、段位榜与战绩卡前端"
 **Task 3 的测试条数口径**：points **24**（规格自带 7 + 预审补测 1 + 变异检验补测 16）。
 
 **最终结果**：变异体 45 → **KILLED 43 / 等价变异体 2 / 有效缺口 0**；`points.test.js` **24/24**；P3 全量 **613/613**。
+
+---
+
+## Task 4 父代理预审修正台账（2026-10-21）
+
+> Task 4 是**段位**的落地：段位表 D/C/B/A/S + 降级规则 + 权益。
+> 实施前把规格的代码块抽到 `/tmp` 的独立工程实跑（**先跑后派**）—— 规格自带 **7/7 全绿**。
+> 但**规格自带全绿 ≠ 规格正确**：本轮在**逐条 Task 通读**时发现 **1 条 Important 计划级缺陷**
+> （段位引擎零调用方），并在**变异检验**中补掉 2 条真盲区。
+> 变异体 **40** 个 → **KILLED 34 / 等价存活 6 / 有效缺口 0**。
+
+### 一、预审发现的计划级缺陷
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| **P3-15** | **Important** | **整套段位引擎在本阶段【零生产调用方】** —— `computeTier` / `applyTierDemotion` / `classifyDepartment` / `isDataOrPrototypeMilestone` 在整份 P3 计划里**只出现在 Task 4 的定义与测试里**。Task 7 的 `src/services/tier.js` 只从 `tier_records` **读**段位（`record?.tier ?? 'D'`），**从不计算**；`publishLeaderboard` 也不重算 | `grep -n "computeTier\|applyTierDemotion\|insertTierRecord" <P3 计划>` → 命中全部落在 Task 4 段内（定义 + 测试 + 仓储定义）；Task 7 的「Consumes: … `computeTier`（Task 2–6）」是**一句没有落点的承诺**（悬空引用）。**后果**：没有任何生产路径写 `tier_records` → 所有队伍段位永远是兜底的 `'D'` → R-PTS-01（锚定企业签字）、R-PTS-02（段位表）、R-PTS-03（业务部门签字）、R-PTS-05（换资源不换钱）**四条需求全部落空**，R-PTS-04（降级）连触发点都没有 | **在 Task 7 增设「Step 5b: 段位计算接线」**，把「段位怎么被算出来」写成**可执行规格**（仓储函数 + 服务函数 + `publishLeaderboard` 接入点 + 段位口径表），而不是留一句悬空的「Consumes」。⚠️ 口径里写死了三件容易做错的事：① 里程碑「已达成」= **有未撤回的企业签字**（`requires_signoff=1` 时），否则 R-PTS-01 被架空；② 「零提交」的时间口径**不含 `points_ledger`**（发榜会写积分流水，算进去等于发榜自我豁免，降级规则永远不触发）；③ 撤回归档**由重算实现**、不再喂给 `applyTierDemotion`（否则 S→A 之后再 A→B，重复降级） |
+
+> **为什么在 Task 4 就发现、却修在 Task 7**：段位引擎是 Task 4 建的，但**写路径**属于 Task 7 的
+> `src/services/tier.js`（文件归属：最早建立者 owns）。与 P3 Task 1 处理 `stage_team` 同一手法：
+> **最早发现处登记 + 最早的可行处落地**。区别在于这次不是「表建好了没写路径」，
+> 而是「引擎建好了没调用方」—— 后果更隐蔽（引擎的 16 条用例全绿，但线上没有一段位）。
+
+### 二、变异检验发现的实现盲区
+
+> 变异体 **40** 个（部门归类的关键词 / 空值与大小写 / 里程碑取值口径 / 撤回签字 /
+> 档位门槛与附加条件 / 展示字段 / 降级开关与阈值 / 公示与原因 / 索引下限 …），
+> 在 `/tmp` 副本上跑 `tier.test.js`，**测试必须失败才算杀灭**。变异脚本：`/tmp/p3t4/mutate.mjs`。
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| **P3-16** | Minor | **配置里的【技术】关键词不转小写零覆盖** —— 业务关键词那条有「配置写大写 `BIZ`」的用例守着，技术关键词没有对称的用例 | 变异存活：技术关键词的 `.toLowerCase()` 被摘掉 → 用例全绿 | 补对称用例：配置写大写 `TECH` 时仍能匹配 `tech` |
+| **P3-17** | Minor | **`isBusinessDepartment` 标志位缺失时的口径零覆盖** —— 判定写的是 `=== true`（缺标志位 = 不是业务部门），但**没有用例钉住这一点** | 变异存活：判定改成 `!== false` → **缺标志位的签字会被当成业务部门** → S 段凭空达标（正是 `rules/criteria.json` 注释里警告的「签字部门写错不得默认算业务部门」） | 补用例：没有 `isBusinessDepartment` 的签字 → `businessSignoffCount = 0`、段位不得升到 S |
+| — | — | **等价变异体 6 条**：`!d` 空值闸门（空串对任何关键词的 `includes` 都是 false）、部门名不 `trim`（`includes` 是子串匹配，首尾空格不影响）、档位查找不查最低档（`chosen` 为 null 时落到兜底 `tiers[0]`，而 `tiers[0]` 正是 D 档）、兜底不取 `tiers[0]`（`chosen` 为空 ⟺ `tiers` 为空 ⟺ `tiers[0]` 必是 undefined）、索引不做下限保护（`current` 必在 `order` 里）、闲置天数不兜底 0（`NaN` 与 `0` 比较都不大于阈值） | 探针：每条都做 **1551 组差分比对**（15 部门名 × 5 配置 × 6 里程碑集 × 6 签字集 × 6 档位配置 × 7 段位 × 10 天数 × 3 撤回集），**差异 0** | **不是盲区**，标记为等价变异体、允许存活。⚠️ 但它们说明这几处闸门是**冗余**的 —— 保留（防御 + 自解释），**不能再算它们「有测试覆盖」** |
+
+**Task 4 的测试条数口径**：tier **16**（规格自带 7 + 变异检验补测 9）。
+
+**最终结果**：变异体 40 → **KILLED 34 / 等价变异体 6 / 有效缺口 0**；`tier.test.js` **16/16**；P3 全量 **629/629**。
