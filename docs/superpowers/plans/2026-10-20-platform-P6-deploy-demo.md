@@ -3156,6 +3156,13 @@ git commit -m "feat(P6): 发布前扫描闸接发布产物 + 更正语境豁免 
 - Create: `platform/web/seed/demo-data.json`
 - Test: `platform/test/demo-seed.test.js`
 
+> **【2026-10-21 实施补记 · Task 4】** 规格的 **9 个用例逐字保留**（文件头追加 4 行领域层
+> import + 溯源注释）；另**追加 11 个判别性用例** —— 规格的 9 个用例全是**静态**检查
+> （结构、维度名、原始分相等、样本数、缺双签、自由命题、互评、expectations 齐不齐），
+> 它们证明「数据摆对了形状」，**证明不了「点一下计算，这条数据真的触发了那条分支」**。
+> 而本 Task 的灵魂恰恰是后者 ⇒ 追加的用例把种子喂给**真实领域层引擎**（`src/domain/*`），
+> 断言分支真的发生了。逐条理由、实跑证据与变异结果见文末「Task 4 实施台账（2026-10-21）」。
+
 **Interfaces:**
 - Consumes: 无（纯数据）
 - Produces: 一份**能触发每一条 trace 分支**的种子数据。结构见下，`web/api.demo.js` 按此结构读取。
@@ -3190,12 +3197,33 @@ git commit -m "feat(P6): 发布前扫描闸接发布产物 + 更正语境豁免 
 `platform/test/demo-seed.test.js`：
 
 ```javascript
+// platform/test/demo-seed.test.js —— 演示版种子数据（web/seed/demo-data.json）
+//
+// 规则溯源：
+//   - 「种子 = 每条 trace 分支的触发器」→ P6 计划 Task 4【本 Task 的灵魂】+ 设计文档 §12（trace 三件套）
+//   - 「z-score 宽严归一化 / 样本不足降级」→ S7 §3.1 + 设计文档 §6.2 Step 2 + 冲突裁决 C-05
+//   - 「去极值（该维度评委数 ≥5）」→ S7 §3.2 + 设计文档 §6.2 Step 3
+//   - 「R1 分赛道 / R2 双签 / R3 权重封顶 / R4 自由命题」→ S7 §2.4 + 设计文档 §6.2 Step 5
+//   - 「自评差异（高 → 书面说明 / 低 → 评委提问，阈值 10）」→ S7 §4.3 + R-JDG-13
+//   - 「破同分链（total → 加时陈述 → 互评 → 企业原始分 → 行为分 → 队伍编号）」→ S7 §3.3 + 冲突裁决 C-03
+//   - 「段位（里程碑计数 + 数据/原型 + 业务部门签字）」→ S10 §2.2 + S10 §2.1 + R-PTS-01~04
+//   - 「行为分只做垫底排序、不进总分」→ S10 §3.3 + R-PTS-08 + 设计文档 §11.1
+//
+// ⚠️ 本文件的核心用例是「同分队伍在引擎里总分【严格相等】」：
+//    规格原种子把两支队伍设计为同分，但**自评席**把它们拉开了（自评 95 触发「书面说明」
+//    → 对齐到评委分 81.28，另一支自评 81 不触发 → 保持 81）⇒ 总分差 0.0139 ⇒ 根本不同分。
+//    本文件断言的是**引擎算出来的总分**，不是种子里的自述 —— 种子说同分不算数，引擎算出来同分才算。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadRules } from '../src/config.js';
+// ── 实施补记 2026-10-21：追加的判别性用例要把种子喂给【真实领域层引擎】才断言得了分支 ──
+import { scoreStage } from '../src/domain/scoring.js';
+import { rankTeams } from '../src/domain/ranking.js';
+import { behaviorScore } from '../src/domain/behavior.js';
+import { computeTier } from '../src/domain/tier.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const seed = JSON.parse(readFileSync(join(here, '..', 'web', 'seed', 'demo-data.json'), 'utf8'));
@@ -3286,6 +3314,248 @@ test('expectations 覆盖了全部要演示的 trace 分支', () => {
   assert.equal(e.tiedTeams.length, 2, '必须正好是两支同分队伍');
   assert.deepEqual(Object.keys(e.tiers).sort(), seed.teams.map((t) => t.id).sort());
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 【实施补记 2026-10-21】规格的 9 个用例【逐字保留】+ 追加 11 个判别性用例。
+//
+// 为什么必须追加：规格的 9 个用例全是**静态**检查（结构、维度名、原始分相等、
+// 样本数、缺双签、自由命题、互评、expectations 齐不齐）—— 它们证明的是
+// 「数据摆对了形状」，**证明不了**「点一下计算，这条数据真的触发了那条分支」。
+// 而本 Task 的灵魂恰恰是后者：种子 = 每条 trace 分支的**触发器**。
+//
+// 追加的用例把种子喂给【真实的领域层引擎】（src/domain/*，纯函数、无 IO、无 Node 内置模块），
+// 断言分支真的发生了 —— 这样 Task 5 的 demo-engine.test.js 逐条断言 expectations 时，
+// 断言的是**引擎的输出**，不是种子里的一句自述。
+//
+// ⚠️ 输入构造（expandSubmissions / roster）与 Task 5 的 web/api.demo.js 同形；
+//    两边若漂移，Task 5 的 demo-parity.test.js 会当场判出来（那里比的是
+//    「演示适配器 vs 直接调 scoreStage」的一致性）。
+// ─────────────────────────────────────────────────────────────────────────────
+
+function expandSubmissions(s) {
+  const out = [];
+  for (const [judgeId, byTeam] of Object.entries(s.reviews ?? {})) {
+    for (const [teamId, byDim] of Object.entries(byTeam ?? {})) {
+      for (const [dimension, rawScore] of Object.entries(byDim ?? {})) {
+        out.push({ judgeId, teamId, dimension, rawScore: Number(rawScore) });
+      }
+    }
+  }
+  return out;
+}
+
+function roster(s) {
+  const pkgById = new Map((s.taskPackages ?? []).map((p) => [p.id, p]));
+  return (s.teams ?? []).map((t) => {
+    const pkg = pkgById.get(t.packageId) ?? {};
+    return {
+      teamId: t.id,
+      packageEnterpriseId: pkg.enterpriseId ?? null,
+      isFreeBrief: pkg.isFreeBrief === true,
+    };
+  });
+}
+
+function compute(s = seed) {
+  return scoreStage({
+    config: rules.scoring.final,
+    judges: (s.judges ?? []).map((j) => ({ judgeId: j.id, seat: j.seat })),
+    submissions: expandSubmissions(s),
+    enterpriseConfirmations: s.enterpriseConfirmations ?? [],
+    peerReviews: s.peerReviews ?? [],
+    teams: roster(s),
+    selfReviews: s.selfReviews ?? [],
+  });
+}
+
+function behaviorOf(s, teamId) {
+  return behaviorScore({
+    events: (s.behaviorEvents ?? []).filter((e) => e.teamId === teamId),
+    behaviorConfig: rules.behavior,
+  });
+}
+
+test('追加·同分队伍在引擎里总分严格相等（构造保证，不靠手算）', () => {
+  const out = compute();
+  const [a, b] = seed.expectations.tiedTeams;
+  const ta = out.teams.find((t) => t.teamId === a);
+  const tb = out.teams.find((t) => t.teamId === b);
+  assert.ok(ta && tb, '两支队伍都必须参与计算');
+  assert.equal(ta.total, tb.total, '同分队伍的总分必须完全相等');
+  assert.equal(ta.seatP, tb.seatP, '同分队伍的评委席分必须完全相等');
+  assert.equal(ta.seatE, tb.seatE, '同分队伍的企业席分必须完全相等');
+  // ⛔ 反例守卫：同分不能只看评委席 —— 自评席也算一席，
+  //    自评不一样就会把「同分」拉开（规格原种子就踩了这个坑）。
+  for (const d of Object.keys(ta.perDimension)) {
+    assert.equal(ta.perDimension[d].mean, tb.perDimension[d].mean, `维度 ${d} 的分必须相等`);
+  }
+});
+
+test('追加·破同分链真的在 peer 级把同分队伍分开（互评高者在前）', () => {
+  const out = compute();
+  const [a, b] = seed.expectations.tiedTeams;
+  const byTeam = {};
+  for (const row of out.teams) {
+    const peer = (seed.peerReviews ?? []).filter((p) => p.toTeamId === row.teamId);
+    const conf = (seed.enterpriseConfirmations ?? []).filter((c) => c.teamId === row.teamId);
+    byTeam[row.teamId] = {
+      peerScore: peer.length ? peer.reduce((s, p) => s + Number(p.score || 0), 0) / peer.length : undefined,
+      enterpriseRaw: conf.length ? conf.reduce((s, c) => s + Number(c.rawScore || 0), 0) / conf.length : undefined,
+      behaviorScore: behaviorOf(seed, row.teamId).total,
+    };
+  }
+  const ranked = rankTeams({
+    teams: out.teams.map((row) => ({
+      teamId: row.teamId, total: row.total, seatP: row.seatP, seatE: row.seatE,
+      peerScore: byTeam[row.teamId].peerScore,
+      enterpriseRaw: byTeam[row.teamId].enterpriseRaw,
+      behaviorScore: byTeam[row.teamId].behaviorScore,
+    })),
+    tiebreakChain: rules.tiebreak.chain,
+    tiebreakData: { isFinal: true, byTeam },
+    pointsConfig: rules.points,
+  });
+  const ra = ranked.ordered.find((r) => r.teamId === a);
+  const rb = ranked.ordered.find((r) => r.teamId === b);
+  assert.notEqual(ra.rank, rb.rank, '同分队伍必须被破同分链分开');
+  assert.ok(ra.rank < rb.rank, '互评分高的一方名次在前');
+  const used = ranked.applied.find((c) => c.key === seed.expectations.tiebreakSeparatedBy);
+  assert.ok(used, `破同分链里必须用到 ${seed.expectations.tiebreakSeparatedBy} 这一级`);
+  assert.ok(used.usedBy.includes(a) && used.usedBy.includes(b), '分开它们的那一级必须同时用到两支队伍');
+});
+
+test('追加·归一化降级真的发生（告警指向期望的维度与评委）', () => {
+  const out = compute();
+  const dim = seed.expectations.unnormalizedDimension;
+  const judge = seed.expectations.unnormalizedJudge;
+  const hit = out.warnings.find((w) => w.code === 'normalization_fallback' && w.dimension === dim);
+  assert.ok(hit, `必须出现维度 ${dim} 的归一化降级告警，实际告警：${JSON.stringify(out.warnings.map((w) => w.code))}`);
+  assert.ok(String(hit.message).includes(judge), `告警必须点名评委 ${judge}：${hit.message}`);
+  const agg = out.trace.normalization[dim];
+  assert.equal(agg.normalized, false, '该维度的归一化状态必须是「已降级」');
+  assert.ok(agg.judgeSampleSizes[judge] < rules.scoring.final.minSamplesForJudgeNormalization,
+    `评委 ${judge} 的样本数必须小于阈值`);
+  assert.equal(agg.judgeReasons[judge], 'judge_sample_too_small', '降级原因必须是样本不足');
+});
+
+test('追加·去极值真的发生（期望的维度上每个单元都 trimmed）', () => {
+  const out = compute();
+  const dims = new Set(seed.expectations.trimmedDimensions);
+  const steps = out.trace.steps.filter((s) => dims.has(s.dimension));
+  assert.ok(steps.length > 0, 'trace 里必须有去极值步骤');
+  for (const s of steps) {
+    assert.equal(s.trimmed, true, `${s.teamId} 的 ${s.dimension} 必须真的去极值`);
+    assert.ok(s.removed.max && s.removed.min, '必须记录被去掉的最高分与最低分评委');
+  }
+});
+
+test('追加·缺双签真的触发 R2 告警且该项按 0 分计', () => {
+  const out = compute();
+  const teamId = seed.expectations.missingDualSignatureTeam;
+  const hit = out.warnings.find((w) => w.code === 'R2_missing_dual_signature');
+  assert.ok(hit, '必须出现 R2_missing_dual_signature 告警');
+  assert.equal(hit.teamId, teamId, `告警必须指向 ${teamId}`);
+  const row = out.teams.find((t) => t.teamId === teamId);
+  assert.equal(row.seatE, 0, '缺双签的企业席分必须按 0 分计（权重保留）');
+});
+
+test('追加·自由命题真的触发 R4（企业项由评委「需求真实性」维度替代）', () => {
+  const out = compute();
+  const teamId = seed.expectations.freeBriefTeam;
+  const hit = out.warnings.find((w) => w.code === 'R4_free_brief_judge_scored');
+  assert.ok(hit, '必须出现 R4_free_brief_judge_scored 告警');
+  assert.equal(hit.teamId, teamId, `告警必须指向 ${teamId}`);
+  const row = out.teams.find((t) => t.teamId === teamId);
+  const substituteDim = rules.scoring.final.freeBrief.judgeDimension;
+  assert.ok(Number.isFinite(row.seatE) && row.seatE > 0, 'R4 生效时企业席分由评委维度替代，不能是 0');
+  assert.ok(
+    Math.abs(row.seatE - row.perDimension[substituteDim].mean) < 1e-9,
+    '企业席分必须等于替代维度的评委分',
+  );
+  assert.ok(
+    !out.warnings.some((w) => w.code === 'R4_substitute_no_scores'),
+    '替代维度有评委分，不应出现「替代维度无分」的告警',
+  );
+});
+
+test('追加·自评差异三条分流真的发生（书面说明 / 评委提问 / 阈值内不告警）', () => {
+  const out = compute();
+  const byCode = (code) => out.warnings.filter((w) => w.code === code);
+  const hi = byCode('self_eval_written_explanation');
+  const lo = byCode('self_eval_judge_question');
+  assert.equal(hi.length, 1, `「书面说明」分支必须恰好一支队（实际 ${hi.length}）`);
+  assert.equal(lo.length, 1, `「评委提问」分支必须恰好一支队（实际 ${lo.length}）`);
+  assert.equal(hi[0].teamId, seed.expectations.selfEvalWrittenExplanationTeam);
+  assert.equal(lo[0].teamId, seed.expectations.selfEvalJudgeQuestionTeam);
+  for (const t of seed.expectations.selfEvalWithinThresholdTeams) {
+    assert.ok(
+      !hi.some((w) => w.teamId === t) && !lo.some((w) => w.teamId === t),
+      `${t} 的自评与评委分差异在阈值内，不该告警`,
+    );
+  }
+});
+
+test('追加·自评对齐不加分：书面说明那支队的自评席分 = 评委席分（不是自评原分）', () => {
+  const out = compute();
+  const teamId = seed.expectations.selfEvalWrittenExplanationTeam;
+  const row = out.teams.find((t) => t.teamId === teamId);
+  const self = seed.selfReviews.find((r) => r.teamId === teamId);
+  assert.ok(self, `${teamId} 必须有自评记录`);
+  const selfSeat = row.perDimension.self_eval;
+  const judgeSide = row.perDimension[self.dimension];
+  assert.notEqual(selfSeat.mean, self.rawScore, '自评席分不能是自评原分（那样就变成加分项了）');
+  assert.equal(selfSeat.mean, judgeSide.mean, '自评席分必须对齐到评委席该维度的分');
+  assert.ok(selfSeat.mean < self.rawScore, '对齐只会把自评拉低，绝不会拉高（自评不得变成加分项）');
+});
+
+test('追加·缺自评的队伍：self_eval 维度没有分并告警（不静默当 0）', () => {
+  const out = compute();
+  const teamId = seed.expectations.missingSelfEvalTeam;
+  const hit = out.warnings.find((w) => w.code === 'dimension_no_scores' && w.teamId === teamId);
+  assert.ok(hit, `必须出现 ${teamId} 的缺分告警`);
+  assert.equal(hit.dimension, 'self_eval');
+  const row = out.teams.find((t) => t.teamId === teamId);
+  assert.equal(row.perDimension.self_eval.mean, null, '该维度没有分');
+  // 缺分维度必须被【剔除出分母】，而不是【静默当 0 分】（设计文档 §13 降级表）
+  let num = 0; let denAll = 0; let denPresent = 0;
+  for (const [key, v] of Object.entries(row.perDimension)) {
+    if (key === 'enterprise') continue;
+    denAll += v.weight;
+    if (v.mean != null) { num += v.weight * v.mean; denPresent += v.weight; }
+  }
+  assert.ok(Math.abs(row.seatP - num / denPresent) < 1e-9, '缺分维度必须被剔除出分母');
+  assert.ok(Math.abs(row.seatP - num / denAll) > 1e-9, '缺分维度不能被静默当 0 分');
+});
+
+test('追加·段位与 expectations.tiers 逐条一致（用 computeTier 复算）', () => {
+  for (const [teamId, tier] of Object.entries(seed.expectations.tiers)) {
+    const milestones = (seed.milestones ?? []).filter((m) => m.teamId === teamId);
+    const signoffs = (seed.signoffs ?? []).filter((s) => s.teamId === teamId);
+    const info = computeTier({ milestones, signoffs, ranksConfig: rules.ranks });
+    assert.equal(info.tier, tier, `${teamId} 的段位应为 ${tier}，实际 ${info.tier}`);
+  }
+});
+
+test('追加·行为分：证据合规才算分，且分值与 expectations 一致', () => {
+  for (const [teamId, expected] of Object.entries(seed.expectations.behaviorScores)) {
+    const b = behaviorOf(seed, teamId);
+    assert.equal(b.total, expected, `${teamId} 的行为分应为 ${expected}，实际 ${b.total}`);
+  }
+  const counted = seed.behaviorEvents.some((e) => behaviorOf(seed, e.teamId).items
+    .some((i) => i.type === e.type && i.counted));
+  assert.ok(counted, '至少要有一条行为事件真的拿到分（否则行为分支不可观测）');
+});
+
+test('追加·行为分不进入总分（分轨在算法层，不靠人的自觉）', () => {
+  const before = compute();
+  const bumped = {
+    ...seed,
+    behaviorEvents: seed.behaviorEvents.map((e) => ({ ...e, evidence: '{"repo":"r","version":"v","artifact":"a"}' })),
+  };
+  const after = compute(bumped);
+  const sum = (out) => out.teams.map((t) => `${t.teamId}:${t.total}`).sort();
+  assert.deepEqual(sum(after), sum(before), '行为分变化不得影响任何队伍的总分');
+});
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -3332,11 +3602,11 @@ Expected: FAIL —— `ENOENT: no such file or directory, open 'platform/web/see
     { "id": "t_epsilon", "name": "自由花队", "packageId": "tp_free", "captainId": "mba_captain", "memberIds": ["mba_captain", "demo_member_1"] }
   ],
   "reviews": {
-    "j_lenient": { "t_alpha": { "track_fit": 86, "innovation": 88, "feasibility": 84, "completeness": 85, "collaboration": 90 }, "t_beta": { "track_fit": 86, "innovation": 88, "feasibility": 84, "completeness": 85, "collaboration": 90 }, "t_gamma": { "track_fit": 74, "innovation": 70, "feasibility": 78, "completeness": 72, "collaboration": 75 }, "t_delta": { "track_fit": 80, "innovation": 82, "feasibility": 79, "completeness": 81, "collaboration": 78 }, "t_epsilon": { "track_fit": 70, "innovation": 66, "feasibility": 72, "completeness": 68, "collaboration": 70 } },
-    "j_strict": { "t_alpha": { "track_fit": 72, "innovation": 74, "feasibility": 70, "completeness": 73, "collaboration": 75 }, "t_beta": { "track_fit": 72, "innovation": 74, "feasibility": 70, "completeness": 73, "collaboration": 75 }, "t_gamma": { "track_fit": 60, "innovation": 58, "feasibility": 64, "completeness": 61, "collaboration": 62 }, "t_delta": { "track_fit": 66, "innovation": 68, "feasibility": 63, "completeness": 65, "collaboration": 64 }, "t_epsilon": { "track_fit": 56, "innovation": 52, "feasibility": 58, "completeness": 55, "collaboration": 57 } },
-    "j_mid1": { "t_alpha": { "track_fit": 80, "innovation": 81, "feasibility": 77, "completeness": 79, "collaboration": 83 }, "t_beta": { "track_fit": 80, "innovation": 81, "feasibility": 77, "completeness": 79, "collaboration": 83 }, "t_gamma": { "track_fit": 68, "innovation": 65, "feasibility": 70, "completeness": 66, "collaboration": 69 }, "t_delta": { "track_fit": 74, "innovation": 76, "feasibility": 72, "completeness": 75, "collaboration": 71 }, "t_epsilon": { "track_fit": 63, "innovation": 60, "feasibility": 65, "completeness": 61, "collaboration": 64 } },
-    "j_mid2": { "t_alpha": { "track_fit": 78, "innovation": 79, "feasibility": 76, "completeness": 77, "collaboration": 81 }, "t_beta": { "track_fit": 78, "innovation": 79, "feasibility": 76, "completeness": 77, "collaboration": 81 }, "t_gamma": { "track_fit": 67, "innovation": 64, "feasibility": 69, "completeness": 67, "collaboration": 68 }, "t_delta": { "track_fit": 73, "innovation": 75, "feasibility": 71, "completeness": 74, "collaboration": 70 }, "t_epsilon": { "track_fit": 62, "innovation": 59, "feasibility": 64, "completeness": 60, "collaboration": 63 } },
-    "j_cross": { "t_alpha": { "track_fit": 82, "innovation": 83, "feasibility": 80, "completeness": 81, "collaboration": 85 }, "t_beta": { "track_fit": 82, "innovation": 83, "feasibility": 80, "completeness": 81, "collaboration": 85 }, "t_gamma": { "track_fit": 71, "innovation": 69, "feasibility": 73, "completeness": 70, "collaboration": 72 }, "t_delta": { "track_fit": 77, "innovation": 79, "feasibility": 75, "completeness": 78, "collaboration": 76 }, "t_epsilon": { "track_fit": 66, "innovation": 63, "feasibility": 67, "completeness": 65, "collaboration": 67 } },
+    "j_lenient": { "t_alpha": { "innovation": 88, "feasibility": 84, "completeness": 85, "collaboration": 90 }, "t_beta": { "innovation": 88, "feasibility": 84, "completeness": 85, "collaboration": 90 }, "t_gamma": { "innovation": 70, "feasibility": 78, "completeness": 72, "collaboration": 75 }, "t_delta": { "innovation": 82, "feasibility": 79, "completeness": 81, "collaboration": 78 }, "t_epsilon": { "innovation": 66, "feasibility": 72, "completeness": 68, "collaboration": 70 } },
+    "j_strict": { "t_alpha": { "innovation": 74, "feasibility": 70, "completeness": 73, "collaboration": 75 }, "t_beta": { "innovation": 74, "feasibility": 70, "completeness": 73, "collaboration": 75 }, "t_gamma": { "innovation": 58, "feasibility": 64, "completeness": 61, "collaboration": 62 }, "t_delta": { "innovation": 68, "feasibility": 63, "completeness": 65, "collaboration": 64 }, "t_epsilon": { "innovation": 52, "feasibility": 58, "completeness": 55, "collaboration": 57 } },
+    "j_mid1": { "t_alpha": { "innovation": 81, "feasibility": 77, "completeness": 79, "collaboration": 83 }, "t_beta": { "innovation": 81, "feasibility": 77, "completeness": 79, "collaboration": 83 }, "t_gamma": { "innovation": 65, "feasibility": 70, "completeness": 66, "collaboration": 69 }, "t_delta": { "innovation": 76, "feasibility": 72, "completeness": 75, "collaboration": 71 }, "t_epsilon": { "innovation": 60, "feasibility": 65, "completeness": 61, "collaboration": 64 } },
+    "j_mid2": { "t_alpha": { "innovation": 79, "feasibility": 76, "completeness": 77, "collaboration": 81 }, "t_beta": { "innovation": 79, "feasibility": 76, "completeness": 77, "collaboration": 81 }, "t_gamma": { "innovation": 64, "feasibility": 69, "completeness": 67, "collaboration": 68 }, "t_delta": { "innovation": 75, "feasibility": 71, "completeness": 74, "collaboration": 70 }, "t_epsilon": { "innovation": 59, "feasibility": 64, "completeness": 60, "collaboration": 63 } },
+    "j_cross": { "t_alpha": { "innovation": 83, "feasibility": 80, "completeness": 81, "collaboration": 85 }, "t_beta": { "innovation": 83, "feasibility": 80, "completeness": 81, "collaboration": 85 }, "t_gamma": { "innovation": 69, "feasibility": 73, "completeness": 70, "collaboration": 72 }, "t_delta": { "innovation": 79, "feasibility": 75, "completeness": 78, "collaboration": 76 }, "t_epsilon": { "innovation": 63, "feasibility": 67, "completeness": 65, "collaboration": 67 } },
     "j_partial": { "t_gamma": { "feasibility": 90 } }
   },
   "enterpriseConfirmations": [
@@ -3358,9 +3628,10 @@ Expected: FAIL —— `ENOENT: no such file or directory, open 'platform/web/see
     { "fromTeamId": "t_beta", "toTeamId": "t_epsilon", "score": 61 }
   ],
   "selfReviews": [
-    { "teamId": "t_alpha", "dimension": "innovation", "rawScore": 95 },
+    { "teamId": "t_alpha", "dimension": "innovation", "rawScore": 85 },
+    { "teamId": "t_beta", "dimension": "innovation", "rawScore": 85 },
     { "teamId": "t_gamma", "dimension": "innovation", "rawScore": 50 },
-    { "teamId": "t_beta", "dimension": "innovation", "rawScore": 81 }
+    { "teamId": "t_delta", "dimension": "innovation", "rawScore": 95 }
   ],
   "milestones": [
     { "teamId": "t_alpha", "key": "problem_confirmed", "achieved": true, "countsTowardTier": true, "isDataOrPrototype": false },
@@ -3380,14 +3651,14 @@ Expected: FAIL —— `ENOENT: no such file or directory, open 'platform/web/see
     { "teamId": "t_gamma", "milestoneKey": "problem_confirmed", "department": "技术部", "revokedAt": null, "isBusinessDepartment": false }
   ],
   "behaviorEvents": [
-    { "id": "be_1", "teamId": "t_alpha", "type": "weekly_progress", "evidence": "第 1 周进度", "created_at": "2026-10-12T10:00:00Z" },
-    { "id": "be_2", "teamId": "t_alpha", "type": "weekly_progress", "evidence": "第 2 周进度", "created_at": "2026-10-19T10:00:00Z" },
-    { "id": "be_3", "teamId": "t_alpha", "type": "workshop_output", "evidence": "workshop 课后产出", "created_at": "2026-10-19T12:00:00Z" },
-    { "id": "be_4", "teamId": "t_alpha", "type": "first_demo", "evidence": "首次可运行 Demo", "created_at": "2026-10-20T09:00:00Z" },
-    { "id": "be_5", "teamId": "t_beta", "type": "weekly_progress", "evidence": "第 1 周进度", "created_at": "2026-10-12T10:00:00Z" },
-    { "id": "be_6", "teamId": "t_delta", "type": "weekly_progress", "evidence": "第 1 周进度", "created_at": "2026-10-12T10:00:00Z" },
-    { "id": "be_7", "teamId": "t_delta", "type": "milestone_on_time", "evidence": "按时交付里程碑", "created_at": "2026-10-18T10:00:00Z" },
-    { "id": "be_8", "teamId": "t_gamma", "type": "enterprise_meeting", "evidence": "完成一次企业对接会", "created_at": "2026-10-17T10:00:00Z" }
+    { "id": "be_1", "teamId": "t_alpha", "type": "weekly_progress", "evidence": "{\"repo\":\"https://demo.local/alpha\",\"version\":\"v0.1\",\"artifact\":\"第 1 周进度截图\"}", "created_at": "2026-10-12T10:00:00Z" },
+    { "id": "be_2", "teamId": "t_alpha", "type": "weekly_progress", "evidence": "{\"repo\":\"https://demo.local/alpha\",\"version\":\"v0.2\",\"artifact\":\"第 2 周进度截图\"}", "created_at": "2026-10-19T10:00:00Z" },
+    { "id": "be_3", "teamId": "t_alpha", "type": "workshop_output", "evidence": "{\"output\":\"workshop 课后产出：缺货预测 Demo\"}", "created_at": "2026-10-19T12:00:00Z" },
+    { "id": "be_4", "teamId": "t_alpha", "type": "first_demo", "evidence": "{\"version\":\"v0.3\",\"artifact\":\"首次可运行 Demo\"}", "created_at": "2026-10-20T09:00:00Z" },
+    { "id": "be_5", "teamId": "t_beta", "type": "weekly_progress", "evidence": "{\"repo\":\"https://demo.local/beta\",\"version\":\"v0.1\",\"artifact\":\"第 1 周进度截图\"}", "created_at": "2026-10-12T10:00:00Z" },
+    { "id": "be_6", "teamId": "t_delta", "type": "weekly_progress", "evidence": "{\"repo\":\"https://demo.local/delta\",\"version\":\"v0.1\",\"artifact\":\"第 1 周进度截图\"}", "created_at": "2026-10-12T10:00:00Z" },
+    { "id": "be_7", "teamId": "t_delta", "type": "milestone_on_time", "evidence": "{\"milestone\":\"pilot_contract\",\"onTime\":true}", "created_at": "2026-10-18T10:00:00Z" },
+    { "id": "be_8", "teamId": "t_gamma", "type": "enterprise_meeting", "evidence": "{\"enterpriseConfirmationId\":\"ec_gamma\"}", "created_at": "2026-10-17T10:00:00Z" }
   ],
   "expectations": {
     "tiedTeams": ["t_alpha", "t_beta"],
@@ -3396,8 +3667,12 @@ Expected: FAIL —— `ENOENT: no such file or directory, open 'platform/web/see
     "unnormalizedJudge": "j_partial",
     "missingDualSignatureTeam": "t_gamma",
     "freeBriefTeam": "t_epsilon",
-    "selfEvalWrittenExplanationTeam": "t_alpha",
+    "selfEvalWrittenExplanationTeam": "t_delta",
     "selfEvalJudgeQuestionTeam": "t_gamma",
+    "selfEvalWithinThresholdTeams": ["t_alpha", "t_beta"],
+    "missingSelfEvalTeam": "t_epsilon",
+    "trimmedDimensions": ["innovation", "feasibility", "completeness", "collaboration"],
+    "behaviorScores": { "t_alpha": 17, "t_beta": 2, "t_gamma": 5, "t_delta": 7, "t_epsilon": 0 },
     "tiers": { "t_alpha": "B", "t_beta": "C", "t_gamma": "A", "t_delta": "S", "t_epsilon": "D" }
   }
 }
@@ -3406,7 +3681,7 @@ Expected: FAIL —— `ENOENT: no such file or directory, open 'platform/web/see
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cd platform && node --test test/demo-seed.test.js`
-Expected: PASS（8 个测试全过：demo-seed.test.js 8）
+Expected: PASS（20 个测试全过：demo-seed.test.js 20）
 
 > **【2026-10-21 漂移审计修正 M-1】** **原来错在哪**：本计划一处「Expected: PASS」的条数声明
 > 与代码块里实际的 `test(` 数量不符 —— `demo-seed.test.js` 声明 **7** 实为 **8**。
@@ -3422,7 +3697,7 @@ Expected: PASS（8 个测试全过：demo-seed.test.js 8）
 
 ```bash
 cd platform && git add web/seed test/demo-seed.test.js
-git commit -m "feat(P6): 演示种子数据（每条 trace 分支都有触发器 + expectations 断言块）"
+git commit -m "feat(P6): 演示种子数据（每条 trace 分支都有触发器 + expectations 断言块）" -- web/seed test/demo-seed.test.js
 ```
 
 ---
@@ -5540,12 +5815,12 @@ git commit -m "test(P6): 全链路验收 + 跨平台可移植性验收"
 
 > 本节是 Task 2（部署资产）的预审记录：**规格缺陷清单**、处置方式、逐字回写位置、硬约束自证。
 > 纪律：本计划 Task 2 的 5 个代码块 = 最终实现的**逐字副本**
-> （核验脚本 `platform/test/plan-assets-match.test.js` 之外的独立核验见下「D-13」）。
+> （核验脚本 `platform/test/plan-assets-match.test.js` 之外的独立核验见下「D2-13」）。
 
 ### A. 预审方法（先跑后派）
 
 1. 把规格 Task 2 的 5 个代码块**原样抽到** `/tmp/p6-t2/spec/`（一个字节都没改）。
-2. 在该副本上跑规格自带用例 → **红**（真实输出见 D-01）。
+2. 在该副本上跑规格自带用例 → **红**（真实输出见 D2-01）。
 3. 逐条定位根因 → 改实现 → 再跑 → 全绿 → 才落盘到 `platform/deploy/` 与 `platform/test/`。
 4. 落盘后做：幂等干跑（连续两次执行）、YAML 解析、nginx 结构检查（含反证）、全量测试、
    发布扫描、变异测试。
@@ -5554,32 +5829,32 @@ git commit -m "test(P6): 全链路验收 + 跨平台可移植性验收"
 
 | # | 级别 | 缺陷 | 实跑证据 | 处置 |
 |---|---|---|---|---|
-| D-01 | **Critical** | **规格的资产文件与规格自己的验收用例互相矛盾**：systemd 单元与 compose 的**注释里**写了被禁字面量（`--workers` / `cluster`），而规格的用例是 `doesNotMatch(全文)` → 注释里出现同样判红 | 规格副本上跑自带用例：`# tests 7 / # pass 4 / # fail 3`；逐条断言探针：`12/18 断言通过，6 条失败` | 资产文件的注释改写为不含被禁字面量（保留语义与指向计划的指引）。**不改用例**（用例的意图是对的：文件里就不该出现这些字面量）。 |
-| D-02 | **Critical** | `install.sh` 的 `ROOT="$(cd "$(dirname "$0")/.." && pwd)"` **对不上**规格用例的正则 `\$\(cd "\$\(dirname "\$0\)" && pwd\)`（少一个 `/..`） | 同上探针：`FAIL [sh] match /\$\(cd "\$\(dirname "\$0\)" && pwd\)/` | 拆成两行：`SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"`（**正是全局约束写的那个写法**）+ `ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"`。用例与全局约束同时满足。 |
-| D-03 | **Critical** | `install.sh` 的用法注释里 `ADMIN_PASSWORD='...'` **被规格自己的「不许硬编码口令」正则判成硬编码口令**（`'...'` 里第一个字符不是 `$`） | 同上探针：`FAIL [sh] doesNotMatch /PASSWORD\s*=\s*["'][^"'$][^"']*["']/`（大小写不敏感那条同样红） | 用法注释改成**不出现任何带引号的口令字面量**（口令值当场填、且不落盘）。口令来源仍是 `ADMIN_PASSWORD` 环境变量或交互读取。 |
-| D-04 | **Critical** | `install.sh` 里 `log "…（手机号 $phone）"` 的 `$phone` **紧跟全角括号** → bash 在 `C` / `C.UTF-8` locale 下把高位字节并进变量名 → `set -u` 下直接 **unbound variable 崩掉**（种子步骤之后全流程中断） | 干跑实测：`/tmp/…/install.sh: line 195: phone?: unbound variable`（本机 locale = `C.UTF-8`）。最小复现：`LANG=C.UTF-8 bash -c 'phone=123; echo "手机号 $phone）"'` → 输出乱码而非 `123` | 改成 `${phone}`（显式界定变量名）。全文件扫了一遍「`$VAR` 紧跟非 ASCII 字节」= **仅此 1 处**。 |
-| D-05 | **Critical** | `docker-compose.yml` 用 `ports: "127.0.0.1:8080:8080"`，但 `src/server.js` **只绑 127.0.0.1** → 容器里端口映射转发到容器 eth0，进程不听那里 ⇒ **连接被拒**（容器 healthy、宿主机 curl 不通，**静默失败**） | 实跑取证：`node src/server.js` 后 `lsof` → `TCP 127.0.0.1:8080 (LISTEN)`；`curl http://127.0.0.1:8080/api/health` → `{"ok":true,…}`；`curl http://192.168.2.27:8080/api/health` → 不可达 | 改用 `network_mode: host`（容器与宿主机共享网络栈 ⇒ 进程绑的 127.0.0.1:8080 就是宿主机的 127.0.0.1:8080，与 `nginx` 反代目标一致，也不暴露公网）。同时在文件里写清「若上游把 `src/server.js` 改成可绑 0.0.0.0，可换回 `ports`」。见「与接口契约的偏差」T2-1。 |
-| D-06 | Important | `install.sh` 的 Node 版本下限 `MIN_NODE_MINOR=5` 低于项目真实下限 | `package.json` → `"engines": { "node": ">=22.16.0" }`；`src/db/sqlite.js` 注释：备份 API `sqlite.backup()` 是 22.16.0 引入 | 改为 `22 / 16`（与 engines 逐字一致），错误提示同步。 |
-| D-07 | Important | systemd 单元的 `Documentation=file:/opt/heikesong/platform/README.md` **硬编码部署路径** | 与单元里其它路径都用 `__APP_DIR__` 不一致 | 改为 `Documentation=file:__APP_DIR__/README.md`（占位符集合不变）。 |
-| D-08 | Important | `install.sh` 的 `ENV_FILE` 变量**形同虚设**：单元里写死 `EnvironmentFile=-/etc/heikesong/platform.env`，改了 `ENV_FILE` 服务读不到 | 代码走查；干跑时 `ENV_FILE` 指向临时路径，而单元里仍是 `/etc/heikesong/platform.env` | sed 替换该字面路径（`s|/etc/heikesong/platform.env|$ENV_FILE|g`），**不新增占位符**。干跑产物核对：单元里 `EnvironmentFile=-/tmp/…/etc/heikesong/platform.env` ✓。 |
-| D-09 | Important | `write_env_file` 里的 `umask 077` **泄漏**到后面的函数 → nginx 站点文件会被建成 `600` | 代码走查（`umask` 不是函数局部） | `umask` 存取成对（写完恢复）。干跑产物核对：环境文件 `0640`、nginx 站点 `644` ✓。 |
-| D-10 | Minor | `install -d -g "$RUN_USER"` 假设存在**与用户名同名的组** | 干跑实测：`install: unknown group mac`（macOS 主组是 `staff`） | 落盘属组改用运行用户的**主组**（`id -gn`），并保留同名组作为兜底。 |
-| D-11 | Important | 规格的 7 个用例全是**字面扫一遍**：改掉注释就红、但把**配置本身**改坏（上游绑 `0.0.0.0`、compose 扩副本、`DEMO_MODE=1`、端口漂移、单元里写口令）**全都测不出来** | 变异测试第 1 轮：这些变异体在规格的 7 个用例下**全部存活**（见台账 E） | **规格的 7 个用例逐字保留**，另**追加 7 个**用例（单进程 / `DEMO_MODE` 禁令 / 正式形态 TLS / 上游只绑回环 / 不扩副本 / 端口与真实代码同口径 / 环境文件不落口令 / 幂等守卫），并引入 `effective()`（去掉整行注释）**只对有效配置断言** —— 注释里的「默认值说明」是文档，不是配置。 |
-| D-12 | Minor | 规格 Step 8 第二条命令的**期望值与规格自己的文件不符** | `sh -c 'grep -c "proxy_buffering off;" deploy/nginx.conf'` → 实测 **2**（头部注释里写了一遍 + 真指令 1 处），规格写 `1` | 命令改为「去掉整行注释再计数」→ 实测 `1`（真指令本来就只有 1 处），且能真正抓到重复指令。 |
-| D-13 | Minor | `nginx.conf` 的 `location /assets/ { alias __APP_DIR__/web/assets/; }` 指向的目录**当前不存在** | `ls platform/web/assets` → `No such file or directory`（现有静态文件在 `web/` 根下） | 保留规格形态（`R-OPS-04` 要求「`location /assets/` + 缓存策略存在」），但在文件里写清「`web/assets/` 是前端构建产物目录，现在还没有；目录不存在时该前缀返 404，不影响其它路径」。**不擅自改静态目录结构**（那是 Task 6 的范围）。 |
-| D-14 | Minor | `install.sh` 结尾无条件打印「备份命令：… node scripts/backup.js」，但 `scripts/backup.js` 是 **P6 Task 1** 的产物（另一个 worktree 在写） | `ls platform/scripts/` → 只有 `audit-scan.js` / `forbidden.txt` / `migrate.js` / `seed.js` | 改成「文件存在才打印」，避免给出跑不通的命令提示。 |
-| D-15 | Important | 规格的用例是**全文扫一遍** ⇒ **把真指令注释掉也扫得到**（假绿）。第 1 轮变异实测：`systemctl daemon-reload` 与 `nginx -t` 被注释掉后，规格用例 6 **仍然全绿** | 变异体 M28 / M29 在第 1 轮 **SURVIVED**（规格用例 6 仍绿）；M11 / M16 同理（SSE 指令被改/被删，规格用例 3 仍绿 —— 头部注释里写着同样的字面量） | 新增用例 12「注释不能掩盖配置错误」：对**去掉整行注释后的有效配置**再断言一遍（`effective()`）。规格的 7 个用例仍逐字保留（不削弱它们），只是补上「有效配置」这一层。 |
+| D2-01 | **Critical** | **规格的资产文件与规格自己的验收用例互相矛盾**：systemd 单元与 compose 的**注释里**写了被禁字面量（`--workers` / `cluster`），而规格的用例是 `doesNotMatch(全文)` → 注释里出现同样判红 | 规格副本上跑自带用例：`# tests 7 / # pass 4 / # fail 3`；逐条断言探针：`12/18 断言通过，6 条失败` | 资产文件的注释改写为不含被禁字面量（保留语义与指向计划的指引）。**不改用例**（用例的意图是对的：文件里就不该出现这些字面量）。 |
+| D2-02 | **Critical** | `install.sh` 的 `ROOT="$(cd "$(dirname "$0")/.." && pwd)"` **对不上**规格用例的正则 `\$\(cd "\$\(dirname "\$0\)" && pwd\)`（少一个 `/..`） | 同上探针：`FAIL [sh] match /\$\(cd "\$\(dirname "\$0\)" && pwd\)/` | 拆成两行：`SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"`（**正是全局约束写的那个写法**）+ `ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"`。用例与全局约束同时满足。 |
+| D2-03 | **Critical** | `install.sh` 的用法注释里 `ADMIN_PASSWORD='...'` **被规格自己的「不许硬编码口令」正则判成硬编码口令**（`'...'` 里第一个字符不是 `$`） | 同上探针：`FAIL [sh] doesNotMatch /PASSWORD\s*=\s*["'][^"'$][^"']*["']/`（大小写不敏感那条同样红） | 用法注释改成**不出现任何带引号的口令字面量**（口令值当场填、且不落盘）。口令来源仍是 `ADMIN_PASSWORD` 环境变量或交互读取。 |
+| D2-04 | **Critical** | `install.sh` 里 `log "…（手机号 $phone）"` 的 `$phone` **紧跟全角括号** → bash 在 `C` / `C.UTF-8` locale 下把高位字节并进变量名 → `set -u` 下直接 **unbound variable 崩掉**（种子步骤之后全流程中断） | 干跑实测：`/tmp/…/install.sh: line 195: phone?: unbound variable`（本机 locale = `C.UTF-8`）。最小复现：`LANG=C.UTF-8 bash -c 'phone=123; echo "手机号 $phone）"'` → 输出乱码而非 `123` | 改成 `${phone}`（显式界定变量名）。全文件扫了一遍「`$VAR` 紧跟非 ASCII 字节」= **仅此 1 处**。 |
+| D2-05 | **Critical** | `docker-compose.yml` 用 `ports: "127.0.0.1:8080:8080"`，但 `src/server.js` **只绑 127.0.0.1** → 容器里端口映射转发到容器 eth0，进程不听那里 ⇒ **连接被拒**（容器 healthy、宿主机 curl 不通，**静默失败**） | 实跑取证：`node src/server.js` 后 `lsof` → `TCP 127.0.0.1:8080 (LISTEN)`；`curl http://127.0.0.1:8080/api/health` → `{"ok":true,…}`；`curl http://192.168.2.27:8080/api/health` → 不可达 | 改用 `network_mode: host`（容器与宿主机共享网络栈 ⇒ 进程绑的 127.0.0.1:8080 就是宿主机的 127.0.0.1:8080，与 `nginx` 反代目标一致，也不暴露公网）。同时在文件里写清「若上游把 `src/server.js` 改成可绑 0.0.0.0，可换回 `ports`」。见「与接口契约的偏差」T2-1。 |
+| D2-06 | Important | `install.sh` 的 Node 版本下限 `MIN_NODE_MINOR=5` 低于项目真实下限 | `package.json` → `"engines": { "node": ">=22.16.0" }`；`src/db/sqlite.js` 注释：备份 API `sqlite.backup()` 是 22.16.0 引入 | 改为 `22 / 16`（与 engines 逐字一致），错误提示同步。 |
+| D2-07 | Important | systemd 单元的 `Documentation=file:/opt/heikesong/platform/README.md` **硬编码部署路径** | 与单元里其它路径都用 `__APP_DIR__` 不一致 | 改为 `Documentation=file:__APP_DIR__/README.md`（占位符集合不变）。 |
+| D2-08 | Important | `install.sh` 的 `ENV_FILE` 变量**形同虚设**：单元里写死 `EnvironmentFile=-/etc/heikesong/platform.env`，改了 `ENV_FILE` 服务读不到 | 代码走查；干跑时 `ENV_FILE` 指向临时路径，而单元里仍是 `/etc/heikesong/platform.env` | sed 替换该字面路径（`s|/etc/heikesong/platform.env|$ENV_FILE|g`），**不新增占位符**。干跑产物核对：单元里 `EnvironmentFile=-/tmp/…/etc/heikesong/platform.env` ✓。 |
+| D2-09 | Important | `write_env_file` 里的 `umask 077` **泄漏**到后面的函数 → nginx 站点文件会被建成 `600` | 代码走查（`umask` 不是函数局部） | `umask` 存取成对（写完恢复）。干跑产物核对：环境文件 `0640`、nginx 站点 `644` ✓。 |
+| D2-10 | Minor | `install -d -g "$RUN_USER"` 假设存在**与用户名同名的组** | 干跑实测：`install: unknown group mac`（macOS 主组是 `staff`） | 落盘属组改用运行用户的**主组**（`id -gn`），并保留同名组作为兜底。 |
+| D2-11 | Important | 规格的 7 个用例全是**字面扫一遍**：改掉注释就红、但把**配置本身**改坏（上游绑 `0.0.0.0`、compose 扩副本、`DEMO_MODE=1`、端口漂移、单元里写口令）**全都测不出来** | 变异测试第 1 轮：这些变异体在规格的 7 个用例下**全部存活**（见台账 E） | **规格的 7 个用例逐字保留**，另**追加 7 个**用例（单进程 / `DEMO_MODE` 禁令 / 正式形态 TLS / 上游只绑回环 / 不扩副本 / 端口与真实代码同口径 / 环境文件不落口令 / 幂等守卫），并引入 `effective()`（去掉整行注释）**只对有效配置断言** —— 注释里的「默认值说明」是文档，不是配置。 |
+| D2-12 | Minor | 规格 Step 8 第二条命令的**期望值与规格自己的文件不符** | `sh -c 'grep -c "proxy_buffering off;" deploy/nginx.conf'` → 实测 **2**（头部注释里写了一遍 + 真指令 1 处），规格写 `1` | 命令改为「去掉整行注释再计数」→ 实测 `1`（真指令本来就只有 1 处），且能真正抓到重复指令。 |
+| D2-13 | Minor | `nginx.conf` 的 `location /assets/ { alias __APP_DIR__/web/assets/; }` 指向的目录**当前不存在** | `ls platform/web/assets` → `No such file or directory`（现有静态文件在 `web/` 根下） | 保留规格形态（`R-OPS-04` 要求「`location /assets/` + 缓存策略存在」），但在文件里写清「`web/assets/` 是前端构建产物目录，现在还没有；目录不存在时该前缀返 404，不影响其它路径」。**不擅自改静态目录结构**（那是 Task 6 的范围）。 |
+| D2-14 | Minor | `install.sh` 结尾无条件打印「备份命令：… node scripts/backup.js」，但 `scripts/backup.js` 是 **P6 Task 1** 的产物（另一个 worktree 在写） | `ls platform/scripts/` → 只有 `audit-scan.js` / `forbidden.txt` / `migrate.js` / `seed.js` | 改成「文件存在才打印」，避免给出跑不通的命令提示。 |
+| D2-15 | Important | 规格的用例是**全文扫一遍** ⇒ **把真指令注释掉也扫得到**（假绿）。第 1 轮变异实测：`systemctl daemon-reload` 与 `nginx -t` 被注释掉后，规格用例 6 **仍然全绿** | 变异体 M28 / M29 在第 1 轮 **SURVIVED**（规格用例 6 仍绿）；M11 / M16 同理（SSE 指令被改/被删，规格用例 3 仍绿 —— 头部注释里写着同样的字面量） | 新增用例 12「注释不能掩盖配置错误」：对**去掉整行注释后的有效配置**再断言一遍（`effective()`）。规格的 7 个用例仍逐字保留（不削弱它们），只是补上「有效配置」这一层。 |
 
 ### C. 逐字回写位置（本轮改动的计划代码块）
 
 | 计划位置 | 改动 |
 |---|---|
 | Task 2 Step 1 的 `platform/test/deploy-assets.test.js` 代码块 | 规格 7 个用例**逐字保留** + 追加 5 个用例（整体回写） |
-| Task 2 Step 3 的 `deploy/heikesong.service` 代码块 | 整体回写（D-01 注释改写、D-07 `Documentation` 占位符） |
-| Task 2 Step 4 的 `deploy/nginx.conf` 代码块 | 整体回写（D-13 注释增补） |
-| Task 2 Step 5 的 `deploy/docker-compose.yml` 代码块 | 整体回写（D-01 注释改写、D-05 `network_mode: host`） |
-| Task 2 Step 6 的 `deploy/install.sh` 代码块 | 整体回写（D-02/D-03/D-04/D-06/D-08/D-09/D-10/D-14） |
-| Task 2 Step 2 / Step 7 / Step 8 的 Expected 与命令 | 见上表 D-11 / D-12 |
+| Task 2 Step 3 的 `deploy/heikesong.service` 代码块 | 整体回写（D2-01 注释改写、D2-07 `Documentation` 占位符） |
+| Task 2 Step 4 的 `deploy/nginx.conf` 代码块 | 整体回写（D2-13 注释增补） |
+| Task 2 Step 5 的 `deploy/docker-compose.yml` 代码块 | 整体回写（D2-01 注释改写、D2-05 `network_mode: host`） |
+| Task 2 Step 6 的 `deploy/install.sh` 代码块 | 整体回写（D2-02/D2-03/D2-04/D2-06/D2-08/D2-09/D2-10/D2-14） |
+| Task 2 Step 2 / Step 7 / Step 8 的 Expected 与命令 | 见上表 D2-11 / D2-12 |
 
 ### D. 硬约束自证
 
@@ -5613,14 +5888,14 @@ git commit -m "test(P6): 全链路验收 + 跨平台可移植性验收"
 
 1. **`scripts/backup.js` 尚未落地**（P6 Task 1 另一个 worktree 在写）。`install.sh` 已改成「文件存在才打印备份命令」，
    但**备份命令的可用性**要等 Task 1 落地后再验一次。
-2. **`src/server.js` 只绑 127.0.0.1** 是 compose 路径的根因（D-05）。若上游愿意把绑定做成可配置
+2. **`src/server.js` 只绑 127.0.0.1** 是 compose 路径的根因（D2-05）。若上游愿意把绑定做成可配置
    （如 `HOST` 环境变量），compose 可以换回更常见的 `ports` 映射；**本 Task 不改 `src/server.js`**（不在归属内）。
-3. **`web/assets/` 目录尚不存在**（D-13）：`location /assets/` 现在是「给前端构建产物预留」的位置。
+3. **`web/assets/` 目录尚不存在**（D2-13）：`location /assets/` 现在是「给前端构建产物预留」的位置。
    Task 6 的静态站构建落地后，这里才有实际内容。
 4. **`Group=__RUN_USER__` 假设存在与用户名同名的组**（Debian/RHEL `useradd` 默认行为）。
    `install.sh` 落盘时用主组（`id -gn`），两者在目标平台一致；若将来换到用户名与组名不同的系统，
    单元里的 `Group=` 需要单独处理。
-5. **上海机调试形态**（计划「临时调试形态」D-1～D-4）**不在本 Task 的四个文件里**：那需要另开一套
+5. **上海机调试形态**（计划「临时调试形态」D2-1～D2-4）**不在本 Task 的四个文件里**：那需要另开一套
    `listen 8080`、无 TLS、无 `server_name` 的 nginx server 块。本 Task 的 `nginx.conf` 是**正式形态**
    （域名 + TLS + 443），与计划「部署目标决策登记」一致。
 
@@ -5650,16 +5925,16 @@ git commit -m "test(P6): 全链路验收 + 跨平台可移植性验收"
 
 | # | 级别 | 缺陷 | 实跑证据 | 处置 |
 |---|---|---|---|---|
-| D-01 | **Important** | `backup()` 的 `progress` 回调**签名写错**：规格写 `(_db, copied)`，Node v22 的真实签名是**一个对象** `{ totalPages, remainingPages }`；而且该回调**只在多轮迭代时触发**（库小到一次迭代就拷完时根本不触发）→ 规格原样实跑 `pages` 恒为 **0** | 探针 `probe2.mjs`：回调收到 `[{totalPages:52,remainingPages:51}]`（`args.length===1`，参数类型 `object`）；探针 `probe1.mjs`（52 页 / `rate:100`）→ **回调 0 次触发**；规格原样实现的探针：`PROBE_PAGES=0 type=number` | 按真实签名取 `totalPages`；回调一次都没触发时回落到源库 `PRAGMA page_count`。规格原样的 `pages=0` 由此修掉 |
-| D-02 | **Important** | Task 1 的 **Interfaces 段明写**「Consumes: `openDatabase({ dataDir, filename })`（P0 `src/db/sqlite.js`）」，Step 4 的代码块却用 `new DatabaseSync(sourcePath)` 直连 —— **同一 Task 内自相矛盾**，且丢掉 `openDatabase` 提供的 `busy_timeout=5000`（服务运行中备份时对 `SQLITE_BUSY` 没有退避） | 计划原文：Task 1「**Interfaces:** - Consumes: `openDatabase({ dataDir, filename })`」 vs Step 4 代码块 `const source = new DatabaseSync(sourcePath);` | 改用 `openDatabase({ dataDir, filename })`，与 Interfaces 段对齐。⚠️ **这一条没有测试能区分**（两条路径在本 Task 覆盖的场景里行为等价）—— 属**接口契约对齐**而非行为修复，已在变异结果里显式标注 |
-| D-03 | **Important** | `verifyBackupFile` 用 `readOnly: true` 打开 WAL 标志的库时，SQLite **会在文件旁建出** `-wal`(0B) 与 `-shm`(32KB)，且**关库后不删** → 备份目录每次校验多两个文件；保留策略只认 `*.db` ⇒ 这些残留**永不被清理** ⇒ 备份目录无限膨胀；`restoreDatabase` 的临时文件旁也会留 `app.db.restore.tmp-wal/-shm` | 探针 `probe4.mjs`：`readOnly 打开备份后: out.db(8192B) out.db-shm(32768B) out.db-wal(0B)`；规格原样实现的探针：`BEFORE=app-….db` → `AFTER=app-….db,app-….db-shm,app-….db-wal` | `verifyBackupFile` 记下「打开前 sidecar 存不存在」，关库后只删**本次自己造出来的**（打开前就存在的 `-wal` 可能带真实数据，一律不动） |
-| D-04 | **Important** | `checkServiceState` 把「pid 文件存在但内容不是合法 pid」当成「服务没在跑」→ **拿不到「服务已停」的证据却放行恢复**，与「恢复前必须先停服务」这条安全闸的 fail-safe 意图相反 | `readPidFile` 对非法内容返回 `null`（规格原样），`checkServiceState` 随即落到「未发现运行中的服务进程」 | 补一条：pid 文件在但内容不可解析 ⇒ `running: true`（保守拒绝），错误信息点明原因。运维确认服务已停后删掉该 pid 文件即可继续 |
-| D-05 | **Important** | 规格自带的 8 个用例里有 **3 条不判别**（把实现改坏它们照样绿）：① 「恢复后旧 `-wal`/`-shm` 被清掉」的断言放在**新库打开并关闭之后** —— 可 SQLite 自己会在打开时重建 `-wal`、关闭时删掉 `-wal`/`-shm` ⇒ 就算恢复**根本没删**也照样绿；② 「恢复前会留一份 `.before-restore-`」只断言 `steps` **文本**、不查**磁盘**（把 `rename` 换成 `unlink` 也照样绿）；③ 「备份文件损坏时拒绝恢复」用的是**根本不是 sqlite 的文件** ⇒ 它在**打开**阶段就被拒 ⇒ 跳不跳过 `integrity_check` 都一样拒 | 变异实测：M18（不删 `-wal`/`-shm`）**存活**、M19（不留存旧库）**存活**、M21（跳过 `integrity_check`）**存活** | 规格的 8 个用例**逐字保留**；另**追加 10 个判别性用例**：`-wal`/`-shm` **紧接恢复后**就断言、旧库必须**真在磁盘上**、临时文件必须清干净、**能打开但页已损坏**的备份（清零第 3 页 → `integrity_check` 报 `btreeInitPage() returns error code 11` 而**不抛错**，见探针 `probe5.mjs` 策略 A）、命令行入口可执行、保留策略的「份数 ∪ 天数」语义、真实生产 schema 往返等。三个存活体由此被杀 |
-| D-06 | Minor | Step 9 的实跑命令 `node scripts/seed.js` **不带 `ADMIN_PASSWORD`** → `scripts/seed.js` fail-fast 拒绝（「不提供默认口令」）→ 整条 `&&` 链在此中断，**备份根本没跑** | 实跑输出：`缺少环境变量 ADMIN_PASSWORD，拒绝创建管理员账号（不提供默认口令）。` | Step 9 的命令补上 `ADMIN_PASSWORD='<你的口令>'` 并写明原因。⚠️ 种子脚本的 fail-fast 设计**不改**（不提供默认口令是对的） |
-| D-07 | Minor | Step 10 的 `git commit` **不带 `-- <paths>`** —— 违反「先 `git add <paths>`，再 `git commit -m "…" -- <paths>`」这条纪律 | 计划 Step 10 原文 | 补上 `-- <paths>`（`-m` 仍在 `--` 之前） |
-| D-08 | Minor | 两个脚本的 `isMain` 判定照抄「`fileURLToPath(import.meta.url) === process.argv[1]`」：**符号链接入口会静默不执行、退出码 0**（`src/server.js` 的注释里已记录这个坑并改用 realpath 判定） | `src/server.js` 注释原文：「Node 会把主入口 realpath 化，import.meta.url 是真实路径，而 process.argv[1] 是链接路径 → 字符串全等为假 → 服务器静默不启动、退出码 0」 | 沿用 `src/server.js` 的 realpath 判定。⚠️ 实施时**第一版漏了 `fileURLToPath`** —— `realpathSync()` 吃的是**路径**不是 `file://` URL，直接传 `import.meta.url` 会抛 ENOENT ⇒ `isMain` 恒假 ⇒ **命令行跑起来什么都不干、退出码 0**。是 Step 9 实跑抓到的（`[backup] 完成：…` 一行都没打、`data/backups/` 没生成）。已修，并补两条「命令行入口可执行」的用例守住（M25/M26/M27 三个变异体被杀） |
-| D-09 | Minor | `restoreDatabase` 在 `dataDir` 不存在时 `copyFileSync` 抛 ENOENT（**恢复到新机器**的典型场景） | 代码走查 | 换库前 `mkdirSync(dataDir, { recursive: true })` |
-| D-10 | Minor | `checkServiceState({ dataDir })` 不传 `dataDir` 时 `join(undefined, 'app.pid')` 抛 TypeError | 代码走查 | 补默认值 `dataDir = './data'`（与 `restoreDatabase` 一致） |
+| D1-01 | **Important** | `backup()` 的 `progress` 回调**签名写错**：规格写 `(_db, copied)`，Node v22 的真实签名是**一个对象** `{ totalPages, remainingPages }`；而且该回调**只在多轮迭代时触发**（库小到一次迭代就拷完时根本不触发）→ 规格原样实跑 `pages` 恒为 **0** | 探针 `probe2.mjs`：回调收到 `[{totalPages:52,remainingPages:51}]`（`args.length===1`，参数类型 `object`）；探针 `probe1.mjs`（52 页 / `rate:100`）→ **回调 0 次触发**；规格原样实现的探针：`PROBE_PAGES=0 type=number` | 按真实签名取 `totalPages`；回调一次都没触发时回落到源库 `PRAGMA page_count`。规格原样的 `pages=0` 由此修掉 |
+| D1-02 | **Important** | Task 1 的 **Interfaces 段明写**「Consumes: `openDatabase({ dataDir, filename })`（P0 `src/db/sqlite.js`）」，Step 4 的代码块却用 `new DatabaseSync(sourcePath)` 直连 —— **同一 Task 内自相矛盾**，且丢掉 `openDatabase` 提供的 `busy_timeout=5000`（服务运行中备份时对 `SQLITE_BUSY` 没有退避） | 计划原文：Task 1「**Interfaces:** - Consumes: `openDatabase({ dataDir, filename })`」 vs Step 4 代码块 `const source = new DatabaseSync(sourcePath);` | 改用 `openDatabase({ dataDir, filename })`，与 Interfaces 段对齐。⚠️ **这一条没有测试能区分**（两条路径在本 Task 覆盖的场景里行为等价）—— 属**接口契约对齐**而非行为修复，已在变异结果里显式标注 |
+| D1-03 | **Important** | `verifyBackupFile` 用 `readOnly: true` 打开 WAL 标志的库时，SQLite **会在文件旁建出** `-wal`(0B) 与 `-shm`(32KB)，且**关库后不删** → 备份目录每次校验多两个文件；保留策略只认 `*.db` ⇒ 这些残留**永不被清理** ⇒ 备份目录无限膨胀；`restoreDatabase` 的临时文件旁也会留 `app.db.restore.tmp-wal/-shm` | 探针 `probe4.mjs`：`readOnly 打开备份后: out.db(8192B) out.db-shm(32768B) out.db-wal(0B)`；规格原样实现的探针：`BEFORE=app-….db` → `AFTER=app-….db,app-….db-shm,app-….db-wal` | `verifyBackupFile` 记下「打开前 sidecar 存不存在」，关库后只删**本次自己造出来的**（打开前就存在的 `-wal` 可能带真实数据，一律不动） |
+| D1-04 | **Important** | `checkServiceState` 把「pid 文件存在但内容不是合法 pid」当成「服务没在跑」→ **拿不到「服务已停」的证据却放行恢复**，与「恢复前必须先停服务」这条安全闸的 fail-safe 意图相反 | `readPidFile` 对非法内容返回 `null`（规格原样），`checkServiceState` 随即落到「未发现运行中的服务进程」 | 补一条：pid 文件在但内容不可解析 ⇒ `running: true`（保守拒绝），错误信息点明原因。运维确认服务已停后删掉该 pid 文件即可继续 |
+| D1-05 | **Important** | 规格自带的 8 个用例里有 **3 条不判别**（把实现改坏它们照样绿）：① 「恢复后旧 `-wal`/`-shm` 被清掉」的断言放在**新库打开并关闭之后** —— 可 SQLite 自己会在打开时重建 `-wal`、关闭时删掉 `-wal`/`-shm` ⇒ 就算恢复**根本没删**也照样绿；② 「恢复前会留一份 `.before-restore-`」只断言 `steps` **文本**、不查**磁盘**（把 `rename` 换成 `unlink` 也照样绿）；③ 「备份文件损坏时拒绝恢复」用的是**根本不是 sqlite 的文件** ⇒ 它在**打开**阶段就被拒 ⇒ 跳不跳过 `integrity_check` 都一样拒 | 变异实测：M18（不删 `-wal`/`-shm`）**存活**、M19（不留存旧库）**存活**、M21（跳过 `integrity_check`）**存活** | 规格的 8 个用例**逐字保留**；另**追加 10 个判别性用例**：`-wal`/`-shm` **紧接恢复后**就断言、旧库必须**真在磁盘上**、临时文件必须清干净、**能打开但页已损坏**的备份（清零第 3 页 → `integrity_check` 报 `btreeInitPage() returns error code 11` 而**不抛错**，见探针 `probe5.mjs` 策略 A）、命令行入口可执行、保留策略的「份数 ∪ 天数」语义、真实生产 schema 往返等。三个存活体由此被杀 |
+| D1-06 | Minor | Step 9 的实跑命令 `node scripts/seed.js` **不带 `ADMIN_PASSWORD`** → `scripts/seed.js` fail-fast 拒绝（「不提供默认口令」）→ 整条 `&&` 链在此中断，**备份根本没跑** | 实跑输出：`缺少环境变量 ADMIN_PASSWORD，拒绝创建管理员账号（不提供默认口令）。` | Step 9 的命令补上 `ADMIN_PASSWORD='<你的口令>'` 并写明原因。⚠️ 种子脚本的 fail-fast 设计**不改**（不提供默认口令是对的） |
+| D1-07 | Minor | Step 10 的 `git commit` **不带 `-- <paths>`** —— 违反「先 `git add <paths>`，再 `git commit -m "…" -- <paths>`」这条纪律 | 计划 Step 10 原文 | 补上 `-- <paths>`（`-m` 仍在 `--` 之前） |
+| D1-08 | Minor | 两个脚本的 `isMain` 判定照抄「`fileURLToPath(import.meta.url) === process.argv[1]`」：**符号链接入口会静默不执行、退出码 0**（`src/server.js` 的注释里已记录这个坑并改用 realpath 判定） | `src/server.js` 注释原文：「Node 会把主入口 realpath 化，import.meta.url 是真实路径，而 process.argv[1] 是链接路径 → 字符串全等为假 → 服务器静默不启动、退出码 0」 | 沿用 `src/server.js` 的 realpath 判定。⚠️ 实施时**第一版漏了 `fileURLToPath`** —— `realpathSync()` 吃的是**路径**不是 `file://` URL，直接传 `import.meta.url` 会抛 ENOENT ⇒ `isMain` 恒假 ⇒ **命令行跑起来什么都不干、退出码 0**。是 Step 9 实跑抓到的（`[backup] 完成：…` 一行都没打、`data/backups/` 没生成）。已修，并补两条「命令行入口可执行」的用例守住（M25/M26/M27 三个变异体被杀） |
+| D1-09 | Minor | `restoreDatabase` 在 `dataDir` 不存在时 `copyFileSync` 抛 ENOENT（**恢复到新机器**的典型场景） | 代码走查 | 换库前 `mkdirSync(dataDir, { recursive: true })` |
+| D1-10 | Minor | `checkServiceState({ dataDir })` 不传 `dataDir` 时 `join(undefined, 'app.pid')` 抛 TypeError | 代码走查 | 补默认值 `dataDir = './data'`（与 `restoreDatabase` 一致） |
 
 ### C. 逐字回写位置（本轮改动的计划代码块）
 
@@ -5669,13 +5944,13 @@ git commit -m "test(P6): 全链路验收 + 跨平台可移植性验收"
 | Task 1 Step 1 的 `platform/test/backup.test.js` 代码块 | 整体回写（规格 4 个用例逐字保留 + 追加 3 个判别性用例） |
 | Task 1 Step 1 的 `platform/test/restore.test.js` 代码块 | 整体回写（规格 4 个用例逐字保留 + 追加 7 个判别性用例） |
 | Task 1 Step 3 的 `src/runtime/pidfile.js` 代码块 | **未改**（与实现逐字一致） |
-| Task 1 Step 4 的 `scripts/backup.js` 代码块 | 整体回写（D-01 progress 签名、D-02 openDatabase） |
+| Task 1 Step 4 的 `scripts/backup.js` 代码块 | 整体回写（D1-01 progress 签名、D1-02 openDatabase） |
 | Task 1 Step 5 的 `src/db/migrate.js` 片段 | **未改**（追加块与实现逐字一致） |
-| Task 1 Step 6 的 `scripts/restore.js` 代码块 | 整体回写（D-03 sidecar、D-04 pid 坏内容、D-09/D-10） |
-| Task 1 Step 7 的 `src/server.js` 三处片段 | 整体回写（D-08 realpath 判定；写成三处独立可分离的小改动） |
+| Task 1 Step 6 的 `scripts/restore.js` 代码块 | 整体回写（D1-03 sidecar、D1-04 pid 坏内容、D1-09/D1-10） |
+| Task 1 Step 7 的 `src/server.js` 三处片段 | 整体回写（D1-08 realpath 判定；写成三处独立可分离的小改动） |
 | Task 1 Step 8 的 Expected | 改成实跑数字（backup 7 + restore 11 = 18） |
-| Task 1 Step 9 的命令 | 补 `ADMIN_PASSWORD`（D-06） |
-| Task 1 Step 10 的命令 | 补 `-- <paths>`（D-07） |
+| Task 1 Step 9 的命令 | 补 `ADMIN_PASSWORD`（D1-06） |
+| Task 1 Step 10 的命令 | 补 `-- <paths>`（D1-07） |
 
 ### D. 实跑证据
 
@@ -5684,14 +5959,14 @@ git commit -m "test(P6): 全链路验收 + 跨平台可移植性验收"
 | 全量测试（`node --disable-warning=ExperimentalWarning --test`，cwd 发现） | **841 / 841 全绿**（基线 823 + 本 Task 新增 18） |
 | 单文件（`--test test/backup.test.js test/restore.test.js`） | **18 / 18 全绿**（backup 7 + restore 11） |
 | Step 9 实跑（migrate → seed → backup → restore → 读表） | `[backup] 完成：app-20261021T070553Z.db（630784 字节，154 页）` → `[restore] 成功。请重新启动服务： systemctl restart heikesong` → `users = 6`（正整数） |
-| 规格原样实现对照（`/tmp/p6-mutate/t1-spec-baseline.mjs`：把计划里的代码块逐字装进副本，跑本次的用例） | **13 绿 / 3 红** —— 3 条红正是 D-01（页数）、D-03（sidecar 残留）、D-04（pid 坏内容）的判别点 |
+| 规格原样实现对照（`/tmp/p6-mutate/t1-spec-baseline.mjs`：把计划里的代码块逐字装进副本，跑本次的用例） | **13 绿 / 3 红** —— 3 条红正是 D1-01（页数）、D1-03（sidecar 残留）、D1-04（pid 坏内容）的判别点 |
 | 本 Task 的灵魂用例 | 「WAL 模式下备份包含已提交但未 checkpoint 的事务（而只 cp .db 会丢）」**同时**断言反例（只 cp `.db` 的副本 `COUNT=0`）与正例（`backup()` 的副本 `COUNT=1`） |
 
 ### E. 变异测试（脚本 `/tmp/p6-mutate/t1.mjs`，指向**已落地**的测试文件）
 
 | 轮次 | 变异体总数 | KILLED | SURVIVED | 处置 |
 |---|---|---|---|---|
-| 第 1 轮 | 18 | 13 | 5 | 5 个存活体逐个定位为「**用例不判别**」（D-05）：M18/M19/M20/M21 + M02。逐个补判别性断言（`-wal`/`-shm` 紧接恢复后断言、旧库查磁盘、临时文件查磁盘、能打开但损坏的备份） |
+| 第 1 轮 | 18 | 13 | 5 | 5 个存活体逐个定位为「**用例不判别**」（D1-05）：M18/M19/M20/M21 + M02。逐个补判别性断言（`-wal`/`-shm` 紧接恢复后断言、旧库查磁盘、临时文件查磁盘、能打开但损坏的备份） |
 | 第 2 轮 | **27** | **26** | **1** | 追加 9 个变异体（M19/M20/M21 改锚点后重杀 + M22..M27：schema 版本、sidecar 清理、`currentVersion`、三个命令行入口），第 1 轮的 4 个存活体同时被杀 |
 
 **最终：27 个变异体，26 个 KILLED，1 个存活，0 个脚本错误（锚点全部唯一命中）。**
@@ -5700,7 +5975,7 @@ git commit -m "test(P6): 全链路验收 + 跨平台可移植性验收"
 本实现有 `PRAGMA page_count` 兜底 ⇒ 回调写错**不改变可观测结果**。**探针差分实证**：
 Node v22 的真实签名是**单对象** `{ totalPages, remainingPages }`（探针 `probe2.mjs` 输出
 `args.length 集合: [1]`、参数类型 `["object"]`）；而**规格原样实现**（无兜底）的实跑结果是
-`pages = 0`（探针 `PROBE_PAGES=0 type=number`）⇒ **缺陷 D-01 真实存在**，只是在本实现里被兜底掩盖。
+`pages = 0`（探针 `PROBE_PAGES=0 type=number`）⇒ **缺陷 D1-01 真实存在**，只是在本实现里被兜底掩盖。
 
 > ⚠️ 方法说明：每个变异体都**真的改变行为**（改的是有效代码，不是注释）；锚点命中数必须 `=== 1`，
 > 命中 0 次报「锚点失效」、命中 ≥2 次报「锚点不唯一」并要求加长上下文 —— 脚本不放过含糊。
@@ -5742,7 +6017,7 @@ Node v22 的真实签名是**单对象** `{ totalPages, remainingPages }`（探�
    若将来服务改名，需要扩接口。
 5. **备份目录的 sidecar 清理依赖 `verifyBackupFile` 的兜底**：若有人绕过本脚本直接用别的工具打开备份文件，
    仍可能留下 `-wal`/`-shm`（这是 SQLite 的行为，不是本 Task 可控的）。
-6. **`backupDatabase` 打开源库用 `openDatabase`**（D-02）⇒ 备份动作会把源库切到 WAL 模式
+6. **`backupDatabase` 打开源库用 `openDatabase`**（D1-02）⇒ 备份动作会把源库切到 WAL 模式
    （对已经是 WAL 的库是 no-op，不取锁）。
 
 ---
@@ -5777,15 +6052,15 @@ Node v22 的真实签名是**单对象** `{ totalPages, remainingPages }`（探�
 
 | # | 级别 | 缺陷 | 实跑证据 | 处置 |
 |---|---|---|---|---|
-| D-01 | **Critical** | 规格 Step 4 让清单写 `@skip-path ^platform/web/dist/`，与 Step 3 的「发布产物也扫」**互相抵消**：`scanRoots` 先查 `skipPaths` 再查 `excludePaths`，清单里这一行会把发布产物里的**每个文件**整条跳过 ⇒ 本 Task 的核心（发布产物过闸）**形同虚设**，而闸还报「✓ 未发现禁用表述」退出 0 | 探针 1（`/tmp/p6-t3-scratch/probe-defects.mjs`）：按规格原样（清单带那一行）+ `dist/index.html` 里有 `积分占决赛 30%` → **退出码 0**；报告里 `platform/web/dist/index.html` 出现在**排除段（@skip-path）**、**不在违规段**；同一份实现去掉那一行 → **退出码 1**（违规段点名 dist）。变异体 M01/M02/M03 是同一形状 | ① 清单里**不**写 `@skip-path ^platform/web/dist/`（并在清单里写明为什么）；② 发布产物那一趟固定 `skipPaths: []`（**清单关不掉它**）+ `excludePaths: []`（源码目录的默认排除项不套到发布产物上）；③ 追加 3 条判别性用例（发布产物必过闸 / 清单的 `@skip-path` 关不掉它 / 发布产物里每一个文本文件都要过闸） |
-| D-02 | **Important** | 规格 Step 4 的**前提过期**：它要求「把 P4 里带 `?` 的两条拆成空格变体」，但 **P4 定稿早已拆好**（P4 自己的用例断言「仓库自带清单里没有「正则占位」写法」）→ 照规格再追加一遍会触发 `parseManifest` 的「重复词条」→ 退出码 2 ⇒ **闸永远打不开** | 探针 5：`git show HEAD:platform/scripts/forbidden.txt` 里已有 `初赛企业确认权重20%` / `初赛企业确认权重 20%` / `四维各25%` / `四维各 25%`；把它再追加一遍 → `parseManifest` 报错 `["清单里有重复词条：四维各 25%"]` | **不改** P4 的词条，只追加 P6 的新词条；把计划里这一步的前提改正（Step 4 的说明 + 「与接口契约的偏差」第 9 条一并改写） |
-| D-03 | **Important** | 规格自带的用例 6 名为「发布产物目录也必须过闸」，实际测的是 `--forbidden` + **普通文件** ⇒ 规格最核心的一条（发布产物过闸）**没有任何用例覆盖** | 探针 2：把 Step 3 的「发布产物那一趟」整段删掉（= 变异体 M03）后，**规格自带的 6 个用例全部通过**（`not ok` = 0） | 规格的 6 个用例**逐字保留**；另加 4 条针对发布产物的用例（发布产物必过闸 / 每个文本文件都要过闸 / 清单的 `@skip-path` 关不掉它 / 发布产物不存在时按「存在才扫」处理） |
-| D-04 | **Important** | 规格的用例 5「增强不可用也不影响结论」在**参数还没实现时也会通过**（未识别的参数被当成扫描路径 → 扫 0 个文件 → 退出码 0）⇒ 假绿 | 在 **P4 的实现**上直接跑规格的 6 个用例：用例 5 **通过**（`--evidence-chain` 根本没被解析） | 追加 2 条用例：HOME 下没有该 skill 时退出码仍为 0 且打印一行说明 / `--evidence-chain` 指向真实脚本时该脚本**确实被调用**（写标记文件） |
-| D-05 | **Important** | 规格的 `main` 把**未知参数**当扫描路径吞掉（`roots.push(a)`）⇒ 参数写错（如 `--jsonn`）时扫 0 个文件并报「✓ 未发现禁用表述」，退出码 0 —— 静默放行 | 探针 3：按规格原样跑 `--jsonn` → **退出码 0**，输出「扫描 0 个文件」+「未发现禁用表述」 | 未知 `--` 参数 → 退出码 2 + 报「未知参数」+ 用法提示 |
-| D-06 | **Important** | 规格的 `--forbidden` 缺值时回落默认清单（`argv[i + 1] \|\| manifestPath`）⇒ 参数写错 = 用错清单 = 假绿 | 探针 4：按规格原样跑 `--forbidden`（缺路径）→ **退出码 0**（静默用了默认清单）；变异体 M07（照规格原写法改回去）→ 新增用例「--forbidden 缺路径 → 退出码 2」变红 | 缺值 → 退出码 2 + 报「--forbidden 后面必须跟清单路径」 |
-| D-07 | **Important** | 规格没有「扫到 0 个文件」的判定 ⇒ 扫描范围写错（路径拼错、目录搬走、参数被吞）时闸报「✓ 未发现禁用表述」并退出 0 —— 与全局约束「静默的空产出比报错更危险」相悖 | 变异体 M08 / M15 都是这个形状（扫 0 个文件还报通过） | 扫到 0 个文件 → 退出码 2（文本输出与 JSON 输出都报「闸未生效」，JSON 里另有 `gateEffective: false`） |
-| D-08 | **Minor** | 规格的 `runEvidenceChain` 用 `join(process.env.HOME \|\| '', ...)` ⇒ HOME 未设置时拼出**相对路径** `.minimax/skills/...`，会按当前工作目录去找（可能误命中） | 探针 6：HOME 为空时的候选路径 = `".minimax/skills/evidence-chain/scripts/audit-evidence.js"`（相对路径） | HOME 为空时该候选项直接置 `null` |
-| D-09 | **Minor** | 规格 Step 3 是「整体替换 P4 的 `main`」，但没给「不许削弱 P4 行为」的验收手段 | P4 的 `test/audit-scan.test.js`（20 例：CLI 退出码 2/1/0 三种语义、排除项打印、豁免打印、清单自检）在改造后**仍全绿** | P4 的测试文件一个字不改（本 Task 只新建 `test/audit-scan-release.test.js`）；P4 的 20 例 + 本 Task 的 19 例一起跑 |
+| D3-01 | **Critical** | 规格 Step 4 让清单写 `@skip-path ^platform/web/dist/`，与 Step 3 的「发布产物也扫」**互相抵消**：`scanRoots` 先查 `skipPaths` 再查 `excludePaths`，清单里这一行会把发布产物里的**每个文件**整条跳过 ⇒ 本 Task 的核心（发布产物过闸）**形同虚设**，而闸还报「✓ 未发现禁用表述」退出 0 | 探针 1（`/tmp/p6-t3-scratch/probe-defects.mjs`）：按规格原样（清单带那一行）+ `dist/index.html` 里有 `积分占决赛 30%` → **退出码 0**；报告里 `platform/web/dist/index.html` 出现在**排除段（@skip-path）**、**不在违规段**；同一份实现去掉那一行 → **退出码 1**（违规段点名 dist）。变异体 M01/M02/M03 是同一形状 | ① 清单里**不**写 `@skip-path ^platform/web/dist/`（并在清单里写明为什么）；② 发布产物那一趟固定 `skipPaths: []`（**清单关不掉它**）+ `excludePaths: []`（源码目录的默认排除项不套到发布产物上）；③ 追加 3 条判别性用例（发布产物必过闸 / 清单的 `@skip-path` 关不掉它 / 发布产物里每一个文本文件都要过闸） |
+| D3-02 | **Important** | 规格 Step 4 的**前提过期**：它要求「把 P4 里带 `?` 的两条拆成空格变体」，但 **P4 定稿早已拆好**（P4 自己的用例断言「仓库自带清单里没有「正则占位」写法」）→ 照规格再追加一遍会触发 `parseManifest` 的「重复词条」→ 退出码 2 ⇒ **闸永远打不开** | 探针 5：`git show HEAD:platform/scripts/forbidden.txt` 里已有 `初赛企业确认权重20%` / `初赛企业确认权重 20%` / `四维各25%` / `四维各 25%`；把它再追加一遍 → `parseManifest` 报错 `["清单里有重复词条：四维各 25%"]` | **不改** P4 的词条，只追加 P6 的新词条；把计划里这一步的前提改正（Step 4 的说明 + 「与接口契约的偏差」第 9 条一并改写） |
+| D3-03 | **Important** | 规格自带的用例 6 名为「发布产物目录也必须过闸」，实际测的是 `--forbidden` + **普通文件** ⇒ 规格最核心的一条（发布产物过闸）**没有任何用例覆盖** | 探针 2：把 Step 3 的「发布产物那一趟」整段删掉（= 变异体 M03）后，**规格自带的 6 个用例全部通过**（`not ok` = 0） | 规格的 6 个用例**逐字保留**；另加 4 条针对发布产物的用例（发布产物必过闸 / 每个文本文件都要过闸 / 清单的 `@skip-path` 关不掉它 / 发布产物不存在时按「存在才扫」处理） |
+| D3-04 | **Important** | 规格的用例 5「增强不可用也不影响结论」在**参数还没实现时也会通过**（未识别的参数被当成扫描路径 → 扫 0 个文件 → 退出码 0）⇒ 假绿 | 在 **P4 的实现**上直接跑规格的 6 个用例：用例 5 **通过**（`--evidence-chain` 根本没被解析） | 追加 2 条用例：HOME 下没有该 skill 时退出码仍为 0 且打印一行说明 / `--evidence-chain` 指向真实脚本时该脚本**确实被调用**（写标记文件） |
+| D3-05 | **Important** | 规格的 `main` 把**未知参数**当扫描路径吞掉（`roots.push(a)`）⇒ 参数写错（如 `--jsonn`）时扫 0 个文件并报「✓ 未发现禁用表述」，退出码 0 —— 静默放行 | 探针 3：按规格原样跑 `--jsonn` → **退出码 0**，输出「扫描 0 个文件」+「未发现禁用表述」 | 未知 `--` 参数 → 退出码 2 + 报「未知参数」+ 用法提示 |
+| D3-06 | **Important** | 规格的 `--forbidden` 缺值时回落默认清单（`argv[i + 1] \|\| manifestPath`）⇒ 参数写错 = 用错清单 = 假绿 | 探针 4：按规格原样跑 `--forbidden`（缺路径）→ **退出码 0**（静默用了默认清单）；变异体 M07（照规格原写法改回去）→ 新增用例「--forbidden 缺路径 → 退出码 2」变红 | 缺值 → 退出码 2 + 报「--forbidden 后面必须跟清单路径」 |
+| D3-07 | **Important** | 规格没有「扫到 0 个文件」的判定 ⇒ 扫描范围写错（路径拼错、目录搬走、参数被吞）时闸报「✓ 未发现禁用表述」并退出 0 —— 与全局约束「静默的空产出比报错更危险」相悖 | 变异体 M08 / M15 都是这个形状（扫 0 个文件还报通过） | 扫到 0 个文件 → 退出码 2（文本输出与 JSON 输出都报「闸未生效」，JSON 里另有 `gateEffective: false`） |
+| D3-08 | **Minor** | 规格的 `runEvidenceChain` 用 `join(process.env.HOME \|\| '', ...)` ⇒ HOME 未设置时拼出**相对路径** `.minimax/skills/...`，会按当前工作目录去找（可能误命中） | 探针 6：HOME 为空时的候选路径 = `".minimax/skills/evidence-chain/scripts/audit-evidence.js"`（相对路径） | HOME 为空时该候选项直接置 `null` |
+| D3-09 | **Minor** | 规格 Step 3 是「整体替换 P4 的 `main`」，但没给「不许削弱 P4 行为」的验收手段 | P4 的 `test/audit-scan.test.js`（20 例：CLI 退出码 2/1/0 三种语义、排除项打印、豁免打印、清单自检）在改造后**仍全绿** | P4 的测试文件一个字不改（本 Task 只新建 `test/audit-scan-release.test.js`）；P4 的 20 例 + 本 Task 的 19 例一起跑 |
 
 ### C. 逐字回写位置（本轮改动的计划代码块）
 
@@ -5796,7 +6071,7 @@ Node v22 的真实签名是**单对象** `{ totalPages, remainingPages }`（探�
 | Task 3 Step 3 的 import 代码块 | 不变（逐字一致） |
 | Task 3 Step 4 的清单「P6 追加」代码块 | 整体回写（19 行 ＝ 落地清单里 P6 追加段的逐字副本） |
 | Task 3 Step 4 的清单「P4 定稿现状」代码块 | 整体回写（5 行 ＝ 落地清单里 P4 那几行的逐字片段） |
-| Task 3 Step 4 / 4b / 5 的说明与 Expected | 前提改正（D-02）+ 实跑数字（词条 15 条 / 扫描 140 个文件 / 19 例） |
+| Task 3 Step 4 / 4b / 5 的说明与 Expected | 前提改正（D3-02）+ 实跑数字（词条 15 条 / 扫描 140 个文件 / 19 例） |
 | 「与接口契约的偏差」第 9 条 | 改写（P4 已自行拆好空格变体，P6 不重复追加） |
 | 本台账 | 新增 |
 
@@ -5853,7 +6128,7 @@ Node v22 的真实签名是**单对象** `{ totalPages, remainingPages }`（探�
 1. **⚠️ 前端构建产物目录三处不一致（待 Task 6 拍板）** ——
    - 计划 Task 6 规定产物在 **`platform/web/dist/`**；
    - `deploy/nginx.conf` 的静态资源直出却指向 **`__APP_DIR__/web/assets/`**
-     （**没有任何 Task 会生成这个目录** —— Task 2 台账 D-13 已记过同一件事）；
+     （**没有任何 Task 会生成这个目录** —— Task 2 台账 D2-13 已记过同一件事）；
    - `deploy/install.sh` 的 rsync 又把 **`web/dist/` 排除**在拷贝之外
      （`--exclude 'web/dist/'`）。
    - ⇒ **本 Task 的扫描目标按计划走 `web/dist`**（`audit-scan.js` 里的 `distDir`），
@@ -5881,6 +6156,123 @@ Node v22 的真实签名是**单对象** `{ totalPages, remainingPages }`（探�
 
 
 ---
+
+## Task 4 实施台账（2026-10-21）
+
+> 本节是 Task 4（演示版种子数据）的实施记录：**规格缺陷清单**、处置方式、逐字回写位置、实跑证据、变异测试、
+> 以及**种子覆盖了哪些分支**的逐条清单。
+> 纪律：本计划 Task 4 的 **2 个代码块 = 最终实现的逐字副本**
+> （核验命令：`node /tmp/p6-mutate/t4-verify-blocks.mjs`）。
+>
+> **本 Task 的灵魂**（规格第 2510–2514 行）：种子不是「好看的假数据」，而是**每一条 trace 分支的触发器** ——
+> 所以「种子里摆了一条数据」**不算数**，必须是**引擎真的因此触发了那条分支**才算数。
+> ⇒ 本 Task 的测试不只做静态检查，还要把种子喂给**真实领域层引擎**（`src/domain/*`），
+> 断言引擎的输出（总分 / 告警 / 破同分链 / 段位 / 行为分）。
+
+### A. 实施方法（先跑后落盘）
+
+1. 把规格 Task 4 的两个代码块**原样抽到** `/tmp/p6-t4/spec/`（一个字节都没改）。
+2. 在 `/tmp/p6-t4-scratch/platform`（platform 整树副本）上跑**规格自带用例** → 红 1 条（D4-01 的实证）。
+3. 写引擎探针 `/tmp/p6-t4/probe.mjs`（输入构造复刻 Task 5 的 `runDemoCompute`）→ 把 D4-02 / D4-03 的
+   后果**量化**（同分两队总分差 0.0139、破同分链走不到 `peer`、行为分全 0）。
+4. 改种子 → 探针转绿（总分差 `0.0000000000`、`peer` 级分开、行为分 17/2/5/7/0）→ **才落盘**到 worktree。
+5. 落盘后：单文件 → 全量 → 变异测试 → 计划块回写与逐字核验。
+
+### B. 规格缺陷清单
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| D4-01 | **Critical** | 种子的打分矩阵用了 `track_fit` —— 那是**初赛**维度（只在 `rules/scoring-initial.json` 里）；**规格自己的用例**却断言「维度必须在 `rules.scoring.final` 里」⇒ **规格的种子与规格自己的用例互相矛盾** | 规格原样副本上跑自带用例：`# tests 8 / # pass 7 / # fail 1`，红的那条是 `维度 track_fit 不在 rules.scoring.final 里（评委 j_lenient 队 t_alpha）`；引擎探针另证：`track_fit` 在 `trace.normalization` 里有、但在 `perDimension` 里**没有席位**（决赛根本不计这一维）⇒ 演示版会白展示一整维原始分 | 从种子里**删掉 `track_fit` 这一维**（其余 4 维原始分一字不动）⇒ 决赛 4 个评委席维度全部有数据、每维 5 个样本（= `minSamplesForJudgeNormalization`）⇒ 归一化不降级。**不改 `rules/scoring-final.json`**（权重表是 P1 定稿的规则，不属本 Task） |
+| D4-02 | **Critical** | 规格声称 `tiedTeams: ["t_alpha","t_beta"]` 同分，但**引擎算出来根本不同分**：**自评席**把差距拉开了 —— `t_alpha` 自评 95（比评委 81 高 14 → 触发「书面说明」→ 自评分**对齐**到评委分 81.2788），`t_beta` 自评 81（d=0 → 不触发 → 自评席保留原分 81）⇒ 总分差 **0.0139378046** ⇒ 破同分链在**第一级 `total`** 就把它们分开，**永远走不到 `peer`** ⇒ 演示版最想展示的「同分 → 互评破同分」根本没发生 | 引擎探针（规格原样种子）：`t_alpha total=81.089336` / `t_beta total=81.075398`，`total 差 = 0.0139378046`；逐维差**只在** `self_eval`：`81.27875609118963 vs 80.99999999999999`；破同分链 `applied` 只有 `{"key":"total",…,"separated":true}`，**没有 `peer` 这一级** | 让两支同分队的**自评席完全一致**（都取阈值内的 85，d=+4 不告警）⇒ 六个席位分全相等 ⇒ 总分**严格相等**（差 `0.0000000000`）⇒ 破同分链在 `peer` 级分开（alpha 互评 71 > beta 59）。**「书面说明」分支改由 `t_delta` 承担**（自评 95 vs 评委 76，d=+19）⇒ `expectations.selfEvalWrittenExplanationTeam` 的**值**由 `t_alpha` 改为 `t_delta`（键名与结构未动） |
+| D4-03 | **Important** | `behaviorEvents[].evidence` 是**纯文字**（"第 1 周进度"）—— ① 领域层 `parseEvidence` 只认 JSON 对象 ⇒ 纯文字一律 0 分（`evidence_not_json`）⇒ 行为分**全是 0**、行为分支不可观测；② 这种形状**真实写入方根本产不出来**：`src/services/behavior.js` 先用域函数校验证据，不合规直接 400 `EVIDENCE_REJECTED` 拒收 | 引擎探针（规格原样种子）：`t_alpha items=["weekly_progress:0(evidence_not_json)","weekly_progress:0(evidence_not_json)","workshop_output:0(evidence_not_json)","first_demo:10"]`；`src/services/behavior.js:40-47`（写入前校验）+ `:50`（`JSON.stringify` 落库） | 证据改成**合规的 JSON 串**（形状与真实写入方落库一致：TEXT 列里存 JSON 串），逐条满足 `rules/criteria.json` 的 `behaviorEvidence`（weekly_progress 要 `repo`+`version`+`artifact\|blocker`、workshop_output 要 `output`、enterprise_meeting 要 `enterpriseConfirmationId`）⇒ 行为分 17/2/5/7/0，并写进 `expectations.behaviorScores` 供机器校验 |
+| D4-04 | Minor | 规格的 Step 5 提交命令**不带 `-- <paths>`** —— 违反「先 `git add <paths>`，再 `git commit -m "…" -- <paths>`」这条纪律 | 计划 Step 5 原文 | 补上 `-- web/seed test/demo-seed.test.js`（`-m` 仍在 `--` 之前） |
+| D4-05 | Minor | 种子里的 `signatoryUserId`（`u_ent_retail` / `u_ent_mfg`）**在 `users` 列表里不存在** —— 企业签字人是企业侧身份，而种子的 `users` 结构表（`[{id,name,mbaStatus}]`）没有 org/role 字段可放 | 结构表原文 + 种子内容 | **不改**（登记为已知边界）：塞进 `users` 会被误当成平台用户（`mbaStatus` 只能是 mba/member/other），而 `users` 的用途是**组长硬门槛判定**；企业席只校验签字人 id **非空**（`enterprise-seat.js` 的 `!c.crossJudgeId \|\| !c.signatoryUserId`）⇒ 规则上成立 |
+| D4-06 | Minor | `tp_free` 任务包下只有 1 支队伍，而 `rules/team-formation.json` 的 `teamsPerPackage.min = 2` | 种子 teams + 规则原文 | **不改**（登记为已知边界）：该门槛是**组队/认领任务包时**的闸，种子是「组队之后」的快照；且凑成 2 支要多一支队伍 ⇒ 连带改 `expectations.tiers`、互评、自评，收益远小于风险 |
+| D4-07 | Minor | 共享核验脚本 `/tmp/p3fix/plan-blocks.mjs` 的 hint 正则 `(?:js\|html\|css\|sql\|json)` 里 `js` 排在 `json` 前面 ⇒ `web/seed/demo-data.json` 的 hint 被截成 `web/seed/demo-data.js` ⇒ 该块永远显示「无实现」 | `node /tmp/p3fix/plan-blocks.mjs <plan> <platform>` 输出：`行 3020 \| web/seed/demo-data.js \| 无实现` | 本 Task 另用 `/tmp/p6-mutate/t4-verify-blocks.mjs`（按**块正文内容锚点**定位，不靠 hint 猜文件名）逐字核验两个块 ⇒ 均 ✅。**共享脚本本身不动**（它是 P1/P3 的既有工具，不在本 Task 归属内） |
+
+### C. 逐字回写位置（本轮改动的计划代码块）
+
+| 计划位置 | 改动 |
+|---|---|
+| Task 4 Files 段 | 追加「实施补记」（规格 9 个用例逐字保留 + 追加 11 个判别性用例） |
+| Task 4 Step 1 的 `platform/test/demo-seed.test.js` 代码块 | **整体回写**（规格 9 个用例逐字保留 + 追加 11 个 + 文件头 4 行领域层 import 与溯源注释） |
+| Task 4 Step 3 的 `web/seed/demo-data.json` 代码块 | **整体回写**（D4-01 删 `track_fit`、D4-02 自评席对齐、D4-03 证据合规、expectations 增补 4 键） |
+| Task 4 Step 4 的 Expected | `8` → **20**（实跑值） |
+| Task 4 Step 5 的命令 | 补 `-- <paths>`（D4-04） |
+
+> 回写脚本 `/tmp/p6-mutate/t4-plan-rewrite.mjs`：**按块在文档里的位置升序**处理，
+> 锚点用**块正文内容**（不是行号猜测）定位，命中数必须 === 1，否则报错退出。
+
+### D. 实跑证据
+
+| 项 | 结果 |
+|---|---|
+| 基线全量（实施前，本 worktree） | **937 / 937**（936 通过 + 1 跳过 + 0 失败） |
+| 规格原样种子 + 规格自带用例 | **8 个用例：7 通过 / 1 失败**（红的那条即 D4-01） |
+| 规格原样种子的引擎探针 | 同分两队总分差 **0.0139378046**；破同分链只到 `total` 级（**没有 `peer`**）；行为分全 0（D4-02 / D4-03） |
+| 修正后种子的引擎探针 | 同分两队总分差 **0.0000000000**（六个席位分逐维相等）；破同分链 `total` → **`peer`**（`usedBy:["t_alpha","t_beta"]`）；行为分 17 / 2 / 5 / 7 / 0 |
+| 单文件 `node --test test/demo-seed.test.js` | **20 / 20 全绿** |
+| 全量 `node --test` | **957 / 957**（956 通过 + 1 跳过 + 0 失败；基线 937 + 本 Task 20） |
+
+### E. 变异测试（脚本 `/tmp/p6-mutate/t4.mjs`，指向**已落地**的测试文件）
+
+| 轮次 | 变异体总数 | KILLED | SURVIVED | 脚本错误 | 处置 |
+|---|---|---|---|---|---|
+| 第 1 轮 | 22 | 21 | 1 | 0 | 存活者 M19「行为分事件被删光」**其实没改到行为**（把 `first_demo` 证据里的 `artifact` 字段删掉，而该类型**没有证据要求** ⇒ 仍计 10 分）⇒ 改成**真删掉那条事件**后重杀 |
+| 第 2 轮 | **24** | **24** | **0** | 0 | M19 改成**真删事件**（重杀）；M14 换成「同分两队的企业确认分不同」（原来那个没改到行为）；追加 M23（自由命题队改挂赛道）/ M24（某队没有互评） |
+
+**最终：24 个变异体，24 个 KILLED，0 个存活，0 个脚本错误（锚点全部唯一命中）。**
+
+> ⚠️ 方法说明：变异体**只改「某个分支的触发数据」**（种子是本 Task 的产物），
+> 每个变异体都**真的改变引擎行为**（改完后的总分 / 告警 / 破同分 / 段位 / 行为分至少有一项不同），
+> 且**只改有效数据**（不改注释）。锚点命中数必须 `=== 1`，命中 0 次报「锚点失效」、
+> 命中 ≥2 次报「锚点不唯一」—— 脚本不放过含糊。变异体清单见脚本里的 `MUTANTS` 数组，
+> 明细 JSON：`/tmp/p6-mutate/t4-results.json`。
+
+### F. 计划块逐字核验
+
+`node /tmp/p6-mutate/t4-verify-blocks.mjs` → **2/2 逐字一致**：
+
+| 块 | 结果 |
+|---|---|
+| `test/demo-seed.test.js` | 整文件块 ✅ 一致（359 行） |
+| `web/seed/demo-data.json` | 整文件块 ✅ 一致（110 行） |
+
+### G. 种子覆盖的分支清单（本 Task 的核心交付）
+
+| # | 分支（规则出处） | 种子里的哪条数据触发它 | `expectations` 里写了什么 | 引擎里的可观测结果（实跑） |
+|---|---|---|---|---|
+| 1 | **z-score 宽严归一化降级**（S7 §3.1 + C-05） | `j_partial` 只给 `t_gamma` 打了 `feasibility` 一项（样本数 1 < `minSamplesForJudgeNormalization`=5） | `unnormalizedDimension: "feasibility"`、`unnormalizedJudge: "j_partial"` | 告警 `normalization_fallback`（点名 `j_partial:judge_sample_too_small`）+ `trace.normalization.feasibility.normalized=false` |
+| 2 | **去极值**（S7 §3.2，评委数 ≥5） | 每个维度 5 位评委各交 5 队分（≥ `minJudgesForTrim`=5） | `trimmedDimensions: ["innovation","feasibility","completeness","collaboration"]` | `trace.steps` 里 20/20 个 (队,维度) 单元 `trimmed=true`，并记录被去掉的最高/最低分评委 |
+| 3 | **R2 缺双签 → 企业项按 0 分计**（S7 §2.4 R2） | `ec_gamma`（t_gamma）的 `crossJudgeId: null` | `missingDualSignatureTeam: "t_gamma"` | 告警 `R2_missing_dual_signature`；`t_gamma.seatE === 0`（权重保留） |
+| 4 | **R4 自由命题 → 企业项改由评委「需求真实性」维度替代**（S7 §2.4 R4） | `tp_free` 任务包 `isFreeBrief: true`，`t_epsilon` 挂在其下且**没有**企业确认 | `freeBriefTeam: "t_epsilon"` | 告警 `R4_free_brief_judge_scored`；`t_epsilon.seatE` = `feasibility` 维评委分（62.5537），且**无** `R4_substitute_no_scores` |
+| 5 | **破同分链在 `peer` 级分开**（S7 §3.3 + C-03） | `t_alpha` 收到的互评 70/72（均值 71）> `t_beta` 的 60/58（均值 59） | `tiedTeams: ["t_alpha","t_beta"]`、`tiebreakSeparatedBy: "peer"` | 两队总分**严格相等**（差 `0.0000000000`）→ 破同分链 `applied` 含 `{"key":"peer","usedBy":["t_alpha","t_beta"],"separated":true}` → alpha 第 1、beta 第 2 |
+| 6 | **破同分键不可用 ⇒ 显式告警，不静默当 0**（ranking.js 设计） | 种子没有 `tiebreakExtra` 字段（结构表里没这个键）⇒ 「加时陈述复议分」这一级不可用 | （无独立键；由 `tiebreakSeparatedBy: "peer"` 间接约束） | 告警 `tiebreak_key_unusable`（本组不用该键），链继续走到 `peer` |
+| 7 | **自评差异 · 高 → 书面说明且对齐不加分**（S7 §4.3 + R-JDG-13） | `t_delta` 自评 `innovation` 95（评委均分 76，d=+19 > 10） | `selfEvalWrittenExplanationTeam: "t_delta"` | 告警 `self_eval_written_explanation`（**恰好 1 支队**）；`t_delta` 的 `self_eval` 席分 = 评委该维分 76.1602（**不是**自评原分 95 ⇒ 不是加分项） |
+| 8 | **自评差异 · 低 → 评委提问（只提问不改分）**（S7 §4.3） | `t_gamma` 自评 `innovation` 50（评委均分 65.2，d=−15.2 < −10） | `selfEvalJudgeQuestionTeam: "t_gamma"` | 告警 `self_eval_judge_question`（**恰好 1 支队**） |
+| 9 | **自评差异在阈值内 → 不告警、不影响** | `t_alpha` / `t_beta` 自评 85（评委均分 81，d=+4 ≤ 10） | `selfEvalWithinThresholdTeams: ["t_alpha","t_beta"]` | 两队均**不**出现在两类自评告警里；且两队自评席分相同（85）⇒ 这是它们能严格同分的前提 |
+| 10 | **某维度无人打分 → 权重记 0 + 告警，不静默当 0**（设计文档 §13 降级表） | `t_epsilon` **没有**自评记录 ⇒ `self_eval` 维度无分 | `missingSelfEvalTeam: "t_epsilon"` | 告警 `dimension_no_scores`（维度 `self_eval`）；`perDimension.self_eval.mean === null`，且 `seatP` 的分母**剔除了**该维度（与「静默当 0」的结果不同） |
+| 11 | **段位判定（里程碑计数 + 数据/原型 + 业务部门签字）**（S10 §2.2 + R-PTS-01~04） | 5 支队伍的 `milestones` 分别是 2/1/3/5/0 个；`t_delta` 的 `pilot_contract` 有 `业务部` 签字（`isBusinessDepartment: true`） | `tiers: {t_alpha:B, t_beta:C, t_gamma:A, t_delta:S, t_epsilon:D}` | `computeTier` 复算 5 支全中（`milestones=5` + `business_signoff=1` ⇒ `t_delta` 落 S 段） |
+| 12 | **行为分：证据合规才计分**（S10 §3.1 + R-STG-04 + R-PTS-10） | 8 条 `behaviorEvents`，`evidence` 逐条满足 `criteria.behaviorEvidence` | `behaviorScores: {t_alpha:17, t_beta:2, t_gamma:5, t_delta:7, t_epsilon:0}` | `behaviorScore` 复算 5 支全中；`first_demo`（`once:true`）只计一次 |
+| 13 | **行为分不进入总分（分轨在算法层）**（S10 §3.3 + R-PTS-08） | 改动全部行为事件的证据后重算 | （由「行为分不进入总分」用例守住） | 改行为事件前后 5 支队伍的总分**逐字相同** |
+| 14 | **评委席宽严差异被归一化抵消**（S7 §2.1 机制归因） | `j_lenient` 普遍给高分、`j_strict` 普遍给低分（同一队的两档评委差 14 分） | （无独立键；由「同分两队总分严格相等」间接守住） | `t_alpha` / `t_beta` 的四个评委席维度分**逐维相等**（81.2788 / 80.2047 / 79.3845 / 83.5182） |
+
+### H. 遗留 / 需上游注意
+
+1. **Task 5 读种子必须按「决赛维度表」读**：`reviews` 里只可能出现 `rules.scoring.final.dimensions` 的
+   评委席 key（`innovation` / `feasibility` / `completeness` / `collaboration`）；
+   `enterprise` 维度走 `enterpriseConfirmations`，`self_eval` 维度走 `selfReviews`。
+   **不要**再往种子里加 `track_fit`（那是初赛维度，决赛不计分）。
+2. **`expectations` 增补了 4 个键**：`selfEvalWithinThresholdTeams` / `missingSelfEvalTeam` /
+   `trimmedDimensions` / `behaviorScores`。规格原有的 **9 个键一个没动**，
+   只有 `selfEvalWrittenExplanationTeam` 的**值**由 `t_alpha` 改为 `t_delta`（理由见 D4-02）。
+3. **破同分链在 `tiebreak_extra`（加时陈述复议分）这一级会出一条 `tiebreak_key_unusable` 告警** ——
+   种子没有 `tiebreakExtra` 字段（结构表里没有这个键）⇒ 该级不可用、**不静默当 0**（引擎的正确行为）。
+   演示时应当显式展示这条告警，它正好说明「链上每一级都要有可比较的值」。
+4. **行为分达标线 60 分没有任何一支队达到**（最高的 `t_alpha` 也只有 17）⇒ 演示里「完赛认定」恒为 false。
+   这是数据的真实状态，不是 bug；要演示该分支需要更多行为事件（`weekly_progress` 每次只 2 分）。
+5. **`t_alpha` / `t_beta` 的同分是「构造出来的」**：`reviews` 逐维相同 + 企业确认同分 + 自评同分 + 同一个任务包。
+   少任何一样都会被某一张席拉开 —— 这正是 D4-02 的教训，演示时可以顺带讲这一条。
 
 ## P6 部署资产修复轮（父代理，2026-10-21）
 
