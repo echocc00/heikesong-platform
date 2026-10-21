@@ -379,10 +379,23 @@ leaderboard_snapshots(id, edition_id, stage_id, scope, payload_json, created_at)
   "stagePoints": [10, 8, 5],
   "stagePointsOnlyTopN": 3,
   "mvp": { "stagesCounted": 4, "roadshowWeight": 1.0, "perPackage": 1 },
-  "personal": { "lifetime": true, "includeMvpVote": true },
+  "personal": {
+    "lifetime": true,
+    "includeMvpVote": true,
+    "atomicKinds": ["stage_rank", "mvp", "roadshow"],
+    "rollupKind": "personal_rollup"
+  },
   "tieRankStyle": "1224"
 }
 ```
+
+> ⚠️ **P5 修复轮（2026-10-21）追加**：`personal` 组多了 `atomicKinds` / `rollupKind`。
+> 原因：R-RNK-10「个人积分终生上榜」曾有**两套独立实现**（`src/domain/points.js` 的
+> `computePersonalPoints` 与 `src/domain/pool-derive.js` 的 `aggregatePersonalPoints`），
+> 读**不同的规则文件**、按**不同的口径**算 —— 同一份流水能算出两个不同的名次。
+> 现在口径收敛到**唯一**计算点 `src/domain/personal-points.js`，
+> 规则来源也收敛到**本文件这一处**（`personal.atomicKinds` = 计入的原子 kind 白名单，
+> `personal.rollupKind` = 汇总快照的 kind；有 rollup 行则以 rollup 为准）。
 
 ### 领域层（纯函数）
 

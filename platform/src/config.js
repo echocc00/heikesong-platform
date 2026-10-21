@@ -8,6 +8,14 @@
 import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+// 交叉引用校验用的常量（fail-fast 的「引用真实存在」那一类）：
+//   · TASK_PACKAGE_STATUSES —— task_packages.status 的取值域（唯一写入方
+//     src/services/taskPackage.js 的状态机：submitted → assessed → published | returned）。
+//   · RESOURCE_KINDS —— 资源池的分组类型（唯一产生方 src/domain/pool-derive.js）。
+//   · LEDGER_POINT_KINDS —— points_ledger.kind 的取值域（契约 INTERFACES.md §4 明列）。
+// ⚠️ 这三个模块都是**叶子模块**（不 import 本文件）⇒ 不会形成循环依赖。
+import { TASK_PACKAGE_STATUSES } from './db/repo/taskPackages.js';
+import { RESOURCE_KINDS } from './domain/pool-derive.js';
 
 const FILES = {
   scoringInitial: 'scoring-initial.json',
@@ -24,6 +32,7 @@ const FILES = {
   compliance: 'compliance.json',
   points: 'points.json',
   criteria: 'criteria.json',
+  pools: 'pools.json',
   audit: 'audit.json',                     // ← P4 新增
 };
 
@@ -43,6 +52,12 @@ const VALID_NORMALIZATIONS = ['zscore', 'median', 'trimmed', 'bayes'];
 const VALID_FALLBACKS = ['global', 'raw'];
 // 里程碑确认方只有两种：企业侧确认 / 评委确认
 const VALID_CONFIRMERS = ['enterprise', 'judge'];
+// points_ledger.kind 的取值域。
+// 依据：INTERFACES.md §4「points_ledger(id, edition_id, stage_id, team_id, user_id, kind, points, created_at)
+//        -- kind: stage_rank | mvp | roadshow | personal_rollup」。
+// ⛔ 这不是「随便列几个」：kind 写错一个字母 → 该笔积分被静默丢弃（口径外 kind
+//    只告警不计入）→ 榜单少一分且没人知道。配置里引用不存在的 kind 必须当场拒绝。
+const LEDGER_POINT_KINDS = new Set(['stage_rank', 'mvp', 'roadshow', 'personal_rollup']);
 
 function weightSum(dimensions) {
   return dimensions.reduce((a, d) => a + (typeof d.weight === 'number' ? d.weight : 0), 0);
@@ -562,6 +577,31 @@ export function validateRules(rules, expectedCount = null) {
     if (pts.tieRankStyle !== '1224') errors.push(`points.tieRankStyle 必须是 "1224"（当前 ${pts.tieRankStyle}）`);
     if (!pts.mvp || pts.mvp.perPackage !== 1) errors.push('points.mvp.perPackage 必须是 1（每个任务包 1 个 MVP，任务书 §七）');
     if (!pts.personal || typeof pts.personal.lifetime !== 'boolean') errors.push('points.personal.lifetime 必须是布尔值');
+    // ── 个人积分口径的**唯一规则来源**（R-RNK-10）─────────────────────
+    // ⚠️ 这三项（atomicKinds / rollupKind / includeMvpVote）是个人积分口径的全部依据：
+    //    缺任何一项，口径就是**未定义**的（两处实现各按各的理解算 ⇒ 两个名次）。
+    //    原来 atomicKinds / rollupKind 散在 rules.pools.talentPointKinds 里，
+    //    而 rules.points.personal 只有 lifetime / includeMvpVote ⇒ 规则有两份、且不一致。
+    const personal = pts.personal;
+    if (personal) {
+      if (!Array.isArray(personal.atomicKinds) || personal.atomicKinds.length === 0) {
+        errors.push('points.personal.atomicKinds 必须是非空数组（个人积分的原子 kind 白名单）');
+      } else {
+        for (const k of personal.atomicKinds) {
+          if (!LEDGER_POINT_KINDS.has(k)) {
+            errors.push(`points.personal.atomicKinds 含不存在的积分 kind：${k}（合法取值：${[...LEDGER_POINT_KINDS].join(' / ')}）`);
+          }
+        }
+      }
+      if (typeof personal.rollupKind !== 'string' || !personal.rollupKind) {
+        errors.push('points.personal.rollupKind 必须是非空字符串（个人积分汇总快照的 kind）');
+      } else if (!LEDGER_POINT_KINDS.has(personal.rollupKind)) {
+        errors.push(`points.personal.rollupKind 引用了不存在的积分 kind：${personal.rollupKind}`);
+      }
+      if (personal.includeMvpVote !== undefined && typeof personal.includeMvpVote !== 'boolean') {
+        errors.push('points.personal.includeMvpVote 必须是布尔值');
+      }
+    }
   }
 
   // ── 段位附加条件（P3）────────────────────────────────────
@@ -631,6 +671,57 @@ export function validateRules(rules, expectedCount = null) {
     }
   }
 
+  // ── 三池与工作流（P5）────────────────────────────────────────────
+  const pools = rules.pools;
+  if (!pools) {
+    errors.push('pools 缺失');
+  } else {
+    // R-OPS-14：禁止岗位制——claimMode 只允许 self_claim_only，写别的值直接拒绝启动
+    if (pools.workflow?.claimMode !== 'self_claim_only') {
+      errors.push('pools.workflow.claimMode 必须是 self_claim_only（R-OPS-14 禁止岗位制，不允许其他取值）');
+    }
+    if (!Number.isInteger(pools.publicTokenTtlDays) || pools.publicTokenTtlDays <= 0) {
+      errors.push('pools.publicTokenTtlDays 必须是正整数');
+    }
+    if (!Array.isArray(pools.publicScopes) || !pools.publicScopes.includes('all')) {
+      errors.push('pools.publicScopes 必须包含 all');
+    }
+    // ⚠️ 交叉引用校验：配置里写的取值必须**真实存在**。
+    //    原来这一段只校验「形状」，不校验「引用」：
+    //    · packageStatusFilter 里写错一个 status 拼写 → 过滤掉**全部**任务包
+    //      → 资源池空掉，而且**不报任何错**（空集是合法结果）；
+    //    · resourceKinds 写错 → 与派生端（RESOURCE_KINDS）对不上，配置在骗人。
+    if (!Array.isArray(pools.packageStatusFilter)) {
+      errors.push('pools.packageStatusFilter 必须是数组（空数组 = 不按状态过滤）');
+    } else {
+      for (const st of pools.packageStatusFilter) {
+        if (!TASK_PACKAGE_STATUSES.includes(st)) {
+          errors.push(
+            `pools.packageStatusFilter 含不存在的任务包状态：${st}`
+            + `（合法取值：${TASK_PACKAGE_STATUSES.join(' / ')}）`,
+          );
+        }
+      }
+    }
+    if (!Array.isArray(pools.resourceKinds) || pools.resourceKinds.length === 0) {
+      errors.push('pools.resourceKinds 必须是非空数组');
+    } else {
+      for (const k of pools.resourceKinds) {
+        if (!RESOURCE_KINDS.includes(k)) {
+          errors.push(
+            `pools.resourceKinds 含不存在的资源类型：${k}`
+            + `（合法取值：${RESOURCE_KINDS.join(' / ')}）`,
+          );
+        }
+      }
+    }
+    if (pools.talentTotalScope !== 'lifetime') {
+      errors.push('pools.talentTotalScope 必须是 lifetime（R-RNK-10 个人积分终生上榜）');
+    }
+    if (!pools.taskEvidence?.requireRunnableOrBlocker) {
+      errors.push('pools.taskEvidence.requireRunnableOrBlocker 必须为 true（R-STG-04）');
+    }
+  }
   return errors;
 }
 
@@ -655,6 +746,7 @@ export function loadRules(rulesDir) {
     compliance: rules.compliance,
     points: rules.points,
     criteria: rules.criteria,
+    pools: rules.pools,
     audit: rules.audit,                    // ← P4 新增
   };
 

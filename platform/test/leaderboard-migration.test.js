@@ -69,7 +69,15 @@ test('rules/points.json 与 INTERFACES.md §4 一致（10/8/5 · 前 3 名 · MV
   assert.deepEqual(rules.points.stagePoints, [10, 8, 5]);
   assert.equal(rules.points.stagePointsOnlyTopN, 3);
   assert.deepEqual(rules.points.mvp, { stagesCounted: 4, roadshowWeight: 1.0, perPackage: 1 });
-  assert.deepEqual(rules.points.personal, { lifetime: true, includeMvpVote: true });
+  // ⚠️ personal 组在 P5 修复轮（I-3）里多了两项：atomicKinds / rollupKind ——
+  //    个人积分口径的**唯一规则来源**（原来散在 rules.pools.talentPointKinds 与
+  //    rules.points.personal 两处，两处口径还不一样）。
+  assert.deepEqual(rules.points.personal, {
+    lifetime: true,
+    includeMvpVote: true,
+    atomicKinds: ['stage_rank', 'mvp', 'roadshow'],
+    rollupKind: 'personal_rollup',
+  });
   assert.equal(rules.points.tieRankStyle, '1224');
   assert.equal(rules.points.fallbackPolicy.enabled, false, 'R-JDG-21 权重回退默认关闭');
   assert.equal(rules.points.fallbackPolicy.enterpriseWeight, 0.15);
