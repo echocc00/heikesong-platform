@@ -351,6 +351,123 @@ test('记录计算时审计日志必须带上规则版本（事后查得到当�
   rmSync(dataDir, { recursive: true, force: true });
 });
 
+// ── ⑪ P2 实际写入的快照形状（父代理预审补测）────────────────────────────
+// ⛔ 上面的 BASE_INPUT 是**手造的**形状：带 `configKey`、`ruleVersion` 带前缀、output 里带 trace。
+//    与 P2 的 `compute.js` **实际写入的形状不一致** —— 用它测出来的「一致」是**假象**：
+//    真实快照复算会恒判「不一致 + 规则版本已变更」，把正常快照全报成「被篡改」。
+//    P2 实际写的 input（`src/services/compute.js`）：
+//      { config, judges, submissions, excludedReviews, enterpriseConfirmations,
+//        peerReviews, selfReviews, teams, judgePool, ruleVersion: config.version }
+//    且 `output_json` **只存 { teams, warnings }**（trace 单独存 trace_json）。
+const P2_INPUT = {
+  config: { id: 'scoring-final', version: '2026-10-20', dimensions: [{ key: 'innovation', weight: 0.2 }] },
+  judges: [{ judgeId: 'j1', seat: 'judge' }],
+  submissions: [
+    { judgeId: 'j1', teamId: 't1', dimension: 'innovation', rawScore: 80 },
+    { judgeId: 'j1', teamId: 't2', dimension: 'innovation', rawScore: 90 },
+  ],
+  excludedReviews: [],
+  enterpriseConfirmations: [],
+  peerReviews: [],
+  selfReviews: [{ teamId: 't1', dimension: 'self_eval', rawScore: 70 }],
+  teams: [
+    { teamId: 't1', packageEnterpriseId: null, isFreeBrief: false },
+    { teamId: 't2', packageEnterpriseId: null, isFreeBrief: false },
+  ],
+  judgePool: { ok: true, errors: [], stats: {} },
+  ruleVersion: '2026-10-20',
+};
+
+// P2 形状的引擎：**名册缺失会给出 team_roster_missing**（复刻 P2 `scoreStage` 的行为）——
+// ⛔ 引擎不转发 teams ⇒ 复算与原计算结果不同 ⇒ 严格重放恒判失败。
+// ⛔ 有自评输入才做自评差异检测（复刻 P2 的 R-JDG-13）—— 引擎不转发 selfReviews 同理。
+function p2ShapeEngine(input) {
+  const roster = input.teams?.length ? input.teams : null;
+  const warnings = roster ? [] : [{ code: 'team_roster_missing', message: '没有队伍名册（R1 / R4 需要任务包归属与自由命题标记），相关判定按「不适用」处理' }];
+  if ((input.selfReviews ?? []).length > 0) {
+    warnings.push({ code: 'self_eval_divergence', message: '自评测与评委分存在差异，已留痕' });
+  }
+  const teams = (input.submissions ?? []).map((s) => ({ teamId: s.teamId, total: s.rawScore }));
+  return { teams, warnings, trace: { steps: [] } };
+}
+
+test('P2 真实写入的快照形状必须能复算出「一致」（否则正常快照被误报成被篡改）', () => {
+  const { db, close, dataDir } = setup();
+  const output = p2ShapeEngine(P2_INPUT);
+  const { id } = recordComputation({
+    db, kind: 'stage_score', stageId: 'st1', ruleVersion: P2_INPUT.ruleVersion,
+    input: P2_INPUT, output: { teams: output.teams, warnings: output.warnings }, trace: output.trace,
+  });
+  const rules = { scoring: { final: { id: 'scoring-final', version: '2026-10-20', dimensions: [{ key: 'innovation', weight: 0.2 }] } } };
+  const r = recomputeAndDiff({
+    db, id, actorId: 'u_admin', now: '2026-10-20T01:00:00.000Z', rules, engine: p2ShapeEngine,
+  });
+  assert.equal(r.identical, true, `P2 形状的快照复算必须一致，实际 diff=${JSON.stringify(r.diff)}`);
+  assert.deepEqual(r.diff, []);
+  assert.ok(
+    !r.warnings.some((w) => w.code === 'rule_version_changed'),
+    '规则版本没变却报「规则版本已变更」= 误报',
+  );
+  assert.ok(
+    !r.warnings.some((w) => w.code === 'strict_replay_failed'),
+    '严格重放失败 = 误报（teams 没被转发就会这样）',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('P2 形状的快照：当前规则版本真的变了时必须报出来（修复不能把版本比对一起吞掉）', () => {
+  const { db, close, dataDir } = setup();
+  const output = p2ShapeEngine(P2_INPUT);
+  const { id } = recordComputation({
+    db, kind: 'stage_score', stageId: 'st1', ruleVersion: P2_INPUT.ruleVersion,
+    input: P2_INPUT, output: { teams: output.teams, warnings: output.warnings }, trace: output.trace,
+  });
+  const rules = { scoring: { final: { id: 'scoring-final', version: '2026-10-21', dimensions: [{ key: 'innovation', weight: 0.2 }] } } };
+  const r = recomputeAndDiff({
+    db, id, actorId: 'u_admin', now: '2026-10-20T01:00:00.000Z', rules, engine: p2ShapeEngine,
+  });
+  assert.equal(r.identical, false, '规则版本变了却报 identical=true = 漏报');
+  const w = r.warnings.find((x) => x.code === 'rule_version_changed');
+  assert.ok(w, '规则版本变了必须在 warnings 里显式说明');
+  assert.equal(w.snapshotRuleVersion, '2026-10-20');
+  assert.equal(w.currentRuleVersion, '2026-10-21');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('diff 的数组 path 在业务主键重复时必须唯一（否则差异定位不到具体那一条）', () => {
+  const before = { warnings: [{ teamId: 't1', code: 'a' }, { teamId: 't1', code: 'b' }] };
+  const after = { warnings: [{ teamId: 't1', code: 'a' }, { teamId: 't1', code: 'c' }] };
+  const diff = diffValues(before, after);
+  assert.equal(diff.length, 1);
+  assert.equal(diff[0].path, 'warnings[1].code', '主键重复时必须回退到下标，否则两条共用一个 path');
+  assert.equal(diff[0].before, 'b');
+  assert.equal(diff[0].after, 'c');
+});
+
+test('同一个版本的两种写法（裸 version 与 key@version）必须判为「同一版」', () => {
+  // 快照写的是带前缀的 ruleVersion、但没有 configKey —— 这是「按契约写的新快照」的形状。
+  // 库里同时存在两种写法（P2 实际写的是裸 version）⇒ 比较必须两边都认。
+  const { db, close, dataDir } = setup();
+  const input = { ...P2_INPUT, ruleVersion: 'scoring.final@2026-10-20' };
+  const output = p2ShapeEngine(input);
+  const { id } = recordComputation({
+    db, kind: 'stage_score', stageId: 'st1', ruleVersion: 'scoring.final@2026-10-20',
+    input, output: { teams: output.teams, warnings: output.warnings }, trace: output.trace,
+  });
+  const rules = { scoring: { final: { id: 'scoring-final', version: '2026-10-20', dimensions: [{ key: 'innovation', weight: 0.2 }] } } };
+  const r = recomputeAndDiff({
+    db, id, actorId: 'u_admin', now: '2026-10-20T01:00:00.000Z', rules, engine: p2ShapeEngine,
+  });
+  assert.ok(
+    !r.warnings.some((w) => w.code === 'rule_version_changed'),
+    '同一个版本的两种写法不该报「规则版本已变更」',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
 function writeAuditLogForTest(db) {
   db.prepare(
     'INSERT INTO audit_log (id, actor_id, action, entity, entity_id, detail_json, created_at) VALUES (?,?,?,?,?,?,?)',

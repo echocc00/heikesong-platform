@@ -120,6 +120,27 @@ test('findLatestTransition 返回最后一次迁移的 to_state', () => {
   rmSync(dataDir, { recursive: true, force: true });
 });
 
+test('同毫秒并列的迁移日志必须按【插入次序】取最后一条（不能靠随机 UUID 破并列）', () => {
+  const { db, close, dataDir } = setup();
+  const at = '2026-10-20T00:00:00.000Z';
+  // ⚠️ 故意让 id 的字典序与插入次序**相反**：
+  //    `ORDER BY id DESC` 会取到 'z1'（最先插入的那条），
+  //    `ORDER BY rowid DESC` 才取到 'x1'（最后插入的那条）⇒ 判别性数据集，两种实现结果**不同**。
+  //    （`audit_log.id` 是 randomUUID() ⇒ 同毫秒并列时次序随机 ⇒ 状态机随机报 409。
+  //      Task 5 实跑：200 次里 135 次读到过期态。）
+  for (const id of ['z1', 'y1', 'x1']) {
+    db.prepare(
+      'INSERT INTO audit_log (id, actor_id, action, entity, entity_id, detail_json, created_at) VALUES (?,?,?,?,?,?,?)',
+    ).run(id, 'u_admin', 'review_state.transition', 'stage_result', 'st1', JSON.stringify({ to: id }), at);
+  }
+  const latest = findLatestTransition(db, 'stage_result', 'st1');
+  assert.equal(latest.to, 'x1', '同毫秒并列时必须取最后插入的那条（rowid 序），不能靠 id 的字典序');
+  const { rows } = queryAuditLog(db, { entity: 'stage_result', entityId: 'st1' });
+  assert.equal(rows[0].id, 'x1', '列表也必须按插入次序倒序');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
 test('幂等键：同一 (key, scope) 只能插入一次，第二次返回 false', () => {
   const { db, close, dataDir } = setup();
   const first = insertIdempotency(db, {
@@ -371,4 +392,66 @@ test('appError 带上 status / code / detail', () => {
   assert.equal(err.status, 429);
   assert.equal(err.code, 'RATE_LIMITED');
   assert.equal(err.detail.retryAfterSeconds, 7);
+});
+
+// ── 终审修正（M-3）：同毫秒并列时的破并列键必须是 `rowid`，不是 `id` ──
+//
+// ⚠️ 为什么这条容易写成「恒绿」：全局约束说「确定性排序的兜底键一律用 SQLite 隐式
+//    `rowid`（不用随机 UUID）」，但**同一个库内 UUID 是固定的** ⇒ 顺序其实稳定、
+//    分页不会漂移（终审实测：4×5 分页 20 行 distinct=20 / duplicates=0）。
+//    ⇒ 光断言「顺序稳定」区分不出 `rowid DESC` 与 `id DESC`。
+//    **判别性做法**：让 `id` 的**字典序与插入次序相反**（先插的用 'z…'，后插的用 'a…'），
+//    同一毫秒下 —— `rowid DESC` ⇒ 后插的在前；`id DESC` ⇒ 'z…' 在前 ⇒ 两条实现结论相反。
+const SAME_MS = '2026-10-20T03:00:00.000Z';
+
+test('flagged_reviews：同毫秒并列时，后插入的必须在前（rowid 破并列，不是 id）', () => {
+  const { db, close, dataDir } = setup();
+  // ⚠️ id 的字典序与插入次序**故意相反**
+  createFlag(db, { id: 'z-first-inserted', kind: 'low_variance', detail: { n: 1 }, now: SAME_MS });
+  createFlag(db, { id: 'a-second-inserted', kind: 'low_variance', detail: { n: 2 }, now: SAME_MS });
+  const { rows } = listFlagRows(db, { kind: 'low_variance' });
+  assert.equal(rows.length, 2);
+  assert.equal(
+    rows[0].id,
+    'a-second-inserted',
+    '同毫秒并列时必须按 rowid 破并列（后插入的在前）；用 id 破并列会得到相反的顺序',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('appeals：同毫秒并列时，后插入的必须在前（rowid 破并列，不是 id）', () => {
+  const { db, close, dataDir } = setup();
+  insertAppeal(db, { id: 'z-first-inserted', subjectType: 'team_result', subjectId: 'st1:t1', reason: '先插的', now: SAME_MS });
+  insertAppeal(db, { id: 'a-second-inserted', subjectType: 'team_result', subjectId: 'st1:t1', reason: '后插的', now: SAME_MS });
+  const { rows } = listAppealRows(db, {});
+  assert.equal(rows.length, 2);
+  assert.equal(
+    rows[0].id,
+    'a-second-inserted',
+    '同毫秒并列时必须按 rowid 破并列（后插入的在前）；用 id 破并列会得到相反的顺序',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('computation_snapshots：同毫秒并列时，后插入的必须在前（rowid 破并列，不是 id）', () => {
+  const { db, close, dataDir } = setup();
+  insertSnapshot(db, {
+    id: 'z-first-inserted', kind: 'stage_score', stageId: 'st1', ruleVersion: 'scoring.final@2026-10-20',
+    input: { a: 1 }, output: { total: 80 }, trace: {}, revision: 1, now: SAME_MS,
+  });
+  insertSnapshot(db, {
+    id: 'a-second-inserted', kind: 'stage_score', stageId: 'st1', ruleVersion: 'scoring.final@2026-10-20',
+    input: { a: 2 }, output: { total: 81 }, trace: {}, revision: 2, now: SAME_MS,
+  });
+  const { rows } = listComputationRows(db, { kind: 'stage_score', stageId: 'st1' });
+  assert.equal(rows.length, 2);
+  assert.equal(
+    rows[0].id,
+    'a-second-inserted',
+    '同毫秒并列时必须按 rowid 破并列（后插入的在前）；用 id 破并列会得到相反的顺序',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
 });

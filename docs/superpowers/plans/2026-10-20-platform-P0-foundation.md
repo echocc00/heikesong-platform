@@ -1063,10 +1063,15 @@ function sleepSync(ms) {
  *
  * ⚠️ 为什么不能直接 `db.exec('PRAGMA journal_mode = WAL')`：
  *   1. 切 journal_mode 需要**独占锁**；此时库里有别的连接在写就拿不到。
- *   2. **SQLite 的 busy handler 不覆盖这一步** —— 实测（探针
- *      `probe-wal-lock-2.mjs` 实验 B）：持锁时执行该 PRAGMA 在 **0ms** 内就抛
+ *   2. **别的连接持有写事务（RESERVED 锁）时，SQLite 的 busy handler 不覆盖这一步**
+ *      —— 实测（探针 `probe-wal-lock-2.mjs` 实验 B）：持锁时执行该 PRAGMA 在 **0ms** 内就抛
  *      SQLITE_BUSY(errcode=5)；把 busy_timeout 设成 5000 也一样**立刻**失败，不等。
  *      ⇒ 「先设 busy_timeout 再切 WAL」**不够**，必须自己实现退避重试。
+ *      ⚠️ **限定条件**（P4 终审 Minor M-2 实测纠正，别再无条件地转述这句话）：
+ *      并非对所有锁型都如此 —— 别的连接持 **EXCLUSIVE** 锁时 busy handler **仍会**等待
+ *      （实测 busy_timeout=5000 时等 5485ms 才抛、=1000 时等 1129ms，随 busy_timeout 线性缩放）。
+ *      现实故障场景（并发写事务）落在 RESERVED 那一侧 ⇒ 本修法覆盖真实故障；
+ *      但「busy handler 一概不覆盖切 WAL」是**过度泛化**的说法。
  *   3. 危险窗口只有**数据库文件首次创建**的那一瞬间：WAL 模式持久化在文件头里，
  *      此后再次执行该 PRAGMA 是 no-op（不取锁，实测 0ms 成功）。
  *      所以「两条连接同时开同一个新库」必有一方撞上第 1 条 → "database is locked"。
@@ -1381,9 +1386,12 @@ git commit -m "feat(P0): SQLite 封装、迁移机制与初始表结构"
 - [ ] **Step 10: 补连接层并发回归（父代理修正轮 2026-10-21）**
 
 > **为什么补这一条**：P5 的 worker 在「真并发建库」实测时撞到 `database is locked`，
-> 父代理定位到根因在 `src/db/sqlite.js`：**切 journal_mode 需要独占锁，而 SQLite 的
-> busy handler 不覆盖这一步** —— 实测持锁时该 PRAGMA 在 **0ms** 内就抛 SQLITE_BUSY(errcode=5)，
-> busy_timeout 设成 5000 也**不等**（探针 `/tmp/p4-proof/probe-wal-lock-2.mjs` 实验 A/B/C/D）。
+> 父代理定位到根因在 `src/db/sqlite.js`：**切 journal_mode 需要独占锁；而当别的连接持有写事务
+> （RESERVED 锁）时，SQLite 的 busy handler 在这一步不生效** —— 实测该 PRAGMA 在 **0ms** 内就抛
+> SQLITE_BUSY(errcode=5)，busy_timeout 设成 5000 也**不等**（探针 `/tmp/p4-proof/probe-wal-lock-2.mjs` 实验 A/B/C/D）。
+> ⚠️ **限定条件**（P4 终审 Minor M-2 实测纠正，别再无条件地转述这句话）：并非对所有锁型都如此 ——
+> 别的连接持 **EXCLUSIVE** 锁时 busy handler **仍会**等待（实测 busy_timeout=5000 等 5485ms、
+> =1000 等 1129ms，随 busy_timeout 线性缩放）。现实故障场景（并发写事务）落在 RESERVED 那一侧。
 > ⇒ 两条连接同时首开同一个**新库**必有一方失败。修法见上面 Step 3 的新实现：
 > 「已是 wal 直接返回（no-op）→ 否则带**退避重试**地切」。
 >
@@ -1397,8 +1405,14 @@ git commit -m "feat(P0): SQLite 封装、迁移机制与初始表结构"
 //
 // 缺陷背景（P5 的 worker 在「真并发建库」时撞到，父代理实证定位）：
 //   原实现把 `PRAGMA journal_mode = WAL` 排在 `PRAGMA busy_timeout = 5000` **之前**，
-//   而且 —— 关键 —— **切 journal_mode 需要独占锁，SQLite 的 busy handler 不覆盖这一步**。
+//   而且 —— 关键 —— **别的连接持有写事务（RESERVED 锁）时，切 journal_mode 需要的独占锁拿不到，
+//   而 SQLite 的 busy handler 在这一种锁型上不生效**。
 //   ⇒ 两条连接同时开同一个**新库**时，后者立刻 "database is locked"（errcode=5）。
+//
+// ⚠️ 限定条件（P4 终审 Minor M-2 实测纠正）：上面那句**不是无条件成立** ——
+//   别的连接持 **EXCLUSIVE** 锁时，busy handler 仍会等待
+//   （实测 busy_timeout=5000 等 5485ms、=1000 等 1129ms，随 busy_timeout 线性缩放）。
+//   现实故障场景（并发写事务）落在 RESERVED 那一侧 ⇒ 下面第 ②④ 条正是复现这一侧。
 //
 // 探针证据（/tmp/p4-proof/probe-wal-lock-2.mjs）：
 //   实验 A：库里**已是** WAL + 另一连接持写锁 → 设 WAL **成功（0ms）**（no-op，不取锁）
