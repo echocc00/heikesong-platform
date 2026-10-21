@@ -768,7 +768,20 @@ WHERE EXISTS (SELECT 1 FROM assignment a
 
 ## 8. API 设计
 
+> ⚠️ **下面是实施后的真实 API 面**（**54 个端点**，逐条从代码里的 `router.add(...)` 抽出来的，
+> 不是设计期的手写清单）。复算：
+> `grep -rhoE "router\.add\('[A-Z]+',\s*'[^']+'" platform/src/ | sort -u`
+>
+> 变更史：本节原为设计期的 28 个端点；P0–P4 按计划实现，P5 追加了工作流 / 三池 / 公开榜
+> （+15），P4 追加了复核与申诉（+11）。**逐条需求的落点与验收**见
+> [`../requirement-implementation-map.md`](../requirement-implementation-map.md)（机器生成）；
+> **跨阶段签名与表结构的唯一事实来源**是
+> [`../superpowers/plans/INTERFACES.md`](../superpowers/plans/INTERFACES.md)。
+
 ```
+健康
+  GET    /api/health
+
 认证
   POST   /api/auth/login              {phone,password} → session
   POST   /api/auth/logout
@@ -776,18 +789,24 @@ WHERE EXISTS (SELECT 1 FROM assignment a
 
 报名与组队
   POST   /api/registrations            提交报名 → 自动算分分级
+  GET    /api/registrations            组委会列表
   GET    /api/registrations/:id        组委会看可解释明细
   POST   /api/registrations/:id/level  复核/申诉改级
+  GET    /api/registration-criteria    筛选标准（对外透明）
   POST   /api/teams                    建队（认领任务包）
+  GET    /api/teams                    队伍列表
+  GET    /api/teams/:id                单队详情
   POST   /api/teams/:id/members        加入 / 退出 / 汰换
   PATCH  /api/teams/:id                改队名 / 换任务包
+  POST   /api/teams/:id/behavior-events 行为事件（进行为分，**不进总分**）
 
 企业侧
+  GET    /api/task-packages            任务卡列表
   POST   /api/task-packages            企业提交任务卡
   POST   /api/task-packages/:id/solvability   六维可解性评估
   POST   /api/task-packages/:id/approve       分级 + 签约类型
-  POST   /api/signoffs                 企业签字里程碑（带内容 + 部门）
-  POST   /api/signoffs/:id/revoke      撤回签字 → 触发段位降级
+  POST   /api/milestones/:id/signoff          企业签字里程碑（客观事实，**不进总分**）
+  POST   /api/milestones/:id/signoff/withdraw 撤回签字 → 触发段位降级
 
 评审
   POST   /api/stages/:stageId/reviews       评委批量打分
@@ -795,22 +814,46 @@ WHERE EXISTS (SELECT 1 FROM assignment a
   POST   /api/stages/:stageId/calibration   校准打分（不计入）
   POST   /api/stages/:stageId/peer-reviews  互评
   POST   /api/stages/:stageId/self-review    自评测
+  POST   /api/stages/:stageId/recusals      回避 / 撤销回避
+  POST   /api/stages/:stageId/enterprise-confirmations  企业席主观确认（进总分）
   POST   /api/stages/:stageId/compute       ★ 计算 → 结果 + trace
+  GET    /api/stages/:stageId/computations/:computationId  某次计算的可复算快照
 
 榜单
   GET    /api/leaderboard/:stageId?scope=rank|business|personal
+  GET    /api/leaderboard/rolling      滚动榜
+  GET    /api/leaderboard/tier         段位榜
   GET    /api/teams/:id/performance-card     项目商业战绩卡
   GET    /api/teams/:id/tier                 段位与权益
 
-工作流（S2/S3）
-  GET    /api/workflows/:id/tasks
-  POST   /api/tasks/:id/claim                自主领取
+工作流与三池（P5）
+  POST   /api/workflows                 建工作流
+  GET    /api/workflows/:id/tasks       任务清单
+  POST   /api/workflows/:id/tasks       建任务
+  POST   /api/tasks/:id/claim           自主领取（**唯一**入口，无岗位制）
+  POST   /api/tasks/:id/release         释放领取
+  POST   /api/tasks/:id/complete        完成任务（须给可运行证据，**且不加分**）
+  GET    /api/pools/projects            项目池
+  GET    /api/pools/talents             人才池
+  GET    /api/pools/resources           资源池
+  POST   /api/pools/sync                三池同步（幂等）
 
-审计
+公开接口（P5，**无需登录**，用 public_tokens 鉴权）
+  GET    /api/public/leaderboard        公开榜单（显式过可见性过滤 + 字段白名单）
+  GET    /api/public/calendar.ics       赛程日历订阅（iCal，零依赖手写）
+
+审计与复核（P4）
   GET    /api/audit/computations/:id         计算快照（可复算）
+  GET    /api/audit/computations/:id/diff    复算 diff
   GET    /api/audit/log                      审计日志
-  GET    /api/events                         ★ SSE 实时事件流
-```
+  GET    /api/audit/flags                    异常标记
+  POST   /api/audit/flags/:id/resolve        标记处置
+  GET    /api/appeals                        申诉列表
+  POST   /api/appeals                        发起申诉
+  POST   /api/appeals/:id/decide             申诉裁决
+
+实时
+  GET    /api/events                         ★ SSE 实时事件流（**不带 judgeId**）
 
 **【决策】`compute` 是显式动作，不自动触发**。发榜是一个有后果的动作（影响奖金），必须有明确的操作者与时间戳，自动触发会让"谁在什么时候改了什么"不可追。
 
