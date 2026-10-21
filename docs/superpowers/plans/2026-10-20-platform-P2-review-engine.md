@@ -1642,7 +1642,7 @@ Expected: PASS（18 个测试全过：normalization.test.js 18）
 
 ```bash
 cd platform && git add src/domain/normalization.js test/normalization.test.js
-git commit -m "feat(P2): 评委宽严归一化引擎（zscore/median/trimmed/bayes 4 策略 + 显式降级）"
+git commit -m "feat(P2): 评委宽严归一化引擎（zscore/median/trimmed/bayes 4 策略 + 显式降级 + 配置 fail-fast）"
 ```
 
 ---
@@ -1660,15 +1660,38 @@ git commit -m "feat(P2): 评委宽严归一化引擎（zscore/median/trimmed/bay
     - `values` = `[{ judgeId, z }]`（同一 (队伍, 维度) 单元内，全部评委的 z 值）
     - 有效评委数 < `minJudges` → **不去极值**（`trimmed: false`，`removed` 全 null）
     - 并列时按 `judgeId` 字典序确定性打破（保证可复算）
+    - ⛔ **`minJudges` 必填且必须是 ≥1 的整数**，否则抛 `TypeError`（父代理预审修正）
+      —— 缺省 / 非法会让 `list.length < minJudges` **恒为 false**，去极值闸门直接失效：
+      3 个评委也去极值 → 去掉一高一低后只剩 1 个 → **该队分数完全由单个评委决定**，
+      评委宽严偏差直接变成队伍分差（S7 §3.2 要求评委数达标才去极值）。
+    - ⛔ 同一 `judgeId` 出现多次 → 抛 `TypeError`（否则同一个人被算成两个评委）
   - `seatScore({ dimensionScores, weights })` → `{ score, weightSum, missing }`
     - 席位加权分（0–100）：`score = Σ(w·s) / Σw`；`Σw = 0` → `score = 0` 且 `missing` 列出全部维度
     - 评委席代入即得 **P**（评委席得分）；企业席代入即得 **E**
+    - ⛔ **权重必须是有限非负数**，否则抛 `TypeError`（父代理预审修正）
+      —— 权重为字符串时 `weightSum += weight` 会把 `weightSum` **变成字符串**（`0 + 'x' === '0x'`），
+      再拿它做除数 → NaN。类型污染 + 数值污染同时发生。
+    - ⚠️ **零权重的维度不启用**：不参与分子分母，没有分也**不算缺分**
+      （报进 `missing` 就是虚假告警 —— 权重表里写 0 本身就是「不启用」的意思）
+    - ⚠️ **分母是实际参与计算的权重和，不是权重表全量**：
+      某维度缺分时它的权重被**剔除**（并进 `missing`），
+      于是结果是「**已有维度上的相对加权平均**」，不是绝对分数。
+      例：`weights {a:0.5, b:0.5}`、只有 a 有分 → `score = a 的分`、`weightSum = 0.5`。
+      ⛔ **Task 8 总装必须知道这条**，否则 P 的绝对值会被误读。
+    - ⚠️ `dimensionScores` 里权重表**没有**的维度被忽略（权重表定义席位的构成）
+    - ⚠️ `weightSum === 0`（整个席位没启用任何维度）→ `score = 0`，
+      调用方**必须**自行记 warning —— `missing` 此时是空的，看不出来。
 
 - [ ] **Step 1: 写失败的测试**
 
 `platform/test/trim.test.js`：
 
 ```javascript
+// platform/test/trim.test.js —— 去极值 + 席位加权分
+//
+// 依据：P2 计划 Task 3「去极值 + 评委席得分 P」
+// 溯源需求：R-JDG-03（去极值）｜R-JDG-04（双席加权总分 P 的公共原语）
+// 依据来源：S7 §3.2（去极值：同维度去掉一个最高一个最低再取均值，评委数 ≥5 才做）
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { trimOutliers, seatScore } from '../src/domain/trim.js';
@@ -1710,8 +1733,8 @@ test('并列时按 judgeId 确定性打破（可复算）', () => {
       { judgeId: 'j3', z: 0 },
       { judgeId: 'j1', z: 0 },
       { judgeId: 'j2', z: 0 },
-      { judgeId: 'j4', z: 0 },
       { judgeId: 'j5', z: 0 },
+      { judgeId: 'j4', z: 0 },
     ],
     minJudges: 5,
   });
@@ -1758,6 +1781,172 @@ test('权重合计为 0 → 该席位无权重，分数记 0（调用方必须�
   // 该维度有分（只是权重为 0），因此不算「缺分」
   assert.deepEqual(r.missing, []);
 });
+
+// ── 父代理预审修正用例（2026-10-21）────────────────────────────────────
+// ⚠️ 规格自带的 7 条用例全绿，但下面的缺陷在它们**全都看不见**。
+
+test('minJudges 缺省或非法 → 响亮报错（绝不让去极值闸门失效）', () => {
+  // ⚠️ 原实现：`list.length < minJudges` 在 minJudges 为 undefined/'x'/0 时**恒为 false**
+  //    → 3 个评委也去极值 → 去掉一高一低后只剩 1 个 →
+  //    **该队的分数完全由单个评委决定**，评委宽严偏差直接变成队伍分差。
+  for (const bad of [undefined, null, 'x', 0, -1, 2.5, NaN]) {
+    assert.throws(
+      () => trimOutliers({
+        values: [
+          { judgeId: 'j1', z: 1 },
+          { judgeId: 'j2', z: 2 },
+          { judgeId: 'j3', z: 100 },
+        ],
+        minJudges: bad,
+      }),
+      /minJudges/,
+      `minJudges=${String(bad)} 必须报错`,
+    );
+  }
+  // 闸门真的有效：3 个评委 + minJudges=5 → 不去极值
+  const r = trimOutliers({
+    values: [
+      { judgeId: 'j1', z: 1 },
+      { judgeId: 'j2', z: 2 },
+      { judgeId: 'j3', z: 100 },
+    ],
+    minJudges: 5,
+  });
+  assert.equal(r.trimmed, false);
+});
+
+test('席位权重非法 → 响亮报错（绝不让 NaN 或字符串混进榜单）', () => {
+  // ⚠️ 原实现：权重 NaN → score 变 NaN；
+  //    权重 'x' → `weightSum += weight` 让 weightSum **变成字符串 "0x"**（`0 + 'x'`），
+  //    再拿它做除数 → NaN。类型污染 + 数值污染同时发生。
+  for (const bad of [NaN, Infinity, 'x', undefined, null]) {
+    assert.throws(
+      () => seatScore({ dimensionScores: { a: 80 }, weights: { a: bad } }),
+      /席位权重/,
+      `权重=${String(bad)} 必须报错`,
+    );
+  }
+  // 负权重会让分数倒挂
+  assert.throws(
+    () => seatScore({ dimensionScores: { a: 80 }, weights: { a: -0.5 } }),
+    /席位权重/,
+  );
+});
+
+test('零权重的维度不启用：没有分也【不算缺分】（不要虚假告警）', () => {
+  // ⚠️ 原实现：权重 0 的维度没有分时被塞进 `missing` →
+  //    trace 里出现「某维度缺分」的虚假告警，而它本来就是「不启用」的维度。
+  const r = seatScore({
+    dimensionScores: { b: 60 },
+    weights: { a: 0, b: 1 },
+  });
+  assert.equal(r.missing.length, 0, '权重为 0 的维度不该报缺分');
+  assert.ok(Math.abs(r.score - 60) < 1e-12);
+  assert.ok(Math.abs(r.weightSum - 1) < 1e-12);
+});
+
+test('同一 judgeId 出现多次 → 响亮报错，不当成两个评委', () => {
+  // ⚠️ 原实现：重复的 judgeId 被当成两个评委，
+  //    `removed` 甚至会出现 max === min === 'j1'（同一个人既最高又最低）。
+  assert.throws(
+    () => trimOutliers({
+      values: [
+        { judgeId: 'j1', z: 1 },
+        { judgeId: 'j1', z: 50 },
+        { judgeId: 'j2', z: 2 },
+        { judgeId: 'j3', z: 3 },
+        { judgeId: 'j4', z: 4 },
+        { judgeId: 'j5', z: 5 },
+      ],
+      minJudges: 5,
+    }),
+    /judgeId/,
+  );
+});
+
+test('登记口径：缺分维度的权重被剔除 → 结果是【已有维度上的相对加权平均】', () => {
+  // ⚠️ Task 8 总装必须知道这条：分母是**实际参与计算的权重和**，不是权重表全量。
+  const r = seatScore({
+    dimensionScores: { a: 80 },
+    weights: { a: 0.5, b: 0.5 },
+  });
+  assert.ok(Math.abs(r.score - 80) < 1e-12, '不是 40（那是把缺失维度当 0 分）');
+  assert.ok(Math.abs(r.weightSum - 0.5) < 1e-12, '分母只算参与计算的权重');
+  assert.deepEqual(r.missing, ['b']);
+});
+
+test('登记口径：权重表之外的维度分被忽略（权重表定义席位构成）', () => {
+  const r = seatScore({
+    dimensionScores: { a: 80, zzz: 999 },
+    weights: { a: 1 },
+  });
+  assert.ok(Math.abs(r.score - 80) < 1e-12);
+  assert.deepEqual(r.missing, []);
+});
+
+test('去极值的均值必须真的是【去极值后】的均值（不能等于全体均值）', () => {
+  // ⚠️ 规格自带那条用例的期望值 **3 恰好**等于「去极值后均值」与「全体均值」两种算法的
+  //    结果（1+2+3+4+5 的均值也是 3）—— 所以它**区分不了**「有没有真的去掉极值」。
+  //    这里用一个两者结果不同的数据集把这条缝补上。
+  const r = trimOutliers({
+    values: [
+      { judgeId: 'j1', z: 0 },
+      { judgeId: 'j2', z: 0 },
+      { judgeId: 'j3', z: 0 },
+      { judgeId: 'j4', z: 0 },
+      { judgeId: 'j5', z: 10 },
+    ],
+    minJudges: 5,
+  });
+  assert.equal(r.trimmed, true);
+  assert.equal(r.removed.max, 'j5');
+  assert.equal(r.removed.min, 'j1'); // 并列的 0 里字典序最小
+  assert.equal(r.mean, 0, '去极值后的均值是 0；全体均值是 2 —— 两者必须不同');
+});
+
+test('非法 z 的样本被忽略，不参与去极值（不静默当 0）', () => {
+  // ⚠️ 规格自带那条用例名叫「空值与非法 z 被忽略」，但它**只传了空数组** ——
+  //    「非法 z」这半句从来没被验证过。
+  const r = trimOutliers({
+    values: [
+      { judgeId: 'j1', z: 1 },
+      { judgeId: 'j2', z: 2 },
+      { judgeId: 'j3', z: 3 },
+      { judgeId: 'j4', z: 4 },
+      { judgeId: 'j5', z: 5 },
+      { judgeId: 'j6', z: null },
+      { judgeId: 'j7', z: NaN },
+      { judgeId: 'j8', z: undefined },
+      { judgeId: 'j9', z: '80' },
+    ],
+    minJudges: 5,
+  });
+  // 只有 5 个有效评委 → 去极值后 (2+3+4)/3 = 3
+  assert.equal(r.trimmed, true);
+  assert.equal(r.mean, 3);
+  assert.equal(r.removed.max, 'j5');
+  assert.equal(r.removed.min, 'j1');
+});
+
+test('minJudges 配成 2 → 去极值会退化成空集，此时不去极值（不许算出 NaN）', () => {
+  // ⚠️ 防御分支原来**零覆盖** —— minJudges=1 或 2 时 kept 为空，
+  //    `kept.reduce(...) / kept.length` 就是 0/0 = NaN。
+  const r = trimOutliers({
+    values: [{ judgeId: 'j1', z: 10 }, { judgeId: 'j2', z: 20 }],
+    minJudges: 2,
+  });
+  assert.equal(r.trimmed, false);
+  assert.equal(r.mean, 15);
+  assert.deepEqual(r.removed, { max: null, min: null });
+});
+
+test('missing 按维度名字典序输出（与权重表的写入顺序无关）', () => {
+  const r = seatScore({
+    dimensionScores: { innovation: 80 },
+    weights: { zzz_missing: 0.1, aaa_missing: 0.2, innovation: 0.3 },
+  });
+  assert.deepEqual(r.missing, ['aaa_missing', 'zzz_missing']);
+});
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -1786,18 +1975,50 @@ Expected: FAIL —— `Cannot find module '../src/domain/trim.js'`
 //   该口径在 scoring.js 中实现，本模块只提供两个纯函数原语。
 //
 // 纯函数：无 IO、无 Date.now()、无 Math.random()。
+//
+// 【父代理预审修正 2026-10-21 —— 本文件有 4 处修正，读代码前先看这段】
+//   ① `minJudges` 缺省 / 非法 → 去极值闸门**完全失效**：
+//      `list.length < undefined` 恒为 false，于是**3 个评委也去极值** ——
+//      去掉一个最低一个最高后只剩 1 个，该队的分数**完全由单个评委决定**，
+//      评委宽严偏差直接变成队伍分差（S7 §3.2 要求评委数达标才去极值）。
+//      现在 minJudges 必填且必须是 ≥1 的整数，否则抛 TypeError。
+//   ② `seatScore` 的权重**没有校验** → NaN 静默进榜单；
+//      更糟的是权重为字符串时 `weightSum += weight` 会把 weightSum **变成字符串**
+//      （`0 + 'x' === '0x'`）—— 类型污染，下游比较全乱。
+//      现在权重必须是**有限非负数**，否则抛 TypeError。
+//   ③ **零权重的维度被误报进 `missing`** → 虚假告警污染 trace 与 warning。
+//      权重表里写 0 的维度是「不启用」，既不参与计算，也**不算缺分**。
+//   ④ 同一 judgeId 出现两次被当成两个评委（removed 甚至会出现 max === min === 'j1'）。
+//      现在响亮报错。
 
 /**
  * 去极值。
  * @param {object} input
  * @param {Array<{judgeId:string, z:number}>} input.values 同一 (队伍, 维度) 单元内全部评委的 z
- * @param {number} input.minJudges 有效评委数下限；不足则不去极值
+ * @param {number} input.minJudges 有效评委数下限（**必填**，≥1 的整数）；不足则不去极值
  * @returns {{mean:number, trimmed:boolean, removed:{max:string|null, min:string|null}}}
  */
 export function trimOutliers({ values, minJudges } = {}) {
+  if (!Number.isInteger(minJudges) || minJudges < 1) {
+    throw new TypeError(
+      `去极值的 minJudges 非法：${JSON.stringify(minJudges)}（必须是 ≥1 的整数 —— S7 §3.2 要求该维度评委数达标才去极值）`,
+    );
+  }
+
   const list = (Array.isArray(values) ? values : []).filter(
     (v) => v && Number.isFinite(v.z),
   );
+
+  // 一个 (队伍, 维度) 单元内 judgeId 必须唯一 —— 否则「去掉最高最低」会把同一个人算两次
+  const seen = new Set();
+  for (const v of list) {
+    if (seen.has(v.judgeId)) {
+      throw new TypeError(
+        `去极值样本中评委 ${v.judgeId} 出现多次 —— 一个 (队伍,维度) 单元内 judgeId 必须唯一`,
+      );
+    }
+    seen.add(v.judgeId);
+  }
 
   if (!list.length) {
     return { mean: 0, trimmed: false, removed: { max: null, min: null } };
@@ -1832,10 +2053,20 @@ export function trimOutliers({ values, minJudges } = {}) {
 /**
  * 席位加权分（0–100）。
  * @param {object} input
- * @param {Object<string, number>} input.dimensionScores 该队各维度的最终分
- * @param {Object<string, number>} input.weights 各维度的生效权重
+ * @param {Object<string, number>} input.dimensionScores 该队各维度的最终分（0–100，由上游保证区间）
+ * @param {Object<string, number>} input.weights 各维度的生效权重（**必须有限非负数**）
  * @returns {{score:number, weightSum:number, missing:string[]}}
- *   missing = 有权重但没有分数的维度（调用方必须把它变成 warning，⛔ 不静默当 0）
+ *   missing = 有**正权重**但没有分数的维度（调用方必须把它变成 warning，⛔ 不静默当 0）
+ *
+ * ⚠️ 口径提醒（Task 8 总装时必须知道）：
+ *   ① `score = Σ(w·s) / Σw` 的分母是**实际参与计算的权重和**，不是权重表的全量。
+ *      某维度缺分时它的权重被**剔除**（并进 `missing`），
+ *      于是结果是「**已有维度上的相对加权平均**」，不是绝对分数。
+ *      例：weights {a:0.5, b:0.5}、只有 a 有分 → score = a 的分、weightSum = 0.5。
+ *   ② 权重为 0 的维度**不启用**：不参与分子分母、没有分也**不算缺分**。
+ *   ③ `dimensionScores` 里权重表**没有**的维度被忽略（权重表定义席位的构成）。
+ *   ④ `weightSum === 0`（整个席位没启用任何维度）→ `score = 0`，
+ *      调用方**必须**自行记 warning —— `missing` 此时是空的，看不出来。
  */
 export function seatScore({ dimensionScores, weights } = {}) {
   const scores = dimensionScores ?? {};
@@ -1846,6 +2077,17 @@ export function seatScore({ dimensionScores, weights } = {}) {
 
   for (const key of Object.keys(w).sort()) {
     const weight = w[key];
+    if (typeof weight !== 'number' || !Number.isFinite(weight)) {
+      throw new TypeError(`席位权重 ${key} 非法：${JSON.stringify(weight)}（必须是有限数）`);
+    }
+    if (weight < 0) {
+      throw new TypeError(`席位权重 ${key} 非法：${weight}（不能为负）`);
+    }
+    if (weight === 0) {
+      // 权重为 0 → 该维度在席位里**不启用**：不参与分子分母，
+      // 没有分也**不算缺分**（报了就是虚假告警 —— 权重表里写 0 本身就是「不启用」的意思）。
+      continue;
+    }
     const score = scores[key];
     if (!Number.isFinite(score)) {
       missing.push(key);
@@ -1865,7 +2107,7 @@ export function seatScore({ dimensionScores, weights } = {}) {
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cd platform && node --test test/trim.test.js`
-Expected: PASS（7 个测试全过：trim.test.js 7）
+Expected: PASS（17 个测试全过：trim.test.js 17）
 
 - [ ] **Step 5: 提交**
 
@@ -5640,6 +5882,53 @@ git commit -m "feat(P2): SSE 评审进度推送（src/http/sse.js + GET /api/sta
 **Task 2 的测试条数口径**：normalization **18**（规格自带 10 + 预审回归 8）。
 
 **最终结果**：变异体 27 → **KILLED 27 / SURVIVED 0**；`normalization.test.js` **18/18**；P2 全量 **342/342**。
+
+---
+
+## Task 3 父代理预审修正台账（2026-10-21）
+
+> Task 3 的规格在**实施前**被父代理逐条实跑预审（抽到 `/tmp` 独立工程跑）。
+> 规格自带的 **7 条用例全绿** —— 但预审用**探针脚本**逐个探测边界，发现 **2 Critical + 2 Important + 1 Minor**，
+> 全部在实现里修掉后再补 **10 条回归用例**；
+> 实施完成后做**变异检验**，变异体一度出现 **4 条存活**（其中 1 条是**测试期望值写巧了**
+> 导致根本区分不出两种算法），补完后 **21/21 有效变异杀灭**（另 1 条等价变异体）。
+
+### 一、预审发现的规格缺陷
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| **T-1** | **Critical** | **`minJudges` 缺省 / 非法 → 去极值闸门完全失效** —— `list.length < minJudges` 在 `minJudges` 为 `undefined` / `'x'` / `0` 时**恒为 false** | 探针：3 个评委、**不传 `minJudges`** → `{"mean":2,"trimmed":true,"removed":{"max":"j3","min":"j1"}}` —— **去极值了**。S7 §3.2 要求该维度评委数 ≥5 才去极值；去掉一高一低后只剩 1 个评委 → **该队的分数完全由单个评委决定**，评委宽严偏差直接变成队伍分差 | `minJudges` 改为**必填**且必须是 ≥1 的整数，否则抛 `TypeError`（同构于 Task 2 的配置 fail-fast）。S7 的「≥5」由规则文件里的值传入，不在代码里硬编码 |
+| **T-2** | **Critical** | **席位权重没有校验 → NaN 静默进榜单 + 类型污染** | 探针：权重 `NaN` → `score = NaN`；权重 `'x'` → **`weightSum` 变成字符串 `"0x"`**（`0 + 'x'` 的字符串拼接），再拿它做除数 → NaN | 权重必须是**有限非负数**，否则抛 `TypeError`。负权重会让分数倒挂，一并拦掉 |
+| **T-3** | **Important** | **零权重的维度被误报进 `missing`** → 虚假告警污染 trace 与 warning | 探针：`weights {a:0, b:1}`、`scores {b:60}` → `missing = ['a']` —— 但 `a` 的权重是 0，权重表里写 0 本身就是「不启用」 | 权重为 0 的维度直接 `continue`：不参与分子分母，**没有分也不算缺分** |
+| **T-4** | **Important** | 同一 `judgeId` 出现两次被当成**两个**评委 | 探针：重复的 `j1` → `removed = {max:'j1', min:'j1'}` —— 同一个人既被当最高又被当最低 | 响亮抛 `TypeError`（与 Task 2 同一处理原则：契约前提被破坏 → 报错，不静默） |
+| **T-5** | Minor | 缺分维度的权重被剔除后，`score` 是「**已有维度上的相对加权平均**」而非绝对分数 —— 这个口径原计划**完全没写** | 探针：`weights {a:0.5,b:0.5}`、只有 a 有分 → `score = 80`（不是 40） | **登记口径**并写进 Interfaces —— ⛔ Task 8 总装必须知道，否则 P 的绝对值会被误读 |
+
+### 二、变异检验发现的实现盲区
+
+> 变异体 **22** 个（只去一端 / 不去极值 / 均值用全体 / 并列不打破 / 闸门摘掉 /
+> 权重校验摘掉 / 零权重不跳过 / 缺失当 0 分 / 不排序 / 席位由分数驱动 …），
+> 在 `/tmp` 副本上跑 `trim.test.js`，**测试必须失败才算杀灭**。变异脚本：`/tmp/p2t3/mutate.mjs`。
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| **T-6** | **Important** | **规格自带那条用例根本区分不出「有没有真的去极值」** —— 期望值 `3` **恰好**等于「去极值后均值 (2+3+4)/3 = 3」**与**「全体均值 (1+2+3+4+5)/5 = 3」两种算法的结果 | 变异存活：把 `mean` 换成全体均值，用例照样绿 | 补一条两者结果不同的数据集（`0,0,0,0,10` → 去极值后 0，全体 2），把这条缝补上 |
+| **T-7** | **Important** | **「非法 z 被忽略」这半句从来没被验证过** —— 用例名叫「空值与非法 z 被忽略」，实际**只传了空数组** | 变异存活：把过滤条件从 `v && Number.isFinite(v.z)` 改成 `v`，用例照样绿 | 补用例：混入 `null` / `NaN` / `undefined` / 字符串 z，断言它们既不参与去极值也不影响 `removed` |
+| **T-8** | Minor | **`kept` 为空的防御分支零覆盖** —— `minJudges` 配成 1 或 2 时 `kept` 为空，`kept.reduce(...) / kept.length` = 0/0 = **NaN** | 变异存活：摘掉防御分支，用例照样绿 | 补用例：`minJudges: 2` + 2 个评委 → 不去极值、mean = 15（不是 NaN） |
+| **T-9** | Minor | **`missing` 的输出顺序零覆盖** —— 规格只测过单个 missing 维度，字典序从未被验证 | 变异存活：把 `Object.keys(w).sort()` 改成不排序，用例照样绿 | 补用例：权重表按「写入顺序 ≠ 字典序」排 3 个维度、2 个缺分 → 断言 `missing` 按字典序 |
+| — | — | **等价变异体 T18**（`weightSum === 0` → `<= 0`）：T-2 修好后负权重直接抛错，`weightSum` **不可能为负**，两个判断**语义等价** | 变异存活 | **不是盲区**，标记为等价变异体、允许存活（已在变异脚本里显式标注） |
+
+### 三、刻意保持的行为（登记口径）
+
+| 行为 | 为什么这样 |
+|---|---|
+| **去极值的 `mean` 单位是 z，不是 0–100** | 还原回 0–100 由 `scoring.js` 做（Task 8），本模块只提供原语。还原公式见 Task 3 的文件头注释 |
+| **`removed` 只给 `judgeId`，不给被去掉的 z 值** | 契约形状是 `{max, min}`；被去掉的分数可由 `judgeId` 回查输入。⚠️ 若将来要「按行 ID 兜底排序」那类需求，这里要同步扩展 |
+| **`dimensionScores` 的 0–100 区间不在本模块校验** | 上游（Task 6 的评分服务）负责区间校验；本模块只做加权 |
+| **`weightSum === 0` 时 `missing` 是空的** | 「整个席位没启用任何维度」与「某维度缺分」是两种不同的事，调用方要靠 `weightSum` 判断并自己记 warning |
+
+**Task 3 的测试条数口径**：trim **17**（规格自带 7 + 预审回归 6 + 变异补测 4）。
+
+**最终结果**：变异体 22 → **KILLED 21 / 等价变异体 1 / 有效缺口 0**；`trim.test.js` **17/17**；P2 全量 **359/359**。
 
 ---
 
