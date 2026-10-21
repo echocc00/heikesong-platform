@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { readFileSync, existsSync, mkdtempSync, rmSync, mkdirSync, writeFileSync, chmodSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
@@ -377,4 +377,39 @@ test('前端产物目录口径：唯一构建产物目录是 web/dist/，nginx �
   assert.match(conf, /web\/dist/, 'nginx.conf 必须写明真正的构建产物目录是 web/dist/');
   assert.match(sh, /--exclude 'web\/dist\/'/, 'install.sh 必须排除构建产物目录（它是发布物，不随程序同步）');
   assert.match(sh, /--exclude 'web\/assets\/'/, 'install.sh 必须排除预留的静态资源目录');
+});
+
+test('nginx HTTP/2 兼容：自动探测必须认得 nginx 真实输出格式（回归 D7-4）', () => {
+  const compatPath = join(deployDir, 'nginx-http2-compat.sh');
+  const tmp = mkdtempSync(join(tmpdir(), 'heikesong-nginxver-'));
+  try {
+    // 造一个假 nginx：`-v` 把版本号打在 **stderr**，格式与官方构建一致
+    // （`nginx version: nginx/1.24.0 (Ubuntu)` —— 版本号前有 `nginx/` 前缀）。
+    const fakeBin = join(tmp, 'bin');
+    mkdirSync(fakeBin, { recursive: true });
+
+    // ⚠️ 版本号要**烤进**假脚本里：真 nginx 是 `nginx -v` 被调用（**无参数**），
+    //    假脚本若写 `nginx/$1` 会输出成 `nginx version: nginx/ (Ubuntu)` —— 那是假失败。
+    const run = (version) => {
+      const fakeNginx = join(fakeBin, 'nginx');
+      writeFileSync(fakeNginx, `#!/bin/sh\necho "nginx version: nginx/${version} (Ubuntu)" >&2\nexit 0\n`);
+      chmodSync(fakeNginx, 0o755);
+      const out = join(tmp, `auto-${version}`);
+      const env = { ...process.env, PATH: `${fakeBin}:${process.env.PATH}` };
+      delete env.NGINX_VERSION;            // ⛔ 不给覆盖 ⇒ 走**自动探测**这条真实路径
+      execFileSync('bash', [compatPath, join(deployDir, 'nginx.conf'), out], { env, encoding: 'utf8' });
+      return readFileSync(out, 'utf8');
+    };
+
+    // 旧版：必须被**探测到**并降级（不是靠「探测不到 ⇒ 保守降级」蒙对）
+    const old = run('1.24.0');
+    assert.match(old, /^\s*listen 443 ssl http2;$/m, '探测到 1.24.0 必须降级');
+    assert.doesNotMatch(old, /^\s*http2 on;$/m, '1.24.0 不认 `http2 on;`');
+    // 新版：必须被**探测到**并保留（这条最关键 —— 探测失败会误降级）
+    const neu = run('1.25.1');
+    assert.match(neu, /^\s*http2 on;$/m, '探测到 1.25.1 必须保留 `http2 on;`（探测失败会误降级）');
+    assert.match(neu, /^\s*listen 443 ssl;$/m, '探测到 1.25.1 不应改动 listen 行');
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
 });

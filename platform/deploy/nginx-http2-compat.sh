@@ -55,8 +55,12 @@ detect_version() {
     return 0
   fi
   if command -v nginx >/dev/null 2>&1; then
-    # nginx -v 把版本号打在 **stderr**
-    nginx -v 2>&1 | sed -n 's|^nginx version: \([0-9][0-9.]*\).*|\1|p' | head -n 1
+    # nginx -v 把版本号打在 **stderr**。
+    # ⚠️ 真实输出是 `nginx version: nginx/1.24.0 (Ubuntu)` —— 版本号前有 `nginx/` 前缀
+    #    （官方构建的 VERSION 串就是 "nginx/" + 版本号）。只写 `nginx version: 1.24.0`
+    #    的正则**匹配不到** ⇒ 真机上永远探测失败、永远走保守降级。
+    #    ⇒ 这里两种形态都要吃下（用 POSIX BRE 的 \{0,1\}，BSD sed（macOS）也认）。
+    nginx -v 2>&1 | sed -n 's|^nginx version: *\(nginx/\)\{0,1\}\([0-9][0-9.]*\).*|\2|p' | head -n 1
     return 0
   fi
   printf ''

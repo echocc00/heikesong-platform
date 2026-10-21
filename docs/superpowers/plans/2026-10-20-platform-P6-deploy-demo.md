@@ -1311,7 +1311,7 @@ git commit -m "feat(P6): 一致性备份与恢复脚本（sqlite.backup() API + 
 ```javascript
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { readFileSync, existsSync, mkdtempSync, rmSync, mkdirSync, writeFileSync, chmodSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
@@ -1689,6 +1689,41 @@ test('前端产物目录口径：唯一构建产物目录是 web/dist/，nginx �
   assert.match(sh, /--exclude 'web\/dist\/'/, 'install.sh 必须排除构建产物目录（它是发布物，不随程序同步）');
   assert.match(sh, /--exclude 'web\/assets\/'/, 'install.sh 必须排除预留的静态资源目录');
 });
+
+test('nginx HTTP/2 兼容：自动探测必须认得 nginx 真实输出格式（回归 D7-4）', () => {
+  const compatPath = join(deployDir, 'nginx-http2-compat.sh');
+  const tmp = mkdtempSync(join(tmpdir(), 'heikesong-nginxver-'));
+  try {
+    // 造一个假 nginx：`-v` 把版本号打在 **stderr**，格式与官方构建一致
+    // （`nginx version: nginx/1.24.0 (Ubuntu)` —— 版本号前有 `nginx/` 前缀）。
+    const fakeBin = join(tmp, 'bin');
+    mkdirSync(fakeBin, { recursive: true });
+
+    // ⚠️ 版本号要**烤进**假脚本里：真 nginx 是 `nginx -v` 被调用（**无参数**），
+    //    假脚本若写 `nginx/$1` 会输出成 `nginx version: nginx/ (Ubuntu)` —— 那是假失败。
+    const run = (version) => {
+      const fakeNginx = join(fakeBin, 'nginx');
+      writeFileSync(fakeNginx, `#!/bin/sh\necho "nginx version: nginx/${version} (Ubuntu)" >&2\nexit 0\n`);
+      chmodSync(fakeNginx, 0o755);
+      const out = join(tmp, `auto-${version}`);
+      const env = { ...process.env, PATH: `${fakeBin}:${process.env.PATH}` };
+      delete env.NGINX_VERSION;            // ⛔ 不给覆盖 ⇒ 走**自动探测**这条真实路径
+      execFileSync('bash', [compatPath, join(deployDir, 'nginx.conf'), out], { env, encoding: 'utf8' });
+      return readFileSync(out, 'utf8');
+    };
+
+    // 旧版：必须被**探测到**并降级（不是靠「探测不到 ⇒ 保守降级」蒙对）
+    const old = run('1.24.0');
+    assert.match(old, /^\s*listen 443 ssl http2;$/m, '探测到 1.24.0 必须降级');
+    assert.doesNotMatch(old, /^\s*http2 on;$/m, '1.24.0 不认 `http2 on;`');
+    // 新版：必须被**探测到**并保留（这条最关键 —— 探测失败会误降级）
+    const neu = run('1.25.1');
+    assert.match(neu, /^\s*http2 on;$/m, '探测到 1.25.1 必须保留 `http2 on;`（探测失败会误降级）');
+    assert.match(neu, /^\s*listen 443 ssl;$/m, '探测到 1.25.1 不应改动 listen 行');
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -1963,8 +1998,12 @@ detect_version() {
     return 0
   fi
   if command -v nginx >/dev/null 2>&1; then
-    # nginx -v 把版本号打在 **stderr**
-    nginx -v 2>&1 | sed -n 's|^nginx version: \([0-9][0-9.]*\).*|\1|p' | head -n 1
+    # nginx -v 把版本号打在 **stderr**。
+    # ⚠️ 真实输出是 `nginx version: nginx/1.24.0 (Ubuntu)` —— 版本号前有 `nginx/` 前缀
+    #    （官方构建的 VERSION 串就是 "nginx/" + 版本号）。只写 `nginx version: 1.24.0`
+    #    的正则**匹配不到** ⇒ 真机上永远探测失败、永远走保守降级。
+    #    ⇒ 这里两种形态都要吃下（用 POSIX BRE 的 \{0,1\}，BSD sed（macOS）也认）。
+    nginx -v 2>&1 | sed -n 's|^nginx version: *\(nginx/\)\{0,1\}\([0-9][0-9.]*\).*|\2|p' | head -n 1
     return 0
   fi
   printf ''
@@ -6391,7 +6430,7 @@ nginx 在**最后**。机器上没装 nginx 时，脚本会先把上面**全部*
 | D7-1 | **Important** | **计划 Task 7 的骨架把 §5 的演示版构建命令写成了「现在就能跑」** —— 但 `scripts/build-demo.js` / `scripts/serve-demo.js` 是 **P6 Task 6** 的产物，此刻**尚未落地** | `ls platform/scripts/build-demo.js` → `No such file or directory`；`scripts/serve-demo.js` 同样不存在；`ls -d platform/web/dist platform/web/assets` → 两个都不存在 | **计划代码块逐字保留**（不改规格），但手册顶部加「**阅读须知**」明确声明：§5 的两条命令**此刻跑不通**，§8.5 写全了 Task 6 落地后的**构建 / 产物位置 / 本地预览 / 扫描闸 / 发布**流程 + 一张状态声明表 |
 | D7-2 | **Important** | **计划 §2.2 的 `install.sh` 步骤清单没有反映 F-2 / F-3 / F-4 修复后的行为**（清单里没有 nginx 前置检查、没有失败回滚、没有版本自动降级、没有绝对过期天数字段） | 逐条对读 `platform/deploy/install.sh`：`require_nginx` 在 `main()` **最前**（第 341 行）→ `validate_session_ttls`（342）→ … → `write_nginx_site`（358）先跑兼容脚本、再备份旧站点、再 `if ! nginx -t` | 计划代码块逐字保留；手册 **§8.1 – §8.4** 逐条写清修复后的真实行为，**每条都带实跑输出** |
 | D7-3 | **Important** | **计划 §1 的环境变量清单不全** —— 只列 `PORT` / `DATA_DIR` / `SESSION_TTL_DAYS`，漏了 `SESSION_ABSOLUTE_TTL_DAYS` | `src/auth/session.js` 第 23 行 `DEFAULT_ABSOLUTE_TTL_DAYS = 30`，第 36 行读 `process.env.SESSION_ABSOLUTE_TTL_DAYS`；F-3 后 `install.sh` 的 `write_env_file()` 也显式写它 | 计划代码块逐字保留；手册 **§10** 给出完整速查表（**9 个变量** + 「改了怎么生效」列 + 端口 8080 的「四处同一口径」清单） |
-| D7-4 | **Critical（后果安全）** | **`nginx-http2-compat.sh` 的 `detect_version()` 解析不了真实 nginx 的版本输出** —— 脚本用 `sed -n 's\|^nginx version: \([0-9][0-9.]*\).*\|\1\|p'`，要求版本号**紧跟** `nginx version: ` 后是一个数字；而 nginx 的**真实输出**是 `nginx version: nginx/1.24.0`（版本号前带 `nginx/` 前缀）⇒ **匹配不到** | `printf 'nginx version: nginx/1.24.0\n' \| sed -n 's\|^nginx version: \([0-9][0-9.]*\).*\|\1\|p'` → **空**；沙箱里跑完整 `install.sh`，兼容脚本打印「**[nginx-compat] nginx 未探测到（按需降级处理）** < 1.25.1：已降级为 `listen ... ssl http2;`」 | 手册 **§8.1 如实写明**：真机上自动探测**总是失败** ⇒ 总是走保守降级；**后果安全**（`listen ... ssl http2;` 在**所有**版本都合法，部署不会因此失败）；但「≥ 1.25.1 保留 `http2 on;`」这条分支在真机上**只有显式给 `NGINX_VERSION` 才走得到**。**本 Task 不修**（`platform/` 不在本 Task 归属内）—— 一行修法写进手册 §8.1 与本台账 E 节，供上游处理 |
+| D7-4 | **Critical（后果安全）** | **`nginx-http2-compat.sh` 的 `detect_version()` 解析不了真实 nginx 的版本输出** —— 脚本用 `sed -n 's\|^nginx version: \([0-9][0-9.]*\).*\|\1\|p'`，要求版本号**紧跟** `nginx version: ` 后是一个数字；而 nginx 的**真实输出**是 `nginx version: nginx/1.24.0`（版本号前带 `nginx/` 前缀）⇒ **匹配不到** | `printf 'nginx version: nginx/1.24.0\n' \| sed -n 's\|^nginx version: \([0-9][0-9.]*\).*\|\1\|p'` → **空**；沙箱里跑完整 `install.sh`，兼容脚本打印「**[nginx-compat] nginx 未探测到（按需降级处理）** < 1.25.1：已降级为 `listen ... ssl http2;`」 | 手册 **§8.1 如实写明**：真机上自动探测**总是失败** ⇒ 总是走保守降级；**后果安全**（`listen ... ssl http2;` 在**所有**版本都合法，部署不会因此失败）；但「≥ 1.25.1 保留 `http2 on;`」这条分支在真机上**只有显式给 `NGINX_VERSION` 才走得到**。**本 Task 不修**（`platform/` 不在本 Task 归属内）—— 一行修法写进手册 §8.1 与本台账 E 节，供上游处理 | ⛔ **后续（2026-10-21，父代理修复轮）已修**：解析式改为 `s\|^nginx version: *\(nginx/\)\{0,1\}\([0-9][0-9.]*\).*\|\2\|p`（POSIX BRE，BSD/GNU sed 都认），并补了走**真实自动探测路径**的回归用例（假 `nginx` 放 `PATH`、输出官方格式版本号、不给 `NGINX_VERSION`）—— 变异体 M12（把解析式改回旧写法）被该用例杀掉 |
 | D7-5 | Minor | **计划 §2.4 没提 `network_mode: host` 在 Docker Desktop（macOS / Windows）上宿主仍不通** | `deploy/docker-compose.yml` 第 26–27 行自己写明「host 网络只保证 Linux 宿主机的语义；Docker Desktop（macOS/Windows）上容器拿到的是 Linux 虚拟机的网络栈，宿主机 127.0.0.1:8080 仍不通」 | 计划代码块逐字保留；手册 §13 **U-2** 登记为边界（本 Task 环境无 Docker daemon，未实跑） |
 | D7-6 | Minor | **计划 Task 7 Step 2 的期望值 `backup()` = 2 与最终文件实际 3 不符** | `grep -c "single writer at a time" docs/deployment.md` → `1`；`grep -c "proxy_buffering off"` → `1`；`grep -c "backup()"` → `3` | 计划写的是「三个数字都 ≥ 1」，`3 ≥ 1` **通过**。**不为了凑「2」而删内容**（第三个 `backup()` 出现在 §8.1/§12 的实跑证据上下文里） |
 | D7-7 | — | **计划 Task 7 的代码块与最终文件的对应关系需要写清** | 程序化核验：计划第 5259–5470 行（`markdown` 围栏内）在 `docs/deployment.md` 里是**逐字连续**的片段（起始字节下标 **963**）；§0 段（`## 0.` → `## 1.`）单独核验同样**逐字包含** | **不改计划规格**（计划块原样保留）；补写内容**全部**落在手册 §8 – §14。计划文档本身只**追加**了本台账一章，**未改动** Task 7 的代码块 |
@@ -6429,7 +6468,7 @@ nginx 在**最后**。机器上没装 nginx 时，脚本会先把上面**全部*
 | **F-1** 前端产物目录口径 | 唯一构建产物目录 = `platform/web/dist/`（Task 6 的 `build-demo.js --out web/dist` 产出，**走独立发布通道，不经 nginx**）；nginx 的 `location /assets/ { alias __APP_DIR__/web/assets/; }` 是**预留**的带哈希静态资源位，**本仓库无任何构建步骤产出它**，目录不存在时该前缀返 404、不影响其它路径；`install.sh` 的 rsync **两个都排除** | 手册 **§8.4**（含一张「目录 / 是什么 / 由谁产出 / 走不走 nginx」对照表） | ✅ 一致。**手册没有把 `web/assets/` 说成「构建产物目录」** |
 | **F-2** nginx 前置检查与回滚 | `require_nginx()` 在 `main()` **最前**（动任何东西之前）⇒ 缺 nginx **当场明确拒绝**；`nginx -t` 失败 ⇒ 有旧配置就 `mv` 还原、没旧配置就**撤销站点文件与软链** ⇒ 坏配置不会留在 `sites-enabled` 里毒化下一次 reload | 手册 **§8.2**（两条分支各带实跑输出 + 事后 `sites-enabled/` 为空的核对） | ✅ 一致 |
 | **F-3** 会话环境变量 | 环境文件**显式**写 `SESSION_ABSOLUTE_TTL_DAYS`（默认 **30**，与 `src/auth/session.js` 的 `DEFAULT_ABSOLUTE_TTL_DAYS` 同源）与 `SESSION_TTL_DAYS`（默认 **7**）；两个天数**必须是正整数**，否则 `install.sh` **fail-fast 报错**（代码侧是静默回退到默认值，环境文件写错没人会发现）；**改完必须重启服务**（systemd 在服务启动时读 `EnvironmentFile`） | 手册 **§8.3**（完整说明 + 「改了怎么生效」的命令 + 确认生效的查法）、**§10**（速查表） | ✅ 一致 |
-| **F-4** nginx 版本 | **已自动化，不需要人手工改语法**：`install.sh` 先跑 `deploy/nginx-http2-compat.sh`，按**目标机**的 nginx 版本自动决定：≥ 1.25.1 保留 `http2 on;`、< 1.25.1 自动降级成 `listen ... ssl http2;`（所有版本都合法）、探测不到时按需降级（保守）；`NGINX_VERSION` 可覆盖探测结果（用于预演 / 测试） | 手册 **§8.1**（含决策表、查版本的方法、`NGINX_VERSION` 覆盖用法、4 个版本的实跑输出） | ✅ 一致 —— **但追加了一条如实说明**：自动探测在真机上**总是失败**（见 D7-4） |
+| **F-4** nginx 版本 | **已自动化，不需要人手工改语法**：`install.sh` 先跑 `deploy/nginx-http2-compat.sh`，按**目标机**的 nginx 版本自动决定：≥ 1.25.1 保留 `http2 on;`、< 1.25.1 自动降级成 `listen ... ssl http2;`（所有版本都合法）、探测不到时按需降级（保守）；`NGINX_VERSION` 可覆盖探测结果（用于预演 / 测试） | 手册 **§8.1**（含决策表、查版本的方法、`NGINX_VERSION` 覆盖用法、4 个版本的实跑输出） | ✅ 一致 —— **自动探测的解析缺陷已由父代理修复轮修掉**（D7-4）：原解析匹配不到 `nginx/1.24.0` 这种真实格式，现在带前缀/不带前缀两种形态都吃下，并有走真实探测路径的回归用例钉住（见手册 §8.1） |
 
 ### D. 计划块核验结果
 

@@ -292,18 +292,19 @@ NGINX_VERSION=1.25.1 bash deploy/nginx-http2-compat.sh deploy/nginx.conf /tmp/si
 1.25.1 保留后：  listen 443 ssl;         /   listen [::]:443 ssl;   /   http2 on;
 ```
 
-⚠️ **一条如实说明（实跑发现）**：`nginx-http2-compat.sh` 的 `detect_version()` 用
-`sed -n 's|^nginx version: \([0-9][0-9.]*\).*|\1|p'` 解析 `nginx -v` 的输出，
-而 **nginx 的真实输出格式是 `nginx version: nginx/1.24.0`**（版本号前面带 `nginx/` 前缀）
-⇒ 这条 sed **匹配不到** ⇒ **真机上自动探测总是「探测不到」**，于是**总是走保守降级分支**。
+✅ **已修复（2026-10-21，父代理修复轮）**：`detect_version()` 的解析式已改为
+`sed -n 's|^nginx version: *\(nginx/\)\{0,1\}\([0-9][0-9.]*\).*|\2|p'` ——
+**带 `nginx/` 前缀与不带前缀两种形态都吃下**，且用的是 POSIX BRE（`\{0,1\}`），
+BSD sed（macOS）与 GNU sed（Linux）都认。
 
-- **后果是安全的**：降级后的语法在**所有** nginx 版本上都合法，部署不会因此失败。
-- **但**「≥ 1.25.1 保留 `http2 on;`」这条分支在真机上**只有显式给 `NGINX_VERSION` 才走得到**。
-- 一行的修法（**本 Task 不改** —— `platform/` 不在本 Task 归属内，见 §13 U-4）：
-
-  ```bash
-  sed -n 's|^nginx version: nginx/\?\([0-9][0-9.]*\).*|\1|p'
-  ```
+> **这条曾经是真缺陷**：原式要求版本号紧跟 `nginx version: `，
+> 而 nginx 的**真实输出**是 `nginx version: nginx/1.24.0`（版本号前带 `nginx/` 前缀）
+> ⇒ 匹配不到 ⇒ 真机上自动探测**总是失败**、**总是**走保守降级。
+> 后果当时是安全的（降级语法在所有版本都合法），但「≥ 1.25.1 保留 `http2 on;`」
+> 这条分支在真机上只有显式给 `NGINX_VERSION` 才走得到。
+> 修复后有**回归用例**钉住（`test/deploy-assets.test.js` 的「自动探测必须认得 nginx 真实输出格式」：
+> 用一个假 `nginx` 放在 `PATH` 上、输出官方格式的版本号，**不**给 `NGINX_VERSION`，
+> 走真实的自动探测路径，分别断言 1.24.0 被降级、1.25.1 被保留）。
 
 ### 8.2 F-2 · nginx 前置检查 + 失败回滚 —— 坏配置不会留在 `sites-enabled` 里
 
@@ -713,7 +714,7 @@ heikesong-platform 启动于 http://127.0.0.1:8080（规则版本 2026-10-20）
 | U-1 | **证书签发的完整流程未实跑** | 需要真实域名 + 公网 DNS。手册只把它当**前置条件**（`install.sh` 收 `CERT_PATH` / `KEY_PATH`），certbot 的命令按需自取（§9.6） |
 | U-2 | **Docker 形态未实跑** | 本 Task 环境无 Docker daemon。`deploy/docker-compose.yml` 的形态与注意事项写在 §2.4。⚠️ 它用的是 `network_mode: host` —— 那是 **Linux 宿主机的语义**；在 macOS / Windows 的 Docker Desktop 上容器拿的是 Linux 虚拟机的网络栈，宿主 `127.0.0.1:8080` 仍不通 |
 | U-3 | **`install.sh` 的完整执行未在真机实跑** | 需要 Linux + root + systemd + nginx。**沙箱实跑**已覆盖：fail-fast 三条（缺 nginx / TTL 非法 / Node 版本不足）、一次完整部署（所有落盘产物 + 自动降级 + 幂等重跑）、`nginx -t` 失败的两条回滚路径（见 §14 E9–E13） |
-| U-4 | **`nginx-http2-compat.sh` 的版本探测在真机上总是失败** | `detect_version()` 的 sed 匹配不到 nginx 的真实输出格式 `nginx version: nginx/1.24.0`（版本号前有 `nginx/` 前缀）⇒ 真机总是走保守降级。**后果安全**（降级语法在所有版本都合法），但「≥ 1.25.1 保留 `http2 on;`」只有显式 `NGINX_VERSION` 才走得到。**本 Task 不修**（`platform/` 不在本 Task 归属内）—— 建议上游按 §8.1 的一行修法处理 |
+| U-4 | ~~`nginx-http2-compat.sh` 的版本探测在真机上总是失败~~ **已修** | 原 `detect_version()` 的 sed 匹配不到 nginx 的真实输出格式 `nginx version: nginx/1.24.0`（版本号前带 `nginx/` 前缀）⇒ 真机总是走保守降级。**后果安全**（降级语法在所有版本都合法），但「≥ 1.25.1 保留 `http2 on;`」只有显式 `NGINX_VERSION` 才走得到。**已由父代理修复轮修掉**（2026-10-21）：解析式改为同时吃下带前缀/不带前缀两种形态，并补了走**真实自动探测路径**的回归用例（假 `nginx` 放 `PATH` 上）—— 见 §8.1 |
 | U-5 | **演示版构建 / 发布流程未实跑** | `scripts/build-demo.js` / `scripts/serve-demo.js` 是 **P6 Task 6** 的产物，**本 Task 时点尚未落地**。§8.5 写的是**目标流程**（接口以 P6 计划 Task 6 为准） |
 | U-6 | **多机 / Postgres 方案** | 超出本阶段范围。§0.2 与 §4 只把**边界**说清楚（多机必须换 Postgres，没有第三条路） |
 | U-7 | **计划代码块原样保留，未作改动** | 计划 Task 7 的 `docs/deployment.md` 代码块在本文件里**逐字连续**保留（§0–§7），补写内容全部落在 §8–§14。计划文档本身只**追加**了「Task 7 实施台账」一章 |
@@ -735,6 +736,7 @@ heikesong-platform 启动于 http://127.0.0.1:8080（规则版本 2026-10-20）
 | E6 | `node scripts/restore.js`（活 pid / pid 文件坏 / 成功） | 活 pid ⇒ 拒绝；pid 不可解析 ⇒ **保守判为在跑并拒绝**；成功 ⇒ 旧库留存 + **删旧 `-wal`/`-shm`** + 新库就位 |
 | E7 | `node src/server.js` + `curl -s http://127.0.0.1:8080/api/health` | `{"ok":true,"at":"..."}` |
 | E8 | `bash deploy/nginx-http2-compat.sh` × 4 个 `NGINX_VERSION` + 不探测 | 1.18.0 / 1.24.0 ⇒ 降级；1.25.1 / 2.0.0 ⇒ 保留 `http2 on;`；不探测 ⇒ 降级 |
+| E9 | 父代理修复轮：`test/deploy-assets.test.js` 的「自动探测必须认得 nginx 真实输出格式」（假 `nginx` 放 `PATH`、输出官方格式版本号、**不**给 `NGINX_VERSION`） | 1.24.0 ⇒ 被探测到并降级；1.25.1 ⇒ 被探测到并保留 `http2 on;`（这条钉住的正是原缺陷） |
 | E9 | 沙箱 `install.sh`：**缺 nginx** | 退出码 1，错误信息明确，**沙箱目录零改动** |
 | E10 | 沙箱 `install.sh`：`SESSION_TTL_DAYS=abc` / `SESSION_ABSOLUTE_TTL_DAYS=0` / `SESSION_TTL_DAYS=3.5` | 三次都退出码 1，**沙箱目录零改动** |
 | E11 | 沙箱 `install.sh`：完整部署（nginx 桩 = 1.24.0） | 退出码 0；环境文件含 `SESSION_ABSOLUTE_TTL_DAYS=30`；站点配置**自动降级**成 `listen 443 ssl http2;`；`alias .../web/assets/` 为**预留位** |
