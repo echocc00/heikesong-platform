@@ -32,6 +32,7 @@ import {
   submitEnterpriseConfirmation,
 } from '../../services/review.js';
 import { computeStage, getComputation } from '../../services/compute.js';
+import { reviewEvents } from '../sse.js';
 import { getStage, getStageJudge, listStageTeams } from '../../db/repo/stages.js';
 import { getTeamWithPackage } from '../../db/repo/teams.js';
 import { listActiveMembers } from '../../db/repo/teamMembers.js';
@@ -108,9 +109,11 @@ function assertJudgeDimensions(ctx, items) {
 export function registerReviewRoutes(router) {
   router.add('POST', '/api/stages/:stageId/reviews', async (ctx) => {
     requireStageCapability(ctx, 'score:write');
+    // ⚠️ 维度白名单**不能丢**（D-32）：评委只能给评委席维度打分，
+    //    否则评委能对 seat='self' 的维度打分 → 自评栏被评委占掉。
     const items = ctx.body?.items ?? [];
     assertJudgeDimensions(ctx, items);
-    return submitReviews({
+    const result = await submitReviews({
       db: ctx.db,
       stageId: ctx.params.stageId,
       judgeId: ctx.user.id,
@@ -118,6 +121,17 @@ export function registerReviewRoutes(router) {
       requestId: ctx.body?.requestId ?? null,
       now: new Date().toISOString(),
     });
+    // 评审进度推送：订阅同一赛段的评审端据此刷新进度条。
+    // ⚠️ 发布点在 **HTTP 层**（不是 service 层）：service 不该知道 HTTP 的存在。
+    // ⚠️ **载荷不含 judgeId**（D-37）：事件流里带「谁在什么时候提交了评分」，
+    //    等于把评委行踪广播给该赛段的每个订阅者。事件只作为**信号**，
+    //    客户端收到后重新拉 `review-state` —— 可见性由那一层按观众过滤。
+    reviewEvents.publish(
+      'review.progress',
+      { stageId: ctx.params.stageId, at: new Date().toISOString() },
+      `stage:${ctx.params.stageId}`,
+    );
+    return result;
   });
 
   router.add('GET', '/api/stages/:stageId/review-state', async (ctx) => {

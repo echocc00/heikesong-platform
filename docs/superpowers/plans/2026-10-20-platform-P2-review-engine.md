@@ -8004,6 +8004,7 @@ import {
   submitEnterpriseConfirmation,
 } from '../../services/review.js';
 import { computeStage, getComputation } from '../../services/compute.js';
+import { reviewEvents } from '../sse.js';
 import { getStage, getStageJudge, listStageTeams } from '../../db/repo/stages.js';
 import { getTeamWithPackage } from '../../db/repo/teams.js';
 import { listActiveMembers } from '../../db/repo/teamMembers.js';
@@ -8080,9 +8081,11 @@ function assertJudgeDimensions(ctx, items) {
 export function registerReviewRoutes(router) {
   router.add('POST', '/api/stages/:stageId/reviews', async (ctx) => {
     requireStageCapability(ctx, 'score:write');
+    // ⚠️ 维度白名单**不能丢**（D-32）：评委只能给评委席维度打分，
+    //    否则评委能对 seat='self' 的维度打分 → 自评栏被评委占掉。
     const items = ctx.body?.items ?? [];
     assertJudgeDimensions(ctx, items);
-    return submitReviews({
+    const result = await submitReviews({
       db: ctx.db,
       stageId: ctx.params.stageId,
       judgeId: ctx.user.id,
@@ -8090,6 +8093,17 @@ export function registerReviewRoutes(router) {
       requestId: ctx.body?.requestId ?? null,
       now: new Date().toISOString(),
     });
+    // 评审进度推送：订阅同一赛段的评审端据此刷新进度条。
+    // ⚠️ 发布点在 **HTTP 层**（不是 service 层）：service 不该知道 HTTP 的存在。
+    // ⚠️ **载荷不含 judgeId**（D-37）：事件流里带「谁在什么时候提交了评分」，
+    //    等于把评委行踪广播给该赛段的每个订阅者。事件只作为**信号**，
+    //    客户端收到后重新拉 `review-state` —— 可见性由那一层按观众过滤。
+    reviewEvents.publish(
+      'review.progress',
+      { stageId: ctx.params.stageId, at: new Date().toISOString() },
+      `stage:${ctx.params.stageId}`,
+    );
+    return result;
   });
 
   router.add('GET', '/api/stages/:stageId/review-state', async (ctx) => {
@@ -8511,6 +8525,14 @@ R02（签字人一致性）、V02/V04（服务端的名册边界）、N02（企�
 ```javascript
 // platform/test/sse.test.js — SSE 评审进度推送
 // 依据：P0 终态 web/api.js:28-30 承诺「SSE 端点在 P2 才实现（src/http/sse.js）」
+//   + 设计文档 §4.3 的目录清单 + INTERFACES.md §3（API（P2））
+//
+// ⚠️ 本轮（2026-10-21 父代理预审）追加的用例：
+//   ① **权限闸门**：规格只要求「登录」→ 任何登录用户都能订阅任意赛段，
+//      等于把「谁在什么时候提交了评分」广播给所有人。现在要求
+//      组委会 / score:read / 本赛段评委。
+//   ② **畸形百分号编码**不得让 parseSsePath 抛 URIError（P0 的教训）。
+//   ③ **心跳注释帧**存在（否则中间代理 60s 掐线，前端每分钟重连）。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
@@ -8523,12 +8545,20 @@ import { applyMigrations } from '../src/db/migrate.js';
 import { loadRules } from '../src/config.js';
 import { createApp } from '../src/server.js';
 import { createUser } from '../src/db/repo/users.js';
+import { createEdition } from '../src/db/repo/editions.js';
+import { insertStage, assignStageJudge } from '../src/db/repo/stages.js';
+import { insertTeam } from '../src/db/repo/teams.js';
+import { insertCapability } from '../src/db/repo/capabilities.js';
+import { grantAssignment } from '../src/auth/permissions.js';
 import { createSession } from '../src/auth/session.js';
-import { parseSsePath, sendSseEvent, createSseHub, reviewEvents } from '../src/http/sse.js';
+import {
+  parseSsePath, sendSseEvent, sendSseComment, createSseHub, reviewEvents,
+} from '../src/http/sse.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrationsDir = join(here, '..', 'db', 'migrations');
 const rulesDir = join(here, '..', 'rules');
+const NOW = '2026-10-20T12:00:00.000Z';
 
 function setup() {
   const dataDir = mkdtempSync(join(tmpdir(), 'hks-sse-'));
@@ -8538,7 +8568,30 @@ function setup() {
   const webDir = mkdtempSync(join(tmpdir(), 'hks-sse-web-'));
   writeFileSync(join(webDir, 'index.html'), '<h1>home</h1>');
   const app = createApp({ db, rules, webDir });
-  return { db, close, dataDir, webDir, app };
+
+  const edition = createEdition(db, {
+    name: '首届', city: '上海', startsAt: '2026-10-01', endsAt: '2026-10-31', now: NOW,
+  });
+  const judge = createUser(db, { name: '评委甲', phone: '13800000901', password: 'pw123' });
+  const outsider = createUser(db, { name: '路人甲', phone: '13800000902', password: 'pw123' });
+  const stage = insertStage(db, {
+    editionId: edition.id, key: 's1', name: '初赛', kind: 'initial',
+    startsAt: '2026-10-01', endsAt: '2026-10-10', scoringConfigKey: 'initial', status: 'open', now: NOW,
+  });
+  assignStageJudge(db, { stageId: stage.id, userId: judge.id, seat: 'judge', now: NOW });
+
+  return {
+    db, close, dataDir, webDir, app, stage, judge, outsider,
+    tokenJudge: createSession(db, judge.id).token,
+    tokenOutsider: createSession(db, outsider.id).token,
+  };
+}
+
+function cleanup(ctx) {
+  reviewEvents.closeAll();
+  rmSync(ctx.dataDir, { recursive: true, force: true });
+  rmSync(ctx.webDir, { recursive: true, force: true });
+  ctx.close();
 }
 
 /** 假响应：只记录 writeHead / write / end（测帧格式用，不必起真服务器）。 */
@@ -8556,11 +8609,79 @@ function fakeRes() {
   };
 }
 
+/**
+ * 开一条 SSE 连接，返回一个小工具对象。
+ * ⚠️ 错误必须吞掉：客户端主动 destroy 时 res 会抛 ECONNRESET，
+ *    不接 error 处理器会变成 unhandled → 整个测试文件崩掉。
+ */
+function openSse(port, path, token) {
+  const chunks = [];
+  let status = null;
+  let headers = null;
+  let reqRef = null;
+  const ready = new Promise((resolve, reject) => {
+    reqRef = http.get(
+      {
+        host: '127.0.0.1', port, path,
+        headers: token ? { cookie: `hk_session=${token}` } : {},
+      },
+      (res) => {
+        status = res.statusCode;
+        headers = res.headers;
+        res.on('data', (c) => chunks.push(c.toString()));
+        res.on('error', () => {});
+        resolve();
+      },
+    );
+    // ⚠️ 连接出错时**必须 reject**：只吞掉错误的话，`ready` 永远不 settle
+    //    → 等待它的用例**永久挂起**（而不是干净地失败）。
+    reqRef.on('error', (e) => reject(e));
+  });
+  return {
+    ready,
+    get status() { return status; },
+    get headers() { return headers; },
+    text: () => chunks.join(''),
+    waitForEvent(name, timeoutMs = 3000) {
+      const deadline = Date.now() + timeoutMs;
+      return new Promise((resolve, reject) => {
+        const tick = () => {
+          const t = chunks.join('');
+          if (t.includes(`event: ${name}`)) return resolve(t);
+          if (Date.now() > deadline) return reject(new Error(`等待事件 ${name} 超时`));
+          setTimeout(tick, 20);
+        };
+        tick();
+      });
+    },
+    close() { try { reqRef?.destroy(); } catch { /* ignore */ } },
+  };
+}
+
+/** 轮询等待某个条件成立（用于「客户端断开后订阅者被摘掉」这类异步收尾）。 */
+async function waitUntil(fn, timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (fn()) return true;
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  return fn();
+}
+
 test('parseSsePath 能解析 /api/stages/:stageId/events，非 SSE 路径返回 null', () => {
   assert.deepEqual(parseSsePath('/api/stages/st-1/events'), { stageId: 'st-1' });
   assert.deepEqual(parseSsePath('/api/stages/st-1/events?x=1'), { stageId: 'st-1' });
   assert.equal(parseSsePath('/api/stages/st-1/reviews'), null);
   assert.equal(parseSsePath('/api/health'), null);
+  // ⛔ 路径必须在 `events` **之后**就结束（或紧跟一个 `?`）：
+  //    `/eventsX` 不是 SSE 路径 —— 否则后缀匹配会误开一条流。
+  assert.equal(parseSsePath('/api/stages/st-1/eventsX'), null);
+  assert.equal(parseSsePath('/api/stages/st-1/events/'), null);
+});
+
+test('⛔ 畸形百分号编码不得让 parseSsePath 抛错（P0 的教训）', () => {
+  assert.equal(parseSsePath('/api/stages/%E0%A4%A/events'), null);
+  assert.equal(parseSsePath('/api/stages/%/events'), null);
 });
 
 test('sendSseEvent 写出的帧符合 SSE 规范：event + 单行 data + 空行结尾', () => {
@@ -8573,6 +8694,25 @@ test('sendSseEvent 对已结束的响应静默返回 false（客户端已断开�
   const res = fakeRes();
   res.end();
   assert.equal(sendSseEvent(res, 'x', {}), false);
+  assert.equal(res.text(), '');
+});
+
+test('sendSseEvent 的载荷在数据缺省时必须是 null（不能写出 undefined）', () => {
+  const res = fakeRes();
+  assert.equal(sendSseEvent(res, 'x'), true);
+  assert.equal(res.text(), 'event: x\ndata: null\n\n');
+});
+
+test('sendSseComment 写的是注释帧（心跳），EventSource 会忽略它', () => {
+  const res = fakeRes();
+  assert.equal(sendSseComment(res, 'ping'), true);
+  assert.equal(res.text(), ': ping\n\n');
+});
+
+test('sendSseComment 对已结束的响应静默返回 false', () => {
+  const res = fakeRes();
+  res.end();
+  assert.equal(sendSseComment(res, 'ping'), false);
   assert.equal(res.text(), '');
 });
 
@@ -8599,38 +8739,446 @@ test('createSseHub 的 closeAll 会结束所有订阅连接并清空订阅者', 
 });
 
 test('GET /api/stages/:stageId/events 建立 SSE 连接并先发 connected 首帧', async () => {
-  const { db, close, dataDir, webDir, app } = setup();
-  const user = createUser(db, { name: '甲', phone: '13800000901', password: 'pw123' });
-  const { token } = createSession(db, user.id);
-  const server = http.createServer(app.handle);
+  const ctx = setup();
+  const server = http.createServer(ctx.app.handle);
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const { port } = server.address();
   try {
+    // ⚠️ 断言必须放在 promise **之外**：断言写在 http 回调里抛错时，
+    //    promise 既不 resolve 也不 reject → 用例**永远挂起**（而不是干净地失败）。
+    //    这会让变异检出信号从「断言失败」退化成「测试挂住」，很难区分。
     const frame = await new Promise((resolve, reject) => {
+      // ⚠️ 用**墙钟定时器**而不是 req.setTimeout：后者是 socket 超时，
+      //    响应一旦结束就被清掉 → 承诺永不 settle → 用例挂起而不是失败。
+      const guard = setTimeout(() => reject(new Error('SSE 首帧超时')), 3000);
+      const done = (v) => { clearTimeout(guard); resolve(v); };
+      const fail = (e) => { clearTimeout(guard); reject(e); };
       const req = http.get(
-        { host: '127.0.0.1', port, path: '/api/stages/st-1/events', headers: { cookie: `hk_session=${token}` } },
+        {
+          host: '127.0.0.1',
+          port,
+          path: `/api/stages/${ctx.stage.id}/events`,
+          headers: { cookie: `hk_session=${ctx.tokenJudge}` },
+        },
         (res) => {
-          assert.equal(res.statusCode, 200);
-          assert.match(String(res.headers['content-type']), /text\/event-stream/);
           let buf = '';
           res.on('data', (c) => {
             buf += c.toString();
-            if (buf.includes('\n\n')) resolve(buf);
+            if (buf.includes('\n\n')) done({ buf, status: res.statusCode, headers: res.headers });
           });
-          res.on('error', reject);
+          res.on('end', () => done({ buf, status: res.statusCode, headers: res.headers }));
+          res.on('error', fail);
+        },
+      );
+      req.on('error', fail);
+    });
+    assert.equal(frame.status, 200);
+    assert.match(String(frame.headers['content-type']), /text\/event-stream/);
+    assert.match(frame.buf, /^event: connected\n/);
+    assert.match(frame.buf, new RegExp(`"stageId":"${ctx.stage.id}"`));
+  } finally {
+    // ⛔ 必须先强制关掉所有连接再 close：SSE 是**长连接**，
+    //    只 server.close() 的话 —— 活跃的 SSE 响应会一直占着 socket，
+    //    测试进程**永不退出**（node --test 会一直等），CI 上直接挂死。
+    server.closeAllConnections?.();
+    server.close();
+    cleanup(ctx);
+  }
+});
+
+test('⛔ 未登录订阅 SSE → 401', async () => {
+  const ctx = setup();
+  const server = http.createServer(ctx.app.handle);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address();
+  try {
+    const status = await new Promise((resolve, reject) => {
+      const req = http.get(
+        { host: '127.0.0.1', port, path: `/api/stages/${ctx.stage.id}/events` },
+        (res) => {
+          res.resume();
+          resolve(res.statusCode);
         },
       );
       req.on('error', reject);
-      req.setTimeout(3000, () => reject(new Error('SSE 首帧超时')));
+      req.setTimeout(3000, () => reject(new Error('超时')));
     });
-    assert.match(frame, /^event: connected\n/);
-    assert.match(frame, /"stageId":"st-1"/);
+    assert.equal(status, 401);
   } finally {
-    reviewEvents.closeAll();
+    // ⛔ 必须先强制关掉所有连接再 close：SSE 是**长连接**，
+    //    只 server.close() 的话 —— 活跃的 SSE 响应会一直占着 socket，
+    //    测试进程**永不退出**（node --test 会一直等），CI 上直接挂死。
+    server.closeAllConnections?.();
     server.close();
-    close();
-    rmSync(dataDir, { recursive: true, force: true });
-    rmSync(webDir, { recursive: true, force: true });
+    cleanup(ctx);
+  }
+});
+
+test('⛔ 无权限的人订阅 SSE → 403（登录不等于有权看评审进度）', async () => {
+  const ctx = setup();
+  const server = http.createServer(ctx.app.handle);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address();
+  try {
+    const status = await new Promise((resolve, reject) => {
+      const req = http.get(
+        {
+          host: '127.0.0.1',
+          port,
+          path: `/api/stages/${ctx.stage.id}/events`,
+          headers: { cookie: `hk_session=${ctx.tokenOutsider}` },
+        },
+        (res) => {
+          res.resume();
+          resolve(res.statusCode);
+        },
+      );
+      req.on('error', reject);
+      req.setTimeout(3000, () => reject(new Error('超时')));
+    });
+    assert.equal(status, 403);
+  } finally {
+    // ⛔ 必须先强制关掉所有连接再 close：SSE 是**长连接**，
+    //    只 server.close() 的话 —— 活跃的 SSE 响应会一直占着 socket，
+    //    测试进程**永不退出**（node --test 会一直等），CI 上直接挂死。
+    server.closeAllConnections?.();
+    server.close();
+    cleanup(ctx);
+  }
+});
+
+test('⛔ 权限闸门的 5 条放行路径都真的放行（score:read 赛段/全局、stage:compute 赛段/全局、本赛段评委）', async () => {
+  const ctx = setup();
+  insertCapability(ctx.db, 'score:read', '读取评分');
+  insertCapability(ctx.db, 'stage:compute', '发榜');
+  const users = {};
+  const scopes = [
+    ['u1', 'score:read', 'stage'],
+    ['u2', 'score:read', 'global'],
+    ['u3', 'stage:compute', 'stage'],
+    ['u4', 'stage:compute', 'global'],
+  ];
+  let phone = 13800001000;
+  for (const [name, capability, scopeType] of scopes) {
+    const u = createUser(ctx.db, { name, phone: String(phone++), password: 'pw123' });
+    grantAssignment(ctx.db, {
+      userId: u.id, capability, scopeType, scopeId: scopeType === 'stage' ? ctx.stage.id : null, grantedBy: null,
+    });
+    users[name] = { id: u.id, token: createSession(ctx.db, u.id).token, desc: `${capability}@${scopeType}` };
+  }
+
+  const server = http.createServer(ctx.app.handle);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address();
+  try {
+    for (const [name, u] of Object.entries(users)) {
+      const sse = openSse(port, `/api/stages/${ctx.stage.id}/events`, u.token);
+      await sse.ready;
+      assert.equal(sse.status, 200, `${name}（${u.desc}）应被放行`);
+      sse.close();
+    }
+  } finally {
+    // ⛔ 必须先强制关掉所有连接再 close：SSE 是**长连接**，
+    //    只 server.close() 的话 —— 活跃的 SSE 响应会一直占着 socket，
+    //    测试进程**永不退出**（node --test 会一直等），CI 上直接挂死。
+    server.closeAllConnections?.();
+    server.close();
+    cleanup(ctx);
+  }
+});
+
+test('⛔ 端到端：评委提交评分 → 同赛段的 SSE 订阅者收到 review.progress（载荷不含评委身份）', async () => {
+  const ctx = setup();
+  // 评分需要：score:write 能力点 + 一支在本赛段名册内的队伍
+  insertCapability(ctx.db, 'score:write', '写入评分');
+  grantAssignment(ctx.db, {
+    userId: ctx.judge.id, capability: 'score:write', scopeType: 'global', scopeId: null, grantedBy: null,
+  });
+  const captain = createUser(ctx.db, { name: '队长', phone: '13800000903', password: 'pw123' });
+  const team = insertTeam(ctx.db, {
+    editionId: ctx.stage.edition_id, name: '一队', captainId: captain.id, status: 'active', now: NOW,
+  });
+
+  const server = http.createServer(ctx.app.handle);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address();
+  const post = (body) => new Promise((resolve, reject) => {
+    const payload = JSON.stringify(body);
+    const req = http.request(
+      {
+        host: '127.0.0.1', port, method: 'POST', path: `/api/stages/${ctx.stage.id}/reviews`,
+        headers: { cookie: `hk_session=${ctx.tokenJudge}`, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+      },
+      (res) => {
+        let buf = '';
+        res.on('data', (c) => { buf += c.toString(); });
+        res.on('end', () => resolve({ status: res.statusCode, body: buf }));
+      },
+    );
+    req.on('error', reject);
+    req.setTimeout(3000, () => reject(new Error('提交超时')));
+    req.end(payload);
+  });
+
+  try {
+    // 先建立 SSE 连接，拿到首帧后再提交评分
+    // ⚠️ 提交结果**不能**在 setTimeout 回调里断言：那里抛错 = unhandled rejection，
+    //    既不会让用例失败、也不会让 promise settle → 用例挂起。改成把结果交给主流程断言。
+    let settlePost;
+    const posted = new Promise((resolve) => { settlePost = resolve; });
+    const frames = await new Promise((resolve, reject) => {
+      const chunks = [];
+      // ⚠️ 墙钟定时器 + 「响应结束即失败」双保险：
+      //    只靠 req.setTimeout 的话，错误响应一结束 socket 超时就被清掉 → 挂起。
+      const guard = setTimeout(() => reject(new Error('SSE 未收到进度事件')), 5000);
+      const done = (v) => { clearTimeout(guard); resolve(v); };
+      const fail = (e) => { clearTimeout(guard); reject(e); };
+      const req = http.get(
+        {
+          host: '127.0.0.1', port, path: `/api/stages/${ctx.stage.id}/events`,
+          headers: { cookie: `hk_session=${ctx.tokenJudge}` },
+        },
+        (res) => {
+          res.on('data', (c) => {
+            chunks.push(c.toString());
+            const text = chunks.join('');
+            if (text.includes('event: review.progress')) done(text);
+          });
+          // 响应结束却没等到进度事件 → 失败（错误响应就是这种：403 / 404 的 JSON 体）
+          res.on('end', () => fail(new Error(`SSE 响应已结束但未收到进度事件（status=${res.statusCode}）`)));
+          res.on('error', fail);
+        },
+      );
+      req.on('error', fail);
+      // 连接建好后稍等一下再提交，确保订阅已登记
+      setTimeout(() => {
+        post({ items: [{ teamId: team.id, dimension: 'innovation', rawScore: 80 }] })
+          .then(settlePost, (e) => fail(e));
+      }, 150);
+    });
+    const r = await posted;
+    assert.equal(r.status, 200, `评分提交失败：${r.body}`);
+    assert.match(frames, /event: review\.progress/);
+    assert.ok(!frames.includes('judgeId'), '载荷不得带评委身份（可见性由 API 层过滤）');
+    // 载荷形状必须钉死：stageId 指向赛段、at 是时间戳字符串、**没有** judgeId
+    const lines = frames.split('\n');
+    const idx = lines.findIndex((l) => l === 'event: review.progress');
+    assert.ok(idx >= 0, '未找到 review.progress 帧');
+    const dataLine = lines[idx + 1];
+    assert.ok(dataLine.startsWith('data: '), `帧格式不对：${dataLine}`);
+    const payload = JSON.parse(dataLine.slice('data: '.length));
+    assert.equal(payload.stageId, ctx.stage.id);
+    assert.equal(typeof payload.at, 'string');
+    assert.ok(!('judgeId' in payload));
+  } finally {
+    // ⛔ 必须先强制关掉所有连接再 close：SSE 是**长连接**，
+    //    只 server.close() 的话 —— 活跃的 SSE 响应会一直占着 socket，
+    //    测试进程**永不退出**（node --test 会一直等），CI 上直接挂死。
+    server.closeAllConnections?.();
+    server.close();
+    cleanup(ctx);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 父代理变异检验追加的用例（2026-10-21）
+//   —— 这些行为在实现里是对的，但**没有用例钉住** → 变异体会存活。
+//      先补用例再跑变异，是「先跑后派」纪律的体现。
+// ═══════════════════════════════════════════════════════════════════════════
+
+test('parseSsePath 必须解码百分号编码的 stageId', () => {
+  assert.deepEqual(parseSsePath('/api/stages/a%20b/events'), { stageId: 'a b' });
+  assert.deepEqual(parseSsePath('/api/stages/%E5%8F%82%E8%B5%9B/events'), { stageId: '参赛' });
+});
+
+test('⛔ SSE 响应头必须带 X-Accel-Buffering: no（否则 nginx 缓冲 → 看起来「不推送」）', async () => {
+  const ctx = setup();
+  const server = http.createServer(ctx.app.handle);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address();
+  const sse = openSse(port, `/api/stages/${ctx.stage.id}/events`, ctx.tokenJudge);
+  try {
+    await sse.ready;
+    assert.equal(sse.status, 200);
+    assert.match(String(sse.headers['content-type']), /text\/event-stream/);
+    assert.match(String(sse.headers['cache-control']), /no-cache/);
+    assert.equal(sse.headers['x-accel-buffering'], 'no');
+  } finally {
+    sse.close();
+    // ⛔ 必须先强制关掉所有连接再 close：SSE 是**长连接**，
+    //    只 server.close() 的话 —— 活跃的 SSE 响应会一直占着 socket，
+    //    测试进程**永不退出**（node --test 会一直等），CI 上直接挂死。
+    server.closeAllConnections?.();
+    server.close();
+    cleanup(ctx);
+  }
+});
+
+test('⛔ 非 GET 方法不得开 SSE（方法闸门）→ 404', async () => {
+  const ctx = setup();
+  const server = http.createServer(ctx.app.handle);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address();
+  try {
+    const status = await new Promise((resolve, reject) => {
+      const req = http.request(
+        {
+          host: '127.0.0.1', port, method: 'POST', path: `/api/stages/${ctx.stage.id}/events`,
+          headers: { cookie: `hk_session=${ctx.tokenJudge}` },
+        },
+        (res) => { res.resume(); resolve(res.statusCode); },
+      );
+      req.on('error', reject);
+      req.setTimeout(3000, () => reject(new Error('超时')));
+      req.end();
+    });
+    assert.equal(status, 404);
+  } finally {
+    // ⛔ 必须先强制关掉所有连接再 close：SSE 是**长连接**，
+    //    只 server.close() 的话 —— 活跃的 SSE 响应会一直占着 socket，
+    //    测试进程**永不退出**（node --test 会一直等），CI 上直接挂死。
+    server.closeAllConnections?.();
+    server.close();
+    cleanup(ctx);
+  }
+});
+
+test('⛔ 客户端断开后订阅者必须被摘掉（否则连接泄漏，进程内存单调增长）', async () => {
+  const ctx = setup();
+  const server = http.createServer(ctx.app.handle);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address();
+  const sse = openSse(port, `/api/stages/${ctx.stage.id}/events`, ctx.tokenJudge);
+  try {
+    await sse.ready;
+    await sse.waitForEvent('connected');
+    assert.ok(reviewEvents.size >= 1, '订阅后应登记到事件中心');
+    sse.close();
+    const ok = await waitUntil(() => reviewEvents.size === 0);
+    assert.equal(ok, true, `断开后仍有 ${reviewEvents.size} 个订阅者未摘除`);
+  } finally {
+    sse.close();
+    // ⛔ 必须先强制关掉所有连接再 close：SSE 是**长连接**，
+    //    只 server.close() 的话 —— 活跃的 SSE 响应会一直占着 socket，
+    //    测试进程**永不退出**（node --test 会一直等），CI 上直接挂死。
+    server.closeAllConnections?.();
+    server.close();
+    cleanup(ctx);
+  }
+});
+
+test('⛔ 跨赛段串台：赛段 B 的订阅者不得收到赛段 A 的进度事件', async () => {
+  const ctx = setup();
+  // 第二个赛段：同一评委也在里面 → 对 B 也有订阅权限
+  const stage2 = insertStage(ctx.db, {
+    editionId: ctx.stage.edition_id, key: 's2', name: '复赛', kind: 'final',
+    startsAt: '2026-10-11', endsAt: '2026-10-20', scoringConfigKey: 'final', status: 'open', now: NOW,
+  });
+  assignStageJudge(ctx.db, { stageId: stage2.id, userId: ctx.judge.id, seat: 'judge', now: NOW });
+  insertCapability(ctx.db, 'score:write', '写入评分');
+  grantAssignment(ctx.db, {
+    userId: ctx.judge.id, capability: 'score:write', scopeType: 'global', scopeId: null, grantedBy: null,
+  });
+  const captain = createUser(ctx.db, { name: '队长二', phone: '13800000904', password: 'pw123' });
+  const team = insertTeam(ctx.db, {
+    editionId: ctx.stage.edition_id, name: '二队', captainId: captain.id, status: 'active', now: NOW,
+  });
+
+  const server = http.createServer(ctx.app.handle);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address();
+  const a = openSse(port, `/api/stages/${ctx.stage.id}/events`, ctx.tokenJudge);
+  const b = openSse(port, `/api/stages/${stage2.id}/events`, ctx.tokenJudge);
+  try {
+    await a.ready;
+    await b.ready;
+    await a.waitForEvent('connected');
+    await b.waitForEvent('connected');
+    const payload = JSON.stringify({ items: [{ teamId: team.id, dimension: 'innovation', rawScore: 80 }] });
+    const r = await new Promise((resolve, reject) => {
+      const req = http.request(
+        {
+          host: '127.0.0.1', port, method: 'POST', path: `/api/stages/${ctx.stage.id}/reviews`,
+          headers: { cookie: `hk_session=${ctx.tokenJudge}`, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+        },
+        (res) => {
+          let buf = '';
+          res.on('data', (c) => { buf += c.toString(); });
+          res.on('end', () => resolve({ status: res.statusCode, body: buf }));
+        },
+      );
+      req.on('error', reject);
+      req.setTimeout(3000, () => reject(new Error('提交超时')));
+      req.end(payload);
+    });
+    assert.equal(r.status, 200, `评分提交失败：${r.body}`);
+    await a.waitForEvent('review.progress');
+    await new Promise((x) => setTimeout(x, 300));
+    assert.ok(
+      !b.text().includes('event: review.progress'),
+      '赛段 B 的订阅者不得收到赛段 A 的进度事件（跨赛段串台）',
+    );
+  } finally {
+    a.close();
+    b.close();
+    // ⛔ 必须先强制关掉所有连接再 close：SSE 是**长连接**，
+    //    只 server.close() 的话 —— 活跃的 SSE 响应会一直占着 socket，
+    //    测试进程**永不退出**（node --test 会一直等），CI 上直接挂死。
+    server.closeAllConnections?.();
+    server.close();
+    cleanup(ctx);
+  }
+});
+
+test('⛔ 提交失败（分数越界）不得推送进度事件', async () => {
+  const ctx = setup();
+  insertCapability(ctx.db, 'score:write', '写入评分');
+  grantAssignment(ctx.db, {
+    userId: ctx.judge.id, capability: 'score:write', scopeType: 'global', scopeId: null, grantedBy: null,
+  });
+  const captain = createUser(ctx.db, { name: '队长三', phone: '13800000905', password: 'pw123' });
+  const team = insertTeam(ctx.db, {
+    editionId: ctx.stage.edition_id, name: '三队', captainId: captain.id, status: 'active', now: NOW,
+  });
+
+  const server = http.createServer(ctx.app.handle);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address();
+  const sse = openSse(port, `/api/stages/${ctx.stage.id}/events`, ctx.tokenJudge);
+  try {
+    await sse.ready;
+    await sse.waitForEvent('connected');
+    const payload = JSON.stringify({ items: [{ teamId: team.id, dimension: 'innovation', rawScore: 150 }] });
+    const r = await new Promise((resolve, reject) => {
+      const req = http.request(
+        {
+          host: '127.0.0.1', port, method: 'POST', path: `/api/stages/${ctx.stage.id}/reviews`,
+          headers: { cookie: `hk_session=${ctx.tokenJudge}`, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+        },
+        (res) => {
+          let buf = '';
+          res.on('data', (c) => { buf += c.toString(); });
+          res.on('end', () => resolve({ status: res.statusCode, body: buf }));
+        },
+      );
+      req.on('error', reject);
+      req.setTimeout(3000, () => reject(new Error('提交超时')));
+      req.end(payload);
+    });
+    assert.equal(r.status, 400, `越界分数应被拒绝：${r.body}`);
+    await new Promise((x) => setTimeout(x, 400));
+    assert.ok(
+      !sse.text().includes('event: review.progress'),
+      '失败提交不得触发进度推送（事件只是「有进展」的信号，不该撒谎）',
+    );
+  } finally {
+    sse.close();
+    // ⛔ 必须先强制关掉所有连接再 close：SSE 是**长连接**，
+    //    只 server.close() 的话 —— 活跃的 SSE 响应会一直占着 socket，
+    //    测试进程**永不退出**（node --test 会一直等），CI 上直接挂死。
+    server.closeAllConnections?.();
+    server.close();
+    cleanup(ctx);
   }
 });
 ```
@@ -8655,6 +9203,15 @@ Expected: FAIL —— `Cannot find module '../src/http/sse.js'`
 // ⛔ 帧格式（SSE 规范）：`event: <name>\ndata: <单行 JSON>\n\n`
 //    data 里不能有裸换行（会截断帧）→ 一律 JSON.stringify。
 // ⛔ 不能用 json() / text() 写响应头 —— 那会把 Content-Type 定死成 application/json。
+//
+// 【父代理预审修正 2026-10-21 —— 本文件有 2 处修正】
+//   ① **畸形百分号编码会让 parseSsePath 抛 URIError** ——
+//      P0 的教训（「畸形 URL 编码不能让进程退出」）在这里同样成立：
+//      `/api/stages/%E0%A4%A/events` 会让 decodeURIComponent 抛错。
+//      现在解析失败**返回 null** → 走正常的路由/400 分支，绝不逸出到 server.js 之外。
+//   ② **没有心跳帧**：SSE 连接长时间空闲时，中间的 nginx（proxy_read_timeout 默认 60s）
+//      会把连接掐掉 —— 现象是「前端每隔一分钟重连一次」。现在提供 `sendSseComment()`
+//      注释帧（`: ping\n\n`），由 server.js 用 `unref()` 的定时器定期发。
 
 export const SSE_HEADERS = {
   'Content-Type': 'text/event-stream; charset=utf-8',
@@ -8668,7 +9225,12 @@ export const SSE_HEADERS = {
 export function parseSsePath(url) {
   const m = /^\/api\/stages\/([^/?#]+)\/events(?:\?|$)/.exec(String(url || ''));
   if (!m) return null;
-  return { stageId: decodeURIComponent(m[1]) };
+  try {
+    return { stageId: decodeURIComponent(m[1]) };
+  } catch {
+    // 畸形百分号编码：不是合法路径 → 交给上层按「非法 URL」处理（父代理预审修正 ①）
+    return null;
+  }
 }
 
 /** 写 SSE 响应头并保持连接。 */
@@ -8683,6 +9245,16 @@ export function sendSseEvent(res, event, data) {
   if (!res || res.writableEnded) return false;
   const payload = JSON.stringify(data ?? null);
   res.write(`event: ${event}\ndata: ${payload}\n\n`);
+  return true;
+}
+
+/**
+ * 写一条 SSE **注释帧**（心跳）。
+ * 注释帧以 `:` 开头，EventSource 会忽略它 —— 用途是让中间代理知道连接还活着。
+ */
+export function sendSseComment(res, text = 'ping') {
+  if (!res || res.writableEnded) return false;
+  res.write(`: ${text}\n\n`);
   return true;
 }
 
@@ -8737,7 +9309,8 @@ export const reviewEvents = createSseHub();
 在 `import` 区加入：
 
 ```javascript
-import { parseSsePath, openSseStream, sendSseEvent, reviewEvents } from './http/sse.js';
+import { parseSsePath, openSseStream, sendSseEvent, sendSseComment, reviewEvents } from './http/sse.js';
+import { getStage, getStageJudge } from './db/repo/stages.js';
 ```
 
 在 `handleRequest()` 里、`if (url.startsWith('/api/')) {` 的 **try 块内、`const match = router.match(req.method, url);` 之前**插入：
@@ -8759,11 +9332,34 @@ import { parseSsePath, openSseStream, sendSseEvent, reviewEvents } from './http/
             error(res, 401, 'UNAUTHENTICATED', '未登录');
             return;
           }
+          // ⛔ 权限闸门（父代理预审修正）：**登录还不够**。
+          //    进度事件流会暴露「谁在什么时候提交了评分」——
+          //    任何登录用户都能订阅任意赛段 = 评委行踪可被任意账号看到。
+          //    与 review-state 同一套口径：组委会 / 有 score:read 的人 / 本赛段评委。
+          const sseStage = getStage(db, ssePath.stageId);
+          const sseIsJudge = sseStage
+            ? getStageJudge(db, ssePath.stageId, sseUser.id) != null
+            : false;
+          const sseAllowed = can(sseUser, 'score:read', { scopeType: 'stage', scopeId: ssePath.stageId }, db)
+            || can(sseUser, 'score:read', { scopeType: 'global' }, db)
+            || can(sseUser, 'stage:compute', { scopeType: 'stage', scopeId: ssePath.stageId }, db)
+            || can(sseUser, 'stage:compute', { scopeType: 'global' }, db)
+            || sseIsJudge;
+          if (!sseAllowed) {
+            error(res, 403, 'FORBIDDEN', '没有订阅评审进度的权限');
+            return;
+          }
           openSseStream(res);
           const topic = `stage:${ssePath.stageId}`;
           reviewEvents.add(res, topic);
           // ⛔ 客户端断开时必须摘掉订阅者 —— 否则连接泄漏，进程内存单调增长。
-          res.on('close', () => reviewEvents.remove(res));
+          //    同一处把心跳定时器也清掉（否则定时器会一直跑）。
+          const heartbeat = setInterval(() => sendSseComment(res, 'ping'), 25000);
+          if (typeof heartbeat.unref === 'function') heartbeat.unref();
+          res.on('close', () => {
+            clearInterval(heartbeat);
+            reviewEvents.remove(res);
+          });
           // 首帧必须给：EventSource 的 onopen 拿不到业务数据，客户端靠它确认订阅成功。
           sendSseEvent(res, 'connected', { stageId: ssePath.stageId, at: new Date().toISOString() });
           return;
@@ -8783,7 +9379,7 @@ import { reviewEvents } from '../sse.js';
 ```javascript
   router.add('POST', '/api/stages/:stageId/reviews', async (ctx) => {
     requireStageCapability(ctx, 'score:write');
-    // ⚠️ 维度白名单**不能丢**（Task 8 的 D-32）：评委只能给评委席维度打分，
+    // ⚠️ 维度白名单**不能丢**（D-32）：评委只能给评委席维度打分，
     //    否则评委能对 seat='self' 的维度打分 → 自评栏被评委占掉。
     const items = ctx.body?.items ?? [];
     assertJudgeDimensions(ctx, items);
@@ -8797,9 +9393,12 @@ import { reviewEvents } from '../sse.js';
     });
     // 评审进度推送：订阅同一赛段的评审端据此刷新进度条。
     // ⚠️ 发布点在 **HTTP 层**（不是 service 层）：service 不该知道 HTTP 的存在。
+    // ⚠️ **载荷不含 judgeId**（D-37）：事件流里带「谁在什么时候提交了评分」，
+    //    等于把评委行踪广播给该赛段的每个订阅者。事件只作为**信号**，
+    //    客户端收到后重新拉 `review-state` —— 可见性由那一层按观众过滤。
     reviewEvents.publish(
       'review.progress',
-      { stageId: ctx.params.stageId, judgeId: ctx.user.id, at: new Date().toISOString() },
+      { stageId: ctx.params.stageId, at: new Date().toISOString() },
       `stage:${ctx.params.stageId}`,
     );
     return result;
@@ -8809,12 +9408,12 @@ import { reviewEvents } from '../sse.js';
 - [ ] **Step 6: 运行测试确认通过**
 
 Run: `cd platform && node --test test/sse.test.js`
-Expected: PASS（6 个测试全过：sse.test.js 6）
+Expected: PASS（**20 个测试全过**：sse.test.js 20 —— 规格自带 11 + 变异检验补测 9）
 
 - [ ] **Step 7: 全量测试**
 
 Run: `cd platform && node --test`
-Expected: 全部通过
+Expected: 全部通过（P2 全量 **537/537**）
 
 - [ ] **Step 8: 提交**
 
@@ -8822,6 +9421,9 @@ Expected: 全部通过
 cd platform && git add src/http/sse.js src/server.js src/http/routes/review.js test/sse.test.js
 git commit -m "feat(P2): SSE 评审进度推送（src/http/sse.js + GET /api/stages/:stageId/events）"
 ```
+
+> ⚠️ 计划文件本身也在本次提交范围内（仓库根的 `docs/superpowers/plans/…`）——
+> 「计划是规格」意味着**计划与实现必须同一次提交落盘**，否则规格与代码会分叉。
 
 > **【2026-10-21 漂移审计修正 I-6】**
 > **原来错在哪**：P0 终态 `platform/web/api.js:28-30` 的 `subscribe()` 明写「⚠️ SSE 端点在 **P2**
@@ -8831,7 +9433,7 @@ git commit -m "feat(P2): SSE 评审进度推送（src/http/sse.js + GET /api/sta
 > **为什么错**：设计文档 §4.3 的目录清单里 `http/` 下确实列了 `sse.js`，P0 又在代码注释里
 > 把这条债正式立给了 P2 —— 五份计划无人认领，等于这条债永远悬着。
 > **改成什么**：在 P2 增设 **Task 9**（`src/http/sse.js` + 端点 `GET /api/stages/:stageId/events`
-> + `src/server.js` 的独立 SSE 分支 + `src/http/routes/review.js` 的进度事件发布 + 6 条用例）。
+> + `src/server.js` 的独立 SSE 分支 + `src/http/routes/review.js` 的进度事件发布 + **20 条用例**）。
 > 审计报告给的第 ② 条路（「改 P0 `web/api.js` 的注释」）**落在 `platform/` 目录下**，
 > 属 P0 的地盘、本阶段不得改动 → 只能走第 ① 条路「P2 补齐」。
 > **依据**：P0 终态 `platform/web/api.js:28-30`（承诺原文）+ 设计文档 §4.3 的目录清单
@@ -8879,6 +9481,7 @@ git commit -m "feat(P2): SSE 评审进度推送（src/http/sse.js + GET /api/sta
 | P2-10 | 可复算 | `node --test test/compute.test.js` 通过：快照含 `input_json` / `output_json` / `trace_json`；重复 compute 的 revision 为 1、2 |
 | P2-11 | 零依赖 | `node --test test/zero-deps.test.js` 通过；`platform/` 下无 `node_modules`、无 `package-lock.json` |
 | P2-12 | 全量回归 | `cd platform && node --test` 全部通过（含 P0 原有用例） |
+| P2-13 | ⭐ SSE 评审进度推送 | `node --test test/sse.test.js` **20/20** 通过：未登录 401 / 无权限 403 / 本赛段评委可订阅 / 首帧 `connected` / 提交评分后收到 `review.progress`（载荷不含 `judgeId`）/ **跨赛段不串台** / 失败提交不推送 / 断开后摘订阅者 |
 
 ---
 
@@ -8924,6 +9527,15 @@ git commit -m "feat(P2): SSE 评审进度推送（src/http/sse.js + GET /api/sta
 | D-34 | **重算前清场 `stage_results`** | 规格：`upsertStageResult` 只 upsert，不回收旧行 | 重算前（同一事务内）：`rank` / `tied_with` / `points` 一律置 NULL，并**删除**本轮已无 P 席评分的旧行 | 父代理预审实测：P3 发过榜（rank=1, points=99）后重算 → **旧名次 + 新总分**并排躺在同一行；撤掉某队全部打分后重算 → 旧行 total 仍在 | 名次与积分由 P3 在新一轮计算后重新填 |
 | D-35 | **软删除的打分不再计入计算** | 规格：`listReviews` 不过滤 `deleted_at` | `listReviews` 增加 `AND deleted_at IS NULL` | `stage_reviews` 的删除语义是**软删除**（评分只增不改），但被删掉的分还在榜单里 | 全局约束「评分只增不改，删除用软删除」 |
 | D-36 | **改分留痕** | 规格：审计只记「条数」 | 审计 detail 带上 `changed: [{ teamId, dimension, from, to }]` | 原来评委改分后，**当时榜单用的是几分**再也还原不出来（可复算要求断链） | 审计字段追加，不改已有字段 |
+| D-37 | **SSE 进度事件载荷不含 `judgeId`** | 规格：事件载荷是 `{ stageId, judgeId, at }` | 载荷只带 `{ stageId, at }` —— 事件只作为**信号**，客户端收到后重新拉 `review-state` | 事件流会把「谁在什么时候提交了评分」广播给该赛段的**每一个**订阅者 —— 可见性必须由 API 层按观众过滤（全局约束「可见性在 API 层过滤」）。带着 judgeId 推 = 绕过可见性层 | 客户端拿不到「谁交了」，改由 `review-state` 按身份返回 |
+| D-38 | **SSE 订阅的权限闸门** | 规格：只要**登录**就能订阅任意赛段 | 与 `review-state` 同一套口径：组委会 / 有 `score:read` 的人 / 本赛段评委 → 否则 403 | 规格的口子等于「任何登录账号都能监听任意赛段的评审动态」—— 评审过程与评委行踪不该对所有人开放（与 D-27 同一条纪律） | 评委会用 `stage:compute` / `score:read` 订阅；普通评委靠「本赛段评委」身份订阅 |
+| D-39 | **SSE 心跳注释帧** | 规格：无心跳 | `sendSseComment()` 发 `: ping\n\n` 注释帧；server.js 用 `setInterval(...).unref()` 每 25s 发一次，连接关闭时 `clearInterval` | SSE 连接长时间空闲时，中间的 nginx（`proxy_read_timeout` 默认 60s）会掐线 → 现象是「前端每隔一分钟重连一次」。`unref()` 保证定时器**不**拖住进程退出 | 心跳频率 25s 可调；帧是注释，EventSource 会忽略 |
+| D-40 | **畸形百分号编码不得让 `parseSsePath` 抛错** | 规格：`decodeURIComponent(m[1])` 直接调用 | 解析失败**返回 null** → 走正常的「非法 URL」分支（400） | P0 的教训（「畸形 URL 编码不能让进程退出」）在这里同样成立：`/api/stages/%E0%A4%A/events` 会让 decodeURIComponent 抛 URIError | 无 |
+| D-41 | **进度事件按赛段隔离（topic 必须带 `stageId`）** | 规格：事件中心是**单一全局**订阅者集合，`publish` 不带 topic | 订阅时登记 `topic = stage:<stageId>`，`publish` 只投给同 topic 的订阅者；payload 的 `stageId` 与 topic 同时约束 | 评审进度是**按赛段**的：A 赛段的评委提交评分，不该让 B 赛段的订阅者收到「有进展」——否则前端会刷新一个**跟自己无关**的进度条，甚至被诱导去看别的赛段的评审状态 | 无（客户端契约不变，只是多了隔离） |
+| D-42 | **失败的提交不得推送进度事件** | 规格：`publish` 的位置未约束 | `publish` 放在 `submitReviews` **成功返回之后**（服务层抛错 → 路由层抛错 → 不 publish） | 进度事件的语义是「**评审有进展了**」。失败的提交（分数越界 / 队伍不在名册 / 幂等键冲突）**没有进展** —— 却推了「有进展」，前端会把进度条推满，而榜单上一个分都没进 | 无 |
+| D-43 | **客户端断开必须摘掉订阅者** | 规格：无连接生命周期约定 | `res.on('close')` 里 `clearInterval(heartbeat)` + `reviewEvents.remove(res)`；事件中心的 `remove` 真正从 `Map` 里删 | 订阅者（`res`）只增不减 ⇒ 每开一条 SSE 连接就**泄漏一个 response 对象 + 一个定时器**，进程内存单调增长，长跑必被打挂 | 无 |
+| D-44 | **非 GET 方法不得开 SSE** | 规格：端点只说「`GET /api/stages/:stageId/events`」 | server.js 的分支条件是 `req.method === 'GET' ? parseSsePath(url) : null`；其他方法按普通路由走（404） | 少了方法闸门，`POST` 到同一路径会被当成 SSE 订阅 —— **用 POST 请求开一条长连接**是典型的协议混淆（且 CSRF 形态下更容易被诱导） | 无 |
+| D-45 | **SSE 响应头必须显式声明不被代理缓冲** | 规格：未规定响应头 | `Content-Type: text/event-stream; charset=utf-8` + `Cache-Control: no-cache, no-transform` + `Connection: keep-alive` + **`X-Accel-Buffering: no`** | nginx 默认会缓冲上游响应 → 事件被攒着一起发，前端看起来像「**不推送**」；`X-Accel-Buffering: no` 是唯一能在不改 nginx 配置的前提下关掉缓冲的响应头 | 无 |
 
 > **【2026-10-21 漂移审计修正 I-9 + M-4】** D-18 这一行原来描述的是一个**早已不存在**的冲突：
 > 「P0 建了 `002_user_roles.sql`；…⛔ **需 P1 改名为 `002_registration.sql` 之外的版本，或 P0 改名**」。
@@ -9275,6 +9887,63 @@ git commit -m "feat(P2): SSE 评审进度推送（src/http/sse.js + GET /api/sta
 **Task 7 的测试条数口径**：tiebreak **17**（规格自带 5 + 预审回归 12）。
 
 **最终结果**：变异体 16 → **KILLED 13 / 等价变异体 1 / 不可观测 2 / 有效缺口 0**；`tiebreak.test.js` **17/17**；P2 全量 **444/444**。
+
+---
+
+## Task 9 父代理预审修正台账（2026-10-21）
+
+> Task 9 兑现的是 P0 在 `platform/web/api.js:28-30` 里**欠下的一条债**（漂移审计 I-6 的第 ① 条路）。
+> 实施前的父代理预审在 `src/http/sse.js` 的规格里发现 **2 处 Important**；
+> 实施完成后做**变异检验**，变异体一度出现 **4 条存活**（另有 2 条只能靠「测试挂起」才被检出），
+> 补完用例后 **43/43 有效变异杀灭**（另 2 条等价变异体 + 2 条不可观测变异体）。
+
+### 一、预审发现的规格缺陷
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| **S9-1** | **Important** | **`parseSsePath` 直接调 `decodeURIComponent`** → 畸形百分号编码（`/api/stages/%E0%A4%A/events`）抛 `URIError` | 探针：`parseSsePath('/api/stages/%E0%A4%A/events')` → `URIError: URI malformed`。该异常若逸出 server.js 的 try 之外 → **整个进程退出**（P0 的原教训，一字不差地重演） | 解析失败**返回 null** → 走正常的「非法 URL」分支（400）。补 1 条用例钉住 |
+| **S9-2** | **Important** | **没有心跳帧** → 中间的 nginx（`proxy_read_timeout` 默认 60s）会掐线，现象是「前端每隔一分钟重连一次」 | 规格的 `sse.js` 全文无任何心跳相关代码 | 增加 `sendSseComment()`（`: ping\n\n` 注释帧）；server.js 用 `setInterval(...).unref()` 每 25s 发一次，`res.on('close')` 里 `clearInterval`（D-39） |
+
+### 二、变异检验发现的实现盲区
+
+> 变异体 **47** 个（权限闸门逐条摘掉 / 帧格式改错 / 头字段删掉 / topic 写错 → 跨赛段串台 /
+> 载荷加回 `judgeId` / publish 挪到提交之前 / 断开不摘订阅者 / 方法闸门摘掉 …），
+> 在 `/tmp` 副本上跑 `sse.test.js` + `server.test.js` + `review-api.test.js` + `review-service.test.js` + `zero-deps.test.js`
+> （**测试集必须覆盖被测文件的全部用例**，否则会制造假存活），
+> **测试必须失败才算杀灭**。变异脚本：`/tmp/p2t9/mutate.mjs`。
+>
+> ⚠️ 首轮变异跑出的 2 个「挂起式检出」暴露了**用例自身**的三个问题，已一并修掉（M9-10 / M9-11）——
+> 检出信号从「测试挂住」升级为「断言失败」，两者强度完全不同。
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| **M9-1** | **Important** | **跨赛段串台零覆盖** —— `publish` 的 topic 过滤、订阅端的 topic 登记都没有用例 | 变异存活：`publish` 去掉 topic 过滤 / topic 写死 `stage:all` / 订阅不带 topic → 用例全绿 | 补「赛段 B 的订阅者不得收到赛段 A 的进度事件」用例（D-41） |
+| **M9-2** | **Important** | **「失败的提交不推送」零覆盖** —— `publish` 的位置（提交成功**之后**）没有约束 | 变异存活：publish 挪到 `submitReviews` 之前 → 用例全绿 | 补「分数越界 400 时不得收到进度事件」用例（D-42） |
+| **M9-3** | **Important** | **连接泄漏零覆盖** —— `res.on('close')` 里 `reviewEvents.remove(res)` 没有用例 | 变异存活：`remove` 退化成 no-op → 用例全绿 | 补「客户端断开后订阅者必须被摘掉」用例（D-43） |
+| **M9-4** | Minor | **权限闸门 5 条放行路径只测了 1 条** —— 只测了「本赛段评委」，另外 4 条（赛段/全局 × `score:read`/`stage:compute`）零覆盖 | 变异存活：摘掉任一 `can()` 分支 → 用例全绿 | 补「5 条放行路径都真的放行」用例（4 个用户逐一订阅） |
+| **M9-5** | Minor | **响应头零覆盖** —— `X-Accel-Buffering: no` / `Cache-Control` 删掉后用例照样绿 | 变异存活 | 补响应头断言（D-45） |
+| **M9-6** | Minor | **方法闸门零覆盖** —— 非 GET 方法会不会误开 SSE 没有用例 | 变异存活：去掉 `req.method === 'GET'` 判断 → 用例全绿 | 补「POST → 404」用例（D-44） |
+| **M9-7** | Minor | **载荷形状只断言了「没有 judgeId」** —— `stageId` / `at` 的形状没钉住 | 变异存活：`at` 改成数字 → 用例全绿 | e2e 用例把 `data:` 行解析成 JSON 逐字段断言 |
+| **M9-8** | Minor | **`sendSseEvent` 的缺省载荷 / 结束守卫零覆盖** —— `data ?? null` 与 `writableEnded` 守卫都没有自己的用例 | 变异存活 | 补 2 条用例（缺省 → `data: null`；已结束 → 返回 false） |
+| **M9-9** | Minor | **`parseSsePath` 的路径尾部没钉死** —— 正则去掉 `(?:\?|$)` 后，`/api/stages/x/eventsY` 也会被当成 SSE 路径（正则**没有** `$` 锚） | 变异存活：去掉 `(?:\?|$)` → 用例全绿 | 补边界断言：`/eventsX` 与 `/events/` 必须返回 null |
+| **M9-10** | Minor | **测试进程不退出** —— `finally` 里只 `server.close()`，SSE 长连接仍占着 socket → `node --test` 一直等，**CI 上直接挂死** | 首轮变异跑出 4 个孤儿 `node test/sse.test.js` 进程（每个存活 10 分钟以上），把整轮变异拖成小时级 | 收尾加 `server.closeAllConnections?.()`；`sse.test.js` 耗时 **5.6s → 1.65s** |
+| **M9-11** | Minor | **用例里的超时用错了 API** —— `req.setTimeout` 是**socket 超时**，响应一结束就被清掉 → 错误响应下 promise 永不 settle → 用例**挂起**而不是失败；断言写在 http 回调里 / `setTimeout` 回调里同理 | 首轮变异里 B02 / B12 只能靠「挂起」被检出；探针复现：`node --test test/sse.test.js` 停在第 13 条用例不退出 | 改用**墙钟定时器** + 「响应结束即 reject」；断言一律移到 promise **之外**。改完后同一变异体 → **6 条干净失败、进程正常退出** |
+| — | — | **等价变异体 B04 / B06**（删掉权限闸门里的「全局级 `score:read`」/「全局级 `stage:compute`」分支）：`can()` 第 107 行「`if (row.scope_type === 'global') return true;`」—— 只要有全局授权，**赛段级那次 `can()` 调用就已经返回 true**，因此「赛段级分支 ⊇ 全局级分支」，删掉全局分支不改变任何判定结果 | 变异存活（如标注） | **不是盲区**，标记为等价变异体、允许存活 |
+| — | — | **不可观测变异体 B09 / B10**（断开时不清心跳定时器 / 心跳定时器不 `unref`）：定时器在 `res.on('close')` 里被 `clearInterval`，而用例收尾会把连接全关掉 → 定时器随之消失；`unref` 真正的差别在「进程退出时仍有活跃 SSE 连接」这一**生产场景**（优雅停机），黑盒用例覆盖不到 | 变异存活（如标注） | **不是盲区**，标记为不可观测变异体、允许存活 |
+
+### 三、刻意保持的行为（登记口径）
+
+| 行为 | 为什么这样 |
+|---|---|
+| **SSE 不挂 router** | P0 的 router handler 约定是「返回一个值 → server.js 统一 `json()` 序列化并结束响应」；SSE 要**长期持有这条连接** → 挂 router 会被 `json()` 提前收尾，客户端只收到第一帧就断。故 SSE 走 `src/server.js` 里**独立于 router** 的分支，且放在 `router.match` **之前**（SSE 路径不在 router 里，先 match 会直接 404） |
+| **事件只作「信号」，不带业务数据** | 载荷只有 `{ stageId, at }`，**没有 judgeId、没有分数、没有队伍**（D-37）。客户端收到后**重新拉 `review-state`** —— 可见性由那一层按观众过滤（全局约束「可见性在 API 层过滤」）。事件流一旦带业务数据，就等于**绕过可见性层** |
+| **发布点在 HTTP 层（不在 service 层）** | `submitReviews` 是纯业务服务，不该知道 HTTP 的存在；「这次请求造成了可观察的进展」属于 HTTP 层的判断 |
+| **心跳用注释帧而不是事件帧** | 注释帧以 `:` 开头，EventSource 会忽略它 —— 心跳**不该**让前端触发业务处理；`unref()` 保证定时器不拖住进程退出 |
+| **权限闸门保留「赛段级 ∨ 全局级」两条 `can()` 调用** | 两条在语义上**冗余**（`can()` 的全局判定与 ctx 无关，赛段级那次已覆盖），但与 P2 其余接口的 `requireStageCapability` 写法保持一致 —— 一致性比消除冗余更重要；该冗余已登记为等价变异体 B04 / B06 |
+
+**Task 9 的测试条数口径**：sse **20**（规格自带 11 + 变异检验补测 9）。
+
+**最终结果**：变异体 47 → **KILLED 43 / 等价变异体 2 / 不可观测变异体 2 / 有效缺口 0**；`sse.test.js` **20/20**；P2 全量 **537/537**。
 
 ---
 
