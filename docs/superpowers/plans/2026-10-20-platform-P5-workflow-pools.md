@@ -5453,6 +5453,7 @@ import { appError } from '../errors.js';
 import { applyVisibility } from '../domain/visibility.js';
 import * as tokenRepo from '../db/repo/public-tokens.js';
 import * as srcRepo from '../db/repo/pool-sources.js';
+import { buildICalendarText } from '../domain/icalendar.js';
 
 export const PUBLIC_NOTICE =
   'A 榜赛段名次全程公开；D 段不公示排名；B 榜评分与签字人不公开；企业名不公示；互评来源不公示。';
@@ -5654,6 +5655,42 @@ function projectPublicRows(rows, rules, warnings, stageId) {
   }
   return out;
 }
+
+/**
+ * 赛程日历（iCal）。
+ * 溯源：R-STG-01（5 赛段时间轴与交付物）—— 依据 INTERFACES.md §6 / 设计文档 §8
+ * @param db        数据库
+ * @param editionId 届期
+ * @param now       时间（【追加的可选参数】，便于测试注入；不传则取当前时间）
+ * @returns ics 文本
+ */
+export function buildICalendar({ db, editionId, now }) {
+  const at = nowIso(now);
+  if (!editionId) throw appError(400, 'EDITION_REQUIRED', 'editionId 必填');
+  const edition = srcRepo.getEdition(db, editionId);
+  const stages = srcRepo.listEditionStages(db, editionId);
+  const events = stages.map((s) => ({
+    uid: `stage-${s.id}@heikesong.local`,
+    summary: `${s.name}（${s.stage_key}）`,
+    description: `赛段 ${s.stage_key}：${s.name}`,
+    start: s.starts_at,
+    end: s.ends_at ?? addOneDay(s.starts_at),
+    location: edition?.city ?? null,
+    url: `/leaderboard?stageId=${encodeURIComponent(s.id)}`,
+  }));
+  return buildICalendarText({
+    calName: edition?.name ?? '黑客松赛程',
+    events,
+    now: at,
+  });
+}
+
+function addOneDay(value) {
+  if (!value) return null;
+  const d = new Date(String(value));
+  if (Number.isNaN(d.getTime())) return null;
+  return new Date(d.getTime() + 86400000).toISOString();
+}
 ```
 
 - [ ] **Step 4: 创建 `src/http/routes/workflow.js`**
@@ -5795,7 +5832,7 @@ export function registerPoolsRoutes(router, { db, rules }) {
 // src/http/routes/public.js — 公开接口（无需登录，token 鉴权）
 // 依据：INTERFACES.md §6 的 P5 API 清单
 // ⚠️ token 走 query 参数（契约如此）：部署时应在 nginx 层关掉 query 串的访问日志（P6 负责）。
-import { getPublicLeaderboard } from '../../services/public-api.js';
+import { getPublicLeaderboard, buildICalendar, resolvePublicToken } from '../../services/public-api.js';
 
 export function registerPublicRoutes(router, { db, rules }) {
   router.add('GET', '/api/public/leaderboard', async ({ query }) =>
@@ -5805,6 +5842,15 @@ export function registerPublicRoutes(router, { db, rules }) {
       editionId: query.editionId,
       rules,
     }));
+  // 赛程日历（iCal）。⛔ 同样要 token：公开 ≠ 无鉴权。
+  // 溯源：R-STG-01（5 赛段时间轴与交付物）—— 依据 INTERFACES.md §6 / 设计文档 §8
+  router.add('GET', '/api/public/calendar.ics', async ({ query }) => {
+    resolvePublicToken({
+      db, token: query.token, requiredScope: 'calendar', editionId: query.editionId,
+    });
+    const body = buildICalendar({ db, editionId: query.editionId });
+    return { __rawText: true, body, contentType: 'text/calendar; charset=utf-8' };
+  });
 }
 ```
 
@@ -5962,26 +6008,43 @@ git commit -m "feat(P5): 公开榜单 API（token 鉴权 + 显式可见性过滤
 `platform/test/icalendar.test.js`：
 
 ```javascript
+// platform/test/icalendar.test.js — iCal 日历导出（手写 RFC 5545，零依赖）
+// 依据：设计文档 §8「公开榜单 API + 赛程 iCal 订阅」；INTERFACES.md §6 `buildICalendar`
+// 溯源：R-STG-01（5 赛段时间轴与交付物）—— 赛段起止时间轴能被日历客户端订阅
+//
+// ⚠️ 本文件同时覆盖【两层】：
+//   ① 领域纯函数（src/domain/icalendar.js）：转义 / 折叠 / 时间戳
+//   ② HTTP 路由（GET /api/public/calendar.ics）：token 鉴权 + 原文响应（__rawText）
+//   计划原块只覆盖领域层与���务层 ⇒ 路由零覆盖（同 Task 4 的 T4-C2 同款病根），此处补齐。
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openDatabase } from '../src/db/sqlite.js';
 import { applyMigrations } from '../src/db/migrate.js';
+import { loadRules } from '../src/config.js';
+import { createApp } from '../src/server.js';
 import {
   buildICalendarText, formatICalTimestamp, escapeICalText, foldICalLine,
 } from '../src/domain/icalendar.js';
-import { buildICalendar } from '../src/services/public-api.js';
+import { buildICalendar, createPublicToken } from '../src/services/public-api.js';
+import { call } from '../test-helpers/http-call.js';
+import { stripComments } from '../test-helpers/strip-comments.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrationsDir = join(here, '..', 'db', 'migrations');
+const rulesDir = join(here, '..', 'rules');
+const webDir = join(here, '..', 'web');
+// 统一注入时间：领域层不读时钟，所有时间断言都基于它，口径可复算
+const NOW = '2026-10-20T00:00:00.000Z';
 
 function setup() {
   const dataDir = mkdtempSync(join(tmpdir(), 'hks-p5ics-'));
   const { db, close } = openDatabase({ dataDir });
   applyMigrations(db, migrationsDir);
+  const { rules } = loadRules(rulesDir);
   db.exec(`
     INSERT INTO editions (id, name, city, starts_at, ends_at, created_at)
     VALUES ('ed_1', '第一届 · 杭州', '杭州', '2026-10-01', '2026-10-31', '2026-10-01T00:00:00.000Z');
@@ -5990,7 +6053,8 @@ function setup() {
            ('st_2', 'ed_1', 's2', '任务', 'initial', '2026-10-10', '2026-10-13', NULL, 'initial', 'computed'),
            ('st_3', 'ed_1', 's3', '开发', 'initial', '2026-10-13', '2026-10-25', NULL, 'initial', 'open');
   `);
-  return { db, close, dataDir };
+  const app = createApp({ db, rules, webDir });
+  return { db, close, dataDir, rules, app };
 }
 
 function cleanup(db, close, dataDir) {
@@ -6015,6 +6079,19 @@ function parseEvents(ics) {
     }
     return fields;
   });
+}
+
+/** 追加一个赛段（给「长标题」「含特殊字符」等场景用） */
+function addStage(db, { id, key, name, startsAt = '2026-10-01', endsAt = '2026-10-10' }) {
+  db.prepare(
+    `INSERT INTO stages (id, edition_id, "key", name, kind, starts_at, ends_at, freeze_at, scoring_config_key, status)
+     VALUES (?, 'ed_1', ?, ?, 'initial', ?, ?, NULL, 'initial', 'computed')`,
+  ).run(id, key, name, startsAt, endsAt);
+}
+
+/** 签发一个公开令牌（明文只在这里返回一次） */
+function publicToken(db, { scope = 'calendar', editionId = 'ed_1', expiresAt = '2099-01-01T00:00:00.000Z' } = {}) {
+  return createPublicToken({ db, scope, editionId, expiresAt, now: NOW }).token;
 }
 
 test('VEVENT 数 = 赛段数（基本解析器能读出来）', () => {
@@ -6099,11 +6176,278 @@ test('foldICalLine 不劈开多字节字符', () => {
   }
   assert.equal(folded.replace(/\r\n /g, ''), line, '取消折叠后必须还原');
 });
+
+test('折叠宽度用满 75 octets（首段 75 octets；续行 = 74 octets 内容 + 1 个前导空格；末段是余量）', () => {
+  const line = `SUMMARY:${'a'.repeat(200)}`;
+  const folded = foldICalLine(line);
+  const parts = folded.split('\r\n');
+  assert.equal(Buffer.byteLength(parts[0], 'utf8'), 75, '首段必须用满 75 octets');
+  for (const p of parts.slice(1, -1)) {
+    assert.equal(Buffer.byteLength(p, 'utf8'), 75, '续行 = 74 octets 内容 + 1 个前导空格');
+  }
+  const last = Buffer.byteLength(parts[parts.length - 1], 'utf8');
+  assert.ok(last > 0 && last <= 75, `末段是余量，实际 ${last}`);
+  assert.equal(folded.replace(/\r\n /g, ''), line);
+});
+
+// ── 以下为 P5 Task 5 实跑后补齐的用例（计划原块只覆盖领域层与���务层，
+//    新建的 GET /api/public/calendar.ics 路由**零覆盖**）──
+
+test('buildICalendarText 不给 now → 抛错（领域层不读时钟，时间必须由调用方注入）', () => {
+  assert.throws(
+    () => buildICalendarText({ events: [{ uid: 'u1', start: '2026-10-01T00:00:00.000Z' }] }),
+    /now/,
+    '缺 now 必须抛错，不能默默取当前时间',
+  );
+});
+
+test('领域层是纯函数：icalendar.js 不 import node: 内置模块、不用 Date.now()/Math.random()', () => {
+  const src = readFileSync(join(here, '..', 'src', 'domain', 'icalendar.js'), 'utf8');
+  const code = src.replace(/\/\/[^\n]*/g, '').replace(/\/\*[\s\S]*?\*\//g, '');
+  assert.equal(/from\s+['"]node:/.test(code), false, '领域层不得 import Node 内置模块');
+  assert.equal(/\bDate\.now\s*\(/.test(code), false, '领域层不得用 Date.now()');
+  assert.equal(/\bMath\.random\s*\(/.test(code), false, '领域层不得用 Math.random()');
+  assert.equal(/new Date\s*\(\s*\)/.test(code), false, '领域层不得无参构造 Date');
+});
+
+test('★ 领域层不含 Node 专属全局：Buffer / process / require / __dirname / __filename', () => {
+  // ⚠️ 为什么钉这一条：P6 的演示版把 `src/domain/*.js` **原样拷进浏览器产物**
+  //    （platform/scripts/build-demo.js）⇒ 领域层必须在**浏览器**里跑同一套引擎。
+  //    `Buffer` 是 Node 专属全局 —— 浏览器里 `Buffer is not defined` ⇒ 整个模块 ReferenceError。
+  //    ⛔ `build-demo.js` 的 `assertDomainIsBrowserSafe` **只查 import 说明符、不查 Node 全局**
+  //    ⇒ 这类违规它查不出来（见计划文档 T5-C9）。所以这里补一条静态扫描把它钉住。
+  const banned = [
+    { re: /\bBuffer\b/, name: 'Buffer' },
+    { re: /\bprocess\s*\./, name: 'process.' },
+    { re: /\brequire\s*\(/, name: 'require(' },
+    { re: /\b__dirname\b/, name: '__dirname' },
+    { re: /\b__filename\b/, name: '__filename' },
+  ];
+  const dir = join(here, '..', 'src', 'domain');
+  const files = readdirSync(dir).filter((n) => n.endsWith('.js'));
+  assert.ok(files.length > 0, '领域层目录不该是空的');
+  for (const name of files) {
+    // 先剥注释：注释里提到 Buffer 不算「用了 Buffer」
+    const code = stripComments(readFileSync(join(dir, name), 'utf8'));
+    for (const b of banned) {
+      assert.equal(
+        b.re.test(code),
+        false,
+        `src/domain/${name} 不得使用 Node 专属全局 ${b.name}（浏览器里不存在）`,
+      );
+    }
+  }
+});
+
+test('★ 换成 TextEncoder/TextDecoder 后折叠语义不变：每行 ≤ 75 UTF-8 字节，拼接后与原文逐字相等', () => {
+  const original = `SUMMARY:${'华东区赛段：需求评审与原型验证'.repeat(9)}`;
+  const folded = foldICalLine(original);
+  const lines = folded.split('\r\n');
+  assert.ok(lines.length > 1, '长中文标题必须被折成多行');
+  for (const line of lines) {
+    assert.ok(
+      Buffer.byteLength(line, 'utf8') <= 75,
+      `行太长（${Buffer.byteLength(line, 'utf8')} octets）`,
+    );
+    assert.equal(line.includes('\uFFFD'), false, '不能出现乱码（说明字符被劈开了）');
+  }
+  // 取消折叠后必须与原文逐字相等（证明换字节 API 没改语义）
+  assert.equal(folded.replace(/\r\n /g, ''), original);
+});
+
+test('escapeICalText 的空值口径是空串（不是 "null"/"undefined" 字面量）', () => {
+  assert.equal(escapeICalText(null), '');
+  assert.equal(escapeICalText(undefined), '');
+  assert.equal(escapeICalText(''), '');
+});
+
+test('formatICalTimestamp 遇到非法时间 → 抛错（不静默产出一个坏时间戳）', () => {
+  assert.throws(() => formatICalTimestamp('not-a-date'), /非法时间戳/);
+  assert.throws(() => formatICalTimestamp(''), /非法时间戳/);
+});
+
+test('每个事件带 DESCRIPTION / LOCATION / URL（赛段说明、赛点、榜单跳转）', () => {
+  const { db, close, dataDir } = setup();
+  const ics = buildICalendar({ db, editionId: 'ed_1', now: NOW });
+  const events = parseEvents(ics);
+  for (const ev of events) {
+    assert.ok(ev.DESCRIPTION, '缺 DESCRIPTION');
+    assert.ok(ev.LOCATION, '缺 LOCATION');
+    assert.ok(ev.URL, '缺 URL');
+  }
+  assert.equal(events[0].LOCATION, '杭州', '赛点取届期城市');
+  assert.ok(events[0].URL.includes('stageId=st_1'), 'URL 必须指向该赛段');
+  assert.ok(events[0].DESCRIPTION.includes('s1'), 'DESCRIPTION 必须带赛段代号');
+  assert.ok(events[0].DESCRIPTION.includes('调研'), 'DESCRIPTION 必须带赛段名');
+  cleanup(db, close, dataDir);
+});
+
+test('同样的输入产出同样的字节（可复算：不掺入真实时钟）', () => {
+  const { db, close, dataDir } = setup();
+  const a = buildICalendar({ db, editionId: 'ed_1', now: NOW });
+  const b = buildICalendar({ db, editionId: 'ed_1', now: NOW });
+  assert.equal(a, b, '同一个 now 必须产出逐字相同的日历');
+  const c = buildICalendar({ db, editionId: 'ed_1', now: '2026-10-21T00:00:00.000Z' });
+  assert.notEqual(a, c, 'now 变了 DTSTAMP 必须变');
+  assert.ok(c.includes('DTSTAMP:20261021T000000Z'));
+  cleanup(db, close, dataDir);
+});
+
+test('日历头字段齐全：VERSION / PRODID / CALSCALE / METHOD / X-WR-CALNAME', () => {
+  const { db, close, dataDir } = setup();
+  const ics = buildICalendar({ db, editionId: 'ed_1', now: NOW });
+  assert.ok(ics.includes('VERSION:2.0\r\n'));
+  assert.ok(ics.includes('PRODID:-//heikesong//platform//CN\r\n'));
+  assert.ok(ics.includes('CALSCALE:GREGORIAN\r\n'));
+  assert.ok(ics.includes('METHOD:PUBLISH\r\n'));
+  assert.ok(ics.includes('X-WR-CALNAME:第一届 · 杭州\r\n'), '日历名取届期名');
+  cleanup(db, close, dataDir);
+});
+
+test('每个赛段一个 VEVENT：UID 唯一且可追溯到赛段 id', () => {
+  const { db, close, dataDir } = setup();
+  const ics = buildICalendar({ db, editionId: 'ed_1', now: NOW });
+  const events = parseEvents(ics);
+  const uids = events.map((e) => e.UID);
+  assert.equal(new Set(uids).size, uids.length, 'UID 必须唯一（重复 UID 客户端会互相覆盖）');
+  assert.deepEqual(uids.sort(), ['stage-st_1@heikesong.local', 'stage-st_2@heikesong.local', 'stage-st_3@heikesong.local']);
+  cleanup(db, close, dataDir);
+});
+
+test('赛段起止时间落到 DTSTART/DTEND（日期串按 UTC 零点解析）', () => {
+  const { db, close, dataDir } = setup();
+  const ics = buildICalendar({ db, editionId: 'ed_1', now: NOW });
+  const events = parseEvents(ics);
+  assert.equal(events[0].DTSTART, '20261001T000000Z');
+  assert.equal(events[0].DTEND, '20261010T000000Z');
+  assert.equal(events[2].DTEND, '20261025T000000Z');
+  cleanup(db, close, dataDir);
+});
+
+test('赛段名里的逗号/分号/反斜杠在服务层同样被转义（不只在纯函数层）', () => {
+  const { db, close, dataDir } = setup();
+  addStage(db, { id: 'st_x', key: 'sx', name: 'A,B;C\\D' });
+  const ics = buildICalendar({ db, editionId: 'ed_1', now: NOW });
+  assert.ok(ics.includes('SUMMARY:A\\,B\\;C\\\\D（sx）'), '特殊字符必须转义');
+  cleanup(db, close, dataDir);
+});
+
+test('超长赛段名在服务层同样被折叠（且不劈开多字节字符）', () => {
+  const { db, close, dataDir } = setup();
+  addStage(db, { id: 'st_long', key: 'sl', name: '长'.repeat(80) });
+  const ics = buildICalendar({ db, editionId: 'ed_1', now: NOW });
+  for (const line of ics.split('\r\n')) {
+    assert.ok(Buffer.byteLength(line, 'utf8') <= 75, `行太长：${Buffer.byteLength(line, 'utf8')}`);
+    assert.equal(line.includes('\uFFFD'), false, '不能出现乱码');
+  }
+  assert.ok(unfold(ics).includes(`SUMMARY:${'长'.repeat(80)}（sl）`), '取消折叠后必须还原');
+  cleanup(db, close, dataDir);
+});
+
+test('buildICalendar 缺 editionId → 400 EDITION_REQUIRED（不静默出一份空日历）', () => {
+  const { db, close, dataDir } = setup();
+  assert.throws(
+    () => buildICalendar({ db, now: NOW }),
+    (err) => err.status === 400 && err.code === 'EDITION_REQUIRED',
+  );
+  cleanup(db, close, dataDir);
+});
+
+test('HTTP GET /api/public/calendar.ics：带 token → 200 + text/calendar + 原文 CRLF', async () => {
+  const s = setup();
+  const token = publicToken(s.db);
+  const res = await call(s.app, 'GET', `/api/public/calendar.ics?editionId=ed_1&token=${encodeURIComponent(token)}`);
+  assert.equal(res.status, 200, res.body);
+  assert.equal(res.headers['Content-Type'], 'text/calendar; charset=utf-8');
+  assert.ok(res.body.startsWith('BEGIN:VCALENDAR\r\n'), '必须是原文，不是 JSON 字符串');
+  assert.ok(res.body.endsWith('END:VCALENDAR\r\n'));
+  assert.equal(res.body.includes('\\r\\n'), false, '原文不能被 JSON 转义');
+  assert.equal(res.body.replace(/\r\n/g, '').includes('\n'), false, '不允许裸 LF');
+  assert.equal(parseEvents(res.body).length, 3);
+  cleanup(s.db, s.close, s.dataDir);
+});
+
+test('HTTP GET /api/public/calendar.ics：无 token → 403 PUBLIC_TOKEN_MISSING（公开 ≠ 无鉴权）', async () => {
+  const s = setup();
+  const res = await call(s.app, 'GET', '/api/public/calendar.ics?editionId=ed_1');
+  assert.equal(res.status, 403, res.body);
+  assert.equal(JSON.parse(res.body).error.code, 'PUBLIC_TOKEN_MISSING');
+  cleanup(s.db, s.close, s.dataDir);
+});
+
+test('HTTP GET /api/public/calendar.ics：scope 不符 → 403 PUBLIC_TOKEN_SCOPE_MISMATCH', async () => {
+  const s = setup();
+  const token = publicToken(s.db, { scope: 'leaderboard' });
+  const res = await call(s.app, 'GET', `/api/public/calendar.ics?editionId=ed_1&token=${encodeURIComponent(token)}`);
+  assert.equal(res.status, 403, res.body);
+  assert.equal(JSON.parse(res.body).error.code, 'PUBLIC_TOKEN_SCOPE_MISMATCH');
+  cleanup(s.db, s.close, s.dataDir);
+});
+
+test('HTTP GET /api/public/calendar.ics：跨届期 token → 403 PUBLIC_TOKEN_EDITION_MISMATCH', async () => {
+  const s = setup();
+  const token = publicToken(s.db, { editionId: 'ed_other' });
+  const res = await call(s.app, 'GET', `/api/public/calendar.ics?editionId=ed_1&token=${encodeURIComponent(token)}`);
+  assert.equal(res.status, 403, res.body);
+  assert.equal(JSON.parse(res.body).error.code, 'PUBLIC_TOKEN_EDITION_MISMATCH');
+  cleanup(s.db, s.close, s.dataDir);
+});
+
+test('HTTP GET /api/public/calendar.ics：过期 token → 403 PUBLIC_TOKEN_EXPIRED', async () => {
+  const s = setup();
+  const token = createPublicToken({
+    db: s.db, scope: 'calendar', editionId: 'ed_1',
+    expiresAt: '2026-10-19T00:00:00.000Z', now: '2026-10-01T00:00:00.000Z',
+  }).token;
+  const res = await call(s.app, 'GET', `/api/public/calendar.ics?editionId=ed_1&token=${encodeURIComponent(token)}`);
+  assert.equal(res.status, 403, res.body);
+  assert.equal(JSON.parse(res.body).error.code, 'PUBLIC_TOKEN_EXPIRED');
+  cleanup(s.db, s.close, s.dataDir);
+});
+
+test('HTTP GET /api/public/calendar.ics：缺 editionId → 400 EDITION_REQUIRED', async () => {
+  const s = setup();
+  const token = publicToken(s.db);
+  const res = await call(s.app, 'GET', `/api/public/calendar.ics?token=${encodeURIComponent(token)}`);
+  assert.equal(res.status, 400, res.body);
+  assert.equal(JSON.parse(res.body).error.code, 'EDITION_REQUIRED');
+  cleanup(s.db, s.close, s.dataDir);
+});
+
+test('HTTP GET /api/public/calendar.ics：该届期没有赛段 → 200 + 空日历（列表 → 200 + 空集）', async () => {
+  const s = setup();
+  s.db.exec("INSERT INTO editions (id, name, city, starts_at, ends_at, created_at) VALUES ('ed_2', '第二届', '上海', '2026-11-01', '2026-11-30', '2026-10-01T00:00:00.000Z')");
+  const token = publicToken(s.db, { editionId: 'ed_2' });
+  const res = await call(s.app, 'GET', `/api/public/calendar.ics?editionId=ed_2&token=${encodeURIComponent(token)}`);
+  assert.equal(res.status, 200, res.body);
+  assert.equal(parseEvents(res.body).length, 0);
+  assert.ok(res.body.startsWith('BEGIN:VCALENDAR\r\n'));
+  cleanup(s.db, s.close, s.dataDir);
+});
+
+test('HTTP GET /api/public/calendar.ics：日历里不泄露企业名与内部身份（公开面只给赛段时间轴）', async () => {
+  const s = setup();
+  s.db.exec(`
+    INSERT INTO users (id, name, phone, password_hash, mba_status, org, is_superadmin, active, created_at)
+    VALUES ('u_a', '甲', '13900000051', 'x', 'mba', '学堂', 0, 1, '2026-10-01T00:00:00.000Z');
+    INSERT INTO task_packages (id, edition_id, enterprise_id, enterprise_name, title, pain_point,
+      expected_delivery, acceptance_criteria, grade, status, solvability_score, solvability_grade,
+      commitment, agreement, is_free_brief, submitted_by, submitted_at, deleted_at)
+    VALUES ('tp_1', 'ed_1', 'ent_1', '某银行', '零售风控助手', '人工审批慢', '可演示原型', '能跑', 'A',
+      'approved', 11, 'A', '试点承诺', '试点承诺书', 0, 'u_a', '2026-10-01T00:00:00.000Z', NULL);
+  `);
+  const token = publicToken(s.db);
+  const res = await call(s.app, 'GET', `/api/public/calendar.ics?editionId=ed_1&token=${encodeURIComponent(token)}`);
+  assert.equal(res.status, 200, res.body);
+  assert.equal(res.body.includes('某银行'), false, '企业名不公示');
+  assert.equal(res.body.includes('零售风控助手'), false, '任务包标题不公示');
+  cleanup(s.db, s.close, s.dataDir);
+});
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
 
-Run: `cd platform && node --test test/icalendar.test.js`
+Run: `cd platform && node --disable-warning=ExperimentalWarning --test test/icalendar.test.js`
 Expected: FAIL —— `Cannot find module '../src/domain/icalendar.js'`
 
 - [ ] **Step 3: 创建 `src/domain/icalendar.js`**
@@ -6111,6 +6455,7 @@ Expected: FAIL —— `Cannot find module '../src/domain/icalendar.js'`
 ```javascript
 // src/domain/icalendar.js — RFC 5545 日历文本生成（纯函数）
 // 依据：设计文档 §8「公开榜单 API + 赛程 iCal 订阅」；INTERFACES.md §6 `buildICalendar`
+// 溯源：R-STG-01（5 赛段时间轴与交付物）—— iCal 把「赛段时间轴」变成机器可读、可订阅的形态
 // 借鉴：dribdat 的 iCal 实现思路（MIT）——但【自己写】：
 //   零依赖约束（R-OPS-07：只用 Node 标准库），且 dribdat 的实现依赖 Django 生态。
 // ⛔ 纯函数：无 IO、无 Date.now()、无 Math.random()。now 由调用方传入。
@@ -6121,6 +6466,16 @@ Expected: FAIL —— `Cannot find module '../src/domain/icalendar.js'`
 //   ③ 行尾：CRLF
 //   ④ 时间戳：YYYYMMDDTHHMMSSZ（UTC）
 export const ICAL_LINE_MAX_OCTETS = 75;
+
+// ⚠️ ⛔ 领域层必须在**浏览器**里跑同一套引擎（P6 的演示版把 src/domain/*.js 原样拷进浏览器产物）
+//    ⇒ 不得用 Node 专属全局（Buffer / process / require / __dirname / __filename）——
+//    浏览器里 `Buffer is not defined` ⇒ 整个模块直接 ReferenceError。
+//    TextEncoder / TextDecoder 是 **WHATWG Web 标准**（Node ≥ 11 起也是全局）⇒ 两端通用，
+//    且**不需要 import 任何 Node 内置模块**。
+//    ⚠️ `build-demo.js` 的 `assertDomainIsBrowserSafe` 只查 import 说明符、不查 Node 全局
+//    ⇒ 这类违规它查不出来（见计划文档 T5-C9）。
+const ENCODER = new TextEncoder();
+const DECODER = new TextDecoder();
 
 export function escapeICalText(value) {
   return String(value ?? '')
@@ -6146,7 +6501,7 @@ export function formatICalTimestamp(value) {
  */
 export function foldICalLine(line) {
   const text = String(line ?? '');
-  const bytes = Buffer.from(text, 'utf8');
+  const bytes = ENCODER.encode(text);
   if (bytes.length <= ICAL_LINE_MAX_OCTETS) return text;
 
   const parts = [];
@@ -6156,7 +6511,7 @@ export function foldICalLine(line) {
     let end = Math.min(start + limit, bytes.length);
     // 回退到字符边界：bytes[end] 若是续接字节（10xxxxxx）说明劈开了多字节字符
     while (end > start && end < bytes.length && (bytes[end] & 0xc0) === 0x80) end -= 1;
-    parts.push(bytes.subarray(start, end).toString('utf8'));
+    parts.push(DECODER.decode(bytes.subarray(start, end)));
     start = end;
     limit = ICAL_LINE_MAX_OCTETS - 1; // 续行首字符是空格，占 1 octet
   }
@@ -6211,6 +6566,7 @@ import { buildICalendarText } from '../domain/icalendar.js';
 ```javascript
 /**
  * 赛程日历（iCal）。
+ * 溯源：R-STG-01（5 赛段时间轴与交付物）—— 依据 INTERFACES.md §6 / 设计文档 §8
  * @param db        数据库
  * @param editionId 届期
  * @param now       时间（【追加的可选参数】，便于测试注入；不传则取当前时间）
@@ -6250,13 +6606,14 @@ function addOneDay(value) {
 把导入区改成：
 
 ```javascript
-import { getPublicLeaderboard, buildICalendar, resolvePublicToken } from '../services/public-api.js';
+import { getPublicLeaderboard, buildICalendar, resolvePublicToken } from '../../services/public-api.js';
 ```
 
 在 `registerPublicRoutes` 里追加：
 
 ```javascript
   // 赛程日历（iCal）。⛔ 同样要 token：公开 ≠ 无鉴权。
+  // 溯源：R-STG-01（5 赛段时间轴与交付物）—— 依据 INTERFACES.md §6 / 设计文档 §8
   router.add('GET', '/api/public/calendar.ics', async ({ query }) => {
     resolvePublicToken({
       db, token: query.token, requiredScope: 'calendar', editionId: query.editionId,
@@ -6268,18 +6625,27 @@ import { getPublicLeaderboard, buildICalendar, resolvePublicToken } from '../ser
 
 - [ ] **Step 6: 运行测试确认通过**
 
-Run: `cd platform && node --test test/icalendar.test.js`
-Expected: PASS（8 个测试全过：icalendar.test.js 8）
+Run: `cd platform && node --disable-warning=ExperimentalWarning --test test/icalendar.test.js`
+Expected: PASS（**31** 个测试全过：icalendar.test.js 31）
+
+Run: `cd platform && node --disable-warning=ExperimentalWarning --test`
+Expected: 全部通过（P0–P5 累计：**1107** 例 / 通过 1106 / 失败 0 / 跳过 1）
+
+Run: `cd platform && node --disable-warning=ExperimentalWarning --test`
+Expected: 全部通过（P0–P5 累计：**1104** 例 / 通过 1103 / 失败 0 / 跳过 1）
 
 - [ ] **Step 7: 提交**
 
 ```bash
-cd platform && git add src/domain/icalendar.js src/services/public-api.js src/http/routes/public.js test/icalendar.test.js
+git add platform/src/domain/icalendar.js platform/src/services/public-api.js \
+  platform/src/http/routes/public.js platform/test/icalendar.test.js
 git commit -m "feat(P5): iCal 日历导出（手写 RFC 5545，零依赖）
 
-对应设计文档 §8 公开日历订阅：
+对应设计文档 §8 公开日历订阅（R-STG-01 赛段时间轴）：
 - 行折叠 ≤75 octets、逗号/分号/反斜杠转义、CRLF 行尾、UTC 时间戳
-- 日历接口同样要 token（scope=calendar）"
+- 日历接口同样要 token（scope=calendar）" -- \
+  platform/src/domain/icalendar.js platform/src/services/public-api.js \
+  platform/src/http/routes/public.js platform/test/icalendar.test.js
 ```
 
 ---
@@ -6307,9 +6673,20 @@ git commit -m "feat(P5): iCal 日历导出（手写 RFC 5545，零依赖）
 `platform/test/workflow-e2e.test.js`：
 
 ```javascript
+// platform/test/workflow-e2e.test.js —— P5 Task 6 端到端验收 + 前端任务清单页
+//
+// 规则溯源：
+//   - R-OPS-13 任务清单工作流拆解：任务包 → 工作流 → 任务清单 → 队员自主领取任务完成
+//   - R-OPS-14 禁止岗位制：任务**只能自主领取**（⛔ 页面不得出现指派 / 按岗位分工的控件）
+//   - 「前端只渲染，不做过滤」→ 可见性在 API 层完成（设计文档 §6.6）——前端隐藏 = 数据已泄露
+//
+// ⚠️ 本文件覆盖**三块**（计划原块只覆盖第 ① 块）：
+//   ① 后端闭环：建工作流 → 建任务 → 领取 → 完成 → 同步三池 → 公开 API 拉榜
+//   ② 前端视图的**纯函数**：三段分类 / 可用操作 / 行内容（P1 的 web/views/*.js 同款做法）
+//   ③ 前端**接线**：web/app.js 注册了 /tasks/:workflowId 且把路由参数透传给视图
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -6319,6 +6696,11 @@ import { loadRules } from '../src/config.js';
 import { createSession } from '../src/auth/session.js';
 import { createApp } from '../src/server.js';
 import { createPublicToken } from '../src/services/public-api.js';
+import { call } from '../test-helpers/http-call.js';
+import { stripComments } from '../test-helpers/strip-comments.js';
+import {
+  classifyTasks, taskMode, taskActions, buildTaskItem, buildTaskSections,
+} from '../web/views/tasks.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrationsDir = join(here, '..', 'db', 'migrations');
@@ -6370,35 +6752,6 @@ function setup() {
 function cleanup(db, close, dataDir) {
   close();
   rmSync(dataDir, { recursive: true, force: true });
-}
-
-function call(app, method, path, { token = null, body = null } = {}) {
-  return new Promise((resolve) => {
-    const chunks = body ? [Buffer.from(JSON.stringify(body))] : [];
-    const headers = {};
-    if (token) headers.cookie = `hk_session=${token}`;
-    if (body) headers['content-type'] = 'application/json';
-    const req = {
-      method,
-      url: path,
-      headers,
-      async *[Symbol.asyncIterator]() {
-        for (const c of chunks) yield c;
-      },
-      on() {},
-    };
-    const res = {
-      statusCode: 200,
-      headers: {},
-      body: '',
-      writeHead(status, h) { this.statusCode = status; this.headers = h || {}; },
-      end(payload) {
-        if (payload) this.body = payload.toString();
-        resolve({ status: this.statusCode, headers: this.headers, body: this.body });
-      },
-    };
-    app.handle(req, res);
-  });
 }
 
 test('端到端：工作流 → 任务 → 领取 → 完成 → 同步三池 → 公开 API 拉榜单', async () => {
@@ -6495,6 +6848,192 @@ test('端到端：工作流 → 任务 → 领取 → 完成 → 同步三池 �
 
   cleanup(db, close, dataDir);
 });
+
+// ── 以下为 P5 Task 6 实跑后补齐的用例（计划原块只覆盖后端闭环，
+//    前端任务清单页与 web/app.js 的接线**零覆盖**）──
+
+const TASKS = [
+  { id: 't1', title: '没人领的任务', detail: '', status: 'todo', claim: null },
+  { id: 't2', title: '我领的', detail: '细节', status: 'in_progress', claim: { userId: 'u_a', teamId: 'tm_1' } },
+  { id: 't3', title: '别人领的', detail: '', status: 'in_progress', claim: { userId: 'u_b', teamId: 'tm_2' } },
+  { id: 't4', title: '做完了', detail: '', status: 'done', claim: { userId: 'u_a', teamId: 'tm_1' }, completedAt: '2026-10-12T00:00:00.000Z' },
+];
+
+test('★ 三段分类：可领取的 / 我领取的 / 已完成的', () => {
+  const s = classifyTasks(TASKS, 'u_a');
+  assert.deepEqual(s.claimable.map((t) => t.id), ['t1']);
+  assert.deepEqual(s.mine.map((t) => t.id), ['t2', 't3']);
+  assert.deepEqual(s.done.map((t) => t.id), ['t4']);
+});
+
+test('★ 前端不做可见性过滤：每个任务都落进且只落进一段，一个都不丢', () => {
+  // ⛔ 「前端隐藏 = 数据已泄露」—— 可见性在 API 层完成。
+  //    前端只能**重新分桶**，不能少给一条：少给一条 = 用户看不到自己有权看的任务。
+  const s = classifyTasks(TASKS, 'u_a');
+  assert.equal(s.claimable.length + s.mine.length + s.done.length, TASKS.length);
+  const ids = [...s.claimable, ...s.mine, ...s.done].map((t) => t.id).sort();
+  assert.deepEqual(ids, TASKS.map((t) => t.id).sort());
+  // 换个登录人，分桶跟着变，但**条数不变**
+  const other = classifyTasks(TASKS, 'u_b');
+  assert.equal(other.claimable.length + other.mine.length + other.done.length, TASKS.length);
+});
+
+test('★ 任务模式：未领=可领取 / 本人领=mine / 他人领=taken / 已完成=done', () => {
+  assert.equal(taskMode(TASKS[0], 'u_a'), 'claimable');
+  assert.equal(taskMode(TASKS[1], 'u_a'), 'mine');
+  assert.equal(taskMode(TASKS[2], 'u_a'), 'taken');
+  assert.equal(taskMode(TASKS[3], 'u_a'), 'done');
+  assert.equal(taskMode(TASKS[2], 'u_b'), 'mine', '同一个人看自己的任务就是 mine');
+});
+
+test('★ R-OPS-14：任务只有一个入口 —— 自主领取；⛔ 没有任何指派 / 按岗位分工的操作', () => {
+  assert.deepEqual(taskActions(TASKS[0], 'u_a'), ['claim'], '未领取的任务只有「自主领取」');
+  assert.deepEqual(taskActions(TASKS[1], 'u_a'), ['complete', 'release'], '本人领的：可提交完成 / 可释放');
+  assert.deepEqual(taskActions(TASKS[2], 'u_a'), [], '别人领的：不可动');
+  assert.deepEqual(taskActions(TASKS[3], 'u_a'), [], '已完成的：不可动');
+  // ⛔ 白名单：任何模式下都不得出现「指派 / 按岗位」类操作
+  const allowed = new Set(['claim', 'complete', 'release']);
+  for (const t of TASKS) {
+    for (const me of ['u_a', 'u_b', null]) {
+      for (const a of taskActions(t, me)) {
+        assert.ok(allowed.has(a), `出现了计划外的操作「${a}」`);
+      }
+    }
+  }
+});
+
+test('★ 视图源码里没有任何指派 / 岗位控件（剥掉注释后扫）', () => {
+  const src = stripComments(readFileSync(join(here, '..', 'web', 'views', 'tasks.js'), 'utf8'));
+  for (const word of ['指派', 'assign', 'Assign', '岗位分工', '<select', 'role=']) {
+    assert.equal(
+      src.includes(word),
+      false,
+      `任务清单页不得出现「${word}」（R-OPS-14：任务只能自主领取）`,
+    );
+  }
+});
+
+test('★ 行内容：标题与详情必须转义（innerHTML 插值 = 存储型 XSS）', () => {
+  const evil = '<img src=x onerror=alert(1)>';
+  const html = buildTaskItem({ id: 't', title: evil, detail: evil, status: 'todo', claim: null }, 'u_a');
+  assert.equal(html.includes(evil), false, `原始 payload 不得出现在 HTML 里：${html}`);
+  assert.equal(/<img/i.test(html), false, `不得出现真实的 <img> 标签：${html}`);
+  assert.ok(html.includes('&lt;img'), `payload 必须被转义：${html}`);
+});
+
+test('★ 行内容：已完成的任务显示完成时间；无人领取的显示「无人领取」', () => {
+  const doneHtml = buildTaskItem(TASKS[3], 'u_a');
+  assert.ok(doneHtml.includes('完成于'), doneHtml);
+  assert.ok(doneHtml.includes('2026-10-12T00:00:00.000Z'), doneHtml);
+  const freeHtml = buildTaskItem(TASKS[0], 'u_a');
+  assert.ok(freeHtml.includes('无人领取'), freeHtml);
+  const takenHtml = buildTaskItem(TASKS[2], 'u_a');
+  assert.ok(takenHtml.includes('领取人：u_b'), takenHtml);
+});
+
+test('★ 三段的行内容由同一套纯函数产出（视图与断言不会各写一套）', () => {
+  const sections = buildTaskSections(TASKS, 'u_a');
+  assert.ok(sections.claimable.includes('没人领的任务'), sections.claimable);
+  assert.ok(sections.mine.includes('我领的'), sections.mine);
+  assert.ok(sections.mine.includes('别人领的'), sections.mine);
+  assert.ok(sections.done.includes('做完了'), sections.done);
+  assert.equal(sections.claimable.includes('做完了'), false, '已完成的任务不得出现在「可领取的」里');
+});
+
+// ── 前端接线：web/app.js 注册了 /tasks/:workflowId 且把路由参数透传给视图 ──
+
+/** 最小 DOM 桩（同 test/web.test.js 的做法）：够 web/app.js + 任务清单页跑起来 */
+function installDom(hash, tasks = []) {
+  const calls = [];
+  const makeEl = (tag = 'div') => {
+    const el = {
+      tagName: tag,
+      className: '',
+      innerHTML: '',
+      textContent: '',
+      value: '',
+      placeholder: '',
+      id: '',
+      children: [],
+      listeners: {},
+      appendChild(child) { el.children.push(child); return child; },
+      replaceChildren(...kids) { el.children = kids; },
+      addEventListener(evt, fn) { el.listeners[evt] = fn; },
+      querySelector(sel) {
+        el.__sels = el.__sels ?? {};
+        if (!el.__sels[sel]) el.__sels[sel] = makeEl();
+        return el.__sels[sel];
+      },
+      querySelectorAll() { return []; },
+    };
+    return el;
+  };
+  const appEl = makeEl('div');
+  globalThis.window = {
+    location: { search: '', hash },
+    addEventListener: () => {},
+  };
+  globalThis.document = {
+    createElement: (tag) => makeEl(tag),
+    getElementById: () => appEl,
+  };
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url, method: init?.method ?? 'GET', body: init?.body });
+    const body = url === '/api/me'
+      ? { user: { id: 'u_a', name: '甲' } }
+      : { tasks };
+    return { ok: true, status: 200, text: async () => JSON.stringify(body) };
+  };
+  return { calls, appEl };
+}
+
+test('★ web/app.js 注册了 /tasks/:workflowId 且把 workflowId 透传给视图', async () => {
+  const { calls, appEl } = installDom('#/tasks/wf_123');
+  // ?v=tag → 每个用例一个独立的 app.js 模块实例（ESM 只求值一次）
+  await import(`../web/app.js?v=taskroute`);
+  await new Promise((r) => setTimeout(r, 30));
+  assert.ok(
+    calls.some((c) => c.url === '/api/workflows/wf_123/tasks'),
+    `路由必须把 workflowId 透传给视图，实际请求：${JSON.stringify(calls)}`,
+  );
+  // 页面骨架：三段标题都在
+  const html = appEl.children?.[0]?.innerHTML ?? '';
+  assert.ok(html.includes('可领取的'), `页面必须有「可领取的」段：${html}`);
+  assert.ok(html.includes('我领取的'), `页面必须有「我领取的」段：${html}`);
+  assert.ok(html.includes('已完成的'), `页面必须有「已完成的」段：${html}`);
+});
+
+test('★ 任务清单页的 DOM 接线：无人领取的任务挂「自主领取」按钮，点它发 POST /api/tasks/<id>/claim', async () => {
+  const { calls, appEl } = installDom('#/tasks/wf_123', [
+    { id: 't1', title: '没人领的任务', detail: '', status: 'todo', claim: null },
+  ]);
+  await import(`../web/app.js?v=claimbtn`);
+  await new Promise((r) => setTimeout(r, 30));
+  const wrap = appEl.children?.[0];
+  const list = wrap?.querySelector('#task-claimable');
+  const li = list?.children?.[0];
+  assert.ok(li, '「可领取的」段里应有任务行');
+  const btn = li.children.find((c) => c.textContent === '自主领取');
+  assert.ok(
+    btn,
+    `任务行里应有「自主领取」按钮，实际子节点：${JSON.stringify(li.children.map((c) => c.textContent))}`,
+  );
+  await btn.listeners.click();
+  const post = calls.find((c) => c.method === 'POST');
+  assert.ok(post, `点「自主领取」必须发 POST，实际调用：${JSON.stringify(calls)}`);
+  assert.equal(post.url, '/api/tasks/t1/claim');
+});
+
+test('★ 没有登记 /tasks/:workflowId 的路由 → 渲染「页面不存在」（反向对照：上面的用例不是恒绿）', async () => {
+  const { calls } = installDom('#/no-such-page');
+  await import(`../web/app.js?v=notasks`);
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(
+    calls.some((c) => c.url.includes('/api/workflows/')),
+    false,
+    `未知路由不得触发任务清单请求，实际请求：${JSON.stringify(calls)}`,
+  );
+});
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -6506,9 +7045,92 @@ Expected: FAIL —— `POST /api/workflows` 返回 404（`src/http/routes/workfl
 
 ```javascript
 // web/views/tasks.js — 任务清单页
-// 依据：设计文档 §9 前端信息架构「赛段与任务清单 + 自主领取任务」；R-OPS-13 / R-OPS-14
-// R-OPS-14：页面只有「自主领取」一个入口，⛔ 不出现"指派给某人""按岗位分工"这类控件。
-// ⚠️ 前端不做可见性过滤：过滤在 API 层完成（前端隐藏 = 数据已泄露）。
+// 依据：设计文档 §9 前端信息架构「赛段与任务清单 + 自主领取任务」；INTERFACES.md §6 的 P5 API 清单
+// 溯源：R-OPS-13（任务清单工作流拆解：任务包 → 工作流 → 任务清单 → 队员自主领取任务完成）
+// 溯源：R-OPS-14（禁止岗位制：严禁按岗位和身份分工，任务只能自主领取）
+//
+// ⛔ R-OPS-14：页面上任务**只有「自主领取」一个入口** —— 不出现「指派给某人」「按岗位分工」这类控件。
+//    这是【刻意的功能缺失】，不是遗漏（探月黑客松因岗位制失败：忙的忙死、闲的闲死、最后一个人说了算）。
+//    唯一的取任务路径：POST /api/tasks/:id/claim（自主领取）。
+//
+// ⚠️ 前端**不做任何可见性过滤**：过滤在 API 层完成 —— 前端隐藏 = 数据已泄露。
+//    ⇒ 本视图把 API 返回的任务**原样分桶**呈现，一个都不丢（见 classifyTasks 的分桶恒等式）。
+//
+// ⚠️ 为什么把分类与操作抽成**纯函数**（与 web/views/team.js 的 buildTeamCards 同款做法）：
+//    如果「三段怎么分」「这个任务能做什么」只写在 DOM 回调里，
+//    就没有任何东西能断言「页面没有指派控件」—— 把分类逻辑改掉，全量测试照样全绿。
+//    抽成纯函数后，这两条**渲染路径**能被直接断言（见 test/workflow-e2e.test.js）。
+import { escapeHtml } from '../escape.js';
+
+/**
+ * 任务的展示模式（纯函数）。
+ * - claimable：无人领取 → 可自主领取
+ * - mine：本人领取 → 可提交完成 / 可释放
+ * - taken：他人领取 → 不可动
+ * - done：已完成
+ */
+export function taskMode(t, me) {
+  if (!t) return 'claimable';
+  if (t.status === 'done') return 'done';
+  if (!t.claim) return 'claimable';
+  return t.claim.userId === me ? 'mine' : 'taken';
+}
+
+/**
+ * 三段分类（纯函数）：可领取的 / 我领取的 / 已完成的。
+ *
+ * ⚠️ **分桶恒等**：每个任务恰好落进一段，一个都不丢 ——
+ *    这是「前端不做可见性过滤」的**可断言形式**：前端只重新分桶，不隐藏任何一条。
+ */
+export function classifyTasks(tasks, me) {
+  const out = { claimable: [], mine: [], done: [] };
+  for (const t of tasks ?? []) {
+    const mode = taskMode(t, me);
+    if (mode === 'done') out.done.push(t);
+    else if (mode === 'claimable') out.claimable.push(t);
+    else out.mine.push(t);
+  }
+  return out;
+}
+
+/**
+ * 某个任务当前**允许的操作**（纯函数）。
+ * ⛔ 只有三种：自主领取 / 提交完成 / 释放。**没有**指派、按岗位分配之类的操作。
+ */
+export function taskActions(t, me) {
+  const mode = taskMode(t, me);
+  if (mode === 'claimable') return ['claim'];
+  if (mode === 'mine') return ['complete', 'release'];
+  return [];
+}
+
+/**
+ * 单行任务的静态内容 HTML（纯函数，不碰 document）。
+ * ⚠️ 服务端返回的标题/详情必须转义 —— innerHTML 插值 = 存储型 XSS（设计文档 §14.2 / P0 终审 I-2）。
+ */
+export function buildTaskItem(t, me) {
+  const mode = taskMode(t, me);
+  const who = t?.claim ? `领取人：${t.claim.userId}` : '无人领取';
+  const parts = [
+    `<span class="task-title">${escapeHtml(t?.title)}</span>`,
+    `<span class="task-meta">${escapeHtml(t?.detail || '')} · ${escapeHtml(who)} · 状态 ${escapeHtml(t?.status)}</span>`,
+  ];
+  if (mode === 'done') {
+    parts.push(`<span class="task-meta">完成于 ${escapeHtml(t?.completedAt || '')}</span>`);
+  }
+  return parts.join('');
+}
+
+/**
+ * 三段的行内容 HTML（纯函数）：{ claimable, mine, done }。
+ * 段标题写死在 renderTasks 的骨架里（可领取的 / 我领取的 / 已完成的）。
+ */
+export function buildTaskSections(tasks, me) {
+  const s = classifyTasks(tasks, me);
+  const rows = (list) => list.map((t) => buildTaskItem(t, me)).join('');
+  return { claimable: rows(s.claimable), mine: rows(s.mine), done: rows(s.done) };
+}
+
 export function renderTasks(ctx) {
   const { api } = ctx;
   const wrap = document.createElement('div');
@@ -6542,111 +7164,87 @@ export function renderTasks(ctx) {
     errBox.textContent = message || '';
   }
 
-  function reload() {
-    return load();
-  }
-
   async function load() {
     showError('');
     try {
       const res = await api.get(`/api/workflows/${encodeURIComponent(workflowId)}/tasks`);
       const tasks = res.tasks ?? [];
       const me = ctx.getState?.().user?.id ?? null;
+      const sections = classifyTasks(tasks, me);
       listClaimable.replaceChildren();
       listMine.replaceChildren();
       listDone.replaceChildren();
-
-      for (const t of tasks) {
-        if (t.status === 'done') {
-          listDone.appendChild(renderTask(t, 'done', me));
-        } else if (t.claim && t.claim.userId === me) {
-          listMine.appendChild(renderTask(t, 'mine', me));
-        } else if (!t.claim) {
-          listClaimable.appendChild(renderTask(t, 'claimable', me));
-        } else {
-          listMine.appendChild(renderTask(t, 'taken', me));
-        }
-      }
+      for (const t of sections.claimable) listClaimable.appendChild(renderTask(t, me));
+      for (const t of sections.mine) listMine.appendChild(renderTask(t, me));
+      for (const t of sections.done) listDone.appendChild(renderTask(t, me));
     } catch (e) {
       showError(e.message || '加载任务清单失败');
     }
   }
 
-  function renderTask(t, mode, me) {
+  function renderTask(t, me) {
     const li = document.createElement('li');
-    li.className = `task task-${mode}`;
-    const who = t.claim ? `领取人：${t.claim.userId}` : '无人领取';
-    li.innerHTML = `
-      <span class="task-title">${escapeHtml(t.title)}</span>
-      <span class="task-meta">${escapeHtml(t.detail || '')} · ${escapeHtml(who)} · 状态 ${escapeHtml(t.status)}</span>
-    `;
+    li.className = `task task-${taskMode(t, me)}`;
+    li.innerHTML = buildTaskItem(t, me);
 
-    if (mode === 'claimable') {
-      const btn = document.createElement('button');
-      btn.textContent = '自主领取';
-      btn.addEventListener('click', async () => {
-        try {
-          await api.post(`/api/tasks/${encodeURIComponent(t.id)}/claim`, {});
-          await reload();
-        } catch (e) {
-          showError(e.message || '领取失败');
-        }
-      });
-      li.appendChild(btn);
-    }
+    // ⛔ 只按 taskActions 给控件 —— 没有任何指派/岗位类操作可加
+    for (const action of taskActions(t, me)) {
+      if (action === 'claim') {
+        const btn = document.createElement('button');
+        btn.textContent = '自主领取';
+        btn.addEventListener('click', async () => {
+          try {
+            await api.post(`/api/tasks/${encodeURIComponent(t.id)}/claim`, {});
+            await load();
+          } catch (e) {
+            showError(e.message || '领取失败');
+          }
+        });
+        li.appendChild(btn);
+      }
 
-    if (mode === 'mine') {
-      const url = document.createElement('input');
-      url.placeholder = '可运行产物链接（如仓库地址）';
-      const ver = document.createElement('input');
-      ver.placeholder = '版本号（如 v0.1）';
-      const done = document.createElement('button');
-      done.textContent = '提交完成状态';
-      done.addEventListener('click', async () => {
-        try {
-          await api.post(`/api/tasks/${encodeURIComponent(t.id)}/complete`, {
-            evidence: {
-              kind: 'runnable',
-              summary: url.value.trim() ? `已提交可运行版本 ${ver.value.trim() || '未标注版本'}` : '已提交可运行版本',
-              artifactUrl: url.value.trim(),
-              version: ver.value.trim(),
-            },
-          });
-          await reload();
-        } catch (e) {
-          showError(e.message || '提交失败');
-        }
-      });
-      const release = document.createElement('button');
-      release.textContent = '释放任务';
-      release.addEventListener('click', async () => {
-        try {
-          await api.post(`/api/tasks/${encodeURIComponent(t.id)}/release`, {});
-          await reload();
-        } catch (e) {
-          showError(e.message || '释放失败');
-        }
-      });
-      li.appendChild(url);
-      li.appendChild(ver);
-      li.appendChild(done);
-      li.appendChild(release);
-    }
-
-    if (mode === 'done') {
-      const at = document.createElement('span');
-      at.className = 'task-meta';
-      at.textContent = `完成于 ${t.completedAt || ''}`;
-      li.appendChild(at);
+      if (action === 'complete') {
+        const url = document.createElement('input');
+        url.placeholder = '可运行产物链接（如仓库地址）';
+        const ver = document.createElement('input');
+        ver.placeholder = '版本号（如 v0.1）';
+        const done = document.createElement('button');
+        done.textContent = '提交完成状态';
+        done.addEventListener('click', async () => {
+          try {
+            await api.post(`/api/tasks/${encodeURIComponent(t.id)}/complete`, {
+              evidence: {
+                kind: 'runnable',
+                summary: url.value.trim()
+                  ? `已提交可运行版本 ${ver.value.trim() || '未标注版本'}`
+                  : '已提交可运行版本',
+                artifactUrl: url.value.trim(),
+                version: ver.value.trim(),
+              },
+            });
+            await load();
+          } catch (e) {
+            showError(e.message || '提交失败');
+          }
+        });
+        const release = document.createElement('button');
+        release.textContent = '释放任务';
+        release.addEventListener('click', async () => {
+          try {
+            await api.post(`/api/tasks/${encodeURIComponent(t.id)}/release`, {});
+            await load();
+          } catch (e) {
+            showError(e.message || '释放失败');
+          }
+        });
+        li.appendChild(url);
+        li.appendChild(ver);
+        li.appendChild(done);
+        li.appendChild(release);
+      }
     }
 
     return li;
-  }
-
-  function escapeHtml(value) {
-    return String(value ?? '').replace(/[&<>"']/g, (c) => ({
-      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-    }[c]));
   }
 
   load();
@@ -6658,29 +7256,38 @@ export function renderTasks(ctx) {
 
 在导入区加一行：
 
+`web/app.js`（导入行 · 核验锚点）
+
 ```javascript
 import { renderTasks } from './views/tasks.js';
 ```
 
-在 `route('/', ...)` 附近加一行：
+在既有路由注册之后追加一行（⛔ 必须在文件末尾的 `render()` **之前** —— 否则首屏路由匹配不到，
+页面会先渲染一次「页面不存在」）：
+
+`web/app.js`（路由注册行 · 核验锚点）
 
 ```javascript
-route('/tasks/:workflowId', (ctx) => renderTasks(ctx));
+route('/tasks/:workflowId', (c) => renderTasks(c));
 ```
 
-把 `const el = await found.view(ctx);` 改成：
+⚠️ **这一步 P0 终态已经做过了**：`web/app.js` 的 `render()` 里**已经**是
+`found.view({ ...ctx, params: found.params, query: currentQuery() })` —— 路由参数 `params` 与 `query` 都已透传。
+**本步不需要再改这一行**；下面这行是**核验用**（实现里必须逐字是它）：
+
+`web/app.js`（render() 透传行 · 核验锚点）
 
 ```javascript
-      const el = await found.view({ ...ctx, params: found.params });
+    const el = await found.view({ ...ctx, params: found.params, query: currentQuery() });
 ```
 
 - [ ] **Step 5: 运行测试确认通过**
 
-Run: `cd platform && node --test test/workflow-e2e.test.js`
-Expected: PASS（1 个端到端用例通过）
+Run: `cd platform && node --disable-warning=ExperimentalWarning --test test/workflow-e2e.test.js`
+Expected: PASS（**12** 个用例全过：workflow-e2e.test.js 12）
 
-Run: `cd platform && node --test`
-Expected: 全部通过
+Run: `cd platform && node --disable-warning=ExperimentalWarning --test`
+Expected: 全部通过（P0–P5 累计：**1119** 例 / 通过 1118 / 失败 0 / 跳过 1）
 
 - [ ] **Step 6: 人工验收任务清单页**
 
@@ -6693,12 +7300,13 @@ Expected: 页面分三段显示「可领取的 / 我领取的 / 已完成的」�
 - [ ] **Step 7: 提交**
 
 ```bash
-cd platform && git add web/views/tasks.js web/app.js test/workflow-e2e.test.js
+git add platform/web/views/tasks.js platform/web/app.js platform/test/workflow-e2e.test.js
 git commit -m "feat(P5): 任务清单前端页 + 端到端验收（工作流→任务→领取→完成→同步→公开榜）
 
 对应 R-OPS-13 / R-OPS-14 / R-POOL-01~04 / R-RNK-10：
 - 页面只有自主领取入口，无任何按岗位指派的控件
-- 端到端跑通公开 API 拉榜，D 段队伍不公示"
+- 端到端跑通公开 API 拉榜，D 段队伍不公示" -- \
+  platform/web/views/tasks.js platform/web/app.js platform/test/workflow-e2e.test.js
 ```
 
 ---
@@ -7695,3 +8303,252 @@ test('computePersonalPoints：无 userId 的条目不参与累加；口径外的
 | `platform/src/server.js` | Modify（P0 建立，**本 Task 只追加**） | 导入段 + 3 条路由挂载 + `__rawText` 原文响应分支；I7-4 块**整段保留** |
 | `platform/test/public-api.test.js` | **新建**（P5） | 55 例（服务层 25 + HTTP 层 30） |
 | `docs/superpowers/plans/2026-10-20-platform-P5-workflow-pools.md` | Modify | Task 4 代码块逐字回写 + 本章台账 |
+
+---
+
+## P5 Task 5 实施台账（2026-10-21）
+
+> 执行者：P5 Task 5 实现 Agent。**规格 = 本计划 Task 5 章节**（唯一权威）。
+> 本台账记七件事：① 实施方法（先跑后派）；② 规格缺陷与处置；③ 逐字回写位置；
+> ④ 实跑证据；⑤ 变异检验；⑥ 计划块逐字核验；⑦ 遗留需上游注意；⑧ 改动文件清单。
+> **落盘文件与本计划 Task 5 的代码块逐字一致**（核验脚本见 T5-F）。
+>
+> **溯源 ID 订正**：派单时给的「R-PTS-08」有误 —— R-PTS-08 是「行为分 ≤10% 且只做垫底排序」，
+> 与日历无关。iCal 导出赛程日历的正确落点是 **R-STG-01（5 赛段时间轴与交付物）**
+> （`docs/requirements-traceability.md:41` 全表里没有独立的「日历订阅」条目）。
+> 已按上游订正写成 `// R-STG-01：赛段时间轴（iCal 导出）—— 依据 INTERFACES.md §6 / 设计文档 §8`。
+
+### T5-A 实施方法（先跑后派：规格改动必须先在独立工程实跑通过）
+
+| 步骤 | 动作 | 证据 |
+|---|---|---|
+| A-1 | 把 Task 5 的 **7 个围栏代码块**抽到独立工程 `/tmp/p5-t5/`（`extract.mjs` 按块号落盘，保留计划行号） | `/tmp/p5-t5/blocks/00..06-*.txt` |
+| A-2 | 独立工程 = `cp -R` worktree 的 `platform/` ⇒ `/tmp/p5-t5/platform`（**不在仓库里试错**） | — |
+| A-3 | **Step 2 期望失败实跑**：只落测试块 → `node --disable-warning=ExperimentalWarning --test test/icalendar.test.js` | `Error [ERR_MODULE_NOT_FOUND]: Cannot find module '/private/tmp/p5-t5/platform/src/domain/icalendar.js' imported from .../test/icalendar.test.js`（与计划 Expected 逐字一致） |
+| A-4 | 落 4 个实现块（领域层 / 服务层追加 / 路由追加 / 路由导入） | 见 T5-B 的实跑缺陷 |
+| A-5 | 规格缺陷**先在独立工程里修好并跑通**，再把修正内容**逐字回写**计划对应代码块 | T5-C |
+| A-6 | 独立工程全量绿（1101 例 / 失败 0）后，才把文件落进 worktree | `/tmp/p5-t5/platform` → worktree |
+| A-7 | 变异检验在 **`cp -R` 副本** `/tmp/p5-mutate/t5work` 上跑（变异会改文件 ⇒ 绝不能污染 worktree）；变异脚本**不进仓库** | `/tmp/p5-mutate/t5.mjs` |
+
+> ⛔ **A-3 的顺序纪律**：先跑「Step 2 期望失败」，再落实现 —— 否则「测试通过」不能证明
+> 「测试对被测行为有判别力」。
+
+### T5-B 规格缺陷清单
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| T5-C1 | **Important** | Step 5 的路由导入行**相对深度错了一层**：计划写 `from '../services/public-api.js'`，但文件在 `src/http/routes/` ⇒ 解析到 `src/http/services/public-api.js`（不存在）。**与 Task 4 的 T4-C1 同款**（计划作者按 `src/services/` 的深度写，而文件在 `src/http/routes/`） | 把计划块**逐字**落盘后跑全量，当场红 **13 个测试文件**：`Error [ERR_MODULE_NOT_FOUND]: Cannot find module '/private/tmp/p5-t5/platform/src/http/services/public-api.js' imported from .../src/http/routes/public.js` | 改为 `../../services/public-api.js`（与 P1/P2 既有路由文件 `src/http/routes/team.js:3-6` **逐字同款**）；**回写计划 Step 5 的导入块** |
+| T5-C2 | **Important** | 计划的测试块**只覆盖领域层与服务层**（8 例）⇒ 本 Task 新建的 **`GET /api/public/calendar.ics` 路由零覆盖**（与 Task 4 的 T4-C2 同款病根：机制写下来了，测试却没接线）。零覆盖 ⇒ 路由的 token 鉴权、`__rawText` 原文响应、`Content-Type`、CRLF 是否被 JSON 转义 —— 全部没有回归保护 | 变异检验实测：路由相关变异体（`T5-M45`…`T5-M50`）在原 8 例下**全体存活** | 补测：测试块 **8 → 29 例**（领域层 13 + 服务层 3 + HTTP 层 13）。补的判别性数据：赛段名含 `,` `;` `\`、超长中文赛段名（触发服务层折叠）、跨届期 token / 过期 token / scope 不符、无赛段届期（200 + 空集）、企业名不外泄 |
+| T5-C3 | Minor | Step 2 / Step 6 的测试命令缺 `--disable-warning=ExperimentalWarning`（`package.json` 四个 scripts 都带这个 flag，计划里是旧口径） | — | 两处补上 |
+| T5-C4 | Minor | Step 7 的提交命令**没有 `-- <paths…>` 显式路径**，且 `git add` 给的是 `src/…` 相对路径（在 `platform/` 目录下执行时才对，但与本项目「从仓库根 + 显式路径」的纪律不符） | 本项目提交纪律（见 T1-1 C-8 / T4-C3） | 改为从仓库根执行的逐文件显式路径 + `--` |
+| T5-C5 | Minor | Step 6 的 Expected 写「8 个测试全过」，与补测后的实际数字不符 | 实跑 29 例 / 全量 1105 例 | 回写为 `29` / `1105`（见 T5-C 的逐字回写位置） |
+| T5-C6 | Minor | **溯源 ID 缺失且派单给的 ID 有误**：计划正文未给 iCal 的溯源 ID；派单提示的 `R-PTS-08` 实为「行为分 ≤10% 且只做垫底排序」（`requirements-traceability.md:103`），与日历无关 | 核对 `docs/requirements-traceability.md` 全表 | 落 `// R-STG-01：赛段时间轴（iCal 导出）—— 依据 INTERFACES.md §6 / 设计文档 §8`（`R-STG-01` = 5 赛段时间轴与交付物，`:41`）；**回写计划的三处代码块** |
+| T5-C7 | Minor（知悉） | `buildICalendar` 的 `end: s.ends_at ?? addOneDay(s.starts_at)` 里的 `addOneDay` **在当前 schema 下不可达** —— `stages.ends_at` 是 `TEXT NOT NULL`（`db/migrations/003_review.sql:29`）⇒ `??` 的左操作数恒非空 | 变异检验 `T5-M44`（把 +1 天改成 +2 天）在全表面探针下**无差别**；见证探针（把仓储的 `ends_at` 改成 `NULL AS ends_at`）⇒ base ≠ mutant | **不改代码**：保留作防御（上游若放开 `ends_at` 可空，它立刻生效）；登记为 T5-G-5（不可观测 + 见证成立） |
+| T5-C8 | Minor（知悉） | `URL` 用的是**相对路径**（`/leaderboard?stageId=…`），而 RFC 5545 的 `URL` 属性要求**绝对 URI** | 计划原块如此；`buildICalendar` 的签名里**没有** base URL 参数 | **不改代码**（加 baseUrl 参数会改 `INTERFACES.md` §6 的签名，超出本 Task 范围）；登记为 T5-G-6（若上游要绝对 URL，须先扩签名） |
+| T5-C9 | **Important** | **领域层用了 Node 专属全局 `Buffer`**（`src/domain/icalendar.js` 的 `Buffer.from(text,'utf8')` 与 `bytes.subarray(...).toString('utf8')`）—— 违反「领域层要在**浏览器**里跑同一套引擎」的硬约束 | ① P6 的演示版把 `src/domain/*.js` **原样拷进浏览器产物**（`<out>/src/domain/*.js`）⇒ 浏览器里 `Buffer is not defined` ⇒ 整个模块 **ReferenceError**；② 全仓扫描：`Buffer` 在 `src/domain/**` 里**只此一处**（`src/auth/`、`src/http/` 的 `Buffer` 不在领域层，不受此约束）；③ ⛔ `build-demo.js` 的 `assertDomainIsBrowserSafe` **只查 import 说明符、不查 Node 全局** ⇒ 这类违规它**查不出来** | 改用 **WHATWG Web 标准** `TextEncoder` / `TextDecoder`（Node ≥ 11 起也是全局 ⇒ 两端通用，且**不需要 import 任何 Node 内置模块**）：`ENCODER.encode(text)` 取代 `Buffer.from(text,'utf8')`；`DECODER.decode(bytes.subarray(start,end))` 取代 `bytes.subarray(start,end).toString('utf8')`；encoder/decoder 提到**模块级常量**。⚠️ **多字节回退那段逻辑一个字未动**（diff 实证：只有上述两行字节 API 变化）。补 2 条测试（静态扫描 + 折叠行为）；**回写计划的两处代码块**；变异检验新增 6 个变异体（见 T5-E） |
+
+> **编号说明**：本 Task 的台账条目一律用 `T5-C*` 前缀（Task 1 用裸 `C-*`、Task 2 用 `T2-C*`、
+> Task 3 用 `T3-C*`、Task 3 修复轮用 `T3R-C*`、Task 4 用 `T4-C*`）⇒ **不重号**。
+
+### T5-C 逐字回写位置（计划文档 → 实际文件）
+
+| 计划的代码块 | 实际文件 | 回写内容 |
+|---|---|---|
+| Task 5 Step 1 的测试块（计划行 6010 起） | `platform/test/icalendar.test.js` | 整块替换为 31 例（计划原 8 例**逐字保留** + 23 例新增：21 例首轮 + 2 例 T5-C9 修复轮）；`setup()` 增 `loadRules` + `createApp`（HTTP 层用例需要） |
+| Task 5 Step 3 的领域块（计划行 6455 起） | `platform/src/domain/icalendar.js` | 加 1 行 `// 溯源：R-STG-01…`；**T5-C9 修复轮**：把 `Buffer.from` / `.toString('utf8')` 换成 `TextEncoder` / `TextDecoder`（模块级常量）+ 浏览器安全的注释；**多字节回退逻辑逐字未动** |
+| Task 5 Step 4 的服务追加块（计划行 6510 起） | `platform/src/services/public-api.js` | 仅在 `buildICalendar` 的文档注释里加 1 行 `// 溯源：R-STG-01…` |
+| Task 5 Step 5 的路由导入块（计划行 6552 起） | `platform/src/http/routes/public.js` | **导入深度 `../services/` → `../../services/`**（T5-C1）；**回写计划** |
+| Task 5 Step 5 的路由追加块（计划行 6558 起） | `platform/src/http/routes/public.js` | 仅加 1 行 `// 溯源：R-STG-01…` |
+| **Task 4 Step 3** 的 `src/services/public-api.js` 整文件块（计划行 5443 起） | `platform/src/services/public-api.js` | 同步为 Task 5 之后的终态（250 行）：原 213 行**逐字保留** + Task 5 的 1 行导入 + 追加段 |
+| **Task 4 Step 6** 的 `src/http/routes/public.js` 整文件块（计划行 5831 起） | `platform/src/http/routes/public.js` | 同步为 Task 5 之后的终态（23 行）：原 14 行**逐字保留**（仅导入行按 T5-C1 改）+ Task 5 的路由段 |
+| Task 5 Step 2 / Step 6 / Step 7 的文字 | 计划正文 | 补 `--disable-warning=ExperimentalWarning`；Expected 数字回写；提交命令补 `--` 与显式路径 |
+
+> ⚠️ **为什么 Task 4 的整文件块也要动**：`plan-blocks.mjs` 对「整文件块」要求**逐字等于实现文件全文**。
+> Task 5 是**追加**（文件归属：最早建立者 owns，后续阶段 Modify-追加）⇒ Task 4 的整文件块
+> 若不同步，`plan-blocks.mjs` 就会报 `src/services/public-api.js` / `src/http/routes/public.js`
+> 两处 `整文件块❌不一致`。**Task 5 自己的块仍是片段块**（导入行 / 追加段），与 Task 4 对
+> `src/server.js` 的处理方式同款（Task 4 台账 T4-C6 已记这条纪律）。
+
+### T5-D 实跑证据
+
+| 环节 | 命令 | 结果 |
+|---|---|---|
+| Step 2 期望失败 | `cd platform && node --disable-warning=ExperimentalWarning --test test/icalendar.test.js` | `ERR_MODULE_NOT_FOUND: …/src/domain/icalendar.js` ✅ 与计划 Expected 逐字一致 |
+| 本 Task 单文件 | `cd platform && node --disable-warning=ExperimentalWarning --test test/icalendar.test.js` | **31 例 / 通过 31 / 失败 0 / 跳过 0**（29 例 + T5-C9 修复轮新增 2 例） |
+| **全量** | `cd platform && node --disable-warning=ExperimentalWarning --test` | **1107 例 / 通过 1106 / 失败 0 / 跳过 1**（跳过的 1 例是 P0–P4 既有的） |
+| 禁用表述扫描 | `cd platform && node scripts/audit-scan.js; echo "退出码=$?"` | **退出码 0**（未发现禁用表述） |
+| 计划块核验 | `node /tmp/p3fix/plan-blocks.mjs <计划> platform` | Task 5 的 2 个整文件块 + Task 4 的 2 个被同步的整文件块全部 `✅一致` |
+| 片段核验 | `node /tmp/p4-proof/fragment-check.mjs <计划> platform <4 个文件>` | `核验 4 个片段块，不一致 0 个`（退出码 0） |
+| 按路径核验 | `node /tmp/p3fix/block-by-path.mjs <计划> platform <4 个文件>` | `共核验 4 个文件，不一致 0 个`（退出码 0） |
+
+> ⚠️ 唯一一处「整文件块❌不一致」是 `web/app.js`（计划行 6971，Task 6 的 1 行片段）——
+> **本 Task 之前就已存在**（Task 4 台账 T4-D 已记同样一条），**与本 Task 无关**，由 Task 6 处置。
+>
+> ⚠️ **一次未能复现的偶发失败（诚实记录）**：全量跑的第 1 次出现过 **1 例失败**（当时**未捕获失败用例名**），
+> 随后的 **19 次连续全量跑全部为 1104/0**（本 Task 侧 3 + 6 + 10 次；Task 5 之前的基线 `HEAD` 侧另跑 8 次也全绿）。
+> 候选嫌疑是 `test/db-concurrency.test.js`（**唯一**按墙钟时间断言的用例：`waited >= 300` / `elapsed < 2500`，
+> 且会起 worker 线程）—— 新增一个测试文件会抬高 `node --test` 的并行负载 ⇒ 放大了这个**既有**用例的抖动窗口。
+> **本 Task 未改动 `db-concurrency` 或任何并发/超时相关代码**（只新增 1 个测试文件 + 追加 2 处实现）。
+> 若上游要消除该抖动，须单独收紧 `db-concurrency.test.js` 的时间断言（**不在本轮范围**）。
+
+### T5-E 变异检验（`/tmp/p5-mutate/t5.mjs`，**不进仓库**）
+
+**56 个变异体 → 杀 52 / 真等价 2 / 不可观测 2 / 缺口 0**（锚点命中异常 0 个：每个锚点都恰好命中 1 次）。
+（其中 T5-M51…M56 是 **T5-C9 修复轮**新增的 `TextEncoder`/`TextDecoder` 变异体。）
+
+| 类别 | 编号 | 为什么能判成这一类（**必须有探针差分实证**） |
+|---|---|---|
+| **真等价**（2） | T5-M34 | `if (bytes.length <= ICAL_LINE_MAX_OCTETS) return text;` → `<`：**恰好 75 octet 的行**在两条路径下产出**同一串字节** —— 折叠分支里 `end = min(0+75, 75) = 75`，而回退多字节边界的条件要求 `end < bytes.length`（75 < 75 为假）⇒ 首块就是整行，`start = 75` 后循环结束 ⇒ 恒等。**探针差分实证**：探针覆盖了「恰好 75 octet 且末字符是多字节」（`'x'×72 + '赛'`）等 5 组边界输入 + 全表面快照，base 与 mutant **逐字节相同** |
+| | T5-M56 | `bytes.subarray(start, end)` → `bytes.slice(start, end)`：`subarray` 返回**视图**、`slice` 返回**拷贝** —— 但本模块只把结果**读一次**（`DECODER.decode(...)`）⇒ 两者产出同一串字符串。**探针差分实证**：全表面快照 base 与 mutant **逐字节相同** |
+| **不可观测**（2）<br>（当前 schema/测试集下测不出，但**见证探针证明它会改变行为**） | T5-M08 | `pad(d.getUTCFullYear(), 4)` → `pad(…, 2)`：**见证**（把年份推到 999）⇒ `09990101T000000Z` vs `990101T000000Z` ⇒ base ≠ mutant。正常业务日期（年份 ≥ 1000）下 `padStart` 不截断 ⇒ 恒等 ⇒ 当前测不出 |
+| | T5-M44 | `addOneDay` 的 `+ 86400000` → `+ 172800000`：**见证**（把仓储的 `ends_at` 改成 `NULL AS ends_at`，即「赛段没有结束日期」这个场景）⇒ DTEND 不同 ⇒ base ≠ mutant。当前 `stages.ends_at` 是 `NOT NULL` ⇒ 该分支**不可达** ⇒ 当前测不出（T5-C7） |
+| **杀死**（52） | T5-M01…M56 中其余 52 个 | 覆盖：折叠上限（±1 octet）/ 折叠宽度用满 75 / 续行前导空格 / 续行宽度扣减 / 多字节边界回退 / 转义四类（`\` `,` `;` 换行）与其**顺序** / 年月日时分秒各位 / UTC 与本地时区 / `Z` 后缀 / CRLF 行尾与结尾 CRLF / `now` 必填与「不读时钟」/ 域层纯度（不 import `node:`、不用 `Date.now()`）/ 五个日历头字段 / `UID`·`DTSTAMP`·`DTEND`·`DESCRIPTION`·`LOCATION`·`URL` / `SUMMARY` 转义 / 服务层 `editionId` 必填 / `UID`·`SUMMARY`·`DESCRIPTION`·`DTEND`·`LOCATION`·`X-WR-CALNAME`·`URL` / 路由 `scope`·`届期`·`Content-Type`·`参数透传`·`鉴权`·`路径` / **T5-C9 新增**：`TextEncoder` 编码内容被改·`TextDecoder` 丢掉 `end`·解码器用错编码·**退回 `Buffer`**（浏览器里 ReferenceError）·编码多一个尾随空格 |
+
+**探针差分方法**（`/tmp/p5-mutate/t5.mjs` 内置 `PROBE`）：对「全绿但存活」的变异体，跑一个**全表面快照**——
+领域层（转义 / 折叠 / 时间戳，各 20+ 组输入，含「恰好 75 octet」「末字符是多字节」等边界）
+**+ 服务层**（`buildICalendar` 对 3 个赛段：普通中文 / 含 `,;\` / 超长中文名，产出整份 ics）。
+归一化后与基线**逐字节**比较：相同 ⇒ 等价/不可观测，不同 ⇒ 存活（要归类）。
+⚠️ **第一版探针只覆盖领域层** ⇒ 服务层变异体 `T5-M42`（`DESCRIPTION` 不带赛段代号）被**误判**成「真等价」。
+已把探针扩到服务层，并据此补了一条断言（`DESCRIPTION 必须带赛段代号`）⇒ `T5-M42` 改为**被杀**。
+**见证脚本**：对判为「不可观测」的 2 个变异体，**再叠加一个场景改动**（年份推到 999 / 仓储返回空 `ends_at`），
+证明 base ≠ mutant ⇒ 它们**不是逻辑等价**，只是当前空间测不出。**见证成立 2 / 2**。
+
+### T5-F 计划块逐字核验
+
+| 文件 | 核验结果 |
+|---|---|
+| `platform/test/icalendar.test.js` | 整文件块 ✅一致（435 行） |
+| `platform/src/domain/icalendar.js` | 整文件块 ✅一致（98 行） |
+| `platform/src/services/public-api.js` | 整文件块 ✅一致（250 行；Task 4 的块已同步为终态） |
+| `platform/src/http/routes/public.js` | 整文件块 ✅一致（23 行；Task 4 的块已同步为终态） |
+
+### T5-G 遗留需上游注意
+
+| # | 事项 | 说明 |
+|---|---|---|
+| G-1 | **`addOneDay` 在当前 schema 下不可达** | `stages.ends_at` 是 `TEXT NOT NULL`（`db/migrations/003_review.sql:29`）⇒ `s.ends_at ?? addOneDay(s.starts_at)` 的右操作数恒不生效。保留作防御（上游若放开 `ends_at` 可空，它立刻生效）。**不要**因为「看起来没用」就删掉它（T5-C7 / 变异体 `T5-M44` 见证成立） |
+| G-2 | **iCal 的 `URL` 是相对路径** | RFC 5545 的 `URL` 属性要求**绝对 URI**，本实现给的是 `/leaderboard?stageId=…`（没有 base URL 可拼）。主流客户端会忽略这条属性，**不影响订阅**；若上游要绝对 URL，须先给 `buildICalendar` 扩 `baseUrl` 参数（会动 `INTERFACES.md` §6 的签名 ⇒ 须上游裁决） |
+| G-3 | **`.ics` 路由的 `editionId` 必填** | 契约没有「当届期」的默认解析口径（本 Task 未擅自引入）⇒ 不传 `editionId` 返回 400 `EDITION_REQUIRED`。若上游希望「不传即当届」，须在 `src/http/routes/public.js` 里接 `pickCurrentEdition`（P0/P1 已有该函数）—— **本轮不改**（会引入新的口径） |
+| G-4 | **公开 token 走 query 串**（沿用 Task 4 的 G-5） | `GET /api/public/calendar.ics?editionId=…&token=…` ⇒ token 会进 nginx 访问日志。P6 部署时须在 nginx 层关掉 query 串访问日志 |
+| G-5 | `resolvePublicToken` 的 `requiredScope: 'calendar'` | `rules/pools.json` 的 `publicScopes` 含 `calendar` ⇒ 可签发日历专用令牌；`scope='all'` 的令牌同样可用（`resolvePublicToken` 放行 `all`） |
+| G-6 | **`X-WR-CALNAME` 取届期名** | 届期名含中文与 `·` 等字符时按 RFC 5545 的 TEXT 规则转义（`escapeICalText`）；`·` 不在需转义之列 ⇒ 原样输出 |
+| G-7 | **iCal 不泄露企业名与内部身份** | 公开日历只含赛段时间轴（赛段名/代号/赛点/榜单跳转），**不含**企业名、任务包标题、用户 id —— 有专门用例守着 |
+| G-8 | **`build-demo.js` 的 `assertDomainIsBrowserSafe` 只查 import 说明符，不查 Node 专属全局** | ⛔ 本仓的领域层硬约束是「**不得 import 任何 Node 内置模块**（P6 的演示版要在浏览器里跑同一套引擎）」，但该检查器只看 `import … from 'node:…'` ⇒ **`Buffer` / `process.` / `require(` / `__dirname` 这类 Node 专属全局它查不出来**（T5-C9 就是这样溜进去的）。`build-demo.js` 属 P6 Task 6 的文件（**本轮未改**）⇒ **建议上游把检查范围扩到 Node 全局**，并把本轮补的静态扫描（`test/icalendar.test.js` 的「★ 领域层不含 Node 专属全局」）推广到整个 `src/domain/**`（现已覆盖该目录全部 22 个文件） |
+
+### T5-H 本 Task 改动的文件清单
+
+| 文件 | 性质 | 说明 |
+|---|---|---|
+| `platform/src/domain/icalendar.js` | **新建**（P5） | RFC 5545 纯函数：`escapeICalText` / `formatICalTimestamp` / `foldICalLine` / `buildICalendarText` / `ICAL_LINE_MAX_OCTETS`；⛔ 无 IO、无 `Date.now()`、无 `Math.random()`、`now` 必填；⛔ **无 Node 专属全局**（用 `TextEncoder`/`TextDecoder`，浏览器可跑，T5-C9） |
+| `platform/src/services/public-api.js` | Modify（Task 4 建立，**本 Task 只追加**） | 追加 `buildICalendar` + 1 行导入 + `addOneDay` 私有辅助；原 213 行逐字未改 |
+| `platform/src/http/routes/public.js` | Modify（Task 4 建立，**本 Task 只追加**） | 追加 `GET /api/public/calendar.ics`（token 鉴权 + `__rawText` 原文响应）；导入行按 T5-C1 修正深度 |
+| `platform/test/icalendar.test.js` | **新建**（P5） | 31 例（领域层 15 + 服务层 3 + HTTP 层 13） |
+| `docs/superpowers/plans/2026-10-20-platform-P5-workflow-pools.md` | Modify | Task 5 代码块逐字回写 + Task 4 两处整文件块同步为终态 + 本章台账 |
+
+---
+
+## P5 Task 6 实施台账（2026-10-21）
+
+> 执行者：P5 Task 6 实现 Agent。**规格 = 本计划 Task 6 章节**（唯一权威）。
+> 本台账记七件事：① 实施方法（先跑后派）；② 规格缺陷与处置；③ 逐字回写位置；
+> ④ 实跑证据；⑤ 变异检验；⑥ 计划块逐字核验；⑦ 遗留需上游注意；⑧ 改动文件清单。
+> **落盘文件与本计划 Task 6 的代码块逐字一致**（核验脚本见 T6-F）。
+>
+> **溯源**：`R-OPS-13`（任务清单工作流拆解：任务包 → 工作流 → 任务清单 → 队员自主领取任务完成）
+> ＋ `R-OPS-14`（禁止岗位制：严禁按岗位和身份分工，任务只能自主领取）。
+
+### T6-A 实施方法（先跑后派：规格改动必须先在独立工程实跑通过）
+
+| 步骤 | 动作 | 证据 |
+|---|---|---|
+| A-1 | 把 Task 6 的 **6 个围栏代码块**抽到独立工程 `/tmp/p5-t6/`（`extract.mjs` 按块号落盘，保留计划行号） | `/tmp/p5-t6/blocks/00..05-*.txt` |
+| A-2 | 独立工程 = `cp -R` worktree 的 `platform/` ⇒ `/tmp/p5-t6/platform`（**不在仓库里试错**） | — |
+| A-3 | **Step 2 期望失败实跑**：只落测试块 → `node --disable-warning=ExperimentalWarning --test test/workflow-e2e.test.js` | ⚠️ **没有失败 —— 当场通过（1/1 绿）**：Task 4 已把 workflow 路由挂进 `src/server.js` ⇒ 计划写的 Expected（「`POST /api/workflows` 返回 404」）**不成立**（见 T6-C1） |
+| A-4 | 落 4 个实现块（视图 / app.js 导入 / app.js 路由注册 / app.js 透传） | 见 T6-B 的实跑缺陷 |
+| A-5 | 规格缺陷**先在独立工程里修好并跑通**，再把修正内容**逐字回写**计划对应代码块 | T6-C |
+| A-6 | 独立工程全量绿（1118 例 / 失败 0）后，才把文件落进 worktree | `/tmp/p5-t6/platform` → worktree |
+| A-7 | 变异检验在 **`cp -R` 副本** `/tmp/p5-mutate/t6work` 上跑；变异脚本**不进仓库** | `/tmp/p5-mutate/t6.mjs` |
+
+### T6-B 规格缺陷清单
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| T6-C1 | **Important** | **Step 2 的「期望失败」不成立**：计划写「`POST /api/workflows` 返回 404（`src/http/routes/workflow.js` 未在 `src/server.js` 挂载，或视图文件不存在）」—— 但 Task 4 已经把 `registerWorkflowRoutes` 挂进 `src/server.js`（`src/server.js:187`）⇒ 只落测试块就**当场通过** | 实跑：`# tests 1 / # pass 1 / # fail 0`（计划 Expected 与实跑**相反**） | 回写 Step 2 的 Expected；**更重要的是这个「假失败」暴露了真问题** ⇒ 见 T6-C2 |
+| T6-C2 | **Important** | 计划的测试块**只覆盖后端闭环**（1 例）⇒ **前端交付物零覆盖**：`web/views/tasks.js` 的三段渲染、「无任何指派/岗位控件」、`web/app.js` 注册路由并把 `params` 透传给视图 —— 全都没有测试。与 Task 4 的 T4-C2 / Task 5 的 T5-C2 **同款病根**（机制写下来了，测试却没接线） | P5-10 的判据有两半（「`web/views/tasks.js` 渲染三段」+「端到端闭环」），计划只覆盖了后端那一半 | 补测：测试块 **1 → 12 例**（后端闭环 1 + 视图纯函数 8 + 前端接线 3） |
+| T6-C3 | **Important** | 计划的 `web/views/tasks.js` **只导出 `renderTasks(ctx)`**（依赖 `document`）⇒ 无法测试。本仓前端惯例是「视图导出**纯函数**，DOM 只做接线」—— P1 的 `web/views/team.js` 就导出 `summarizeTeam` / `canLeaveTeam` / `buildTeamCards`（其注释明写「抽成纯函数后，这条**渲染路径**能被直接断言」） | P1 的 `test/p1-frontend.test.js` 直接 import 视图的纯函数断言；计划的视图没有任何可 import 的纯函数 | 抽出 5 个纯函数：`taskMode` / `classifyTasks` / `taskActions` / `buildTaskItem` / `buildTaskSections`；`renderTasks` 只做 DOM 接线（与 `buildTeamCards` 同款做法） |
+| T6-C4 | Minor | 计划的视图里**自建**了一个局部 `escapeHtml` ⇒ 与 `web/escape.js` 重复。该文件头明确写「把转义收成一个工具，所有插值统一走它」 | `web/escape.js:10` | 改为 `import { escapeHtml } from '../escape.js';`（删掉局部副本） |
+| T6-C5 | Minor | Step 4 的第三处改动（「把 `const el = await found.view(ctx);` 改成 `{ ...ctx, params: found.params }`」）**已经是 P0 终态** —— 实际是 `{ ...ctx, params: found.params, query: currentQuery() }` ⇒ 计划块与实现**不一致**（这就是 `plan-blocks.mjs` 长期报 `web/app.js` `整文件块❌不一致` 的那一处；Task 4 台账 T4-D 已记「本 Task 之前就已存在」） | `plan-blocks.mjs` 报 `行 7027 | web/app.js | 整文件块❌不一致`；Task 4 台账 T4-D 明确记了它与 Task 4 无关 | 回写该块为**实现里的真实那一行**（含 `query`），并把 Step 4 的文字从「改成」改为「**已经是终态，本步不用改；下面是核验用**」⇒ **全计划 60 个块现在零不一致** |
+| T6-C6 | Minor | 计划的路由注册写成 `route('/tasks/:workflowId', (ctx) => renderTasks(ctx));` —— 形参 `ctx` **遮蔽**模块级的 `const ctx`（能跑，但与既有 `route('/flags', (c) => renderFlags(c));` 的写法不一致）；且**追加位置**有坑：追加到文件**末尾**（`render()` 之后）⇒ 首屏渲染时路由还没注册 ⇒ 先渲染一次「页面不存在」 | 既有 `web/app.js` 的 9 条路由一律用 `(c) => renderX(c)` | 改为 `route('/tasks/:workflowId', (c) => renderTasks(c));`，并追加在**既有路由注册之后、末尾 `render()` 之前** |
+| T6-C7 | Minor | 计划的测试块**逐字抄了一份** `call`（进程内 HTTP 调用器）⇒ 与 `test-helpers/http-call.js` 重复。该文件头明写「此前在三个 API 测试文件里各抄了一份（**逐字相同**）—— 改一处要改三处，必然漂移」 | `test-helpers/http-call.js:9-16` | 删掉本地副本，改用共享 helper `import { call } from '../test-helpers/http-call.js';` |
+| T6-C8 | Minor | Step 5 的 Expected 写「1 个端到端用例通过」；且 **Task 6 Step 5 的全量数字被本轮早先的 Task 5 回写误改成 1101**（那是 Task 5 独立工程当时的数字，不是全量） | `grep` 计划文档：`Expected: 全部通过（P0–P5 累计：**1101** 例 …）` 出现在 Task 6 Step 5 | 两处一起订正为 `12` 例 / 全量 `1119` 例 |
+| T6-C9 | Minor | Step 7 的提交命令**没有 `-- <paths…>` 显式路径**，且 `git add` 给的是 `platform/` 下的相对路径 | 本项目提交纪律（见 T1-1 C-8 / T4-C3 / T5-C4） | 改为从仓库根执行的逐文件显式路径 + `--` |
+
+> **编号说明**：本 Task 的台账条目一律用 `T6-C*` 前缀（Task 1 用裸 `C-*`、Task 2 用 `T2-C*`、
+> Task 3 用 `T3-C*`、Task 3 修复轮用 `T3R-C*`、Task 4 用 `T4-C*`、Task 5 用 `T5-C*`）⇒ **不重号**。
+
+### T6-C 逐字回写位置（计划文档 → 实际文件）
+
+| 计划的代码块 | 实际文件 | 回写内容 |
+|---|---|---|
+| Task 6 Step 1 的测试块（计划行 6675 起） | `platform/test/workflow-e2e.test.js` | 整块替换为 12 例（计划原 1 例的**断言逐字保留** + 11 例新增）；删掉本地 `call` 副本（T6-C7） |
+| Task 6 Step 3 的视图块（计划行 7046 起） | `platform/web/views/tasks.js` | 整块替换：**抽出 5 个纯函数**（T6-C3）+ 改用共享 `escapeHtml`（T6-C4）+ 补 `R-OPS-13`/`R-OPS-14` 溯源注释 |
+| Task 6 Step 4 的导入块（计划行 7261 起） | `platform/web/app.js` | **逐字未改**（`import { renderTasks } from './views/tasks.js';`） |
+| Task 6 Step 4 的路由块（计划行 7270 起） | `platform/web/app.js` | 形参 `(ctx)` → `(c)`（T6-C6） |
+| Task 6 Step 4 的 `found.view` 块（计划行 7280 起） | `platform/web/app.js` | 回写为**实现里的真实那一行**（4 空格缩进 + 带 `query`）⇒ 消掉全计划唯一的 `❌`（T6-C5） |
+| Task 6 Step 2 / Step 4 / Step 5 / Step 7 的文字 | 计划正文 | Step 2 的 Expected 订正；Step 4 的三处核验锚点 + 文字；Step 5 的 Expected 数字；Step 7 的提交命令补 `--` 与显式路径 |
+| **核验锚点**（`web/app.js` 的 3 个片段块） | 计划正文 | `fragment-check.mjs` 的 hint 启发式只认「`**Step N: 修改 `path``」或「**行首**就是 `` `path` ``」两种形状 ⇒ 在三个块前各加一行行首锚点（`` `web/app.js`（…行 · 核验锚点） ``）⇒ 三个块**全部**纳入机器核验 |
+
+### T6-D 实跑证据
+
+| 环节 | 命令 | 结果 |
+|---|---|---|
+| Step 2 期望失败 | `cd platform && node --disable-warning=ExperimentalWarning --test test/workflow-e2e.test.js` | ⚠️ **当场通过（1/1）**，计划 Expected 不成立（T6-C1）；实跑证据本身就是缺陷证据 |
+| 本 Task 单文件 | `cd platform && node --disable-warning=ExperimentalWarning --test test/workflow-e2e.test.js` | **12 例 / 通过 12 / 失败 0 / 跳过 0** |
+| **全量** | `cd platform && node --disable-warning=ExperimentalWarning --test` | **1119 例 / 通过 1118 / 失败 0 / 跳过 1**（跳过的 1 例是 P0–P4 既有的） |
+| 禁用表述扫描 | `cd platform && node scripts/audit-scan.js; echo "退出码=$?"` | **退出码 0** |
+| 计划块核验 | `node /tmp/p3fix/plan-blocks.mjs <计划> platform` | **全计划 60 个块零不一致**（Task 6 的 2 个整文件块 ✅ + `web/app.js` 的 3 个片段块 ✅）；**Task 5 之前就存在的那一处 `web/app.js` ❌ 一并消除** |
+| 片段核验 | `node /tmp/p4-proof/fragment-check.mjs <计划> platform web/views/tasks.js web/app.js test/workflow-e2e.test.js` | `核验 5 个片段块，不一致 0 个`（退出码 0） |
+| 按路径核验 | `node /tmp/p3fix/block-by-path.mjs <计划> platform web/views/tasks.js test/workflow-e2e.test.js` | `共核验 2 个文件，不一致 0 个`（退出码 0） |
+| 接线判别性自检 | 手工把 `web/app.js` 的路由注册删掉 / 把 `params` 透传删掉，各跑一次 | 两次都让「★ web/app.js 注册了 /tasks/:workflowId 且把 workflowId 透传给视图」**当场变红**（10/11 → 11/11）⇒ 该用例**不是恒绿** |
+
+### T6-E 变异检验（`/tmp/p5-mutate/t6.mjs`，**不进仓库**）
+
+**23 个变异体 → 杀 23 / 真等价 0 / 不可观测 0 / 缺口 0**（锚点命中异常 0 个：每个锚点都恰好命中 1 次）。
+
+| 类别 | 编号 | 覆盖 |
+|---|---|---|
+| **杀死**（23） | T6-M01…M23 全体 | 模式判定（done / claimable / mine vs taken）/ 三段分类的每一条分支（落错段）/ **前端丢任务**（可见性过滤的同款病根）/ 可用操作（自主领取入口消失 / 提交完成消失 / **冒出一个「指派」操作**）/ 标题与详情的转义（存储型 XSS）/ 完成时间与领取人显示 / 路由参数取错 / 请求路径写错 / 「自主领取」按钮不挂上 / 按钮文案被改 / 领取请求打错接口 / app.js 不注册路由 / 路由参数被吃掉 / 不导入 `renderTasks` / `render()` 不透传 `params` |
+
+**探针差分方法**（`/tmp/p5-mutate/t6.mjs` 内置 `PROBE`）：快照 = 5 个纯函数在 3 个登录人身份下的输出
+（分类 / 操作 / 模式 / 行 HTML / 三段 HTML）**+** 起一个最小 DOM 桩跑**真实前端**后的
+（请求序列 / 页面骨架 HTML / 任务行的 class 与子节点文案）。
+⚠️ **第一版探针只覆盖纯函数** ⇒ 会漏掉「DOM 接线」层的变异（`T6-M17`…`T6-M19`）；
+已把探针扩到**真实 DOM 行为**，并据此补了 3 条接线用例（按钮存在 / 按钮文案 / 点击后发对接口）。
+**本轮 23 个变异体**全部被杀 ⇒ 纯函数层与 DOM 接线层**都**有判别力。
+
+### T6-F 计划块逐字核验
+
+| 文件 | 核验结果 |
+|---|---|
+| `platform/test/workflow-e2e.test.js` | 整文件块 ✅一致（361 行） |
+| `platform/web/views/tasks.js` | 整文件块 ✅一致（206 行） |
+| `platform/web/app.js` | 片段块 ×3 全部 ✅一致（导入行 / 路由注册行 / `render()` 透传行） |
+
+### T6-G 遗留需上游注意
+
+| # | 事项 | 说明 |
+|---|---|---|
+| G-1 | **「我领取的」段里会混入他人已领的任务** | 计划的分类只有三段（可领取的 / 我领取的 / 已完成的），且**他人已领**的任务既不属于「可领取」也不属于「已完成」⇒ 只能落进第二段（渲染上标记为 `task-taken`、**不给任何操作按钮**）。这是**计划原设计**，本轮未改（改了就是三段变四段，与 P5-10 的判据冲突）。若上游觉得语义别扭，须先改判据再改实现 |
+| G-2 | **完成任务的证据表单在前端是「可运行版本」默认值** | 计划原设计：`kind: 'runnable'` + 产物链接 + 版本号。⛔ 前端**不提供** `kind: 'blocked'`（明确阻塞点）的入口 —— 但服务端 `completeTask` 支持 `kind='blocked'`（R-STG-04 要求「可运行状态**或**明确阻塞点」）。⇒ **「被卡住」的任务在前端无法提交**。本轮未改（超出计划范围），**建议上游补一个 blocked 入口** |
+| G-3 | **`web/app.js` 与 P6 Task 6 冲突** | P6 Task 6 也改 `web/app.js`（两边在**不同分支**上）。本轮改动**最小且靠后**：只加了 1 行导入 + 2 行路由注册（`git diff --stat` = `3 insertions(+)`，**零删除、零重排**）⇒ 合并冲突面只有这 3 行 |
+| G-4 | **前端路由用 hash（`#/tasks/<workflowId>`）** | 与既有 P0–P4 前端一致（`web/router.js` 是哈希路由）⇒ 部署时无需服务端 rewrite；计划 Step 6 的 `http://127.0.0.1:8080/#/tasks/<workflowId>` 写法正确 |
+| G-5 | **任务的可见性完全在 API 层** | `GET /api/workflows/:id/tasks` 对无权者返回**空集**（200 + 空数组，三态状态码）⇒ 前端拿到空列表 ⇒ 页面三段都空。视图**不做任何过滤**（分桶恒等式：每个任务恰好落进一段，一个都不丢） |
+
+### T6-H 本 Task 改动的文件清单
+
+| 文件 | 性质 | 说明 |
+|---|---|---|
+| `platform/web/views/tasks.js` | **新建**（P5） | 任务清单页：5 个纯函数（`taskMode` / `classifyTasks` / `taskActions` / `buildTaskItem` / `buildTaskSections`）+ `renderTasks(ctx)` 的 DOM 接线；⛔ 无指派/岗位控件（R-OPS-14）；⛔ 无前端过滤 |
+| `platform/web/app.js` | Modify（P0 建立，**本 Task 只追加**） | 1 行导入 + 2 行路由注册（`route('/tasks/:workflowId', (c) => renderTasks(c));`）；`render()` 的 `params`/`query` 透传**本轮未改**（P0 终态已具备） |
+| `platform/test/workflow-e2e.test.js` | **新建**（P5） | 12 例（后端闭环 1 + 视图纯函数 8 + 前端接线 3） |
+| `docs/superpowers/plans/2026-10-20-platform-P5-workflow-pools.md` | Modify | Task 6 代码块逐字回写 + Step 2/4/5/7 文字订正 + 三个核验锚点 + 本章台账 |
