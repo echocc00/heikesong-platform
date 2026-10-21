@@ -10,6 +10,20 @@
   "fallback": "global",
   "trimOutliers": true,
   "minJudgesForTrim": 5,
+  "trimmedIterations": 20,
+  "bayesPriorStrength": 5,
+  "selfEvalThreshold": 10,
+  "judgePool": {
+    "minJudgesPerDimension": 9,
+    "minEnterpriseSeatShare": 0.30,
+    "maxExpertSeatShare": 0.50,
+    "votingSeats": ["judge", "enterprise"],
+    "nonVotingSeats": ["observer"]
+  },
+  "freeBrief": {
+    "judgeDimension": "feasibility",
+    "label": "需求真实性的公开证据"
+  },
   "dimensions": [
     { "key": "enterprise",    "name": "企业确认",   "weight": 0.25, "seat": "enterprise" },
     { "key": "innovation",    "name": "创新性",     "weight": 0.20, "seat": "judge" },

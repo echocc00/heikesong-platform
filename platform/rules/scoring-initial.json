@@ -10,6 +10,20 @@
   "fallback": "global",
   "trimOutliers": true,
   "minJudgesForTrim": 5,
+  "trimmedIterations": 20,
+  "bayesPriorStrength": 5,
+  "selfEvalThreshold": 10,
+  "judgePool": {
+    "minJudgesPerDimension": 7,
+    "minEnterpriseSeatShare": 0.30,
+    "maxExpertSeatShare": 0.50,
+    "votingSeats": ["judge", "enterprise"],
+    "nonVotingSeats": ["observer"]
+  },
+  "freeBrief": {
+    "judgeDimension": "track_fit",
+    "label": "需求真实性的公开证据"
+  },
   "dimensions": [
     { "key": "track_fit",     "name": "赛题契合度", "weight": 0.10, "seat": "judge" },
     { "key": "innovation",    "name": "创新性",     "weight": 0.20, "seat": "judge" },

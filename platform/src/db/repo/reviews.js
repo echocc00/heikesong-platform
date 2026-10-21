@@ -35,8 +35,11 @@ export function listReviews(db, { stageId, judgeId = null, teamId = null } = {})
   const params = [stageId];
   if (judgeId) { where.push('judge_id = ?'); params.push(judgeId); }
   if (teamId) { where.push('team_id = ?'); params.push(teamId); }
+  // ⚠️ 父代理预审修正（Important，I5 的同源问题）：软删除的打分**不得**再计入计算。
+  //    `stage_reviews` 有 `deleted_at` 列（软删除语义：评分只增不改，删除用软删除），
+  //    但这里原来不滤 —— 删掉的分还在榜单里。
   return db
-    .prepare(`SELECT * FROM stage_reviews WHERE ${where.join(' AND ')} AND calibrated = 0 ORDER BY team_id, dimension, judge_id`)
+    .prepare(`SELECT * FROM stage_reviews WHERE ${where.join(' AND ')} AND calibrated = 0 AND deleted_at IS NULL ORDER BY team_id, dimension, judge_id`)
     .all(...params);
 }
 

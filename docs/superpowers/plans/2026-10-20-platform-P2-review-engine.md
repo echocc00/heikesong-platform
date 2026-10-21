@@ -2565,9 +2565,6 @@ export function applyEnterpriseRules({ confirmations = [], teams = [], judges = 
       (c) => c.teamId === team.teamId && enterpriseKeys.includes(c.dimension),
     );
     // 自由命题组没有「本赛道企业」概念 → R1 不适用（否则会与 R4 打架）
-    const outOfTrack = team.isFreeBrief
-      ? []
-      : mine.filter((c) => c.enterpriseId !== team.packageEnterpriseId);
     // 自由命题组按「内容合规」判有效，与 packageEnterpriseId 无关（父代理预审修正 ③）
     const inTrack = team.isFreeBrief
       ? mine
@@ -2589,6 +2586,23 @@ export function applyEnterpriseRules({ confirmations = [], teams = [], judges = 
     const failed = classified.filter((x) => x.reason !== null);
     const hasReason = (reason) => failed.some((x) => x.reason === reason);
 
+    // ⚠️ 父代理预审修正（Critical，C1 / D-30）：**R1 只依据「有效的」非本赛道确认判定**。
+    //    原来 `outOfTrack` 是「全部非本赛道确认」，于是一条**无效**的记录（缺双签 / 内容空白 /
+    //    分数越界）也能把该队的**企业项权重整段归零** —— 而写入口一旦被绕过（冒名签字），
+    //    攻击者就能用一条垃圾记录「连坐」掉受害队伍的企业席（初赛 10% / 决赛 25%）。
+    //    现在：无效记录不触发 R1；**本赛道企业已合法确认时，R1 也不再把权重归零**
+    //    （R1 的本意是「本赛道企业没确认 ⇒ 企业席不适用」，不是「有人冒签就整队作废」）。
+    const outOfTrackClassified = (team.isFreeBrief
+      ? []
+      : mine.filter((c) => c.enterpriseId !== team.packageEnterpriseId)).map((c) => {
+      if (!c.crossJudgeId || !c.signatoryUserId) return { c, reason: 'dual_signature' };
+      if (typeof c.content !== 'string' || !c.content.trim()) return { c, reason: 'content' };
+      if (!Number.isFinite(c.rawScore) || c.rawScore < 0 || c.rawScore > 100) return { c, reason: 'score_range' };
+      return { c, reason: null };
+    });
+    const validOutOfTrack = outOfTrackClassified.filter((x) => x.reason === null).map((x) => x.c);
+    const outOfTrack = validOutOfTrack;
+
     // R4 只在「该队**完全没有**企业确认」时接管；确认存在但无效 → 按无效处理
     const r4Candidate = Boolean(team.isFreeBrief) && inTrack.length === 0;
     if (r4Candidate && (!demandKey || base[demandKey] == null)) {
@@ -2603,10 +2617,14 @@ export function applyEnterpriseRules({ confirmations = [], teams = [], judges = 
 
     if (outOfTrack.length) {
       // R1：企业评委给非本企业题目打分 → 该队企业项权重自动降为 0
-      if (enterpriseKey) eff[enterpriseKey] = 0;
+      // ⚠️ 但**本赛道企业已合法确认时不得降权**（D-30）：
+      //    「别家企业也签了一条」不该把本赛道企业的合法签字一起废掉。
+      if (enterpriseKey && !valid.length) eff[enterpriseKey] = 0;
       warnings.push({
         code: 'R1_out_of_track',
-        message: '企业席评了非本企业题目，该队「企业确认」权重降为 0',
+        message: valid.length
+          ? '有非本赛道企业的有效确认（已忽略，不影响本赛道企业的签字）'
+          : '企业席评了非本企业题目，该队「企业确认」权重降为 0',
         teamId: team.teamId,
       });
     }
@@ -3962,6 +3980,63 @@ test('不能给自己互评 → 400', () => {
   );
   cleanup(ctx);
 });
+
+// ── 写入口的队伍边界（父代理预审 I1 / I5 / D-33）─────────────────────────
+
+test('服务层：给名册外的队伍打分 → 404（不是外键报错 500）', () => {
+  const ctx = setup();
+  const otherEdition = createEdition(ctx.db, {
+    name: '第二届', city: '杭州', startsAt: '2027-01-01', endsAt: '2027-02-28', now: NOW,
+  });
+  const outsider = insertTeam(ctx.db, {
+    editionId: otherEdition.id, name: '外队', captainId: ctx.admin.id, status: 'active', now: NOW,
+  });
+  assert.throws(
+    () => submitReviews({
+      db: ctx.db, stageId: ctx.stage.id, judgeId: ctx.judge.id,
+      items: [{ teamId: outsider.id, dimension: 'innovation', rawScore: 99 }], now: NOW,
+    }),
+    (err) => err.status === 404 && err.code === 'TEAM_NOT_IN_STAGE',
+  );
+  cleanup(ctx);
+});
+
+test('服务层：企业确认名册外的队伍 → 404', () => {
+  const ctx = setup();
+  const otherEdition = createEdition(ctx.db, {
+    name: '第二届', city: '杭州', startsAt: '2027-01-01', endsAt: '2027-02-28', now: NOW,
+  });
+  const outsider = insertTeam(ctx.db, {
+    editionId: otherEdition.id, name: '外队', captainId: ctx.admin.id, status: 'active', now: NOW,
+  });
+  assert.throws(
+    () => submitEnterpriseConfirmation({
+      db: ctx.db, stageId: ctx.stage.id, teamId: outsider.id, enterpriseId: ctx.admin.id,
+      dimension: 'enterprise', rawScore: 90, crossJudgeId: ctx.judge.id,
+      signatoryUserId: ctx.admin.id, content: '外队确认', now: NOW,
+    }),
+    (err) => err.status === 404 && err.code === 'TEAM_NOT_IN_STAGE',
+  );
+  cleanup(ctx);
+});
+
+test('服务层：互评的被评队不在名册内 → 404', () => {
+  const ctx = setup();
+  const otherEdition = createEdition(ctx.db, {
+    name: '第二届', city: '杭州', startsAt: '2027-01-01', endsAt: '2027-02-28', now: NOW,
+  });
+  const outsider = insertTeam(ctx.db, {
+    editionId: otherEdition.id, name: '外队', captainId: ctx.admin.id, status: 'active', now: NOW,
+  });
+  assert.throws(
+    () => submitPeerReviews({
+      db: ctx.db, stageId: ctx.stage.id,
+      items: [{ fromTeamId: ctx.teamA.id, toTeamId: outsider.id, score: 80 }], now: NOW,
+    }),
+    (err) => err.status === 404 && err.code === 'TEAM_NOT_IN_STAGE',
+  );
+  cleanup(ctx);
+});
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -4168,8 +4243,11 @@ export function listReviews(db, { stageId, judgeId = null, teamId = null } = {})
   const params = [stageId];
   if (judgeId) { where.push('judge_id = ?'); params.push(judgeId); }
   if (teamId) { where.push('team_id = ?'); params.push(teamId); }
+  // ⚠️ 父代理预审修正（Important，I5 的同源问题）：软删除的打分**不得**再计入计算。
+  //    `stage_reviews` 有 `deleted_at` 列（软删除语义：评分只增不改，删除用软删除），
+  //    但这里原来不滤 —— 删掉的分还在榜单里。
   return db
-    .prepare(`SELECT * FROM stage_reviews WHERE ${where.join(' AND ')} AND calibrated = 0 ORDER BY team_id, dimension, judge_id`)
+    .prepare(`SELECT * FROM stage_reviews WHERE ${where.join(' AND ')} AND calibrated = 0 AND deleted_at IS NULL ORDER BY team_id, dimension, judge_id`)
     .all(...params);
 }
 
@@ -4576,6 +4654,27 @@ function assertStageExists(db, stageId) {
   }
 }
 
+/**
+ * 队伍必须在本赛段名册内。
+ * ⚠️ 父代理预审修正（Important，I1 / I5）：
+ *   ① 原来写入口**不校验队伍** → 评委能给**别的届期**的队打分，
+ *      那支队会被算进本赛段榜单（外队进榜）。
+ *   ② 队伍不存在时直接撞外键 → `FOREIGN KEY constraint failed` 漏到 HTTP 层
+ *      → **500**（而不是三态状态码要求的 404）。
+ * 现在统一按「本赛段名册」判定，不在册 → 404。
+ * ⚠️ 名册的粒度目前是**届期级**（stages → edition_id → teams），
+ *    赛段级队伍边界需要一张 stage_team 表 —— 登记在 P3（见 P2 计划「已知限制」）。
+ */
+function assertTeamInStage(db, stageId, teamId, label = '队伍') {
+  if (!teamId) {
+    throw fail(400, 'MISSING_TEAM_ID', `缺少${label}`);
+  }
+  const roster = listStageTeams(db, stageId).map((t) => t.teamId);
+  if (!roster.includes(teamId)) {
+    throw fail(404, 'TEAM_NOT_IN_STAGE', `${label} ${teamId} 不在本赛段名册内`);
+  }
+}
+
 function assertVotingJudge(db, stageId, judgeId) {
   const seat = getStageJudge(db, stageId, judgeId);
   if (!seat) throw fail(403, 'NOT_ASSIGNED_JUDGE', '该评委未被分配到本赛段');
@@ -4602,6 +4701,10 @@ function assertNotRecused(db, stageId, judgeId, teamId) {
 export function submitReviews({ db, stageId, judgeId, items = [], requestId = null, now }) {
   assertStageExists(db, stageId);
   assertVotingJudge(db, stageId, judgeId);
+  // 队伍必须在本赛段名册内（外队进榜 / 不存在 → 404）
+  for (const item of items) {
+    assertTeamInStage(db, stageId, item.teamId);
+  }
 
   // 幂等快速路径：同一次请求已经生效过 → 直接返回上次结果，不重复落数据
   if (requestId) {
@@ -4632,6 +4735,9 @@ export function submitReviews({ db, stageId, judgeId, items = [], requestId = nu
     }
 
     const written = [];
+    // 改分留痕：旧分与新分一起进审计（父代理预审 Minor 7）
+    // ⚠️ 原来只记「条数」—— 评委改分后，**当时榜单用的是几分**再也还原不出来。
+    const changed = [];
     // 按维度分桶的增量（新增分 / 被改分替换掉的旧分）——score_stats 必须同步修正
     const byDimension = new Map();
     const bucketOf = (dimension) => {
@@ -4649,6 +4755,7 @@ export function submitReviews({ db, stageId, judgeId, items = [], requestId = nu
         updateReviewScore(db, { id: existing.id, rawScore: item.rawScore, now });
         bucket.removed.push(existing.raw_score);
         bucket.added.push(item.rawScore);
+        changed.push({ teamId: item.teamId, dimension: item.dimension, from: existing.raw_score, to: item.rawScore });
       } else {
         const row = insertReview(db, {
           stageId, judgeId, teamId: item.teamId, dimension: item.dimension,
@@ -4666,7 +4773,7 @@ export function submitReviews({ db, stageId, judgeId, items = [], requestId = nu
 
     writeAuditLog(db, {
       actorId: judgeId, action: 'review.submit', entity: 'stage', entityId: stageId,
-      detail: { requestId, count: items.length }, now,
+      detail: { requestId, count: items.length, changed }, now,
     });
 
     return { stageId, judgeId, requestId, submitted: written.length, items: written };
@@ -4751,6 +4858,7 @@ export function submitEnterpriseConfirmation({ db, stageId, teamId, enterpriseId
     throw fail(400, 'SIGNATURE_CONTENT_REQUIRED', '企业签字必须填写内容（解决了我方哪个具体环节 / 预计落地时间 / 我方投入角色）');
   }
   assertScoreInRange(rawScore, '企业确认分');
+  assertTeamInStage(db, stageId, teamId);
   const row = insertEnterpriseConfirmation(db, {
     stageId, teamId, enterpriseId, dimension, rawScore, crossJudgeId, signatoryUserId, content, now,
   });
@@ -4771,6 +4879,11 @@ export function submitEnterpriseConfirmation({ db, stageId, teamId, enterpriseId
 export function submitPeerReviews({ db, stageId, items = [], requestId = null, actorId = null, now }) {
   assertStageExists(db, stageId);
   const subject = actorId ?? '*';
+  // 互评的两端都必须是本赛段名册内的队伍（外队 / 不存在 → 404）
+  for (const item of items) {
+    assertTeamInStage(db, stageId, item.fromTeamId, '发起队');
+    assertTeamInStage(db, stageId, item.toTeamId, '被评队');
+  }
 
   if (requestId) {
     const prior = findPeerReviewsByRequestId(db, { stageId, requestId });
@@ -4839,6 +4952,7 @@ export function submitPeerReviews({ db, stageId, items = [], requestId = null, a
 /** 自评测（幂等） */
 export function submitSelfReviews({ db, stageId, teamId, items = [], requestId = null, now }) {
   assertStageExists(db, stageId);
+  assertTeamInStage(db, stageId, teamId);
   if (requestId) {
     const prior = findSelfReviewsByRequestId(db, { stageId, teamId, requestId });
     if (prior.length) {
@@ -4889,6 +5003,9 @@ export function declareRecusal({ db, stageId, judgeId, teamId = null, reason, ac
   assertStageExists(db, stageId);
   if (!reason || !String(reason).trim()) {
     throw fail(400, 'RECUSAL_REASON_REQUIRED', '回避必须填写原因（供应方 / 投资方 / 前雇主）');
+  }
+  if (teamId != null) {
+    assertTeamInStage(db, stageId, teamId);
   }
   const row = insertRecusal(db, {
     stageId, judgeId, teamId, reason, source: 'declared', auditBy: actorId, action: 'recused', now,
@@ -5551,8 +5668,14 @@ git commit -m "feat(P2): 加时陈述轮次与一票破同分（数据库唯一�
 - Modify: `platform/rules/scoring-initial.json`、`platform/rules/scoring-final.json`（加 `judgePool` / `freeBrief` / 归一化策略参数）
 - Modify: `platform/src/config.js`（校验新增字段，fail-fast）
 - Modify: `platform/src/server.js`（注册评审路由）
+- Modify: `platform/scripts/seed.js`（新增 `self_review:write` 能力点 + 队长/组员持有；见 D-27）
+- Modify: `platform/src/domain/enterprise-seat.js`（R1 收窄；见 D-30）
+- Modify: `platform/src/services/review.js`（写入口的队伍边界 + 改分留痕；见 D-33 / D-36）
+- Modify: `platform/src/db/repo/reviews.js`（软删除过滤；见 D-35）
+- Modify: `platform/src/db/repo/teams.js`（新增 `getTeamWithPackage`；见 D-31）
 - Create: `platform/test/scoring.test.js`
 - Create: `platform/test/compute.test.js`
+- Create: `platform/test/review-api.test.js`（9 条 API 的**权限闸门**用例；见 D-23~D-27 / D-31~D-34）
 
 **Interfaces:**
 - Consumes: Task 2 `normalizeScores`、Task 3 `trimOutliers` / `seatScore`、Task 4 `applyEnterpriseRules`、Task 5 `detectSelfEvalDiff`、Task 6 服务与仓储
@@ -5566,12 +5689,31 @@ git commit -m "feat(P2): 加时陈述轮次与一票破同分（数据库唯一�
     - 写 `computation_snapshots`（input + output + trace 三件套）+ `stage_results`
     - **显式动作，不自动触发**（发榜影响奖金，必须有明确操作者与时间戳）
   - 9 条 API（见下）
+  - **能力点**（`scripts/seed.js` 注册）：
+    | 能力点 | 持有者 | 用途 |
+    |---|---|---|
+    | `score:write` | 评委 / 企业 / 组委会 | 打分、签企业确认 |
+    | `score:read` | 评委 / 企业 / 组委会 | 看评审进度 |
+    | `peer_review:write` | 评委 / 队长 / 组员 | 互评 |
+    | **`self_review:write`**（P2 新增） | **队长 / 组员** | 提交**本队**自评 |
+    | `signoff:create` | 企业 / 企业管理员 | 签署企业确认（证明是出题企业） |
+    | `stage:compute` | 组委会 | 触发计算发榜 / 代录回避与企业确认 |
+    | `audit:read` | 评委 / 组委会 | 读取计算快照（三件套） |
 
 - [ ] **Step 1: 写失败的测试**
 
 `platform/test/scoring.test.js`：
 
 ```javascript
+// platform/test/scoring.test.js —— scoreStage 总装
+//
+// 规则溯源：
+//   - 「总分 = (1−w_E)×P + w_E×E，初赛 w_E=10%」→ S7 §2.1 权重表 + §3.1 评分公式
+//     + 冲突裁决 C-01（rule-decisions.md）
+//   - 「行为分不得影响总分」→ S10 §8 第三条风险（分轨必须在算法层，不靠纪律）
+//   - 「降级必须显式」→ 设计文档 §6.2【决策】+ §12 trace 结构
+//   - 「R1/R2/R3/R4」→ S7 §2.4（R-JDG-05~08）
+//   - 「自评测不加分」→ S7 §4.3（R-JDG-13）
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { scoreStage } from '../src/domain/scoring.js';
@@ -5630,6 +5772,11 @@ const CONFIRMATIONS = [
   { teamId: 't1', enterpriseId: 'E1', dimension: 'enterprise', rawScore: 80, crossJudgeId: 'j2', signatoryUserId: 'u_e1', content: '解决了库存周转' },
 ];
 
+/** 生效权重合计（每队各自一份） */
+function weightSum(perDimension) {
+  return Object.values(perDimension).reduce((acc, d) => acc + d.weight, 0);
+}
+
 test('总分 = (1−w_E)×P + w_E×E，初赛 w_E = 0.10（冲突裁决 C-01）', () => {
   const r = scoreStage({ config: CONFIG, judges: JUDGES, submissions: SUBMISSIONS, enterpriseConfirmations: CONFIRMATIONS, teams: TEAMS });
   const t1 = r.teams.find((t) => t.teamId === 't1');
@@ -5639,6 +5786,8 @@ test('总分 = (1−w_E)×P + w_E×E，初赛 w_E = 0.10（冲突裁决 C-01）'
   assert.equal(t1.seatE, 80);
   assert.ok(Math.abs(t1.total - 74.75) < 1e-6, `total=${t1.total}`);
   assert.ok(Math.abs(t1.total - (1 - 0.10) * t1.seatP - 0.10 * t1.seatE) < 1e-9);
+  // 生效权重合计必须是 1（席位权重按 (1−w_E) 归一后与 w_E 拼回 100%）
+  assert.ok(Math.abs(weightSum(t1.perDimension) - 1) < 1e-9, `生效权重合计=${weightSum(t1.perDimension)}`);
 });
 
 test('⭐ 行为分变化不影响总分（S10 §8：分轨必须是算法层面的，不是纪律层面的）', () => {
@@ -5734,6 +5883,9 @@ test('样本足够时走真归一化：已知评委矩阵 → 期望维度分', 
   // j3 恒定 70 → stdev=0 → z=0 且必须显式标记
   assert.equal(r.trace.normalization.innovation.judgeReasons.j3, 'zero_stdev');
   assert.ok(r.warnings.some((w) => w.code === 'normalization_fallback'));
+  // R3 把企业项从 0.2 封顶到 w_E=0.1 后，评委席权重必须补足到 0.9（合计仍是 1）
+  assert.ok(Math.abs(weightSum(t1.perDimension) - 1) < 1e-9, `生效权重合计=${weightSum(t1.perDimension)}`);
+  assert.ok(Math.abs(t1.perDimension.innovation.weight - 0.9) < 1e-9, `创新性生效权重=${t1.perDimension.innovation.weight}`);
 });
 
 test('自评测 d > 10 → 对齐评委分（不加分）+ warning；d < -10 → 只提问', () => {
@@ -5754,17 +5906,883 @@ test('自评测 d > 10 → 对齐评委分（不加分）+ warning；d < -10 →
     selfReviews: [{ teamId: 't1', dimension: 'innovation', rawScore: 95 }],
   });
   assert.ok(r.warnings.some((w) => w.code === 'self_eval_written_explanation' && w.teamId === 't1'));
+  // ⛔ 关键断言：**用评委分 80，不是自评的 95** —— 自评不得加分（S7 §4.3 / S10 §8）
+  const t1 = r.teams.find((t) => t.teamId === 't1');
+  assert.equal(t1.perDimension.innovation.mean, 80, '自评 95 分不得进入评委席维度');
+  assert.equal(t1.seatP, 80);
 });
 
 test('评委池缺失 → 记 warning，绝不静默', () => {
   const r = scoreStage({ config: CONFIG, judges: [], submissions: SUBMISSIONS, enterpriseConfirmations: CONFIRMATIONS, teams: TEAMS });
   assert.ok(r.warnings.some((w) => w.code === 'judge_roster_missing'));
 });
+
+test('⛔ 自评不得填补评委席维度（自评加分路径封堵）', () => {
+  // 评委没给「创新性」打分，但队伍自己给了 95 分 —— 该维度必须**缺分**（权重记 0），
+  // 而不是拿自评分顶上（S7 §4.3「不加分」+ S10 §8「自评不得成为博弈项」）。
+  const cfg = {
+    ...CONFIG,
+    dimensions: [
+      { key: 'track_fit', weight: 0.50, seat: 'judge' },
+      { key: 'innovation', weight: 0.40, seat: 'judge' },
+      { key: 'enterprise', weight: 0.10, seat: 'enterprise' },
+    ],
+  };
+  const r = scoreStage({
+    config: cfg,
+    judges: JUDGES,
+    submissions: [
+      { judgeId: 'j1', teamId: 't1', dimension: 'track_fit', rawScore: 80 },
+      { judgeId: 'j2', teamId: 't1', dimension: 'track_fit', rawScore: 80 },
+    ],
+    enterpriseConfirmations: [],
+    teams: [{ teamId: 't1', packageEnterpriseId: 'E1', isFreeBrief: false }],
+    selfReviews: [{ teamId: 't1', dimension: 'innovation', rawScore: 95 }],
+  });
+  const t1 = r.teams.find((t) => t.teamId === 't1');
+  assert.equal(t1.perDimension.innovation.mean, null, '评委席维度不得由自评填补');
+  assert.equal(t1.seatP, 80, '只有「赛题契合度」有分 → 席位分 = 80');
+  assert.ok(r.warnings.some((w) => w.code === 'dimension_no_scores' && w.dimension === 'innovation'));
+});
+
+test('自评席维度（seat=self）取自自评记录并进 trace', () => {
+  const cfg = {
+    ...CONFIG,
+    dimensions: [
+      { key: 'innovation', weight: 0.80, seat: 'judge' },
+      { key: 'self_eval', weight: 0.10, seat: 'self' },
+      { key: 'enterprise', weight: 0.10, seat: 'enterprise' },
+    ],
+  };
+  const r = scoreStage({
+    config: cfg,
+    judges: JUDGES,
+    submissions: [
+      { judgeId: 'j1', teamId: 't1', dimension: 'innovation', rawScore: 80 },
+      { judgeId: 'j2', teamId: 't1', dimension: 'innovation', rawScore: 80 },
+    ],
+    enterpriseConfirmations: [],
+    teams: [{ teamId: 't1', packageEnterpriseId: 'E1', isFreeBrief: false }],
+    selfReviews: [{ teamId: 't1', dimension: 'self_eval', rawScore: 88 }],
+  });
+  const t1 = r.teams.find((t) => t.teamId === 't1');
+  assert.equal(t1.perDimension.self_eval.mean, 88);
+  assert.equal(t1.perDimension.self_eval.raw, 88);
+  assert.equal(t1.perDimension.self_eval.z, null);
+  // P = (0.80*80 + 0.10*88) / 0.90 = 72.8/0.9
+  assert.ok(Math.abs(t1.seatP - 80.888888888) < 1e-6, `seatP=${t1.seatP}`);
+});
+
+test('自评席维度缺自评记录 → 该维度缺分（权重记 0）+ warning', () => {
+  const cfg = {
+    ...CONFIG,
+    dimensions: [
+      { key: 'innovation', weight: 0.80, seat: 'judge' },
+      { key: 'self_eval', weight: 0.10, seat: 'self' },
+      { key: 'enterprise', weight: 0.10, seat: 'enterprise' },
+    ],
+  };
+  const r = scoreStage({
+    config: cfg,
+    judges: JUDGES,
+    submissions: [
+      { judgeId: 'j1', teamId: 't1', dimension: 'innovation', rawScore: 80 },
+      { judgeId: 'j2', teamId: 't1', dimension: 'innovation', rawScore: 80 },
+    ],
+    enterpriseConfirmations: [],
+    teams: [{ teamId: 't1', packageEnterpriseId: 'E1', isFreeBrief: false }],
+    selfReviews: [],
+  });
+  const t1 = r.teams.find((t) => t.teamId === 't1');
+  assert.equal(t1.perDimension.self_eval.mean, null);
+  assert.ok(r.warnings.some((w) => w.code === 'dimension_no_scores' && w.dimension === 'self_eval'));
+});
+
+test('⛔ 观察员无投票权（R-JDG-11）：观察员的打分不计入', () => {
+  // 观察员给 100 分、评委给 80 分 —— 维度分必须是 80（不是 90）
+  const r = scoreStage({
+    config: CONFIG,
+    judges: [{ judgeId: 'j1', seat: 'judge' }, { judgeId: 'obs', seat: 'observer' }],
+    submissions: [
+      { judgeId: 'j1', teamId: 't1', dimension: 'innovation', rawScore: 80 },
+      { judgeId: 'obs', teamId: 't1', dimension: 'innovation', rawScore: 100 },
+    ],
+    enterpriseConfirmations: [],
+    teams: [{ teamId: 't1', packageEnterpriseId: 'E1', isFreeBrief: false }],
+  });
+  const t1 = r.teams.find((t) => t.teamId === 't1');
+  assert.equal(t1.perDimension.innovation.mean, 80, '观察员的分不得计入');
+});
+
+test('⛔ R4：自由命题组无企业签字 → 企业项改由评委的「需求真实性」维度替代', () => {
+  const dims = ['innovation', 'feasibility', 'completeness', 'collaboration'];
+  const subs = [];
+  for (const dim of dims) {
+    subs.push({ judgeId: 'j1', teamId: 'tFree', dimension: dim, rawScore: 70 });
+    subs.push({ judgeId: 'j2', teamId: 'tFree', dimension: dim, rawScore: 70 });
+  }
+  subs.push({ judgeId: 'j1', teamId: 'tFree', dimension: 'track_fit', rawScore: 70 });
+  subs.push({ judgeId: 'j2', teamId: 'tFree', dimension: 'track_fit', rawScore: 80 });
+
+  const r = scoreStage({
+    config: CONFIG,
+    judges: JUDGES,
+    submissions: subs,
+    enterpriseConfirmations: [],
+    teams: [{ teamId: 'tFree', packageEnterpriseId: null, isFreeBrief: true }],
+  });
+  const t = r.teams.find((x) => x.teamId === 'tFree');
+  assert.ok(r.warnings.some((w) => w.code === 'R4_free_brief_judge_scored'), '必须显式记 R4');
+  // 企业项由评委的 track_fit 分替代（(70+80)/2 = 75）
+  assert.equal(t.perDimension.enterprise.mean, 75, '企业项须由评委的替代维度分填充');
+  assert.equal(t.perDimension.track_fit.weight, 0, '替代维度要从评委席移出，避免双重计分');
+  assert.ok(Math.abs(weightSum(t.perDimension) - 1) < 1e-9);
+  // 总分 = 0.9×70 + 0.1×75 = 70.5
+  assert.ok(Math.abs(t.total - 70.5) < 1e-6, `total=${t.total}`);
+});
+
+test('perDimension.raw 必须是原始分（不是 z 值）', () => {
+  const r = scoreStage({ config: CONFIG, judges: JUDGES, submissions: SUBMISSIONS, enterpriseConfirmations: CONFIRMATIONS, teams: TEAMS });
+  const t1 = r.teams.find((t) => t.teamId === 't1');
+  assert.equal(t1.perDimension.innovation.raw, 80, '创新性原始分 = (90+70)/2');
+  assert.equal(t1.perDimension.completeness.raw, 90, '完成度原始分 = (100+80)/2');
+  assert.equal(t1.perDimension.enterprise.raw, 80, '企业项的 raw 就是企业确认分');
+});
+
+test('没有任何 P 席评分的队伍 → 记 team_no_reviews（不参与排名）', () => {
+  const r = scoreStage({
+    config: CONFIG,
+    judges: JUDGES,
+    submissions: [],
+    enterpriseConfirmations: [],
+    teams: [
+      { teamId: 't1', packageEnterpriseId: 'E1', isFreeBrief: false },
+      { teamId: 't2', packageEnterpriseId: 'E1', isFreeBrief: false },
+    ],
+  });
+  const warned = r.warnings.filter((w) => w.code === 'team_no_reviews').map((w) => w.teamId).sort();
+  assert.deepEqual(warned, ['t1', 't2'], '两支队都没有评委分 → 都应标记不参与排名');
+});
+
+test('⛔ 冒名的非本赛道确认不得连坐掉本赛道企业的合法签字（D-30）', () => {
+  // 一条「非本赛道企业」的**有效**双签 + 本赛道企业的合法双签同时存在：
+  // 本赛道企业对自己出的题签字是天经地义的，不能被别人的一条记录废掉。
+  const r = scoreStage({
+    config: CONFIG, judges: JUDGES, submissions: SUBMISSIONS,
+    enterpriseConfirmations: [
+      CONFIRMATIONS[0],
+      { teamId: 't1', enterpriseId: 'E9', dimension: 'enterprise', rawScore: 100, crossJudgeId: 'j2', signatoryUserId: 'u_e9', content: '冒名' },
+    ],
+    teams: TEAMS,
+  });
+  const t1 = r.teams.find((t) => t.teamId === 't1');
+  assert.equal(t1.seatE, 80, '本赛道企业的合法签字必须保留');
+  assert.ok(r.warnings.some((w) => w.code === 'R1_out_of_track'), '仍然要留下 R1 告警（不能静默）');
+  assert.ok(Math.abs(weightSum(t1.perDimension) - 1) < 1e-9, '企业项权重不得被归零');
+});
+
+test('⛔ 自评席维度高于评委席分 10 分以上 → 对齐到评委席分（不加分）', () => {
+  const cfg = {
+    ...CONFIG,
+    dimensions: [
+      { key: 'innovation', weight: 0.80, seat: 'judge' },
+      { key: 'self_eval', weight: 0.10, seat: 'self' },
+      { key: 'enterprise', weight: 0.10, seat: 'enterprise' },
+    ],
+  };
+  const r = scoreStage({
+    config: cfg, judges: JUDGES,
+    submissions: [
+      { judgeId: 'j1', teamId: 't1', dimension: 'innovation', rawScore: 80 },
+      { judgeId: 'j2', teamId: 't1', dimension: 'innovation', rawScore: 80 },
+    ],
+    enterpriseConfirmations: [],
+    teams: [{ teamId: 't1', packageEnterpriseId: 'E1', isFreeBrief: false }],
+    selfReviews: [{ teamId: 't1', dimension: 'self_eval', rawScore: 95 }], // 95 − 80 = 15 > 10
+  });
+  const t1 = r.teams.find((t) => t.teamId === 't1');
+  assert.equal(t1.perDimension.self_eval.mean, 80, '自评 95 必须对齐到评委席分 80（不加分）');
+  assert.ok(r.warnings.some((w) => w.code === 'self_eval_written_explanation'));
+});
+
+test('⛔ 评委打分不得填自评席维度（领域层第二道防线）', () => {
+  // 即使写入口被绕过（服务层直调），领域层也绝不能让评委的打分填进自评席维度。
+  const cfg = {
+    ...CONFIG,
+    dimensions: [
+      { key: 'innovation', weight: 0.80, seat: 'judge' },
+      { key: 'self_eval', weight: 0.10, seat: 'self' },
+      { key: 'enterprise', weight: 0.10, seat: 'enterprise' },
+    ],
+  };
+  const r = scoreStage({
+    config: cfg, judges: JUDGES,
+    submissions: [
+      { judgeId: 'j1', teamId: 't1', dimension: 'innovation', rawScore: 80 },
+      { judgeId: 'j2', teamId: 't1', dimension: 'innovation', rawScore: 80 },
+      { judgeId: 'j1', teamId: 't1', dimension: 'self_eval', rawScore: 100 },
+    ],
+    enterpriseConfirmations: [],
+    teams: [{ teamId: 't1', packageEnterpriseId: 'E1', isFreeBrief: false }],
+    selfReviews: [],
+  });
+  const t1 = r.teams.find((t) => t.teamId === 't1');
+  assert.equal(t1.perDimension.self_eval.mean, null, '评委的打分不得填自评席维度');
+  assert.ok(r.warnings.some((w) => w.code === 'dimension_no_scores' && w.dimension === 'self_eval'));
+});
+
+test('⛔ R4 替代维度没有评委分 → 必须显式告警（不能静默丢 20%）', () => {
+  const r = scoreStage({
+    config: CONFIG, judges: JUDGES,
+    submissions: [
+      { judgeId: 'j1', teamId: 'tFree', dimension: 'innovation', rawScore: 70 },
+      { judgeId: 'j2', teamId: 'tFree', dimension: 'innovation', rawScore: 70 },
+    ],
+    enterpriseConfirmations: [],
+    teams: [{ teamId: 'tFree', packageEnterpriseId: null, isFreeBrief: true }],
+  });
+  const t = r.teams.find((x) => x.teamId === 'tFree');
+  assert.equal(t.perDimension.enterprise.mean, 0, '替代维度无分 → 企业项按 0 分计');
+  assert.ok(
+    r.warnings.some((w) => w.code === 'R4_substitute_no_scores' && w.teamId === 'tFree'),
+    '必须显式说明替代维度没有评委分',
+  );
+});
+
+test('⛔ 无效的非本赛道记录不得触发 R1 把企业权重归零（D-30）', () => {
+  const r = scoreStage({
+    config: CONFIG, judges: JUDGES, submissions: SUBMISSIONS,
+    enterpriseConfirmations: [
+      // 非本赛道企业 + 缺双签（**无效**）→ 不得把企业项权重归零
+      { teamId: 't1', enterpriseId: 'E9', dimension: 'enterprise', rawScore: 100, crossJudgeId: null, signatoryUserId: 'u_e9', content: '冒名' },
+    ],
+    teams: TEAMS,
+  });
+  const t1 = r.teams.find((t) => t.teamId === 't1');
+  assert.equal(t1.seatE, 0, '没有有效的企业确认 → 企业席 0 分');
+  assert.ok(!r.warnings.some((w) => w.code === 'R1_out_of_track'), '无效记录不得触发 R1');
+  assert.ok(
+    Math.abs(t1.total - 0.9 * t1.seatP) < 1e-9,
+    '无效记录不得把企业项权重归零（归零后总分会从 0.9×P 变成 P）',
+  );
+});
+```
+
+`platform/test/review-api.test.js`（9 条 API 的**权限闸门**用例；本轮预审新增）：
+
+```javascript
+// platform/test/review-api.test.js —— 评审 API 的权限闸门
+//
+// 规则溯源：
+//   - 「权限模型 = capability + assignment，can() 是唯一判定入口」→ 设计文档 §7.1/§7.2
+//   - 「三态状态码」→ 设计文档 §7.3（禁用 → 403；单条不存在 → 404）
+//   - 「回避必须留档、不能代他人申报」→ S7 §2.4 R5（R-JDG-09）
+//   - 「企业签字必须有内容 + 双签」→ S7 §4.1（R-JDG-06 / R-JDG-14）
+//   - 「自评不加分、只能本队提交」→ S7 §4.3（R-JDG-13）
+//
+// ⚠️ 这些闸门一旦没有测试钉住，就会**静默失效**（能力点形同虚设、越权可写入分数）——
+//    与 P1 Task 3 的 A1（registration:write 被注册却从不校验）同一类病根。
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { openDatabase } from '../src/db/sqlite.js';
+import { applyMigrations } from '../src/db/migrate.js';
+import { loadRules } from '../src/config.js';
+import { createApp } from '../src/server.js';
+import { createUser } from '../src/db/repo/users.js';
+import { createEdition } from '../src/db/repo/editions.js';
+import { createTaskPackage } from '../src/db/repo/taskPackages.js';
+import { insertTeam } from '../src/db/repo/teams.js';
+import { insertTeamMember } from '../src/db/repo/teamMembers.js';
+import { insertStage, assignStageJudge } from '../src/db/repo/stages.js';
+import { insertCapability } from '../src/db/repo/capabilities.js';
+import { grantAssignment } from '../src/auth/permissions.js';
+import { createSession } from '../src/auth/session.js';
+import { call } from '../test-helpers/http-call.js';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const migrationsDir = join(here, '..', 'db', 'migrations');
+const rulesDir = join(here, '..', 'rules');
+const webDir = join(here, '..', 'web');
+const NOW = '2026-10-20T12:00:00.000Z';
+
+const CAPS = [
+  ['score:write', '写入评分'],
+  ['peer_review:write', '互评'],
+  ['self_review:write', '提交本队自评'],
+  ['stage:compute', '触发计算发榜'],
+  ['audit:read', '读取审计与计算快照'],
+  ['signoff:create', '企业签字'],
+];
+
+function setup() {
+  const dataDir = mkdtempSync(join(tmpdir(), 'hks-revapi-'));
+  const { db, close } = openDatabase({ dataDir });
+  applyMigrations(db, migrationsDir);
+  const { rules } = loadRules(rulesDir);
+
+  const edition = createEdition(db, {
+    name: '首届 · 上海', city: '上海', startsAt: '2026-10-01', endsAt: '2026-11-30', now: NOW,
+  });
+  const judge = createUser(db, { name: '评委甲', phone: '13900000041', password: 'pw' });
+  const judge2 = createUser(db, { name: '评委乙', phone: '13900000042', password: 'pw' });
+  const admin = createUser(db, { name: '组委会', phone: '13900000043', password: 'pw' });
+  const enterprise = createUser(db, { name: '出题企业', phone: '13900000044', password: 'pw' });
+  const captain = createUser(db, { name: '队长', phone: '13900000045', password: 'pw' });
+  const outsider = createUser(db, { name: '无权限者', phone: '13900000046', password: 'pw' });
+  const enterprise2 = createUser(db, { name: '别家企业', phone: '13900000048', password: 'pw' });
+
+  for (const [key, description] of CAPS) insertCapability(db, key, description);
+  const grant = (userId, capability) => grantAssignment(db, {
+    userId, capability, scopeType: 'global', scopeId: null, grantedBy: admin.id,
+  });
+  grant(judge.id, 'score:write');
+  grant(judge2.id, 'score:write');
+  grant(judge.id, 'audit:read');
+  grant(admin.id, 'score:write');
+  grant(admin.id, 'stage:compute');
+  grant(admin.id, 'audit:read');
+  grant(captain.id, 'self_review:write');
+  grant(captain.id, 'peer_review:write');
+  // 企业席要 score:write（企业确认就是企业席分）+ signoff:create（证明是出题企业）
+  // —— 与 seed 的 enterprise 角色一致
+  grant(enterprise.id, 'score:write');
+  grant(enterprise.id, 'signoff:create');
+
+  const pkg = createTaskPackage(db, {
+    editionId: edition.id, enterpriseId: enterprise.id, enterpriseName: '某某企业',
+    title: '库存周转', painPoint: '门店库存周转慢',
+    expectedDelivery: '可运行的排产原型', acceptanceCriteria: '能给出周转天数下降的测算',
+    submittedBy: admin.id, now: NOW,
+  });
+  const team1 = insertTeam(db, {
+    editionId: edition.id, name: '一队', captainId: captain.id, taskPackageId: pkg.id, status: 'active', now: NOW,
+  });
+  // 第二支队的任务包属于**别家企业** —— 用来验「企业只能给自己出的题签字」
+  const pkg2 = createTaskPackage(db, {
+    editionId: edition.id, enterpriseId: enterprise2.id, enterpriseName: '别家企业',
+    title: '门店排班', painPoint: '排班靠人肉',
+    expectedDelivery: '可用的排班建议', acceptanceCriteria: '能给出人力节省测算',
+    submittedBy: admin.id, now: NOW,
+  });
+  const team2 = insertTeam(db, {
+    editionId: edition.id, name: '二队', captainId: admin.id, taskPackageId: pkg2.id, status: 'active', now: NOW,
+  });
+  insertTeamMember(db, { teamId: team1.id, userId: captain.id, role: 'captain', now: NOW });
+
+  const stage = insertStage(db, {
+    editionId: edition.id, key: 's1', name: '初赛', kind: 'initial',
+    startsAt: '2026-10-01', endsAt: '2026-10-10', scoringConfigKey: 'initial', status: 'open', now: NOW,
+  });
+  assignStageJudge(db, { stageId: stage.id, userId: judge.id, seat: 'judge', now: NOW });
+  assignStageJudge(db, { stageId: stage.id, userId: judge2.id, seat: 'judge', now: NOW });
+
+  const app = createApp({ db, rules, webDir });
+  return {
+    db, close, dataDir, app, rules, judge, judge2, admin, enterprise, enterprise2, captain, outsider, team1, team2, stage,
+    tokenJudge: createSession(db, judge.id).token,
+    tokenJudge2: createSession(db, judge2.id).token,
+    tokenAdmin: createSession(db, admin.id).token,
+    tokenEnterprise: createSession(db, enterprise.id).token,
+    tokenCaptain: createSession(db, captain.id).token,
+    tokenOutsider: createSession(db, outsider.id).token,
+  };
+}
+
+test('未登录提交评分 → 401', async () => {
+  const s = setup();
+  const res = await call(s.app, 'POST', `/api/stages/${s.stage.id}/reviews`, {
+    body: { items: [{ teamId: s.team1.id, dimension: 'innovation', rawScore: 80 }] },
+  });
+  assert.equal(res.status, 401);
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('有能力点但**不是**该赛段评委 → 403（NOT_ASSIGNED_JUDGE）', async () => {
+  const s = setup();
+  const res = await call(s.app, 'POST', `/api/stages/${s.stage.id}/reviews`, {
+    token: s.tokenCaptain,
+    body: { items: [{ teamId: s.team1.id, dimension: 'innovation', rawScore: 80 }] },
+  });
+  assert.equal(res.status, 403);
+  assert.equal(JSON.parse(res.body).error.code, 'FORBIDDEN');
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('评委提交打分 → 200', async () => {
+  const s = setup();
+  const res = await call(s.app, 'POST', `/api/stages/${s.stage.id}/reviews`, {
+    token: s.tokenJudge,
+    body: { items: [{ teamId: s.team1.id, dimension: 'innovation', rawScore: 80 }] },
+  });
+  assert.equal(res.status, 200);
+  assert.equal(JSON.parse(res.body).submitted, 1);
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('⛔ 评委不能代他人申报回避（打分 sabotage）', async () => {
+  const s = setup();
+  const res = await call(s.app, 'POST', `/api/stages/${s.stage.id}/recusals`, {
+    token: s.tokenJudge,
+    body: { judgeId: s.judge2.id, teamId: s.team1.id, reason: '投资方' },
+  });
+  assert.equal(res.status, 403);
+  assert.equal(JSON.parse(res.body).error.code, 'FORBIDDEN');
+  // 确认没有落库
+  const rows = s.db.prepare('SELECT * FROM recusal_records WHERE stage_id = ?').all(s.stage.id);
+  assert.equal(rows.length, 0, '被拒绝的回避申报不得留下记录');
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('评委为自己申报回避 → 200（本人可申报）', async () => {
+  const s = setup();
+  const res = await call(s.app, 'POST', `/api/stages/${s.stage.id}/recusals`, {
+    token: s.tokenJudge,
+    body: { teamId: s.team1.id, reason: '前雇主' },
+  });
+  assert.equal(res.status, 200);
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('⛔ 评委不能冒名签企业确认（企业项占初赛 10% / 决赛 25% 权重）', async () => {
+  const s = setup();
+  const res = await call(s.app, 'POST', `/api/stages/${s.stage.id}/enterprise-confirmations`, {
+    token: s.tokenJudge,
+    body: {
+      teamId: s.team1.id, enterpriseId: s.enterprise.id, rawScore: 100,
+      crossJudgeId: s.judge2.id, content: '我们认可这支队伍',
+    },
+  });
+  assert.equal(res.status, 403);
+  const rows = s.db.prepare('SELECT * FROM enterprise_confirmations WHERE stage_id = ?').all(s.stage.id);
+  assert.equal(rows.length, 0, '被拒绝的企业确认不得落库');
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('出题企业为自己签确认 → 200；跨领域评委不在名单 → 404', async () => {
+  const s = setup();
+  const bad = await call(s.app, 'POST', `/api/stages/${s.stage.id}/enterprise-confirmations`, {
+    token: s.tokenEnterprise,
+    body: {
+      teamId: s.team1.id, rawScore: 90,
+      crossJudgeId: s.captain.id, content: '解决了我方库存周转环节',
+    },
+  });
+  assert.equal(bad.status, 404, '跨领域评委必须在本赛段名单里');
+  assert.equal(JSON.parse(bad.body).error.code, 'JUDGE_NOT_ASSIGNED');
+
+  const ok = await call(s.app, 'POST', `/api/stages/${s.stage.id}/enterprise-confirmations`, {
+    token: s.tokenEnterprise,
+    body: {
+      teamId: s.team1.id, rawScore: 90,
+      crossJudgeId: s.judge2.id, content: '解决了我方库存周转环节',
+    },
+  });
+  assert.equal(ok.status, 200);
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('⛔ 评委不能替别的队伍交自评（自评加分路径）', async () => {
+  const s = setup();
+  const res = await call(s.app, 'POST', `/api/stages/${s.stage.id}/self-review`, {
+    token: s.tokenJudge,
+    body: { teamId: s.team1.id, items: [{ dimension: 'self_eval', rawScore: 95 }] },
+  });
+  assert.equal(res.status, 403, '评委连自评能力点都没有，先被能力点拦下');
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('⛔ 队长不能替别的队伍交自评', async () => {
+  const s = setup();
+  const other = insertTeam(s.db, {
+    editionId: s.stage.edition_id, name: '二队', captainId: s.admin.id, status: 'active', now: NOW,
+  });
+  const res = await call(s.app, 'POST', `/api/stages/${s.stage.id}/self-review`, {
+    token: s.tokenCaptain,
+    body: { teamId: other.id, items: [{ dimension: 'self_eval', rawScore: 95 }] },
+  });
+  assert.equal(res.status, 403);
+  assert.equal(JSON.parse(res.body).error.code, 'NOT_TEAM_MEMBER');
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('队长为本队交自评 → 200', async () => {
+  const s = setup();
+  const res = await call(s.app, 'POST', `/api/stages/${s.stage.id}/self-review`, {
+    token: s.tokenCaptain,
+    body: { teamId: s.team1.id, items: [{ dimension: 'self_eval', rawScore: 90 }] },
+  });
+  assert.equal(res.status, 200);
+  assert.equal(JSON.parse(res.body).submitted, 1);
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('⛔ 互评必须由本队成员发起', async () => {
+  const s = setup();
+  const res = await call(s.app, 'POST', `/api/stages/${s.stage.id}/peer-reviews`, {
+    token: s.tokenCaptain,
+    body: { items: [{ fromTeamId: '别人的队', toTeamId: s.team1.id, score: 80 }] },
+  });
+  assert.equal(res.status, 403);
+  assert.equal(JSON.parse(res.body).error.code, 'NOT_TEAM_MEMBER');
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('compute 权限：评委 403 / 组委会 200', async () => {
+  const s = setup();
+  const denied = await call(s.app, 'POST', `/api/stages/${s.stage.id}/compute`, { token: s.tokenJudge });
+  assert.equal(denied.status, 403);
+  assert.equal(JSON.parse(denied.body).error.code, 'FORBIDDEN');
+
+  const allowed = await call(s.app, 'POST', `/api/stages/${s.stage.id}/compute`, { token: s.tokenAdmin });
+  assert.equal(allowed.status, 200);
+  const body = JSON.parse(allowed.body);
+  assert.ok(body.computationId);
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('⛔ 计算快照不得跨赛段读取（404）', async () => {
+  const s = setup();
+  const computed = await call(s.app, 'POST', `/api/stages/${s.stage.id}/compute`, { token: s.tokenAdmin });
+  const computationId = JSON.parse(computed.body).computationId;
+
+  const other = insertStage(s.db, {
+    editionId: s.stage.edition_id, key: 's2', name: '决赛', kind: 'final',
+    startsAt: '2026-11-01', endsAt: '2026-11-10', scoringConfigKey: 'final', status: 'open', now: NOW,
+  });
+  const res = await call(s.app, 'GET', `/api/stages/${other.id}/computations/${computationId}`, {
+    token: s.tokenAdmin,
+  });
+  assert.equal(res.status, 404);
+  assert.equal(JSON.parse(res.body).error.code, 'COMPUTATION_NOT_FOUND');
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('⛔ 跨领域评委不能与出题企业签字人相同（双签必须真是两个人）', async () => {
+  const s = setup();
+  const res = await call(s.app, 'POST', `/api/stages/${s.stage.id}/enterprise-confirmations`, {
+    token: s.tokenEnterprise,
+    body: {
+      teamId: s.team1.id, rawScore: 90,
+      crossJudgeId: s.enterprise.id, content: '自己给自己当跨领域评委',
+    },
+  });
+  assert.equal(res.status, 400);
+  assert.equal(JSON.parse(res.body).error.code, 'CROSS_JUDGE_SAME_AS_SIGNATORY');
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('赛段级作用域授权可用（不只是全局授权）', async () => {
+  const s = setup();
+  // 另建一个赛段 + 一个只在 s1 上有 score:write 授权的评委
+  const scopedJudge = createUser(s.db, { name: '赛段评委', phone: '13900000047', password: 'pw' });
+  assignStageJudge(s.db, { stageId: s.stage.id, userId: scopedJudge.id, seat: 'judge', now: NOW });
+  grantAssignment(s.db, {
+    userId: scopedJudge.id, capability: 'score:write', scopeType: 'stage', scopeId: s.stage.id, grantedBy: s.admin.id,
+  });
+  const token = createSession(s.db, scopedJudge.id).token;
+
+  const ok = await call(s.app, 'POST', `/api/stages/${s.stage.id}/reviews`, {
+    token,
+    body: { items: [{ teamId: s.team1.id, dimension: 'innovation', rawScore: 70 }] },
+  });
+  assert.equal(ok.status, 200, '赛段级授权必须被认');
+
+  // 换一个赛段 → 该授权不覆盖 → 403
+  const other = insertStage(s.db, {
+    editionId: s.stage.edition_id, key: 's2', name: '决赛', kind: 'final',
+    startsAt: '2026-11-01', endsAt: '2026-11-10', scoringConfigKey: 'final', status: 'open', now: NOW,
+  });
+  const denied = await call(s.app, 'POST', `/api/stages/${other.id}/reviews`, {
+    token,
+    body: { items: [{ teamId: s.team1.id, dimension: 'innovation', rawScore: 70 }] },
+  });
+  assert.equal(denied.status, 403, '赛段级授权不得跨赛段生效');
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('没有能力的账号 → 403（三态：禁用 → 403，不是 404）', async () => {
+  const s = setup();
+  const res = await call(s.app, 'POST', `/api/stages/${s.stage.id}/reviews`, {
+    token: s.tokenOutsider,
+    body: { items: [] },
+  });
+  assert.equal(res.status, 403);
+  s.close();
+  rmSync(s.dataDir, { recursive: true, force: true });
+});
+
+test('⛔ 评委不能以自己名义替别人家的队签企业确认（C1：连坐作废对手的企业席）', async () => {
+  const s = setup();
+  const res = await call(s.app, 'POST', `/api/stages/${s.stage.id}/enterprise-confirmations`, {
+    token: s.tokenJudge,
+    body: {
+      teamId: s.team1.id, enterpriseId: s.judge.id, rawScore: 100,
+      crossJudgeId: s.judge2.id, content: '我替这家签了',
+    },
+  });
+  assert.equal(res.status, 403);
+  assert.equal(
+    s.db.prepare('SELECT COUNT(*) AS n FROM enterprise_confirmations WHERE stage_id = ?').get(s.stage.id).n,
+    0,
+    '被拒绝的冒名确认不得落库（否则会连坐掉受害队伍的企业席）',
+  );
+  s.close();
+  rmSync(s.dataDir, { recursive: true });
+});
+
+test('⛔ 评委不能给名册外的队伍打分（外队进榜）', async () => {
+  const s = setup();
+  // 另一个届期的队伍：不在本赛段名册内
+  const otherEdition = createEdition(s.db, {
+    name: '第二届', city: '杭州', startsAt: '2027-01-01', endsAt: '2027-02-28', now: NOW,
+  });
+  const outsider = insertTeam(s.db, {
+    editionId: otherEdition.id, name: '外队', captainId: s.admin.id, status: 'active', now: NOW,
+  });
+  const res = await call(s.app, 'POST', `/api/stages/${s.stage.id}/reviews`, {
+    token: s.tokenJudge,
+    body: { items: [{ teamId: outsider.id, dimension: 'innovation', rawScore: 99 }] },
+  });
+  assert.equal(res.status, 404, '名册外的队伍 → 404（不是 500）');
+  assert.equal(JSON.parse(res.body).error.code, 'TEAM_NOT_IN_STAGE');
+  s.close();
+  rmSync(s.dataDir, { recursive: true });
+});
+
+test('⛔ 评委不能给自评席维度打分（绕过「自评只能本队成员」）', async () => {
+  const s = setup();
+  // 决赛权重表里「自评测」是 seat=self 的维度
+  const finalStage = insertStage(s.db, {
+    editionId: s.stage.edition_id, key: 's2', name: '决赛', kind: 'final',
+    startsAt: '2026-11-01', endsAt: '2026-11-10', scoringConfigKey: 'final', status: 'open', now: NOW,
+  });
+  assignStageJudge(s.db, { stageId: finalStage.id, userId: s.judge.id, seat: 'judge', now: NOW });
+  const res = await call(s.app, 'POST', `/api/stages/${finalStage.id}/reviews`, {
+    token: s.tokenJudge,
+    body: { items: [{ teamId: s.team1.id, dimension: 'self_eval', rawScore: 100 }] },
+  });
+  assert.equal(res.status, 403);
+  assert.equal(JSON.parse(res.body).error.code, 'DIMENSION_SEAT_FORBIDDEN');
+  s.close();
+  rmSync(s.dataDir, { recursive: true });
+});
+
+test('⛔ 回避对象不在本赛段名单 → 404', async () => {
+  const s = setup();
+  const res = await call(s.app, 'POST', `/api/stages/${s.stage.id}/recusals`, {
+    token: s.tokenAdmin,
+    body: { judgeId: s.outsider.id, teamId: s.team1.id, reason: '投资方' },
+  });
+  assert.equal(res.status, 404);
+  assert.equal(JSON.parse(res.body).error.code, 'JUDGE_NOT_ASSIGNED');
+  s.close();
+  rmSync(s.dataDir, { recursive: true });
+});
+
+test('⛔ 有能力点但不是本赛段评委 → 403 NOT_ASSIGNED_JUDGE', async () => {
+  const s = setup();
+  // 给队长发 score:write：他有能力点，但不是本赛段评委
+  insertCapability(s.db, 'score:write', '写入评分');
+  grantAssignment(s.db, {
+    userId: s.captain.id, capability: 'score:write', scopeType: 'global', scopeId: null, grantedBy: s.admin.id,
+  });
+  const res = await call(s.app, 'POST', `/api/stages/${s.stage.id}/reviews`, {
+    token: s.tokenCaptain,
+    body: { items: [{ teamId: s.team1.id, dimension: 'innovation', rawScore: 80 }] },
+  });
+  assert.equal(res.status, 403);
+  assert.equal(JSON.parse(res.body).error.code, 'NOT_ASSIGNED_JUDGE');
+  s.close();
+  rmSync(s.dataDir, { recursive: true });
+});
+
+test('⛔ 企业席只能给自己出的题签字（别家企业的队 → 403）', async () => {
+  const s = setup();
+  // 授予企业席能力（signoff:create）—— 闸门 N02 通过，但 N03（是不是你出的题）不通过
+  insertCapability(s.db, 'signoff:create', '企业签字');
+  grantAssignment(s.db, {
+    userId: s.enterprise.id, capability: 'signoff:create', scopeType: 'global', scopeId: null, grantedBy: s.admin.id,
+  });
+  const res = await call(s.app, 'POST', `/api/stages/${s.stage.id}/enterprise-confirmations`, {
+    token: s.tokenEnterprise,
+    body: {
+      teamId: s.team2.id, rawScore: 100,
+      crossJudgeId: s.judge2.id, content: '我给别家企业的队也签一个',
+    },
+  });
+  assert.equal(res.status, 403);
+  assert.equal(
+    s.db.prepare('SELECT COUNT(*) AS n FROM enterprise_confirmations WHERE stage_id = ?').get(s.stage.id).n,
+    0,
+    '被拒绝的确认不得落库',
+  );
+  s.close();
+  rmSync(s.dataDir, { recursive: true });
+});
+
+test('⛔ 签字人必须与请求里的 enterpriseId 一致（不能顶着别人的名义签）', async () => {
+  const s = setup();
+  const res = await call(s.app, 'POST', `/api/stages/${s.stage.id}/enterprise-confirmations`, {
+    token: s.tokenEnterprise,
+    body: {
+      teamId: s.team1.id, enterpriseId: s.enterprise2.id, rawScore: 90,
+      crossJudgeId: s.judge2.id, content: '顶着别家的名义签',
+    },
+  });
+  assert.equal(res.status, 403);
+  s.close();
+  rmSync(s.dataDir, { recursive: true });
+});
+
+test('⛔ 企业确认不得签名册外的队伍', async () => {
+  const s = setup();
+  const otherEdition = createEdition(s.db, {
+    name: '第二届', city: '杭州', startsAt: '2027-01-01', endsAt: '2027-02-28', now: NOW,
+  });
+  const outsiderTeam = insertTeam(s.db, {
+    editionId: otherEdition.id, name: '外队', captainId: s.admin.id, status: 'active', now: NOW,
+  });
+  const res = await call(s.app, 'POST', `/api/stages/${s.stage.id}/enterprise-confirmations`, {
+    token: s.tokenEnterprise,
+    body: {
+      teamId: outsiderTeam.id, rawScore: 90,
+      crossJudgeId: s.judge2.id, content: '外队确认',
+    },
+  });
+  assert.equal(res.status, 404);
+  assert.equal(JSON.parse(res.body).error.code, 'TEAM_NOT_IN_STAGE');
+  s.close();
+  rmSync(s.dataDir, { recursive: true });
+});
+
+test('⛔ 改分必须把旧分写进审计（事后能还原当时榜单）', async () => {
+  const s = setup();
+  const first = await call(s.app, 'POST', `/api/stages/${s.stage.id}/reviews`, {
+    token: s.tokenJudge,
+    body: { items: [{ teamId: s.team1.id, dimension: 'innovation', rawScore: 80 }] },
+  });
+  assert.equal(first.status, 200);
+  await call(s.app, 'POST', `/api/stages/${s.stage.id}/reviews`, {
+    token: s.tokenJudge,
+    body: { items: [{ teamId: s.team1.id, dimension: 'innovation', rawScore: 85 }] },
+  });
+  const rows = s.db.prepare('SELECT * FROM audit_log WHERE action = ? ORDER BY rowid').all('review.submit');
+  const last = JSON.parse(rows[rows.length - 1].detail_json);
+  assert.ok(Array.isArray(last.changed) && last.changed.length === 1, '改分必须留痕');
+  assert.equal(last.changed[0].from, 80);
+  assert.equal(last.changed[0].to, 85);
+  s.close();
+  rmSync(s.dataDir, { recursive: true });
+});
+
+test('⛔ 没有评审权限的人读不到评审进度', async () => {
+  const s = setup();
+  const res = await call(s.app, 'GET', `/api/stages/${s.stage.id}/review-state`, {
+    token: s.tokenOutsider,
+  });
+  assert.equal(res.status, 403);
+  assert.equal(JSON.parse(res.body).error.code, 'FORBIDDEN');
+  s.close();
+  rmSync(s.dataDir, { recursive: true });
+});
+
+test('⛔ 互评的被评队不在名册内 → 404', async () => {
+  const s = setup();
+  const otherEdition = createEdition(s.db, {
+    name: '第二届', city: '杭州', startsAt: '2027-01-01', endsAt: '2027-02-28', now: NOW,
+  });
+  const outsiderTeam = insertTeam(s.db, {
+    editionId: otherEdition.id, name: '外队', captainId: s.admin.id, status: 'active', now: NOW,
+  });
+  const res = await call(s.app, 'POST', `/api/stages/${s.stage.id}/peer-reviews`, {
+    token: s.tokenCaptain,
+    body: { items: [{ fromTeamId: s.team1.id, toTeamId: outsiderTeam.id, score: 80 }] },
+  });
+  assert.equal(res.status, 404);
+  assert.equal(JSON.parse(res.body).error.code, 'TEAM_NOT_IN_STAGE');
+  s.close();
+  rmSync(s.dataDir, { recursive: true });
+});
+
+test('⛔ 请求里的 signatoryUserId 与出题企业不符 → 403', async () => {
+  const s = setup();
+  const res = await call(s.app, 'POST', `/api/stages/${s.stage.id}/enterprise-confirmations`, {
+    token: s.tokenEnterprise,
+    body: {
+      teamId: s.team1.id, signatoryUserId: s.judge2.id, rawScore: 90,
+      crossJudgeId: s.judge2.id, content: '签字人写成了别人',
+    },
+  });
+  assert.equal(res.status, 403);
+  s.close();
+  rmSync(s.dataDir, { recursive: true });
+});
+
+test('⛔ 不是企业席的人不能签企业确认（哪怕他就是出题企业）', async () => {
+  const s = setup();
+  // 一支任务包属于 outsider 的队伍；outsider 有 score:write，但**没有** signoff:create
+  const pkg3 = createTaskPackage(s.db, {
+    editionId: s.stage.edition_id, enterpriseId: s.outsider.id, enterpriseName: '某企业',
+    title: '别的题', painPoint: '痛点',
+    expectedDelivery: '交付物', acceptanceCriteria: '验收标准',
+    submittedBy: s.admin.id, now: NOW,
+  });
+  const team3 = insertTeam(s.db, {
+    editionId: s.stage.edition_id, name: '三队', captainId: s.admin.id, taskPackageId: pkg3.id, status: 'active', now: NOW,
+  });
+  insertCapability(s.db, 'score:write', '写入评分');
+  grantAssignment(s.db, {
+    userId: s.outsider.id, capability: 'score:write', scopeType: 'global', scopeId: null, grantedBy: s.admin.id,
+  });
+  const res = await call(s.app, 'POST', `/api/stages/${s.stage.id}/enterprise-confirmations`, {
+    token: s.tokenOutsider,
+    body: {
+      teamId: team3.id, rawScore: 90,
+      crossJudgeId: s.judge2.id, content: '我出的题我签',
+    },
+  });
+  assert.equal(res.status, 403, '不是企业席 → 403');
+  assert.equal(
+    s.db.prepare('SELECT COUNT(*) AS n FROM enterprise_confirmations WHERE stage_id = ?').get(s.stage.id).n,
+    0,
+  );
+  s.close();
+  rmSync(s.dataDir, { recursive: true });
+});
 ```
 
 `platform/test/compute.test.js`：
 
 ```javascript
+// platform/test/compute.test.js —— computeStage 计算快照 + 评审路由
+//
+// 规则溯源：
+//   - 「compute 是显式动作，产出 input+output+trace 三件套」→ 设计文档 §8【决策】+ §12
+//   - 「rank / points 留给 P3」→ 设计文档 §6.2 + INTERFACES.md §3
+//   - 「回避的评委不打分不计入」→ S7 §2.4 R5（R-JDG-09）
+//   - 「企业确认进总分」→ S7 §4.1（R-JDG-05/06）
+//
+// ⚠️ 夹具纪律：迁移 003 补齐了 38 条引用型外键，**所有 id 必须是真实行**
+//    （不能再用 'ed1' / 't1' 这类假 id —— 那样夹具会掩盖孤儿行）。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -5774,8 +6792,16 @@ import { fileURLToPath } from 'node:url';
 import { openDatabase } from '../src/db/sqlite.js';
 import { applyMigrations } from '../src/db/migrate.js';
 import { createUser } from '../src/db/repo/users.js';
+import { createEdition } from '../src/db/repo/editions.js';
+import { createTaskPackage } from '../src/db/repo/taskPackages.js';
+import { insertTeam } from '../src/db/repo/teams.js';
+import { insertStage, assignStageJudge } from '../src/db/repo/stages.js';
+import { insertReview } from '../src/db/repo/reviews.js';
+import { insertEnterpriseConfirmation } from '../src/db/repo/enterprise-confirmations.js';
+import { insertPeerReview } from '../src/db/repo/peer-reviews.js';
+import { insertRecusal } from '../src/db/repo/recusals.js';
 import { loadRules } from '../src/config.js';
-import { computeStage } from '../src/services/compute.js';
+import { computeStage, getComputation } from '../src/services/compute.js';
 import { createRouter } from '../src/http/router.js';
 import { registerReviewRoutes } from '../src/http/routes/review.js';
 
@@ -5789,26 +6815,53 @@ function setup() {
   const { db, close } = openDatabase({ dataDir });
   applyMigrations(db, migrationsDir);
   const { rules } = loadRules(rulesDir);
+
+  const edition = createEdition(db, {
+    name: '首届 · 上海', city: '上海', startsAt: '2026-10-01', endsAt: '2026-11-30', now: NOW,
+  });
   const judge = createUser(db, { name: '评委甲', phone: '13900000031', password: 'pw' });
+  const judge2 = createUser(db, { name: '评委乙', phone: '13900000035', password: 'pw' });
   const admin = createUser(db, { name: '组委会', phone: '13900000032', password: 'pw' });
-  db.prepare(
-    `INSERT INTO stages (id, edition_id, "key", name, kind, starts_at, ends_at, scoring_config_key, status)
-     VALUES ('s1', 'ed1', 's1', '初赛', 'initial', '2026-10-01', '2026-10-10', 'initial', 'open')`,
-  ).run();
-  db.prepare(
-    'INSERT INTO stage_judges (stage_id, user_id, seat, scope_type, scope_id, assigned_at) VALUES (?, ?, ?, ?, ?, ?)',
-  ).run('s1', judge.id, 'judge', 'global', null, NOW);
-  return { db, close, dataDir, rules, judge, admin };
+  const enterprise = createUser(db, { name: '出题企业', phone: '13900000033', password: 'pw' });
+  const captain = createUser(db, { name: '队长', phone: '13900000034', password: 'pw' });
+
+  const pkg = createTaskPackage(db, {
+    editionId: edition.id,
+    enterpriseId: enterprise.id,
+    enterpriseName: '某某企业',
+    title: '库存周转',
+    painPoint: '门店库存周转慢',
+    expectedDelivery: '可运行的排产原型',
+    acceptanceCriteria: '能给出周转天数下降的测算',
+    submittedBy: admin.id,
+    now: NOW,
+  });
+  const team1 = insertTeam(db, {
+    editionId: edition.id, name: '一队', captainId: captain.id, taskPackageId: pkg.id, status: 'active', now: NOW,
+  });
+  const team2 = insertTeam(db, {
+    editionId: edition.id, name: '二队', captainId: admin.id, taskPackageId: pkg.id, status: 'active', now: NOW,
+  });
+
+  const stage = insertStage(db, {
+    editionId: edition.id, key: 's1', name: '初赛', kind: 'initial',
+    startsAt: '2026-10-01', endsAt: '2026-10-10', scoringConfigKey: 'initial', status: 'open', now: NOW,
+  });
+  // ⚠️ 必须走 assignStageJudge：它会**同时**写利益冲突声明并回填 stage_judges
+  //    （R-JDG-18；直插 stage_judges 会绕过这条接线，测试就再也拦不住它坏掉）。
+  assignStageJudge(db, { stageId: stage.id, userId: judge.id, seat: 'judge', now: NOW });
+  assignStageJudge(db, { stageId: stage.id, userId: judge2.id, seat: 'judge', now: NOW });
+
+  return { db, close, dataDir, rules, judge, judge2, admin, enterprise, captain, team1, team2, stage };
 }
 
 test('computeStage 写快照三件套 + stage_results', () => {
-  const { db, close, dataDir, rules, admin, judge } = setup();
-  db.prepare(
-    `INSERT INTO stage_reviews (id, stage_id, judge_id, team_id, dimension, raw_score, submitted_at)
-     VALUES ('r1', 's1', ?, 't1', 'innovation', 80, ?)`,
-  ).run(judge.id, NOW);
+  const { db, close, dataDir, rules, admin, judge, team1, stage } = setup();
+  insertReview(db, {
+    stageId: stage.id, judgeId: judge.id, teamId: team1.id, dimension: 'innovation', rawScore: 80, now: NOW,
+  });
 
-  const res = computeStage({ db, stageId: 's1', actorId: admin.id, now: NOW, rules });
+  const res = computeStage({ db, stageId: stage.id, actorId: admin.id, now: NOW, rules });
   assert.ok(res.computationId);
   assert.ok(Array.isArray(res.teams));
 
@@ -5821,18 +6874,33 @@ test('computeStage 写快照三件套 + stage_results', () => {
   assert.ok(trace.normalization);
   assert.ok(trace.weights);
 
-  const row = db.prepare('SELECT * FROM stage_results WHERE stage_id = ? AND team_id = ?').get('s1', 't1');
+  const row = db.prepare('SELECT * FROM stage_results WHERE stage_id = ? AND team_id = ?').get(stage.id, team1.id);
   assert.equal(row.computation_id, res.computationId);
   assert.equal(row.rank, null, '名次由 P3 填');
+  assert.equal(row.points, null, '积分由 P3 填');
 
   close();
   rmSync(dataDir, { recursive: true, force: true });
 });
 
+test('重算后 stage_results 必须指向最新一次计算', () => {
+  const { db, close, dataDir, rules, admin, judge, team1, stage } = setup();
+  insertReview(db, {
+    stageId: stage.id, judgeId: judge.id, teamId: team1.id, dimension: 'innovation', rawScore: 80, now: NOW,
+  });
+  const a = computeStage({ db, stageId: stage.id, actorId: admin.id, now: NOW, rules });
+  const b = computeStage({ db, stageId: stage.id, actorId: admin.id, now: NOW, rules });
+  const row = db.prepare('SELECT * FROM stage_results WHERE stage_id = ? AND team_id = ?').get(stage.id, team1.id);
+  assert.equal(row.computation_id, b.computationId, '结果行必须跟着最新一次计算走');
+  assert.notEqual(row.computation_id, a.computationId);
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
 test('重复 compute → revision 递增（可复算的历史留档）', () => {
-  const { db, close, dataDir, rules, admin } = setup();
-  const a = computeStage({ db, stageId: 's1', actorId: admin.id, now: NOW, rules });
-  const b = computeStage({ db, stageId: 's1', actorId: admin.id, now: NOW, rules });
+  const { db, close, dataDir, rules, admin, stage } = setup();
+  const a = computeStage({ db, stageId: stage.id, actorId: admin.id, now: NOW, rules });
+  const b = computeStage({ db, stageId: stage.id, actorId: admin.id, now: NOW, rules });
   const revs = db.prepare('SELECT revision FROM computation_snapshots ORDER BY revision').all().map((r) => r.revision);
   assert.deepEqual(revs, [1, 2]);
   assert.notEqual(a.computationId, b.computationId);
@@ -5840,8 +6908,18 @@ test('重复 compute → revision 递增（可复算的历史留档）', () => {
   rmSync(dataDir, { recursive: true, force: true });
 });
 
+test('compute 必须写审计日志（action=stage.compute）', () => {
+  const { db, close, dataDir, rules, admin, stage } = setup();
+  computeStage({ db, stageId: stage.id, actorId: admin.id, now: NOW, rules });
+  const row = db.prepare('SELECT * FROM audit_log WHERE action = ? AND entity_id = ?').get('stage.compute', stage.id);
+  assert.ok(row, '计算是显式动作，必须留下操作者与时间戳');
+  assert.equal(row.actor_id, admin.id);
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
 test('compute 路由已注册且计算快照可读', () => {
-  const { db, close, dataDir, rules, admin } = setup();
+  const { db, close, dataDir } = setup();
   const router = createRouter();
   registerReviewRoutes(router);
   const paths = router.list().map((r) => `${r.method} ${r.pattern}`);
@@ -5858,6 +6936,189 @@ test('compute 路由已注册且计算快照可读', () => {
   ]) {
     assert.ok(paths.includes(p), `缺路由 ${p}`);
   }
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('⛔ 企业确认必须真的进总分（仓储 snake_case → 领域 camelCase 映射）', () => {
+  const { db, close, dataDir, rules, admin, judge, judge2, enterprise, team1, stage } = setup();
+  insertReview(db, {
+    stageId: stage.id, judgeId: judge.id, teamId: team1.id, dimension: 'innovation', rawScore: 80, now: NOW,
+  });
+  insertEnterpriseConfirmation(db, {
+    stageId: stage.id, teamId: team1.id, enterpriseId: enterprise.id, dimension: 'enterprise',
+    rawScore: 90, crossJudgeId: judge2.id, signatoryUserId: enterprise.id, content: '解决库存周转环节', now: NOW,
+  });
+
+  const res = computeStage({ db, stageId: stage.id, actorId: admin.id, now: NOW, rules });
+  const t1 = res.teams.find((t) => t.teamId === team1.id);
+  assert.equal(t1.seatE, 90, '企业确认分必须进入企业席');
+  assert.ok(!res.warnings.some((w) => w.code === 'no_enterprise_confirmation' && w.teamId === team1.id),
+    '有有效企业确认却报「没有企业确认」说明映射断了');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('⛔ 没有任何评分的队伍不写 stage_results（不参与排名）', () => {
+  const { db, close, dataDir, rules, admin, judge, team1, team2, stage } = setup();
+  insertReview(db, {
+    stageId: stage.id, judgeId: judge.id, teamId: team1.id, dimension: 'innovation', rawScore: 80, now: NOW,
+  });
+  computeStage({ db, stageId: stage.id, actorId: admin.id, now: NOW, rules });
+
+  assert.ok(db.prepare('SELECT * FROM stage_results WHERE stage_id = ? AND team_id = ?').get(stage.id, team1.id));
+  assert.equal(
+    db.prepare('SELECT * FROM stage_results WHERE stage_id = ? AND team_id = ?').get(stage.id, team2.id),
+    undefined,
+    '没被任何评委打分的队不该有结果行（否则会以 0 分被排进榜单）',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('⛔ 回避的评委其打分不计入本次计算', () => {
+  const { db, close, dataDir, rules, admin, judge, judge2, team1, stage } = setup();
+  insertReview(db, {
+    stageId: stage.id, judgeId: judge.id, teamId: team1.id, dimension: 'innovation', rawScore: 80, now: NOW,
+  });
+  insertReview(db, {
+    stageId: stage.id, judgeId: judge2.id, teamId: team1.id, dimension: 'innovation', rawScore: 20, now: NOW,
+  });
+  insertRecusal(db, {
+    stageId: stage.id, judgeId: judge2.id, teamId: team1.id, reason: '投资方', source: 'declared', action: 'recused', now: NOW,
+  });
+
+  const res = computeStage({ db, stageId: stage.id, actorId: admin.id, now: NOW, rules });
+  const t1 = res.teams.find((t) => t.teamId === team1.id);
+  assert.ok(Math.abs(t1.seatP - 80) < 1e-6, `seatP=${t1.seatP}（回避后只剩评委甲的 80 分）`);
+  assert.ok(res.warnings.some((w) => w.code === 'recusal_excluded'));
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('⛔ 计算快照不得跨赛段读取（D-26）', () => {
+  const { db, close, dataDir, rules, admin, judge, team1, stage } = setup();
+  insertReview(db, {
+    stageId: stage.id, judgeId: judge.id, teamId: team1.id, dimension: 'innovation', rawScore: 80, now: NOW,
+  });
+  const res = computeStage({ db, stageId: stage.id, actorId: admin.id, now: NOW, rules });
+
+  // 本赛段读得到
+  const ok = getComputation({ db, id: res.computationId, stageId: stage.id });
+  assert.equal(ok.id, res.computationId);
+
+  // 换一个赛段读 → 404（不是「找到但不给看」）
+  assert.throws(
+    () => getComputation({ db, id: res.computationId, stageId: 'other-stage' }),
+    (err) => err.status === 404 && err.code === 'COMPUTATION_NOT_FOUND',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('⛔ 互评分必须进 trace.perTeam.peerScore（破同分链的输入）', () => {
+  const { db, close, dataDir, rules, admin, judge, team1, team2, stage } = setup();
+  insertReview(db, {
+    stageId: stage.id, judgeId: judge.id, teamId: team1.id, dimension: 'innovation', rawScore: 80, now: NOW,
+  });
+  insertPeerReview(db, {
+    stageId: stage.id, fromTeamId: team2.id, toTeamId: team1.id, score: 70, now: NOW,
+  });
+
+  const res = computeStage({ db, stageId: stage.id, actorId: admin.id, now: NOW, rules });
+  assert.equal(res.trace.perTeam[team1.id].peerScore, 70, '互评分必须落在被评队的 trace 上');
+  assert.equal(res.trace.perTeam[team2.id].peerScore, null, '发起方不因此拿到互评分');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('⛔ 快照的 input 必须含原始打分（可复算的载体）', () => {
+  const { db, close, dataDir, rules, admin, judge, team1, stage } = setup();
+  insertReview(db, {
+    stageId: stage.id, judgeId: judge.id, teamId: team1.id, dimension: 'innovation', rawScore: 80, now: NOW,
+  });
+  const res = computeStage({ db, stageId: stage.id, actorId: admin.id, now: NOW, rules });
+  const snap = db.prepare('SELECT * FROM computation_snapshots WHERE id = ?').get(res.computationId);
+  const input = JSON.parse(snap.input_json);
+  assert.equal(input.submissions.length, 1, 'input 必须带原始打分，否则无法从快照重放');
+  assert.equal(input.submissions[0].rawScore, 80);
+  assert.ok(input.config, 'input 必须带生效的权重表');
+  assert.ok(input.ruleVersion);
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('⛔ compute 中途失败 → 整体回滚（不留半成品快照与结果行）', () => {
+  const { db, close, dataDir, rules, judge, team1, stage } = setup();
+  insertReview(db, {
+    stageId: stage.id, judgeId: judge.id, teamId: team1.id, dimension: 'innovation', rawScore: 80, now: NOW,
+  });
+  // actor_id 有外键 → 用一个不存在的用户当操作者，让审计写入失败
+  assert.throws(
+    () => computeStage({ db, stageId: stage.id, actorId: '不存在的用户', now: NOW, rules }),
+    (err) => /FOREIGN KEY/i.test(String(err.message)),
+  );
+  assert.equal(
+    db.prepare('SELECT COUNT(*) AS n FROM computation_snapshots WHERE stage_id = ?').get(stage.id).n,
+    0,
+    '失败的事务不能留下快照',
+  );
+  assert.equal(
+    db.prepare('SELECT COUNT(*) AS n FROM stage_results WHERE stage_id = ?').get(stage.id).n,
+    0,
+    '失败的事务不能留下结果行',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('computeStage 对不存在的赛段 → 404', () => {
+  const { db, close, dataDir, rules, admin } = setup();
+  assert.throws(
+    () => computeStage({ db, stageId: 'nope', actorId: admin.id, now: NOW, rules }),
+    (err) => err.status === 404 && err.code === 'STAGE_NOT_FOUND',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('computeStage 缺规则 → 500（绝不用默认值凑一个榜单）', () => {
+  const { db, close, dataDir, admin, stage } = setup();
+  assert.throws(
+    () => computeStage({ db, stageId: stage.id, actorId: admin.id, now: NOW, rules: {} }),
+    (err) => err.status === 500 && err.code === 'RULES_MISSING',
+  );
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('⛔ 重算必须清空旧名次/积分，并删掉本轮已无评分的旧结果行', () => {
+  const { db, close, dataDir, rules, admin, judge, team1, team2, stage } = setup();
+  insertReview(db, {
+    stageId: stage.id, judgeId: judge.id, teamId: team1.id, dimension: 'innovation', rawScore: 80, now: NOW,
+  });
+  insertReview(db, {
+    stageId: stage.id, judgeId: judge.id, teamId: team2.id, dimension: 'innovation', rawScore: 60, now: NOW,
+  });
+  computeStage({ db, stageId: stage.id, actorId: admin.id, now: NOW, rules });
+
+  // 模拟 P3 已经发过榜（名次 / 积分已填）
+  db.prepare('UPDATE stage_results SET rank = 1, tied_with = 2, points = 99 WHERE stage_id = ?').run(stage.id);
+
+  // 把二队的打分撤掉 → 重算
+  // 软删除（评分只增不改，删除用软删除）—— 软删掉的分不得再计入计算
+  db.prepare('UPDATE stage_reviews SET deleted_at = ? WHERE stage_id = ? AND team_id = ?').run(NOW, stage.id, team2.id);
+  computeStage({ db, stageId: stage.id, actorId: admin.id, now: NOW, rules });
+
+  const row1 = db.prepare('SELECT * FROM stage_results WHERE stage_id = ? AND team_id = ?').get(stage.id, team1.id);
+  assert.equal(row1.rank, null, '重算后名次必须回到 NULL（由 P3 重新填）');
+  assert.equal(row1.points, null, '重算后积分必须回到 NULL');
+  assert.equal(row1.tied_with, null);
+  assert.equal(
+    db.prepare('SELECT * FROM stage_results WHERE stage_id = ? AND team_id = ?').get(stage.id, team2.id),
+    undefined,
+    '本轮已无评分的队伍必须从结果表里消失（否则会以旧总分留在榜单上）',
+  );
   close();
   rmSync(dataDir, { recursive: true, force: true });
 });
@@ -5889,6 +7150,23 @@ Expected: FAIL —— `Cannot find module '../src/domain/scoring.js'`
 //   当评委完全同质时该式退化为原始分均值（详见 src/domain/trim.js 顶部说明）。
 //
 // 纯函数：无 IO、无 Date.now()、无 Math.random()。
+//
+// 【父代理预审修正 2026-10-21 —— 本文件有 4 处修正，读代码前先看这段】
+//   ① **自评能填补评委席维度 → 自评加分路径**（本文件最严重的一处）。
+//      原实现里，评委席维度若没有评委打分，会去 `selfReviews` 里找同维度的自评记录顶上；
+//      「精确命中」分支还完全绕过了对齐规则（自评 95 分 / 评委 80 分 → 直接用 95 分进榜）。
+//      这与 R-JDG-13「不成立则自评分对齐评委分（**不加分**）」和 S10 §8「自评不得变成加分项」
+//      直接冲突 —— 团队可以自己给自己加分。
+//      现在：**评委席维度只由评委打分**；评委没打分就是没打分（该维度权重记 0 + warning）。
+//      自评记录只能填 **seat='self'** 的维度。
+//   ② **对齐规则在「精确命中」分支失效**（同 ① 的另一面）。
+//      现在自评维度的取值也走同一套对齐判定：命中 `written_explanation` 时改用评委分。
+//   ③ **自评席维度的分写回了 `dimScores`** → 污染后续队伍的 `perDimension`，
+//      且让「评委分」查表可能取到**别的队伍的自评分**。
+//      现在自评席维度单独放在 `selfDimScores`，与评委维度的 `dimScores` 完全隔离。
+//   ④ **「没有任何评分」判定被企业席污染** → `team_no_reviews` 永远不会触发，
+//      任何在名册里的队都会拿到一条 total=0 的结果行（进而被排进榜单）。
+//      现在「是否参评」只看 **P 席**（评委席 + 自评席）有没有分。
 
 import { normalizeScores } from './normalization.js';
 import { trimOutliers, seatScore } from './trim.js';
@@ -5902,6 +7180,19 @@ function clamp(value, lo, hi) {
 function mean(values) {
   if (!values.length) return 0;
   return values.reduce((a, b) => a + b, 0) / values.length;
+}
+
+/** 按维度权重取加权平均（只算有分的维度）；一个都没有 → null */
+function weightedAverage(scores, dims) {
+  let num = 0;
+  let den = 0;
+  for (const d of dims) {
+    const v = scores[d.key];
+    if (!Number.isFinite(v)) continue;
+    num += d.weight * v;
+    den += d.weight;
+  }
+  return den > 0 ? num / den : null;
 }
 
 /**
@@ -5937,7 +7228,10 @@ export function scoreStage({
   const judgeDims = dimensions.filter((d) => d.seat === 'judge');
   const enterpriseDims = dimensions.filter((d) => d.seat === 'enterprise');
   const selfDims = dimensions.filter((d) => d.seat === 'self');
-  const pSeatKeys = [...judgeDims.map((d) => d.key), ...selfDims.map((d) => d.key)];
+  const selfSeatKeys = selfDims.map((d) => d.key);
+  const pSeatKeys = [...judgeDims.map((d) => d.key), ...selfSeatKeys];
+  const selfSeatKeySet = new Set(selfSeatKeys);
+  const selfThreshold = config.selfEvalThreshold ?? 10;
 
   // 评委池：观察员无投票权（R-JDG-11），其打分一律不计入
   const votingIds = new Set(judges.filter((j) => j.seat !== 'observer').map((j) => j.judgeId));
@@ -5954,6 +7248,7 @@ export function scoreStage({
   }
 
   // ── Step 2/3/4｜逐维度归一化 → 去极值 → 还原到 0–100 ────────────────
+  // dimScores 只装**评委席**维度；自评席维度另装 selfDimScores（父代理预审修正 ③）
   const dimScores = new Map(); // dim -> Map(teamId -> { score, zMean, z, raw })
   for (const [dim, rows] of byDim) {
     const pool = [...new Set(rows.map((r) => r.judgeId))].sort();
@@ -6109,6 +7404,11 @@ export function scoreStage({
     peerByTeam.get(p.toTeamId).push(p.score);
   }
 
+  // 自评席维度的分（与评委维度隔离，父代理预审修正 ③）
+  const selfDimScores = new Map(); // dim -> Map(teamId -> { score, zMean, z, raw })
+  // 每队的席位权重分母（seatP 的真实分母）
+  const seatWeightSums = new Map();
+
   const teamsOut = [];
   for (const teamId of teamIds) {
     const effW = { ...(ent.weights[teamId] ?? {}) };
@@ -6120,6 +7420,18 @@ export function scoreStage({
     if (r4 && enterpriseScore === null) {
       const substitute = dimScores.get(r4.dimension)?.get(teamId)?.score ?? 0;
       enterpriseScore = substitute;
+      if (substitute === 0 && !dimScores.get(r4.dimension)?.has(teamId)) {
+        // ⚠️ 父代理预审修正（Important，I4）：替代维度**没有评委分**时，
+        //    企业席会静默变成 0 分（自由命题组白丢 20%），而告警却写着
+        //    「改由评委打分」—— 队伍和组委会都看不出来少了这一块。
+        //    现在必须显式说清楚：替代维度没分，企业项按 0 分计。
+        warnings.push({
+          code: 'R4_substitute_no_scores',
+          message: `自由命题组触发 R4，但替代维度 ${r4.dimension} 上该队没有任何评委打分，企业项按 0 分计`,
+          teamId,
+          dimension: r4.dimension,
+        });
+      }
     }
 
     // 席位权重：企业席封顶（R3 已在 applyEnterpriseRules 内封顶）→ 评委席补足到 1 − w_E
@@ -6134,18 +7446,55 @@ export function scoreStage({
 
     // 评委席 + 自评席的维度分
     const pScores = {};
+
+    // ── 评委席维度：只由评委打分 ────────────────────────────────────
+    // ⛔ 自评**永不**填补评委席维度（父代理预审修正 ①）；
+    //    ⛔ 而且自评席维度**绝不能**取评委打分记录（父代理预审修正 ⑤）：
+    //    评委若能对 `seat='self'` 的维度打分，就能把「自评只能本队成员提交」
+    //    这道闸门整个绕过去 —— 评委自己填 100 分，自评栏就归他了。
     for (const k of pSeatKeys) {
+      if (selfSeatKeySet.has(k)) continue;
       const cell = dimScores.get(k)?.get(teamId);
-      if (cell) {
-        pScores[k] = cell.score;
-        continue;
-      }
-      // 自评维度：从自评测记录取分（必要时按对齐规则替换为评委分）
+      if (cell) pScores[k] = cell.score;
+      // 评委没打分就是没打分 —— 该维度权重记 0，并由 seatScore().missing 统一出 warning。
+    }
+
+    // 评委席（不含自评席）的加权分 —— 自评席维度的对照基准（R-JDG-13 同一尺度）
+    const judgeSeatAvg = weightedAverage(pScores, judgeDims);
+
+    // ── 自评席维度 ─────────────────────────────────────────────────
+    for (const k of selfSeatKeys) {
       const selfRows = selfReviews.filter((r) => r.teamId === teamId);
       const exact = selfRows.find((r) => r.dimension === k);
       if (exact) {
-        pScores[k] = exact.rawScore;
+        const raw = exact.rawScore;
+        // ⛔ D-29：自评分必须与「该队评委席分」比 —— 高出阈值就对齐（**不加分**）。
+        //    自评席维度没有同维度的评委分可比，若放任不管，队伍把自评维度填到 100
+        //    就是白拿 5% 的加权分 —— 正是 S7 §4.3 说的「一旦自评可以加分，它就变成了纯粹的博弈项」。
+        if (judgeSeatAvg != null) {
+          const d = raw - judgeSeatAvg;
+          if (d > selfThreshold) {
+            pScores[k] = judgeSeatAvg;
+            warnings.push({
+              code: 'self_eval_written_explanation',
+              message: `自评分比评委席分高 ${d.toFixed(2)} 分，须提交书面说明；不成立则自评分对齐评委席分（不加分）`,
+              teamId,
+              dimension: k,
+            });
+            continue;
+          }
+          if (d < -selfThreshold) {
+            warnings.push({
+              code: 'self_eval_judge_question',
+              message: `自评分比评委席分低 ${Math.abs(d).toFixed(2)} 分，评委须向团队提问（只提问，不改分）`,
+              teamId,
+              dimension: k,
+            });
+          }
+        }
+        pScores[k] = raw;
       } else {
+        // 没有该维度的自评 → 用「本队对评委维度的自评」加权平均（命中对齐的用评委分）
         let num = 0;
         let den = 0;
         for (const jd of judgeDims) {
@@ -6157,19 +7506,6 @@ export function scoreStage({
           den += jd.weight;
         }
         if (den > 0) pScores[k] = num / den;
-        else {
-          warnings.push({
-            code: 'dimension_no_scores',
-            message: `队伍 ${teamId} 在维度 ${k} 上没有任何评分，该维度权重记 0`,
-            teamId,
-            dimension: k,
-          });
-        }
-      }
-      // 自评维度的分也要进 trace（否则发榜页看不到该维度的来由）
-      if (pScores[k] != null && !dimScores.has(k)) dimScores.set(k, new Map());
-      if (pScores[k] != null) {
-        dimScores.get(k).set(teamId, { score: pScores[k], zMean: null, z: {}, raw: pScores[k] });
       }
     }
 
@@ -6186,6 +7522,9 @@ export function scoreStage({
       });
     }
     const seatP = pSeat.score;
+    // 席位分的**真实分母**（缺分维度被剔除后的权重和）——
+    // 不记进 trace 的话，从 trace 复算 seatP 会得到不同的数（父代理预审 Minor 8）。
+    seatWeightSums.set(teamId, pSeat.weightSum);
 
     let seatE = 0;
     if (wE > 0) {
@@ -6201,10 +7540,19 @@ export function scoreStage({
     // 总分 = (1 − w_E) × P + w_E × E（S7 §3.1；w_E 为该队生效值，R1 时为 0）
     const total = (1 - wE) * seatP + wE * seatE;
 
+    // 自评席维度的分进 trace（否则发榜页看不到该维度的来由）
+    for (const k of selfSeatKeySet) {
+      if (pScores[k] == null) continue;
+      if (!selfDimScores.has(k)) selfDimScores.set(k, new Map());
+      selfDimScores.get(k).set(teamId, { score: pScores[k], zMean: null, z: {}, raw: pScores[k] });
+    }
+
     const perDimension = {};
     for (const d of dimensions) {
-      const cell = dimScores.get(d.key)?.get(teamId);
       const isEnterprise = d.seat === 'enterprise';
+      const cell = isEnterprise
+        ? null
+        : (selfSeatKeySet.has(d.key) ? selfDimScores.get(d.key)?.get(teamId) : dimScores.get(d.key)?.get(teamId));
       perDimension[d.key] = {
         weight: effW[d.key] ?? 0,
         raw: isEnterprise ? (enterpriseScore ?? null) : (cell?.raw ?? null),
@@ -6217,8 +7565,11 @@ export function scoreStage({
   }
 
   // 没有任何评分的队伍不参与排名（设计文档 §11）
+  // ⚠️ 判定只看 **P 席**（评委席 + 自评席）：企业席缺分时企业项按 0 分计，
+  //    若把它算作「有评分」，则名册里没被任何人评过的队会拿到 total=0 的结果行，
+  //    进而被排进榜单 —— 与「不参与排名」相悖（父代理预审修正 ④）。
   for (const t of teamsOut) {
-    const hasAny = Object.values(t.perDimension).some((d) => d.mean != null);
+    const hasAny = pSeatKeys.some((k) => t.perDimension[k]?.mean != null);
     if (!hasAny) {
       warnings.push({
         code: 'team_no_reviews',
@@ -6242,6 +7593,7 @@ export function scoreStage({
       seatP: t.seatP,
       seatE: t.seatE,
       total: t.total,
+      seatPWeightSum: seatWeightSums.get(t.teamId) ?? 0,
       peerScore: peerByTeam.has(t.teamId) ? mean(peerByTeam.get(t.teamId)) : null,
     };
   }
@@ -6258,6 +7610,8 @@ export function scoreStage({
 
 ```javascript
 // src/db/repo/computations.js — 计算快照与赛段结果
+// 依据：设计文档 §12（可复算：input + output + trace 三件套）+ §8【决策】（compute 是显式动作）
+// ⚠️ 本文件**不含裸 SQL 之外的任何逻辑**，全部 SQL 收在此处（全局约束「SQL 边界」）。
 import { randomUUID } from 'node:crypto';
 
 export function nextRevision(db, { stageId, kind }) {
@@ -6282,11 +7636,47 @@ export function getSnapshot(db, id) {
   return db.prepare('SELECT * FROM computation_snapshots WHERE id = ?').get(id) ?? null;
 }
 
+/**
+ * 取快照并**校验它属于该赛段**。
+ * ⚠️ 父代理预审修正（Critical，D-26）：接口是
+ *    `GET /api/stages/:stageId/computations/:computationId`，
+ *    但原实现只按 id 取 —— 路径里的 stageId 形同虚设，
+ *    任何有 `audit:read` 的人都能拿**别的赛段**的计算快照来读（跨赛段越权读）。
+ *    现在传入 stageId 时必须匹配，不匹配返回 null（上层回 404）。
+ */
+export function getSnapshotInStage(db, { id, stageId = null }) {
+  const row = getSnapshot(db, id);
+  if (!row) return null;
+  if (stageId != null && row.stage_id !== stageId) return null;
+  return row;
+}
+
 export function listSnapshots(db, { stageId, kind = null } = {}) {
   if (kind) {
     return db.prepare('SELECT * FROM computation_snapshots WHERE stage_id = ? AND kind = ? ORDER BY revision').all(stageId, kind);
   }
   return db.prepare('SELECT * FROM computation_snapshots WHERE stage_id = ? ORDER BY revision').all(stageId);
+}
+
+/**
+ * 重算前清场：名次/并列/积分一律置 NULL，并删掉「本轮已无评分」的旧结果行。
+ * ⚠️ 父代理预审修正（Important，I2）：`upsertStageResult` 的 ON CONFLICT 只更新
+ *    total / seat_p / seat_e / computation_id —— **rank / tied_with / points 原样保留**。
+ *    于是「P3 已经发过榜 → 之后又重算一次」的结果是：**旧名次 + 新总分**并排躺在同一行上，
+ *    榜单自相矛盾。撤掉某队的全部打分后重算，旧行也仍在（total 还是老的）。
+ *    现在重算前先清场（P3 会在新一轮计算后重新填名次与积分）。
+ * @param {string[]} keepTeamIds 本轮**有**评分的队伍；不在名单里的旧行一律删除
+ */
+export function resetStageResults(db, { stageId, keepTeamIds = [] }) {
+  db.prepare('UPDATE stage_results SET rank = NULL, tied_with = NULL, points = NULL WHERE stage_id = ?').run(stageId);
+  if (keepTeamIds.length) {
+    const placeholders = keepTeamIds.map(() => '?').join(', ');
+    db
+      .prepare(`DELETE FROM stage_results WHERE stage_id = ? AND team_id NOT IN (${placeholders})`)
+      .run(stageId, ...keepTeamIds);
+    return;
+  }
+  db.prepare('DELETE FROM stage_results WHERE stage_id = ?').run(stageId);
 }
 
 /** 赛段结果：rank / tied_with / points 由 P3 填（P2 显式留空，不假装有名次） */
@@ -6310,14 +7700,31 @@ export function upsertStageResult(db, { stageId, teamId, total, seatP, seatE, co
 //   ⛔ compute 是【显式动作，不自动触发】：发榜影响奖金，必须有明确的操作者与时间戳。
 //   每次计算产出三件套（input + output + trace）写入 computation_snapshots → 榜单可复算。
 //   ⛔ 但计算用的是【原始数据全量重算】，不是 score_stats 增量值 —— 可复算要求能从原始数据重放。
-import { getStage, listStageTeams as listStageTeamsRows } from '../db/repo/stages.js';
+//
+// 【父代理预审修正 2026-10-21 —— 本文件有 4 处修正，读代码前先看这段】
+//   ① **仓储返回的是 snake_case 行，规格却把三张表的原始行直接喂给领域层** ——
+//      企业确认 / 互评 / 自评三张表全部被**静默忽略**：
+//        · enterprise_confirmations 的列是 team_id / enterprise_id / raw_score /
+//          cross_judge_id / signatory_user_id，而领域层读的是 teamId / rawScore / …
+//          → 领域层按 `c.teamId === team.teamId` 过滤，一条都匹配不上
+//          → 每支队都拿到「没有企业确认」→ 企业席恒为 0 分（初赛 10% / 决赛 25% 直接蒸发）。
+//        · 互评分（trace.perTeam.peerScore）恒为 null。
+//        · 自评测恒为空 → 决赛的「自评测 5%」维度恒缺分。
+//      现在三张表都**显式映射**成领域层的驼峰形状。
+//   ② **「抢 revision + 写快照 + 写结果 + 写审计」不在同一事务** →
+//      中途失败会留下「有快照没结果」或「结果指向不存在的快照」的半成品。
+//      现在整段在一个 `BEGIN IMMEDIATE` 事务里。
+//   ③ **没有任何评分的队伍也写进了 stage_results**（total = 0）→
+//      它们会被 P3 排进榜单。设计文档 §11 明写「不参与排名」。
+//      现在只写「P 席有分」的队伍。
+//   ④ **计算快照可跨赛段读取**（D-26）→ 见 db/repo/computations.js 的 getSnapshotInStage。
+import { getStage, listStageTeams as listStageTeamsRows, listStageJudges } from '../db/repo/stages.js';
 import { listReviews } from '../db/repo/reviews.js';
 import { listEnterpriseConfirmations } from '../db/repo/enterprise-confirmations.js';
 import { listPeerReviews } from '../db/repo/peer-reviews.js';
 import { listSelfReviews } from '../db/repo/self-reviews.js';
 import { listRecusals } from '../db/repo/recusals.js';
-import { listStageJudges } from '../db/repo/stages.js';
-import { insertSnapshot, nextRevision, upsertStageResult, getSnapshot } from '../db/repo/computations.js';
+import { insertSnapshot, nextRevision, upsertStageResult, getSnapshotInStage, resetStageResults } from '../db/repo/computations.js';
 import { writeAuditLog } from '../audit/log.js';
 import { scoreStage } from '../domain/scoring.js';
 import { checkRecusal } from '../domain/review-eligibility.js';
@@ -6330,16 +7737,65 @@ function fail(status, code, message) {
   return appError(status, code, message);
 }
 
-/** 队伍名册（需要 P1 的 teams / task_packages；表未就绪时返回空并由调用方记 warning） */
+/**
+ * 队伍名册（需要 P1 的 teams / task_packages）。
+ * ⚠️ 只吞「表还没建」这一种错误（表未就绪时返回空并由调用方记 warning）；
+ *    其它错误（SQL 写错、约束冲突）**必须上抛** —— 静默返回空名册会让
+ *    R1 / R4 判定整段跳过，榜单分数静默出错。
+ */
 export function listStageTeams(db, stageId) {
   try {
     // SQL 在仓储层（src/db/repo/stages.js）；本文件**不含 SQL**。
     return listStageTeamsRows(db, stageId);
-  } catch {
-    return [];
+  } catch (err) {
+    const msg = String(err?.message ?? '');
+    if (/no such table/i.test(msg)) return [];
+    throw err;
   }
 }
 
+/** 单事务执行：要么全成功，要么全回滚（⛔ BEGIN IMMEDIATE：立即取写锁） */
+function inTransaction(db, fn) {
+  const nested = db.isTransaction === true;
+  if (!nested) db.exec('BEGIN IMMEDIATE');
+  try {
+    const out = fn();
+    if (!nested) db.exec('COMMIT');
+    return out;
+  } catch (err) {
+    if (!nested) db.exec('ROLLBACK');
+    throw err;
+  }
+}
+
+/** 仓储行（snake_case）→ 领域层形状（camelCase）—— 见文件头修正 ① */
+function mapConfirmations(rows) {
+  return rows.map((c) => ({
+    teamId: c.team_id,
+    enterpriseId: c.enterprise_id,
+    dimension: c.dimension,
+    rawScore: c.raw_score,
+    crossJudgeId: c.cross_judge_id ?? null,
+    signatoryUserId: c.signatory_user_id ?? null,
+    content: c.content ?? '',
+  }));
+}
+
+function mapPeerReviews(rows) {
+  return rows.map((p) => ({
+    fromTeamId: p.from_team_id,
+    toTeamId: p.to_team_id,
+    score: p.score,
+  }));
+}
+
+function mapSelfReviews(rows) {
+  return rows.map((r) => ({
+    teamId: r.team_id,
+    dimension: r.dimension,
+    rawScore: r.raw_score,
+  }));
+}
 
 /**
  * 计算一个赛段的分数并落快照。
@@ -6377,14 +7833,18 @@ export function computeStage({ db, stageId, actorId, now, rules }) {
   }
 
   const teams = listStageTeams(db, stageId);
+  const confirmations = mapConfirmations(listEnterpriseConfirmations(db, { stageId }));
+  const peerReviews = mapPeerReviews(listPeerReviews(db, stageId));
+  const selfReviews = mapSelfReviews(listSelfReviews(db, stageId));
+
   const result = scoreStage({
     config,
     judges,
     submissions,
-    enterpriseConfirmations: listEnterpriseConfirmations(db, { stageId }),
-    peerReviews: listPeerReviews(db, stageId),
+    enterpriseConfirmations: confirmations,
+    peerReviews,
     teams,
-    selfReviews: listSelfReviews(db, stageId),
+    selfReviews,
   });
 
   if (excluded.length) {
@@ -6395,50 +7855,69 @@ export function computeStage({ db, stageId, actorId, now, rules }) {
   }
 
   // 三件套快照
-  const revision = nextRevision(db, { stageId, kind: 'stage_score' });
   const input = {
     config,
     judges,
     submissions,
-    enterpriseConfirmations: listEnterpriseConfirmations(db, { stageId }),
-    peerReviews: listPeerReviews(db, stageId),
-    selfReviews: listSelfReviews(db, stageId),
+    excludedReviews: excluded,
+    enterpriseConfirmations: confirmations,
+    peerReviews,
+    selfReviews,
     teams,
     ruleVersion: config.version ?? 'unknown',
   };
-  const computationId = insertSnapshot(db, {
-    kind: 'stage_score',
-    editionId: stage.edition_id,
-    stageId,
-    ruleVersion: config.version ?? 'unknown',
-    input,
-    output: { teams: result.teams, warnings: result.warnings },
-    trace: result.trace,
-    revision,
-    now,
-  });
 
-  for (const t of result.teams) {
-    upsertStageResult(db, {
-      stageId, teamId: t.teamId, total: t.total, seatP: t.seatP, seatE: t.seatE, computationId, now,
+  return inTransaction(db, () => {
+    const revision = nextRevision(db, { stageId, kind: 'stage_score' });
+    const scoredTeamIds = [];
+    const computationId = insertSnapshot(db, {
+      kind: 'stage_score',
+      editionId: stage.edition_id,
+      stageId,
+      ruleVersion: config.version ?? 'unknown',
+      input,
+      output: { teams: result.teams, warnings: result.warnings },
+      trace: result.trace,
+      revision,
+      now,
     });
-  }
 
-  writeAuditLog(db, {
-    actorId,
-    action: 'stage.compute',
-    entity: 'stage',
-    entityId: stageId,
-    detail: { computationId, revision, teams: result.teams.length, warnings: result.warnings.length },
-    now,
+    for (const t of result.teams) {
+      // 没有 P 席评分的队伍不写结果行（不参与排名，见文件头修正 ③）
+      const hasPSeat = Object.entries(t.perDimension).some(
+        ([key, d]) => config.dimensions.some((dim) => dim.key === key && dim.seat !== 'enterprise') && d.mean != null,
+      );
+      if (!hasPSeat) continue;
+      scoredTeamIds.push(t.teamId);
+    }
+
+    // ⛔ 重算前清场：名次/并列/积分置 NULL + 删掉本轮已无评分的旧行
+    //    （否则「旧名次 + 新总分」会并排躺在同一行上 —— 父代理预审修正 I2）
+    resetStageResults(db, { stageId, keepTeamIds: scoredTeamIds });
+
+    for (const teamId of scoredTeamIds) {
+      const t = result.teams.find((x) => x.teamId === teamId);
+      upsertStageResult(db, {
+        stageId, teamId: t.teamId, total: t.total, seatP: t.seatP, seatE: t.seatE, computationId, now,
+      });
+    }
+
+    writeAuditLog(db, {
+      actorId,
+      action: 'stage.compute',
+      entity: 'stage',
+      entityId: stageId,
+      detail: { computationId, revision, teams: result.teams.length, warnings: result.warnings.length },
+      now,
+    });
+
+    return { computationId, revision, teams: result.teams, warnings: result.warnings, trace: result.trace };
   });
-
-  return { computationId, teams: result.teams, warnings: result.warnings, trace: result.trace };
 }
 
-/** 读取计算快照（三件套） */
-export function getComputation({ db, id }) {
-  const row = getSnapshot(db, id);
+/** 读取计算快照（三件套）；给了 stageId 时必须属于该赛段（D-26） */
+export function getComputation({ db, id, stageId = null }) {
+  const row = getSnapshotInStage(db, { id, stageId });
   if (!row) throw fail(404, 'COMPUTATION_NOT_FOUND', '计算快照不存在');
   return {
     id: row.id,
@@ -6496,7 +7975,24 @@ export function getComputation({ db, id }) {
 // 依据：INTERFACES.md §3「API（P2）」+ 设计文档 §8。
 //   权限：capability + assignment（唯一入口 can()）。P2 阶段先做「登录 + 能力点」判定，
 //   行级 scope 由 P3/P4 的 scopeClause 补齐。
-import { json } from '../respond.js';
+//
+// 【父代理预审修正 2026-10-21 —— 本文件有 5 处修正，读代码前先看这段】
+//   ① **回避可代他人申报** → 任何有 `score:write` 的人都能把**别的评委**拉下水，
+//      那个评委的打分随即被剔除（computeStage 里按回避剔除打分）——
+//      这是「打分 sabotage」，不是能力点该给的权限。现在只有本人能给自己申报，
+//      代录仅限组委会（`stage:compute`），且被申报人必须在本赛段评委名单里。
+//   ② **企业确认可代签 / 可冒名** → 企业确认占初赛 10% / 决赛 25% 的权重，
+//      原实现允许任意有 `score:write` 的人为任意队伍、任意企业「签字」，
+//      甚至把 `signatoryUserId` 伪造成别人。现在出题企业只能为自己签，
+//      跨领域评委必须真实存在于本赛段名单且与签字人不同；组委会可代录（留审计）。
+//   ③ **自评可代队伍提交** → 决赛「自评测」占 P 席 5%，
+//      原实现允许任意有 `score:write` 的人替任意队伍提交自评 ——
+//      等于「给别人加分」。现在自评用独立能力点 `self_review:write`（队长/组员持有），
+//      且必须是**本队成员**才能提交。
+//   ④ **互评可代队伍提交** → 同理，现在要求提交者是该支互评发起队的在册成员。
+//   ⑤ **能力点校验的作用域** → 原来传 `{ scopeType: 'global' }`，
+//      只能认全局授权，赛段级授权一律不认。现在同时认赛段级与全局级授权
+//      （都走 `can()`，唯一判定入口）。
 import { AppError } from '../../errors.js';
 import {
   submitReviews,
@@ -6508,6 +8004,9 @@ import {
   submitEnterpriseConfirmation,
 } from '../../services/review.js';
 import { computeStage, getComputation } from '../../services/compute.js';
+import { getStage, getStageJudge, listStageTeams } from '../../db/repo/stages.js';
+import { getTeamWithPackage } from '../../db/repo/teams.js';
+import { listActiveMembers } from '../../db/repo/teamMembers.js';
 
 function requireUser(ctx) {
   if (!ctx.user) {
@@ -6516,21 +8015,78 @@ function requireUser(ctx) {
   return ctx.user;
 }
 
-function requireCapability(ctx, capability) {
+/**
+ * 能力点校验：认**赛段级**与**全局级**授权（都走 can()）。
+ * ⚠️ 不能只传 `{ scopeType: 'global' }` —— 那等于「只认全局授权」，
+ *    赛段级授权（scope_type='stage'）会被静默判成无权。
+ */
+function requireStageCapability(ctx, capability) {
   requireUser(ctx);
-  if (!ctx.can(capability, { scopeType: 'global' })) {
-    throw new AppError(403, 'FORBIDDEN', `缺少能力：${capability}`);
+  const stageId = ctx.params?.stageId ?? null;
+  if (ctx.can(capability, { scopeType: 'stage', scopeId: stageId })) return;
+  if (ctx.can(capability, { scopeType: 'global' })) return;
+  throw new AppError(403, 'FORBIDDEN', `缺少能力：${capability}`);
+}
+
+/** 是否组委会（可看全局进度、可代录） */
+function isCommittee(ctx) {
+  if (!ctx.user) return false;
+  const stageId = ctx.params?.stageId ?? null;
+  return ctx.can('stage:compute', { scopeType: 'stage', scopeId: stageId })
+    || ctx.can('stage:compute', { scopeType: 'global' });
+}
+
+/** 是否企业席（能签企业确认）—— `signoff:create` 是企业角色的能力点 */
+function isEnterpriseSeat(ctx) {
+  if (!ctx.user) return false;
+  const stageId = ctx.params?.stageId ?? null;
+  return ctx.can('signoff:create', { scopeType: 'stage', scopeId: stageId })
+    || ctx.can('signoff:create', { scopeType: 'global' });
+}
+
+/** 本人是否是该队的在册成员 */
+function isTeamMember(db, teamId, userId) {
+  if (!teamId || !userId) return false;
+  return listActiveMembers(db, teamId).some((m) => m.user_id === userId);
+}
+
+/**
+ * 评委只能给**评委席维度**打分。
+ * ⚠️ 父代理预审修正（Important，I3）：
+ *   原来维度键不校验 → 评委可以对 `seat='self'` 的维度（「自评测」）打分，
+ *   于是「自评只能本队成员提交」这道闸门被整个绕过去 ——
+ *   评委自己填 100 分，自评栏就归他了（R-JDG-13「不加分」直接失效）。
+ *   领域层也做了同样的防御（自评席维度不取评委打分记录），这里是写入口的第一道。
+ */
+function assertJudgeDimensions(ctx, items) {
+  const stage = getStage(ctx.db, ctx.params.stageId);
+  if (!stage) throw new AppError(404, 'STAGE_NOT_FOUND', '赛段不存在');
+  const config = ctx.rules?.scoring?.[stage.scoring_config_key];
+  if (!config) {
+    throw new AppError(500, 'SCORING_CONFIG_MISSING', `赛段 ${stage.id} 指向的权重表 ${stage.scoring_config_key} 不存在`);
+  }
+  const dims = new Map((config.dimensions ?? []).map((d) => [d.key, d]));
+  for (const item of items) {
+    const dim = dims.get(item.dimension);
+    if (!dim) {
+      throw new AppError(400, 'UNKNOWN_DIMENSION', `未知评分维度：${item.dimension}`);
+    }
+    if (dim.seat !== 'judge') {
+      throw new AppError(403, 'DIMENSION_SEAT_FORBIDDEN', `维度 ${item.dimension} 不属于评委席，不能由评委打分`);
+    }
   }
 }
 
 export function registerReviewRoutes(router) {
   router.add('POST', '/api/stages/:stageId/reviews', async (ctx) => {
-    requireCapability(ctx, 'score:write');
+    requireStageCapability(ctx, 'score:write');
+    const items = ctx.body?.items ?? [];
+    assertJudgeDimensions(ctx, items);
     return submitReviews({
       db: ctx.db,
       stageId: ctx.params.stageId,
       judgeId: ctx.user.id,
-      items: ctx.body?.items ?? [],
+      items,
       requestId: ctx.body?.requestId ?? null,
       now: new Date().toISOString(),
     });
@@ -6538,11 +8094,22 @@ export function registerReviewRoutes(router) {
 
   router.add('GET', '/api/stages/:stageId/review-state', async (ctx) => {
     requireUser(ctx);
-    return getReviewState({ db: ctx.db, stageId: ctx.params.stageId, viewer: { userId: ctx.user.id, isAdmin: ctx.user.is_superadmin === 1 } });
+    // 权限：组委会 / 有评分读取能力的人 / 本赛段队伍成员（队长看本队自评进度）
+    if (!isCommittee(ctx)
+      && !ctx.can('score:read', { scopeType: 'stage', scopeId: ctx.params.stageId })
+      && !ctx.can('score:read', { scopeType: 'global' })
+      && !getStageJudge(ctx.db, ctx.params.stageId, ctx.user.id)) {
+      throw new AppError(403, 'FORBIDDEN', '没有查看评审进度的权限');
+    }
+    return getReviewState({
+      db: ctx.db,
+      stageId: ctx.params.stageId,
+      viewer: { userId: ctx.user.id, isAdmin: isCommittee(ctx) },
+    });
   });
 
   router.add('POST', '/api/stages/:stageId/calibration', async (ctx) => {
-    requireCapability(ctx, 'score:write');
+    requireStageCapability(ctx, 'score:write');
     return submitCalibration({
       db: ctx.db,
       stageId: ctx.params.stageId,
@@ -6553,22 +8120,37 @@ export function registerReviewRoutes(router) {
   });
 
   router.add('POST', '/api/stages/:stageId/peer-reviews', async (ctx) => {
-    requireCapability(ctx, 'peer_review:write');
+    requireStageCapability(ctx, 'peer_review:write');
+    const items = ctx.body?.items ?? [];
+    // ⛔ 互评是「队 → 队」的动作：提交者必须在发起队里（父代理预审修正 ④）
+    for (const item of items) {
+      if (!isTeamMember(ctx.db, item.fromTeamId, ctx.user.id)) {
+        throw new AppError(403, 'NOT_TEAM_MEMBER', '只能代表本队提交互评');
+      }
+    }
     return submitPeerReviews({
       db: ctx.db,
       stageId: ctx.params.stageId,
-      items: ctx.body?.items ?? [],
+      items,
       requestId: ctx.body?.requestId ?? null,
+      actorId: ctx.user.id,
       now: new Date().toISOString(),
     });
   });
 
   router.add('POST', '/api/stages/:stageId/self-review', async (ctx) => {
-    requireCapability(ctx, 'score:write');
+    requireStageCapability(ctx, 'self_review:write');
+    const teamId = ctx.body?.teamId;
+    if (!teamId) {
+      throw new AppError(400, 'MISSING_TEAM_ID', '缺少队伍');
+    }
+    if (!isTeamMember(ctx.db, teamId, ctx.user.id)) {
+      throw new AppError(403, 'NOT_TEAM_MEMBER', '只能为本队提交自评');
+    }
     return submitSelfReviews({
       db: ctx.db,
       stageId: ctx.params.stageId,
-      teamId: ctx.body?.teamId,
+      teamId,
       items: ctx.body?.items ?? [],
       requestId: ctx.body?.requestId ?? null,
       now: new Date().toISOString(),
@@ -6576,27 +8158,78 @@ export function registerReviewRoutes(router) {
   });
 
   router.add('POST', '/api/stages/:stageId/enterprise-confirmations', async (ctx) => {
-    requireCapability(ctx, 'score:write');
+    const stageId = ctx.params.stageId;
+    const actorId = ctx.user.id;
+    const committee = isCommittee(ctx);
+    // ⛔ 只有**企业席**（signoff:create）或组委会能签企业确认（父代理预审修正 ② / C1）
+    if (!isEnterpriseSeat(ctx) && !committee) {
+      throw new AppError(403, 'FORBIDDEN', '只有出题企业（或组委会）可以签署企业确认');
+    }
+    requireStageCapability(ctx, 'score:write');
+    // 出题企业只能为自己签
+    const enterpriseId = ctx.body?.enterpriseId ?? actorId;
+    if (enterpriseId !== actorId && !committee) {
+      throw new AppError(403, 'FORBIDDEN', '企业确认只能由出题企业本人签署（组委会可代录）');
+    }
+    if (ctx.body?.signatoryUserId && ctx.body.signatoryUserId !== enterpriseId) {
+      throw new AppError(403, 'FORBIDDEN', '签字人必须与出题企业一致');
+    }
+    // ⛔ 被签的队伍必须在本赛段名册内，且必须**确实由这家企业出题**
+    //    （否则一条冒名记录就能把受害队伍的企业席连坐作废 —— 父代理预审 C1）
+    const teamId = ctx.body?.teamId;
+    const team = teamId ? getTeamWithPackage(ctx.db, teamId) : null;
+    if (!team) {
+      throw new AppError(404, 'TEAM_NOT_FOUND', '队伍不存在');
+    }
+    // 名册判定**先于**归属判定：名册外的队伍 → 404（三态：单条不满足 → 404），
+    // 而不是「归属不符 → 403」（那会泄露「这支队存在但不是你家的」）。
+    const roster = listStageTeams(ctx.db, stageId).map((t) => t.teamId);
+    if (!roster.includes(teamId)) {
+      throw new AppError(404, 'TEAM_NOT_IN_STAGE', `队伍 ${teamId} 不在本赛段名册内`);
+    }
+    if (!committee && team.packageEnterpriseId !== actorId) {
+      throw new AppError(403, 'FORBIDDEN', '该队伍的任务包不是贵司出的题，不能代签企业确认');
+    }
+    const crossJudgeId = ctx.body?.crossJudgeId ?? null;
+    if (crossJudgeId && crossJudgeId === enterpriseId) {
+      throw new AppError(400, 'CROSS_JUDGE_SAME_AS_SIGNATORY', '跨领域评委签字人不能与出题企业签字人相同');
+    }
+    if (crossJudgeId && !getStageJudge(ctx.db, stageId, crossJudgeId)) {
+      throw new AppError(404, 'JUDGE_NOT_ASSIGNED', '跨领域评委不在本赛段名单内');
+    }
     return submitEnterpriseConfirmation({
       db: ctx.db,
-      stageId: ctx.params.stageId,
-      teamId: ctx.body?.teamId,
-      enterpriseId: ctx.body?.enterpriseId,
+      stageId,
+      teamId,
+      enterpriseId,
       dimension: ctx.body?.dimension ?? 'enterprise',
       rawScore: ctx.body?.rawScore,
-      crossJudgeId: ctx.body?.crossJudgeId ?? null,
-      signatoryUserId: ctx.body?.signatoryUserId ?? ctx.user.id,
+      crossJudgeId,
+      signatoryUserId: enterpriseId,
       content: ctx.body?.content ?? '',
       now: new Date().toISOString(),
     });
   });
 
   router.add('POST', '/api/stages/:stageId/recusals', async (ctx) => {
-    requireCapability(ctx, 'score:write');
+    const stageId = ctx.params.stageId;
+    const committee = isCommittee(ctx);
+    // ⛔ 不能代他人申报回避（父代理预审修正 ①）
+    //    组委会代录不受 `score:write` 约束 —— 否则「有 stage:compute 的人」反而不能代录
+    if (!committee) {
+      requireStageCapability(ctx, 'score:write');
+    }
+    const judgeId = ctx.body?.judgeId ?? ctx.user.id;
+    if (judgeId !== ctx.user.id && !committee) {
+      throw new AppError(403, 'FORBIDDEN', '不能代他人申报回避（组委会可代录）');
+    }
+    if (!getStageJudge(ctx.db, stageId, judgeId)) {
+      throw new AppError(404, 'JUDGE_NOT_ASSIGNED', '该评委未被分配到本赛段');
+    }
     return declareRecusal({
       db: ctx.db,
-      stageId: ctx.params.stageId,
-      judgeId: ctx.body?.judgeId ?? ctx.user.id,
+      stageId,
+      judgeId,
       teamId: ctx.body?.teamId ?? null,
       reason: ctx.body?.reason,
       actorId: ctx.user.id,
@@ -6606,7 +8239,7 @@ export function registerReviewRoutes(router) {
 
   // ⛔ compute 是显式动作：发布权在「stage:compute」能力（组委会）
   router.add('POST', '/api/stages/:stageId/compute', async (ctx) => {
-    requireCapability(ctx, 'stage:compute');
+    requireStageCapability(ctx, 'stage:compute');
     return computeStage({
       db: ctx.db,
       stageId: ctx.params.stageId,
@@ -6617,12 +8250,14 @@ export function registerReviewRoutes(router) {
   });
 
   router.add('GET', '/api/stages/:stageId/computations/:computationId', async (ctx) => {
-    requireCapability(ctx, 'audit:read');
-    return getComputation({ db: ctx.db, id: ctx.params.computationId });
+    requireStageCapability(ctx, 'audit:read');
+    return getComputation({
+      db: ctx.db,
+      id: ctx.params.computationId,
+      stageId: ctx.params.stageId,
+    });
   });
 }
-
-export { json };
 ```
 
 > **【2026-10-21 漂移审计修正 N-1（审计报告未覆盖，本次新发现）】**
@@ -6661,11 +8296,9 @@ export { json };
 
 - [ ] **Step 7: 修改 rules/scoring-initial.json 与 rules/scoring-final.json**
 
-`platform/rules/scoring-initial.json`（在 `minJudgesForTrim` 之后插入）：
+`platform/rules/scoring-initial.json`（在 `minJudgesForTrim` 之后、`dimensions` 之前插入）：
 
 ```json
-  "minJudgesForTrim": 5,
-  "fallback": "global",
   "trimmedIterations": 20,
   "bayesPriorStrength": 5,
   "selfEvalThreshold": 10,
@@ -6682,11 +8315,9 @@ export { json };
   },
 ```
 
-`platform/rules/scoring-final.json`（`minJudgesForTrim` 之后插入；决赛下限 ≥9，R-JDG-10）：
+`platform/rules/scoring-final.json`（同位置插入；决赛下限 ≥9，R-JDG-10）：
 
 ```json
-  "minJudgesForTrim": 5,
-  "fallback": "global",
   "trimmedIterations": 20,
   "bayesPriorStrength": 5,
   "selfEvalThreshold": 10,
@@ -6709,36 +8340,50 @@ export { json };
 
 ```javascript
     // ── P2 追加：评委池 / 自由命题替代维度 / 归一化策略参数 ──
+    // ⛔ 为什么要在这里 fail-fast（而不是等到运行时才报）：
+    //    这些字段直接决定「谁有投票权」「自由命题组的企业项由谁顶」——
+    //    写错时不会崩，会**静默算出一份错的榜单**（与「权重合计≠100% 拒绝启动」同一类病）。
     const pool = cfg.judgePool;
     if (!pool) {
-      errors.push(`scoring.${key} 缺少 judgePool 段（R-JDG-10 / R-JDG-11）`);
+      push(`scoring.${key} 缺少 judgePool 段（R-JDG-10 / R-JDG-11）`);
     } else {
       if (!(Number(pool.minJudgesPerDimension) > 0)) {
-        errors.push(`scoring.${key} judgePool.minJudgesPerDimension 必须 > 0`);
+        push(`scoring.${key} judgePool.minJudgesPerDimension 必须 > 0`);
       }
       if (Number(pool.minEnterpriseSeatShare) < 0 || Number(pool.minEnterpriseSeatShare) > 1) {
-        errors.push(`scoring.${key} judgePool.minEnterpriseSeatShare 必须在 0..1`);
+        push(`scoring.${key} judgePool.minEnterpriseSeatShare 必须在 0..1`);
       }
       if (Number(pool.maxExpertSeatShare) < 0 || Number(pool.maxExpertSeatShare) > 1) {
-        errors.push(`scoring.${key} judgePool.maxExpertSeatShare 必须在 0..1`);
+        push(`scoring.${key} judgePool.maxExpertSeatShare 必须在 0..1`);
       }
       if (!Array.isArray(pool.votingSeats) || !pool.votingSeats.length) {
-        errors.push(`scoring.${key} judgePool.votingSeats 缺失`);
+        push(`scoring.${key} judgePool.votingSeats 缺失`);
       }
       if (!Array.isArray(pool.nonVotingSeats) || !pool.nonVotingSeats.length) {
-        errors.push(`scoring.${key} judgePool.nonVotingSeats 缺失`);
+        push(`scoring.${key} judgePool.nonVotingSeats 缺失`);
       }
     }
     const demand = cfg.freeBrief?.judgeDimension;
     if (!demand) {
-      errors.push(`scoring.${key} 缺少 freeBrief.judgeDimension（R-JDG-08 R4）`);
+      push(`scoring.${key} 缺少 freeBrief.judgeDimension（R-JDG-08 R4）`);
     } else if (!cfg.dimensions.some((d) => d.key === demand && d.seat === 'judge')) {
-      errors.push(`scoring.${key} freeBrief.judgeDimension=${demand} 必须是一个评委席维度`);
+      push(`scoring.${key} freeBrief.judgeDimension=${demand} 必须是一个评委席维度`);
     }
     if (cfg.selfEvalThreshold != null && Number(cfg.selfEvalThreshold) < 0) {
-      errors.push(`scoring.${key} selfEvalThreshold 必须 ≥ 0`);
+      push(`scoring.${key} selfEvalThreshold 必须 ≥ 0`);
+    }
+    if (cfg.trimmedIterations != null && !(Number.isInteger(cfg.trimmedIterations) && cfg.trimmedIterations >= 1)) {
+      push(`scoring.${key} trimmedIterations 必须是 ≥1 的整数`);
+    }
+    if (cfg.bayesPriorStrength != null && !(Number.isFinite(cfg.bayesPriorStrength) && cfg.bayesPriorStrength >= 0)) {
+      push(`scoring.${key} bayesPriorStrength 必须是 ≥0 的有限数`);
     }
 ```
+
+> ⚠️ **写法统一**：本项目 `validateRules` 里的报错收集函数名是 **`push`**（`const push = (msg) => errors.push(msg);`）。
+> 原计划片段写的是 `errors.push(...)` —— **两者行为完全相同**（`errors` 就在同一函数作用域里），
+> 但该循环内**其余全部检查项用的都是 `push(...)`**。现在统一成 `push(...)`，
+> 免得同一段里两种写法混着，让「这行到底累加到哪」变得需要读心。
 
 - [ ] **Step 9: 修改 src/server.js（注册评审路由）**
 
@@ -6748,29 +8393,86 @@ export { json };
 import { registerReviewRoutes } from './http/routes/review.js';
 ```
 
-在 `createApp` 内、`router.add('GET', '/api/me', ...)` 之后加入：
+在 `createApp` 内、P1 的三组路由注册之后加入：
 
 ```javascript
   // P2 评审 API（报名/组队等 P1 路由由 P1 追加，不要互相覆盖）
   registerReviewRoutes(router);
 ```
 
+> ⚠️ **位置说明**：原计划写的是「`router.add('GET', '/api/me', ...)` 之后」。
+> 实际实现放在 **P1 三组路由注册之后**（`registerRegistrationRoutes` / `registerTaskPackageRoutes` /
+> `registerTeamRoutes` 之后、`/api/health` 之前）—— 理由是「按阶段分组注册」比「按具体某条路由的位置」
+> 更不容易在后续阶段插队出错，且与 P1 已有代码的组织方式一致。行为无差异（注册顺序不影响路由匹配：
+> `router.match` 按逐段比较排序，静态段恒胜参数段）。
+
 - [ ] **Step 10: 运行测试确认通过**
 
-Run: `cd platform && node --test test/scoring.test.js test/compute.test.js`
-Expected: PASS（10 + 3 = 13 个测试全过）
+Run: `cd platform && node --test test/scoring.test.js test/compute.test.js test/review-api.test.js test/review-service.test.js`
+Expected: PASS（22 + 15 + 29 + 25 = 91 个测试全过）
 
 - [ ] **Step 11: 全量测试**
 
 Run: `cd platform && node --test`
-Expected: 全部通过
+Expected: 全部通过（P2 全量 517/517）
 
 - [ ] **Step 12: 提交**
 
 ```bash
-cd platform && git add src/domain/scoring.js src/services/compute.js src/db/repo/computations.js src/http/routes/review.js src/config.js src/server.js rules test/scoring.test.js test/compute.test.js
+cd platform && git add src/domain/scoring.js src/domain/enterprise-seat.js src/services/compute.js src/services/review.js src/db/repo/computations.js src/db/repo/reviews.js src/db/repo/teams.js src/http/routes/review.js src/config.js src/server.js rules scripts/seed.js test/scoring.test.js test/compute.test.js test/review-api.test.js test/review-service.test.js
 git commit -m "feat(P2): scoreStage 总装、compute 快照服务与 9 条评审 API"
 ```
+
+### Task 8 的独立预审与变异检验（2026-10-21）
+
+**预审结论**：**不能过** —— 1 条 Critical + 5 条 Important + 8 条 Minor + 5 条规格歧义。
+全部已修，修复登记为 **D-29 ~ D-36**（见文末偏差表）。
+
+| 级别 | 问题 | 修法 | 登记 |
+|---|---|---|---|
+| **Critical** | 任何持有 `score:write` 的人都能替**别人家**的队签一条「非本赛道」的企业确认 → R1 触发 → 该队企业席（初赛 10% / 决赛 25%）整段作废，合法 90 分被一条伪造记录**连坐**掉 | 写入口必须核验「签署人 = 该队任务包的出题企业」+ `signoff:create` 能力点；领域层 R1 只认**有效**的非本赛道记录，且本赛道企业已合法确认时不再降权 | D-31 / D-30 |
+| Important | 评委能给**别的届期**的队打分 → 外队进榜；队伍不存在时外键报错漏到 HTTP 层 → **500**（破坏三态状态码） | 写入口统一按「本赛段名册」判定 → 404 `TEAM_NOT_IN_STAGE` | D-33 |
+| Important | 重算**不回收** `stage_results` → 「旧名次 + 新总分」并排躺在一行；撤掉全部打分的队伍旧行仍在 | 重算前同事务清场：名次/并列/积分置 NULL + 删掉本轮无分的旧行 | D-34 |
+| Important | 维度键不校验 → 评委能对 `seat='self'` 的维度打分 → 「自评只能本队成员」被绕开，自评栏归评委 | 写入口按权重表校验维度白名单（非评委席维度 → 403）；领域层再兜一道 | D-32 |
+| Important | R4 替代维度没有评委分 → 企业席静默变 0（自由命题组白丢 20%），告警却写着「改由评委打分」 | 显式告警 `R4_substitute_no_scores` | — |
+| Important | 自评席维度**没有**同维度评委分可比 → R-JDG-13 恒不触发 → 队伍把自评填到 100 就是白拿 5% | 自评席维度与「该队评委席分」比，超阈值则对齐（不加分） | D-29 |
+| Minor | 软删除的打分仍计入计算；改分不留旧分；席位分的真实分母没进 trace；`review-state` 无权限闸门；组委会代录回避受 `score:write` 约束 | 逐条修复 | D-35 / D-36 |
+
+**变异检验**（独立脚本 `/tmp/p2t8/mutate.mjs`，62 个变异体，测试集 = scoring / compute /
+review-api / review-service / config 五个文件）：
+`KILLED 61 / 等价变异体 1 / 存活 0 / 构造失败 0`。
+唯一的存活者是 **C12**（`listStageTeams` 的 catch 吞掉一切错误）—— 已显式标注为**等价变异体**：
+测试里不会触发任何错误，两条路径结果完全相同（按构造正确性接受，不追求用例会话覆盖）。
+
+存活变异体全部转成了**回归用例**（不靠「变异体恰好没被抓住」蒙混）：
+R02（签字人一致性）、V02/V04（服务端的名册边界）、N02（企业席身份）、E02（无效记录不触发 R1）。
+> ⚠️ 其中 V02 一度「存活」的原因是**变异脚本没跑 `test/review-service.test.js`**
+> —— 覆盖它的那条用例正好在那个文件里。**变异脚本的测试集必须覆盖被测文件的全部用例**，
+> 否则「存活」只说明脚本漏跑了文件，不说明代码没被测。
+
+> **⚠️ 变异构造自身失效的三个坑（本轮又踩到，记录在案）**：
+> ① **改配置缺省值等于没改**：`minJudges: config.minJudgesForTrim ?? 5` 里把 `?? 5` 改成 `?? 6`
+>    是**零效果**的 —— 配置永远有值，`??` 分支走不到。必须改**取值本身**（`+ 1`）。
+> ② **锚点会随重构漂移**：本轮把评分装配拆成「评委席循环 + 自评席循环」后，
+>    三个旧锚点全部命中 0 次（`if (!selfSeatKeySet.has(k)) {` 等）→ 变异「构造失败」而非「存活」，
+>    两者含义完全不同，必须分开统计。
+> ③ **两个闸门会互相掩盖**：企业确认的「只有企业席能签」与「必须是自己出的题」，
+>    单独去掉任意一个，用例都仍然绿 —— 因为另一个会先拒。
+>    补法是**造出让另一个闸门放行的场景**（给对手企业 `signoff:create`、
+>    让出题企业本人没有 `signoff:create`），否则等于没测。
+
+> **【Task 8 的已知限制（移交 P3）】**
+> ① **赛段名册目前是届期级的**：`stages → edition_id → teams`，
+>    所以「后段赛事的队伍」会出现在初赛名册里并参与初赛计分。
+>    本轮已经把「名册外的队伍」挡在写入口之外（D-33），
+>    但**赛段级队伍边界**需要一张 `stage_team` 表 —— 属于迁移层改动，登记在 P3。
+> ② **缺分维度被剔出席位分的分母**（`seatScore` 的口径），
+>    于是「缺分多的队」拿到的是「已有维度上的相对加权平均」。
+>    本轮已把席位分的**真实分母**记进 `trace.perTeam[teamId].seatPWeightSum`，
+>    但口径本身要不要改（如缺分计 0）留给 P3 与规则委员会裁决。
+> ③ **R1 收窄后，「本赛道企业已确认 + 别的企业也签了」的组合**按 D-30 走
+>    「保留本赛道签字 + 记 R1 告警」；如果规则委员会认为这种情况应当更严，
+>    改 `src/domain/enterprise-seat.js` 一处即可。
 
 ---
 
@@ -7080,12 +8782,16 @@ import { reviewEvents } from '../sse.js';
 
 ```javascript
   router.add('POST', '/api/stages/:stageId/reviews', async (ctx) => {
-    requireCapability(ctx, 'score:write');
+    requireStageCapability(ctx, 'score:write');
+    // ⚠️ 维度白名单**不能丢**（Task 8 的 D-32）：评委只能给评委席维度打分，
+    //    否则评委能对 seat='self' 的维度打分 → 自评栏被评委占掉。
+    const items = ctx.body?.items ?? [];
+    assertJudgeDimensions(ctx, items);
     const result = await submitReviews({
       db: ctx.db,
       stageId: ctx.params.stageId,
       judgeId: ctx.user.id,
-      items: ctx.body?.items ?? [],
+      items,
       requestId: ctx.body?.requestId ?? null,
       now: new Date().toISOString(),
     });
@@ -7202,6 +8908,22 @@ git commit -m "feat(P2): SSE 评审进度推送（src/http/sse.js + GET /api/sta
 | D-18 | 迁移版本号 | 全局唯一序位：`001=P0`、`002=P1`、`003=P2`、`004=P3`、`005=P4`、`006=P5` | P2 的迁移用 `003_review.sql`（不冲突） | ✅ **已消解**（2026-10-21 订正）：P0 终态 `platform/db/migrations/` **只有 `001_init.sql`**，**从未建过 `002_user_roles.sql`**；P1 的迁移是 `002_registration.sql`，与 P2 的 `003_review.sql` 无冲突。`applyMigrations` 按 version 去重，重复版本号会**响亮抛错**（P0 `src/db/migrate.js` 有专门的重复检测），不存在「后者被静默跳过」。⚠️ 不要再按原写法提「需 P1 改名」或「需 P0 改名」—— 那个冲突在 P1 落地时就不存在了 |
 | D-19 | **`audit_log` 的写入口与 SQL 落点** | 契约未规定 `audit_log` 的仓储落点 | `src/db/repo/audit-log.js`（**新建**，SQL 唯一归宿）+ `src/audit/log.js`（**薄服务门面**，不含 SQL） | ⚠️ 原写法是把两条 SQL **内联在 `src/audit/log.js`** 里 —— 那会越过全局约束「所有 SQL 收进 `src/db/repo/`」，P0 的 `test/sql-boundary.test.js` 守卫**当场判违规**（审计实跑：`not ok 1`，3 条违规）。同时 P4 原计划另建 `src/db/repo/audit-log.js` → 同一张表**两条写路径**。现改为**单一归属**：SQL 全在仓储层，门面只转调。见 C-3 / I-8 修正记录 |
 | D-20 | **新增 SSE 端点 `GET /api/stages/:stageId/events`** | 契约的 P2 API 清单里没有这一条 | 新增该端点 + `src/http/sse.js`（新建） | P0 的 `platform/web/api.js:28-30` 的 `subscribe()` 明写「⚠️ SSE 端点在 **P2** 才实现（`src/http/sse.js`）」，而 P2–P6 五份计划**全都没有承接** → 一条**指向不存在实现的活引用**。现由 P2 的 **Task 9** 落地（审计报告 I-6 的第 ① 条路；第 ② 条路要改 `platform/web/api.js`，属 P0 的地盘，本阶段不得改动）。契约已同步更新 |
+| D-21 | **自评不得填补评委席维度**（算法层封堵自评加分路径） | 规格原写法：评委席维度若没有评委打分，就去 `selfReviews` 里找同维度的自评记录顶上；「精确命中」分支还完全绕过对齐规则 | 评委席维度**只由评委打分**；评委没打分就是没打分（该维度权重记 0 + `dimension_no_scores` warning）。自评记录只能填 `seat='self'` 的维度 | S7 §4.3 明写自评「**不加分**、只触发说明与提问」；S10 §8 第三条风险明写「分轨必须是算法层面的，不是纪律层面的」。原写法让**团队可以自己给自己加分**（自评 95 分顶掉缺失的评委分），与两条原文直接冲突 | 评委席维度缺分时该队少拿权重（不是拿自评补），是这个方向上的「更严」。⚠️ 规格自带的用例只断言了 warning 存在、**没断言分数**——现在补了断言（`perDimension.innovation.mean === 80` 而非 95） |
+| D-22 | **自评席维度与评委维度隔离** | 规格原写法把自评席维度的分写回 `dimScores` | 自评席维度另装 `selfDimScores`，与评委维度的 `dimScores` 完全隔离 | 原写法污染后续队伍的 `perDimension`，且让「查评委分」可能取到**别的队伍的自评分** | trace 的 `perDimension` 形状不变 |
+| D-23 | **对齐规则覆盖「精确命中」分支** | 规格原写法：自评被判定 `written_explanation` 时，只在「加权平均兜底」分支用评委分；「精确命中」分支直接用自评分 | 两条分支都走同一套对齐判定：命中 `written_explanation` 时改用评委分；找不到评委分则该维度缺分 | R-JDG-13「不成立则自评分对齐评委分（不加分）」——对齐规则不能有例外分支 | 无 |
+| D-24 | **`computeStage` 的仓储行 → 领域形状映射** | 规格原写法：企业确认 / 互评 / 自评三张表的仓储行**原样**喂给领域层 | 三张表都**显式映射**成驼峰形状（`teamId` / `rawScore` / `crossJudgeId` / …） | 仓储返回 snake_case（`team_id` / `raw_score`），领域层读的是驼峰 → **三张表全部被静默忽略**：企业席恒为 0 分（初赛 10% / 决赛 25% 的权重直接蒸发）、互评恒为 null、自评恒为空（决赛 5% 恒缺分）。**没有一条报错**——榜单只是「安静地少算了一块」 | 已补 `compute.test.js` 的「企业确认必须真的进总分」用例钉住 |
+| D-25 | **compute 的事务边界** | 规格原写法：抢 revision → 写快照 → 写结果 → 写审计，四步各自独立 | 四步在**一个 `BEGIN IMMEDIATE` 事务**里 | 中途失败会留下「有快照没结果」或「结果指向不存在的快照」的半成品 | 与 Task 6 的「抢幂等键与写数据同事务」同一纪律 |
+| D-26 | **计算快照不得跨赛段读取** | 规格原写法：`getComputation` 只按 id 取，路径里的 `:stageId` 形同虚设 | 传入 `stageId` 时必须匹配，不匹配返回 404 | 任何有 `audit:read` 的人都能拿**别的赛段**的计算快照来读（跨赛段越权读） | 已补跨赛段 404 用例 |
+| D-27 | **评审 API 的越权闸门 + 独立能力点** | 规格原写法：9 条 API 全部只校验「登录 + 一个能力点」 | ① 回避**不能代他人申报**（只有本人或组委会可申报，且被申报人必须在名单内）；② 企业确认**不能冒名**（出题企业只能为自己签，组委会可代录；跨领域评委必须在名单内且与签字人不同）；③ 自评用**独立能力点 `self_review:write`** 且必须本队成员；④ 互评必须由发起队成员提交；⑤ 能力点校验同时认**赛段级**与**全局级**授权 | 原写法里，任何有 `score:write` 的人都能①让别人被剔除打分、②替任意队伍签出占 10–25% 权重的企业确认、③替任意队伍提交自评 —— 全是**直接影响奖金**的越权。与 P1 Task 3 的 A1（能力点被注册却从不校验）同一类病根 | ① 需要 `seed.js` 新增 `self_review:write` 能力点并授予队长/组员；② 能力点作用域从 `{scopeType:'global'}` 改为「赛段级 ∨ 全局级」（原来只认全局，赛段级授权会被静默判成无权） |
+| D-28 | **没有 P 席评分的队伍不写 `stage_results`** | 规格原写法：`result.teams` 里的每一队都写一条结果行 | 只写「P 席（评委席 + 自评席）有分」的队伍 | 设计文档 §11 明写「没有任何评分的队伍不参与排名」；原写法会让名册里没被任何人评过的队拿到 `total=0` 的结果行，**被 P3 排进榜单** | 「是否参评」的判定也相应改为只看 P 席（企业席单独有分不算参评） |
+| D-29 | **自评席维度与「该队评委席分」比（R-JDG-13 覆盖到自评席）** | 规格只让自评与**同维度**的评委分比；而 `seat='self'` 的维度（如决赛「自评测 5%」）**没有**同维度评委分 → 判定恒不触发 → 队伍把自评维度填到 100 就是白拿 5% 的加权分 | 自评席维度的分与**该队的评委席分（不含自评席）**比：高出 `selfEvalThreshold` → 对齐到评委席分（不加分）+ warning；低出同样阈值 → 只提问 | S7 §4.3 机制归因：「一旦自评可以加分，它就变成了纯粹的博弈项。让它只触发『解释』和『提问』，它才真正对治黑箱。」自评席维度是**唯一**能让自评真正进入总分的口子，不封住它，R-JDG-13 就是空的 | 备选口径是「自评席维度分硬顶到评委席分」—— 本轮选了「±阈值比较」，因为它复用了 R-JDG-13 已经确立的 ±10 语义，两处口径一致 |
+| D-30 | **R1 只依据「有效的」非本赛道确认判定；本赛道企业已合法确认时不再降权** | 规格：`outOfTrack` = 全部非本赛道确认（**不看是否有效**）；只要有一条就把企业项权重归零 | ① 无效的（缺双签 / 内容空白 / 分数越界）非本赛道记录**不触发** R1；② 本赛道企业已合法确认时，R1 **不再**把权重归零（只记 warning） | ① 原来一条**垃圾记录**就能把受害队伍的企业席整段作废（初赛 10% / 决赛 25%）；② R1 的本意是「本赛道企业没确认 ⇒ 企业席不适用」，不是「有人冒签就整队作废」—— 本赛道企业对自己出的题签字是天经地义的 | 保留了 R1 的告警（`R1_out_of_track`），不静默 |
+| D-31 | **企业确认的写入口必须核验「出题企业」身份** | 规格：只校验「有 `score:write` 能力点」 | ① 签署人必须有 `signoff:create`（企业席的能力点）或 `stage:compute`（组委会代录）；② 签署人必须是**该队任务包的出题企业**；③ 被签队伍必须存在 | 父代理预审实测：只持有 `score:write` 的**评委**可以替任意队伍签一条「非本赛道」的企业确认 → R1 触发 → 该队企业席整段作废（合法 90 分被一条伪造记录连坐掉） | 与 D-30 配套：写入口堵死 + 领域层不再被冒名记录劫持，两道防线 |
+| D-32 | **评委打分的维度白名单** | 规格：维度键不校验 | 写入口按该赛段 `scoring_config_key` 的 dimensions 校验：未知维度 → 400；**非评委席维度**（`seat='self'` / `seat='enterprise'`）→ 403 `DIMENSION_SEAT_FORBIDDEN`。领域层再兜一道：自评席维度**绝不**取评委的打分记录 | 父代理预审实测：评委对 `self_eval` 维度打 100 分 → 200 → 自评栏被评委占掉 → 「自评只能本队成员提交」的闸门整个失效（R-JDG-13「不加分」失效） | 写入口在路由层（请求级校验），语义层在领域层（算法级防护） |
+| D-33 | **写入口的队伍边界 + 三态状态码补齐** | 规格：`submitReviews` 等不校验队伍 | 评分 / 企业确认 / 互评 / 自评 / 回避的**队伍 id** 必须在本赛段名册内，否则 404 `TEAM_NOT_IN_STAGE`（不再是外键报错 → 500） | ① 父代理预审实测：评委能给**别的届期**的队打分 → 那支队被算进本赛段榜单（外队进榜）；② 队伍不存在时 `FOREIGN KEY constraint failed` 漏到 HTTP 层 → 500（破坏三态状态码） | ⚠️ **已知限制**：名册目前是**届期级**（stages → edition_id → teams），赛段级队伍边界需要一张 `stage_team` 表 —— 登记在 P3 |
+| D-34 | **重算前清场 `stage_results`** | 规格：`upsertStageResult` 只 upsert，不回收旧行 | 重算前（同一事务内）：`rank` / `tied_with` / `points` 一律置 NULL，并**删除**本轮已无 P 席评分的旧行 | 父代理预审实测：P3 发过榜（rank=1, points=99）后重算 → **旧名次 + 新总分**并排躺在同一行；撤掉某队全部打分后重算 → 旧行 total 仍在 | 名次与积分由 P3 在新一轮计算后重新填 |
+| D-35 | **软删除的打分不再计入计算** | 规格：`listReviews` 不过滤 `deleted_at` | `listReviews` 增加 `AND deleted_at IS NULL` | `stage_reviews` 的删除语义是**软删除**（评分只增不改），但被删掉的分还在榜单里 | 全局约束「评分只增不改，删除用软删除」 |
+| D-36 | **改分留痕** | 规格：审计只记「条数」 | 审计 detail 带上 `changed: [{ teamId, dimension, from, to }]` | 原来评委改分后，**当时榜单用的是几分**再也还原不出来（可复算要求断链） | 审计字段追加，不改已有字段 |
 
 > **【2026-10-21 漂移审计修正 I-9 + M-4】** D-18 这一行原来描述的是一个**早已不存在**的冲突：
 > 「P0 建了 `002_user_roles.sql`；…⛔ **需 P1 改名为 `002_registration.sql` 之外的版本，或 P0 改名**」。

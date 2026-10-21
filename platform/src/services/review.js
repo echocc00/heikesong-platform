@@ -96,6 +96,27 @@ function assertStageExists(db, stageId) {
   }
 }
 
+/**
+ * 队伍必须在本赛段名册内。
+ * ⚠️ 父代理预审修正（Important，I1 / I5）：
+ *   ① 原来写入口**不校验队伍** → 评委能给**别的届期**的队打分，
+ *      那支队会被算进本赛段榜单（外队进榜）。
+ *   ② 队伍不存在时直接撞外键 → `FOREIGN KEY constraint failed` 漏到 HTTP 层
+ *      → **500**（而不是三态状态码要求的 404）。
+ * 现在统一按「本赛段名册」判定，不在册 → 404。
+ * ⚠️ 名册的粒度目前是**届期级**（stages → edition_id → teams），
+ *    赛段级队伍边界需要一张 stage_team 表 —— 登记在 P3（见 P2 计划「已知限制」）。
+ */
+function assertTeamInStage(db, stageId, teamId, label = '队伍') {
+  if (!teamId) {
+    throw fail(400, 'MISSING_TEAM_ID', `缺少${label}`);
+  }
+  const roster = listStageTeams(db, stageId).map((t) => t.teamId);
+  if (!roster.includes(teamId)) {
+    throw fail(404, 'TEAM_NOT_IN_STAGE', `${label} ${teamId} 不在本赛段名册内`);
+  }
+}
+
 function assertVotingJudge(db, stageId, judgeId) {
   const seat = getStageJudge(db, stageId, judgeId);
   if (!seat) throw fail(403, 'NOT_ASSIGNED_JUDGE', '该评委未被分配到本赛段');
@@ -122,6 +143,10 @@ function assertNotRecused(db, stageId, judgeId, teamId) {
 export function submitReviews({ db, stageId, judgeId, items = [], requestId = null, now }) {
   assertStageExists(db, stageId);
   assertVotingJudge(db, stageId, judgeId);
+  // 队伍必须在本赛段名册内（外队进榜 / 不存在 → 404）
+  for (const item of items) {
+    assertTeamInStage(db, stageId, item.teamId);
+  }
 
   // 幂等快速路径：同一次请求已经生效过 → 直接返回上次结果，不重复落数据
   if (requestId) {
@@ -152,6 +177,9 @@ export function submitReviews({ db, stageId, judgeId, items = [], requestId = nu
     }
 
     const written = [];
+    // 改分留痕：旧分与新分一起进审计（父代理预审 Minor 7）
+    // ⚠️ 原来只记「条数」—— 评委改分后，**当时榜单用的是几分**再也还原不出来。
+    const changed = [];
     // 按维度分桶的增量（新增分 / 被改分替换掉的旧分）——score_stats 必须同步修正
     const byDimension = new Map();
     const bucketOf = (dimension) => {
@@ -169,6 +197,7 @@ export function submitReviews({ db, stageId, judgeId, items = [], requestId = nu
         updateReviewScore(db, { id: existing.id, rawScore: item.rawScore, now });
         bucket.removed.push(existing.raw_score);
         bucket.added.push(item.rawScore);
+        changed.push({ teamId: item.teamId, dimension: item.dimension, from: existing.raw_score, to: item.rawScore });
       } else {
         const row = insertReview(db, {
           stageId, judgeId, teamId: item.teamId, dimension: item.dimension,
@@ -186,7 +215,7 @@ export function submitReviews({ db, stageId, judgeId, items = [], requestId = nu
 
     writeAuditLog(db, {
       actorId: judgeId, action: 'review.submit', entity: 'stage', entityId: stageId,
-      detail: { requestId, count: items.length }, now,
+      detail: { requestId, count: items.length, changed }, now,
     });
 
     return { stageId, judgeId, requestId, submitted: written.length, items: written };
@@ -271,6 +300,7 @@ export function submitEnterpriseConfirmation({ db, stageId, teamId, enterpriseId
     throw fail(400, 'SIGNATURE_CONTENT_REQUIRED', '企业签字必须填写内容（解决了我方哪个具体环节 / 预计落地时间 / 我方投入角色）');
   }
   assertScoreInRange(rawScore, '企业确认分');
+  assertTeamInStage(db, stageId, teamId);
   const row = insertEnterpriseConfirmation(db, {
     stageId, teamId, enterpriseId, dimension, rawScore, crossJudgeId, signatoryUserId, content, now,
   });
@@ -291,6 +321,11 @@ export function submitEnterpriseConfirmation({ db, stageId, teamId, enterpriseId
 export function submitPeerReviews({ db, stageId, items = [], requestId = null, actorId = null, now }) {
   assertStageExists(db, stageId);
   const subject = actorId ?? '*';
+  // 互评的两端都必须是本赛段名册内的队伍（外队 / 不存在 → 404）
+  for (const item of items) {
+    assertTeamInStage(db, stageId, item.fromTeamId, '发起队');
+    assertTeamInStage(db, stageId, item.toTeamId, '被评队');
+  }
 
   if (requestId) {
     const prior = findPeerReviewsByRequestId(db, { stageId, requestId });
@@ -359,6 +394,7 @@ export function submitPeerReviews({ db, stageId, items = [], requestId = null, a
 /** 自评测（幂等） */
 export function submitSelfReviews({ db, stageId, teamId, items = [], requestId = null, now }) {
   assertStageExists(db, stageId);
+  assertTeamInStage(db, stageId, teamId);
   if (requestId) {
     const prior = findSelfReviewsByRequestId(db, { stageId, teamId, requestId });
     if (prior.length) {
@@ -409,6 +445,9 @@ export function declareRecusal({ db, stageId, judgeId, teamId = null, reason, ac
   assertStageExists(db, stageId);
   if (!reason || !String(reason).trim()) {
     throw fail(400, 'RECUSAL_REASON_REQUIRED', '回避必须填写原因（供应方 / 投资方 / 前雇主）');
+  }
+  if (teamId != null) {
+    assertTeamInStage(db, stageId, teamId);
   }
   const row = insertRecusal(db, {
     stageId, judgeId, teamId, reason, source: 'declared', auditBy: actorId, action: 'recused', now,

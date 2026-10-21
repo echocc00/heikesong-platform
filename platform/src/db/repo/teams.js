@@ -33,6 +33,33 @@ export function getTeam(db, id) {
   return db.prepare('SELECT * FROM teams WHERE id = ? AND deleted_at IS NULL').get(id) ?? null;
 }
 
+/**
+ * 队伍 + 任务包归属（企业确认的归属判定要用）。
+ * ⚠️ 父代理预审修正（Critical，C1）：企业确认的写入口必须知道
+ *    「这支队的出题企业是谁」—— 否则任何有 `score:write` 的人都能替别人家的队
+ *    签一条「非本赛道」的企业确认，把该队的**企业项权重整段归零**
+ *    （初赛 10% / 决赛 25% 直接蒸发），还能连坐掉合法企业的签字。
+ * @returns {{teamId:string, editionId:string, packageEnterpriseId:string|null, isFreeBrief:boolean}|null}
+ */
+export function getTeamWithPackage(db, id) {
+  const row = db
+    .prepare(
+      `SELECT t.id AS team_id, t.edition_id, tp.enterprise_id AS package_enterprise_id,
+              COALESCE(tp.is_free_brief, 0) AS is_free_brief
+       FROM teams t
+       LEFT JOIN task_packages tp ON tp.id = t.task_package_id
+       WHERE t.id = ? AND t.deleted_at IS NULL`,
+    )
+    .get(id);
+  if (!row) return null;
+  return {
+    teamId: row.team_id,
+    editionId: row.edition_id,
+    packageEnterpriseId: row.package_enterprise_id ?? null,
+    isFreeBrief: !!row.is_free_brief,
+  };
+}
+
 export function listTeamRows(db, {
   editionId = null, taskPackageId = null, captainId = null, status = null,
 } = {}) {

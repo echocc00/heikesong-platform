@@ -19,6 +19,7 @@ import { appError, AppError } from './errors.js';
 import { registerRegistrationRoutes } from './http/routes/registration.js';
 import { registerTaskPackageRoutes } from './http/routes/taskPackage.js';
 import { registerTeamRoutes } from './http/routes/team.js';
+import { registerReviewRoutes } from './http/routes/review.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -107,6 +108,8 @@ export function createApp({ db, rules, webDir }) {
   registerTaskPackageRoutes({ router, db, rules });
   // 注册 P1 战队端点（建队 / 我的战队 / 成员增删汰换 / 战队修改）
   registerTeamRoutes({ router, db, rules });
+  // P2 评审 API（报名/组队等 P1 路由由 P1 追加，不要互相覆盖）
+  registerReviewRoutes(router);
   // 生产环境 Cookie 加 Secure；开发环境不加（http://127.0.0.1 会被浏览器拒收）
   const secureCookies = process.env.NODE_ENV === 'production';
 

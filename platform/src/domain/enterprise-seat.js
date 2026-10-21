@@ -81,9 +81,6 @@ export function applyEnterpriseRules({ confirmations = [], teams = [], judges = 
       (c) => c.teamId === team.teamId && enterpriseKeys.includes(c.dimension),
     );
     // 自由命题组没有「本赛道企业」概念 → R1 不适用（否则会与 R4 打架）
-    const outOfTrack = team.isFreeBrief
-      ? []
-      : mine.filter((c) => c.enterpriseId !== team.packageEnterpriseId);
     // 自由命题组按「内容合规」判有效，与 packageEnterpriseId 无关（父代理预审修正 ③）
     const inTrack = team.isFreeBrief
       ? mine
@@ -105,6 +102,23 @@ export function applyEnterpriseRules({ confirmations = [], teams = [], judges = 
     const failed = classified.filter((x) => x.reason !== null);
     const hasReason = (reason) => failed.some((x) => x.reason === reason);
 
+    // ⚠️ 父代理预审修正（Critical，C1 / D-30）：**R1 只依据「有效的」非本赛道确认判定**。
+    //    原来 `outOfTrack` 是「全部非本赛道确认」，于是一条**无效**的记录（缺双签 / 内容空白 /
+    //    分数越界）也能把该队的**企业项权重整段归零** —— 而写入口一旦被绕过（冒名签字），
+    //    攻击者就能用一条垃圾记录「连坐」掉受害队伍的企业席（初赛 10% / 决赛 25%）。
+    //    现在：无效记录不触发 R1；**本赛道企业已合法确认时，R1 也不再把权重归零**
+    //    （R1 的本意是「本赛道企业没确认 ⇒ 企业席不适用」，不是「有人冒签就整队作废」）。
+    const outOfTrackClassified = (team.isFreeBrief
+      ? []
+      : mine.filter((c) => c.enterpriseId !== team.packageEnterpriseId)).map((c) => {
+      if (!c.crossJudgeId || !c.signatoryUserId) return { c, reason: 'dual_signature' };
+      if (typeof c.content !== 'string' || !c.content.trim()) return { c, reason: 'content' };
+      if (!Number.isFinite(c.rawScore) || c.rawScore < 0 || c.rawScore > 100) return { c, reason: 'score_range' };
+      return { c, reason: null };
+    });
+    const validOutOfTrack = outOfTrackClassified.filter((x) => x.reason === null).map((x) => x.c);
+    const outOfTrack = validOutOfTrack;
+
     // R4 只在「该队**完全没有**企业确认」时接管；确认存在但无效 → 按无效处理
     const r4Candidate = Boolean(team.isFreeBrief) && inTrack.length === 0;
     if (r4Candidate && (!demandKey || base[demandKey] == null)) {
@@ -119,10 +133,14 @@ export function applyEnterpriseRules({ confirmations = [], teams = [], judges = 
 
     if (outOfTrack.length) {
       // R1：企业评委给非本企业题目打分 → 该队企业项权重自动降为 0
-      if (enterpriseKey) eff[enterpriseKey] = 0;
+      // ⚠️ 但**本赛道企业已合法确认时不得降权**（D-30）：
+      //    「别家企业也签了一条」不该把本赛道企业的合法签字一起废掉。
+      if (enterpriseKey && !valid.length) eff[enterpriseKey] = 0;
       warnings.push({
         code: 'R1_out_of_track',
-        message: '企业席评了非本企业题目，该队「企业确认」权重降为 0',
+        message: valid.length
+          ? '有非本赛道企业的有效确认（已忽略，不影响本赛道企业的签字）'
+          : '企业席评了非本企业题目，该队「企业确认」权重降为 0',
         teamId: team.teamId,
       });
     }

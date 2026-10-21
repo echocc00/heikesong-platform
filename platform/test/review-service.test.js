@@ -467,3 +467,60 @@ test('不能给自己互评 → 400', () => {
   );
   cleanup(ctx);
 });
+
+// ── 写入口的队伍边界（父代理预审 I1 / I5 / D-33）─────────────────────────
+
+test('服务层：给名册外的队伍打分 → 404（不是外键报错 500）', () => {
+  const ctx = setup();
+  const otherEdition = createEdition(ctx.db, {
+    name: '第二届', city: '杭州', startsAt: '2027-01-01', endsAt: '2027-02-28', now: NOW,
+  });
+  const outsider = insertTeam(ctx.db, {
+    editionId: otherEdition.id, name: '外队', captainId: ctx.admin.id, status: 'active', now: NOW,
+  });
+  assert.throws(
+    () => submitReviews({
+      db: ctx.db, stageId: ctx.stage.id, judgeId: ctx.judge.id,
+      items: [{ teamId: outsider.id, dimension: 'innovation', rawScore: 99 }], now: NOW,
+    }),
+    (err) => err.status === 404 && err.code === 'TEAM_NOT_IN_STAGE',
+  );
+  cleanup(ctx);
+});
+
+test('服务层：企业确认名册外的队伍 → 404', () => {
+  const ctx = setup();
+  const otherEdition = createEdition(ctx.db, {
+    name: '第二届', city: '杭州', startsAt: '2027-01-01', endsAt: '2027-02-28', now: NOW,
+  });
+  const outsider = insertTeam(ctx.db, {
+    editionId: otherEdition.id, name: '外队', captainId: ctx.admin.id, status: 'active', now: NOW,
+  });
+  assert.throws(
+    () => submitEnterpriseConfirmation({
+      db: ctx.db, stageId: ctx.stage.id, teamId: outsider.id, enterpriseId: ctx.admin.id,
+      dimension: 'enterprise', rawScore: 90, crossJudgeId: ctx.judge.id,
+      signatoryUserId: ctx.admin.id, content: '外队确认', now: NOW,
+    }),
+    (err) => err.status === 404 && err.code === 'TEAM_NOT_IN_STAGE',
+  );
+  cleanup(ctx);
+});
+
+test('服务层：互评的被评队不在名册内 → 404', () => {
+  const ctx = setup();
+  const otherEdition = createEdition(ctx.db, {
+    name: '第二届', city: '杭州', startsAt: '2027-01-01', endsAt: '2027-02-28', now: NOW,
+  });
+  const outsider = insertTeam(ctx.db, {
+    editionId: otherEdition.id, name: '外队', captainId: ctx.admin.id, status: 'active', now: NOW,
+  });
+  assert.throws(
+    () => submitPeerReviews({
+      db: ctx.db, stageId: ctx.stage.id,
+      items: [{ fromTeamId: ctx.teamA.id, toTeamId: outsider.id, score: 80 }], now: NOW,
+    }),
+    (err) => err.status === 404 && err.code === 'TEAM_NOT_IN_STAGE',
+  );
+  cleanup(ctx);
+});
