@@ -11,6 +11,7 @@ import {
   touchSessionExpiry,
   deleteSessionByHash,
   deleteSessionsByUser,
+  deleteSessionsByUserExcept,
 } from '../db/repo/sessions.js';
 
 const DEFAULT_TTL_DAYS = 7;
@@ -108,4 +109,21 @@ export function revokeSession(db, token) {
 
 export function revokeAllSessions(db, userId) {
   return deleteSessionsByUser(db, userId);
+}
+
+/**
+ * 吊销该用户的会话，但**保留指定的那一个**（按 token 判定，不是按哈希）。
+ *
+ * 用途：改口令后让**其它设备**上的会话全部作废，同时**不把当前这次登录踢下线**
+ * —— 否则用户改完口令立刻被登出，体验上像「改失败了」。
+ *
+ * ⚠️ 传进来的 exceptToken 是**明文 token**（不是哈希）—— 这里负责算哈希，
+ *    因为 tokenHash 是本文件的私有实现（对外不暴露）。
+ *
+ * @param {string} userId
+ * @param {string|null} exceptToken 要保留的会话的明文 token（null = 全删）
+ * @returns {number} 被吊销的会话条数
+ */
+export function revokeAllSessionsExcept(db, userId, exceptToken = null) {
+  return deleteSessionsByUserExcept(db, userId, exceptToken ? tokenHash(exceptToken) : null);
 }

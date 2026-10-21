@@ -777,8 +777,8 @@ heikesong-platform 启动于 http://127.0.0.1:8080（规则版本 2026-10-20）
 | U-4 | ~~`nginx-http2-compat.sh` 的版本探测在真机上总是失败~~ **已修** | 原 `detect_version()` 的 sed 匹配不到 nginx 的真实输出格式 `nginx version: nginx/1.24.0`（版本号前带 `nginx/` 前缀）⇒ 真机总是走保守降级。**后果安全**（降级语法在所有版本都合法），但「≥ 1.25.1 保留 `http2 on;`」只有显式 `NGINX_VERSION` 才走得到。**已由父代理修复轮修掉**（2026-10-21）：解析式改为同时吃下带前缀/不带前缀两种形态，并补了走**真实自动探测路径**的回归用例（假 `nginx` 放 `PATH` 上）—— 见 §8.1 |
 | U-5 | **演示版构建 / 发布流程未实跑** | `scripts/build-demo.js` / `scripts/serve-demo.js` 是 **P6 Task 6** 的产物，**本 Task 时点尚未落地**。§8.5 写的是**目标流程**（接口以 P6 计划 Task 6 为准） |
 | U-6 | **多机 / Postgres 方案** | 超出本阶段范围。§0.2 与 §4 只把**边界**说清楚（多机必须换 Postgres，没有第三条路） |
-| U-7 | **计划代码块原样保留，未作改动** | 计划 Task 7 的 `docs/deployment.md` 代码块在本文件里**逐字连续**保留（§0–§7），补写内容全部落在 §8–§15。计划文档本身只**追加**了「Task 7 实施台账」一章 |
-| U-8 | **systemd 侧未在真机验证** | 本手册写作环境是 macOS（无 systemd）。§8.3 的「确认生效」三条命令里，②（`systemctl show -p EnvironmentFiles`）与 ③（读 `/proc/<pid>/environ`）**未在真机跑过** —— 但 ③ 读的是内核暴露的进程环境，语义不依赖 systemd 版本。⚠️ 刻意**不用** `systemctl show -p Environment`：那条**看不到** `EnvironmentFile=` 的内容（systemd issue #14723），会让人误判「环境文件没生效」。<br>⚠️ **2026-10-21 补充**：单元文件本身已在**真机 systemd 252** 上过 `systemd-analyze verify`（零告警，见 §15 E20）；仍未验证的是「**服务真跑起来之后**那三条确认命令」（那需要真的把服务装上并启动）<br>✅ **2026-10-21 晚补充**：让路形态部署后服务**真的跑起来了**（`systemctl is-active heikesong` ⇒ `active`，`Main PID` 为 `node /opt/heikesong/platform/src/server.js`），见 §15 E25；「确认生效」三条命令仍可自行跑 |
+| U-7 | **计划代码块原样保留，未作改动** | 计划 Task 7 的 `docs/deployment.md` 代码块在本文件里**逐字连续**保留（§0–§7），补写内容全部落在 §8–§16。计划文档本身只**追加**了「Task 7 实施台账」一章 |
+| U-8 | **systemd 侧未在真机验证** | 本手册写作环境是 macOS（无 systemd）。§8.3 的「确认生效」三条命令里，②（`systemctl show -p EnvironmentFiles`）与 ③（读 `/proc/<pid>/environ`）**未在真机跑过** —— 但 ③ 读的是内核暴露的进程环境，语义不依赖 systemd 版本。⚠️ 刻意**不用** `systemctl show -p Environment`：那条**看不到** `EnvironmentFile=` 的内容（systemd issue #14723），会让人误判「环境文件没生效」。<br>⚠️ **2026-10-21 补充**：单元文件本身已在**真机 systemd 252** 上过 `systemd-analyze verify`（零告警，见 §16 E20）；仍未验证的是「**服务真跑起来之后**那三条确认命令」（那需要真的把服务装上并启动）<br>✅ **2026-10-21 晚补充**：让路形态部署后服务**真的跑起来了**（`systemctl is-active heikesong` ⇒ `active`，`Main PID` 为 `node /opt/heikesong/platform/src/server.js`），见 §16 E25；「确认生效」三条命令仍可自行跑 |
 | U-9 | **平台在公网打不开**（真机部署后实测） | 主机侧**零防火墙规则**（iptables INPUT 0 条 / nftables 空 / firewalld 未装），`8081` 确实在监听 `0.0.0.0` ⇒ **过滤在云侧**（安全组 / 端口映射只放行了 22 / 80 / 443 / 7000 / 8888）。让路形态部署在 8081 ⇒ 机内全通（E26/E27），公网不通（E29）。<br>⇒ **不是应用问题**：在云控制台加一条 **TCP 8081** 的入方向规则即可（代码与主机配置零改动）；在此之前可用 `ssh -L 8081:127.0.0.1:8081` 本机隧道访问 |
 
 ---
@@ -845,7 +845,62 @@ userdel heikesong && groupdel heikesong
 > 回滚只删**本次部署创建**的东西；`default`（headscale）、`headscale-tls`、xray、frps、
 > HydroOJ、mongod 一律不碰。
 
-## 15. 实跑证据台账（2026-10-21）
+## 15. 改口令与强制下线（运维操作）
+
+> 为什么要单独一节：管理员口令是 `scripts/seed.js` **一次定死**的（幂等、不覆盖已有账号），
+> 所以「换口令」只能走 API —— 平台现在有 `POST /api/auth/password` 了。
+
+### 15.1 改口令
+
+```bash
+# ① 登录，取会话 Cookie
+curl -s -i -X POST http://127.0.0.1:8081/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"phone":"13800000000","password":"<旧口令>"}' | grep -i '^set-cookie:'
+
+# ② 用这个会话改口令
+curl -s -X POST http://127.0.0.1:8081/api/auth/password \
+  -H 'Content-Type: application/json' \
+  -H 'Cookie: hk_session=<上一步的 token>' \
+  -d '{"oldPassword":"<旧口令>","newPassword":"<新口令>"}'
+```
+
+| 情况 | HTTP | `error.code` | 说明 |
+|---|---|---|---|
+| 未登录 | 401 | `UNAUTHENTICATED` | |
+| 原口令错 | 401 | `INVALID_CREDENTIALS` | 口令**不**改动 |
+| 新口令为空 | 400 | `PASSWORD_REQUIRED` | |
+| 新口令 < 8 位 | 400 | `PASSWORD_TOO_SHORT` | |
+| 新口令 > 128 位 | 400 | `PASSWORD_TOO_LONG` | 防超长口令把 scrypt 拖成 DoS |
+| 新口令 = 原口令 | 400 | `PASSWORD_REUSED` | 不算「改成功」 |
+| 成功 | 200 | — | `{ ok: true, revokedSessions: N }` |
+
+⚠️ 改完之后：**其它设备**上的会话全部作废（`revokedSessions` = 被作废的个数），
+**当前这次仍有效**（改完不会被自己踢下线）⇒ 换到别的设备时要用**新口令**重新登录。
+
+⚠️ **口令策略只约束「新设」的口令**：存量账号（seed 出来的、历史导入的）仍可用旧口令登录
+—— 新策略不会把老账号**锁死**在外；但**新设**必须 ≥ 8 位。
+
+### 15.2 强制下线
+
+```bash
+curl -s -X POST http://127.0.0.1:8081/api/auth/logout-all -H 'Cookie: hk_session=<token>'
+```
+
+⇒ 该用户**全部**会话作废（**含当前**），并下发清空会话的 Cookie。
+用途：账号疑似泄露、或明确要「把他踢下线」。
+
+### 15.3 轮换 seed 出来的初始口令（部署后第一件事）
+
+`install.sh` 用 `ADMIN_PASSWORD` 建管理员，而那个口令**改不掉**
+（`scripts/seed.js` 幂等、不覆盖已有账号）⇒ 部署后**立刻**用 §15.1 换掉它。
+
+⚠️ 若口令曾出现在**日志 / 截图 / 聊天记录**里 ⇒ **一律当作已泄露**，必须换。
+⚠️ 纯 HTTP 形态下口令每次登录都**明文过网** ⇒ 换口令的同时把安全组来源 IP 限定住。
+
+---
+
+## 16. 实跑证据台账（2026-10-21）
 
 > 全部在**临时目录**（`mktemp -d`）里做，不碰工作树的库文件。
 > 环境：macOS（darwin 27.0.0 arm64）、Node **v22.23.2**、**本机没装 nginx**（正好用来验证降级路径与探测失败路径）。

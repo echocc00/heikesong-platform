@@ -768,15 +768,16 @@ WHERE EXISTS (SELECT 1 FROM assignment a
 
 ## 8. API 设计
 
-> ⚠️ **下面是实施后的真实 API 面**（**56 个端点** = router 里注册的 **55** 个
+> ⚠️ **下面是实施后的真实 API 面**（**58 个端点** = router 里注册的 **57** 个
 > + **不挂 router** 的 SSE 流 **1** 个），逐条从代码里抽出来的，不是设计期的手写清单。复算：
 > `grep -rhoE "router\.add\('[A-Z]+',\s*'[^']+'" platform/src/ | sort -u`
-> ⇒ 55 个；SSE 那条在 `src/http/sse.js` 里按路径匹配（见下方「实时」段），
+> ⇒ 57 个；SSE 那条在 `src/http/sse.js` 里按路径匹配（见下方「实时」段），
 > **不在 `router.add` 的输出里** —— 这是「SSE 不挂 router」的既定决策（它要长期持有连接，
 > 不能像普通 handler 那样「写完就结束响应」）。
 >
 > 变更史：本节原为设计期的 28 个端点；P0–P4 按计划实现，P5 追加了工作流 / 三池 / 公开榜
-> （+15）、P4 追加了复核与申诉（+11），P5 Task 5 追加了 iCal 日历订阅（+1）。
+> （+15）、P4 追加了复核与申诉（+11），P5 Task 5 追加了 iCal 日历订阅（+1），
+> P6 补上了 §7.5 早就规格化却一直没实现的**强制下线**，并追加了**改口令**（+2）。
 > **逐条需求的落点与验收**见
 > [`../requirement-implementation-map.md`](../requirement-implementation-map.md)（机器生成）；
 > **跨阶段签名与表结构的唯一事实来源**是
@@ -789,6 +790,8 @@ WHERE EXISTS (SELECT 1 FROM assignment a
 认证
   POST   /api/auth/login              {phone,password} → session
   POST   /api/auth/logout
+  POST   /api/auth/password           {oldPassword,newPassword} → 改口令（吊销其它设备的会话）
+  POST   /api/auth/logout-all         → 强制下线（吊销该用户全部 session）
   GET    /api/me                       → user + roles + scopes
 
 报名与组队

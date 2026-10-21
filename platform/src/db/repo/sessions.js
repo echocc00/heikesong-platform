@@ -31,6 +31,28 @@ export function deleteSessionsByUser(db, userId) {
   return db.prepare('DELETE FROM sessions WHERE user_id = ?').run(userId).changes;
 }
 
+/**
+ * 吊销某用户的会话，但**保留指定的某一个**。
+ *
+ * 依据：设计文档 §7.5「强制下线」与「改口令后其它设备掉线」两个场景：
+ *   · 强制下线 ⇒ exceptHash = null ⇒ 全删（含当前会话）。
+ *   · 改口令   ⇒ exceptHash = 当前会话的哈希 ⇒ 只删别的设备。
+ * ⛔ 保留的那一个用 `token_hash <> ?` 排除 —— 数据库只存哈希，
+ *    调用方传进来的必须是 tokenHash(token)（见 src/auth/session.js）。
+ *
+ * @param {string} userId
+ * @param {string|null} exceptHash 要保留的会话哈希（null = 全删）
+ * @returns {number} 被删除的会话条数
+ */
+export function deleteSessionsByUserExcept(db, userId, exceptHash = null) {
+  if (!exceptHash) {
+    return db.prepare('DELETE FROM sessions WHERE user_id = ?').run(userId).changes;
+  }
+  return db
+    .prepare('DELETE FROM sessions WHERE user_id = ? AND token_hash <> ?')
+    .run(userId, exceptHash).changes;
+}
+
 export function countActiveSessions(db, userId, { now = new Date() } = {}) {
   // ⛔ 预审修正（m5-1）：过期判定**解析时间戳再比较**，不做字符串比较。
   //    字符串比较下 '...T00:00:00Z' 与 '...T00:00:00.000Z' 会给出相反结论。

@@ -70,6 +70,35 @@ export function getCredentialsByPhone(db, phone) {
     .get(phone) ?? null;
 }
 
+/**
+ * ⛔ 与 getCredentialsByPhone 同款纪律：**唯一会取出 password_hash 的地方**。
+ *    这里按 **userId** 取（改口令场景：已知自己是谁，不必再问手机号）。
+ *    取出的 hash 只用于服务端口令校验，**绝不进任何 HTTP 响应**。
+ *
+ * @param {string} id
+ * @returns {{id: string, password_hash: string, active: number}|null}
+ */
+export function getCredentialsById(db, id) {
+  return db
+    .prepare('SELECT id, password_hash, active FROM users WHERE id = ?')
+    .get(id) ?? null;
+}
+
+/**
+ * 改口令：写入新的 password_hash。
+ * ⛔ **只改口令，不动其它字段**（角色、能力点、停用状态一律不受影响）——
+ *    「改口令」不是「改权限」，这两件事混在一起会让审计失去意义。
+ *
+ * @param {string} userId
+ * @param {string} passwordHash 新哈希（hashPassword 的产物）
+ * @returns {number} 受影响行数（0 = 该用户不存在）
+ */
+export function updatePasswordHash(db, userId, passwordHash) {
+  return db
+    .prepare('UPDATE users SET password_hash = ? WHERE id = ?')
+    .run(passwordHash, userId).changes;
+}
+
 export function listUsers(db, { limit = 100, offset = 0 } = {}) {
   return db
     .prepare(`SELECT ${PUBLIC_COLUMNS} FROM users WHERE active = 1 ORDER BY created_at LIMIT ? OFFSET ?`)

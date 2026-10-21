@@ -18,9 +18,9 @@
 | 4 | **P3 榜单与积分** | 能真实发榜（A/B/个人榜 + 段位 + 行为分隔离 + 战绩卡） | P2 | `2026-10-20-platform-P3-leaderboard-points.md` | 8 Task / 6478 行 |
 | 5 | **P4 审计与防作弊** | 榜单可复算（trace 抽屉 + 复算 diff）+ 限频 + 复核状态机 | P3 | `2026-10-20-platform-P4-audit-anticheat.md` | 8 Task / 8815 行 |
 | 6 | **P5 工作流与三池** | 任务清单与领取；三池底座接口；公开榜单 API + iCal + 任务清单页 | P4 | `2026-10-20-platform-P5-workflow-pools.md` | 6 Task / 8707 行 |
-| 7 | **P6 部署与演示版** | 云主机部署资产 + 公网演示 URL + 端到端/跨平台验收 | P5 | `2026-10-20-platform-P6-deploy-demo.md` | 8 Task / 10485 行 |
+| 7 | **P6 部署与演示版** | 云主机部署资产 + 公网演示 URL + 端到端/跨平台验收 | P5 | `2026-10-20-platform-P6-deploy-demo.md` | 8 Task / 10597 行 |
 
-合计 **54 个 Task**、**61458 行**计划文档。
+合计 **54 个 Task**、**61570 行**计划文档。
 
 > 规模数字是**实施后**的实况（每份计划末尾都追加了父代理预审 / 修复轮 / 实施台账章节，所以比撰写期大）。
 > 复算：`wc -l docs/superpowers/plans/2026-10-20-platform-P*.md`。

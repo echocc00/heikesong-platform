@@ -19,6 +19,7 @@ import { parseSsePath, openSseStream, sendSseEvent, sendSseComment, reviewEvents
 import { createSession, resolveSession, revokeSession } from './auth/session.js';
 import { can } from './auth/permissions.js';
 import { verifyPassword, hashPassword } from './auth/password.js';
+import { changePassword, logoutAllSessions } from './services/auth.js';
 import { getUserById, getCredentialsByPhone, toPublicUser } from './db/repo/users.js';
 import { getStage, getStageJudge } from './db/repo/stages.js';
 import { appError, AppError } from './errors.js';
@@ -259,6 +260,36 @@ export function createApp({ db, rules, webDir }) {
     return {
       status: 200,
       body: { ok: true },
+      headers: { 'Set-Cookie': sessionCookie('', 0, secureCookies) },
+    };
+  });
+
+  // ── P6 追加：改口令 + 强制下线 ──────────────────────────────────────
+  // ⚠️ 为什么这两个端点到现在才补：
+  //    设计文档 §7.5 早就写了「强制下线 | POST /api/auth/logout-all」，
+  //    但端点清单里从来没有它 —— 规格写了、代码没做。
+  //    而「改口令」的缺口更实在：口令是 seed 一次定死的（scripts/seed.js 幂等），
+  //    没有改口令端点 ⇒ 部署方只能一直用 seed 出来的初始口令。
+  router.add('POST', '/api/auth/password', async ({ user, body, sessionToken }) => {
+    if (!user) throw appError(401, 'UNAUTHENTICATED', '未登录');
+    const r = changePassword({
+      db,
+      userId: user.id,
+      oldPassword: body?.oldPassword,
+      newPassword: body?.newPassword,
+      // 当前这次会话保留 ⇒ 改完不用立刻重新登录；别的设备上的会话全部作废
+      keepSessionToken: sessionToken,
+    });
+    return { status: 200, body: { ok: true, revokedSessions: r.revokedSessions } };
+  });
+
+  router.add('POST', '/api/auth/logout-all', async ({ user }) => {
+    if (!user) throw appError(401, 'UNAUTHENTICATED', '未登录');
+    // 语义是「把他踢下线」⇒ **含当前会话**一起删
+    const r = logoutAllSessions({ db, userId: user.id });
+    return {
+      status: 200,
+      body: { ok: true, revokedSessions: r.revokedSessions },
       headers: { 'Set-Cookie': sessionCookie('', 0, secureCookies) },
     };
   });

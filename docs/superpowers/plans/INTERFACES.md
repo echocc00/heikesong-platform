@@ -621,6 +621,50 @@ docs/deployment.md           部署与运维手册
 > 挂到 HTTP 上。它只给本地预览（`scripts/serve-demo.js`）与开发服务器用；
 > 生产部署下这两个路径一律 404。
 
+### 7.1 P6 追加：账号凭据服务与两个认证端点（2026-10-22）
+
+> **为什么追加**：口令是 `scripts/seed.js` **一次定死**的（幂等、不覆盖已有管理员），
+> 而平台**没有改口令端点** ⇒ 部署方只能一直用 seed 出来的初始口令（哪怕它已出现在日志/截图/聊天里）。
+> 这是**每次部署都会撞上**的产品缺口。
+> 同时兑现设计文档 §7.5 早就写好、却一直没实现的「强制下线」。
+
+```js
+// src/services/auth.js —— P6 新建（跨阶段签名以本节为准）
+PASSWORD_MIN_LENGTH                              // → 8
+PASSWORD_MAX_LENGTH                              // → 128（防超长口令把 scrypt 拖成 DoS）
+checkPasswordPolicy(newPassword)                 // → { ok, code?, message? }
+changePassword({ db, userId, oldPassword, newPassword, keepSessionToken })
+//   → { ok: true, revokedSessions }
+//   错误：原口令错 → 401 INVALID_CREDENTIALS；策略不通过 → 400 PASSWORD_*；
+//         与原口令相同 → 400 PASSWORD_REUSED；用户不存在/停用 → 401 UNAUTHENTICATED
+logoutAllSessions({ db, userId })                // → { ok: true, revokedSessions }
+
+// src/auth/session.js —— P0 已建，本阶段**追加**（不改既有签名与行为）
+revokeAllSessionsExcept(db, userId, exceptToken) // → number（保留 exceptToken 那一个，其余全删）
+
+// src/db/repo/users.js —— P0 已建，本阶段**追加**
+getCredentialsById(db, id)                       // → { id, password_hash, active } | null
+updatePasswordHash(db, userId, passwordHash)     // → number（受影响行数；**只改口令**）
+
+// src/db/repo/sessions.js —— P0 已建，本阶段**追加**
+deleteSessionsByUserExcept(db, userId, exceptHash)  // → number
+```
+
+```
+API（P6 追加）
+  POST   /api/auth/password     { oldPassword, newPassword }
+         → 200 { ok: true, revokedSessions }
+         → 401 INVALID_CREDENTIALS（原口令错）/ 401 UNAUTHENTICATED（未登录）
+         → 400 PASSWORD_REQUIRED / PASSWORD_TOO_SHORT / PASSWORD_TOO_LONG / PASSWORD_REUSED
+         ⚠️ 改完后**其它设备**的会话全部作废，当前这次**保留**（不把自己踢下线）。
+  POST   /api/auth/logout-all
+         → 200 { ok: true, revokedSessions }，并下发清空会话的 Set-Cookie
+         ⚠️ 语义是「把他踢下线」⇒ **含当前会话**一起吊销（与改口令的差别就在这里）。
+```
+
+> ⚠️ **口令策略只约束「通过本端点新设」的口令**：存量账号（seed 出来的、历史导入的）
+> 仍可照常登录 —— 不能因为新增一条策略就把老账号**锁死**在外。
+
 ---
 
 ## 8. 阶段间依赖一览
