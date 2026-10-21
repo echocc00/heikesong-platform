@@ -333,6 +333,48 @@ test('构建必须以 platformDir 为准（换一份拷贝也能构建，不许�
   rmSync(root, { recursive: true, force: true });
 });
 
+test('产物里不得夹带 macOS 的 AppleDouble 伴生文件（._xxx）', () => {
+  // 真机实测（2026-10-21，8.133.200.235 / Debian 12 / ext4）：
+  //   按 P6 计划 Step 4 的「跨平台复现」配方从 macOS 拷到 Linux 时，
+  //   `tar` 会给每个文件配一个 `._xxx` 资源叉载体 —— 内容是二进制，不是真资源。
+  //   ⇒ 混进静态站 = 把垃圾发给访客；混进领域层 = 浏览器里加载一个坏模块。
+  const root = mkdtempSync(join(tmpdir(), 'hks-ad-'));
+  const copyRoot = join(root, 'platform');
+  mkdirSync(copyRoot, { recursive: true });
+  cpSync(join(platformDir, 'rules'), join(copyRoot, 'rules'), { recursive: true });
+  cpSync(join(platformDir, 'src', 'domain'), join(copyRoot, 'src', 'domain'), { recursive: true });
+  cpSync(join(platformDir, 'web'), join(copyRoot, 'web'), {
+    recursive: true,
+    filter: (src) => !src.includes(`${sep}dist${sep}`) && !src.endsWith(`${sep}dist`),
+  });
+
+  // 造三个伴生文件：领域层、规则、web 下各一个
+  const ad = Buffer.from([0x00, 0x05, 0x16, 0x07, 0xff, 0xfe]);
+  writeFileSync(join(copyRoot, 'src', 'domain', '._scoring.js'), ad);
+  writeFileSync(join(copyRoot, 'rules', '._scoring-final.json'), ad);
+  writeFileSync(join(copyRoot, 'web', '._app.js'), ad);
+
+  const out = join(root, 'dist');
+  buildDemoSite({ outDir: out, platformDir: copyRoot });
+
+  const leaked = [];
+  const walk = (dir) => {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      const p = join(dir, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (e.name.startsWith('._')) leaked.push(p);
+    }
+  };
+  walk(out);
+  assert.deepEqual(leaked, [], `产物里混进了伴生文件：${leaked.map((p) => relative(out, p)).join('、')}`);
+
+  // 真正的资源必须在（别把「跳过」做成「漏拷」）
+  assert.ok(existsSync(join(out, 'src', 'domain', 'scoring.js')), '真正的领域层文件必须在');
+  assert.ok(existsSync(join(out, 'rules', 'scoring-final.json')), '真正的规则文件必须在');
+
+  rmSync(root, { recursive: true, force: true });
+});
+
 test('构建前必须清空产物目录（陈旧文件不得混进产物）', () => {
   const out = mkdtempSync(join(tmpdir(), 'hks-dist-'));
   writeFileSync(join(out, 'stale.txt'), '上一版的残留\n', 'utf8');

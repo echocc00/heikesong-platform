@@ -6073,6 +6073,48 @@ test('构建必须以 platformDir 为准（换一份拷贝也能构建，不许�
   rmSync(root, { recursive: true, force: true });
 });
 
+test('产物里不得夹带 macOS 的 AppleDouble 伴生文件（._xxx）', () => {
+  // 真机实测（2026-10-21，8.133.200.235 / Debian 12 / ext4）：
+  //   按 P6 计划 Step 4 的「跨平台复现」配方从 macOS 拷到 Linux 时，
+  //   `tar` 会给每个文件配一个 `._xxx` 资源叉载体 —— 内容是二进制，不是真资源。
+  //   ⇒ 混进静态站 = 把垃圾发给访客；混进领域层 = 浏览器里加载一个坏模块。
+  const root = mkdtempSync(join(tmpdir(), 'hks-ad-'));
+  const copyRoot = join(root, 'platform');
+  mkdirSync(copyRoot, { recursive: true });
+  cpSync(join(platformDir, 'rules'), join(copyRoot, 'rules'), { recursive: true });
+  cpSync(join(platformDir, 'src', 'domain'), join(copyRoot, 'src', 'domain'), { recursive: true });
+  cpSync(join(platformDir, 'web'), join(copyRoot, 'web'), {
+    recursive: true,
+    filter: (src) => !src.includes(`${sep}dist${sep}`) && !src.endsWith(`${sep}dist`),
+  });
+
+  // 造三个伴生文件：领域层、规则、web 下各一个
+  const ad = Buffer.from([0x00, 0x05, 0x16, 0x07, 0xff, 0xfe]);
+  writeFileSync(join(copyRoot, 'src', 'domain', '._scoring.js'), ad);
+  writeFileSync(join(copyRoot, 'rules', '._scoring-final.json'), ad);
+  writeFileSync(join(copyRoot, 'web', '._app.js'), ad);
+
+  const out = join(root, 'dist');
+  buildDemoSite({ outDir: out, platformDir: copyRoot });
+
+  const leaked = [];
+  const walk = (dir) => {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      const p = join(dir, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (e.name.startsWith('._')) leaked.push(p);
+    }
+  };
+  walk(out);
+  assert.deepEqual(leaked, [], `产物里混进了伴生文件：${leaked.map((p) => relative(out, p)).join('、')}`);
+
+  // 真正的资源必须在（别把「跳过」做成「漏拷」）
+  assert.ok(existsSync(join(out, 'src', 'domain', 'scoring.js')), '真正的领域层文件必须在');
+  assert.ok(existsSync(join(out, 'rules', 'scoring-final.json')), '真正的规则文件必须在');
+
+  rmSync(root, { recursive: true, force: true });
+});
+
 test('构建前必须清空产物目录（陈旧文件不得混进产物）', () => {
   const out = mkdtempSync(join(tmpdir(), 'hks-dist-'));
   writeFileSync(join(out, 'stale.txt'), '上一版的残留\n', 'utf8');
@@ -6438,6 +6480,10 @@ function copyDir(from, to, { exclude = [], excludePaths = new Set() } = {}) {
   mkdirSync(to, { recursive: true });
   for (const entry of readdirSync(from, { withFileTypes: true })) {
     if (exclude.includes(entry.name)) continue;
+    // ⛔ 不把 macOS 的 AppleDouble 伴生文件（`._xxx`）拷进产物：
+    //    它是资源叉载体（二进制），不是真内容；混进静态站等于把垃圾发给访客。
+    //    真机实测：2026-10-21 在 8.133.200.235 上按「跨平台复现」配方拷贝时带到过。
+    if (entry.name.startsWith('._')) continue;
     const src = join(from, entry.name);
     if (excludePaths.has(resolve(src))) continue;   // 产物目录自身（无论叫什么名字）
     const dst = join(to, entry.name);
@@ -6525,7 +6571,8 @@ export function collectBrowserModules(domainDir) {
   const extraFiles = [];
   const seen = new Set();
   const queue = readdirSync(domainDir)
-    .filter((n) => n.endsWith('.js'))
+    // ⛔ 跳过 macOS 的 AppleDouble 伴生文件（`._xxx`，资源叉载体，不是真模块）
+    .filter((n) => n.endsWith('.js') && !n.startsWith('._'))
     .map((n) => join(domainDir, n));
 
   while (queue.length) {
@@ -8597,6 +8644,32 @@ Expected: 三条命令全部成功，**不需要 `npm install`**，**不需要�
 > ⚠️ **Windows 特别说明**：Windows 上没有零依赖的守护方案（Node 进程不是 Windows 服务）。
 > 组员本地手动起进程即可；**云主机一律 Linux + systemd**（设计文档 §16 风险 11）。
 
+> 🔥 **拷贝方式有坑（2026-10-21 真机实测）**：从 **macOS** 往 Linux 拷时，
+> 如果用 `tar` 打进管道（而不是 `scp`），macOS 的 `bsdtar` 会给**每个文件**配一个
+> **AppleDouble 伴生文件** `._xxx`（资源叉载体，内容是二进制）：
+>
+> ```
+> $ tar -cf - platform/ | ssh other-machine 'tar -xf -'
+> $ cd /tmp/platform && node scripts/migrate.js
+> Error: 迁移文件名必须形如 <版本号>_<名称>.sql: ._001_init.sql
+> ```
+>
+> ⇒ **要么用 `scp`（不产生伴生文件），要么用下面这条**：
+>
+> ```bash
+> # macOS → Linux：必须关掉 xattr/AppleDouble，且显式排除 ._*
+> COPYFILE_DISABLE=1 tar -cf - --no-xattrs --exclude='._*' --exclude='.DS_Store' platform/ \
+>   | ssh other-machine 'mkdir -p /tmp/platform && tar -xf - -C /tmp'
+> ```
+>
+> ⛔ **不要**用 `rsync`（默认会带 xattr）或从 **exFAT/FAT U 盘**中转（那个格式**必然**
+> 生成 `._*`，而且 macOS 往里拷时也会自动造）。
+>
+> ⇒ 另外，**代码侧也已加固**（不让这类伴生文件造成**部署级**故障）：
+> `src/db/migrate.js` 的迁移读取器会**跳过** `._*`（它不是迁移），
+> `scripts/build-demo.js` 的产物拷贝会**丢弃** `._*`（不把垃圾发给访客）。
+> 但**正确做法仍是别把它们拷过去** —— 加固只是兜底，不是许可证。
+
 - [ ] **Step 5: 提交**
 
 ```bash
@@ -9998,4 +10071,120 @@ P5 Task 5 的 iCal 已由该分支的 worker 改成 `TextEncoder`/`TextDecoder`
 3. **Task 8 台账 G-1**（演示适配器与正式服务的响应形状不同源）本轮**未处置** ——
    它是**演示页显示层**的问题（页面显示「总分 undefined 分」），不影响数据正确性，
    留给 P6 演示版的下一轮，不要在本轮顺手改（改动面会波及 `web/api.demo.js` 与 `web/views/**`）。
+## P6 真机跨平台复现轮（父代理，2026-10-21 · Task 8 Step 4 的真实执行）
+
+> **背景**：P6 Task 8 的 Step 4「跨平台复现（在另一台机器上）」在 Task 8 交付时**只做了静态部分**
+> （`test/portability.test.js` 断言代码里可静态判定的可移植性事实），
+> 并在台账 G-8 里如实登记「**没有**把 `platform/` 拷到第二台机器做复现」。
+>
+> 本轮拿到了一台**真机**（用户先前提供过的阿里云中转机），于是把 Step 4 **真的跑了一遍**。
+> 计划里写的「跨平台复现」从此不再是待办。
+
+### A. 真机环境（实跑采集，不是推测）
+
+| 项 | 实测值 | 对本项目的影响 |
+|---|---|---|
+| OS | **Debian 12 (bookworm)** | ✅ 发行版与计划的 Linux 目标一致 |
+| 文件系统 | `/dev/vda3` **ext4** | ✅ 正是「APFS 之外」的另一端（readdir 顺序不同 ⇒ 跨平台排序保证被真验） |
+| Node | **v22.22.2** | ✅ 满足 `engines.node ≥ 22.16.0`（`node:sqlite` + `sqlite.backup()` 都在） |
+| CPU / 内存 | **2 核 / 1.6 GiB**（+2.0 GiB swap，可用约 1.1 GiB） | 单进程 Node + SQLite 够用；**不能**再往上堆服务 |
+| 磁盘 | 40G，用 11G，**可用 28G** | ✅ 部署 + 备份留存空间充足 |
+| systemd | **252** | ✅ 守护单元可用 |
+| nginx | **1.22.1** | ⚠️ **< 1.25.1** ⇒ `http2 on;` 不认识 ⇒ 走自动降级（见 D 节） |
+| nginx 配置健康 | `nginx -t` → syntax is ok | ✅ 既有业务未被本轮影响 |
+
+### B. 三条命令的实跑结果（计划 Step 4 的原配方）
+
+| 命令 | 结果 |
+|---|---|
+| `node scripts/migrate.js` | ✅ `迁移完成，当前版本 6`（001–006 六个迁移全过） |
+| `node --test` | ✅ **1279 例 / 1277 通过 / 0 失败 / 2 跳过**（含本轮新增的 2 条用例） |
+| `node scripts/build-demo.js` | ✅ 产物 60 个文件、**伴生文件 0 个**、领域层浏览器安全检查通过 |
+
+> ⏱️ 全量测试在 2 核机器上约 **167 秒**（macOS 上约 11 秒）—— 机器差异记在案。
+>
+> 📌 **那 2 条跳过，各有各的据**（不是「跑不起来就跳过」）：
+> ① 「Task 5 未落地时申诉接口必须 503」—— **条件式跳过**（Task 5 已落地，该分支不适用；macOS 上也是同一条跳过）。
+> ② 「静态文件读不了时返回错误且服务器存活」—— **平台条件跳过**：`chmod 000` 的文件**以 root 读照样读得到**，
+> 这条用例的前提在 root 下不成立 ⇒ 跳过。**以 root 跑测试套件时这条测不了**，这一点如实记在案。
+> ⇒ 两端的跳过集合**不同**是正常的（平台条件不同），**失败数都是 0**。
+
+### C. 复现过程中抓到的两个问题
+
+#### C-1. macOS 的 AppleDouble 伴生文件 `._xxx` —— **会让部署直接失败**
+
+**现象**（第一次拷贝后跑第一条命令）：
+```
+Error: 迁移文件名必须形如 <版本号>_<名称>.sql: ._001_init.sql
+```
+
+**根因**：从 macOS 往**非 HFS 文件系统**（exFAT/FAT U 盘、或 `tar` 打进 Linux 的流）拷时，
+macOS 的 `bsdtar` 会给**每个文件**配一个 `._xxx` 资源叉载体（内容是二进制）。
+它**不是迁移**，是操作系统产生的伴生文件。
+
+**处置**（两处代码加固 + 一处配方修正）：
+1. `platform/src/db/migrate.js`：**跳过** `._*` —— 它不是迁移。
+   ⚠️ **这不放松 P0 那条「文件名必须形如 `<版本号>_<名称>.sql`」的守卫**：
+   `init.sql` / `1e3_x.sql` / `01_.sql` / `001.sql` 这些**人手写错**的名字仍然照旧**响亮报错**
+   （P0 修复轮加这条守卫就是为了不让版本序号静默开缺口）。
+2. `platform/scripts/build-demo.js`：**丢弃** `._*` —— 不把二进制垃圾拷进静态站产物
+   （`copyDir` 与 `collectBrowserModules` 各一处）。
+3. **配方修正**：计划 Step 4 已补上「安全拷贝方式」（`scp` 或
+   `COPYFILE_DISABLE=1 tar --no-xattrs --exclude='._*'`），并在 `docs/deployment.md` 同步。
+
+**判别性实证**：两个变异体（回退 `migrate.js` 的过滤 / 回退 `build-demo.js` 的过滤）
+**都被新加的用例杀掉** —— 新用例不是恒绿摆设。
+
+#### C-2. 拷贝漏了**仓库根的 `.gitignore`** —— 计划里**已经写了**，是我没照做
+
+第一次只拷 `platform/`，真机上 1 条用例红：
+```
+not ok 313 - package.json 必须登记 P6 的脚本，.gitignore 必须忽略产物目录
+  ENOENT: no such file or directory, open '/tmp/hks-repro/.gitignore'
+```
+⇒ 这正是 Task 8 台账 **D8-5 / G-2** 登记过的那条（`demo-static.test.js` 读仓库根 `.gitignore`），
+计划 Step 4 里**本来就写了这句提醒**。⇒ **不是产品缺陷，是我没照配方做**；带齐后 **0 失败**。
+
+### D. 部署资产在真 nginx / 真 systemd 上的验证（**这一块此前完全没验过**）
+
+| 验证项 | 结果 |
+|---|---|
+| `nginx-http2-compat.sh` 在**真机 nginx 1.22.1** 上判定 | ✅ `[nginx-compat] nginx 1.22.1 < 1.25.1：已降级为 listen ... ssl http2;`；独立 `http2 on;` 行**已消失** |
+| 降级后的站点配置 + 临时自签证书 → `nginx -t -c <临时主配置>` | ✅ `syntax is ok` / `test is successful`（退出码 0） |
+| 系统的既有配置 `nginx -t`（未改动） | ✅ 仍然 `syntax is ok` —— 本轮**没有**污染这台机的 nginx |
+| `heikesong.service` 替换占位符后 → `systemd-analyze verify` | ✅ 退出码 0，**零告警**（systemd 252） |
+
+> ⚠️ 以上全部在 `/tmp` 下**只读/临时**完成，**没有**写 `/etc/nginx/**`、**没有**写
+> `/etc/systemd/system/**`、**没有 reload nginx**、**没有**重启任何既有服务。
+> 这台机上有**在跑的业务**（见 E 节），不能拿它做破坏性试验。
+
+### E. 这台机的既有业务占用（**部署方案必须避让**）
+
+复现时顺带采集的监听端口（`ss -lntp`）：
+
+| 端口 | 占用者 | 对我们的影响 |
+|---|---|---|
+| **80** | nginx `default` 站点 = **headscale 控制台**（`default_server` + `server_name _`，家宽 IP 直连的纯 HTTP 面） | ⛔ **不能抢**。我们的站点必须用**独立 server_name**（域名）⇒ 域名是硬前提 |
+| **443** | **xray** | ⛔ **不能监听**。我们的站点要 TLS 就得换端口，或走 frp 隧道在别处终结 TLS |
+| 127.0.0.1:18443 | nginx（headscale TLS 端点，xray Reality 的 dest） | ⛔ 不能动 |
+| 7000 | **frps**（`/root/frp/frps.toml` 只有 `bindPort = 7000`） | ⚠️ **无 token、无 TLS** ⇒ 任何能连到 7000 的人理论上都能接入隧道 ⇒ **鉴权是缺口** |
+| 8888 | HydroOJ v5.0.1 | ⛔ 不能动 |
+| 27017 / 18080 / 19090 / 8443 | mongod / headscale / python3 | ⛔ 不能动 |
+| **8080** | **空闲** | ✅ 这正是 `deploy/nginx.conf` 里 upstream 写的端口 ⇒ **可用** |
+
+⇒ **结论**：这台机**不适合直接做「域名 + 443 TLS」的正式部署**（443 被 xray 占着，80 是 headscale 的
+`default_server`）。可行路线有两条，选哪条要用户拍板：
+① **另起一台干净主机**做正式部署（最省事，部署资产原样可用）；
+② 复用这台机，但**换端口**（如 8081 走 HTTP，或在 frp 侧终结 TLS），并给 frps 补 token/TLS。
+
+### F. 仍然未覆盖（不假装做过）
+
+1. **Windows 没跑过** —— 本轮只补了 Linux（Debian 12 / ext4 / Node 22.22.2）这一端。
+2. **`install.sh` 完整执行仍未在真机跑过** —— 因为这台机有既有业务（80/443 都被占），
+   跑它必须改 `SERVER_NAME`/端口并接管 nginx 站点，属于**会动生产配置**的动作，
+   没有用户明确确认前不做。本轮验证的是它的**各个可独立验证的部分**：
+   http2 降级（D 节）、站点配置语法（D 节）、systemd 单元语法（D 节）、TTL 校验与幂等（沙箱，已有）。
+   ⇒ 手册 §13 **U-3 仍然成立**（真机完整执行未做），但**不再是「完全没验过」**。
+3. **公网演示 URL** 仍未发布（需用户明确确认 + 云账号）。
+
 

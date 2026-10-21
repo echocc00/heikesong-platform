@@ -896,6 +896,30 @@ test('退化迁移文件名会被拒绝（不静默开版本缺口）', () => {
   rmSync(dirC, { recursive: true, force: true });
 });
 
+test('macOS 的 AppleDouble 伴生文件（._xxx）被忽略 —— 它不是迁移', () => {
+  // 真机实测（2026-10-21，8.133.200.235 / Debian 12 / ext4）：
+  //   按 P6 计划 Step 4 的「跨平台复现」配方把 platform/ 从 macOS 拷到 Linux 时，
+  //   `tar` 会给每个文件配一个 `._xxx` 资源叉载体 ⇒ 迁移直接失败。
+  //   ⚠️ 这条**不是**放宽「退化迁移文件名会被拒绝」那条守卫：
+  //   `init.sql` / `1e3_x.sql` / `01_.sql` 仍然照旧抛错（见上一条用例）。
+  const dir = tempDir();
+  writeFileSync(join(dir, '001_init.sql'), 'CREATE TABLE a (x INTEGER);');
+  // 伴生文件的内容是 AppleDouble 二进制，不是 SQL —— 真读进去必然炸
+  writeFileSync(join(dir, '._001_init.sql'), Buffer.from([0x00, 0x05, 0x16, 0x07, 0xff, 0xfe]));
+  writeFileSync(join(dir, '._999_ghost.sql'), Buffer.from([0x00, 0x05, 0x16, 0x07]));
+
+  const files = readMigrationFiles(dir);
+  assert.equal(files.length, 1, `伴生文件必须被忽略，实际读到 ${files.length} 个：${files.map((f) => f.name).join('、')}`);
+  assert.equal(files[0].name, '001_init.sql');
+  assert.equal(files[0].version, 1);
+
+  // ⛔ 反向：伴生文件**不得**让真正的迁移被吞掉（也不能凭空造出版本号）
+  assert.ok(!files.some((f) => f.name.startsWith('._')), '伴生文件不得出现在迁移列表里');
+  assert.ok(!files.some((f) => f.version === 999), '伴生文件的版本号不得被当成真实迁移');
+
+  rmSync(dir, { recursive: true, force: true });
+});
+
 test('同版本号冲突时错误信息里的文件名顺序是确定的（跨平台稳定）', () => {
   // readdirSync 的返回顺序在 POSIX 里未定义：APFS 按名序、ext4/xfs 按 hash 序。
   // 错误信息里的两个文件名由实现**显式**按字节序排好 —— 跨平台保证由构造成立，
@@ -930,13 +954,25 @@ test('版本号必须从 001 起，且描述符不能为空', () => {
 // ⚠️ 下面两条断言的是「当前迁移集」的快照：P1 加入 002_registration.sql 之后，
 //    「恰好 9 张表 / schema_migrations 恰好 1 行 / version 仍为 1」需要放宽为
 //    「包含 001_init.sql 的那几项」。到 P1 时按此提示修改。
+//
+// ✅ P1 已按此提示放宽（不再对「张数 / 行数 / 版本号」取快照）：
+//    取快照的断言每加一个迁移就必红一次，而它真正要抓的缺陷
+//    （漏建表 / 迁移没被应用 / 迁移历史对不上账）由下面这三条照样抓住：
+//      ① 每个迁移文件都被应用（applied 逐字等于目录里的文件清单）；
+//      ② 期望的表逐个点名，漏建任一张表即红；
+//      ③ schema_migrations 的版本号与文件名逐行对账。
+//    期望值**从迁移目录本身推导**，因此 P2 加 003 时本用例不需要再改。
 test('真实迁移目录：建出全部表并记录版本', () => {
   const dataDir = tempDir();
   const { db } = openDatabase({ dataDir });
 
+  // 期望的迁移文件名与版本号：从真实迁移目录推导（readMigrationFiles 已按版本升序排）
+  const expectedFiles = readMigrationFiles(REAL_MIGRATIONS).map((f) => f.name);
+  const expectedVersions = readMigrationFiles(REAL_MIGRATIONS).map((f) => f.version);
+
   const first = applyMigrations(db, REAL_MIGRATIONS);
-  assert.deepEqual(first.applied, ['001_init.sql']);
-  assert.equal(first.version, 1);
+  assert.deepEqual(first.applied, expectedFiles, '迁移目录里的每个文件都应被应用');
+  assert.equal(first.version, Math.max(...expectedVersions), '版本号应为已应用迁移的最大版本');
 
   const tables = db
     .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
@@ -952,20 +988,35 @@ test('真实迁移目录：建出全部表并记录版本', () => {
     'user_roles',
     'audit_log',
     'schema_migrations',
+    // P1（002_registration.sql）的 7 张表
+    'editions',
+    'cities',
+    'task_packages',
+    'registrations',
+    'registration_events',
+    'teams',
+    'team_members',
   ]) {
     assert.ok(tables.includes(t), `真实迁移应建出表 ${t}`);
   }
-  assert.equal(tables.length, 9, '真实迁移应恰好建出 9 张表');
 
-  const rows = db.prepare('SELECT version, name FROM schema_migrations').all();
-  assert.equal(rows.length, 1, 'schema_migrations 应恰好 1 行');
-  assert.equal(rows[0].version, 1);
-  assert.equal(rows[0].name, '001_init.sql');
+  const rows = db.prepare('SELECT version, name FROM schema_migrations ORDER BY version').all();
+  assert.equal(rows.length, expectedFiles.length, 'schema_migrations 行数应等于迁移文件数');
+  assert.deepEqual(
+    rows.map((r) => r.version),
+    expectedVersions,
+    'schema_migrations 的版本号应与迁移文件一致',
+  );
+  assert.deepEqual(
+    rows.map((r) => r.name),
+    expectedFiles,
+    'schema_migrations 的文件名应与迁移文件一致',
+  );
 
   // 幂等：再跑一次不应再应用
   const second = applyMigrations(db, REAL_MIGRATIONS);
   assert.deepEqual(second.applied, [], '真实迁移重复执行不应再应用');
-  assert.equal(second.version, 1);
+  assert.equal(second.version, first.version, '重复执行后版本号不应变化');
 
   db.close();
   rmSync(dataDir, { recursive: true, force: true });
@@ -1161,6 +1212,19 @@ function versionLabel(name) {
 export function readMigrationFiles(dir) {
   const files = readdirSync(dir)
     .filter((f) => f.endsWith('.sql'))
+    // ⛔ 跳过 macOS 的 **AppleDouble 伴生文件**（`._<原文件名>`）：
+    //    从 macOS 往**非 HFS 文件系统**（exFAT/FAT U 盘、或 `tar` 打进 Linux 的流）
+    //    拷时，每个文件旁边会多出一个 `._xxx` 资源叉载体 —— 它**不是迁移**，
+    //    内容是原文件的资源叉（AppleDouble 格式的二进制），不是 SQL。
+    //    真机实测：2026-10-21 在 8.133.200.235（Debian 12 / ext4 / Node 22.22.2）
+    //    按 P6 计划 Step 4 的「跨平台复现」配方实跑时，这东西让 `node scripts/migrate.js`
+    //    **直接失败**（`迁移文件名必须形如 <版本号>_<名称>.sql: ._001_init.sql`）。
+    //
+    //    ⚠️ 这**不是**放宽下面那条「迁移文件名必须形如 <版本号>_<名称>.sql」的守卫：
+    //    `init.sql` / `1e3_x.sql` / `01_.sql` 这些**人手写错**的名字仍然照旧抛错
+    //    （见 test/migrate.test.js 的「退化迁移文件名会被拒绝」用例）。
+    //    这里只排除**操作系统产生的伴生文件**这一个类别。
+    .filter((f) => !f.startsWith('._'))
     .map((name) => {
       // 严格解析：文件名必须形如 <版本号>_<名称>.sql。
       // ⛔ 不能用 Number(name.split('_')[0])：那样 '_init.sql'（Number('')===0）、
@@ -1251,8 +1315,20 @@ export function applyMigrations(db, migrationsDir) {
     }
   }
 
+  return { applied, version: currentVersion(db) ?? 0 };
+}
+
+// src/db/migrate.js —— 【追加】到 P0 已建的文件里
+//
+// 读当前已应用的 schema 版本（迁移表里的 MAX(version)）。
+// 依据：运维脚本（backup / restore）需要知道「这个备份对应哪个 schema 版本」，
+//   但**不能自己写 SQL** —— 全局约束「所有 SQL 收在 src/db/repo/」，
+//   而 src/db/migrate.js 是该守卫**唯一豁免的文件**（见 platform/test/sql-boundary.test.js
+//   的豁免清单与「迁移执行器确实执行 SQL」那条断言）。
+// @returns {number|null} 一次迁移都没应用过时返回 null
+export function currentVersion(db) {
   const row = db.prepare('SELECT MAX(version) AS v FROM schema_migrations').get();
-  return { applied, version: row?.v ?? 0 };
+  return row?.v ?? null;
 }
 ```
 
@@ -8618,4 +8694,49 @@ git commit -m "feat(P0): 静态服务、前端骨架、种子数据与服务器�
 > ⚠️ **口径**：C-EXT 的「良性」指**结构上**是追加，不等于内容永远不变。
 > 漂移审计可随时复算：`node docs/tools/plan-block-audit.mjs platform`。
 > 若某个文件后续被**重写**（而非追加），它会自动从 C-EXT 升到 C-RW，届时必须再做一次同步。
+## P0 迁移读取器加固（父代理，2026-10-21 · 真机跨平台复现带出的改动）
+
+> **背景**：P6 Task 8 的「跨平台复现」在 **Linux 真机**（8.133.200.235 / Debian 12 / ext4 / Node 22.22.2）
+> 实跑时，**第一条命令** `node scripts/migrate.js` 就失败了：
+>
+> ```
+> Error: 迁移文件名必须形如 <版本号>_<名称>.sql: ._001_init.sql
+> ```
+>
+> **根因**：`._001_init.sql` 是 **macOS 的 AppleDouble 伴生文件**（资源叉载体，内容是二进制）——
+> 从 macOS 往**非 HFS 文件系统**（exFAT/FAT U 盘、或 `tar` 打进 Linux 的流）拷时，
+> 每个文件旁边会多出这样一个 `._xxx`。
+> 它**不是迁移**，是操作系统产生的伴生文件。
+>
+> **处置**：本文件（`src/db/migrate.js`，P0 owns）**只排除这一个类别** ——
+> `.filter((f) => !f.startsWith('._'))`。
+>
+> ⚠️ **这不放松 P0 那条守卫**：文件名严格校验是 P0 修复轮**故意**加的
+> （`_init.sql` / `1e3_x.sql` / `01_.sql` / `001.sql` 这些**人手写错**的名字必须**响亮报错**，
+> 否则会在「全局唯一序位」上静默开一个版本缺口）。
+> 那些名字**仍然照旧抛错** —— 见 `test/migrate.test.js` 的
+> 「退化迁移文件名会被拒绝（不静默开版本缺口）」用例（**本轮未动**）。
+>
+> **配套**：P6 计划记了同一轮的完整复现记录与「安全拷贝配方」。
+
+### 变更清单
+
+| 文件 | 变更 |
+|---|---|
+| `platform/src/db/migrate.js` | `readMigrationFiles()` 增加 `.filter((f) => !f.startsWith('._'))`（含注释说明来源与「为什么不是放松守卫」） |
+| `platform/test/migrate.test.js` | 新增用例「macOS 的 AppleDouble 伴生文件（._xxx）被忽略 —— 它不是迁移」：造 `._001_init.sql` + `._999_ghost.sql` ⇒ 只读到 1 个真迁移、版本号是 1、伴生文件既不出现也不贡献版本号 |
+
+### 判别性实证
+
+| 变异体 | 结果 |
+|---|---|
+| 回退 `.filter((f) => !f.startsWith('._'))` | **杀** —— 新用例红（伴生文件被当成迁移、报「迁移文件名必须形如…」） |
+
+### 计划块逐字核验
+
+| 核验项 | 结果 |
+|---|---|
+| `docs/tools/plan-block-sync.mjs --verify`（`src/db/migrate.js`） | ✅ 逐字一致（145 行） |
+| `docs/tools/plan-block-sync.mjs --verify`（`test/migrate.test.js`） | ✅ 逐字一致（290 行） |
+
 

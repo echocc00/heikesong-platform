@@ -43,6 +43,10 @@ function copyDir(from, to, { exclude = [], excludePaths = new Set() } = {}) {
   mkdirSync(to, { recursive: true });
   for (const entry of readdirSync(from, { withFileTypes: true })) {
     if (exclude.includes(entry.name)) continue;
+    // ⛔ 不把 macOS 的 AppleDouble 伴生文件（`._xxx`）拷进产物：
+    //    它是资源叉载体（二进制），不是真内容；混进静态站等于把垃圾发给访客。
+    //    真机实测：2026-10-21 在 8.133.200.235 上按「跨平台复现」配方拷贝时带到过。
+    if (entry.name.startsWith('._')) continue;
     const src = join(from, entry.name);
     if (excludePaths.has(resolve(src))) continue;   // 产物目录自身（无论叫什么名字）
     const dst = join(to, entry.name);
@@ -130,7 +134,8 @@ export function collectBrowserModules(domainDir) {
   const extraFiles = [];
   const seen = new Set();
   const queue = readdirSync(domainDir)
-    .filter((n) => n.endsWith('.js'))
+    // ⛔ 跳过 macOS 的 AppleDouble 伴生文件（`._xxx`，资源叉载体，不是真模块）
+    .filter((n) => n.endsWith('.js') && !n.startsWith('._'))
     .map((n) => join(domainDir, n));
 
   while (queue.length) {

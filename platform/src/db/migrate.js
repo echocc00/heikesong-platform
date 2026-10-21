@@ -25,6 +25,19 @@ function versionLabel(name) {
 export function readMigrationFiles(dir) {
   const files = readdirSync(dir)
     .filter((f) => f.endsWith('.sql'))
+    // ⛔ 跳过 macOS 的 **AppleDouble 伴生文件**（`._<原文件名>`）：
+    //    从 macOS 往**非 HFS 文件系统**（exFAT/FAT U 盘、或 `tar` 打进 Linux 的流）
+    //    拷时，每个文件旁边会多出一个 `._xxx` 资源叉载体 —— 它**不是迁移**，
+    //    内容是原文件的资源叉（AppleDouble 格式的二进制），不是 SQL。
+    //    真机实测：2026-10-21 在 8.133.200.235（Debian 12 / ext4 / Node 22.22.2）
+    //    按 P6 计划 Step 4 的「跨平台复现」配方实跑时，这东西让 `node scripts/migrate.js`
+    //    **直接失败**（`迁移文件名必须形如 <版本号>_<名称>.sql: ._001_init.sql`）。
+    //
+    //    ⚠️ 这**不是**放宽下面那条「迁移文件名必须形如 <版本号>_<名称>.sql」的守卫：
+    //    `init.sql` / `1e3_x.sql` / `01_.sql` 这些**人手写错**的名字仍然照旧抛错
+    //    （见 test/migrate.test.js 的「退化迁移文件名会被拒绝」用例）。
+    //    这里只排除**操作系统产生的伴生文件**这一个类别。
+    .filter((f) => !f.startsWith('._'))
     .map((name) => {
       // 严格解析：文件名必须形如 <版本号>_<名称>.sql。
       // ⛔ 不能用 Number(name.split('_')[0])：那样 '_init.sql'（Number('')===0）、

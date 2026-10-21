@@ -128,6 +128,30 @@ test('退化迁移文件名会被拒绝（不静默开版本缺口）', () => {
   rmSync(dirC, { recursive: true, force: true });
 });
 
+test('macOS 的 AppleDouble 伴生文件（._xxx）被忽略 —— 它不是迁移', () => {
+  // 真机实测（2026-10-21，8.133.200.235 / Debian 12 / ext4）：
+  //   按 P6 计划 Step 4 的「跨平台复现」配方把 platform/ 从 macOS 拷到 Linux 时，
+  //   `tar` 会给每个文件配一个 `._xxx` 资源叉载体 ⇒ 迁移直接失败。
+  //   ⚠️ 这条**不是**放宽「退化迁移文件名会被拒绝」那条守卫：
+  //   `init.sql` / `1e3_x.sql` / `01_.sql` 仍然照旧抛错（见上一条用例）。
+  const dir = tempDir();
+  writeFileSync(join(dir, '001_init.sql'), 'CREATE TABLE a (x INTEGER);');
+  // 伴生文件的内容是 AppleDouble 二进制，不是 SQL —— 真读进去必然炸
+  writeFileSync(join(dir, '._001_init.sql'), Buffer.from([0x00, 0x05, 0x16, 0x07, 0xff, 0xfe]));
+  writeFileSync(join(dir, '._999_ghost.sql'), Buffer.from([0x00, 0x05, 0x16, 0x07]));
+
+  const files = readMigrationFiles(dir);
+  assert.equal(files.length, 1, `伴生文件必须被忽略，实际读到 ${files.length} 个：${files.map((f) => f.name).join('、')}`);
+  assert.equal(files[0].name, '001_init.sql');
+  assert.equal(files[0].version, 1);
+
+  // ⛔ 反向：伴生文件**不得**让真正的迁移被吞掉（也不能凭空造出版本号）
+  assert.ok(!files.some((f) => f.name.startsWith('._')), '伴生文件不得出现在迁移列表里');
+  assert.ok(!files.some((f) => f.version === 999), '伴生文件的版本号不得被当成真实迁移');
+
+  rmSync(dir, { recursive: true, force: true });
+});
+
 test('同版本号冲突时错误信息里的文件名顺序是确定的（跨平台稳定）', () => {
   // readdirSync 的返回顺序在 POSIX 里未定义：APFS 按名序、ext4/xfs 按 hash 序。
   // 错误信息里的两个文件名由实现**显式**按字节序排好 —— 跨平台保证由构造成立，
