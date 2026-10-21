@@ -30,10 +30,15 @@
 #   NGINX_SITE    nginx 站点文件       默认 /etc/nginx/sites-available/heikesong.conf
 #   NGINX_LINK    nginx 站点软链       默认 /etc/nginx/sites-enabled/heikesong.conf
 #   SYSTEMD_UNIT_DIR systemd 单元目录  默认 /etc/systemd/system
+#   SESSION_TTL_DAYS 会话滑动有效期（天）默认 7（与 src/auth/session.js 的默认值一致）
+#   SESSION_ABSOLUTE_TTL_DAYS 会话绝对过期上限（天）默认 30（同上）
 #
 # ⚠️ 端口口径：8080 是**写死**的口径（与 deploy/nginx.conf 的 upstream、
 #    systemd 单元的 Environment=PORT、docker-compose 的 PORT 同一套）。
 #    要换端口必须四处一起改 —— 本脚本不提供 PORT 变量，避免只改一处连不上。
+#
+# ⚠️ 绝对过期上限**可以**小于滑动有效期（那是「更严」的合法配置：到期必须重登）。
+#    本脚本不禁止这种组合 —— 只校验两者都是正整数。
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -47,6 +52,11 @@ ENV_FILE="${ENV_FILE:-/etc/heikesong/platform.env}"
 NGINX_SITE="${NGINX_SITE:-/etc/nginx/sites-available/heikesong.conf}"
 NGINX_LINK="${NGINX_LINK:-/etc/nginx/sites-enabled/heikesong.conf}"
 SYSTEMD_UNIT_DIR="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
+SESSION_TTL_DAYS="${SESSION_TTL_DAYS:-7}"
+SESSION_ABSOLUTE_TTL_DAYS="${SESSION_ABSOLUTE_TTL_DAYS:-30}"
+# nginx HTTP/2 兼容脚本：`http2 on;` 要 nginx ≥ 1.25.1，Ubuntu 22.04(1.18) /
+# 24.04(1.24) 都没有 ⇒ 旧版本自动降级成 `listen ... ssl http2;`（所有版本都合法）。
+NGINX_COMPAT_SCRIPT="$SCRIPT_DIR/nginx-http2-compat.sh"
 # ⛔ Node 下限 = 22.16.0（package.json engines）。22.16.0 是 node:sqlite.backup()
 #    的引入版本 —— 备份脚本（P6 Task 1）依赖它，低版本装了也跑不了备份。
 MIN_NODE_MAJOR=22
@@ -77,6 +87,37 @@ node_version_ok() {
 # 否则路径里的特殊字符会被 sed 当成自己的语法（& = 整个匹配）。
 sed_escape() {
   printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'
+}
+
+# ⛔ nginx 必须**在做任何改动之前**就检查完。
+#    为什么：nginx 步骤在流程末尾（要等程序装好、库建好、服务起好才轮到它）。
+#    如果 nginx 没装，等发现时机器上已经是一个「装了一半」的部署 —— 服务在跑、
+#    但没有反代，域名单独访问是 502；脚本还在最后一步以
+#    "nginx: command not found" 这种看不懂的错退出。
+#    ⇒ 缺 nginx 必须在**动任何东西之前**就明确拒绝。
+require_nginx() {
+  if [ -z "$SERVER_NAME" ]; then
+    return 0    # 未设 SERVER_NAME ⇒ 本次不配 nginx，跳过
+  fi
+  if ! command -v nginx >/dev/null 2>&1; then
+    die "未检测到 nginx，但设置了 SERVER_NAME=${SERVER_NAME}。请先安装 nginx（Debian/Ubuntu: apt-get install -y nginx；RHEL/CentOS: dnf install -y nginx；Alpine: apk add --no-cache nginx），或去掉 SERVER_NAME 变量以跳过 nginx 配置。"
+  fi
+  log "已检测到 nginx：$(nginx -v 2>&1 | head -n 1)"
+}
+
+# 会话有效期相关的两个天数必须是**正整数**。
+# 为什么要在这里 fail-fast：src/auth/session.js 对非法值是**静默回退到默认值**
+# （"SESSION_TTL_DAYS=abc" ⇒ 悄悄用 7 天）—— 环境文件里写错却没有任何提示，
+# 运维会以为改了其实没改。配置非法就报错，不静默兜底。
+validate_session_ttls() {
+  case "$SESSION_TTL_DAYS" in
+    ''|*[!0-9]*) die "SESSION_TTL_DAYS 必须是正整数（当前：'$SESSION_TTL_DAYS'）" ;;
+  esac
+  case "$SESSION_ABSOLUTE_TTL_DAYS" in
+    ''|*[!0-9]*) die "SESSION_ABSOLUTE_TTL_DAYS 必须是正整数（当前：'$SESSION_ABSOLUTE_TTL_DAYS'）" ;;
+  esac
+  [ "$SESSION_TTL_DAYS" -gt 0 ] || die "SESSION_TTL_DAYS 必须 > 0（当前：${SESSION_TTL_DAYS}）"
+  [ "$SESSION_ABSOLUTE_TTL_DAYS" -gt 0 ] || die "SESSION_ABSOLUTE_TTL_DAYS 必须 > 0（当前：${SESSION_ABSOLUTE_TTL_DAYS}）"
 }
 
 install_node() {
@@ -132,8 +173,14 @@ prepare_dirs() {
 copy_app() {
   log "同步程序到 $APP_DIR"
   if command -v rsync >/dev/null 2>&1; then
+    # ⚠️ 排除 web/dist/：那是**演示版静态站的构建产物**（P6 Task 6 的
+    #    `scripts/build-demo.js` 产出），走**独立发布通道**，不随程序同步到服务器。
+    #    ⚠️ 排除 web/assets/：那是 nginx `location /assets/` 指向的**预留**目录
+    #    （带哈希的生产静态资源位），本仓库**没有任何构建步骤**产出它。
+    #    两者与「前端产物目录」的口径以 P6 计划 Task 6 为准。
     rsync -a --delete \
-      --exclude 'data/' --exclude 'node_modules/' --exclude '.git/' --exclude 'web/dist/' \
+      --exclude 'data/' --exclude 'node_modules/' --exclude '.git/' \
+      --exclude 'web/dist/' --exclude 'web/assets/' \
       "$ROOT/" "$APP_DIR/"
   else
     # 没有 rsync 时的兜底：先删后拷（不删 data/）
@@ -154,7 +201,11 @@ write_env_file() {
   {
     printf 'PORT=8080\n'
     printf 'DATA_DIR=%s\n' "$DATA_DIR"
-    printf 'SESSION_TTL_DAYS=7\n'
+    printf 'SESSION_TTL_DAYS=%s\n' "$SESSION_TTL_DAYS"
+    # ⚠️ 绝对过期上限：src/auth/session.js 读 SESSION_ABSOLUTE_TTL_DAYS（默认 30 天）。
+    #    不写这个变量时应用会**静默**用 30 天默认值 —— 环境文件与实际生效值就对不上了，
+    #    排障时无从查证。显式写出来，让「文件里写的」＝「生效的」。
+    printf 'SESSION_ABSOLUTE_TTL_DAYS=%s\n' "$SESSION_ABSOLUTE_TTL_DAYS"
     # ⚠️ NODE_ENV=production 会让登录 Cookie 带 Secure 标记
     #    （src/server.js: secureCookies = NODE_ENV === 'production'）——
     #    「IP + 端口 + 纯 HTTP」的调试形态下浏览器会直接拒收 Cookie → 登录失效。
@@ -214,17 +265,54 @@ write_nginx_site() {
     log "跳过 nginx：未设置 SERVER_NAME（正式对外域名）"
     return 0
   fi
+  [ -f "$NGINX_COMPAT_SCRIPT" ] || die "缺少 ${NGINX_COMPAT_SCRIPT}（HTTP/2 兼容脚本）"
   log "写 nginx 站点配置 $NGINX_SITE"
   install -d -m 0755 "$(dirname "$NGINX_SITE")" "$(dirname "$NGINX_LINK")"
   local cert="${CERT_PATH:-/etc/letsencrypt/live/$SERVER_NAME/fullchain.pem}"
   local key="${KEY_PATH:-/etc/letsencrypt/live/$SERVER_NAME/privkey.pem}"
+
+  # ① 先做 HTTP/2 语法兼容：`http2 on;` 只有 nginx ≥ 1.25.1 认识，
+  #    Ubuntu 22.04(1.18) / 24.04(1.24) 都没有 ⇒ 旧版本自动降级成
+  #    `listen ... ssl http2;`（这个写法在所有版本上都合法）。
+  #    不做这一步的话，nginx -t 会报 unknown directive "http2"，
+  #    而那已经是整个部署的最后一步了。
+  local rendered
+  rendered="$(mktemp)"
+  if ! bash "$NGINX_COMPAT_SCRIPT" "$ROOT/deploy/nginx.conf" "$rendered"; then
+    rm -f "$rendered"
+    die "nginx HTTP/2 兼容处理失败（见上面的 [nginx-compat] 输出）"
+  fi
+
+  # ② 备份旧站点文件：nginx -t 失败时要**回滚**，不能把一份坏配置留在
+  #    sites-enabled 里 —— 那会毒化这台机器上**下一次**任何 nginx reload
+  #    （哪怕是别人触发的、跟这次部署无关的 reload）。
+  local backup=""
+  if [ -f "$NGINX_SITE" ]; then
+    backup="$(mktemp "${TMPDIR:-/tmp}/heikesong-nginx-site.XXXXXX")"
+    cp -p "$NGINX_SITE" "$backup"
+  fi
+
   sed -e "s|__SERVER_NAME__|$(sed_escape "$SERVER_NAME")|g" \
       -e "s|__CERT_PATH__|$(sed_escape "$cert")|g" \
       -e "s|__KEY_PATH__|$(sed_escape "$key")|g" \
       -e "s|__APP_DIR__|$(sed_escape "$APP_DIR")|g" \
-      "$ROOT/deploy/nginx.conf" > "$NGINX_SITE"
+      "$rendered" > "$NGINX_SITE"
+  rm -f "$rendered"
   ln -sfn "$NGINX_SITE" "$NGINX_LINK"
-  nginx -t                 # ⛔ 先验配置再 reload：配置错了不炸线上
+
+  # ⛔ 先验配置再 reload：配置错了不炸线上。
+  if ! nginx -t; then
+    if [ -n "$backup" ] && [ -f "$backup" ]; then
+      mv -f "$backup" "$NGINX_SITE"
+      log "已回滚到上一版 nginx 站点配置"
+    else
+      rm -f "$NGINX_SITE" "$NGINX_LINK"
+      log "已撤销本次 nginx 站点配置（此前没有旧配置）"
+    fi
+    die "nginx 配置校验失败（nginx -t 返回非 0）——已回滚，请按上面的 nginx -t 输出修正后重跑本脚本"
+  fi
+  if [ -n "$backup" ]; then rm -f "$backup"; fi
+
   if systemctl reload nginx 2>/dev/null; then
     log "nginx 已 reload"
   else
@@ -247,6 +335,11 @@ start_service() {
 
 main() {
   need_root
+  # ⛔ 先查前置条件，再动任何东西：
+  #    nginx 缺失 / 会话天数写错，都必须在「用户/目录/库/服务」被创建之前拒绝，
+  #    否则会留下一个装了一半的机器（服务在跑、但反代没配），排查成本极高。
+  require_nginx
+  validate_session_ttls
   if ! node_version_ok; then
     install_node
   fi

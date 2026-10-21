@@ -1,8 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { tmpdir } from 'node:os';
+import { execFileSync } from 'node:child_process';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const deployDir = join(here, '..', 'deploy');
@@ -259,4 +261,120 @@ test('跨资产口径一致：端口 / 数据目录变量 / 会话变量 / 入�
   // 入口与健康检查路径
   assert.match(unit, /src\/server\.js/, 'systemd 入口必须与应用真实入口一致');
   assert.match(yml, new RegExp(APP_HEALTH_PATH.replace(/\//g, '\\/')), 'compose 健康检查路径必须与应用真实健康检查路径一致');
+});
+
+// ── P6 部署资产修复轮（父代理）：F-1~F-4 的回归用例 ──────────────────────
+// 这四条缺口都不是「样式问题」，每一条都能让一次真实的云主机部署**装到一半**：
+//   F-1 前端产物目录三处口径不一致（计划 web/dist/ vs nginx web/assets/ vs install.sh 排除项）
+//   F-2 nginx 是最后一步且不检查装没装 ⇒ 前面全都装完了才炸，还留一份坏配置在 sites-enabled
+//   F-3 systemd/环境文件漏 SESSION_ABSOLUTE_TTL_DAYS ⇒ 实际生效值与配置对不上
+//   F-4 nginx ≥ 1.25.1 才有 `http2 on;`，而 Ubuntu 22.04=1.18 / 24.04=1.24 都没有
+//
+// ⚠️ 本组用例的断言必须**判别**：把修复改回去（挪顺序 / 删回滚 / 改回降级）必须变红。
+
+test('install.sh：⛔ nginx 必须【在动任何东西之前】检查（否则装到一半才炸）', () => {
+  const sh = read('install.sh');
+  assert.match(sh, /command -v nginx/, '必须探测 nginx 是否安装');
+  assert.match(sh, /require_nginx\(\)\s*\{/, '必须有独立的 nginx 前置检查函数');
+  // 顺序断言：main() 里 require_nginx 必须排在所有「会改变机器状态」的调用之前。
+  // ⚠️ 这条是判别性的：把 require_nginx 挪到 copy_app 之后 → 立刻变红。
+  const mainIdx = sh.indexOf('\nmain() {');
+  assert.ok(mainIdx > 0, '找不到 main()，测试本身失效');
+  const mainBody = sh.slice(mainIdx);
+  const requireIdx = mainBody.indexOf('require_nginx');
+  assert.ok(requireIdx > 0, 'main() 里必须调用 require_nginx');
+  for (const mutating of [
+    'create_service_user', 'prepare_dirs', 'copy_app', 'write_env_file',
+    'init_database', 'write_systemd_unit', 'start_service', 'write_nginx_site',
+  ]) {
+    const idx = mainBody.indexOf(mutating);
+    assert.ok(idx > 0, `找不到 ${mutating} 调用，测试本身失效`);
+    assert.ok(requireIdx < idx, `⛔ require_nginx 必须排在 ${mutating} 之前（先查前置条件，再动手）`);
+  }
+});
+
+test('install.sh：nginx -t 失败必须回滚（坏配置绝不能留在 sites-enabled）', () => {
+  const sh = read('install.sh');
+  // 裸 `nginx -t` + set -e ⇒ 失败即退出，**来不及回滚** ⇒ 必须放在 if 保护下
+  assert.match(sh, /if ! nginx -t; then/, 'nginx -t 必须在 if 保护下，失败分支才能做回滚');
+  assert.match(sh, /cp -p "\$NGINX_SITE" "\$backup"/, '写新配置前必须先备份旧配置（否则回滚无源可回）');
+  const guardIdx = sh.indexOf('if ! nginx -t; then');
+  assert.ok(guardIdx > 0, '找不到 nginx -t 保护块，测试本身失效');
+  const guardEnd = sh.indexOf('\n  fi', guardIdx);
+  assert.ok(guardEnd > guardIdx, '找不到 nginx -t 保护块的结尾，测试本身失效');
+  const block = sh.slice(guardIdx, guardEnd);
+  assert.match(block, /mv -f "\$backup" "\$NGINX_SITE"/, '失败时必须还原上一版站点配置');
+  assert.match(block, /rm -f "\$NGINX_SITE" "\$NGINX_LINK"/, '没有旧配置时必须撤销站点文件与软链');
+});
+
+test('会话有效期：环境文件必须写绝对过期变量，且默认值与真实代码一致', () => {
+  const sh = read('install.sh');
+  const unit = read('heikesong.service');
+  // 变量名从真实代码里取，不写死（代码改名时这条测试必须跟着变）
+  const absVar = (sessionSrc.match(/process\.env\.([A-Z_]*ABSOLUTE_TTL_DAYS)/) || [])[1];
+  assert.ok(absVar, '读不到 src/auth/session.js 的绝对过期变量名，测试本身失效');
+  assert.match(sh, new RegExp(`printf '${absVar}=%s`), `环境文件必须写 ${absVar}（不写就静默用代码默认值）`);
+  assert.match(unit, new RegExp(absVar), `systemd 单元的环境文件注释必须列出 ${absVar}`);
+  // 默认值必须与代码里的默认值一致
+  const codeDefault = (sessionSrc.match(/DEFAULT_ABSOLUTE_TTL_DAYS\s*=\s*(\d+)/) || [])[1];
+  assert.ok(codeDefault, '读不到代码里的默认绝对过期天数，测试本身失效');
+  assert.match(
+    sh,
+    new RegExp(`${absVar}="\\$\\{${absVar}:-${codeDefault}\\}"`),
+    `默认值必须与代码一致（${codeDefault} 天），否则「文件里写的」≠「生效的」`,
+  );
+  // 非法值必须 fail-fast（代码对非法值是**静默**回退到默认值 ⇒ 环境文件写错没人会发现）
+  assert.match(sh, /validate_session_ttls/, '必须有会话天数的合法性校验');
+  assert.match(sh, /validate_session_ttls\n/, 'main() 必须真的调用它');
+});
+
+test('nginx HTTP/2 兼容：旧版本自动降级、新版本保留（真跑脚本，不看注释）', () => {
+  const compatPath = join(deployDir, 'nginx-http2-compat.sh');
+  assert.ok(existsSync(compatPath), '必须存在 deploy/nginx-http2-compat.sh');
+  const tmp = mkdtempSync(join(tmpdir(), 'heikesong-nginx-'));
+  try {
+    const run = (version) => {
+      const out = join(tmp, `conf-${version}`);
+      execFileSync('bash', [compatPath, join(deployDir, 'nginx.conf'), out], {
+        env: { ...process.env, NGINX_VERSION: version },
+        encoding: 'utf8',
+      });
+      return readFileSync(out, 'utf8');
+    };
+    // 旧版（Ubuntu 24.04 = nginx 1.24.0）：必须降级
+    const old = run('1.24.0');
+    assert.match(old, /^\s*listen 443 ssl http2;$/m, '旧版 nginx 必须降级成 listen ... ssl http2;');
+    assert.match(old, /^\s*listen \[::\]:443 ssl http2;$/m, 'IPv6 那一支也必须降级');
+    assert.doesNotMatch(old, /^\s*http2 on;$/m, '⛔ 旧版 nginx 不认 `http2 on;`，残留就是必然 nginx -t 失败');
+    // 临界前一版：1.25.1 才引入该指令，1.25.0 一样不认
+    const justUnder = run('1.25.0');
+    assert.doesNotMatch(justUnder, /^\s*http2 on;$/m, '1.25.0 仍不认 `http2 on;`（该指令 1.25.1 引入）');
+    assert.match(justUnder, /^\s*listen 443 ssl http2;$/m, '1.25.0 必须降级');
+    // 新版：保留原写法
+    const neu = run('1.25.1');
+    assert.match(neu, /^\s*http2 on;$/m, '≥ 1.25.1 必须保留 `http2 on;`');
+    assert.match(neu, /^\s*listen 443 ssl;$/m, '≥ 1.25.1 不应改动 listen 行');
+    // 端口 80 的 listen 不能被误改（降级只针对 443）
+    const old80 = run('1.24.0');
+    assert.match(old80, /^\s*listen 80;$/m, '80 端口的 listen 不能被降级脚本改掉');
+    assert.match(old80, /^\s*listen \[::\]:80;$/m, '80 端口的 IPv6 listen 不能被降级脚本改掉');
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+  // install.sh 必须真的调用它（否则兼容脚本只是一份没人用的文档）
+  assert.match(read('install.sh'), /nginx-http2-compat\.sh/, 'install.sh 必须调用兼容脚本');
+});
+
+test('前端产物目录口径：唯一构建产物目录是 web/dist/，nginx 的 web/assets/ 是预留位', () => {
+  const conf = read('nginx.conf');
+  const sh = read('install.sh');
+  // ⛔ nginx 不得再声称 web/assets/ 是「前端构建产物目录」—— 那个目录是 web/dist/
+  assert.doesNotMatch(
+    conf,
+    /web\/assets\/[^\n]*是【前端构建产物目录】/,
+    '⛔ web/assets/ 不是构建产物目录（构建产物在 web/dist/）',
+  );
+  assert.match(conf, /web\/dist/, 'nginx.conf 必须写明真正的构建产物目录是 web/dist/');
+  assert.match(sh, /--exclude 'web\/dist\/'/, 'install.sh 必须排除构建产物目录（它是发布物，不随程序同步）');
+  assert.match(sh, /--exclude 'web\/assets\/'/, 'install.sh 必须排除预留的静态资源目录');
 });

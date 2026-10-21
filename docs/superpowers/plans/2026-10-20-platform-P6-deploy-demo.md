@@ -1287,6 +1287,7 @@ git commit -m "feat(P6): 一致性备份与恢复脚本（sqlite.backup() API + 
 - Create: `platform/deploy/nginx.conf`
 - Create: `platform/deploy/docker-compose.yml`
 - Create: `platform/deploy/install.sh`
+- Create: `platform/deploy/nginx-http2-compat.sh`
 - Test: `platform/test/deploy-assets.test.js`
 
 **Interfaces:**
@@ -1296,6 +1297,7 @@ git commit -m "feat(P6): 一致性备份与恢复脚本（sqlite.backup() API + 
   - `deploy/nginx.conf` → nginx 站点，占位符 `__SERVER_NAME__` / `__CERT_PATH__` / `__KEY_PATH__` / `__APP_DIR__`
   - `deploy/docker-compose.yml` → 单容器编排（⛔ 无 `--workers` / `cluster`）
   - `deploy/install.sh` → 一键部署（幂等；口令从 `ADMIN_PASSWORD` 环境变量或交互读取，⛔ 不硬编码）
+  - `deploy/nginx-http2-compat.sh` → HTTP/2 语法兼容层（按目标机 nginx 版本决定保留 `http2 on;` 还是降级成 `listen ... ssl http2;`）
 
 > **⚠️ 本 Task 的三条硬约束**
 > ① **单写者**：⛔ 禁止多 Node worker 进程同时写同一个 SQLite 文件（SQLite 官方：single writer at a time）——这是 `SQLITE_BUSY` 的真正来源。✅ 扩容只能加**读**（静态资源交给 nginx 直出，几百并发静态请求根本不进 Node 进程）。⚠️ WAL 要求所有进程**在同一台主机**；**一旦要多机部署，必须换 Postgres，没有第三条路**。
@@ -1309,9 +1311,11 @@ git commit -m "feat(P6): 一致性备份与恢复脚本（sqlite.backup() API + 
 ```javascript
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { tmpdir } from 'node:os';
+import { execFileSync } from 'node:child_process';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const deployDir = join(here, '..', 'deploy');
@@ -1569,6 +1573,122 @@ test('跨资产口径一致：端口 / 数据目录变量 / 会话变量 / 入�
   assert.match(unit, /src\/server\.js/, 'systemd 入口必须与应用真实入口一致');
   assert.match(yml, new RegExp(APP_HEALTH_PATH.replace(/\//g, '\\/')), 'compose 健康检查路径必须与应用真实健康检查路径一致');
 });
+
+// ── P6 部署资产修复轮（父代理）：F-1~F-4 的回归用例 ──────────────────────
+// 这四条缺口都不是「样式问题」，每一条都能让一次真实的云主机部署**装到一半**：
+//   F-1 前端产物目录三处口径不一致（计划 web/dist/ vs nginx web/assets/ vs install.sh 排除项）
+//   F-2 nginx 是最后一步且不检查装没装 ⇒ 前面全都装完了才炸，还留一份坏配置在 sites-enabled
+//   F-3 systemd/环境文件漏 SESSION_ABSOLUTE_TTL_DAYS ⇒ 实际生效值与配置对不上
+//   F-4 nginx ≥ 1.25.1 才有 `http2 on;`，而 Ubuntu 22.04=1.18 / 24.04=1.24 都没有
+//
+// ⚠️ 本组用例的断言必须**判别**：把修复改回去（挪顺序 / 删回滚 / 改回降级）必须变红。
+
+test('install.sh：⛔ nginx 必须【在动任何东西之前】检查（否则装到一半才炸）', () => {
+  const sh = read('install.sh');
+  assert.match(sh, /command -v nginx/, '必须探测 nginx 是否安装');
+  assert.match(sh, /require_nginx\(\)\s*\{/, '必须有独立的 nginx 前置检查函数');
+  // 顺序断言：main() 里 require_nginx 必须排在所有「会改变机器状态」的调用之前。
+  // ⚠️ 这条是判别性的：把 require_nginx 挪到 copy_app 之后 → 立刻变红。
+  const mainIdx = sh.indexOf('\nmain() {');
+  assert.ok(mainIdx > 0, '找不到 main()，测试本身失效');
+  const mainBody = sh.slice(mainIdx);
+  const requireIdx = mainBody.indexOf('require_nginx');
+  assert.ok(requireIdx > 0, 'main() 里必须调用 require_nginx');
+  for (const mutating of [
+    'create_service_user', 'prepare_dirs', 'copy_app', 'write_env_file',
+    'init_database', 'write_systemd_unit', 'start_service', 'write_nginx_site',
+  ]) {
+    const idx = mainBody.indexOf(mutating);
+    assert.ok(idx > 0, `找不到 ${mutating} 调用，测试本身失效`);
+    assert.ok(requireIdx < idx, `⛔ require_nginx 必须排在 ${mutating} 之前（先查前置条件，再动手）`);
+  }
+});
+
+test('install.sh：nginx -t 失败必须回滚（坏配置绝不能留在 sites-enabled）', () => {
+  const sh = read('install.sh');
+  // 裸 `nginx -t` + set -e ⇒ 失败即退出，**来不及回滚** ⇒ 必须放在 if 保护下
+  assert.match(sh, /if ! nginx -t; then/, 'nginx -t 必须在 if 保护下，失败分支才能做回滚');
+  assert.match(sh, /cp -p "\$NGINX_SITE" "\$backup"/, '写新配置前必须先备份旧配置（否则回滚无源可回）');
+  const guardIdx = sh.indexOf('if ! nginx -t; then');
+  assert.ok(guardIdx > 0, '找不到 nginx -t 保护块，测试本身失效');
+  const guardEnd = sh.indexOf('\n  fi', guardIdx);
+  assert.ok(guardEnd > guardIdx, '找不到 nginx -t 保护块的结尾，测试本身失效');
+  const block = sh.slice(guardIdx, guardEnd);
+  assert.match(block, /mv -f "\$backup" "\$NGINX_SITE"/, '失败时必须还原上一版站点配置');
+  assert.match(block, /rm -f "\$NGINX_SITE" "\$NGINX_LINK"/, '没有旧配置时必须撤销站点文件与软链');
+});
+
+test('会话有效期：环境文件必须写绝对过期变量，且默认值与真实代码一致', () => {
+  const sh = read('install.sh');
+  const unit = read('heikesong.service');
+  // 变量名从真实代码里取，不写死（代码改名时这条测试必须跟着变）
+  const absVar = (sessionSrc.match(/process\.env\.([A-Z_]*ABSOLUTE_TTL_DAYS)/) || [])[1];
+  assert.ok(absVar, '读不到 src/auth/session.js 的绝对过期变量名，测试本身失效');
+  assert.match(sh, new RegExp(`printf '${absVar}=%s`), `环境文件必须写 ${absVar}（不写就静默用代码默认值）`);
+  assert.match(unit, new RegExp(absVar), `systemd 单元的环境文件注释必须列出 ${absVar}`);
+  // 默认值必须与代码里的默认值一致
+  const codeDefault = (sessionSrc.match(/DEFAULT_ABSOLUTE_TTL_DAYS\s*=\s*(\d+)/) || [])[1];
+  assert.ok(codeDefault, '读不到代码里的默认绝对过期天数，测试本身失效');
+  assert.match(
+    sh,
+    new RegExp(`${absVar}="\\$\\{${absVar}:-${codeDefault}\\}"`),
+    `默认值必须与代码一致（${codeDefault} 天），否则「文件里写的」≠「生效的」`,
+  );
+  // 非法值必须 fail-fast（代码对非法值是**静默**回退到默认值 ⇒ 环境文件写错没人会发现）
+  assert.match(sh, /validate_session_ttls/, '必须有会话天数的合法性校验');
+  assert.match(sh, /validate_session_ttls\n/, 'main() 必须真的调用它');
+});
+
+test('nginx HTTP/2 兼容：旧版本自动降级、新版本保留（真跑脚本，不看注释）', () => {
+  const compatPath = join(deployDir, 'nginx-http2-compat.sh');
+  assert.ok(existsSync(compatPath), '必须存在 deploy/nginx-http2-compat.sh');
+  const tmp = mkdtempSync(join(tmpdir(), 'heikesong-nginx-'));
+  try {
+    const run = (version) => {
+      const out = join(tmp, `conf-${version}`);
+      execFileSync('bash', [compatPath, join(deployDir, 'nginx.conf'), out], {
+        env: { ...process.env, NGINX_VERSION: version },
+        encoding: 'utf8',
+      });
+      return readFileSync(out, 'utf8');
+    };
+    // 旧版（Ubuntu 24.04 = nginx 1.24.0）：必须降级
+    const old = run('1.24.0');
+    assert.match(old, /^\s*listen 443 ssl http2;$/m, '旧版 nginx 必须降级成 listen ... ssl http2;');
+    assert.match(old, /^\s*listen \[::\]:443 ssl http2;$/m, 'IPv6 那一支也必须降级');
+    assert.doesNotMatch(old, /^\s*http2 on;$/m, '⛔ 旧版 nginx 不认 `http2 on;`，残留就是必然 nginx -t 失败');
+    // 临界前一版：1.25.1 才引入该指令，1.25.0 一样不认
+    const justUnder = run('1.25.0');
+    assert.doesNotMatch(justUnder, /^\s*http2 on;$/m, '1.25.0 仍不认 `http2 on;`（该指令 1.25.1 引入）');
+    assert.match(justUnder, /^\s*listen 443 ssl http2;$/m, '1.25.0 必须降级');
+    // 新版：保留原写法
+    const neu = run('1.25.1');
+    assert.match(neu, /^\s*http2 on;$/m, '≥ 1.25.1 必须保留 `http2 on;`');
+    assert.match(neu, /^\s*listen 443 ssl;$/m, '≥ 1.25.1 不应改动 listen 行');
+    // 端口 80 的 listen 不能被误改（降级只针对 443）
+    const old80 = run('1.24.0');
+    assert.match(old80, /^\s*listen 80;$/m, '80 端口的 listen 不能被降级脚本改掉');
+    assert.match(old80, /^\s*listen \[::\]:80;$/m, '80 端口的 IPv6 listen 不能被降级脚本改掉');
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+  // install.sh 必须真的调用它（否则兼容脚本只是一份没人用的文档）
+  assert.match(read('install.sh'), /nginx-http2-compat\.sh/, 'install.sh 必须调用兼容脚本');
+});
+
+test('前端产物目录口径：唯一构建产物目录是 web/dist/，nginx 的 web/assets/ 是预留位', () => {
+  const conf = read('nginx.conf');
+  const sh = read('install.sh');
+  // ⛔ nginx 不得再声称 web/assets/ 是「前端构建产物目录」—— 那个目录是 web/dist/
+  assert.doesNotMatch(
+    conf,
+    /web\/assets\/[^\n]*是【前端构建产物目录】/,
+    '⛔ web/assets/ 不是构建产物目录（构建产物在 web/dist/）',
+  );
+  assert.match(conf, /web\/dist/, 'nginx.conf 必须写明真正的构建产物目录是 web/dist/');
+  assert.match(sh, /--exclude 'web\/dist\/'/, 'install.sh 必须排除构建产物目录（它是发布物，不随程序同步）');
+  assert.match(sh, /--exclude 'web\/assets\/'/, 'install.sh 必须排除预留的静态资源目录');
+});
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -1584,7 +1704,7 @@ Expected: FAIL —— `ENOENT: no such file or directory, open 'platform/deploy/
 
 - [ ] **Step 3: 创建 `deploy/heikesong.service`**
 
-```ini
+```systemd
 # deploy/heikesong.service — systemd 守护单元
 #
 # 依据：设计文档 §14.2「deploy/heikesong.service（systemd 守护）」
@@ -1614,7 +1734,7 @@ User=__RUN_USER__
 Group=__RUN_USER__
 WorkingDirectory=__APP_DIR__
 
-# 环境文件：PORT / DATA_DIR / SESSION_TTL_DAYS / NODE_ENV
+# 环境文件：PORT / DATA_DIR / SESSION_TTL_DAYS / SESSION_ABSOLUTE_TTL_DAYS / NODE_ENV
 # ⛔ 这里不放任何口令：口令只在初始化管理员时用一次，不落盘。
 EnvironmentFile=-/etc/heikesong/platform.env
 
@@ -1680,6 +1800,10 @@ WantedBy=multi-user.target
 #
 # ⚠️ nginx 需要 ≥ 1.25.1（用 `http2 on;` 语法）。更低版本请把
 #    `http2 on;` 换成 `listen 443 ssl http2;`。
+#    ✅ 不用手工改：deploy/install.sh 会先跑 deploy/nginx-http2-compat.sh，
+#    它按**目标机**的 nginx 版本自动决定：≥ 1.25.1 保留本写法，
+#    < 1.25.1（Ubuntu 22.04=1.18 / 24.04=1.24 都是）自动降级成
+#    `listen 443 ssl http2;`（这个写法在**所有** nginx 版本上都合法）。
 #
 # ⚠️ 端口口径：上游固定 127.0.0.1:8080，与 systemd 单元 / 环境文件 / compose
 #    的 PORT=8080 是同一口径。改端口要三处一起改，否则反代连不上。
@@ -1730,9 +1854,11 @@ server {
 
     # ── 静态资源直出（不进 Node 进程）────────────────────────
     # ✅ 这是「扩容只能加读」的落点：几百并发静态请求根本不进 Node。
-    # ⚠️ web/assets/ 是【前端构建产物目录】：仓库里现在还没有这个目录
-    #    （现有静态文件在 web/ 根下，由下面的 location / 交给 Node 出）。
+    # ⚠️ web/assets/ 是【预留】的静态资源目录（带内容哈希、可长期缓存的版本位）：
+    #    **本仓库当前没有任何构建步骤产出它**（演示版静态站的产物在
+    #    platform/web/dist/，走**独立发布通道**，不经本 nginx）。
     #    目录不存在时本段对 /assets/ 请求返 404，不影响其它路径。
+    #    ⚠️ 别把它和「前端构建产物目录」混为一谈 —— 那个目录是 platform/web/dist/。
     location /assets/ {
         alias __APP_DIR__/web/assets/;
         expires 7d;
@@ -1773,6 +1899,152 @@ server {
         add_header X-Accel-Buffering no;
     }
 }
+```
+
+同时创建 `deploy/nginx-http2-compat.sh`（HTTP/2 版本兼容脚本）——
+`http2 on;` 这个指令要 nginx **≥ 1.25.1** 才认识，而 Ubuntu 22.04(1.18) /
+24.04(1.24) 都没有 ⇒ 旧版本自动降级成 `listen ... ssl http2;`（所有版本都合法）：
+
+```bash
+#!/usr/bin/env bash
+# deploy/nginx-http2-compat.sh — HTTP/2 指令的 nginx 版本兼容层
+#
+# 背景：deploy/nginx.conf 用的是 `http2 on;`，**nginx ≥ 1.25.1** 才认识这个指令；
+#   1.25.1 之前只认 `listen 443 ssl http2;` 这一种写法。
+#   发行版现状：Ubuntu 22.04 = nginx 1.18.x、Ubuntu 24.04 = nginx 1.24.0
+#   —— 都 < 1.25.1。直接用本仓库的 nginx.conf，`nginx -t` 会报
+#   "unknown directive \"http2\""，而这一步在 install.sh 的**最后**，
+#   于是部署变成「装完了才炸」，还把一份坏配置留在 sites-enabled 里
+#   （那会毒化这台机器上**下一次**任何 nginx reload）。
+#   本脚本按**目标机**的 nginx 版本把配置改写成该版本认识的语法。
+#
+# 用法：
+#   nginx-http2-compat.sh <输入 conf> <输出 conf>
+#   两种走法：
+#     · 版本够新（≥ 1.25.1）⇒ 原样拷贝（保留 `http2 on;`）
+#     · 版本偏旧         ⇒ 降级：删掉独立的 `http2 on;` 行，
+#                          并把 `listen ... 443 ssl;` 改成 `listen ... 443 ssl http2;`
+#                          （旧语法在**所有** nginx 版本上都合法 ⇒ 降级永远安全）
+#
+# 环境变量：
+#   NGINX_VERSION  覆盖探测到的版本（形如 1.24.0）。默认用 `nginx -v` 探测；
+#                  探测不到时按「需要降级」处理（保守：降级后的语法处处合法）。
+#                  显式给出这个变量的另一个用途是「在没装 nginx 的机器上预演渲染结果」。
+#
+# 退出码：0 成功；2 用法错 / 输入文件不存在 / 降级后仍残留 `http2 on;`。
+set -euo pipefail
+
+# `http2 on;` 的引入版本：nginx 1.25.1
+MIN_NGINX_MAJOR=1
+MIN_NGINX_MINOR=25
+MIN_NGINX_PATCH=1
+
+usage() {
+  printf '用法：nginx-http2-compat.sh <输入 conf> <输出 conf>\n' >&2
+}
+
+if [ "$#" -ne 2 ]; then
+  usage
+  exit 2
+fi
+
+IN_CONF="$1"
+OUT_CONF="$2"
+
+if [ ! -f "$IN_CONF" ]; then
+  printf '[nginx-compat] 错误：输入文件不存在：%s\n' "$IN_CONF" >&2
+  exit 2
+fi
+
+# ── 探测版本 ────────────────────────────────────────────────────────────
+detect_version() {
+  if [ -n "${NGINX_VERSION:-}" ]; then
+    printf '%s' "$NGINX_VERSION"
+    return 0
+  fi
+  if command -v nginx >/dev/null 2>&1; then
+    # nginx -v 把版本号打在 **stderr**
+    nginx -v 2>&1 | sed -n 's|^nginx version: \([0-9][0-9.]*\).*|\1|p' | head -n 1
+    return 0
+  fi
+  printf ''
+}
+
+VERSION="$(detect_version)"
+
+version_supports_http2_on() {
+  # $1 = 版本号（形如 1.24.0 / 1.25.1）；空 = 探测不到 ⇒ 判「不支持」⇒ 降级
+  local v="$1" major minor patch
+  [ -n "$v" ] || return 1
+  major="${v%%.*}"
+  local rest="${v#*.}"
+  minor="${rest%%.*}"
+  local rest2="${rest#*.}"
+  case "$rest2" in
+    ''|*[!0-9]*) patch=0 ;;
+    *) patch="${rest2%%.*}" ;;
+  esac
+  case "$major" in ''|*[!0-9]*) return 1 ;; esac
+  case "$minor" in ''|*[!0-9]*) return 1 ;; esac
+  if [ "$major" -ne "$MIN_NGINX_MAJOR" ]; then
+    [ "$major" -gt "$MIN_NGINX_MAJOR" ]
+    return
+  fi
+  if [ "$minor" -ne "$MIN_NGINX_MINOR" ]; then
+    [ "$minor" -gt "$MIN_NGINX_MINOR" ]
+    return
+  fi
+  [ "$patch" -ge "$MIN_NGINX_PATCH" ]
+}
+
+# ── 渲染 ────────────────────────────────────────────────────────────────
+# 先记住输入里**独立成行**的 `http2 on;` 有没有（注释里提到的不算）
+had_http2_on=0
+if grep -qE '^[[:space:]]*http2[[:space:]]+on;[[:space:]]*$' "$IN_CONF"; then
+  had_http2_on=1
+fi
+
+if version_supports_http2_on "$VERSION"; then
+  cp "$IN_CONF" "$OUT_CONF"
+  printf '[nginx-compat] nginx %s ≥ %s.%s.%s：保留 `http2 on;` 写法\n' \
+    "$VERSION" "$MIN_NGINX_MAJOR" "$MIN_NGINX_MINOR" "$MIN_NGINX_PATCH"
+  # 保持路径的自检：输入有 `http2 on;` ⇒ 输出必须也有（不能被悄悄改掉）
+  out_http2_on=0
+  if grep -qE '^[[:space:]]*http2[[:space:]]+on;[[:space:]]*$' "$OUT_CONF"; then
+    out_http2_on=1
+  fi
+  if [ "$had_http2_on" -ne "$out_http2_on" ]; then
+    printf '[nginx-compat] 错误：保持路径下 `http2 on;` 指令丢失（输入有=%s，输出有=%s）\n' \
+      "$had_http2_on" "$out_http2_on" >&2
+    exit 2
+  fi
+else
+  # 用 awk 而不是 sed：sed 的 BRE 扩展（\+ / \d）在 BSD sed（macOS）上不通用，
+  # 而本脚本要在 macOS 上被测试实跑，必须可移植。
+  awk '
+    # 删掉独立的 `http2 on;` 行（前后允许空白）
+    /^[[:space:]]*http2[[:space:]]+on;[[:space:]]*$/ { next }
+    {
+      line = $0
+      # 把 `listen [::]:443 ssl;` / `listen 443 ssl;` 改成 `... ssl http2;`
+      # ⚠️ IPv6 那一支是 `[::]:443` —— `]` 后面还有一个 `:`，正则必须带上它
+      if (line ~ /^[[:space:]]*listen[[:space:]]+(\[[^]]*\]:[[:space:]]*)?443[[:space:]]+ssl;[[:space:]]*$/) {
+        sub(/;[[:space:]]*$/, " http2;", line)
+        changed = 1
+      }
+      print line
+    }
+  ' "$IN_CONF" > "$OUT_CONF"
+  printf '[nginx-compat] nginx %s < %s.%s.%s：已降级为 `listen ... ssl http2;`（旧语法在所有版本都合法）\n' \
+    "${VERSION:-未探测到（按需降级处理）}" "$MIN_NGINX_MAJOR" "$MIN_NGINX_MINOR" "$MIN_NGINX_PATCH"
+  # 降级路径的自检：**绝不能**还残留独立的 `http2 on;`（否则 nginx -t 必然失败）
+  if grep -qE '^[[:space:]]*http2[[:space:]]+on;[[:space:]]*$' "$OUT_CONF"; then
+    printf '[nginx-compat] 错误：输出里仍残留独立的 `http2 on;`，该 nginx 版本不认这个指令\n' >&2
+    exit 2
+  fi
+fi
+
+exit 0
 ```
 
 - [ ] **Step 5: 创建 `deploy/docker-compose.yml`**
@@ -1895,10 +2167,15 @@ volumes:
 #   NGINX_SITE    nginx 站点文件       默认 /etc/nginx/sites-available/heikesong.conf
 #   NGINX_LINK    nginx 站点软链       默认 /etc/nginx/sites-enabled/heikesong.conf
 #   SYSTEMD_UNIT_DIR systemd 单元目录  默认 /etc/systemd/system
+#   SESSION_TTL_DAYS 会话滑动有效期（天）默认 7（与 src/auth/session.js 的默认值一致）
+#   SESSION_ABSOLUTE_TTL_DAYS 会话绝对过期上限（天）默认 30（同上）
 #
 # ⚠️ 端口口径：8080 是**写死**的口径（与 deploy/nginx.conf 的 upstream、
 #    systemd 单元的 Environment=PORT、docker-compose 的 PORT 同一套）。
 #    要换端口必须四处一起改 —— 本脚本不提供 PORT 变量，避免只改一处连不上。
+#
+# ⚠️ 绝对过期上限**可以**小于滑动有效期（那是「更严」的合法配置：到期必须重登）。
+#    本脚本不禁止这种组合 —— 只校验两者都是正整数。
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -1912,6 +2189,11 @@ ENV_FILE="${ENV_FILE:-/etc/heikesong/platform.env}"
 NGINX_SITE="${NGINX_SITE:-/etc/nginx/sites-available/heikesong.conf}"
 NGINX_LINK="${NGINX_LINK:-/etc/nginx/sites-enabled/heikesong.conf}"
 SYSTEMD_UNIT_DIR="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
+SESSION_TTL_DAYS="${SESSION_TTL_DAYS:-7}"
+SESSION_ABSOLUTE_TTL_DAYS="${SESSION_ABSOLUTE_TTL_DAYS:-30}"
+# nginx HTTP/2 兼容脚本：`http2 on;` 要 nginx ≥ 1.25.1，Ubuntu 22.04(1.18) /
+# 24.04(1.24) 都没有 ⇒ 旧版本自动降级成 `listen ... ssl http2;`（所有版本都合法）。
+NGINX_COMPAT_SCRIPT="$SCRIPT_DIR/nginx-http2-compat.sh"
 # ⛔ Node 下限 = 22.16.0（package.json engines）。22.16.0 是 node:sqlite.backup()
 #    的引入版本 —— 备份脚本（P6 Task 1）依赖它，低版本装了也跑不了备份。
 MIN_NODE_MAJOR=22
@@ -1942,6 +2224,37 @@ node_version_ok() {
 # 否则路径里的特殊字符会被 sed 当成自己的语法（& = 整个匹配）。
 sed_escape() {
   printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'
+}
+
+# ⛔ nginx 必须**在做任何改动之前**就检查完。
+#    为什么：nginx 步骤在流程末尾（要等程序装好、库建好、服务起好才轮到它）。
+#    如果 nginx 没装，等发现时机器上已经是一个「装了一半」的部署 —— 服务在跑、
+#    但没有反代，域名单独访问是 502；脚本还在最后一步以
+#    "nginx: command not found" 这种看不懂的错退出。
+#    ⇒ 缺 nginx 必须在**动任何东西之前**就明确拒绝。
+require_nginx() {
+  if [ -z "$SERVER_NAME" ]; then
+    return 0    # 未设 SERVER_NAME ⇒ 本次不配 nginx，跳过
+  fi
+  if ! command -v nginx >/dev/null 2>&1; then
+    die "未检测到 nginx，但设置了 SERVER_NAME=${SERVER_NAME}。请先安装 nginx（Debian/Ubuntu: apt-get install -y nginx；RHEL/CentOS: dnf install -y nginx；Alpine: apk add --no-cache nginx），或去掉 SERVER_NAME 变量以跳过 nginx 配置。"
+  fi
+  log "已检测到 nginx：$(nginx -v 2>&1 | head -n 1)"
+}
+
+# 会话有效期相关的两个天数必须是**正整数**。
+# 为什么要在这里 fail-fast：src/auth/session.js 对非法值是**静默回退到默认值**
+# （"SESSION_TTL_DAYS=abc" ⇒ 悄悄用 7 天）—— 环境文件里写错却没有任何提示，
+# 运维会以为改了其实没改。配置非法就报错，不静默兜底。
+validate_session_ttls() {
+  case "$SESSION_TTL_DAYS" in
+    ''|*[!0-9]*) die "SESSION_TTL_DAYS 必须是正整数（当前：'$SESSION_TTL_DAYS'）" ;;
+  esac
+  case "$SESSION_ABSOLUTE_TTL_DAYS" in
+    ''|*[!0-9]*) die "SESSION_ABSOLUTE_TTL_DAYS 必须是正整数（当前：'$SESSION_ABSOLUTE_TTL_DAYS'）" ;;
+  esac
+  [ "$SESSION_TTL_DAYS" -gt 0 ] || die "SESSION_TTL_DAYS 必须 > 0（当前：${SESSION_TTL_DAYS}）"
+  [ "$SESSION_ABSOLUTE_TTL_DAYS" -gt 0 ] || die "SESSION_ABSOLUTE_TTL_DAYS 必须 > 0（当前：${SESSION_ABSOLUTE_TTL_DAYS}）"
 }
 
 install_node() {
@@ -1997,8 +2310,14 @@ prepare_dirs() {
 copy_app() {
   log "同步程序到 $APP_DIR"
   if command -v rsync >/dev/null 2>&1; then
+    # ⚠️ 排除 web/dist/：那是**演示版静态站的构建产物**（P6 Task 6 的
+    #    `scripts/build-demo.js` 产出），走**独立发布通道**，不随程序同步到服务器。
+    #    ⚠️ 排除 web/assets/：那是 nginx `location /assets/` 指向的**预留**目录
+    #    （带哈希的生产静态资源位），本仓库**没有任何构建步骤**产出它。
+    #    两者与「前端产物目录」的口径以 P6 计划 Task 6 为准。
     rsync -a --delete \
-      --exclude 'data/' --exclude 'node_modules/' --exclude '.git/' --exclude 'web/dist/' \
+      --exclude 'data/' --exclude 'node_modules/' --exclude '.git/' \
+      --exclude 'web/dist/' --exclude 'web/assets/' \
       "$ROOT/" "$APP_DIR/"
   else
     # 没有 rsync 时的兜底：先删后拷（不删 data/）
@@ -2019,7 +2338,11 @@ write_env_file() {
   {
     printf 'PORT=8080\n'
     printf 'DATA_DIR=%s\n' "$DATA_DIR"
-    printf 'SESSION_TTL_DAYS=7\n'
+    printf 'SESSION_TTL_DAYS=%s\n' "$SESSION_TTL_DAYS"
+    # ⚠️ 绝对过期上限：src/auth/session.js 读 SESSION_ABSOLUTE_TTL_DAYS（默认 30 天）。
+    #    不写这个变量时应用会**静默**用 30 天默认值 —— 环境文件与实际生效值就对不上了，
+    #    排障时无从查证。显式写出来，让「文件里写的」＝「生效的」。
+    printf 'SESSION_ABSOLUTE_TTL_DAYS=%s\n' "$SESSION_ABSOLUTE_TTL_DAYS"
     # ⚠️ NODE_ENV=production 会让登录 Cookie 带 Secure 标记
     #    （src/server.js: secureCookies = NODE_ENV === 'production'）——
     #    「IP + 端口 + 纯 HTTP」的调试形态下浏览器会直接拒收 Cookie → 登录失效。
@@ -2079,17 +2402,54 @@ write_nginx_site() {
     log "跳过 nginx：未设置 SERVER_NAME（正式对外域名）"
     return 0
   fi
+  [ -f "$NGINX_COMPAT_SCRIPT" ] || die "缺少 ${NGINX_COMPAT_SCRIPT}（HTTP/2 兼容脚本）"
   log "写 nginx 站点配置 $NGINX_SITE"
   install -d -m 0755 "$(dirname "$NGINX_SITE")" "$(dirname "$NGINX_LINK")"
   local cert="${CERT_PATH:-/etc/letsencrypt/live/$SERVER_NAME/fullchain.pem}"
   local key="${KEY_PATH:-/etc/letsencrypt/live/$SERVER_NAME/privkey.pem}"
+
+  # ① 先做 HTTP/2 语法兼容：`http2 on;` 只有 nginx ≥ 1.25.1 认识，
+  #    Ubuntu 22.04(1.18) / 24.04(1.24) 都没有 ⇒ 旧版本自动降级成
+  #    `listen ... ssl http2;`（这个写法在所有版本上都合法）。
+  #    不做这一步的话，nginx -t 会报 unknown directive "http2"，
+  #    而那已经是整个部署的最后一步了。
+  local rendered
+  rendered="$(mktemp)"
+  if ! bash "$NGINX_COMPAT_SCRIPT" "$ROOT/deploy/nginx.conf" "$rendered"; then
+    rm -f "$rendered"
+    die "nginx HTTP/2 兼容处理失败（见上面的 [nginx-compat] 输出）"
+  fi
+
+  # ② 备份旧站点文件：nginx -t 失败时要**回滚**，不能把一份坏配置留在
+  #    sites-enabled 里 —— 那会毒化这台机器上**下一次**任何 nginx reload
+  #    （哪怕是别人触发的、跟这次部署无关的 reload）。
+  local backup=""
+  if [ -f "$NGINX_SITE" ]; then
+    backup="$(mktemp "${TMPDIR:-/tmp}/heikesong-nginx-site.XXXXXX")"
+    cp -p "$NGINX_SITE" "$backup"
+  fi
+
   sed -e "s|__SERVER_NAME__|$(sed_escape "$SERVER_NAME")|g" \
       -e "s|__CERT_PATH__|$(sed_escape "$cert")|g" \
       -e "s|__KEY_PATH__|$(sed_escape "$key")|g" \
       -e "s|__APP_DIR__|$(sed_escape "$APP_DIR")|g" \
-      "$ROOT/deploy/nginx.conf" > "$NGINX_SITE"
+      "$rendered" > "$NGINX_SITE"
+  rm -f "$rendered"
   ln -sfn "$NGINX_SITE" "$NGINX_LINK"
-  nginx -t                 # ⛔ 先验配置再 reload：配置错了不炸线上
+
+  # ⛔ 先验配置再 reload：配置错了不炸线上。
+  if ! nginx -t; then
+    if [ -n "$backup" ] && [ -f "$backup" ]; then
+      mv -f "$backup" "$NGINX_SITE"
+      log "已回滚到上一版 nginx 站点配置"
+    else
+      rm -f "$NGINX_SITE" "$NGINX_LINK"
+      log "已撤销本次 nginx 站点配置（此前没有旧配置）"
+    fi
+    die "nginx 配置校验失败（nginx -t 返回非 0）——已回滚，请按上面的 nginx -t 输出修正后重跑本脚本"
+  fi
+  if [ -n "$backup" ]; then rm -f "$backup"; fi
+
   if systemctl reload nginx 2>/dev/null; then
     log "nginx 已 reload"
   else
@@ -2112,6 +2472,11 @@ start_service() {
 
 main() {
   need_root
+  # ⛔ 先查前置条件，再动任何东西：
+  #    nginx 缺失 / 会话天数写错，都必须在「用户/目录/库/服务」被创建之前拒绝，
+  #    否则会留下一个装了一半的机器（服务在跑、但反代没配），排查成本极高。
+  require_nginx
+  validate_session_ttls
   if ! node_version_ok; then
     install_node
   fi
@@ -5512,3 +5877,103 @@ Node v22 的真实签名是**单对象** `{ totalPages, remainingPages }`（探�
    两者都是「静默的空产出比报错更危险」的直接落地；改这个文件时**别把它们一起删掉**。
 7. **本 Task 的退出码语义**（与 P4 一致，未变）：
    **0 = 通过 / 1 = 有违规 / 2 = 清单为空、清单不合规、清单缺失、参数不认、扫了 0 个文件**。
+
+
+
+---
+
+## P6 部署资产修复轮（父代理，2026-10-21）
+
+> 触发：父代理对 P6 部署资产的独立核对（`/tmp/p6-proof/deploy-assets-review.md`）查出 F-1~F-4 四条缺口。
+> 这四条都不是「样式问题」，每一条都能让一次**真实的云主机部署**装到一半或直接失败。
+> 本轮改动**只碰** Task 2 的文件（`platform/deploy/*`）与 `platform/test/deploy-assets.test.js`，
+> **不重建**任何既有文件；Task 3 已登记的 §G-1「遗留 / 需上游注意」由本轮**裁决并落地**。
+
+### F-1 前端构建产物目录「三处不一致」—— 裁决：唯一产物目录是 `platform/web/dist/`
+
+| 位置 | 原状 | 裁决后 |
+|---|---|---|
+| P6 计划 Task 6 | `platform/web/dist/`（`build-demo.js --out web/dist`、`.gitignore`、扫描闸 `distDir`、验收 P6-11/P6-12） | **保持不变 —— 它就是唯一口径** |
+| `deploy/nginx.conf` | `location /assets/ { alias __APP_DIR__/web/assets/; }`，注释声称「web/assets/ 是【前端构建产物目录】」 | **保留该 location**（R-OPS-04 要求它存在），但**订正注释**：web/assets/ 是**预留**的带哈希静态资源位，本仓库**没有任何构建步骤产出它**；真正的构建产物目录是 `web/dist/` |
+| `deploy/install.sh` | rsync `--exclude 'web/dist/'` | **保持**，并**追加** `--exclude 'web/assets/'`；注释写明两者各自的性质 |
+
+**为什么这么定**：① 演示版静态站是**自包含**的（`web/dist/` 里有 `index.html` + `src/domain/` + `rules/` + `seed/`），
+它走的是**独立发布通道**（静态站发布工具），**不经** `deploy/nginx.conf` 这个「应用反代」——
+后者服务的是 Node 应用自己的 `web/` 目录（`location /` 转给 Node）。
+② nginx 里的 `/assets/` 是一块**前瞻位**：正式部署时静态资源要带内容哈希并长期缓存，
+但**一期没有**对应的构建步骤。留着它并在注释里说清现状，比删掉更诚实，也不违反 R-OPS-04。
+③ 若将来要让 nginx 直出演示版静态站，需要**独立的 server block 或独立端口**（不能与 `location /` 抢 `/`），
+那属于部署形态变更，**不在一期**范围内。
+
+### F-2 nginx 是最后一步且不检查装没装 ⇒ 半成品部署 —— 已修
+
+**原状**：`main()` 的顺序是 `建用户 → 建目录 → 同步程序 → 写环境文件 → 建库 → 写 systemd → 启服务 → 写 nginx`。
+nginx 在**最后**。机器上没装 nginx 时，脚本会先把上面**全部**做完，然后在最后一步以
+`nginx: command not found` 退出 —— 留下一个「服务在跑、但没有反代、域名单独访问 502」的半成品部署。
+更糟的是 `nginx -t` 失败时**站点文件与软链已经写进去了**（`ln -sfn` 在 `nginx -t` 之前），
+坏配置留在 `sites-enabled` 里，会**毒化这台机器上下一次任何 nginx reload**（哪怕是别人触发的）。
+
+**修法**：
+① 新增 `require_nginx()`，在 `main()` 里**排在所有会改变机器状态的调用之前**执行 ——
+   没装 nginx 就**当场明确拒绝**，不让前面半截部署发生。
+② `write_nginx_site()` 写新配置前先 `cp -p` 备份旧站点文件；
+   `nginx -t` 失败时**回滚**：有旧配置就 `mv` 还原，没有就 `rm -f` 掉站点文件与软链，然后才报错退出。
+③ `nginx -t` 必须写在 `if ! nginx -t; then` 保护下（裸调用 + `set -e` 会直接退出，**来不及回滚**）。
+
+### F-3 systemd / 环境文件漏 `SESSION_ABSOLUTE_TTL_DAYS` —— 已修
+
+**原状**：`src/auth/session.js` 读 `SESSION_ABSOLUTE_TTL_DAYS`（默认 30 天），
+但 `write_env_file()` 只写了 `SESSION_TTL_DAYS=7`，systemd 单元的环境文件注释也只列了三个变量。
+⇒ 不写这个变量时应用**静默**用 30 天默认值，**「环境文件里写的」≠「实际生效的」**，排障时无从查证。
+
+**修法**：① 环境文件显式写 `SESSION_ABSOLUTE_TTL_DAYS`（默认 30，与代码里的
+`DEFAULT_ABSOLUTE_TTL_DAYS` 同源）；② systemd 单元的环境文件注释补上这个变量名；
+③ 新增 `validate_session_ttls()`：两个天数**必须是正整数**，否则 fail-fast ——
+因为 `session.js` 对非法值是**静默回退**到默认值（`"abc"` ⇒ 悄悄用 7 天），环境文件写错却毫无提示。
+④ ⚠️ **绝对上限可以小于滑动有效期**（那是「更严」的合法配置：到期必须重登）——
+   本轮**不**禁止这种组合，只校验正整数。**不擅自加规则。**
+
+### F-4 nginx 版本 ≥ 1.25.1 未校验 —— 已修（自动降级）
+
+**原状**：`deploy/nginx.conf` 用 `http2 on;`，该指令 **nginx 1.25.1 才引入**；
+而 Ubuntu 22.04 = nginx 1.18、Ubuntu 24.04 = nginx 1.24.0 —— **都 < 1.25.1**。
+`nginx -t` 会报 `unknown directive "http2"`，而这一步在流程**最后** ⇒ 同样是「装到一半才炸」。
+（nginx.conf 的注释里写了「更低版本请把 `http2 on;` 换成 `listen 443 ssl http2;`」，
+但那是**要人手工做**的事，脚本不会替你做。）
+
+**修法**：新增 `platform/deploy/nginx-http2-compat.sh` —— 按**目标机**的 nginx 版本
+（`nginx -v`，或环境变量 `NGINX_VERSION` 覆盖）决定：
+- ≥ 1.25.1 ⇒ 原样保留 `http2 on;`；
+- < 1.25.1 ⇒ 删掉独立的 `http2 on;` 行，并把 `listen 443 ssl;` 与 `listen [::]:443 ssl;`
+  改成 `listen ... ssl http2;`（**这个写法在所有 nginx 版本上都合法** ⇒ 降级永远安全）；
+- 探测不到版本 ⇒ 按「需要降级」处理（保守）。
+
+`install.sh` 在渲染站点配置**之前**先跑这个脚本。脚本用 `awk` 而非 `sed` ——
+`sed` 的 BRE 扩展（`\+` / `\d`）在 BSD sed（macOS）上不通用，而它要在 macOS 上被测试**实跑**。
+脚本自带两道自检：保持路径下 `http2 on;` 不许丢、降级路径下 `http2 on;` 不许留。
+
+### 变异检验（`/tmp/p6-mutate/t2fix.mjs`）
+
+**11 个变异体 / 11 KILLED / 0 存活 / 0 无效 / 0 锚点异常**；对照组（未改动副本）**19/19 全绿**。
+变异体逐个把本轮的修复改回去：挪 `require_nginx` 的位置、把 `nginx -t` 改回裸调用、
+去掉回滚、不写 `SESSION_ABSOLUTE_TTL_DAYS`、改默认值、去掉合法性校验、
+兼容脚本不降级、阈值放宽到 1.24.0、漏改 IPv6 那一支、改回「web/assets/ 是构建产物目录」的注释、
+不排除 `web/dist/` —— **每一个都让对应的新用例变红**。
+
+### 实跑数字
+
+- 单文件 `test/deploy-assets.test.js`：**19 例 / 19 通过**（原 14 + 本轮 5）
+- 全量 `node --test`：**961 例 / 960 通过 / 1 跳过 / 0 失败**（基线 956）
+- `bash -n` 语法自检：`install.sh` 与 `nginx-http2-compat.sh` 均通过
+- 隔离实证：PATH 里没有 nginx 时 `require_nginx` **当场拒绝**（不进入后续步骤）；
+  有 nginx 时打印版本并放行
+- 兼容脚本实跑：1.24.0 / 1.25.0 ⇒ 双 listen 行都降级；1.25.1 / 2.0.0 ⇒ 保留 `http2 on;`；
+  端口 80 的 listen **不受影响**
+
+### 偏离与遗留
+
+- 本轮**新增**了一个文件 `platform/deploy/nginx-http2-compat.sh`（Task 2 的 Files 段已补）。
+- Task 3 台账 §G-1 登记的「产物目录三处不一致」由本轮**裁决并落地**（见 F-1），不再作为遗留。
+- ⚠️ **Task 3 与 Task 4 的缺陷台账编号都用了 `D-01` 起的裸编号**（分属两个 Task 的台账），
+  合并 P6 Task 4 分支时需要重编号（Task 3 → `D3-*`、Task 4 → `D4-*`）——
+  这是**合并时要处理的事**，本轮不动（Task 4 的台账在另一个分支上）。

@@ -27,7 +27,7 @@ User=__RUN_USER__
 Group=__RUN_USER__
 WorkingDirectory=__APP_DIR__
 
-# 环境文件：PORT / DATA_DIR / SESSION_TTL_DAYS / NODE_ENV
+# 环境文件：PORT / DATA_DIR / SESSION_TTL_DAYS / SESSION_ABSOLUTE_TTL_DAYS / NODE_ENV
 # ⛔ 这里不放任何口令：口令只在初始化管理员时用一次，不落盘。
 EnvironmentFile=-/etc/heikesong/platform.env
 
