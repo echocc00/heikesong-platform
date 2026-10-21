@@ -28,6 +28,7 @@ import { getLeaderboard, getRollingLeaderboard } from './services/leaderboard.js
 import { getPerformanceCard } from './services/performance-card.js';
 import { getTeamTier, getTierBoard } from './services/tier.js';
 import { listEditions, getEdition } from './db/repo/editions.js';
+import { writePidFile, removePidFile } from './runtime/pidfile.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -415,6 +416,11 @@ if (isMain) {
 
   const { rules, version } = loadRules(rulesDir);
   const { db, close } = openDatabase({ dataDir });
+  // ── P6：写 pid 文件 ──────────────────────────────────────────
+  // 用途：让「恢复前必须先停服务」这条约束**可被机器检查**（scripts/restore.js 读它）。
+  // 依据：设计文档 §14.2【决策】恢复前置约束。
+  writePidFile(dataDir);
+  // ────────────────────────────────────────────────────────────
   applyMigrations(db, migrationsDir);
   const app = createApp({ db, rules, webDir });
 
@@ -428,6 +434,9 @@ if (isMain) {
   for (const sig of ['SIGINT', 'SIGTERM']) {
     process.on(sig, () => {
       server.close(() => {
+        // ── P6：退出前删 pid 文件（否则留下陈旧 pid）─────────────
+        removePidFile(dataDir);
+        // ────────────────────────────────────────────────────────
         close();
         process.exit(0);
       });

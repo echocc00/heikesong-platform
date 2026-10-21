@@ -180,6 +180,13 @@ platform/package.json               scripts 增加 backup / restore / build:demo
 - Test: `platform/test/backup.test.js`
 - Test: `platform/test/restore.test.js`
 
+> **【2026-10-21 实施补记】** 规格自带的 **8 个用例逐字保留**；实施阶段**追加 10 个判别性用例**
+> （保留策略的「份数 ∪ 天数」语义、`backupDatabase` 自己套用策略、命令行入口可执行、
+> `-wal`/`-shm` 恢复后**立刻**清理、旧库必须真留在磁盘、临时文件必须清干净、
+> 「能打开但完整性不通过」的备份、pid 文件内容损坏、pid 文件指向已退出进程、
+> 服务启动/退出写删 pid 文件、真实生产 schema 备份往返）。
+> 逐条理由与实跑证据见文末「Task 1 实施台账（2026-10-21）」。
+
 **Interfaces:**
 - Consumes: `openDatabase({ dataDir, filename })`（P0 `src/db/sqlite.js`）
 - Produces:
@@ -204,14 +211,28 @@ platform/package.json               scripts 增加 backup / restore / build:demo
 `platform/test/backup.test.js`：
 
 ```javascript
+// platform/test/backup.test.js —— 备份脚本（sqlite.backup() API，不用 cp）
+//
+// 规则溯源：
+//   - 「备份用 sqlite.backup() API，不用 cp」→ 设计文档 §14.2【决策】+ SQLite 官方 backup.html
+//   - 「保留最近 keepCount 份 且 保留 keepDays 天内的」→ P6 计划 Global Constraints「保留策略」
+//   - 「备份文件名 = app-<UTC 时间戳>.db」→ 同上
+//
+// ⚠️ 本文件的核心用例是「WAL 模式下备份包含已提交但未 checkpoint 的事务」：
+//    它**同时**断言正反两面 —— backup() 拷到了那笔事务，而只 cp .db 的副本没拷到。
+//    只断言正面会退化成「跑通即算」；只断言反面则证明不了 backup() 做对了。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, existsSync, statSync, copyFileSync, writeFileSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import { openDatabase } from '../src/db/sqlite.js';
 import { backupDatabase, listBackups, pruneBackups, backupFileName } from '../scripts/backup.js';
+
+const here = dirname(fileURLToPath(import.meta.url));
 
 function tempDir(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -311,23 +332,144 @@ test('备份文件名按 UTC 时间戳命名，可按字典序排序（跨时区
   assert.ok(a < b, '文件名必须可字典序排序');
   assert.equal(backupFileName(new Date('2026-10-20T09:00:00Z')), 'app-20261020T090000Z.db');
 });
+
+// ── 判别性补充用例 ────────────────────────────────────────────
+// ⚠️ 上一条保留策略用例**区分不出两种算法**：
+//    「只按 keepCount 保留」与「keepCount ∪ keepDays 保留」在它那份数据上给出**完全相同**的结果
+//    （超期的 2 份同时也超份数；未超期的 3 份本来就在前 10 份里）。
+//    ⇒ 下面这条用「两种算法结果不同」的数据集，把语义钉死。
+test('保留策略是「份数 ∪ 天数」：没超天数的旧备份即使超出份数也必须保留', () => {
+  const dir = tempDir('hks-prune2-');
+  const now = new Date('2026-10-20T12:00:00Z');
+  const names = [];
+  // 3 份全部在 keepDays=7 之内，但 keepCount=1 ⇒ 只有「份数 ∪ 天数」才会全保留
+  for (let i = 0; i < 3; i += 1) {
+    const name = backupFileName(new Date(now.getTime() - i * 3600_000));
+    const p = join(dir, name);
+    writeFileSync(p, 'x');
+    const t = (now.getTime() - (i + 1) * 3600_000) / 1000;
+    utimesSync(p, t, t);
+    names.push(name);
+  }
+
+  const removed = pruneBackups(dir, { keepDays: 7, keepCount: 1, now });
+  assert.deepEqual(removed, [], '未超保留天数的备份一律保留（keepCount 只是下限，不是上限）');
+  assert.equal(listBackups(dir).length, 3, '三份都必须还在');
+
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('backupDatabase 自己套用保留策略，并报告页数与被清理的文件', async () => {
+  const dataDir = tempDir('hks-bkprune-');
+  const { db, close } = openDatabase({ dataDir });
+  db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)');
+  // ⚠️ 造一个**多轮迭代**的库（> 100 页 = backup() 的默认 rate），
+  //    否则 progress 回调一次都不触发，测不出「页数报的是总量还是剩余量」。
+  db.exec(`WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 2000)
+          INSERT INTO t (v) SELECT hex(randomblob(500)) FROM c`);
+  const pageCount = db.prepare('PRAGMA page_count').get().page_count;
+  assert.ok(pageCount > 100, `前置条件：库必须大于 100 页（实际 ${pageCount}）`);
+  close();
+
+  const backupDir = join(dataDir, 'backups');
+  const now = new Date();
+  // 第一份：20 天前（超 keepDays=7）→ 应被清掉
+  const old = await backupDatabase({
+    dataDir,
+    backupDir,
+    now: new Date(now.getTime() - 20 * 86400_000),
+  });
+  const t = (now.getTime() - 20 * 86400_000) / 1000;
+  utimesSync(old.path, t, t);
+  // 第二份：1 天前（未超天数，但会超出 keepCount=1）→ 必须保留
+  const recent = await backupDatabase({
+    dataDir,
+    backupDir,
+    now: new Date(now.getTime() - 86400_000),
+  });
+  const t2 = (now.getTime() - 86400_000) / 1000;
+  utimesSync(recent.path, t2, t2);
+
+  // 第三份触发清理
+  const third = await backupDatabase({
+    dataDir,
+    backupDir,
+    now,
+    keepCount: 1,
+    keepDays: 7,
+  });
+  assert.deepEqual(third.removed, [old.file], '超天数且超份数的旧备份必须被清掉');
+  assert.equal(existsSync(old.path), false, '旧备份文件必须已删除');
+  assert.equal(existsSync(recent.path), true, '未超天数的备份必须保留（哪怕超出份数）');
+  assert.equal(third.pages, pageCount, '备份必须报告源库的总页数（不是剩余页数）');
+  assert.ok(third.bytes > 0, '备份文件必须有内容');
+
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('命令行入口可执行：node scripts/backup.js 真的备份并打出完成信息', () => {
+  const dataDir = tempDir('hks-bk-cli-');
+  const { db, close } = openDatabase({ dataDir });
+  db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)');
+  close();
+
+  // ⚠️ 这条守住「脚本被当库 import 时不跑、但当命令跑时要真跑」这条边界：
+  //    isMain 判定一旦写错（例如 realpathSync 吃了 file:// URL 而抛 ENOENT），
+  //    命令行会**静默什么都不干、退出码 0** —— 没有这条用例就查不出来。
+  const res = spawnSync(
+    process.execPath,
+    ['--disable-warning=ExperimentalWarning', join(here, '..', 'scripts', 'backup.js')],
+    { encoding: 'utf8', env: { ...process.env, DATA_DIR: dataDir } },
+  );
+  assert.equal(res.status, 0, `备份脚本必须以 0 退出，实际输出：${res.stdout}${res.stderr}`);
+  assert.match(res.stdout, /\[backup\] 完成：app-\d{8}T\d{6}Z\.db/, `备份脚本必须打出完成信息，实际：${res.stdout}`);
+  const made = listBackups(join(dataDir, 'backups'));
+  assert.equal(made.length, 1, '命令行必须真的产出备份文件');
+
+  rmSync(dataDir, { recursive: true, force: true });
+});
 ```
 
 `platform/test/restore.test.js`：
 
 ```javascript
+// platform/test/restore.test.js —— 恢复脚本（先停服务 → 验完整性 → 换库 → 清 -wal/-shm）
+//
+// 规则溯源：
+//   - 「恢复前必须先停服务：脚本用 pid 文件 + systemd 探测，服务在跑 → 拒绝执行」
+//     → P6 计划 Global Constraints「恢复前置」+ 设计文档 §14.2
+//   - 「恢复后必须删掉旧的 -wal / -shm（它们属于旧库，留着会污染新库）」→ 同上
+//   - 「备份文件名 = app-<UTC 时间戳>.db」→ P6 计划 Global Constraints「保留策略」
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, existsSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, writeFileSync, readFileSync, readdirSync, openSync, writeSync, closeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { spawn, spawnSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import { openDatabase } from '../src/db/sqlite.js';
+import { applyMigrations, currentVersion } from '../src/db/migrate.js';
+import { createUser } from '../src/db/repo/users.js';
 import { backupDatabase } from '../scripts/backup.js';
 import { checkServiceState, verifyBackupFile, restoreDatabase } from '../scripts/restore.js';
 
+const here = dirname(fileURLToPath(import.meta.url));
+const migrationsDir = join(here, '..', 'db', 'migrations');
+
 function tempDir(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
+}
+
+/** 轮询直到条件成立或超时；返回条件的结果（超时返回 null）。 */
+async function waitFor(fn, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const v = await fn();
+    if (v) return v;
+    if (Date.now() > deadline) return null;
+    await new Promise((r) => setTimeout(r, 50));
+  }
 }
 
 async function makeBackup(dataDir) {
@@ -372,6 +514,14 @@ test('恢复后数据与备份一致，且旧的 -wal / -shm 被清掉', async (
   const result = restoreDatabase({ dataDir, backupFile: backup.path, now: new Date('2026-10-20T13:00:00Z') });
   assert.equal(result.ok, true, result.error ?? '');
 
+  // ⚠️ 判别性断言必须**紧接恢复之后**做：
+  //    规格里那条断言放在「新库打开并关闭之后」——可 SQLite 自己会在
+  //    打开时重建 -wal、关闭时删掉 -wal/-shm ⇒ 就算恢复**没删**旧 sidecar，
+  //    这条断言照样绿（实测：变异体 M18 存活）。放在恢复返回后立刻断言才判别。
+  assert.equal(existsSync(join(dataDir, 'app.db-wal')), false, '恢复后必须立刻删掉旧 -wal（它属于旧库）');
+  assert.equal(existsSync(join(dataDir, 'app.db-shm')), false, '恢复后必须立刻删掉旧 -shm（它属于旧库）');
+  assert.equal(existsSync(join(dataDir, 'app.db.restore.tmp')), false, '恢复成功后不得留下临时文件');
+
   const after = new DatabaseSync(join(dataDir, 'app.db'));
   const rows = after.prepare('SELECT v FROM t').all();
   after.close();
@@ -411,6 +561,182 @@ test('恢复前会留一份 .before-restore-<时间戳> 的旧库', async () => 
     result.steps.some((s) => s.includes('.before-restore-')),
     `恢复步骤里必须记录旧库留存，实际：${result.steps.join(' | ')}`,
   );
+  // ⚠️ 只看 steps 不够：步骤文本与磁盘上的文件是**两件事**。
+  //    变异体 M19（把 rename 换成 unlink）保留了步骤文本 ⇒ 只断言 steps 会漏。
+  const kept = readdirSync(dataDir).filter((f) => f.startsWith('app.db.before-restore-'));
+  assert.equal(kept.length, 1, `旧库必须以 .before-restore-<时间戳> 留在磁盘上，实际：${readdirSync(dataDir).join(', ')}`);
+  assert.ok(existsSync(join(dataDir, kept[0])), '留存的旧库必须真的有内容');
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+// ── 判别性补充：能打开 ≠ 完好 ────────────────────────────────
+// ⚠️ 规格里那条「备份文件损坏时拒绝恢复」用的是**根本不是 sqlite 的文件**——
+//    它在**打开**阶段就被拒 ⇒ 跳不跳过 integrity_check 都一样拒 ⇒ 不判别。
+//    这条用「能打开但页已损坏」的库，逼出 integrity_check 真的在干活。
+test('备份文件能打开但完整性检查不通过时也拒绝恢复（不能只看「打得开」）', async () => {
+  const dataDir = tempDir('hks-rs-corrupt-');
+  const p = join(dataDir, 'corrupt.db');
+  const db = new DatabaseSync(p);
+  db.exec('PRAGMA journal_mode = DELETE');
+  db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)');
+  db.exec(`WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 800)
+          INSERT INTO t (v) SELECT hex(randomblob(300)) FROM c`);
+  db.close();
+
+  // 把第 3 页整页清零：页头完好 ⇒ 文件**仍能打开**，但 integrity_check 报出坏页
+  const fd = openSync(p, 'r+');
+  writeSync(fd, Buffer.alloc(4096), 0, 4096, 4096 * 2);
+  closeSync(fd);
+
+  const opens = new DatabaseSync(p, { readOnly: true });
+  opens.close();
+
+  const check = verifyBackupFile(p);
+  assert.equal(check.ok, false, '完整性检查不通过必须判为不可用');
+  assert.notEqual(check.integrity, 'ok', 'integrity 字段必须如实报告检查结果');
+  assert.ok(check.error, '必须给出错误原因');
+
+  const result = restoreDatabase({ dataDir, backupFile: p, now: new Date('2026-10-20T13:00:00Z') });
+  assert.equal(result.ok, false, '有损坏的备份必须拒绝恢复');
+  assert.ok(result.error.includes('完整性') || result.error.includes('损坏') || result.error.includes('integrity'));
+
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+// ── 判别性 / 稳健性补充用例 ──────────────────────────────────
+test('校验备份文件后不在旁边留下 -wal / -shm 残留', async () => {
+  const dataDir = tempDir('hks-rs-side-');
+  const backup = await makeBackup(dataDir);
+  const check = verifyBackupFile(backup.path);
+  assert.equal(check.ok, true, check.error ?? '');
+  // ⚠️ 只读打开一个 WAL 标志的库，SQLite 会在文件旁建出 -wal / -shm 且关库后不删
+  //    （sqlite.org/wal.html）。保留策略只认 *.db ⇒ 这些残留永不被清理 ⇒ 备份目录无限膨胀。
+  assert.equal(existsSync(`${backup.path}-wal`), false, '校验不得在备份目录留下 -wal 残留');
+  assert.equal(existsSync(`${backup.path}-shm`), false, '校验不得在备份目录留下 -shm 残留');
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('pid 文件内容损坏时也拒绝恢复（拿不到「服务已停」的证据就保守拒绝）', async () => {
+  const dataDir = tempDir('hks-rs-badpid-');
+  const backup = await makeBackup(dataDir);
+  writeFileSync(join(dataDir, 'app.pid'), 'not-a-pid', 'utf8');
+  const state = checkServiceState({ dataDir });
+  assert.equal(state.running, true, 'pid 文件存在但内容不可解析 → 无法确认服务已停 → 必须判为在跑');
+  const result = restoreDatabase({ dataDir, backupFile: backup.path, now: new Date('2026-10-20T13:00:00Z') });
+  assert.equal(result.ok, false, '拿不到停服证据时必须拒绝恢复');
+  assert.ok(result.error.includes('服务'), `错误信息必须点明原因，实际：${result.error}`);
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('pid 文件指向已退出的进程时视为「服务未在跑」（陈旧残留不阻塞恢复）', async () => {
+  const dataDir = tempDir('hks-rs-stale-');
+  const backup = await makeBackup(dataDir);
+  // 起一个立刻退出的子进程，拿到一个**确定已死**的 pid
+  const dead = spawnSync(process.execPath, ['-e', 'process.exit(0)']);
+  assert.ok(dead.pid, '拿不到已退出子进程的 pid');
+  writeFileSync(join(dataDir, 'app.pid'), String(dead.pid), 'utf8');
+
+  const state = checkServiceState({ dataDir });
+  assert.equal(state.running, false, '进程已退出 → 不得判为在跑');
+  assert.equal(state.stale, true, '必须标记为陈旧残留');
+  assert.ok(state.reason.includes('pid'), '必须说明为什么判定服务没在跑');
+
+  const result = restoreDatabase({ dataDir, backupFile: backup.path, now: new Date('2026-10-20T13:00:00Z') });
+  assert.equal(result.ok, true, `陈旧 pid 不该阻塞恢复：${result.error ?? ''}`);
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('服务启动时写 pid 文件、收到 SIGTERM 后删除（restore 的停服探测靠它）', async () => {
+  const dataDir = tempDir('hks-rs-pid-');
+  const serverPath = join(here, '..', 'src', 'server.js');
+  let out = '';
+  const child = spawn(process.execPath, ['--disable-warning=ExperimentalWarning', serverPath], {
+    env: { ...process.env, DATA_DIR: dataDir, PORT: '0' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  child.stdout.on('data', (d) => { out += d.toString(); });
+  child.stderr.on('data', (d) => { out += d.toString(); });
+  try {
+    // ⚠️ 必须等到**真正开始监听**再往下走：
+    //    pid 文件是在 openDatabase 之后立刻写的（早于迁移与 listen），
+    //    若此时就发 SIGTERM，server.close() 可能落在 listen 之前 → 子进程以
+    //    ERR_SERVER_NOT_RUNNING 崩掉 → pid 文件不删 → 本用例变成随机失败。
+    const ready = await waitFor(() => out.includes('启动于'), 20000);
+    assert.ok(ready, `服务必须能启动（子进程输出：${out}）`);
+
+    const pidPath = join(dataDir, 'app.pid');
+    assert.ok(existsSync(pidPath), `服务启动后必须写 pid 文件（子进程输出：${out}）`);
+    const content = readFileSync(pidPath, 'utf8');
+    assert.equal(Number(content.trim()), child.pid, 'pid 文件必须写当前进程 pid');
+
+    const state = checkServiceState({ dataDir });
+    assert.equal(state.running, true, '服务在跑时必须判为在跑');
+
+    child.kill('SIGTERM');
+    await waitFor(() => child.exitCode !== null || child.signalCode !== null, 20000);
+    const gone = await waitFor(() => !existsSync(pidPath), 5000);
+    assert.ok(gone, `退出后必须删掉 pid 文件（子进程输出：${out}）`);
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+  }
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('真实生产 schema 的备份能往返：恢复后数据与 schema 版本都不变', async () => {
+  const dataDir = tempDir('hks-rs-real-');
+  // 用真实的迁移脚本建库（形状 = 真实写入方写出来的库）
+  const { db, close } = openDatabase({ dataDir });
+  applyMigrations(db, migrationsDir);
+  const version = currentVersion(db);
+  assert.ok(version > 0, '真实 schema 必须有版本号');
+  const created = createUser(db, { name: '备份测试', phone: '13800000001', password: 'pw-for-backup-test' });
+  close();
+
+  const backup = await backupDatabase({
+    dataDir,
+    backupDir: join(dataDir, 'backups'),
+    now: new Date('2026-10-20T12:00:00Z'),
+  });
+  const check = verifyBackupFile(backup.path);
+  assert.equal(check.ok, true, check.error ?? '');
+  assert.equal(check.schemaVersion, version, '备份必须带出真实 schema 版本（走 migrate.js 的 currentVersion）');
+
+  // 改库 → 再恢复
+  const again = openDatabase({ dataDir });
+  again.db.exec('DELETE FROM users');
+  again.close();
+
+  const result = restoreDatabase({ dataDir, backupFile: backup.path, now: new Date('2026-10-20T13:00:00Z') });
+  assert.equal(result.ok, true, result.error ?? '');
+
+  const after = openDatabase({ dataDir });
+  const user = after.db.prepare('SELECT name, phone FROM users WHERE id = ?').get(created.id);
+  const afterVersion = currentVersion(after.db);
+  after.close();
+  assert.ok(user, '恢复后真实用户必须还在');
+  assert.equal(user.phone, '13800000001');
+  assert.equal(afterVersion, version, '恢复后 schema 版本必须不变');
+
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('命令行入口可执行：node scripts/restore.js 真的恢复并打出成功信息', async () => {
+  const dataDir = tempDir('hks-rs-cli-');
+  const backup = await makeBackup(dataDir);
+
+  // ⚠️ 守住 isMain 判定这条边界：判定写错时命令会**静默什么都不干、退出码 0**。
+  const res = spawnSync(
+    process.execPath,
+    ['--disable-warning=ExperimentalWarning', join(here, '..', 'scripts', 'restore.js')],
+    { encoding: 'utf8', env: { ...process.env, DATA_DIR: dataDir } },
+  );
+  assert.equal(res.status, 0, `恢复脚本必须以 0 退出，实际输出：${res.stdout}${res.stderr}`);
+  assert.match(res.stdout, /\[restore\] 成功/, `恢复脚本必须打出成功信息，实际：${res.stdout}`);
+  assert.ok(
+    readdirSync(dataDir).some((f) => f.startsWith('app.db.before-restore-')),
+    '命令行恢复也必须留存旧库',
+  );
+
   rmSync(dataDir, { recursive: true, force: true });
 });
 ```
@@ -482,11 +808,11 @@ export function isProcessAlive(pid) {
 // ⚠️ WAL 模式下只 cp .db 不 cp -wal 会丢数据：已提交但未 checkpoint 的事务还在 WAL 文件里。
 //   backup() 拷贝的是【逻辑库】的页，所以这些事务会被包含进去。
 // ✅ 可以在服务运行中执行（只加读锁，不阻塞写入）。
-import { DatabaseSync, backup } from 'node:sqlite';
-import { mkdirSync, readdirSync, statSync, unlinkSync, existsSync } from 'node:fs';
-import { join, basename } from 'node:path';
+import { backup } from 'node:sqlite';
+import { mkdirSync, readdirSync, statSync, unlinkSync, existsSync, realpathSync } from 'node:fs';
+import { join, basename, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { dirname } from 'node:path';
+import { openDatabase } from '../src/db/sqlite.js';
 
 export const BACKUP_PREFIX = 'app-';
 export const BACKUP_SUFFIX = '.db';
@@ -551,15 +877,26 @@ export async function backupDatabase({
   if (!existsSync(sourcePath)) throw new Error(`源库不存在：${sourcePath}`);
 
   const target = join(outDir, backupFileName(now));
-  const source = new DatabaseSync(sourcePath);
+  // ⚠️ 走 openDatabase 而不是裸 new DatabaseSync：
+  //   ① 本 Task 的接口契约写明「Consumes: openDatabase({ dataDir, filename })」；
+  //   ② openDatabase 带 busy_timeout=5000 —— 服务运行中备份时对 SQLITE_BUSY 有退避
+  //      （WAL 下读者不阻塞写者，但取锁仍可能撞上 SQLITE_BUSY）。
+  const { db, close } = openDatabase({ dataDir, filename });
   let pages = 0;
   try {
-    await backup(source, target, {
+    // ⚠️ progress 回调的真实签名是**一个对象** { totalPages, remainingPages }
+    //   （Node v22 的 node:sqlite 实测），不是 (db, copied)；
+    //   而且它只在【多轮迭代】时触发 —— 库小到一次迭代就拷完时根本不触发。
+    //   ⇒ 取 totalPages 当页数；一次都没触发时回落到源库 PRAGMA page_count。
+    await backup(db, target, {
       rate: 100,
-      progress: (_db, copied) => { pages = copied; },
+      progress: (info) => { pages = info.totalPages; },
     });
+    if (!pages) {
+      pages = db.prepare('PRAGMA page_count').get().page_count;
+    }
   } finally {
-    source.close();
+    close();
   }
 
   const st = statSync(target);
@@ -586,7 +923,20 @@ function parseArgs(argv) {
 
 const here = dirname(fileURLToPath(import.meta.url));
 
-const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+// ⚠️ 符号链接入口：Node 会把主入口 realpath 化，import.meta.url 是**真实路径**，
+//    而 process.argv[1] 是**链接路径** → 字符串全等为假 → 脚本静默不执行、退出码 0。
+//    与 src/server.js 的同一处判定保持一致（两边都 realpath 再比）。
+//    ⚠️ realpathSync 吃的是**路径**，不是 file:// URL —— 必须先 fileURLToPath
+//    （实测：直接 realpathSync(import.meta.url) 抛 ENOENT ⇒ isMain 恒假 ⇒
+//      命令行跑起来什么都不干、退出码 0）。
+const isMain = (() => {
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+})();
 if (isMain) {
   const args = parseArgs(process.argv.slice(2));
   const dataDir = args['data-dir'] || process.env.DATA_DIR || join(here, '..', 'data');
@@ -674,11 +1024,13 @@ export function currentVersion(db) {
 //    本脚本用【pid 文件 + systemd 探测】把这条约束变成机器检查。
 // ⚠️ 恢复后必须删掉旧的 -wal / -shm：它们属于旧库，留着会污染新库。
 import { DatabaseSync } from 'node:sqlite';
-import { copyFileSync, existsSync, renameSync, unlinkSync, readdirSync } from 'node:fs';
+import {
+  copyFileSync, existsSync, renameSync, unlinkSync, readdirSync, mkdirSync, realpathSync,
+} from 'node:fs';
 import { join, basename, dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { readPidFile, isProcessAlive } from '../src/runtime/pidfile.js';
+import { readPidFile, pidFilePath, isProcessAlive } from '../src/runtime/pidfile.js';
 import { currentVersion } from '../src/db/migrate.js';
 
 /** 列出备份文件（新 → 旧）：文件名是 UTC 时间戳，字典序倒排即时间倒序。 */
@@ -692,13 +1044,20 @@ function listBackupFiles(dir) {
 }
 
 /** 服务是否还在跑。优先看 pid 文件（跨平台），Linux 上再兜底 systemd。 */
-export function checkServiceState({ dataDir, serviceName = 'heikesong' } = {}) {
+export function checkServiceState({ dataDir = './data', serviceName = 'heikesong' } = {}) {
   const pid = readPidFile(dataDir);
   if (pid && isProcessAlive(pid)) {
     return { running: true, reason: `pid 文件显示进程 ${pid} 仍在运行`, pid };
   }
   if (pid) {
     return { running: false, reason: `pid 文件存在但进程 ${pid} 已退出（可能是异常终止的残留）`, pid, stale: true };
+  }
+  // ⚠️ pid 文件在，但内容不是合法 pid（写坏了）→ 证明不了服务已停 → 保守判为「还在跑」。
+  //    依据：设计文档 §14.2【决策】恢复前必须先停服务 —— 这条是**安全闸**，
+  //    拿不到证据时必须拒绝，而不是当成「服务没在跑」。
+  //    运维确认服务确实停了，删掉这个 pid 文件即可继续。
+  if (existsSync(pidFilePath(dataDir))) {
+    return { running: true, reason: 'pid 文件存在但内容无法解析，无法确认服务已停止' };
   }
   if (process.platform === 'linux' && existsSync('/run/systemd/system')) {
     try {
@@ -713,9 +1072,22 @@ export function checkServiceState({ dataDir, serviceName = 'heikesong' } = {}) {
   return { running: false, reason: '未发现运行中的服务进程' };
 }
 
-/** 校验备份文件：能不能打开 + 完整性检查。 */
+/**
+ * 校验备份文件：能不能打开 + 完整性检查。
+ *
+ * ⚠️ 只读打开一个 WAL 标志的库时，SQLite 会在文件旁建出 `-wal` 与 `-shm`
+ *   （sqlite.org/wal.html：只读 WAL 库靠 wal-index 读，索引文件建在库文件旁）。
+ *   实测：readOnly 打开备份产物 → 留下 `xxx.db-wal`(0B) 与 `xxx.db-shm`(32KB)，
+ *   且关库后**不删**。而保留策略只认 `*.db` → 这些残留永不被清理 → 备份目录无限膨胀。
+ *   ⇒ 记下「打开前有没有」，关库后把【本次自己造出来的】删掉；
+ *     打开前就存在的 -wal（可能带真实数据）一律保留不动。
+ */
 export function verifyBackupFile(path) {
   if (!existsSync(path)) return { ok: false, integrity: 'missing', schemaVersion: null, error: `备份文件不存在：${path}` };
+  const walPath = `${path}-wal`;
+  const shmPath = `${path}-shm`;
+  const walBefore = existsSync(walPath);
+  const shmBefore = existsSync(shmPath);
   let db;
   try {
     db = new DatabaseSync(path, { readOnly: true });
@@ -727,6 +1099,7 @@ export function verifyBackupFile(path) {
       schemaVersion = null; // 备份里没有迁移表（还没 migrate 过）——不算损坏
     }
     db.close();
+    db = null;
     if (integrity !== 'ok') {
       return { ok: false, integrity: String(integrity), schemaVersion, error: `备份完整性检查未通过：${integrity}` };
     }
@@ -734,6 +1107,10 @@ export function verifyBackupFile(path) {
   } catch (err) {
     try { db?.close(); } catch { /* ignore */ }
     return { ok: false, integrity: 'unopenable', schemaVersion: null, error: `备份文件无法打开：${err.message}` };
+  } finally {
+    // 只删「本次打开造出来的」sidecar，绝不碰打开前就存在的 -wal（可能带真实数据）
+    if (!walBefore) { try { if (existsSync(walPath)) unlinkSync(walPath); } catch { /* ignore */ } }
+    if (!shmBefore) { try { if (existsSync(shmPath)) unlinkSync(shmPath); } catch { /* ignore */ } }
   }
 }
 
@@ -775,6 +1152,7 @@ export function restoreDatabase({
   // 4. 落到临时文件并再验一次
   const dbPath = join(dataDir, filename);
   const tmpPath = `${dbPath}.restore.tmp`;
+  mkdirSync(dataDir, { recursive: true });
   copyFileSync(backupPath, tmpPath);
   const tmpCheck = verifyBackupFile(tmpPath);
   if (!tmpCheck.ok) {
@@ -806,7 +1184,20 @@ export function restoreDatabase({
 
 const here = dirname(fileURLToPath(import.meta.url));
 
-const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+// ⚠️ 符号链接入口：与 src/server.js 同一处判定（两边都 realpath 再比）——
+//    见 src/server.js 的注释：Node 会把主入口 realpath 化，
+//    而 process.argv[1] 保留链接路径 → 字符串全等为假 → 脚本静默不执行。
+// ⚠️ realpathSync 吃的是**路径**，不是 file:// URL —— 必须先 fileURLToPath
+//    （实测：直接 realpathSync(import.meta.url) 抛 ENOENT ⇒ isMain 恒假 ⇒
+//      命令行跑起来什么都不干、退出码 0）。
+const isMain = (() => {
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+})();
 if (isMain) {
   const args = process.argv.slice(2);
   const dataDir = process.env.DATA_DIR || join(here, '..', 'data');
@@ -823,25 +1214,56 @@ if (isMain) {
 
 - [ ] **Step 7: 修改 `src/server.js`（写 pid 文件）**
 
-在 `src/server.js` 的 `isMain` 分支里，`openDatabase` 之后加：
+在 `src/server.js` 里加三处（**每处都是 `src/server.js` 里的连续片段**，可逐字 diff）：
+
+`src/server.js` —— ① 顶部 import（与其它 import 放在一起）：
 
 ```javascript
 import { writePidFile, removePidFile } from './runtime/pidfile.js';
-// …（在 openDatabase 之后）
-  writePidFile(dataDir);
-// …（在 SIGINT / SIGTERM 处理里，close() 之前）
-  removePidFile(dataDir);
 ```
+
+`src/server.js` —— ② `isMain` 分支里，`openDatabase` 之后（**写 pid 文件**：让「恢复前先停服务」可被机器检查）：
+
+```javascript
+  const { db, close } = openDatabase({ dataDir });
+  // ── P6：写 pid 文件 ──────────────────────────────────────────
+  // 用途：让「恢复前必须先停服务」这条约束**可被机器检查**（scripts/restore.js 读它）。
+  // 依据：设计文档 §14.2【决策】恢复前置约束。
+  writePidFile(dataDir);
+  // ────────────────────────────────────────────────────────────
+  applyMigrations(db, migrationsDir);
+```
+
+`src/server.js` —— ③ `SIGINT` / `SIGTERM` 处理里，`close()` 之前（**删 pid 文件**：否则留下陈旧 pid）：
+
+```javascript
+      server.close(() => {
+        // ── P6：退出前删 pid 文件（否则留下陈旧 pid）─────────────
+        removePidFile(dataDir);
+        // ────────────────────────────────────────────────────────
+        close();
+        process.exit(0);
+      });
+```
+
+> ⚠️ **这三处刻意写成彼此独立、可分离的小改动**：`src/server.js` 在 P4 阶段还有审计路由的改动，
+> 两边将来合并时会在同一文件冲突。三处都带 `── P6：… ──` 注释边界，冲突时按边界取即可。
 
 - [ ] **Step 8: 运行测试确认通过**
 
 Run: `cd platform && node --test test/backup.test.js test/restore.test.js`
-Expected: PASS（backup 4 个用例 + restore 4 个用例全过）
+Expected: PASS（backup **7** 个用例 + restore **11** 个用例 = **18** 个全过）
+
+> 规格自带的 8 个用例**逐字保留**；另追加 10 个判别性用例（理由见文末 Task 1 实施台账 D-05）。
 
 - [ ] **Step 9: 实跑一次备份与恢复**
 
-Run: `cd platform && node scripts/migrate.js && node scripts/seed.js && node scripts/backup.js`
+Run: `cd platform && node scripts/migrate.js && ADMIN_PASSWORD='<你的口令>' node scripts/seed.js && node scripts/backup.js`
 Expected: 输出 `[backup] 完成：app-<时间戳>.db（… 字节，… 页）`，且 `data/backups/` 下出现一个 `.db` 文件
+
+> ⚠️ 规格原命令 `node scripts/seed.js` **不带 `ADMIN_PASSWORD` 会 fail-fast 拒绝**
+> （`scripts/seed.js` 明写「不提供默认口令」）→ 整条 `&&` 链在此中断，后面的备份根本没跑。
+> 实跑证据见文末 Task 1 实施台账 D-06。
 
 Run: `cd platform && node scripts/restore.js && node -e "const{DatabaseSync}=require('node:sqlite');const db=new DatabaseSync('./data/app.db');console.log(db.prepare('SELECT COUNT(*) n FROM users').get().n);db.close();"`
 Expected: 输出一个正整数（恢复后库可正常打开读表）
@@ -849,9 +1271,12 @@ Expected: 输出一个正整数（恢复后库可正常打开读表）
 - [ ] **Step 10: 提交**
 
 ```bash
-cd platform && git add src/runtime scripts/backup.js scripts/restore.js src/db/migrate.js src/server.js test/backup.test.js test/restore.test.js
-git commit -m "feat(P6): 一致性备份与恢复脚本（sqlite.backup() API + 停服务前置检查）"
+cd platform && git add src/runtime/pidfile.js scripts/backup.js scripts/restore.js src/db/migrate.js src/server.js test/backup.test.js test/restore.test.js
+git commit -m "feat(P6): 一致性备份与恢复脚本（sqlite.backup() API + 停服务前置检查）" -- src/runtime/pidfile.js scripts/backup.js scripts/restore.js src/db/migrate.js src/server.js test/backup.test.js test/restore.test.js
 ```
+
+> ⚠️ 规格原命令的 `git commit` **不带 `-- <paths>`** —— 违反「先 `git add <paths>`，
+> 再 `git commit -m "…" -- <paths>`」这条纪律（`-m` 必须在 `--` 之前）。已按纪律补上。
 
 ---
 
@@ -4546,3 +4971,123 @@ git commit -m "test(P6): 全链路验收 + 跨平台可移植性验收"
    `listen 8080`、无 TLS、无 `server_name` 的 nginx server 块。本 Task 的 `nginx.conf` 是**正式形态**
    （域名 + TLS + 443），与计划「部署目标决策登记」一致。
 
+
+---
+
+## Task 1 实施台账（2026-10-21）
+
+> 本节是 Task 1（备份与恢复脚本）的实施记录：**规格缺陷清单**、处置方式、逐字回写位置、实跑证据、变异测试。
+> 纪律：本计划 Task 1 的 **6 个代码块 = 最终实现的逐字副本**
+> （核验命令：`node /tmp/p3fix/plan-blocks.mjs <plan> <platformDir>`）。
+>
+> **本 Task 的灵魂**（规格第 195–200 行）：备份用 `sqlite.backup()` API，**不用 `cp`**。
+> 测试**同时**证明两件事：① `backup()` 拷到的备份里**有**那笔「已提交但未 checkpoint」的事务；
+> ② 只 `cp .db` 的副本里**没有**。两条都是真断言（不是「跑通即算」）。
+
+### A. 实施方法（先跑后落盘）
+
+1. 把规格 Task 1 的代码块**原样抽到** `/tmp/p6-t1-scratch/platform`（一个字节都没改）。
+2. 先做 **node:sqlite `backup()` API 探针**（`/tmp/p6-t1-scratch/probe1..5.mjs`）—— 摸清四件事：
+   `progress` 回调的真实签名、`readOnly` 打开 WAL 库的副作用、`backup()` 对并发写者的容忍度、
+   「能打开但页已损坏」的库在 `integrity_check` 下的表现。
+3. 在副本上写实现 + 用例 → 全绿 → 才落盘到 `platform/`。
+4. 落盘后：全量测试、**规格原样实现对照**（缺陷实证）、变异测试、计划块逐字回写与核验、Step 9 实跑。
+
+### B. 规格缺陷清单
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| D-01 | **Important** | `backup()` 的 `progress` 回调**签名写错**：规格写 `(_db, copied)`，Node v22 的真实签名是**一个对象** `{ totalPages, remainingPages }`；而且该回调**只在多轮迭代时触发**（库小到一次迭代就拷完时根本不触发）→ 规格原样实跑 `pages` 恒为 **0** | 探针 `probe2.mjs`：回调收到 `[{totalPages:52,remainingPages:51}]`（`args.length===1`，参数类型 `object`）；探针 `probe1.mjs`（52 页 / `rate:100`）→ **回调 0 次触发**；规格原样实现的探针：`PROBE_PAGES=0 type=number` | 按真实签名取 `totalPages`；回调一次都没触发时回落到源库 `PRAGMA page_count`。规格原样的 `pages=0` 由此修掉 |
+| D-02 | **Important** | Task 1 的 **Interfaces 段明写**「Consumes: `openDatabase({ dataDir, filename })`（P0 `src/db/sqlite.js`）」，Step 4 的代码块却用 `new DatabaseSync(sourcePath)` 直连 —— **同一 Task 内自相矛盾**，且丢掉 `openDatabase` 提供的 `busy_timeout=5000`（服务运行中备份时对 `SQLITE_BUSY` 没有退避） | 计划原文：Task 1「**Interfaces:** - Consumes: `openDatabase({ dataDir, filename })`」 vs Step 4 代码块 `const source = new DatabaseSync(sourcePath);` | 改用 `openDatabase({ dataDir, filename })`，与 Interfaces 段对齐。⚠️ **这一条没有测试能区分**（两条路径在本 Task 覆盖的场景里行为等价）—— 属**接口契约对齐**而非行为修复，已在变异结果里显式标注 |
+| D-03 | **Important** | `verifyBackupFile` 用 `readOnly: true` 打开 WAL 标志的库时，SQLite **会在文件旁建出** `-wal`(0B) 与 `-shm`(32KB)，且**关库后不删** → 备份目录每次校验多两个文件；保留策略只认 `*.db` ⇒ 这些残留**永不被清理** ⇒ 备份目录无限膨胀；`restoreDatabase` 的临时文件旁也会留 `app.db.restore.tmp-wal/-shm` | 探针 `probe4.mjs`：`readOnly 打开备份后: out.db(8192B) out.db-shm(32768B) out.db-wal(0B)`；规格原样实现的探针：`BEFORE=app-….db` → `AFTER=app-….db,app-….db-shm,app-….db-wal` | `verifyBackupFile` 记下「打开前 sidecar 存不存在」，关库后只删**本次自己造出来的**（打开前就存在的 `-wal` 可能带真实数据，一律不动） |
+| D-04 | **Important** | `checkServiceState` 把「pid 文件存在但内容不是合法 pid」当成「服务没在跑」→ **拿不到「服务已停」的证据却放行恢复**，与「恢复前必须先停服务」这条安全闸的 fail-safe 意图相反 | `readPidFile` 对非法内容返回 `null`（规格原样），`checkServiceState` 随即落到「未发现运行中的服务进程」 | 补一条：pid 文件在但内容不可解析 ⇒ `running: true`（保守拒绝），错误信息点明原因。运维确认服务已停后删掉该 pid 文件即可继续 |
+| D-05 | **Important** | 规格自带的 8 个用例里有 **3 条不判别**（把实现改坏它们照样绿）：① 「恢复后旧 `-wal`/`-shm` 被清掉」的断言放在**新库打开并关闭之后** —— 可 SQLite 自己会在打开时重建 `-wal`、关闭时删掉 `-wal`/`-shm` ⇒ 就算恢复**根本没删**也照样绿；② 「恢复前会留一份 `.before-restore-`」只断言 `steps` **文本**、不查**磁盘**（把 `rename` 换成 `unlink` 也照样绿）；③ 「备份文件损坏时拒绝恢复」用的是**根本不是 sqlite 的文件** ⇒ 它在**打开**阶段就被拒 ⇒ 跳不跳过 `integrity_check` 都一样拒 | 变异实测：M18（不删 `-wal`/`-shm`）**存活**、M19（不留存旧库）**存活**、M21（跳过 `integrity_check`）**存活** | 规格的 8 个用例**逐字保留**；另**追加 10 个判别性用例**：`-wal`/`-shm` **紧接恢复后**就断言、旧库必须**真在磁盘上**、临时文件必须清干净、**能打开但页已损坏**的备份（清零第 3 页 → `integrity_check` 报 `btreeInitPage() returns error code 11` 而**不抛错**，见探针 `probe5.mjs` 策略 A）、命令行入口可执行、保留策略的「份数 ∪ 天数」语义、真实生产 schema 往返等。三个存活体由此被杀 |
+| D-06 | Minor | Step 9 的实跑命令 `node scripts/seed.js` **不带 `ADMIN_PASSWORD`** → `scripts/seed.js` fail-fast 拒绝（「不提供默认口令」）→ 整条 `&&` 链在此中断，**备份根本没跑** | 实跑输出：`缺少环境变量 ADMIN_PASSWORD，拒绝创建管理员账号（不提供默认口令）。` | Step 9 的命令补上 `ADMIN_PASSWORD='<你的口令>'` 并写明原因。⚠️ 种子脚本的 fail-fast 设计**不改**（不提供默认口令是对的） |
+| D-07 | Minor | Step 10 的 `git commit` **不带 `-- <paths>`** —— 违反「先 `git add <paths>`，再 `git commit -m "…" -- <paths>`」这条纪律 | 计划 Step 10 原文 | 补上 `-- <paths>`（`-m` 仍在 `--` 之前） |
+| D-08 | Minor | 两个脚本的 `isMain` 判定照抄「`fileURLToPath(import.meta.url) === process.argv[1]`」：**符号链接入口会静默不执行、退出码 0**（`src/server.js` 的注释里已记录这个坑并改用 realpath 判定） | `src/server.js` 注释原文：「Node 会把主入口 realpath 化，import.meta.url 是真实路径，而 process.argv[1] 是链接路径 → 字符串全等为假 → 服务器静默不启动、退出码 0」 | 沿用 `src/server.js` 的 realpath 判定。⚠️ 实施时**第一版漏了 `fileURLToPath`** —— `realpathSync()` 吃的是**路径**不是 `file://` URL，直接传 `import.meta.url` 会抛 ENOENT ⇒ `isMain` 恒假 ⇒ **命令行跑起来什么都不干、退出码 0**。是 Step 9 实跑抓到的（`[backup] 完成：…` 一行都没打、`data/backups/` 没生成）。已修，并补两条「命令行入口可执行」的用例守住（M25/M26/M27 三个变异体被杀） |
+| D-09 | Minor | `restoreDatabase` 在 `dataDir` 不存在时 `copyFileSync` 抛 ENOENT（**恢复到新机器**的典型场景） | 代码走查 | 换库前 `mkdirSync(dataDir, { recursive: true })` |
+| D-10 | Minor | `checkServiceState({ dataDir })` 不传 `dataDir` 时 `join(undefined, 'app.pid')` 抛 TypeError | 代码走查 | 补默认值 `dataDir = './data'`（与 `restoreDatabase` 一致） |
+
+### C. 逐字回写位置（本轮改动的计划代码块）
+
+| 计划位置 | 改动 |
+|---|---|
+| Task 1 Files 段的 Test 两行之后 | 追加「实施补记」（8 个用例逐字保留 + 追加 10 个判别性用例） |
+| Task 1 Step 1 的 `platform/test/backup.test.js` 代码块 | 整体回写（规格 4 个用例逐字保留 + 追加 3 个判别性用例） |
+| Task 1 Step 1 的 `platform/test/restore.test.js` 代码块 | 整体回写（规格 4 个用例逐字保留 + 追加 7 个判别性用例） |
+| Task 1 Step 3 的 `src/runtime/pidfile.js` 代码块 | **未改**（与实现逐字一致） |
+| Task 1 Step 4 的 `scripts/backup.js` 代码块 | 整体回写（D-01 progress 签名、D-02 openDatabase） |
+| Task 1 Step 5 的 `src/db/migrate.js` 片段 | **未改**（追加块与实现逐字一致） |
+| Task 1 Step 6 的 `scripts/restore.js` 代码块 | 整体回写（D-03 sidecar、D-04 pid 坏内容、D-09/D-10） |
+| Task 1 Step 7 的 `src/server.js` 三处片段 | 整体回写（D-08 realpath 判定；写成三处独立可分离的小改动） |
+| Task 1 Step 8 的 Expected | 改成实跑数字（backup 7 + restore 11 = 18） |
+| Task 1 Step 9 的命令 | 补 `ADMIN_PASSWORD`（D-06） |
+| Task 1 Step 10 的命令 | 补 `-- <paths>`（D-07） |
+
+### D. 实跑证据
+
+| 项 | 结果 |
+|---|---|
+| 全量测试（`node --disable-warning=ExperimentalWarning --test`，cwd 发现） | **841 / 841 全绿**（基线 823 + 本 Task 新增 18） |
+| 单文件（`--test test/backup.test.js test/restore.test.js`） | **18 / 18 全绿**（backup 7 + restore 11） |
+| Step 9 实跑（migrate → seed → backup → restore → 读表） | `[backup] 完成：app-20261021T070553Z.db（630784 字节，154 页）` → `[restore] 成功。请重新启动服务： systemctl restart heikesong` → `users = 6`（正整数） |
+| 规格原样实现对照（`/tmp/p6-mutate/t1-spec-baseline.mjs`：把计划里的代码块逐字装进副本，跑本次的用例） | **13 绿 / 3 红** —— 3 条红正是 D-01（页数）、D-03（sidecar 残留）、D-04（pid 坏内容）的判别点 |
+| 本 Task 的灵魂用例 | 「WAL 模式下备份包含已提交但未 checkpoint 的事务（而只 cp .db 会丢）」**同时**断言反例（只 cp `.db` 的副本 `COUNT=0`）与正例（`backup()` 的副本 `COUNT=1`） |
+
+### E. 变异测试（脚本 `/tmp/p6-mutate/t1.mjs`，指向**已落地**的测试文件）
+
+| 轮次 | 变异体总数 | KILLED | SURVIVED | 处置 |
+|---|---|---|---|---|
+| 第 1 轮 | 18 | 13 | 5 | 5 个存活体逐个定位为「**用例不判别**」（D-05）：M18/M19/M20/M21 + M02。逐个补判别性断言（`-wal`/`-shm` 紧接恢复后断言、旧库查磁盘、临时文件查磁盘、能打开但损坏的备份） |
+| 第 2 轮 | **27** | **26** | **1** | 追加 9 个变异体（M19/M20/M21 改锚点后重杀 + M22..M27：schema 版本、sidecar 清理、`currentVersion`、三个命令行入口），第 1 轮的 4 个存活体同时被杀 |
+
+**最终：27 个变异体，26 个 KILLED，1 个存活，0 个脚本错误（锚点全部唯一命中）。**
+
+**存活者 M02（规格原样的 `progress: (_db, copied)`）= 等价变异体**：
+本实现有 `PRAGMA page_count` 兜底 ⇒ 回调写错**不改变可观测结果**。**探针差分实证**：
+Node v22 的真实签名是**单对象** `{ totalPages, remainingPages }`（探针 `probe2.mjs` 输出
+`args.length 集合: [1]`、参数类型 `["object"]`）；而**规格原样实现**（无兜底）的实跑结果是
+`pages = 0`（探针 `PROBE_PAGES=0 type=number`）⇒ **缺陷 D-01 真实存在**，只是在本实现里被兜底掩盖。
+
+> ⚠️ 方法说明：每个变异体都**真的改变行为**（改的是有效代码，不是注释）；锚点命中数必须 `=== 1`，
+> 命中 0 次报「锚点失效」、命中 ≥2 次报「锚点不唯一」并要求加长上下文 —— 脚本不放过含糊。
+> 变异体清单见脚本里的 `MUTANTS` 数组。
+
+### F. 计划块逐字核验
+
+`node /tmp/p3fix/plan-blocks.mjs docs/superpowers/plans/2026-10-20-platform-P6-deploy-demo.md platform` →
+**Task 1 的 6 个块全部一致**：
+
+| 块 | 结果 |
+|---|---|
+| `test/backup.test.js` | 整文件块 ✅ 一致（217 行） |
+| `test/restore.test.js` | 整文件块 ✅ 一致（306 行） |
+| `src/runtime/pidfile.js` | 整文件块 ✅ 一致（43 行） |
+| `scripts/backup.js` | 整文件块 ✅ 一致（152 行） |
+| `scripts/restore.js` | 整文件块 ✅ 一致（193 行） |
+| `src/db/migrate.js`（Step 5 的追加片段） | 片段块 ✅（实现含此片段，12 行） |
+| `src/server.js`（Step 7 的三处 pid 片段） | 片段块 ✅ ×3（1 行 / 7 行 / 6 行） |
+
+> （同一次运行里 `scripts/audit-scan.js` / `web/index.html` / `web/app.js` 报「❌不一致 / 无实现」——
+> 那是 **Task 3/4/5/6** 的块，**在本 Task 之前就已经这样**，与本次改动无关。）
+
+### G. 遗留 / 需上游注意
+
+1. **`src/server.js` 的 P4 合并冲突面**：P4 阶段在同一文件加了审计路由 → 将来合并会冲突。
+   本 Task 的改动刻意写成**三处独立、带 `── P6：… ──` 注释边界**的小改动
+   （顶部 import 一行 / `openDatabase` 之后的 `writePidFile(dataDir)` 一行 /
+   `SIGINT`/`SIGTERM` 处理里的 `removePidFile(dataDir)` 一行），
+   冲突时**按边界取**即可。**本 Task 没有重建 `server.js`**（只在既有文件上追加）。
+2. **`package.json` 的 `backup` / `restore` npm scripts 未加**：计划的 File Structure 段列了
+   「package.json scripts 增加 backup / restore / build:demo / serve:demo」，但 **Task 1 的 Files 清单不含
+   package.json**（`build:demo` / `serve:demo` 属 Task 5/6）→ 为避免与别的 Task 抢同一个 JSON 对象，
+   本 Task **不动 package.json**。功能入口仍是 `node scripts/backup.js` / `node scripts/restore.js`
+   （`deploy/install.sh` 打印的正是这条命令）。
+3. **Task 2 台账 G-1「`scripts/backup.js` 尚未落地」已由本 Task 解除**：
+   `install.sh` 里那条备份命令现在真的可执行（Step 9 实跑已验）。
+4. **`restoreDatabase` 不接受 `serviceName` 参数**（接口契约里没有）→ systemd 探测固定用 `heikesong`；
+   若将来服务改名，需要扩接口。
+5. **备份目录的 sidecar 清理依赖 `verifyBackupFile` 的兜底**：若有人绕过本脚本直接用别的工具打开备份文件，
+   仍可能留下 `-wal`/`-shm`（这是 SQLite 的行为，不是本 Task 可控的）。
+6. **`backupDatabase` 打开源库用 `openDatabase`**（D-02）⇒ 备份动作会把源库切到 WAL 模式
+   （对已经是 WAL 的库是 no-op，不取锁）。
