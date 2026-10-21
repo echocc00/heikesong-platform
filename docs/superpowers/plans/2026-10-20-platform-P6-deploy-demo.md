@@ -2503,6 +2503,13 @@ git commit -m "feat(P6): 发布前扫描闸接发布产物 + 更正语境豁免 
 - Create: `platform/web/seed/demo-data.json`
 - Test: `platform/test/demo-seed.test.js`
 
+> **【2026-10-21 实施补记 · Task 4】** 规格的 **9 个用例逐字保留**（文件头追加 4 行领域层
+> import + 溯源注释）；另**追加 11 个判别性用例** —— 规格的 9 个用例全是**静态**检查
+> （结构、维度名、原始分相等、样本数、缺双签、自由命题、互评、expectations 齐不齐），
+> 它们证明「数据摆对了形状」，**证明不了「点一下计算，这条数据真的触发了那条分支」**。
+> 而本 Task 的灵魂恰恰是后者 ⇒ 追加的用例把种子喂给**真实领域层引擎**（`src/domain/*`），
+> 断言分支真的发生了。逐条理由、实跑证据与变异结果见文末「Task 4 实施台账（2026-10-21）」。
+
 **Interfaces:**
 - Consumes: 无（纯数据）
 - Produces: 一份**能触发每一条 trace 分支**的种子数据。结构见下，`web/api.demo.js` 按此结构读取。
@@ -2537,12 +2544,33 @@ git commit -m "feat(P6): 发布前扫描闸接发布产物 + 更正语境豁免 
 `platform/test/demo-seed.test.js`：
 
 ```javascript
+// platform/test/demo-seed.test.js —— 演示版种子数据（web/seed/demo-data.json）
+//
+// 规则溯源：
+//   - 「种子 = 每条 trace 分支的触发器」→ P6 计划 Task 4【本 Task 的灵魂】+ 设计文档 §12（trace 三件套）
+//   - 「z-score 宽严归一化 / 样本不足降级」→ S7 §3.1 + 设计文档 §6.2 Step 2 + 冲突裁决 C-05
+//   - 「去极值（该维度评委数 ≥5）」→ S7 §3.2 + 设计文档 §6.2 Step 3
+//   - 「R1 分赛道 / R2 双签 / R3 权重封顶 / R4 自由命题」→ S7 §2.4 + 设计文档 §6.2 Step 5
+//   - 「自评差异（高 → 书面说明 / 低 → 评委提问，阈值 10）」→ S7 §4.3 + R-JDG-13
+//   - 「破同分链（total → 加时陈述 → 互评 → 企业原始分 → 行为分 → 队伍编号）」→ S7 §3.3 + 冲突裁决 C-03
+//   - 「段位（里程碑计数 + 数据/原型 + 业务部门签字）」→ S10 §2.2 + S10 §2.1 + R-PTS-01~04
+//   - 「行为分只做垫底排序、不进总分」→ S10 §3.3 + R-PTS-08 + 设计文档 §11.1
+//
+// ⚠️ 本文件的核心用例是「同分队伍在引擎里总分【严格相等】」：
+//    规格原种子把两支队伍设计为同分，但**自评席**把它们拉开了（自评 95 触发「书面说明」
+//    → 对齐到评委分 81.28，另一支自评 81 不触发 → 保持 81）⇒ 总分差 0.0139 ⇒ 根本不同分。
+//    本文件断言的是**引擎算出来的总分**，不是种子里的自述 —— 种子说同分不算数，引擎算出来同分才算。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadRules } from '../src/config.js';
+// ── 实施补记 2026-10-21：追加的判别性用例要把种子喂给【真实领域层引擎】才断言得了分支 ──
+import { scoreStage } from '../src/domain/scoring.js';
+import { rankTeams } from '../src/domain/ranking.js';
+import { behaviorScore } from '../src/domain/behavior.js';
+import { computeTier } from '../src/domain/tier.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const seed = JSON.parse(readFileSync(join(here, '..', 'web', 'seed', 'demo-data.json'), 'utf8'));
@@ -2633,6 +2661,248 @@ test('expectations 覆盖了全部要演示的 trace 分支', () => {
   assert.equal(e.tiedTeams.length, 2, '必须正好是两支同分队伍');
   assert.deepEqual(Object.keys(e.tiers).sort(), seed.teams.map((t) => t.id).sort());
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 【实施补记 2026-10-21】规格的 9 个用例【逐字保留】+ 追加 11 个判别性用例。
+//
+// 为什么必须追加：规格的 9 个用例全是**静态**检查（结构、维度名、原始分相等、
+// 样本数、缺双签、自由命题、互评、expectations 齐不齐）—— 它们证明的是
+// 「数据摆对了形状」，**证明不了**「点一下计算，这条数据真的触发了那条分支」。
+// 而本 Task 的灵魂恰恰是后者：种子 = 每条 trace 分支的**触发器**。
+//
+// 追加的用例把种子喂给【真实的领域层引擎】（src/domain/*，纯函数、无 IO、无 Node 内置模块），
+// 断言分支真的发生了 —— 这样 Task 5 的 demo-engine.test.js 逐条断言 expectations 时，
+// 断言的是**引擎的输出**，不是种子里的一句自述。
+//
+// ⚠️ 输入构造（expandSubmissions / roster）与 Task 5 的 web/api.demo.js 同形；
+//    两边若漂移，Task 5 的 demo-parity.test.js 会当场判出来（那里比的是
+//    「演示适配器 vs 直接调 scoreStage」的一致性）。
+// ─────────────────────────────────────────────────────────────────────────────
+
+function expandSubmissions(s) {
+  const out = [];
+  for (const [judgeId, byTeam] of Object.entries(s.reviews ?? {})) {
+    for (const [teamId, byDim] of Object.entries(byTeam ?? {})) {
+      for (const [dimension, rawScore] of Object.entries(byDim ?? {})) {
+        out.push({ judgeId, teamId, dimension, rawScore: Number(rawScore) });
+      }
+    }
+  }
+  return out;
+}
+
+function roster(s) {
+  const pkgById = new Map((s.taskPackages ?? []).map((p) => [p.id, p]));
+  return (s.teams ?? []).map((t) => {
+    const pkg = pkgById.get(t.packageId) ?? {};
+    return {
+      teamId: t.id,
+      packageEnterpriseId: pkg.enterpriseId ?? null,
+      isFreeBrief: pkg.isFreeBrief === true,
+    };
+  });
+}
+
+function compute(s = seed) {
+  return scoreStage({
+    config: rules.scoring.final,
+    judges: (s.judges ?? []).map((j) => ({ judgeId: j.id, seat: j.seat })),
+    submissions: expandSubmissions(s),
+    enterpriseConfirmations: s.enterpriseConfirmations ?? [],
+    peerReviews: s.peerReviews ?? [],
+    teams: roster(s),
+    selfReviews: s.selfReviews ?? [],
+  });
+}
+
+function behaviorOf(s, teamId) {
+  return behaviorScore({
+    events: (s.behaviorEvents ?? []).filter((e) => e.teamId === teamId),
+    behaviorConfig: rules.behavior,
+  });
+}
+
+test('追加·同分队伍在引擎里总分严格相等（构造保证，不靠手算）', () => {
+  const out = compute();
+  const [a, b] = seed.expectations.tiedTeams;
+  const ta = out.teams.find((t) => t.teamId === a);
+  const tb = out.teams.find((t) => t.teamId === b);
+  assert.ok(ta && tb, '两支队伍都必须参与计算');
+  assert.equal(ta.total, tb.total, '同分队伍的总分必须完全相等');
+  assert.equal(ta.seatP, tb.seatP, '同分队伍的评委席分必须完全相等');
+  assert.equal(ta.seatE, tb.seatE, '同分队伍的企业席分必须完全相等');
+  // ⛔ 反例守卫：同分不能只看评委席 —— 自评席也算一席，
+  //    自评不一样就会把「同分」拉开（规格原种子就踩了这个坑）。
+  for (const d of Object.keys(ta.perDimension)) {
+    assert.equal(ta.perDimension[d].mean, tb.perDimension[d].mean, `维度 ${d} 的分必须相等`);
+  }
+});
+
+test('追加·破同分链真的在 peer 级把同分队伍分开（互评高者在前）', () => {
+  const out = compute();
+  const [a, b] = seed.expectations.tiedTeams;
+  const byTeam = {};
+  for (const row of out.teams) {
+    const peer = (seed.peerReviews ?? []).filter((p) => p.toTeamId === row.teamId);
+    const conf = (seed.enterpriseConfirmations ?? []).filter((c) => c.teamId === row.teamId);
+    byTeam[row.teamId] = {
+      peerScore: peer.length ? peer.reduce((s, p) => s + Number(p.score || 0), 0) / peer.length : undefined,
+      enterpriseRaw: conf.length ? conf.reduce((s, c) => s + Number(c.rawScore || 0), 0) / conf.length : undefined,
+      behaviorScore: behaviorOf(seed, row.teamId).total,
+    };
+  }
+  const ranked = rankTeams({
+    teams: out.teams.map((row) => ({
+      teamId: row.teamId, total: row.total, seatP: row.seatP, seatE: row.seatE,
+      peerScore: byTeam[row.teamId].peerScore,
+      enterpriseRaw: byTeam[row.teamId].enterpriseRaw,
+      behaviorScore: byTeam[row.teamId].behaviorScore,
+    })),
+    tiebreakChain: rules.tiebreak.chain,
+    tiebreakData: { isFinal: true, byTeam },
+    pointsConfig: rules.points,
+  });
+  const ra = ranked.ordered.find((r) => r.teamId === a);
+  const rb = ranked.ordered.find((r) => r.teamId === b);
+  assert.notEqual(ra.rank, rb.rank, '同分队伍必须被破同分链分开');
+  assert.ok(ra.rank < rb.rank, '互评分高的一方名次在前');
+  const used = ranked.applied.find((c) => c.key === seed.expectations.tiebreakSeparatedBy);
+  assert.ok(used, `破同分链里必须用到 ${seed.expectations.tiebreakSeparatedBy} 这一级`);
+  assert.ok(used.usedBy.includes(a) && used.usedBy.includes(b), '分开它们的那一级必须同时用到两支队伍');
+});
+
+test('追加·归一化降级真的发生（告警指向期望的维度与评委）', () => {
+  const out = compute();
+  const dim = seed.expectations.unnormalizedDimension;
+  const judge = seed.expectations.unnormalizedJudge;
+  const hit = out.warnings.find((w) => w.code === 'normalization_fallback' && w.dimension === dim);
+  assert.ok(hit, `必须出现维度 ${dim} 的归一化降级告警，实际告警：${JSON.stringify(out.warnings.map((w) => w.code))}`);
+  assert.ok(String(hit.message).includes(judge), `告警必须点名评委 ${judge}：${hit.message}`);
+  const agg = out.trace.normalization[dim];
+  assert.equal(agg.normalized, false, '该维度的归一化状态必须是「已降级」');
+  assert.ok(agg.judgeSampleSizes[judge] < rules.scoring.final.minSamplesForJudgeNormalization,
+    `评委 ${judge} 的样本数必须小于阈值`);
+  assert.equal(agg.judgeReasons[judge], 'judge_sample_too_small', '降级原因必须是样本不足');
+});
+
+test('追加·去极值真的发生（期望的维度上每个单元都 trimmed）', () => {
+  const out = compute();
+  const dims = new Set(seed.expectations.trimmedDimensions);
+  const steps = out.trace.steps.filter((s) => dims.has(s.dimension));
+  assert.ok(steps.length > 0, 'trace 里必须有去极值步骤');
+  for (const s of steps) {
+    assert.equal(s.trimmed, true, `${s.teamId} 的 ${s.dimension} 必须真的去极值`);
+    assert.ok(s.removed.max && s.removed.min, '必须记录被去掉的最高分与最低分评委');
+  }
+});
+
+test('追加·缺双签真的触发 R2 告警且该项按 0 分计', () => {
+  const out = compute();
+  const teamId = seed.expectations.missingDualSignatureTeam;
+  const hit = out.warnings.find((w) => w.code === 'R2_missing_dual_signature');
+  assert.ok(hit, '必须出现 R2_missing_dual_signature 告警');
+  assert.equal(hit.teamId, teamId, `告警必须指向 ${teamId}`);
+  const row = out.teams.find((t) => t.teamId === teamId);
+  assert.equal(row.seatE, 0, '缺双签的企业席分必须按 0 分计（权重保留）');
+});
+
+test('追加·自由命题真的触发 R4（企业项由评委「需求真实性」维度替代）', () => {
+  const out = compute();
+  const teamId = seed.expectations.freeBriefTeam;
+  const hit = out.warnings.find((w) => w.code === 'R4_free_brief_judge_scored');
+  assert.ok(hit, '必须出现 R4_free_brief_judge_scored 告警');
+  assert.equal(hit.teamId, teamId, `告警必须指向 ${teamId}`);
+  const row = out.teams.find((t) => t.teamId === teamId);
+  const substituteDim = rules.scoring.final.freeBrief.judgeDimension;
+  assert.ok(Number.isFinite(row.seatE) && row.seatE > 0, 'R4 生效时企业席分由评委维度替代，不能是 0');
+  assert.ok(
+    Math.abs(row.seatE - row.perDimension[substituteDim].mean) < 1e-9,
+    '企业席分必须等于替代维度的评委分',
+  );
+  assert.ok(
+    !out.warnings.some((w) => w.code === 'R4_substitute_no_scores'),
+    '替代维度有评委分，不应出现「替代维度无分」的告警',
+  );
+});
+
+test('追加·自评差异三条分流真的发生（书面说明 / 评委提问 / 阈值内不告警）', () => {
+  const out = compute();
+  const byCode = (code) => out.warnings.filter((w) => w.code === code);
+  const hi = byCode('self_eval_written_explanation');
+  const lo = byCode('self_eval_judge_question');
+  assert.equal(hi.length, 1, `「书面说明」分支必须恰好一支队（实际 ${hi.length}）`);
+  assert.equal(lo.length, 1, `「评委提问」分支必须恰好一支队（实际 ${lo.length}）`);
+  assert.equal(hi[0].teamId, seed.expectations.selfEvalWrittenExplanationTeam);
+  assert.equal(lo[0].teamId, seed.expectations.selfEvalJudgeQuestionTeam);
+  for (const t of seed.expectations.selfEvalWithinThresholdTeams) {
+    assert.ok(
+      !hi.some((w) => w.teamId === t) && !lo.some((w) => w.teamId === t),
+      `${t} 的自评与评委分差异在阈值内，不该告警`,
+    );
+  }
+});
+
+test('追加·自评对齐不加分：书面说明那支队的自评席分 = 评委席分（不是自评原分）', () => {
+  const out = compute();
+  const teamId = seed.expectations.selfEvalWrittenExplanationTeam;
+  const row = out.teams.find((t) => t.teamId === teamId);
+  const self = seed.selfReviews.find((r) => r.teamId === teamId);
+  assert.ok(self, `${teamId} 必须有自评记录`);
+  const selfSeat = row.perDimension.self_eval;
+  const judgeSide = row.perDimension[self.dimension];
+  assert.notEqual(selfSeat.mean, self.rawScore, '自评席分不能是自评原分（那样就变成加分项了）');
+  assert.equal(selfSeat.mean, judgeSide.mean, '自评席分必须对齐到评委席该维度的分');
+  assert.ok(selfSeat.mean < self.rawScore, '对齐只会把自评拉低，绝不会拉高（自评不得变成加分项）');
+});
+
+test('追加·缺自评的队伍：self_eval 维度没有分并告警（不静默当 0）', () => {
+  const out = compute();
+  const teamId = seed.expectations.missingSelfEvalTeam;
+  const hit = out.warnings.find((w) => w.code === 'dimension_no_scores' && w.teamId === teamId);
+  assert.ok(hit, `必须出现 ${teamId} 的缺分告警`);
+  assert.equal(hit.dimension, 'self_eval');
+  const row = out.teams.find((t) => t.teamId === teamId);
+  assert.equal(row.perDimension.self_eval.mean, null, '该维度没有分');
+  // 缺分维度必须被【剔除出分母】，而不是【静默当 0 分】（设计文档 §13 降级表）
+  let num = 0; let denAll = 0; let denPresent = 0;
+  for (const [key, v] of Object.entries(row.perDimension)) {
+    if (key === 'enterprise') continue;
+    denAll += v.weight;
+    if (v.mean != null) { num += v.weight * v.mean; denPresent += v.weight; }
+  }
+  assert.ok(Math.abs(row.seatP - num / denPresent) < 1e-9, '缺分维度必须被剔除出分母');
+  assert.ok(Math.abs(row.seatP - num / denAll) > 1e-9, '缺分维度不能被静默当 0 分');
+});
+
+test('追加·段位与 expectations.tiers 逐条一致（用 computeTier 复算）', () => {
+  for (const [teamId, tier] of Object.entries(seed.expectations.tiers)) {
+    const milestones = (seed.milestones ?? []).filter((m) => m.teamId === teamId);
+    const signoffs = (seed.signoffs ?? []).filter((s) => s.teamId === teamId);
+    const info = computeTier({ milestones, signoffs, ranksConfig: rules.ranks });
+    assert.equal(info.tier, tier, `${teamId} 的段位应为 ${tier}，实际 ${info.tier}`);
+  }
+});
+
+test('追加·行为分：证据合规才算分，且分值与 expectations 一致', () => {
+  for (const [teamId, expected] of Object.entries(seed.expectations.behaviorScores)) {
+    const b = behaviorOf(seed, teamId);
+    assert.equal(b.total, expected, `${teamId} 的行为分应为 ${expected}，实际 ${b.total}`);
+  }
+  const counted = seed.behaviorEvents.some((e) => behaviorOf(seed, e.teamId).items
+    .some((i) => i.type === e.type && i.counted));
+  assert.ok(counted, '至少要有一条行为事件真的拿到分（否则行为分支不可观测）');
+});
+
+test('追加·行为分不进入总分（分轨在算法层，不靠人的自觉）', () => {
+  const before = compute();
+  const bumped = {
+    ...seed,
+    behaviorEvents: seed.behaviorEvents.map((e) => ({ ...e, evidence: '{"repo":"r","version":"v","artifact":"a"}' })),
+  };
+  const after = compute(bumped);
+  const sum = (out) => out.teams.map((t) => `${t.teamId}:${t.total}`).sort();
+  assert.deepEqual(sum(after), sum(before), '行为分变化不得影响任何队伍的总分');
+});
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -2679,11 +2949,11 @@ Expected: FAIL —— `ENOENT: no such file or directory, open 'platform/web/see
     { "id": "t_epsilon", "name": "自由花队", "packageId": "tp_free", "captainId": "mba_captain", "memberIds": ["mba_captain", "demo_member_1"] }
   ],
   "reviews": {
-    "j_lenient": { "t_alpha": { "track_fit": 86, "innovation": 88, "feasibility": 84, "completeness": 85, "collaboration": 90 }, "t_beta": { "track_fit": 86, "innovation": 88, "feasibility": 84, "completeness": 85, "collaboration": 90 }, "t_gamma": { "track_fit": 74, "innovation": 70, "feasibility": 78, "completeness": 72, "collaboration": 75 }, "t_delta": { "track_fit": 80, "innovation": 82, "feasibility": 79, "completeness": 81, "collaboration": 78 }, "t_epsilon": { "track_fit": 70, "innovation": 66, "feasibility": 72, "completeness": 68, "collaboration": 70 } },
-    "j_strict": { "t_alpha": { "track_fit": 72, "innovation": 74, "feasibility": 70, "completeness": 73, "collaboration": 75 }, "t_beta": { "track_fit": 72, "innovation": 74, "feasibility": 70, "completeness": 73, "collaboration": 75 }, "t_gamma": { "track_fit": 60, "innovation": 58, "feasibility": 64, "completeness": 61, "collaboration": 62 }, "t_delta": { "track_fit": 66, "innovation": 68, "feasibility": 63, "completeness": 65, "collaboration": 64 }, "t_epsilon": { "track_fit": 56, "innovation": 52, "feasibility": 58, "completeness": 55, "collaboration": 57 } },
-    "j_mid1": { "t_alpha": { "track_fit": 80, "innovation": 81, "feasibility": 77, "completeness": 79, "collaboration": 83 }, "t_beta": { "track_fit": 80, "innovation": 81, "feasibility": 77, "completeness": 79, "collaboration": 83 }, "t_gamma": { "track_fit": 68, "innovation": 65, "feasibility": 70, "completeness": 66, "collaboration": 69 }, "t_delta": { "track_fit": 74, "innovation": 76, "feasibility": 72, "completeness": 75, "collaboration": 71 }, "t_epsilon": { "track_fit": 63, "innovation": 60, "feasibility": 65, "completeness": 61, "collaboration": 64 } },
-    "j_mid2": { "t_alpha": { "track_fit": 78, "innovation": 79, "feasibility": 76, "completeness": 77, "collaboration": 81 }, "t_beta": { "track_fit": 78, "innovation": 79, "feasibility": 76, "completeness": 77, "collaboration": 81 }, "t_gamma": { "track_fit": 67, "innovation": 64, "feasibility": 69, "completeness": 67, "collaboration": 68 }, "t_delta": { "track_fit": 73, "innovation": 75, "feasibility": 71, "completeness": 74, "collaboration": 70 }, "t_epsilon": { "track_fit": 62, "innovation": 59, "feasibility": 64, "completeness": 60, "collaboration": 63 } },
-    "j_cross": { "t_alpha": { "track_fit": 82, "innovation": 83, "feasibility": 80, "completeness": 81, "collaboration": 85 }, "t_beta": { "track_fit": 82, "innovation": 83, "feasibility": 80, "completeness": 81, "collaboration": 85 }, "t_gamma": { "track_fit": 71, "innovation": 69, "feasibility": 73, "completeness": 70, "collaboration": 72 }, "t_delta": { "track_fit": 77, "innovation": 79, "feasibility": 75, "completeness": 78, "collaboration": 76 }, "t_epsilon": { "track_fit": 66, "innovation": 63, "feasibility": 67, "completeness": 65, "collaboration": 67 } },
+    "j_lenient": { "t_alpha": { "innovation": 88, "feasibility": 84, "completeness": 85, "collaboration": 90 }, "t_beta": { "innovation": 88, "feasibility": 84, "completeness": 85, "collaboration": 90 }, "t_gamma": { "innovation": 70, "feasibility": 78, "completeness": 72, "collaboration": 75 }, "t_delta": { "innovation": 82, "feasibility": 79, "completeness": 81, "collaboration": 78 }, "t_epsilon": { "innovation": 66, "feasibility": 72, "completeness": 68, "collaboration": 70 } },
+    "j_strict": { "t_alpha": { "innovation": 74, "feasibility": 70, "completeness": 73, "collaboration": 75 }, "t_beta": { "innovation": 74, "feasibility": 70, "completeness": 73, "collaboration": 75 }, "t_gamma": { "innovation": 58, "feasibility": 64, "completeness": 61, "collaboration": 62 }, "t_delta": { "innovation": 68, "feasibility": 63, "completeness": 65, "collaboration": 64 }, "t_epsilon": { "innovation": 52, "feasibility": 58, "completeness": 55, "collaboration": 57 } },
+    "j_mid1": { "t_alpha": { "innovation": 81, "feasibility": 77, "completeness": 79, "collaboration": 83 }, "t_beta": { "innovation": 81, "feasibility": 77, "completeness": 79, "collaboration": 83 }, "t_gamma": { "innovation": 65, "feasibility": 70, "completeness": 66, "collaboration": 69 }, "t_delta": { "innovation": 76, "feasibility": 72, "completeness": 75, "collaboration": 71 }, "t_epsilon": { "innovation": 60, "feasibility": 65, "completeness": 61, "collaboration": 64 } },
+    "j_mid2": { "t_alpha": { "innovation": 79, "feasibility": 76, "completeness": 77, "collaboration": 81 }, "t_beta": { "innovation": 79, "feasibility": 76, "completeness": 77, "collaboration": 81 }, "t_gamma": { "innovation": 64, "feasibility": 69, "completeness": 67, "collaboration": 68 }, "t_delta": { "innovation": 75, "feasibility": 71, "completeness": 74, "collaboration": 70 }, "t_epsilon": { "innovation": 59, "feasibility": 64, "completeness": 60, "collaboration": 63 } },
+    "j_cross": { "t_alpha": { "innovation": 83, "feasibility": 80, "completeness": 81, "collaboration": 85 }, "t_beta": { "innovation": 83, "feasibility": 80, "completeness": 81, "collaboration": 85 }, "t_gamma": { "innovation": 69, "feasibility": 73, "completeness": 70, "collaboration": 72 }, "t_delta": { "innovation": 79, "feasibility": 75, "completeness": 78, "collaboration": 76 }, "t_epsilon": { "innovation": 63, "feasibility": 67, "completeness": 65, "collaboration": 67 } },
     "j_partial": { "t_gamma": { "feasibility": 90 } }
   },
   "enterpriseConfirmations": [
@@ -2705,9 +2975,10 @@ Expected: FAIL —— `ENOENT: no such file or directory, open 'platform/web/see
     { "fromTeamId": "t_beta", "toTeamId": "t_epsilon", "score": 61 }
   ],
   "selfReviews": [
-    { "teamId": "t_alpha", "dimension": "innovation", "rawScore": 95 },
+    { "teamId": "t_alpha", "dimension": "innovation", "rawScore": 85 },
+    { "teamId": "t_beta", "dimension": "innovation", "rawScore": 85 },
     { "teamId": "t_gamma", "dimension": "innovation", "rawScore": 50 },
-    { "teamId": "t_beta", "dimension": "innovation", "rawScore": 81 }
+    { "teamId": "t_delta", "dimension": "innovation", "rawScore": 95 }
   ],
   "milestones": [
     { "teamId": "t_alpha", "key": "problem_confirmed", "achieved": true, "countsTowardTier": true, "isDataOrPrototype": false },
@@ -2727,14 +2998,14 @@ Expected: FAIL —— `ENOENT: no such file or directory, open 'platform/web/see
     { "teamId": "t_gamma", "milestoneKey": "problem_confirmed", "department": "技术部", "revokedAt": null, "isBusinessDepartment": false }
   ],
   "behaviorEvents": [
-    { "id": "be_1", "teamId": "t_alpha", "type": "weekly_progress", "evidence": "第 1 周进度", "created_at": "2026-10-12T10:00:00Z" },
-    { "id": "be_2", "teamId": "t_alpha", "type": "weekly_progress", "evidence": "第 2 周进度", "created_at": "2026-10-19T10:00:00Z" },
-    { "id": "be_3", "teamId": "t_alpha", "type": "workshop_output", "evidence": "workshop 课后产出", "created_at": "2026-10-19T12:00:00Z" },
-    { "id": "be_4", "teamId": "t_alpha", "type": "first_demo", "evidence": "首次可运行 Demo", "created_at": "2026-10-20T09:00:00Z" },
-    { "id": "be_5", "teamId": "t_beta", "type": "weekly_progress", "evidence": "第 1 周进度", "created_at": "2026-10-12T10:00:00Z" },
-    { "id": "be_6", "teamId": "t_delta", "type": "weekly_progress", "evidence": "第 1 周进度", "created_at": "2026-10-12T10:00:00Z" },
-    { "id": "be_7", "teamId": "t_delta", "type": "milestone_on_time", "evidence": "按时交付里程碑", "created_at": "2026-10-18T10:00:00Z" },
-    { "id": "be_8", "teamId": "t_gamma", "type": "enterprise_meeting", "evidence": "完成一次企业对接会", "created_at": "2026-10-17T10:00:00Z" }
+    { "id": "be_1", "teamId": "t_alpha", "type": "weekly_progress", "evidence": "{\"repo\":\"https://demo.local/alpha\",\"version\":\"v0.1\",\"artifact\":\"第 1 周进度截图\"}", "created_at": "2026-10-12T10:00:00Z" },
+    { "id": "be_2", "teamId": "t_alpha", "type": "weekly_progress", "evidence": "{\"repo\":\"https://demo.local/alpha\",\"version\":\"v0.2\",\"artifact\":\"第 2 周进度截图\"}", "created_at": "2026-10-19T10:00:00Z" },
+    { "id": "be_3", "teamId": "t_alpha", "type": "workshop_output", "evidence": "{\"output\":\"workshop 课后产出：缺货预测 Demo\"}", "created_at": "2026-10-19T12:00:00Z" },
+    { "id": "be_4", "teamId": "t_alpha", "type": "first_demo", "evidence": "{\"version\":\"v0.3\",\"artifact\":\"首次可运行 Demo\"}", "created_at": "2026-10-20T09:00:00Z" },
+    { "id": "be_5", "teamId": "t_beta", "type": "weekly_progress", "evidence": "{\"repo\":\"https://demo.local/beta\",\"version\":\"v0.1\",\"artifact\":\"第 1 周进度截图\"}", "created_at": "2026-10-12T10:00:00Z" },
+    { "id": "be_6", "teamId": "t_delta", "type": "weekly_progress", "evidence": "{\"repo\":\"https://demo.local/delta\",\"version\":\"v0.1\",\"artifact\":\"第 1 周进度截图\"}", "created_at": "2026-10-12T10:00:00Z" },
+    { "id": "be_7", "teamId": "t_delta", "type": "milestone_on_time", "evidence": "{\"milestone\":\"pilot_contract\",\"onTime\":true}", "created_at": "2026-10-18T10:00:00Z" },
+    { "id": "be_8", "teamId": "t_gamma", "type": "enterprise_meeting", "evidence": "{\"enterpriseConfirmationId\":\"ec_gamma\"}", "created_at": "2026-10-17T10:00:00Z" }
   ],
   "expectations": {
     "tiedTeams": ["t_alpha", "t_beta"],
@@ -2743,8 +3014,12 @@ Expected: FAIL —— `ENOENT: no such file or directory, open 'platform/web/see
     "unnormalizedJudge": "j_partial",
     "missingDualSignatureTeam": "t_gamma",
     "freeBriefTeam": "t_epsilon",
-    "selfEvalWrittenExplanationTeam": "t_alpha",
+    "selfEvalWrittenExplanationTeam": "t_delta",
     "selfEvalJudgeQuestionTeam": "t_gamma",
+    "selfEvalWithinThresholdTeams": ["t_alpha", "t_beta"],
+    "missingSelfEvalTeam": "t_epsilon",
+    "trimmedDimensions": ["innovation", "feasibility", "completeness", "collaboration"],
+    "behaviorScores": { "t_alpha": 17, "t_beta": 2, "t_gamma": 5, "t_delta": 7, "t_epsilon": 0 },
     "tiers": { "t_alpha": "B", "t_beta": "C", "t_gamma": "A", "t_delta": "S", "t_epsilon": "D" }
   }
 }
@@ -2753,7 +3028,7 @@ Expected: FAIL —— `ENOENT: no such file or directory, open 'platform/web/see
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cd platform && node --test test/demo-seed.test.js`
-Expected: PASS（8 个测试全过：demo-seed.test.js 8）
+Expected: PASS（20 个测试全过：demo-seed.test.js 20）
 
 > **【2026-10-21 漂移审计修正 M-1】** **原来错在哪**：本计划一处「Expected: PASS」的条数声明
 > 与代码块里实际的 `test(` 数量不符 —— `demo-seed.test.js` 声明 **7** 实为 **8**。
@@ -2769,7 +3044,7 @@ Expected: PASS（8 个测试全过：demo-seed.test.js 8）
 
 ```bash
 cd platform && git add web/seed test/demo-seed.test.js
-git commit -m "feat(P6): 演示种子数据（每条 trace 分支都有触发器 + expectations 断言块）"
+git commit -m "feat(P6): 演示种子数据（每条 trace 分支都有触发器 + expectations 断言块）" -- web/seed test/demo-seed.test.js
 ```
 
 ---
@@ -5091,3 +5366,123 @@ Node v22 的真实签名是**单对象** `{ totalPages, remainingPages }`（探�
    仍可能留下 `-wal`/`-shm`（这是 SQLite 的行为，不是本 Task 可控的）。
 6. **`backupDatabase` 打开源库用 `openDatabase`**（D-02）⇒ 备份动作会把源库切到 WAL 模式
    （对已经是 WAL 的库是 no-op，不取锁）。
+
+---
+
+## Task 4 实施台账（2026-10-21）
+
+> 本节是 Task 4（演示版种子数据）的实施记录：**规格缺陷清单**、处置方式、逐字回写位置、实跑证据、变异测试、
+> 以及**种子覆盖了哪些分支**的逐条清单。
+> 纪律：本计划 Task 4 的 **2 个代码块 = 最终实现的逐字副本**
+> （核验命令：`node /tmp/p6-mutate/t4-verify-blocks.mjs`）。
+>
+> **本 Task 的灵魂**（规格第 2510–2514 行）：种子不是「好看的假数据」，而是**每一条 trace 分支的触发器** ——
+> 所以「种子里摆了一条数据」**不算数**，必须是**引擎真的因此触发了那条分支**才算数。
+> ⇒ 本 Task 的测试不只做静态检查，还要把种子喂给**真实领域层引擎**（`src/domain/*`），
+> 断言引擎的输出（总分 / 告警 / 破同分链 / 段位 / 行为分）。
+
+### A. 实施方法（先跑后落盘）
+
+1. 把规格 Task 4 的两个代码块**原样抽到** `/tmp/p6-t4/spec/`（一个字节都没改）。
+2. 在 `/tmp/p6-t4-scratch/platform`（platform 整树副本）上跑**规格自带用例** → 红 1 条（D-01 的实证）。
+3. 写引擎探针 `/tmp/p6-t4/probe.mjs`（输入构造复刻 Task 5 的 `runDemoCompute`）→ 把 D-02 / D-03 的
+   后果**量化**（同分两队总分差 0.0139、破同分链走不到 `peer`、行为分全 0）。
+4. 改种子 → 探针转绿（总分差 `0.0000000000`、`peer` 级分开、行为分 17/2/5/7/0）→ **才落盘**到 worktree。
+5. 落盘后：单文件 → 全量 → 变异测试 → 计划块回写与逐字核验。
+
+### B. 规格缺陷清单
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| D-01 | **Critical** | 种子的打分矩阵用了 `track_fit` —— 那是**初赛**维度（只在 `rules/scoring-initial.json` 里）；**规格自己的用例**却断言「维度必须在 `rules.scoring.final` 里」⇒ **规格的种子与规格自己的用例互相矛盾** | 规格原样副本上跑自带用例：`# tests 8 / # pass 7 / # fail 1`，红的那条是 `维度 track_fit 不在 rules.scoring.final 里（评委 j_lenient 队 t_alpha）`；引擎探针另证：`track_fit` 在 `trace.normalization` 里有、但在 `perDimension` 里**没有席位**（决赛根本不计这一维）⇒ 演示版会白展示一整维原始分 | 从种子里**删掉 `track_fit` 这一维**（其余 4 维原始分一字不动）⇒ 决赛 4 个评委席维度全部有数据、每维 5 个样本（= `minSamplesForJudgeNormalization`）⇒ 归一化不降级。**不改 `rules/scoring-final.json`**（权重表是 P1 定稿的规则，不属本 Task） |
+| D-02 | **Critical** | 规格声称 `tiedTeams: ["t_alpha","t_beta"]` 同分，但**引擎算出来根本不同分**：**自评席**把差距拉开了 —— `t_alpha` 自评 95（比评委 81 高 14 → 触发「书面说明」→ 自评分**对齐**到评委分 81.2788），`t_beta` 自评 81（d=0 → 不触发 → 自评席保留原分 81）⇒ 总分差 **0.0139378046** ⇒ 破同分链在**第一级 `total`** 就把它们分开，**永远走不到 `peer`** ⇒ 演示版最想展示的「同分 → 互评破同分」根本没发生 | 引擎探针（规格原样种子）：`t_alpha total=81.089336` / `t_beta total=81.075398`，`total 差 = 0.0139378046`；逐维差**只在** `self_eval`：`81.27875609118963 vs 80.99999999999999`；破同分链 `applied` 只有 `{"key":"total",…,"separated":true}`，**没有 `peer` 这一级** | 让两支同分队的**自评席完全一致**（都取阈值内的 85，d=+4 不告警）⇒ 六个席位分全相等 ⇒ 总分**严格相等**（差 `0.0000000000`）⇒ 破同分链在 `peer` 级分开（alpha 互评 71 > beta 59）。**「书面说明」分支改由 `t_delta` 承担**（自评 95 vs 评委 76，d=+19）⇒ `expectations.selfEvalWrittenExplanationTeam` 的**值**由 `t_alpha` 改为 `t_delta`（键名与结构未动） |
+| D-03 | **Important** | `behaviorEvents[].evidence` 是**纯文字**（"第 1 周进度"）—— ① 领域层 `parseEvidence` 只认 JSON 对象 ⇒ 纯文字一律 0 分（`evidence_not_json`）⇒ 行为分**全是 0**、行为分支不可观测；② 这种形状**真实写入方根本产不出来**：`src/services/behavior.js` 先用域函数校验证据，不合规直接 400 `EVIDENCE_REJECTED` 拒收 | 引擎探针（规格原样种子）：`t_alpha items=["weekly_progress:0(evidence_not_json)","weekly_progress:0(evidence_not_json)","workshop_output:0(evidence_not_json)","first_demo:10"]`；`src/services/behavior.js:40-47`（写入前校验）+ `:50`（`JSON.stringify` 落库） | 证据改成**合规的 JSON 串**（形状与真实写入方落库一致：TEXT 列里存 JSON 串），逐条满足 `rules/criteria.json` 的 `behaviorEvidence`（weekly_progress 要 `repo`+`version`+`artifact\|blocker`、workshop_output 要 `output`、enterprise_meeting 要 `enterpriseConfirmationId`）⇒ 行为分 17/2/5/7/0，并写进 `expectations.behaviorScores` 供机器校验 |
+| D-04 | Minor | 规格的 Step 5 提交命令**不带 `-- <paths>`** —— 违反「先 `git add <paths>`，再 `git commit -m "…" -- <paths>`」这条纪律 | 计划 Step 5 原文 | 补上 `-- web/seed test/demo-seed.test.js`（`-m` 仍在 `--` 之前） |
+| D-05 | Minor | 种子里的 `signatoryUserId`（`u_ent_retail` / `u_ent_mfg`）**在 `users` 列表里不存在** —— 企业签字人是企业侧身份，而种子的 `users` 结构表（`[{id,name,mbaStatus}]`）没有 org/role 字段可放 | 结构表原文 + 种子内容 | **不改**（登记为已知边界）：塞进 `users` 会被误当成平台用户（`mbaStatus` 只能是 mba/member/other），而 `users` 的用途是**组长硬门槛判定**；企业席只校验签字人 id **非空**（`enterprise-seat.js` 的 `!c.crossJudgeId \|\| !c.signatoryUserId`）⇒ 规则上成立 |
+| D-06 | Minor | `tp_free` 任务包下只有 1 支队伍，而 `rules/team-formation.json` 的 `teamsPerPackage.min = 2` | 种子 teams + 规则原文 | **不改**（登记为已知边界）：该门槛是**组队/认领任务包时**的闸，种子是「组队之后」的快照；且凑成 2 支要多一支队伍 ⇒ 连带改 `expectations.tiers`、互评、自评，收益远小于风险 |
+| D-07 | Minor | 共享核验脚本 `/tmp/p3fix/plan-blocks.mjs` 的 hint 正则 `(?:js\|html\|css\|sql\|json)` 里 `js` 排在 `json` 前面 ⇒ `web/seed/demo-data.json` 的 hint 被截成 `web/seed/demo-data.js` ⇒ 该块永远显示「无实现」 | `node /tmp/p3fix/plan-blocks.mjs <plan> <platform>` 输出：`行 3020 \| web/seed/demo-data.js \| 无实现` | 本 Task 另用 `/tmp/p6-mutate/t4-verify-blocks.mjs`（按**块正文内容锚点**定位，不靠 hint 猜文件名）逐字核验两个块 ⇒ 均 ✅。**共享脚本本身不动**（它是 P1/P3 的既有工具，不在本 Task 归属内） |
+
+### C. 逐字回写位置（本轮改动的计划代码块）
+
+| 计划位置 | 改动 |
+|---|---|
+| Task 4 Files 段 | 追加「实施补记」（规格 9 个用例逐字保留 + 追加 11 个判别性用例） |
+| Task 4 Step 1 的 `platform/test/demo-seed.test.js` 代码块 | **整体回写**（规格 9 个用例逐字保留 + 追加 11 个 + 文件头 4 行领域层 import 与溯源注释） |
+| Task 4 Step 3 的 `web/seed/demo-data.json` 代码块 | **整体回写**（D-01 删 `track_fit`、D-02 自评席对齐、D-03 证据合规、expectations 增补 4 键） |
+| Task 4 Step 4 的 Expected | `8` → **20**（实跑值） |
+| Task 4 Step 5 的命令 | 补 `-- <paths>`（D-04） |
+
+> 回写脚本 `/tmp/p6-mutate/t4-plan-rewrite.mjs`：**按块在文档里的位置升序**处理，
+> 锚点用**块正文内容**（不是行号猜测）定位，命中数必须 === 1，否则报错退出。
+
+### D. 实跑证据
+
+| 项 | 结果 |
+|---|---|
+| 基线全量（实施前，本 worktree） | **937 / 937**（936 通过 + 1 跳过 + 0 失败） |
+| 规格原样种子 + 规格自带用例 | **8 个用例：7 通过 / 1 失败**（红的那条即 D-01） |
+| 规格原样种子的引擎探针 | 同分两队总分差 **0.0139378046**；破同分链只到 `total` 级（**没有 `peer`**）；行为分全 0（D-02 / D-03） |
+| 修正后种子的引擎探针 | 同分两队总分差 **0.0000000000**（六个席位分逐维相等）；破同分链 `total` → **`peer`**（`usedBy:["t_alpha","t_beta"]`）；行为分 17 / 2 / 5 / 7 / 0 |
+| 单文件 `node --test test/demo-seed.test.js` | **20 / 20 全绿** |
+| 全量 `node --test` | **957 / 957**（956 通过 + 1 跳过 + 0 失败；基线 937 + 本 Task 20） |
+
+### E. 变异测试（脚本 `/tmp/p6-mutate/t4.mjs`，指向**已落地**的测试文件）
+
+| 轮次 | 变异体总数 | KILLED | SURVIVED | 脚本错误 | 处置 |
+|---|---|---|---|---|---|
+| 第 1 轮 | 22 | 21 | 1 | 0 | 存活者 M19「行为分事件被删光」**其实没改到行为**（把 `first_demo` 证据里的 `artifact` 字段删掉，而该类型**没有证据要求** ⇒ 仍计 10 分）⇒ 改成**真删掉那条事件**后重杀 |
+| 第 2 轮 | **24** | **24** | **0** | 0 | M19 改成**真删事件**（重杀）；M14 换成「同分两队的企业确认分不同」（原来那个没改到行为）；追加 M23（自由命题队改挂赛道）/ M24（某队没有互评） |
+
+**最终：24 个变异体，24 个 KILLED，0 个存活，0 个脚本错误（锚点全部唯一命中）。**
+
+> ⚠️ 方法说明：变异体**只改「某个分支的触发数据」**（种子是本 Task 的产物），
+> 每个变异体都**真的改变引擎行为**（改完后的总分 / 告警 / 破同分 / 段位 / 行为分至少有一项不同），
+> 且**只改有效数据**（不改注释）。锚点命中数必须 `=== 1`，命中 0 次报「锚点失效」、
+> 命中 ≥2 次报「锚点不唯一」—— 脚本不放过含糊。变异体清单见脚本里的 `MUTANTS` 数组，
+> 明细 JSON：`/tmp/p6-mutate/t4-results.json`。
+
+### F. 计划块逐字核验
+
+`node /tmp/p6-mutate/t4-verify-blocks.mjs` → **2/2 逐字一致**：
+
+| 块 | 结果 |
+|---|---|
+| `test/demo-seed.test.js` | 整文件块 ✅ 一致（359 行） |
+| `web/seed/demo-data.json` | 整文件块 ✅ 一致（110 行） |
+
+### G. 种子覆盖的分支清单（本 Task 的核心交付）
+
+| # | 分支（规则出处） | 种子里的哪条数据触发它 | `expectations` 里写了什么 | 引擎里的可观测结果（实跑） |
+|---|---|---|---|---|
+| 1 | **z-score 宽严归一化降级**（S7 §3.1 + C-05） | `j_partial` 只给 `t_gamma` 打了 `feasibility` 一项（样本数 1 < `minSamplesForJudgeNormalization`=5） | `unnormalizedDimension: "feasibility"`、`unnormalizedJudge: "j_partial"` | 告警 `normalization_fallback`（点名 `j_partial:judge_sample_too_small`）+ `trace.normalization.feasibility.normalized=false` |
+| 2 | **去极值**（S7 §3.2，评委数 ≥5） | 每个维度 5 位评委各交 5 队分（≥ `minJudgesForTrim`=5） | `trimmedDimensions: ["innovation","feasibility","completeness","collaboration"]` | `trace.steps` 里 20/20 个 (队,维度) 单元 `trimmed=true`，并记录被去掉的最高/最低分评委 |
+| 3 | **R2 缺双签 → 企业项按 0 分计**（S7 §2.4 R2） | `ec_gamma`（t_gamma）的 `crossJudgeId: null` | `missingDualSignatureTeam: "t_gamma"` | 告警 `R2_missing_dual_signature`；`t_gamma.seatE === 0`（权重保留） |
+| 4 | **R4 自由命题 → 企业项改由评委「需求真实性」维度替代**（S7 §2.4 R4） | `tp_free` 任务包 `isFreeBrief: true`，`t_epsilon` 挂在其下且**没有**企业确认 | `freeBriefTeam: "t_epsilon"` | 告警 `R4_free_brief_judge_scored`；`t_epsilon.seatE` = `feasibility` 维评委分（62.5537），且**无** `R4_substitute_no_scores` |
+| 5 | **破同分链在 `peer` 级分开**（S7 §3.3 + C-03） | `t_alpha` 收到的互评 70/72（均值 71）> `t_beta` 的 60/58（均值 59） | `tiedTeams: ["t_alpha","t_beta"]`、`tiebreakSeparatedBy: "peer"` | 两队总分**严格相等**（差 `0.0000000000`）→ 破同分链 `applied` 含 `{"key":"peer","usedBy":["t_alpha","t_beta"],"separated":true}` → alpha 第 1、beta 第 2 |
+| 6 | **破同分键不可用 ⇒ 显式告警，不静默当 0**（ranking.js 设计） | 种子没有 `tiebreakExtra` 字段（结构表里没这个键）⇒ 「加时陈述复议分」这一级不可用 | （无独立键；由 `tiebreakSeparatedBy: "peer"` 间接约束） | 告警 `tiebreak_key_unusable`（本组不用该键），链继续走到 `peer` |
+| 7 | **自评差异 · 高 → 书面说明且对齐不加分**（S7 §4.3 + R-JDG-13） | `t_delta` 自评 `innovation` 95（评委均分 76，d=+19 > 10） | `selfEvalWrittenExplanationTeam: "t_delta"` | 告警 `self_eval_written_explanation`（**恰好 1 支队**）；`t_delta` 的 `self_eval` 席分 = 评委该维分 76.1602（**不是**自评原分 95 ⇒ 不是加分项） |
+| 8 | **自评差异 · 低 → 评委提问（只提问不改分）**（S7 §4.3） | `t_gamma` 自评 `innovation` 50（评委均分 65.2，d=−15.2 < −10） | `selfEvalJudgeQuestionTeam: "t_gamma"` | 告警 `self_eval_judge_question`（**恰好 1 支队**） |
+| 9 | **自评差异在阈值内 → 不告警、不影响** | `t_alpha` / `t_beta` 自评 85（评委均分 81，d=+4 ≤ 10） | `selfEvalWithinThresholdTeams: ["t_alpha","t_beta"]` | 两队均**不**出现在两类自评告警里；且两队自评席分相同（85）⇒ 这是它们能严格同分的前提 |
+| 10 | **某维度无人打分 → 权重记 0 + 告警，不静默当 0**（设计文档 §13 降级表） | `t_epsilon` **没有**自评记录 ⇒ `self_eval` 维度无分 | `missingSelfEvalTeam: "t_epsilon"` | 告警 `dimension_no_scores`（维度 `self_eval`）；`perDimension.self_eval.mean === null`，且 `seatP` 的分母**剔除了**该维度（与「静默当 0」的结果不同） |
+| 11 | **段位判定（里程碑计数 + 数据/原型 + 业务部门签字）**（S10 §2.2 + R-PTS-01~04） | 5 支队伍的 `milestones` 分别是 2/1/3/5/0 个；`t_delta` 的 `pilot_contract` 有 `业务部` 签字（`isBusinessDepartment: true`） | `tiers: {t_alpha:B, t_beta:C, t_gamma:A, t_delta:S, t_epsilon:D}` | `computeTier` 复算 5 支全中（`milestones=5` + `business_signoff=1` ⇒ `t_delta` 落 S 段） |
+| 12 | **行为分：证据合规才计分**（S10 §3.1 + R-STG-04 + R-PTS-10） | 8 条 `behaviorEvents`，`evidence` 逐条满足 `criteria.behaviorEvidence` | `behaviorScores: {t_alpha:17, t_beta:2, t_gamma:5, t_delta:7, t_epsilon:0}` | `behaviorScore` 复算 5 支全中；`first_demo`（`once:true`）只计一次 |
+| 13 | **行为分不进入总分（分轨在算法层）**（S10 §3.3 + R-PTS-08） | 改动全部行为事件的证据后重算 | （由「行为分不进入总分」用例守住） | 改行为事件前后 5 支队伍的总分**逐字相同** |
+| 14 | **评委席宽严差异被归一化抵消**（S7 §2.1 机制归因） | `j_lenient` 普遍给高分、`j_strict` 普遍给低分（同一队的两档评委差 14 分） | （无独立键；由「同分两队总分严格相等」间接守住） | `t_alpha` / `t_beta` 的四个评委席维度分**逐维相等**（81.2788 / 80.2047 / 79.3845 / 83.5182） |
+
+### H. 遗留 / 需上游注意
+
+1. **Task 5 读种子必须按「决赛维度表」读**：`reviews` 里只可能出现 `rules.scoring.final.dimensions` 的
+   评委席 key（`innovation` / `feasibility` / `completeness` / `collaboration`）；
+   `enterprise` 维度走 `enterpriseConfirmations`，`self_eval` 维度走 `selfReviews`。
+   **不要**再往种子里加 `track_fit`（那是初赛维度，决赛不计分）。
+2. **`expectations` 增补了 4 个键**：`selfEvalWithinThresholdTeams` / `missingSelfEvalTeam` /
+   `trimmedDimensions` / `behaviorScores`。规格原有的 **9 个键一个没动**，
+   只有 `selfEvalWrittenExplanationTeam` 的**值**由 `t_alpha` 改为 `t_delta`（理由见 D-02）。
+3. **破同分链在 `tiebreak_extra`（加时陈述复议分）这一级会出一条 `tiebreak_key_unusable` 告警** ——
+   种子没有 `tiebreakExtra` 字段（结构表里没有这个键）⇒ 该级不可用、**不静默当 0**（引擎的正确行为）。
+   演示时应当显式展示这条告警，它正好说明「链上每一级都要有可比较的值」。
+4. **行为分达标线 60 分没有任何一支队达到**（最高的 `t_alpha` 也只有 17）⇒ 演示里「完赛认定」恒为 false。
+   这是数据的真实状态，不是 bug；要演示该分支需要更多行为事件（`weekly_progress` 每次只 2 分）。
+5. **`t_alpha` / `t_beta` 的同分是「构造出来的」**：`reviews` 逐维相同 + 企业确认同分 + 自评同分 + 同一个任务包。
+   少任何一样都会被某一张席拉开 —— 这正是 D-02 的教训，演示时可以顺带讲这一条。
+
