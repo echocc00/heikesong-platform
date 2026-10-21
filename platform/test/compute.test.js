@@ -29,6 +29,10 @@ import { loadRules } from '../src/config.js';
 import { computeStage, getComputation } from '../src/services/compute.js';
 import { createRouter } from '../src/http/router.js';
 import { registerReviewRoutes } from '../src/http/routes/review.js';
+import { isolateTempDir } from '../test-helpers/tmp.js';
+
+// ⚠️ 隔离本进程临时目录：进程退出时整体回收（防临时目录泄漏，详见 test-helpers/tmp.js）
+isolateTempDir();
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrationsDir = join(here, '..', 'db', 'migrations');

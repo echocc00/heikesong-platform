@@ -13,6 +13,10 @@ import { createApp } from '../src/server.js';
 import { createUser } from '../src/db/repo/users.js';
 import { createSession } from '../src/auth/session.js';
 import { stripComments } from '../test-helpers/strip-comments.js';
+import { isolateTempDir } from '../test-helpers/tmp.js';
+
+// ⚠️ 隔离本进程临时目录：进程退出时整体回收（防临时目录泄漏，详见 test-helpers/tmp.js）
+isolateTempDir();
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrationsDir = join(here, '..', 'db', 'migrations');
@@ -24,7 +28,13 @@ function setup() {
   applyMigrations(db, migrationsDir);
   const { rules } = loadRules(rulesDir);
   // web/ 旁边造一个兄弟目录 web-secret/ —— 用来验证目录穿越防护（C7-1）
-  const webRoot = mkdtempSync(join(tmpdir(), 'hks-web-'));
+  //
+  // ⚠️ 静态根**放进 dataDir 里**（而不是另开一个 mkdtemp 目录）：
+  //    本文件 33 处用例末尾清的都是 `rmSync(dataDir, …)`；
+  //    若 webRoot 是独立目录，只有 10/33 处显式删了它 ⇒ **每次全量跑漏 20+ 个目录**。
+  //    （macOS 上 `$TMPDIR` 按用户隔离且系统会清 ⇒ 本机看不见；
+  //      Linux 的 `/tmp` 是共享的 ⇒ 一次真机复现就堆出 80+ 个。实测 2026-10-21。）
+  const webRoot = join(dataDir, 'web-root');
   const webDir = join(webRoot, 'web');
   mkdirSync(webDir, { recursive: true });
   mkdirSync(join(webRoot, 'web-secret'), { recursive: true });

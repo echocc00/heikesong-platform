@@ -12,6 +12,10 @@ import { createSession } from '../src/auth/session.js';
 import { getLeaderboard, publishLeaderboard } from '../src/services/leaderboard.js';
 import { computeTeamTier, getTeamTier } from '../src/services/tier.js';
 import { getLatestTierRecord } from '../src/db/repo/tiers.js';
+import { isolateTempDir } from '../test-helpers/tmp.js';
+
+// ⚠️ 隔离本进程临时目录：进程退出时整体回收（防临时目录泄漏，详见 test-helpers/tmp.js）
+isolateTempDir();
 
 const here = dirname(fileURLToPath(import.meta.url));
 const NOW = '2026-10-20T00:00:00.000Z';

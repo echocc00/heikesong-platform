@@ -6,6 +6,10 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openDatabase } from '../src/db/sqlite.js';
 import { applyMigrations, readMigrationFiles } from '../src/db/migrate.js';
+import { isolateTempDir } from '../test-helpers/tmp.js';
+
+// ⚠️ 隔离本进程临时目录：进程退出时整体回收（防临时目录泄漏，详见 test-helpers/tmp.js）
+isolateTempDir();
 
 // 真实迁移目录（platform/db/migrations）—— 本文件在 platform/test/ 下，故取上一级。
 // 真实 DDL 必须被真正 apply 过：否则 001_init.sql 可以带着语法/外键/类型错误

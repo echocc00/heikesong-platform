@@ -36,6 +36,10 @@ import { computeStage } from '../src/services/compute.js';
 import { reinstateRecusal } from '../src/services/review.js';
 import { listRecusals } from '../src/db/repo/recusals.js';
 import { call } from '../test-helpers/http-call.js';
+import { isolateTempDir } from '../test-helpers/tmp.js';
+
+// ⚠️ 隔离本进程临时目录：进程退出时整体回收（防临时目录泄漏，详见 test-helpers/tmp.js）
+isolateTempDir();
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrationsDir = join(here, '..', 'db', 'migrations');

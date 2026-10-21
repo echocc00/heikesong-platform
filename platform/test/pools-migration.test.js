@@ -19,6 +19,10 @@ import * as poolsRepo from '../src/db/repo/pools.js';
 import * as poolSourcesRepo from '../src/db/repo/pool-sources.js';
 import * as publicTokensRepo from '../src/db/repo/public-tokens.js';
 import { hasActiveMembership, listMemberTeams } from '../src/db/repo/teamMembers.js';
+import { isolateTempDir } from '../test-helpers/tmp.js';
+
+// ⚠️ 隔离本进程临时目录：进程退出时整体回收（防临时目录泄漏，详见 test-helpers/tmp.js）
+isolateTempDir();
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrationsDir = join(here, '..', 'db', 'migrations');

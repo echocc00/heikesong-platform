@@ -13,6 +13,10 @@ import {
   revokeSession,
   revokeAllSessions,
 } from '../src/auth/session.js';
+import { isolateTempDir } from '../test-helpers/tmp.js';
+
+// ⚠️ 隔离本进程临时目录：进程退出时整体回收（防临时目录泄漏，详见 test-helpers/tmp.js）
+isolateTempDir();
 
 // 真实迁移目录（platform/db/migrations）：会话表必须真的被建出来。
 const migrationsDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'db', 'migrations');

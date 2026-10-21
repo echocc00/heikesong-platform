@@ -31,6 +31,10 @@ import { insertCapability } from '../src/db/repo/capabilities.js';
 import { createSession } from '../src/auth/session.js';
 import { createApp } from '../src/server.js';
 import { call } from '../test-helpers/http-call.js';
+import { isolateTempDir } from '../test-helpers/tmp.js';
+
+// ⚠️ 隔离本进程临时目录：进程退出时整体回收（防临时目录泄漏，详见 test-helpers/tmp.js）
+isolateTempDir();
 
 const here = dirname(fileURLToPath(import.meta.url));
 const platformDir = join(here, '..');

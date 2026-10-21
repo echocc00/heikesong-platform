@@ -26,6 +26,10 @@ import {
   getTiebreakRoundState,
   getTiebreakExtraScores,
 } from '../src/services/tiebreak.js';
+import { isolateTempDir } from '../test-helpers/tmp.js';
+
+// ⚠️ 隔离本进程临时目录：进程退出时整体回收（防临时目录泄漏，详见 test-helpers/tmp.js）
+isolateTempDir();
 
 const migrationsDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'db', 'migrations');
 const NOW = '2026-10-20T10:00:00.000Z';

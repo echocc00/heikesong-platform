@@ -20,6 +20,10 @@ import { applyMigrations } from '../src/db/migrate.js';
 import { createUser } from '../src/db/repo/users.js';
 import { createEdition } from '../src/db/repo/editions.js';
 import { insertTeam } from '../src/db/repo/teams.js';
+import { isolateTempDir } from '../test-helpers/tmp.js';
+
+// ⚠️ 隔离本进程临时目录：进程退出时整体回收（防临时目录泄漏，详见 test-helpers/tmp.js）
+isolateTempDir();
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrationsDir = join(here, '..', 'db', 'migrations');

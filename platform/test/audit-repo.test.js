@@ -24,6 +24,10 @@ import { insertAppeal, getAppeal, listAppealRows, updateAppeal } from '../src/db
 import { insertSnapshot, getSnapshot, nextRevision, listComputationRows } from '../src/db/repo/computations.js';
 import { withTransaction } from '../src/db/tx.js';
 import { appError, AppError, badRequest, unauthenticated, forbidden, notFound, conflict, rateLimited } from '../src/errors.js';
+import { isolateTempDir } from '../test-helpers/tmp.js';
+
+// ⚠️ 隔离本进程临时目录：进程退出时整体回收（防临时目录泄漏，详见 test-helpers/tmp.js）
+isolateTempDir();
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrationsDir = join(here, '..', 'db', 'migrations');

@@ -16,6 +16,10 @@ import { insertCapability } from '../src/db/repo/capabilities.js';
 import { createTaskPackage, updateTaskPackage } from '../src/db/repo/taskPackages.js';
 import { insertRegistration } from '../src/db/repo/registrations.js';
 import { call } from '../test-helpers/http-call.js';
+import { isolateTempDir } from '../test-helpers/tmp.js';
+
+// ⚠️ 隔离本进程临时目录：进程退出时整体回收（防临时目录泄漏，详见 test-helpers/tmp.js）
+isolateTempDir();
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrationsDir = join(here, '..', 'db', 'migrations');

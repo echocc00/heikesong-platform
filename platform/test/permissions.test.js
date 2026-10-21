@@ -20,6 +20,10 @@ import { createUser } from '../src/db/repo/users.js';
 import { AppError } from '../src/errors.js';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
+import { isolateTempDir } from '../test-helpers/tmp.js';
+
+// ⚠️ 隔离本进程临时目录：进程退出时整体回收（防临时目录泄漏，详见 test-helpers/tmp.js）
+isolateTempDir();
 
 const migrationsDir = join(
   dirname(fileURLToPath(import.meta.url)), '..', 'db', 'migrations',

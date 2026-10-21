@@ -14,6 +14,10 @@ import { insertRegistration } from '../src/db/repo/registrations.js';
 import {
   createTeam, getTeam, addMember, leaveTeam, replaceMember, updateTeam, checkTeamFormation,
 } from '../src/services/team.js';
+import { isolateTempDir } from '../test-helpers/tmp.js';
+
+// ⚠️ 隔离本进程临时目录：进程退出时整体回收（防临时目录泄漏，详见 test-helpers/tmp.js）
+isolateTempDir();
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrationsDir = join(here, '..', 'db', 'migrations');

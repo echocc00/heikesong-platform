@@ -18,6 +18,10 @@ import { insertTeam } from '../src/db/repo/teams.js';
 import { insertTeamMember } from '../src/db/repo/teamMembers.js';
 import { insertStage } from '../src/db/repo/stages.js';
 import { insertLedgerEntry, insertBehaviorEvent } from '../src/db/repo/points.js';
+import { isolateTempDir } from '../test-helpers/tmp.js';
+
+// ⚠️ 隔离本进程临时目录：进程退出时整体回收（防临时目录泄漏，详见 test-helpers/tmp.js）
+isolateTempDir();
 
 const here = dirname(fileURLToPath(import.meta.url));
 

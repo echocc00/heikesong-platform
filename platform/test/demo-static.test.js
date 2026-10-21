@@ -33,6 +33,10 @@ import { buildDemoSite, assertDomainIsBrowserSafe, collectBrowserModules, loadNo
 import { DEMO_RULE_FILES, SEED_URL, RULES_BASE } from '../web/api.demo.js';
 import { loadRules } from '../src/config.js';
 import { serveStatic } from '../src/http/static.js';
+import { isolateTempDir } from '../test-helpers/tmp.js';
+
+// ⚠️ 隔离本进程临时目录：进程退出时整体回收（防临时目录泄漏，详见 test-helpers/tmp.js）
+isolateTempDir();
 
 const here = dirname(fileURLToPath(import.meta.url));
 const platformDir = join(here, '..');
@@ -165,6 +169,9 @@ test('Node 专属全局禁用清单缺失或为空 ⇒ 守卫必须报错，不�
   writeFileSync(emptyFile, '# 只有注释，没有词条\n\n', 'utf8');
   assert.throws(() => loadNodeOnlyGlobals(emptyFile), /是空的/, '空清单必须报错');
   assert.throws(() => loadNodeOnlyGlobals(emptyFile), /空清单 ≠ 已保护/, '报错要说清空清单等于没保护');
+  // ⚠️ 这个临时目录也要回收 —— macOS 上 $TMPDIR 会自动清，Linux 的 /tmp 不会
+  //    （真机实测：2026-10-21 一次全量跑就在 /tmp 堆出 80+ 个 hks-* 目录）
+  rmSync(dirname(emptyFile), { recursive: true, force: true });
 
   // 正常清单读得到 5 条，且包含两个 __ 前缀的
   const tokens = loadNodeOnlyGlobals();
