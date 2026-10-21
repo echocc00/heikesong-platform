@@ -10,6 +10,7 @@ import { appError } from '../errors.js';
 import { applyVisibility } from '../domain/visibility.js';
 import * as tokenRepo from '../db/repo/public-tokens.js';
 import * as srcRepo from '../db/repo/pool-sources.js';
+import { buildICalendarText } from '../domain/icalendar.js';
 
 export const PUBLIC_NOTICE =
   'A 榜赛段名次全程公开；D 段不公示排名；B 榜评分与签字人不公开；企业名不公示；互评来源不公示。';
@@ -210,4 +211,40 @@ function projectPublicRows(rows, rules, warnings, stageId) {
     warnings.push({ code: 'tier_below_public_threshold_hidden', stageId, count: hidden });
   }
   return out;
+}
+
+/**
+ * 赛程日历（iCal）。
+ * 溯源：R-STG-01（5 赛段时间轴与交付物）—— 依据 INTERFACES.md §6 / 设计文档 §8
+ * @param db        数据库
+ * @param editionId 届期
+ * @param now       时间（【追加的可选参数】，便于测试注入；不传则取当前时间）
+ * @returns ics 文本
+ */
+export function buildICalendar({ db, editionId, now }) {
+  const at = nowIso(now);
+  if (!editionId) throw appError(400, 'EDITION_REQUIRED', 'editionId 必填');
+  const edition = srcRepo.getEdition(db, editionId);
+  const stages = srcRepo.listEditionStages(db, editionId);
+  const events = stages.map((s) => ({
+    uid: `stage-${s.id}@heikesong.local`,
+    summary: `${s.name}（${s.stage_key}）`,
+    description: `赛段 ${s.stage_key}：${s.name}`,
+    start: s.starts_at,
+    end: s.ends_at ?? addOneDay(s.starts_at),
+    location: edition?.city ?? null,
+    url: `/leaderboard?stageId=${encodeURIComponent(s.id)}`,
+  }));
+  return buildICalendarText({
+    calName: edition?.name ?? '黑客松赛程',
+    events,
+    now: at,
+  });
+}
+
+function addOneDay(value) {
+  if (!value) return null;
+  const d = new Date(String(value));
+  if (Number.isNaN(d.getTime())) return null;
+  return new Date(d.getTime() + 86400000).toISOString();
 }

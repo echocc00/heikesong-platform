@@ -5453,6 +5453,7 @@ import { appError } from '../errors.js';
 import { applyVisibility } from '../domain/visibility.js';
 import * as tokenRepo from '../db/repo/public-tokens.js';
 import * as srcRepo from '../db/repo/pool-sources.js';
+import { buildICalendarText } from '../domain/icalendar.js';
 
 export const PUBLIC_NOTICE =
   'A 榜赛段名次全程公开；D 段不公示排名；B 榜评分与签字人不公开；企业名不公示；互评来源不公示。';
@@ -5654,6 +5655,42 @@ function projectPublicRows(rows, rules, warnings, stageId) {
   }
   return out;
 }
+
+/**
+ * 赛程日历（iCal）。
+ * 溯源：R-STG-01（5 赛段时间轴与交付物）—— 依据 INTERFACES.md §6 / 设计文档 §8
+ * @param db        数据库
+ * @param editionId 届期
+ * @param now       时间（【追加的可选参数】，便于测试注入；不传则取当前时间）
+ * @returns ics 文本
+ */
+export function buildICalendar({ db, editionId, now }) {
+  const at = nowIso(now);
+  if (!editionId) throw appError(400, 'EDITION_REQUIRED', 'editionId 必填');
+  const edition = srcRepo.getEdition(db, editionId);
+  const stages = srcRepo.listEditionStages(db, editionId);
+  const events = stages.map((s) => ({
+    uid: `stage-${s.id}@heikesong.local`,
+    summary: `${s.name}（${s.stage_key}）`,
+    description: `赛段 ${s.stage_key}：${s.name}`,
+    start: s.starts_at,
+    end: s.ends_at ?? addOneDay(s.starts_at),
+    location: edition?.city ?? null,
+    url: `/leaderboard?stageId=${encodeURIComponent(s.id)}`,
+  }));
+  return buildICalendarText({
+    calName: edition?.name ?? '黑客松赛程',
+    events,
+    now: at,
+  });
+}
+
+function addOneDay(value) {
+  if (!value) return null;
+  const d = new Date(String(value));
+  if (Number.isNaN(d.getTime())) return null;
+  return new Date(d.getTime() + 86400000).toISOString();
+}
 ```
 
 - [ ] **Step 4: 创建 `src/http/routes/workflow.js`**
@@ -5795,7 +5832,7 @@ export function registerPoolsRoutes(router, { db, rules }) {
 // src/http/routes/public.js — 公开接口（无需登录，token 鉴权）
 // 依据：INTERFACES.md §6 的 P5 API 清单
 // ⚠️ token 走 query 参数（契约如此）：部署时应在 nginx 层关掉 query 串的访问日志（P6 负责）。
-import { getPublicLeaderboard } from '../../services/public-api.js';
+import { getPublicLeaderboard, buildICalendar, resolvePublicToken } from '../../services/public-api.js';
 
 export function registerPublicRoutes(router, { db, rules }) {
   router.add('GET', '/api/public/leaderboard', async ({ query }) =>
@@ -5805,6 +5842,15 @@ export function registerPublicRoutes(router, { db, rules }) {
       editionId: query.editionId,
       rules,
     }));
+  // 赛程日历（iCal）。⛔ 同样要 token：公开 ≠ 无鉴权。
+  // 溯源：R-STG-01（5 赛段时间轴与交付物）—— 依据 INTERFACES.md §6 / 设计文档 §8
+  router.add('GET', '/api/public/calendar.ics', async ({ query }) => {
+    resolvePublicToken({
+      db, token: query.token, requiredScope: 'calendar', editionId: query.editionId,
+    });
+    const body = buildICalendar({ db, editionId: query.editionId });
+    return { __rawText: true, body, contentType: 'text/calendar; charset=utf-8' };
+  });
 }
 ```
 
@@ -5962,26 +6008,43 @@ git commit -m "feat(P5): 公开榜单 API（token 鉴权 + 显式可见性过滤
 `platform/test/icalendar.test.js`：
 
 ```javascript
+// platform/test/icalendar.test.js — iCal 日历导出（手写 RFC 5545，零依赖）
+// 依据：设计文档 §8「公开榜单 API + 赛程 iCal 订阅」；INTERFACES.md §6 `buildICalendar`
+// 溯源：R-STG-01（5 赛段时间轴与交付物）—— 赛段起止时间轴能被日历客户端订阅
+//
+// ⚠️ 本文件同时覆盖【两层】：
+//   ① 领域纯函数（src/domain/icalendar.js）：转义 / 折叠 / 时间戳
+//   ② HTTP 路由（GET /api/public/calendar.ics）：token 鉴权 + 原文响应（__rawText）
+//   计划原块只覆盖领域层与���务层 ⇒ 路由零覆盖（同 Task 4 的 T4-C2 同款病根），此处补齐。
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openDatabase } from '../src/db/sqlite.js';
 import { applyMigrations } from '../src/db/migrate.js';
+import { loadRules } from '../src/config.js';
+import { createApp } from '../src/server.js';
 import {
   buildICalendarText, formatICalTimestamp, escapeICalText, foldICalLine,
 } from '../src/domain/icalendar.js';
-import { buildICalendar } from '../src/services/public-api.js';
+import { buildICalendar, createPublicToken } from '../src/services/public-api.js';
+import { call } from '../test-helpers/http-call.js';
+import { stripComments } from '../test-helpers/strip-comments.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrationsDir = join(here, '..', 'db', 'migrations');
+const rulesDir = join(here, '..', 'rules');
+const webDir = join(here, '..', 'web');
+// 统一注入时间：领域层不读时钟，所有时间断言都基于它，口径可复算
+const NOW = '2026-10-20T00:00:00.000Z';
 
 function setup() {
   const dataDir = mkdtempSync(join(tmpdir(), 'hks-p5ics-'));
   const { db, close } = openDatabase({ dataDir });
   applyMigrations(db, migrationsDir);
+  const { rules } = loadRules(rulesDir);
   db.exec(`
     INSERT INTO editions (id, name, city, starts_at, ends_at, created_at)
     VALUES ('ed_1', '第一届 · 杭州', '杭州', '2026-10-01', '2026-10-31', '2026-10-01T00:00:00.000Z');
@@ -5990,7 +6053,8 @@ function setup() {
            ('st_2', 'ed_1', 's2', '任务', 'initial', '2026-10-10', '2026-10-13', NULL, 'initial', 'computed'),
            ('st_3', 'ed_1', 's3', '开发', 'initial', '2026-10-13', '2026-10-25', NULL, 'initial', 'open');
   `);
-  return { db, close, dataDir };
+  const app = createApp({ db, rules, webDir });
+  return { db, close, dataDir, rules, app };
 }
 
 function cleanup(db, close, dataDir) {
@@ -6015,6 +6079,19 @@ function parseEvents(ics) {
     }
     return fields;
   });
+}
+
+/** 追加一个赛段（给「长标题」「含特殊字符」等场景用） */
+function addStage(db, { id, key, name, startsAt = '2026-10-01', endsAt = '2026-10-10' }) {
+  db.prepare(
+    `INSERT INTO stages (id, edition_id, "key", name, kind, starts_at, ends_at, freeze_at, scoring_config_key, status)
+     VALUES (?, 'ed_1', ?, ?, 'initial', ?, ?, NULL, 'initial', 'computed')`,
+  ).run(id, key, name, startsAt, endsAt);
+}
+
+/** 签发一个公开令牌（明文只在这里返回一次） */
+function publicToken(db, { scope = 'calendar', editionId = 'ed_1', expiresAt = '2099-01-01T00:00:00.000Z' } = {}) {
+  return createPublicToken({ db, scope, editionId, expiresAt, now: NOW }).token;
 }
 
 test('VEVENT 数 = 赛段数（基本解析器能读出来）', () => {
@@ -6099,11 +6176,278 @@ test('foldICalLine 不劈开多字节字符', () => {
   }
   assert.equal(folded.replace(/\r\n /g, ''), line, '取消折叠后必须还原');
 });
+
+test('折叠宽度用满 75 octets（首段 75 octets；续行 = 74 octets 内容 + 1 个前导空格；末段是余量）', () => {
+  const line = `SUMMARY:${'a'.repeat(200)}`;
+  const folded = foldICalLine(line);
+  const parts = folded.split('\r\n');
+  assert.equal(Buffer.byteLength(parts[0], 'utf8'), 75, '首段必须用满 75 octets');
+  for (const p of parts.slice(1, -1)) {
+    assert.equal(Buffer.byteLength(p, 'utf8'), 75, '续行 = 74 octets 内容 + 1 个前导空格');
+  }
+  const last = Buffer.byteLength(parts[parts.length - 1], 'utf8');
+  assert.ok(last > 0 && last <= 75, `末段是余量，实际 ${last}`);
+  assert.equal(folded.replace(/\r\n /g, ''), line);
+});
+
+// ── 以下为 P5 Task 5 实跑后补齐的用例（计划原块只覆盖领域层与���务层，
+//    新建的 GET /api/public/calendar.ics 路由**零覆盖**）──
+
+test('buildICalendarText 不给 now → 抛错（领域层不读时钟，时间必须由调用方注入）', () => {
+  assert.throws(
+    () => buildICalendarText({ events: [{ uid: 'u1', start: '2026-10-01T00:00:00.000Z' }] }),
+    /now/,
+    '缺 now 必须抛错，不能默默取当前时间',
+  );
+});
+
+test('领域层是纯函数：icalendar.js 不 import node: 内置模块、不用 Date.now()/Math.random()', () => {
+  const src = readFileSync(join(here, '..', 'src', 'domain', 'icalendar.js'), 'utf8');
+  const code = src.replace(/\/\/[^\n]*/g, '').replace(/\/\*[\s\S]*?\*\//g, '');
+  assert.equal(/from\s+['"]node:/.test(code), false, '领域层不得 import Node 内置模块');
+  assert.equal(/\bDate\.now\s*\(/.test(code), false, '领域层不得用 Date.now()');
+  assert.equal(/\bMath\.random\s*\(/.test(code), false, '领域层不得用 Math.random()');
+  assert.equal(/new Date\s*\(\s*\)/.test(code), false, '领域层不得无参构造 Date');
+});
+
+test('★ 领域层不含 Node 专属全局：Buffer / process / require / __dirname / __filename', () => {
+  // ⚠️ 为什么钉这一条：P6 的演示版把 `src/domain/*.js` **原样拷进浏览器产物**
+  //    （platform/scripts/build-demo.js）⇒ 领域层必须在**浏览器**里跑同一套引擎。
+  //    `Buffer` 是 Node 专属全局 —— 浏览器里 `Buffer is not defined` ⇒ 整个模块 ReferenceError。
+  //    ⛔ `build-demo.js` 的 `assertDomainIsBrowserSafe` **只查 import 说明符、不查 Node 全局**
+  //    ⇒ 这类违规它查不出来（见计划文档 T5-C9）。所以这里补一条静态扫描把它钉住。
+  const banned = [
+    { re: /\bBuffer\b/, name: 'Buffer' },
+    { re: /\bprocess\s*\./, name: 'process.' },
+    { re: /\brequire\s*\(/, name: 'require(' },
+    { re: /\b__dirname\b/, name: '__dirname' },
+    { re: /\b__filename\b/, name: '__filename' },
+  ];
+  const dir = join(here, '..', 'src', 'domain');
+  const files = readdirSync(dir).filter((n) => n.endsWith('.js'));
+  assert.ok(files.length > 0, '领域层目录不该是空的');
+  for (const name of files) {
+    // 先剥注释：注释里提到 Buffer 不算「用了 Buffer」
+    const code = stripComments(readFileSync(join(dir, name), 'utf8'));
+    for (const b of banned) {
+      assert.equal(
+        b.re.test(code),
+        false,
+        `src/domain/${name} 不得使用 Node 专属全局 ${b.name}（浏览器里不存在）`,
+      );
+    }
+  }
+});
+
+test('★ 换成 TextEncoder/TextDecoder 后折叠语义不变：每行 ≤ 75 UTF-8 字节，拼接后与原文逐字相等', () => {
+  const original = `SUMMARY:${'华东区赛段：需求评审与原型验证'.repeat(9)}`;
+  const folded = foldICalLine(original);
+  const lines = folded.split('\r\n');
+  assert.ok(lines.length > 1, '长中文标题必须被折成多行');
+  for (const line of lines) {
+    assert.ok(
+      Buffer.byteLength(line, 'utf8') <= 75,
+      `行太长（${Buffer.byteLength(line, 'utf8')} octets）`,
+    );
+    assert.equal(line.includes('\uFFFD'), false, '不能出现乱码（说明字符被劈开了）');
+  }
+  // 取消折叠后必须与原文逐字相等（证明换字节 API 没改语义）
+  assert.equal(folded.replace(/\r\n /g, ''), original);
+});
+
+test('escapeICalText 的空值口径是空串（不是 "null"/"undefined" 字面量）', () => {
+  assert.equal(escapeICalText(null), '');
+  assert.equal(escapeICalText(undefined), '');
+  assert.equal(escapeICalText(''), '');
+});
+
+test('formatICalTimestamp 遇到非法时间 → 抛错（不静默产出一个坏时间戳）', () => {
+  assert.throws(() => formatICalTimestamp('not-a-date'), /非法时间戳/);
+  assert.throws(() => formatICalTimestamp(''), /非法时间戳/);
+});
+
+test('每个事件带 DESCRIPTION / LOCATION / URL（赛段说明、赛点、榜单跳转）', () => {
+  const { db, close, dataDir } = setup();
+  const ics = buildICalendar({ db, editionId: 'ed_1', now: NOW });
+  const events = parseEvents(ics);
+  for (const ev of events) {
+    assert.ok(ev.DESCRIPTION, '缺 DESCRIPTION');
+    assert.ok(ev.LOCATION, '缺 LOCATION');
+    assert.ok(ev.URL, '缺 URL');
+  }
+  assert.equal(events[0].LOCATION, '杭州', '赛点取届期城市');
+  assert.ok(events[0].URL.includes('stageId=st_1'), 'URL 必须指向该赛段');
+  assert.ok(events[0].DESCRIPTION.includes('s1'), 'DESCRIPTION 必须带赛段代号');
+  assert.ok(events[0].DESCRIPTION.includes('调研'), 'DESCRIPTION 必须带赛段名');
+  cleanup(db, close, dataDir);
+});
+
+test('同样的输入产出同样的字节（可复算：不掺入真实时钟）', () => {
+  const { db, close, dataDir } = setup();
+  const a = buildICalendar({ db, editionId: 'ed_1', now: NOW });
+  const b = buildICalendar({ db, editionId: 'ed_1', now: NOW });
+  assert.equal(a, b, '同一个 now 必须产出逐字相同的日历');
+  const c = buildICalendar({ db, editionId: 'ed_1', now: '2026-10-21T00:00:00.000Z' });
+  assert.notEqual(a, c, 'now 变了 DTSTAMP 必须变');
+  assert.ok(c.includes('DTSTAMP:20261021T000000Z'));
+  cleanup(db, close, dataDir);
+});
+
+test('日历头字段齐全：VERSION / PRODID / CALSCALE / METHOD / X-WR-CALNAME', () => {
+  const { db, close, dataDir } = setup();
+  const ics = buildICalendar({ db, editionId: 'ed_1', now: NOW });
+  assert.ok(ics.includes('VERSION:2.0\r\n'));
+  assert.ok(ics.includes('PRODID:-//heikesong//platform//CN\r\n'));
+  assert.ok(ics.includes('CALSCALE:GREGORIAN\r\n'));
+  assert.ok(ics.includes('METHOD:PUBLISH\r\n'));
+  assert.ok(ics.includes('X-WR-CALNAME:第一届 · 杭州\r\n'), '日历名取届期名');
+  cleanup(db, close, dataDir);
+});
+
+test('每个赛段一个 VEVENT：UID 唯一且可追溯到赛段 id', () => {
+  const { db, close, dataDir } = setup();
+  const ics = buildICalendar({ db, editionId: 'ed_1', now: NOW });
+  const events = parseEvents(ics);
+  const uids = events.map((e) => e.UID);
+  assert.equal(new Set(uids).size, uids.length, 'UID 必须唯一（重复 UID 客户端会互相覆盖）');
+  assert.deepEqual(uids.sort(), ['stage-st_1@heikesong.local', 'stage-st_2@heikesong.local', 'stage-st_3@heikesong.local']);
+  cleanup(db, close, dataDir);
+});
+
+test('赛段起止时间落到 DTSTART/DTEND（日期串按 UTC 零点解析）', () => {
+  const { db, close, dataDir } = setup();
+  const ics = buildICalendar({ db, editionId: 'ed_1', now: NOW });
+  const events = parseEvents(ics);
+  assert.equal(events[0].DTSTART, '20261001T000000Z');
+  assert.equal(events[0].DTEND, '20261010T000000Z');
+  assert.equal(events[2].DTEND, '20261025T000000Z');
+  cleanup(db, close, dataDir);
+});
+
+test('赛段名里的逗号/分号/反斜杠在服务层同样被转义（不只在纯函数层）', () => {
+  const { db, close, dataDir } = setup();
+  addStage(db, { id: 'st_x', key: 'sx', name: 'A,B;C\\D' });
+  const ics = buildICalendar({ db, editionId: 'ed_1', now: NOW });
+  assert.ok(ics.includes('SUMMARY:A\\,B\\;C\\\\D（sx）'), '特殊字符必须转义');
+  cleanup(db, close, dataDir);
+});
+
+test('超长赛段名在服务层同样被折叠（且不劈开多字节字符）', () => {
+  const { db, close, dataDir } = setup();
+  addStage(db, { id: 'st_long', key: 'sl', name: '长'.repeat(80) });
+  const ics = buildICalendar({ db, editionId: 'ed_1', now: NOW });
+  for (const line of ics.split('\r\n')) {
+    assert.ok(Buffer.byteLength(line, 'utf8') <= 75, `行太长：${Buffer.byteLength(line, 'utf8')}`);
+    assert.equal(line.includes('\uFFFD'), false, '不能出现乱码');
+  }
+  assert.ok(unfold(ics).includes(`SUMMARY:${'长'.repeat(80)}（sl）`), '取消折叠后必须还原');
+  cleanup(db, close, dataDir);
+});
+
+test('buildICalendar 缺 editionId → 400 EDITION_REQUIRED（不静默出一份空日历）', () => {
+  const { db, close, dataDir } = setup();
+  assert.throws(
+    () => buildICalendar({ db, now: NOW }),
+    (err) => err.status === 400 && err.code === 'EDITION_REQUIRED',
+  );
+  cleanup(db, close, dataDir);
+});
+
+test('HTTP GET /api/public/calendar.ics：带 token → 200 + text/calendar + 原文 CRLF', async () => {
+  const s = setup();
+  const token = publicToken(s.db);
+  const res = await call(s.app, 'GET', `/api/public/calendar.ics?editionId=ed_1&token=${encodeURIComponent(token)}`);
+  assert.equal(res.status, 200, res.body);
+  assert.equal(res.headers['Content-Type'], 'text/calendar; charset=utf-8');
+  assert.ok(res.body.startsWith('BEGIN:VCALENDAR\r\n'), '必须是原文，不是 JSON 字符串');
+  assert.ok(res.body.endsWith('END:VCALENDAR\r\n'));
+  assert.equal(res.body.includes('\\r\\n'), false, '原文不能被 JSON 转义');
+  assert.equal(res.body.replace(/\r\n/g, '').includes('\n'), false, '不允许裸 LF');
+  assert.equal(parseEvents(res.body).length, 3);
+  cleanup(s.db, s.close, s.dataDir);
+});
+
+test('HTTP GET /api/public/calendar.ics：无 token → 403 PUBLIC_TOKEN_MISSING（公开 ≠ 无鉴权）', async () => {
+  const s = setup();
+  const res = await call(s.app, 'GET', '/api/public/calendar.ics?editionId=ed_1');
+  assert.equal(res.status, 403, res.body);
+  assert.equal(JSON.parse(res.body).error.code, 'PUBLIC_TOKEN_MISSING');
+  cleanup(s.db, s.close, s.dataDir);
+});
+
+test('HTTP GET /api/public/calendar.ics：scope 不符 → 403 PUBLIC_TOKEN_SCOPE_MISMATCH', async () => {
+  const s = setup();
+  const token = publicToken(s.db, { scope: 'leaderboard' });
+  const res = await call(s.app, 'GET', `/api/public/calendar.ics?editionId=ed_1&token=${encodeURIComponent(token)}`);
+  assert.equal(res.status, 403, res.body);
+  assert.equal(JSON.parse(res.body).error.code, 'PUBLIC_TOKEN_SCOPE_MISMATCH');
+  cleanup(s.db, s.close, s.dataDir);
+});
+
+test('HTTP GET /api/public/calendar.ics：跨届期 token → 403 PUBLIC_TOKEN_EDITION_MISMATCH', async () => {
+  const s = setup();
+  const token = publicToken(s.db, { editionId: 'ed_other' });
+  const res = await call(s.app, 'GET', `/api/public/calendar.ics?editionId=ed_1&token=${encodeURIComponent(token)}`);
+  assert.equal(res.status, 403, res.body);
+  assert.equal(JSON.parse(res.body).error.code, 'PUBLIC_TOKEN_EDITION_MISMATCH');
+  cleanup(s.db, s.close, s.dataDir);
+});
+
+test('HTTP GET /api/public/calendar.ics：过期 token → 403 PUBLIC_TOKEN_EXPIRED', async () => {
+  const s = setup();
+  const token = createPublicToken({
+    db: s.db, scope: 'calendar', editionId: 'ed_1',
+    expiresAt: '2026-10-19T00:00:00.000Z', now: '2026-10-01T00:00:00.000Z',
+  }).token;
+  const res = await call(s.app, 'GET', `/api/public/calendar.ics?editionId=ed_1&token=${encodeURIComponent(token)}`);
+  assert.equal(res.status, 403, res.body);
+  assert.equal(JSON.parse(res.body).error.code, 'PUBLIC_TOKEN_EXPIRED');
+  cleanup(s.db, s.close, s.dataDir);
+});
+
+test('HTTP GET /api/public/calendar.ics：缺 editionId → 400 EDITION_REQUIRED', async () => {
+  const s = setup();
+  const token = publicToken(s.db);
+  const res = await call(s.app, 'GET', `/api/public/calendar.ics?token=${encodeURIComponent(token)}`);
+  assert.equal(res.status, 400, res.body);
+  assert.equal(JSON.parse(res.body).error.code, 'EDITION_REQUIRED');
+  cleanup(s.db, s.close, s.dataDir);
+});
+
+test('HTTP GET /api/public/calendar.ics：该届期没有赛段 → 200 + 空日历（列表 → 200 + 空集）', async () => {
+  const s = setup();
+  s.db.exec("INSERT INTO editions (id, name, city, starts_at, ends_at, created_at) VALUES ('ed_2', '第二届', '上海', '2026-11-01', '2026-11-30', '2026-10-01T00:00:00.000Z')");
+  const token = publicToken(s.db, { editionId: 'ed_2' });
+  const res = await call(s.app, 'GET', `/api/public/calendar.ics?editionId=ed_2&token=${encodeURIComponent(token)}`);
+  assert.equal(res.status, 200, res.body);
+  assert.equal(parseEvents(res.body).length, 0);
+  assert.ok(res.body.startsWith('BEGIN:VCALENDAR\r\n'));
+  cleanup(s.db, s.close, s.dataDir);
+});
+
+test('HTTP GET /api/public/calendar.ics：日历里不泄露企业名与内部身份（公开面只给赛段时间轴）', async () => {
+  const s = setup();
+  s.db.exec(`
+    INSERT INTO users (id, name, phone, password_hash, mba_status, org, is_superadmin, active, created_at)
+    VALUES ('u_a', '甲', '13900000051', 'x', 'mba', '学堂', 0, 1, '2026-10-01T00:00:00.000Z');
+    INSERT INTO task_packages (id, edition_id, enterprise_id, enterprise_name, title, pain_point,
+      expected_delivery, acceptance_criteria, grade, status, solvability_score, solvability_grade,
+      commitment, agreement, is_free_brief, submitted_by, submitted_at, deleted_at)
+    VALUES ('tp_1', 'ed_1', 'ent_1', '某银行', '零售风控助手', '人工审批慢', '可演示原型', '能跑', 'A',
+      'approved', 11, 'A', '试点承诺', '试点承诺书', 0, 'u_a', '2026-10-01T00:00:00.000Z', NULL);
+  `);
+  const token = publicToken(s.db);
+  const res = await call(s.app, 'GET', `/api/public/calendar.ics?editionId=ed_1&token=${encodeURIComponent(token)}`);
+  assert.equal(res.status, 200, res.body);
+  assert.equal(res.body.includes('某银行'), false, '企业名不公示');
+  assert.equal(res.body.includes('零售风控助手'), false, '任务包标题不公示');
+  cleanup(s.db, s.close, s.dataDir);
+});
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
 
-Run: `cd platform && node --test test/icalendar.test.js`
+Run: `cd platform && node --disable-warning=ExperimentalWarning --test test/icalendar.test.js`
 Expected: FAIL —— `Cannot find module '../src/domain/icalendar.js'`
 
 - [ ] **Step 3: 创建 `src/domain/icalendar.js`**
@@ -6111,6 +6455,7 @@ Expected: FAIL —— `Cannot find module '../src/domain/icalendar.js'`
 ```javascript
 // src/domain/icalendar.js — RFC 5545 日历文本生成（纯函数）
 // 依据：设计文档 §8「公开榜单 API + 赛程 iCal 订阅」；INTERFACES.md §6 `buildICalendar`
+// 溯源：R-STG-01（5 赛段时间轴与交付物）—— iCal 把「赛段时间轴」变成机器可读、可订阅的形态
 // 借鉴：dribdat 的 iCal 实现思路（MIT）——但【自己写】：
 //   零依赖约束（R-OPS-07：只用 Node 标准库），且 dribdat 的实现依赖 Django 生态。
 // ⛔ 纯函数：无 IO、无 Date.now()、无 Math.random()。now 由调用方传入。
@@ -6121,6 +6466,16 @@ Expected: FAIL —— `Cannot find module '../src/domain/icalendar.js'`
 //   ③ 行尾：CRLF
 //   ④ 时间戳：YYYYMMDDTHHMMSSZ（UTC）
 export const ICAL_LINE_MAX_OCTETS = 75;
+
+// ⚠️ ⛔ 领域层必须在**浏览器**里跑同一套引擎（P6 的演示版把 src/domain/*.js 原样拷进浏览器产物）
+//    ⇒ 不得用 Node 专属全局（Buffer / process / require / __dirname / __filename）——
+//    浏览器里 `Buffer is not defined` ⇒ 整个模块直接 ReferenceError。
+//    TextEncoder / TextDecoder 是 **WHATWG Web 标准**（Node ≥ 11 起也是全局）⇒ 两端通用，
+//    且**不需要 import 任何 Node 内置模块**。
+//    ⚠️ `build-demo.js` 的 `assertDomainIsBrowserSafe` 只查 import 说明符、不查 Node 全局
+//    ⇒ 这类违规它查不出来（见计划文档 T5-C9）。
+const ENCODER = new TextEncoder();
+const DECODER = new TextDecoder();
 
 export function escapeICalText(value) {
   return String(value ?? '')
@@ -6146,7 +6501,7 @@ export function formatICalTimestamp(value) {
  */
 export function foldICalLine(line) {
   const text = String(line ?? '');
-  const bytes = Buffer.from(text, 'utf8');
+  const bytes = ENCODER.encode(text);
   if (bytes.length <= ICAL_LINE_MAX_OCTETS) return text;
 
   const parts = [];
@@ -6156,7 +6511,7 @@ export function foldICalLine(line) {
     let end = Math.min(start + limit, bytes.length);
     // 回退到字符边界：bytes[end] 若是续接字节（10xxxxxx）说明劈开了多字节字符
     while (end > start && end < bytes.length && (bytes[end] & 0xc0) === 0x80) end -= 1;
-    parts.push(bytes.subarray(start, end).toString('utf8'));
+    parts.push(DECODER.decode(bytes.subarray(start, end)));
     start = end;
     limit = ICAL_LINE_MAX_OCTETS - 1; // 续行首字符是空格，占 1 octet
   }
@@ -6211,6 +6566,7 @@ import { buildICalendarText } from '../domain/icalendar.js';
 ```javascript
 /**
  * 赛程日历（iCal）。
+ * 溯源：R-STG-01（5 赛段时间轴与交付物）—— 依据 INTERFACES.md §6 / 设计文档 §8
  * @param db        数据库
  * @param editionId 届期
  * @param now       时间（【追加的可选参数】，便于测试注入；不传则取当前时间）
@@ -6250,13 +6606,14 @@ function addOneDay(value) {
 把导入区改成：
 
 ```javascript
-import { getPublicLeaderboard, buildICalendar, resolvePublicToken } from '../services/public-api.js';
+import { getPublicLeaderboard, buildICalendar, resolvePublicToken } from '../../services/public-api.js';
 ```
 
 在 `registerPublicRoutes` 里追加：
 
 ```javascript
   // 赛程日历（iCal）。⛔ 同样要 token：公开 ≠ 无鉴权。
+  // 溯源：R-STG-01（5 赛段时间轴与交付物）—— 依据 INTERFACES.md §6 / 设计文档 §8
   router.add('GET', '/api/public/calendar.ics', async ({ query }) => {
     resolvePublicToken({
       db, token: query.token, requiredScope: 'calendar', editionId: query.editionId,
@@ -6268,18 +6625,27 @@ import { getPublicLeaderboard, buildICalendar, resolvePublicToken } from '../ser
 
 - [ ] **Step 6: 运行测试确认通过**
 
-Run: `cd platform && node --test test/icalendar.test.js`
-Expected: PASS（8 个测试全过：icalendar.test.js 8）
+Run: `cd platform && node --disable-warning=ExperimentalWarning --test test/icalendar.test.js`
+Expected: PASS（**31** 个测试全过：icalendar.test.js 31）
+
+Run: `cd platform && node --disable-warning=ExperimentalWarning --test`
+Expected: 全部通过（P0–P5 累计：**1107** 例 / 通过 1106 / 失败 0 / 跳过 1）
+
+Run: `cd platform && node --disable-warning=ExperimentalWarning --test`
+Expected: 全部通过（P0–P5 累计：**1104** 例 / 通过 1103 / 失败 0 / 跳过 1）
 
 - [ ] **Step 7: 提交**
 
 ```bash
-cd platform && git add src/domain/icalendar.js src/services/public-api.js src/http/routes/public.js test/icalendar.test.js
+git add platform/src/domain/icalendar.js platform/src/services/public-api.js \
+  platform/src/http/routes/public.js platform/test/icalendar.test.js
 git commit -m "feat(P5): iCal 日历导出（手写 RFC 5545，零依赖）
 
-对应设计文档 §8 公开日历订阅：
+对应设计文档 §8 公开日历订阅（R-STG-01 赛段时间轴）：
 - 行折叠 ≤75 octets、逗号/分号/反斜杠转义、CRLF 行尾、UTC 时间戳
-- 日历接口同样要 token（scope=calendar）"
+- 日历接口同样要 token（scope=calendar）" -- \
+  platform/src/domain/icalendar.js platform/src/services/public-api.js \
+  platform/src/http/routes/public.js platform/test/icalendar.test.js
 ```
 
 ---
@@ -6679,8 +7045,8 @@ route('/tasks/:workflowId', (ctx) => renderTasks(ctx));
 Run: `cd platform && node --test test/workflow-e2e.test.js`
 Expected: PASS（1 个端到端用例通过）
 
-Run: `cd platform && node --test`
-Expected: 全部通过
+Run: `cd platform && node --disable-warning=ExperimentalWarning --test`
+Expected: 全部通过（P0–P5 累计：**1101** 例 / 通过 1100 / 失败 0 / 跳过 1）
 
 - [ ] **Step 6: 人工验收任务清单页**
 
@@ -7695,3 +8061,144 @@ test('computePersonalPoints：无 userId 的条目不参与累加；口径外的
 | `platform/src/server.js` | Modify（P0 建立，**本 Task 只追加**） | 导入段 + 3 条路由挂载 + `__rawText` 原文响应分支；I7-4 块**整段保留** |
 | `platform/test/public-api.test.js` | **新建**（P5） | 55 例（服务层 25 + HTTP 层 30） |
 | `docs/superpowers/plans/2026-10-20-platform-P5-workflow-pools.md` | Modify | Task 4 代码块逐字回写 + 本章台账 |
+
+---
+
+## P5 Task 5 实施台账（2026-10-21）
+
+> 执行者：P5 Task 5 实现 Agent。**规格 = 本计划 Task 5 章节**（唯一权威）。
+> 本台账记七件事：① 实施方法（先跑后派）；② 规格缺陷与处置；③ 逐字回写位置；
+> ④ 实跑证据；⑤ 变异检验；⑥ 计划块逐字核验；⑦ 遗留需上游注意；⑧ 改动文件清单。
+> **落盘文件与本计划 Task 5 的代码块逐字一致**（核验脚本见 T5-F）。
+>
+> **溯源 ID 订正**：派单时给的「R-PTS-08」有误 —— R-PTS-08 是「行为分 ≤10% 且只做垫底排序」，
+> 与日历无关。iCal 导出赛程日历的正确落点是 **R-STG-01（5 赛段时间轴与交付物）**
+> （`docs/requirements-traceability.md:41` 全表里没有独立的「日历订阅」条目）。
+> 已按上游订正写成 `// R-STG-01：赛段时间轴（iCal 导出）—— 依据 INTERFACES.md §6 / 设计文档 §8`。
+
+### T5-A 实施方法（先跑后派：规格改动必须先在独立工程实跑通过）
+
+| 步骤 | 动作 | 证据 |
+|---|---|---|
+| A-1 | 把 Task 5 的 **7 个围栏代码块**抽到独立工程 `/tmp/p5-t5/`（`extract.mjs` 按块号落盘，保留计划行号） | `/tmp/p5-t5/blocks/00..06-*.txt` |
+| A-2 | 独立工程 = `cp -R` worktree 的 `platform/` ⇒ `/tmp/p5-t5/platform`（**不在仓库里试错**） | — |
+| A-3 | **Step 2 期望失败实跑**：只落测试块 → `node --disable-warning=ExperimentalWarning --test test/icalendar.test.js` | `Error [ERR_MODULE_NOT_FOUND]: Cannot find module '/private/tmp/p5-t5/platform/src/domain/icalendar.js' imported from .../test/icalendar.test.js`（与计划 Expected 逐字一致） |
+| A-4 | 落 4 个实现块（领域层 / 服务层追加 / 路由追加 / 路由导入） | 见 T5-B 的实跑缺陷 |
+| A-5 | 规格缺陷**先在独立工程里修好并跑通**，再把修正内容**逐字回写**计划对应代码块 | T5-C |
+| A-6 | 独立工程全量绿（1101 例 / 失败 0）后，才把文件落进 worktree | `/tmp/p5-t5/platform` → worktree |
+| A-7 | 变异检验在 **`cp -R` 副本** `/tmp/p5-mutate/t5work` 上跑（变异会改文件 ⇒ 绝不能污染 worktree）；变异脚本**不进仓库** | `/tmp/p5-mutate/t5.mjs` |
+
+> ⛔ **A-3 的顺序纪律**：先跑「Step 2 期望失败」，再落实现 —— 否则「测试通过」不能证明
+> 「测试对被测行为有判别力」。
+
+### T5-B 规格缺陷清单
+
+| # | 级别 | 缺陷 | 实跑证据 | 处置 |
+|---|---|---|---|---|
+| T5-C1 | **Important** | Step 5 的路由导入行**相对深度错了一层**：计划写 `from '../services/public-api.js'`，但文件在 `src/http/routes/` ⇒ 解析到 `src/http/services/public-api.js`（不存在）。**与 Task 4 的 T4-C1 同款**（计划作者按 `src/services/` 的深度写，而文件在 `src/http/routes/`） | 把计划块**逐字**落盘后跑全量，当场红 **13 个测试文件**：`Error [ERR_MODULE_NOT_FOUND]: Cannot find module '/private/tmp/p5-t5/platform/src/http/services/public-api.js' imported from .../src/http/routes/public.js` | 改为 `../../services/public-api.js`（与 P1/P2 既有路由文件 `src/http/routes/team.js:3-6` **逐字同款**）；**回写计划 Step 5 的导入块** |
+| T5-C2 | **Important** | 计划的测试块**只覆盖领域层与服务层**（8 例）⇒ 本 Task 新建的 **`GET /api/public/calendar.ics` 路由零覆盖**（与 Task 4 的 T4-C2 同款病根：机制写下来了，测试却没接线）。零覆盖 ⇒ 路由的 token 鉴权、`__rawText` 原文响应、`Content-Type`、CRLF 是否被 JSON 转义 —— 全部没有回归保护 | 变异检验实测：路由相关变异体（`T5-M45`…`T5-M50`）在原 8 例下**全体存活** | 补测：测试块 **8 → 29 例**（领域层 13 + 服务层 3 + HTTP 层 13）。补的判别性数据：赛段名含 `,` `;` `\`、超长中文赛段名（触发服务层折叠）、跨届期 token / 过期 token / scope 不符、无赛段届期（200 + 空集）、企业名不外泄 |
+| T5-C3 | Minor | Step 2 / Step 6 的测试命令缺 `--disable-warning=ExperimentalWarning`（`package.json` 四个 scripts 都带这个 flag，计划里是旧口径） | — | 两处补上 |
+| T5-C4 | Minor | Step 7 的提交命令**没有 `-- <paths…>` 显式路径**，且 `git add` 给的是 `src/…` 相对路径（在 `platform/` 目录下执行时才对，但与本项目「从仓库根 + 显式路径」的纪律不符） | 本项目提交纪律（见 T1-1 C-8 / T4-C3） | 改为从仓库根执行的逐文件显式路径 + `--` |
+| T5-C5 | Minor | Step 6 的 Expected 写「8 个测试全过」，与补测后的实际数字不符 | 实跑 29 例 / 全量 1105 例 | 回写为 `29` / `1105`（见 T5-C 的逐字回写位置） |
+| T5-C6 | Minor | **溯源 ID 缺失且派单给的 ID 有误**：计划正文未给 iCal 的溯源 ID；派单提示的 `R-PTS-08` 实为「行为分 ≤10% 且只做垫底排序」（`requirements-traceability.md:103`），与日历无关 | 核对 `docs/requirements-traceability.md` 全表 | 落 `// R-STG-01：赛段时间轴（iCal 导出）—— 依据 INTERFACES.md §6 / 设计文档 §8`（`R-STG-01` = 5 赛段时间轴与交付物，`:41`）；**回写计划的三处代码块** |
+| T5-C7 | Minor（知悉） | `buildICalendar` 的 `end: s.ends_at ?? addOneDay(s.starts_at)` 里的 `addOneDay` **在当前 schema 下不可达** —— `stages.ends_at` 是 `TEXT NOT NULL`（`db/migrations/003_review.sql:29`）⇒ `??` 的左操作数恒非空 | 变异检验 `T5-M44`（把 +1 天改成 +2 天）在全表面探针下**无差别**；见证探针（把仓储的 `ends_at` 改成 `NULL AS ends_at`）⇒ base ≠ mutant | **不改代码**：保留作防御（上游若放开 `ends_at` 可空，它立刻生效）；登记为 T5-G-5（不可观测 + 见证成立） |
+| T5-C8 | Minor（知悉） | `URL` 用的是**相对路径**（`/leaderboard?stageId=…`），而 RFC 5545 的 `URL` 属性要求**绝对 URI** | 计划原块如此；`buildICalendar` 的签名里**没有** base URL 参数 | **不改代码**（加 baseUrl 参数会改 `INTERFACES.md` §6 的签名，超出本 Task 范围）；登记为 T5-G-6（若上游要绝对 URL，须先扩签名） |
+| T5-C9 | **Important** | **领域层用了 Node 专属全局 `Buffer`**（`src/domain/icalendar.js` 的 `Buffer.from(text,'utf8')` 与 `bytes.subarray(...).toString('utf8')`）—— 违反「领域层要在**浏览器**里跑同一套引擎」的硬约束 | ① P6 的演示版把 `src/domain/*.js` **原样拷进浏览器产物**（`<out>/src/domain/*.js`）⇒ 浏览器里 `Buffer is not defined` ⇒ 整个模块 **ReferenceError**；② 全仓扫描：`Buffer` 在 `src/domain/**` 里**只此一处**（`src/auth/`、`src/http/` 的 `Buffer` 不在领域层，不受此约束）；③ ⛔ `build-demo.js` 的 `assertDomainIsBrowserSafe` **只查 import 说明符、不查 Node 全局** ⇒ 这类违规它**查不出来** | 改用 **WHATWG Web 标准** `TextEncoder` / `TextDecoder`（Node ≥ 11 起也是全局 ⇒ 两端通用，且**不需要 import 任何 Node 内置模块**）：`ENCODER.encode(text)` 取代 `Buffer.from(text,'utf8')`；`DECODER.decode(bytes.subarray(start,end))` 取代 `bytes.subarray(start,end).toString('utf8')`；encoder/decoder 提到**模块级常量**。⚠️ **多字节回退那段逻辑一个字未动**（diff 实证：只有上述两行字节 API 变化）。补 2 条测试（静态扫描 + 折叠行为）；**回写计划的两处代码块**；变异检验新增 6 个变异体（见 T5-E） |
+
+> **编号说明**：本 Task 的台账条目一律用 `T5-C*` 前缀（Task 1 用裸 `C-*`、Task 2 用 `T2-C*`、
+> Task 3 用 `T3-C*`、Task 3 修复轮用 `T3R-C*`、Task 4 用 `T4-C*`）⇒ **不重号**。
+
+### T5-C 逐字回写位置（计划文档 → 实际文件）
+
+| 计划的代码块 | 实际文件 | 回写内容 |
+|---|---|---|
+| Task 5 Step 1 的测试块（计划行 6010 起） | `platform/test/icalendar.test.js` | 整块替换为 31 例（计划原 8 例**逐字保留** + 23 例新增：21 例首轮 + 2 例 T5-C9 修复轮）；`setup()` 增 `loadRules` + `createApp`（HTTP 层用例需要） |
+| Task 5 Step 3 的领域块（计划行 6455 起） | `platform/src/domain/icalendar.js` | 加 1 行 `// 溯源：R-STG-01…`；**T5-C9 修复轮**：把 `Buffer.from` / `.toString('utf8')` 换成 `TextEncoder` / `TextDecoder`（模块级常量）+ 浏览器安全的注释；**多字节回退逻辑逐字未动** |
+| Task 5 Step 4 的服务追加块（计划行 6510 起） | `platform/src/services/public-api.js` | 仅在 `buildICalendar` 的文档注释里加 1 行 `// 溯源：R-STG-01…` |
+| Task 5 Step 5 的路由导入块（计划行 6552 起） | `platform/src/http/routes/public.js` | **导入深度 `../services/` → `../../services/`**（T5-C1）；**回写计划** |
+| Task 5 Step 5 的路由追加块（计划行 6558 起） | `platform/src/http/routes/public.js` | 仅加 1 行 `// 溯源：R-STG-01…` |
+| **Task 4 Step 3** 的 `src/services/public-api.js` 整文件块（计划行 5443 起） | `platform/src/services/public-api.js` | 同步为 Task 5 之后的终态（250 行）：原 213 行**逐字保留** + Task 5 的 1 行导入 + 追加段 |
+| **Task 4 Step 6** 的 `src/http/routes/public.js` 整文件块（计划行 5831 起） | `platform/src/http/routes/public.js` | 同步为 Task 5 之后的终态（23 行）：原 14 行**逐字保留**（仅导入行按 T5-C1 改）+ Task 5 的路由段 |
+| Task 5 Step 2 / Step 6 / Step 7 的文字 | 计划正文 | 补 `--disable-warning=ExperimentalWarning`；Expected 数字回写；提交命令补 `--` 与显式路径 |
+
+> ⚠️ **为什么 Task 4 的整文件块也要动**：`plan-blocks.mjs` 对「整文件块」要求**逐字等于实现文件全文**。
+> Task 5 是**追加**（文件归属：最早建立者 owns，后续阶段 Modify-追加）⇒ Task 4 的整文件块
+> 若不同步，`plan-blocks.mjs` 就会报 `src/services/public-api.js` / `src/http/routes/public.js`
+> 两处 `整文件块❌不一致`。**Task 5 自己的块仍是片段块**（导入行 / 追加段），与 Task 4 对
+> `src/server.js` 的处理方式同款（Task 4 台账 T4-C6 已记这条纪律）。
+
+### T5-D 实跑证据
+
+| 环节 | 命令 | 结果 |
+|---|---|---|
+| Step 2 期望失败 | `cd platform && node --disable-warning=ExperimentalWarning --test test/icalendar.test.js` | `ERR_MODULE_NOT_FOUND: …/src/domain/icalendar.js` ✅ 与计划 Expected 逐字一致 |
+| 本 Task 单文件 | `cd platform && node --disable-warning=ExperimentalWarning --test test/icalendar.test.js` | **31 例 / 通过 31 / 失败 0 / 跳过 0**（29 例 + T5-C9 修复轮新增 2 例） |
+| **全量** | `cd platform && node --disable-warning=ExperimentalWarning --test` | **1107 例 / 通过 1106 / 失败 0 / 跳过 1**（跳过的 1 例是 P0–P4 既有的） |
+| 禁用表述扫描 | `cd platform && node scripts/audit-scan.js; echo "退出码=$?"` | **退出码 0**（未发现禁用表述） |
+| 计划块核验 | `node /tmp/p3fix/plan-blocks.mjs <计划> platform` | Task 5 的 2 个整文件块 + Task 4 的 2 个被同步的整文件块全部 `✅一致` |
+| 片段核验 | `node /tmp/p4-proof/fragment-check.mjs <计划> platform <4 个文件>` | `核验 4 个片段块，不一致 0 个`（退出码 0） |
+| 按路径核验 | `node /tmp/p3fix/block-by-path.mjs <计划> platform <4 个文件>` | `共核验 4 个文件，不一致 0 个`（退出码 0） |
+
+> ⚠️ 唯一一处「整文件块❌不一致」是 `web/app.js`（计划行 6971，Task 6 的 1 行片段）——
+> **本 Task 之前就已存在**（Task 4 台账 T4-D 已记同样一条），**与本 Task 无关**，由 Task 6 处置。
+>
+> ⚠️ **一次未能复现的偶发失败（诚实记录）**：全量跑的第 1 次出现过 **1 例失败**（当时**未捕获失败用例名**），
+> 随后的 **19 次连续全量跑全部为 1104/0**（本 Task 侧 3 + 6 + 10 次；Task 5 之前的基线 `HEAD` 侧另跑 8 次也全绿）。
+> 候选嫌疑是 `test/db-concurrency.test.js`（**唯一**按墙钟时间断言的用例：`waited >= 300` / `elapsed < 2500`，
+> 且会起 worker 线程）—— 新增一个测试文件会抬高 `node --test` 的并行负载 ⇒ 放大了这个**既有**用例的抖动窗口。
+> **本 Task 未改动 `db-concurrency` 或任何并发/超时相关代码**（只新增 1 个测试文件 + 追加 2 处实现）。
+> 若上游要消除该抖动，须单独收紧 `db-concurrency.test.js` 的时间断言（**不在本轮范围**）。
+
+### T5-E 变异检验（`/tmp/p5-mutate/t5.mjs`，**不进仓库**）
+
+**56 个变异体 → 杀 52 / 真等价 2 / 不可观测 2 / 缺口 0**（锚点命中异常 0 个：每个锚点都恰好命中 1 次）。
+（其中 T5-M51…M56 是 **T5-C9 修复轮**新增的 `TextEncoder`/`TextDecoder` 变异体。）
+
+| 类别 | 编号 | 为什么能判成这一类（**必须有探针差分实证**） |
+|---|---|---|
+| **真等价**（2） | T5-M34 | `if (bytes.length <= ICAL_LINE_MAX_OCTETS) return text;` → `<`：**恰好 75 octet 的行**在两条路径下产出**同一串字节** —— 折叠分支里 `end = min(0+75, 75) = 75`，而回退多字节边界的条件要求 `end < bytes.length`（75 < 75 为假）⇒ 首块就是整行，`start = 75` 后循环结束 ⇒ 恒等。**探针差分实证**：探针覆盖了「恰好 75 octet 且末字符是多字节」（`'x'×72 + '赛'`）等 5 组边界输入 + 全表面快照，base 与 mutant **逐字节相同** |
+| | T5-M56 | `bytes.subarray(start, end)` → `bytes.slice(start, end)`：`subarray` 返回**视图**、`slice` 返回**拷贝** —— 但本模块只把结果**读一次**（`DECODER.decode(...)`）⇒ 两者产出同一串字符串。**探针差分实证**：全表面快照 base 与 mutant **逐字节相同** |
+| **不可观测**（2）<br>（当前 schema/测试集下测不出，但**见证探针证明它会改变行为**） | T5-M08 | `pad(d.getUTCFullYear(), 4)` → `pad(…, 2)`：**见证**（把年份推到 999）⇒ `09990101T000000Z` vs `990101T000000Z` ⇒ base ≠ mutant。正常业务日期（年份 ≥ 1000）下 `padStart` 不截断 ⇒ 恒等 ⇒ 当前测不出 |
+| | T5-M44 | `addOneDay` 的 `+ 86400000` → `+ 172800000`：**见证**（把仓储的 `ends_at` 改成 `NULL AS ends_at`，即「赛段没有结束日期」这个场景）⇒ DTEND 不同 ⇒ base ≠ mutant。当前 `stages.ends_at` 是 `NOT NULL` ⇒ 该分支**不可达** ⇒ 当前测不出（T5-C7） |
+| **杀死**（52） | T5-M01…M56 中其余 52 个 | 覆盖：折叠上限（±1 octet）/ 折叠宽度用满 75 / 续行前导空格 / 续行宽度扣减 / 多字节边界回退 / 转义四类（`\` `,` `;` 换行）与其**顺序** / 年月日时分秒各位 / UTC 与本地时区 / `Z` 后缀 / CRLF 行尾与结尾 CRLF / `now` 必填与「不读时钟」/ 域层纯度（不 import `node:`、不用 `Date.now()`）/ 五个日历头字段 / `UID`·`DTSTAMP`·`DTEND`·`DESCRIPTION`·`LOCATION`·`URL` / `SUMMARY` 转义 / 服务层 `editionId` 必填 / `UID`·`SUMMARY`·`DESCRIPTION`·`DTEND`·`LOCATION`·`X-WR-CALNAME`·`URL` / 路由 `scope`·`届期`·`Content-Type`·`参数透传`·`鉴权`·`路径` / **T5-C9 新增**：`TextEncoder` 编码内容被改·`TextDecoder` 丢掉 `end`·解码器用错编码·**退回 `Buffer`**（浏览器里 ReferenceError）·编码多一个尾随空格 |
+
+**探针差分方法**（`/tmp/p5-mutate/t5.mjs` 内置 `PROBE`）：对「全绿但存活」的变异体，跑一个**全表面快照**——
+领域层（转义 / 折叠 / 时间戳，各 20+ 组输入，含「恰好 75 octet」「末字符是多字节」等边界）
+**+ 服务层**（`buildICalendar` 对 3 个赛段：普通中文 / 含 `,;\` / 超长中文名，产出整份 ics）。
+归一化后与基线**逐字节**比较：相同 ⇒ 等价/不可观测，不同 ⇒ 存活（要归类）。
+⚠️ **第一版探针只覆盖领域层** ⇒ 服务层变异体 `T5-M42`（`DESCRIPTION` 不带赛段代号）被**误判**成「真等价」。
+已把探针扩到服务层，并据此补了一条断言（`DESCRIPTION 必须带赛段代号`）⇒ `T5-M42` 改为**被杀**。
+**见证脚本**：对判为「不可观测」的 2 个变异体，**再叠加一个场景改动**（年份推到 999 / 仓储返回空 `ends_at`），
+证明 base ≠ mutant ⇒ 它们**不是逻辑等价**，只是当前空间测不出。**见证成立 2 / 2**。
+
+### T5-F 计划块逐字核验
+
+| 文件 | 核验结果 |
+|---|---|
+| `platform/test/icalendar.test.js` | 整文件块 ✅一致（435 行） |
+| `platform/src/domain/icalendar.js` | 整文件块 ✅一致（98 行） |
+| `platform/src/services/public-api.js` | 整文件块 ✅一致（250 行；Task 4 的块已同步为终态） |
+| `platform/src/http/routes/public.js` | 整文件块 ✅一致（23 行；Task 4 的块已同步为终态） |
+
+### T5-G 遗留需上游注意
+
+| # | 事项 | 说明 |
+|---|---|---|
+| G-1 | **`addOneDay` 在当前 schema 下不可达** | `stages.ends_at` 是 `TEXT NOT NULL`（`db/migrations/003_review.sql:29`）⇒ `s.ends_at ?? addOneDay(s.starts_at)` 的右操作数恒不生效。保留作防御（上游若放开 `ends_at` 可空，它立刻生效）。**不要**因为「看起来没用」就删掉它（T5-C7 / 变异体 `T5-M44` 见证成立） |
+| G-2 | **iCal 的 `URL` 是相对路径** | RFC 5545 的 `URL` 属性要求**绝对 URI**，本实现给的是 `/leaderboard?stageId=…`（没有 base URL 可拼）。主流客户端会忽略这条属性，**不影响订阅**；若上游要绝对 URL，须先给 `buildICalendar` 扩 `baseUrl` 参数（会动 `INTERFACES.md` §6 的签名 ⇒ 须上游裁决） |
+| G-3 | **`.ics` 路由的 `editionId` 必填** | 契约没有「当届期」的默认解析口径（本 Task 未擅自引入）⇒ 不传 `editionId` 返回 400 `EDITION_REQUIRED`。若上游希望「不传即当届」，须在 `src/http/routes/public.js` 里接 `pickCurrentEdition`（P0/P1 已有该函数）—— **本轮不改**（会引入新的口径） |
+| G-4 | **公开 token 走 query 串**（沿用 Task 4 的 G-5） | `GET /api/public/calendar.ics?editionId=…&token=…` ⇒ token 会进 nginx 访问日志。P6 部署时须在 nginx 层关掉 query 串访问日志 |
+| G-5 | `resolvePublicToken` 的 `requiredScope: 'calendar'` | `rules/pools.json` 的 `publicScopes` 含 `calendar` ⇒ 可签发日历专用令牌；`scope='all'` 的令牌同样可用（`resolvePublicToken` 放行 `all`） |
+| G-6 | **`X-WR-CALNAME` 取届期名** | 届期名含中文与 `·` 等字符时按 RFC 5545 的 TEXT 规则转义（`escapeICalText`）；`·` 不在需转义之列 ⇒ 原样输出 |
+| G-7 | **iCal 不泄露企业名与内部身份** | 公开日历只含赛段时间轴（赛段名/代号/赛点/榜单跳转），**不含**企业名、任务包标题、用户 id —— 有专门用例守着 |
+| G-8 | **`build-demo.js` 的 `assertDomainIsBrowserSafe` 只查 import 说明符，不查 Node 专属全局** | ⛔ 本仓的领域层硬约束是「**不得 import 任何 Node 内置模块**（P6 的演示版要在浏览器里跑同一套引擎）」，但该检查器只看 `import … from 'node:…'` ⇒ **`Buffer` / `process.` / `require(` / `__dirname` 这类 Node 专属全局它查不出来**（T5-C9 就是这样溜进去的）。`build-demo.js` 属 P6 Task 6 的文件（**本轮未改**）⇒ **建议上游把检查范围扩到 Node 全局**，并把本轮补的静态扫描（`test/icalendar.test.js` 的「★ 领域层不含 Node 专属全局」）推广到整个 `src/domain/**`（现已覆盖该目录全部 22 个文件） |
+
+### T5-H 本 Task 改动的文件清单
+
+| 文件 | 性质 | 说明 |
+|---|---|---|
+| `platform/src/domain/icalendar.js` | **新建**（P5） | RFC 5545 纯函数：`escapeICalText` / `formatICalTimestamp` / `foldICalLine` / `buildICalendarText` / `ICAL_LINE_MAX_OCTETS`；⛔ 无 IO、无 `Date.now()`、无 `Math.random()`、`now` 必填；⛔ **无 Node 专属全局**（用 `TextEncoder`/`TextDecoder`，浏览器可跑，T5-C9） |
+| `platform/src/services/public-api.js` | Modify（Task 4 建立，**本 Task 只追加**） | 追加 `buildICalendar` + 1 行导入 + `addOneDay` 私有辅助；原 213 行逐字未改 |
+| `platform/src/http/routes/public.js` | Modify（Task 4 建立，**本 Task 只追加**） | 追加 `GET /api/public/calendar.ics`（token 鉴权 + `__rawText` 原文响应）；导入行按 T5-C1 修正深度 |
+| `platform/test/icalendar.test.js` | **新建**（P5） | 31 例（领域层 15 + 服务层 3 + HTTP 层 13） |
+| `docs/superpowers/plans/2026-10-20-platform-P5-workflow-pools.md` | Modify | Task 5 代码块逐字回写 + Task 4 两处整文件块同步为终态 + 本章台账 |
