@@ -21,7 +21,9 @@ import { can } from './auth/permissions.js';
 import { verifyPassword, hashPassword } from './auth/password.js';
 import { changePassword, logoutAllSessions } from './services/auth.js';
 import { getUserById, getCredentialsByPhone, toPublicUser } from './db/repo/users.js';
-import { getStage, getStageJudge } from './db/repo/stages.js';
+import { listUserRoles } from './db/repo/roles.js';
+import { getStage, getStageJudge, listStageSummaries } from './db/repo/stages.js';
+import { listWorkflowSummaries } from './db/repo/workflows.js';
 import { appError, AppError } from './errors.js';
 import { registerRegistrationRoutes, pickCurrentEdition } from './http/routes/registration.js';
 import { registerTaskPackageRoutes } from './http/routes/taskPackage.js';
@@ -223,7 +225,30 @@ export function createApp({ db, rules, webDir }) {
       //    下游 `e instanceof AppError` 分支就再也进不去了。
       throw appError(401, 'UNAUTHENTICATED', '未登录');
     }
-    return { user: toPublicUser(user) };
+    // ⚠️ P7：带上**角色键**（roles）—— 前端要按角色分区导航（用户端 / 管理员端 / 组委会端），
+    //    没有它前端只能做出「所有人看到同一个菜单」的水平导航。
+    //    ⛔ roles 只用于导航入口分区，**不是授权依据**（授权仍由 can() 在服务端裁决）。
+    return { user: toPublicUser(user, listUserRoles(db, user.id)) };
+  });
+
+  // ── P7：赛段时间线 / 工作流列表（给前端做选择器与入口页）────────────
+  // ⚠️ 为什么补这两个只读端点：
+  //    打磨前端时发现「赛段榜没有赛段可选」「任务清单页没有入口」——
+  //    仓储层本来就有 listStages / listWorkflowsByEdition，只是**没有端点**，
+  //    前端只能靠人肉拼 URL ⇒ 页面在生产上是走不通的。
+  router.add('GET', '/api/stages', async ({ query }) => {
+    // 赛段时间线是公开赛事信息（与 /api/registration-criteria 同口径：公开透明）。
+    const editionId = query.editionId ? resolveEditionId(db, query.editionId) : null;
+    return { items: listStageSummaries(db, editionId ? { editionId } : {}) };
+  });
+
+  router.add('GET', '/api/workflows', async ({ user, query }) => {
+    if (!user) throw appError(401, 'UNAUTHENTICATED', '未登录');
+    if (!can(user, 'task_package:read', { scopeType: 'global' }, db)) {
+      throw appError(403, 'FORBIDDEN', '没有查看任务清单的权限');
+    }
+    const editionId = resolveEditionId(db, query.editionId);
+    return { items: listWorkflowSummaries(db, editionId) };
   });
 
   // ── P5 路由 ────────────────────────────────────────────────
@@ -250,7 +275,9 @@ export function createApp({ db, rules, webDir }) {
     const maxAge = Math.max(0, Math.floor((new Date(expiresAt).getTime() - Date.now()) / 1000));
     return {
       status: 200,
-      body: { user: toPublicUser(getUserById(db, cred.id)) },
+      // ⚠️ P7：登录响应同样带 roles —— 否则登录后前端拿不到角色，
+      //    导航要等下一次 /api/me 才分区（用户会看到「刚登录还是访客菜单」）。
+      body: { user: toPublicUser(getUserById(db, cred.id), listUserRoles(db, cred.id)) },
       headers: { 'Set-Cookie': sessionCookie(token, maxAge, secureCookies) },
     };
   });

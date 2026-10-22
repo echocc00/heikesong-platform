@@ -34,7 +34,7 @@
 //      /api/teams/:id/tier        → src/services/tier.js getTeamTier
 //      /api/teams/:id/performance-card → src/services/performance-card.js getPerformanceCard
 import { scoreRegistration, classifyLevel, validateRegistrationAnswers } from '../src/domain/registration.js';
-import { scoreSolvability } from '../src/domain/solvability.js';
+import { scoreSolvability, checkTaskMix } from '../src/domain/solvability.js';
 import { scoreStage } from '../src/domain/scoring.js';
 import { applyEnterpriseRules } from '../src/domain/enterprise-seat.js';
 import { detectSelfEvalDiff } from '../src/domain/self-eval.js';
@@ -62,6 +62,10 @@ export const DEMO_RULE_FILES = {
   teamFormation: 'team-formation.json',
   points: 'points.json',
   criteria: 'criteria.json',
+  // ⚠️ P7 新增：报名页要显示 IP 归属 / 合规红线 / 同意条款
+  //    （src/http/routes/registration.js 的 buildCriteria 从 rules.compliance 取）。
+  //    缺它 ⇒ 演示站的报名页缺三块**明示内容**（R-ENT-11 / R-ENT-12 / 同意条款）。
+  compliance: 'compliance.json',
 };
 
 export function createMemoryStorage() {
@@ -130,6 +134,12 @@ export function buildDemoState(seed) {
     signoffs: deepCopy(seed?.signoffs) ?? [],
     behaviorEvents: deepCopy(seed?.behaviorEvents) ?? [],
     registrations: [],
+    // ⚠️ P7：工作流与任务清单（此前演示适配器**完全没有**工作流/任务端点
+    //    ⇒ 任务清单页在公网演示站是 404，导航里放这个入口就是放一个死链）。
+    workflows: deepCopy(seed?.workflows) ?? [],
+    workflowTasks: deepCopy(seed?.workflowTasks) ?? [],
+    // ⚠️ P7：复核队列（此前演示适配器没有 /api/audit/* ⇒ 两页 404）
+    flags: deepCopy(seed?.flags) ?? [],
     // ⚠️ results / computations / lastStageId **透传种子里的预计算结果**：
     //    演示站的种子由**构建期**跑一次真实引擎生成（build-demo.js），
     //    目的就是让访客打开就能看到榜单（否则 results 永远空 ⇒ 榜单页「暂无数据」）。
@@ -140,6 +150,135 @@ export function buildDemoState(seed) {
     lastStageId: deepCopy(seed?.lastStageId) ?? null,
     me: null,
   };
+}
+
+/**
+ * 演示站的复核队列（纯函数）。
+ * ⚠️ 数据来源：计算快照里的**自评差异标记**（selfEvalFlags）——
+ *    与演示站降级告警用的是同一批判定 ⇒ 队列与告警**说的是同一件事**。
+ *    形状与真实后端 `GET /api/audit/flags` 一致：{ id, kind, status, stageId, teamId, judgeId, detail }。
+ */
+export function demoFlags(state) {
+  if (!Array.isArray(state?.flags)) state.flags = [];
+  if (state.flags.length) return state.flags;
+  const comps = Object.values(state?.computations ?? {});
+  for (const c of comps) {
+    for (const f of c.selfEvalFlags ?? []) {
+      state.flags.push({
+        id: `flag_demo_${state.flags.length + 1}`,
+        kind: 'self_eval_difference',
+        status: 'open',
+        stageId: c.stageId,
+        teamId: f.teamId,
+        judgeId: null,
+        detail: { dimension: f.dimension, difference: f.d, action: f.action },
+        reason: null,
+        evidence: [],
+        createdAt: c.computedAt,
+      });
+    }
+  }
+  return state.flags;
+}
+
+/**
+ * 演示站的战队视图（纯函数）。
+ * ⚠️ 形状必须与真实后端 `src/services/team.js` 的 teamView() **一致** ——
+ *    演示站的种子用 `memberIds`（用户 id 数组），
+ *    而后端返回 `members: [{id, userId, role, joinedAt}]` ⇒ 不转换的话
+ *    前端的「成员列表」「谁是组长」「能不能退出」三处全拿不到数据。
+ */
+export function demoTeamView(team, state) {
+  const memberIds = team?.memberIds ?? [];
+  const captainId = team?.captainId ?? memberIds[0] ?? null;
+  const members = memberIds.map((uid, i) => ({
+    id: `${team.id}_m${i + 1}`,
+    userId: uid,
+    role: uid === captainId ? 'captain' : 'member',
+    joinedAt: null,
+  }));
+  return {
+    id: team?.id ?? '',
+    editionId: state?.edition?.id ?? 'ed_demo',
+    name: team?.name ?? '',
+    captainId,
+    taskPackageId: team?.packageId ?? null,
+    tier: team?.tier ?? 'D',
+    status: team?.status ?? 'forming',
+    members,
+    memberCount: members.length,
+    history: [],
+    needsMerge: team?.status === 'needs_merge',
+    mergeDeadline: team?.mergeDeadline ?? null,
+    milestones: team?.milestones ?? { items: [] },
+    formation: team?.formation ?? { ok: true, errors: [] },
+  };
+}
+
+/**
+ * 演示站的任务包视图（纯函数）。
+ * ⚠️ 形状与 `src/services/taskPackage.js` 的 presentTaskPackage() 一致。
+ */
+export function demoTaskPackageView(p, state) {
+  return {
+    id: p?.id ?? '',
+    editionId: state?.edition?.id ?? 'ed_demo',
+    enterpriseId: p?.enterpriseId ?? null,
+    enterpriseName: p?.enterpriseName ?? '',
+    title: p?.title ?? '',
+    painPoint: p?.painPoint ?? '',
+    expectedDelivery: p?.expectedDelivery ?? '',
+    acceptanceCriteria: p?.acceptanceCriteria ?? '',
+    grade: p?.grade ?? null,
+    status: p?.status ?? 'published',
+    solvabilityScore: p?.solvabilityScore ?? null,
+    solvabilityGrade: p?.solvabilityGrade ?? p?.grade ?? null,
+    commitment: p?.commitment ?? '',
+    agreement: p?.agreement ?? '',
+    isFreeBrief: p?.isFreeBrief === true,
+    submittedBy: p?.submittedBy ?? null,
+    submittedAt: p?.submittedAt ?? null,
+    approvedBy: p?.approvedBy ?? null,
+    approvedAt: p?.approvedAt ?? null,
+  };
+}
+
+/**
+ * 演示站的工作流 / 任务清单。
+ *
+ * ⚠️ 为什么需要「合成」而不是原样拷贝种子：
+ *    种子（web/seed/demo-data.json）里**没有**工作流与任务 ——
+ *    演示数据聚焦在「赛段评审 → 榜单 → 段位」这条主链上。
+ *    但前端的任务清单页需要一条可达路径（导航里就有入口），
+ *    ⇒ 这里按种子里的**任务包**合成一条演示工作流：
+ *      每张任务包 = 一个可自主领取的任务（题目取任务包标题，细节取企业承诺）。
+ *    ⛔ 合成只在**内存里**做（不写回种子文件），且只在 seed 没有工作流时兜底。
+ */
+export function ensureDemoWorkflows(state) {
+  if (!state) return state;
+  if (!Array.isArray(state.workflows)) state.workflows = [];
+  if (!Array.isArray(state.workflowTasks)) state.workflowTasks = [];
+  if (state.workflows.length) return state;
+  const packages = (state.taskPackages ?? []).filter((p) => p && p.status !== 'draft');
+  const workflowId = 'wf_demo_1';
+  state.workflows.push({
+    id: workflowId,
+    editionId: state.edition?.id ?? 'ed_demo',
+    taskPackageId: packages[0]?.id ?? null,
+    name: '演示任务清单',
+    createdAt: state.meta?.id ?? 'demo',
+  });
+  packages.forEach((p, i) => {
+    state.workflowTasks.push({
+      id: `wt_demo_${i + 1}`,
+      workflowId,
+      title: p.title ?? `演示任务 ${i + 1}`,
+      detail: p.commitment ?? p.enterpriseName ?? '完成该任务包的可运行版本',
+      status: 'todo',
+      claim: null,
+    });
+  });
+  return state;
 }
 
 /**
@@ -659,6 +798,10 @@ export function createDemoApi({ storage = defaultStorage(), seed = null, rules =
     if (!state.results || typeof state.results !== 'object') state.results = {};
     if (!Array.isArray(state.registrations)) state.registrations = [];
     if (!state.reviews || typeof state.reviews !== 'object') state.reviews = {};
+    // ⚠️ 工作流/任务清单兜底（老版 localStorage 里没有这两个容器）
+    ensureDemoWorkflows(state);
+    // ⚠️ 复核队列容器兜底（老版 localStorage 里没有）
+    if (!Array.isArray(state.flags)) state.flags = [];
     // ⚠️ **localStorage 里的旧 state 不带 results**（旧版演示站访问时留下的）⇒
     //    榜单会是空的（访客明明是第一次看到新版演示站，却看到「暂无数据」）。
     // ⇒ 补齐：**只补缺失的计算结果**，不覆盖访客自己的操作数据（报名/评审等）。
@@ -685,6 +828,9 @@ export function createDemoApi({ storage = defaultStorage(), seed = null, rules =
     // 当前用户
     if (method === 'GET' && clean === '/api/me') {
       if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
+      // ⚠️ P7：老版 localStorage 里的 me 没有 roles ⇒ 导航分区会退回「访客」。
+      //    演示站只有一个身份（演示组委会），缺角色就补上。
+      if (!Array.isArray(s.me.roles)) s.me.roles = ['admin'];
       return { user: s.me };
     }
     if (method === 'POST' && clean === '/api/auth/login') {
@@ -694,6 +840,8 @@ export function createDemoApi({ storage = defaultStorage(), seed = null, rules =
         mbaStatus: 'mba',
         org: '演示组委会',
         teamId: (s.teams ?? [])[0]?.id ?? null,
+        // ⚠️ P7：角色键 —— 前端据此分区导航（与真实后端 /api/me 的形状一致）
+        roles: ['admin'],
       };
       persist();
       return { user: s.me };
@@ -720,6 +868,16 @@ export function createDemoApi({ storage = defaultStorage(), seed = null, rules =
         levelFinal: level,
         dimensionScores: scored.dimensionScores,
         explain: scored.explain,
+        // ⚠️ P7：形状与真实后端的 presentRegistration() 对齐 ——
+        //    `grading`（分数 / 是否接收 / 可解释明细）与 `events`（事件轨迹）
+        //    是「报名筛选台」两列数据的来源，缺了这两列演示站上那两列恒空。
+        grading: {
+          score: scored.score,
+          level,
+          accepted: scored.accepted,
+          explain: scored.explain,
+        },
+        events: [],
         status: level === 'C' ? 'rejected' : 'accepted',
         createdAt: new Date().toISOString(),
       };
@@ -728,12 +886,237 @@ export function createDemoApi({ storage = defaultStorage(), seed = null, rules =
       return reg;
     }
     if (method === 'GET' && clean === '/api/registrations') {
-      return { rows: s.registrations };
+      // ⚠️ 形状与真实后端一致：后端返 `{ items }`（src/services/registration.js
+      //    listRegistrations），演示站此前返 `{ rows }` ⇒ 前端要么写两套、要么读不到。
+      //    ⇒ 返 `{ items }`，同时保留 `rows` 别名（老访客的 localStorage 不受影响，
+      //    但已有页面若还在读 rows 也不会突然空掉）。
+      return { items: s.registrations, rows: s.registrations };
+    }
+    // ── P7：报名筛选标准 ────────────────────────────────────────
+    // ⚠️ 此前演示适配器**没有**这个端点 ⇒ 公网演示站点「报名」页直接 404。
+    //    形状必须与 src/http/routes/registration.js 的 buildCriteria 一致。
+    if (method === 'GET' && clean === '/api/registration-criteria') {
+      const reg = r.registration;
+      const comp = r.compliance ?? {};
+      return {
+        editionId: s.edition?.id ?? 'ed_demo',
+        editionName: s.edition?.name ?? null,
+        scale: reg.scale,
+        dimensions: (reg.dimensions ?? []).map((d) => ({
+          key: d.key,
+          label: d.label,
+          weight: d.weight,
+          min: d.min,
+          max: d.max,
+          items: (reg.questions?.dimensionItems?.[d.key] ?? []).map((it) => ({ id: it.id, text: it.text })),
+        })),
+        openQuestion: { ...reg.openQuestion, prompt: reg.questions?.openQuestionItem?.text ?? '' },
+        levels: (reg.levels ?? []).map((l) => ({
+          key: l.key, label: l.label, minScore: l.minScore, accept: l.accept,
+        })),
+        funnel: reg.funnel ?? [],
+        funnelNote: reg.funnelNote ?? '',
+        ipOwnership: comp.ipOwnership ?? {},
+        redLines: comp.redLines ?? [],
+        consent: comp.consent ?? {},
+        schedule: [],
+      };
+    }
+    // ── P7：我的战队（列表）────────────────────────────────────
+    // ⚠️ 此前演示适配器**没有** GET /api/teams ⇒ 「我的战队」页 404。
+    if (method === 'GET' && clean === '/api/teams') {
+      if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
+      return { items: (s.teams ?? []).map((t) => demoTeamView(t, s)) };
+    }
+    // ── P7：任务包列表 ────────────────────────────────────────
+    // ⚠️ 此前演示适配器**没有** GET /api/task-packages ⇒ 「我的战队」的认领下拉空、
+    //    「报名筛选台」的配比体检与任务包清单也拿不到数据。
+    if (method === 'GET' && clean === '/api/task-packages') {
+      const items = (s.taskPackages ?? []).map((p) => demoTaskPackageView(p, s));
+      const mix = checkTaskMix(items, r.solvability);
+      return { items, mix };
+    }
+    // ── P7：退出战队（加入 / 退出 / 汰换共用一个端点）────────────
+    let tm2 = clean.match(/^\/api\/teams\/([^/]+)\/members$/);
+    if (method === 'POST' && tm2) {
+      if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
+      const team = (s.teams ?? []).find((t) => t.id === tm2[1]);
+      if (!team) throw httpError(404, 'NOT_FOUND', '战队不存在');
+      const action = body?.action ?? 'add';
+      if (action !== 'leave') {
+        throw httpError(400, 'BAD_REQUEST', '演示站暂不支持该操作（只支持退出）');
+      }
+      const captainId = team.captainId ?? team.memberIds?.[0] ?? null;
+      if (captainId === s.me.id) {
+        // ⛔ 与服务端同一口径：组长不能直接退出（服务端 409 CAPTAIN_MUST_REPLACE）
+        throw httpError(409, 'CAPTAIN_MUST_REPLACE', '组长不能直接退出，请先移交组长职责');
+      }
+      if (!(team.memberIds ?? []).includes(s.me.id)) {
+        throw httpError(404, 'NOT_FOUND', '你不在该战队中');
+      }
+      team.memberIds = (team.memberIds ?? []).filter((uid) => uid !== s.me.id);
+      // R-REG-04：仅剩 1 人 ⇒ 触发并队标记与期限
+      if (team.memberIds.length <= 1) {
+        team.status = 'needs_merge';
+        team.mergeDeadline = new Date(Date.now() + 7 * 86400000).toISOString();
+      }
+      persist();
+      return { ok: true, teamId: team.id, memberCount: team.memberIds.length };
+    }
+    // ── P7：单条报名 + 改级 ────────────────────────────────────
+    let regm = clean.match(/^\/api\/registrations\/([^/]+)$/);
+    if (method === 'GET' && regm) {
+      const reg = (s.registrations ?? []).find((x) => x.id === regm[1]);
+      if (!reg) throw httpError(404, 'NOT_FOUND', '报名记录不存在');
+      return reg;
+    }
+    let lvlm = clean.match(/^\/api\/registrations\/([^/]+)\/level$/);
+    if (method === 'POST' && lvlm) {
+      const reg = (s.registrations ?? []).find((x) => x.id === lvlm[1]);
+      if (!reg) throw httpError(404, 'NOT_FOUND', '报名记录不存在');
+      const from = reg.status;
+      const level = body?.level ?? null;
+      if (level) {
+        reg.levelFinal = level;
+        reg.status = level === 'C' ? 'rejected' : 'accepted';
+      }
+      // R-REG-10：改级要留**事件轨迹**（追加式，历史不覆盖）
+      reg.events = [...(reg.events ?? []), {
+        fromStatus: from, toStatus: reg.status, reason: body?.note ?? null,
+      }];
+      persist();
+      return { ok: true, registration: reg };
     }
     // 任务卡可解性评估（演示"六维准入 + 一票否决"）
     if (method === 'POST' && clean === '/api/task-packages/solvability') {
       const out = scoreSolvability({ answers: body?.answers ?? {}, config: r.solvability });
       return out;
+    }
+    // ── P7：审计三端点（复核队列 / 计算留痕 / 复算 diff）───────────
+    // ⚠️ 此前演示适配器**完全没有** /api/audit/* ⇒ 公网演示站的
+    //    「复核队列」与「计算留痕」两页直接 404。
+    // ⚠️ 顺序要紧：diff 的路径多一段（`/diff`），必须排在普通路径**之前**。
+    let difm = clean.match(/^\/api\/audit\/computations\/([^/]+)\/diff$/);
+    if (method === 'GET' && difm) {
+      const comp = (s.computations ?? {})[difm[1]];
+      if (!comp) throw httpError(404, 'NOT_FOUND', '计算快照不存在');
+      // ⚠️ 演示站的 diff 口径：**同输入复算 ⇒ 必然一致**（浏览器里跑的是同一套引擎、同一份输入）
+      //    ⇒ identical = true、diff 为空 —— 这正是「可复算」在演示站要展示的结论。
+      return { identical: true, diff: [], warnings: [] };
+    }
+    let cmpm = clean.match(/^\/api\/audit\/computations\/([^/]+)$/);
+    if (method === 'GET' && cmpm) {
+      const comp = (s.computations ?? {})[cmpm[1]];
+      if (!comp) throw httpError(404, 'NOT_FOUND', '计算快照不存在');
+      return {
+        computationId: comp.computationId,
+        stageId: comp.stageId,
+        ruleVersion: r.tiebreak?.version ?? 'demo',
+        revision: 1,
+        createdAt: comp.computedAt,
+        input: { submissions: [] },
+        output: { teams: comp.ordered ?? [] },
+        trace: {
+          normalization: comp.trace?.normalization ?? {},
+          steps: comp.trace?.steps ?? [],
+          weights: comp.trace?.weights ?? {},
+          perTeam: comp.trace?.perTeam ?? {},
+          // 降级告警 = 计算告警 + 破同分告警（两者都必须在页面上显式展示，不静默）
+          warnings: [...(comp.warnings ?? []), ...(comp.tiebreakWarnings ?? [])],
+        },
+      };
+    }
+    if (method === 'GET' && clean === '/api/audit/flags') {
+      const flags = demoFlags(s);
+      return { rows: flags, total: flags.length };
+    }
+    let flm = clean.match(/^\/api\/audit\/flags\/([^/]+)\/resolve$/);
+    if (method === 'POST' && flm) {
+      const flag = demoFlags(s).find((f) => f.id === flm[1]);
+      if (!flag) throw httpError(404, 'NOT_FOUND', '复核项不存在');
+      const evidence = Array.isArray(body?.evidence) ? body.evidence : [];
+      flag.status = body?.status ?? 'confirmed';
+      flag.reason = body?.reason ?? null;
+      flag.evidence = evidence;
+      // 独立发行方去重计数（与后端同一口径：按 publisher 去重）
+      const publishers = new Set(evidence.map((e) => e?.publisher).filter(Boolean));
+      persist();
+      return { status: flag.status, detail: { evidence: { uniquePublishers: publishers.size } } };
+    }
+    // ── P7：赛段时间线（前端赛段选择器用）─────────────────────
+    if (method === 'GET' && clean === '/api/stages') {
+      // ⚠️ 演示站只有一个赛段（stage_final）—— 从**已有计算结果**推导，
+      //    不要写死：真实系统里赛段数由赛事配置决定。
+      const stageIds = Object.keys(s.results ?? {});
+      const items = stageIds.map((id) => ({
+        id,
+        key: id,
+        name: id === s.lastStageId ? '决赛赛段' : `赛段 ${id}`,
+        kind: 'final',
+        status: 'computed',
+        startsAt: null,
+        endsAt: null,
+      }));
+      return { items };
+    }
+    // ── P7：工作流与任务清单（任务清单页的入口 + 领取/完成/释放）──
+    if (method === 'GET' && clean === '/api/workflows') {
+      ensureDemoWorkflows(s);
+      const items = s.workflows.map((w) => {
+        const tasks = s.workflowTasks.filter((t) => t.workflowId === w.id);
+        return {
+          id: w.id,
+          name: w.name,
+          taskPackageId: w.taskPackageId,
+          createdAt: w.createdAt,
+          taskCount: tasks.length,
+          doneCount: tasks.filter((t) => t.status === 'done').length,
+        };
+      });
+      return { items };
+    }
+    let wm = clean.match(/^\/api\/workflows\/([^/]+)\/tasks$/);
+    if (method === 'GET' && wm) {
+      ensureDemoWorkflows(s);
+      if (!s.workflows.some((w) => w.id === wm[1])) throw httpError(404, 'NOT_FOUND', '工作流不存在');
+      const tasks = s.workflowTasks.filter((t) => t.workflowId === wm[1]);
+      return { workflowId: wm[1], tasks };
+    }
+    let tm = clean.match(/^\/api\/tasks\/([^/]+)\/claim$/);
+    if (method === 'POST' && tm) {
+      if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
+      ensureDemoWorkflows(s);
+      const t = s.workflowTasks.find((x) => x.id === tm[1]);
+      if (!t) throw httpError(404, 'NOT_FOUND', '任务不存在');
+      if (t.claim) throw httpError(409, 'ALREADY_CLAIMED', '任务已被领取');
+      t.claim = { userId: s.me.id, at: new Date().toISOString() };
+      t.status = 'in_progress';
+      persist();
+      return { ok: true, taskId: t.id, status: t.status };
+    }
+    let cm = clean.match(/^\/api\/tasks\/([^/]+)\/complete$/);
+    if (method === 'POST' && cm) {
+      if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
+      ensureDemoWorkflows(s);
+      const t = s.workflowTasks.find((x) => x.id === cm[1]);
+      if (!t) throw httpError(404, 'NOT_FOUND', '任务不存在');
+      t.status = 'done';
+      t.completedAt = new Date().toISOString();
+      t.completedBy = s.me.id;
+      t.evidence = body?.evidence ?? null;
+      persist();
+      return { ok: true, taskId: t.id, status: t.status };
+    }
+    let rm = clean.match(/^\/api\/tasks\/([^/]+)\/release$/);
+    if (method === 'POST' && rm) {
+      if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
+      ensureDemoWorkflows(s);
+      const t = s.workflowTasks.find((x) => x.id === rm[1]);
+      if (!t) throw httpError(404, 'NOT_FOUND', '任务不存在');
+      t.claim = null;
+      t.status = 'todo';
+      persist();
+      return { ok: true, taskId: t.id, status: t.status };
     }
     // 组队
     if (method === 'POST' && clean === '/api/teams') {
@@ -825,7 +1208,11 @@ export function createDemoApi({ storage = defaultStorage(), seed = null, rules =
       if (!query.token) throw httpError(401, 'UNAUTHENTICATED', '缺少公开访问令牌');
       return demoLeaderboard({ state: s, rules: r, scope: 'rank', viewer: null });
     }
-    throw httpError(404, 'NOT_FOUND', `演示版未实现该接口：${method} ${clean}`);
+    // ⚠️ **专属错误码**：业务上的「单条记录不存在」也是 404（设计文档 §7.3 的三态口径），
+    //    两者共用 NOT_FOUND ⇒ 「端点没实现」与「这条记录不在」**分不开** ⇒
+    //    回归闸 platform/test/demo-api-parity.test.js 没法判定「演示站这一页是不是 404」。
+    //    ⇒ 这里用 DEMO_ENDPOINT_MISSING 单独标记「**这个端点没实现**」。
+    throw httpError(404, 'DEMO_ENDPOINT_MISSING', `演示版未实现该接口：${method} ${clean}`);
   };
 
   return {
@@ -875,6 +1262,7 @@ export async function loadDemoRules(base = RULES_BASE) {
     teamFormation: loaded.teamFormation,
     points: loaded.points,
     criteria: loaded.criteria,
+    compliance: loaded.compliance,
   };
 }
 

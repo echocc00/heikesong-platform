@@ -941,12 +941,19 @@ test('前端：/audit/:computationId 与 /flags 路由都把参数透传给视�
   const calls = [];
   globalThis.fetch = async (url) => {
     calls.push(String(url));
-    return {
-      ok: true, status: 200,
-      text: async () => JSON.stringify({
+    // ⚠️ P7：/api/me 现在必须返回**已登录**用户 ——
+    //    前端新增了路由守卫（未登录访问受保护页 → 引导登录，不发请求），
+    //    否则这个用例测到的会是「被守卫挡掉」，而不是「参数透传」这个本意。
+    //    ⇒ 这里补一个组委会身份，用例的主体（参数透传）保持不变。
+    const body = String(url) === '/api/me'
+      ? { user: { id: 'u_admin', name: '组委会', roles: ['admin'] } }
+      : {
         user: null, rows: [], total: 0,
         ruleVersion: 'v1', revision: 1, createdAt: 'c', output: { teams: [] }, trace: {},
-      }),
+      };
+    return {
+      ok: true, status: 200,
+      text: async () => JSON.stringify(body),
     };
   };
   await import('../web/app.js?v=t6-app');

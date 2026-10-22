@@ -91,8 +91,11 @@ test('toPublicUser 对带哈希的行也不漏 password_hash（对外键集合�
   assert.equal(pub.passwordHash, undefined);
   assert.deepEqual(
     Object.keys(pub).sort(),
-    ['active', 'createdAt', 'id', 'isSuperadmin', 'mbaStatus', 'name', 'org', 'phone'],
-    '对外形状的键集合必须精确等于约定的 8 个字段（多一个也算泄露）',
+    ['active', 'createdAt', 'id', 'isSuperadmin', 'mbaStatus', 'name', 'org', 'phone', 'roles'],
+    '对外形状的键集合必须精确等于约定的字段（多一个也算泄露）'
+    + '｜⚠️ P7 新增 roles：前端要按角色分区导航（三端拆分），必须知道「你是谁」。'
+    + 'roles 是**角色键列表**（admin/captain/judge/…），不是能力也不是授权记录 —— '
+    + '它不构成任何授权依据（可见性始终在 API 层过滤），因此不属于「泄露」。',
   );
   close();
   rmSync(dataDir, { recursive: true, force: true });

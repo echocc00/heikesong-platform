@@ -5874,8 +5874,32 @@ Expected: FAIL —— `Cannot find module '../web/views/registration.js'`
 // web/views/registration.js — 报名问卷（选手视角）
 // 依据：设计文档 §9「报名问卷：每题显示该题所属维度与分值；明示筛选标准（R-REG-09）；
 //       提交后展示『你被判为 X 级』及可解释明细」
+// 溯源需求：R-REG-06（3 维 100 分）/ R-REG-07（阈值）/ R-REG-08（C 级不接收）
+//            R-REG-09（筛选标准对外透明）/ R-REG-11（3 维各 5 题 + 1 道开放题）
+//
+// 本轮（P7）「现有页面打磨到生产级」的改动要点：
+//   ① 评分控件从 <select> 下拉换成**横排按钮组**（.radio-group / .radio）——
+//      1–5 分用下拉框要展开才看得见量表，15 题就是 15 次展开；
+//   ② 加载 / 空 / 错三件套统一走 ui.js 的 loadingState / emptyState / errorState，
+//      错误态带**真的会重跑**的「重试」按钮；
+//   ③ 表单走 .field / .field__label / .input / .textarea 体系，必填项标 .field--required；
+//   ④ 顶部加「答题进度」指标卡，提交前就知道还差几题；
+//   ⑤ 提交成功展示分级结果（等级 + 总分 + 逐维可解释明细），失败给**说清楚原因**的错误提示。
+//
 // ⛔ buildQuestionnaire / formatExplain 是纯函数，不得触碰 document（便于 node:test 直接测）
 import { escapeHtml } from '../escape.js';
+import {
+  emptyState, errorState, kvList, loadingState, noticeState, pageHead, panel,
+  statCard, statRow,
+} from '../ui.js';
+
+/**
+ * 问卷模型（纯函数）。
+ *
+ * ⚠️ **criteriaLines 的内容不许改**（R-REG-09 的对外承诺）：
+ *    「三维权重 25%/35%/40%、每题 1–5 分、阈值 80/60/40、C 级不接收」必须逐字留在页面上，
+ *    打磨只改**呈现方式**（noticeState / panel），不改文案本身。
+ */
 export function buildQuestionnaire(criteria) {
   const dims = (criteria?.dimensions ?? []).map((d) => ({
     key: d.key,
@@ -5920,76 +5944,288 @@ export function formatExplain(explain, scale = { max: 5 }) {
   }));
 }
 
+/**
+ * 单题的评分控件：1–5 分**横排按钮组**。
+ *
+ * ⚠️ 为什么不用 <select>：下拉框默认收起，量表（1–5 各代表什么强度）看不见，
+ *    选手只能「展开 → 看一眼 → 再收起」，15 题的成本极高。
+ *    按钮组把量表摊平成一眼可见的横排（依据：设计文档 §9「每题显示该题所属维度与分值」）。
+ */
+export function buildRatingField(dim, item, index) {
+  const name = `${dim.key}-${index}`;
+  const labelId = `lbl-${name}`;
+  const values = Array.from({ length: dim.max - dim.min + 1 }, (_, k) => dim.min + k);
+  const options = values.map((v) => `
+          <label class="radio">
+            <input type="radio" name="${escapeHtml(name)}" value="${v}" />
+            <span>${v}</span>
+          </label>`).join('');
+  return `
+        <div class="field">
+          <span class="field__label" id="${escapeHtml(labelId)}">${escapeHtml(item.text)}</span>
+          <div class="radio-group" role="radiogroup" aria-labelledby="${escapeHtml(labelId)}">${options}
+          </div>
+          <p class="field__hint">每题 ${dim.min}–${dim.max} 分，选一个即可。</p>
+        </div>`;
+}
+
+/** 一个维度的面板：标题带权重，desc 带量表区间（R-REG-09 明示权重与分值）。 */
+export function buildDimensionPanel(dim) {
+  return panel({
+    title: `${dim.label}（权重 ${dim.weightLabel}）`,
+    desc: `共 ${dim.items.length} 题 · 每题 ${dim.min}–${dim.max} 分`,
+    body: dim.items.map((it, i) => buildRatingField(dim, it, i)).join(''),
+  });
+}
+
+/**
+ * 合规红线 → 可读文本。
+ * ⚠️ 规则文件里 redLines 是**对象数组**（{ key, label }），
+ *    直接丢进 noticeState 会被 String() 成「[object Object]」—— 必须取 label。
+ */
+export function redLineTexts(redLines) {
+  return (redLines ?? [])
+    .map((r) => (typeof r === 'string' ? r : (r?.label ?? r?.key ?? '')))
+    .filter(Boolean);
+}
+
+/** 答题进度指标卡（已填题数 / 总题数）。 */
+export function buildProgressCard(answered, total) {
+  const left = Math.max(0, total - answered);
+  return statCard({
+    label: '答题进度',
+    value: `${answered} / ${total}`,
+    hint: left === 0 ? '全部题目已评分，可以提交' : `还有 ${left} 题未评分`,
+    tone: left === 0 ? 'success' : 'brand',
+  });
+}
+
+/**
+ * 可解释明细 → 键值表（键 = 维度，值 = 去掉重复维度前缀后的明细）。
+ * ⚠️ formatExplain 的文案格式是**契约**（测试直接断言），
+ *    所以这里不改文案，只在展示时去掉与键重复的那一段前缀。
+ */
+export function explainPairs(lines) {
+  return (lines ?? []).map((e) => {
+    const prefix = `${e.label}：`;
+    const value = e.text.startsWith(prefix) ? e.text.slice(prefix.length) : e.text;
+    return [e.label, value];
+  });
+}
+
 export function renderRegistration(ctx) {
   const wrap = document.createElement('div');
-  wrap.className = 'card apply';
-  wrap.innerHTML = '<p class="muted">正在加载报名问卷…</p>';
+  wrap.className = 'apply';
   const { api, navigate } = ctx;
 
-  (async () => {
-    const criteria = await api.get('/api/registration-criteria');
-    const q = buildQuestionnaire(criteria);
-    const form = document.createElement('form');
-    form.innerHTML = `
-      <h1>报名</h1>
-      <section class="criteria">
-        <h2>筛选标准（公开透明，报名之前就告诉你）</h2>
-        <ul>${q.criteriaLines.map((l) => `<li>${escapeHtml(l)}</li>`).join('')}</ul>
-        <p class="muted">${escapeHtml(q.open.text)}</p>
-        <p class="muted">${escapeHtml(q.ipOwnership.team ?? '')} ${escapeHtml(q.ipOwnership.committee ?? '')} ${escapeHtml(q.ipOwnership.enterprise ?? '')}</p>
-      </section>
-      ${q.dims.map((d) => `
-        <section class="dim" data-dim="${d.key}">
-          <h2>${escapeHtml(d.label)}（权重 ${escapeHtml(d.weightLabel)}，每题 ${d.min}–${d.max} 分）</h2>
-          ${d.items.map((it, i) => `
-            <label>${escapeHtml(it.text)}
-              <select name="${d.key}-${i}">
-                ${Array.from({ length: d.max - d.min + 1 }, (_, k) => d.min + k)
-                  .map((v) => `<option value="${v}">${v}</option>`).join('')}
-              </select>
-            </label>`).join('')}
-        </section>`).join('')}
-      <label>${escapeHtml(q.open.text)}<textarea name="open" maxlength="${q.maxLength}"></textarea></label>
-      <label><input type="checkbox" name="consent" /> ${escapeHtml(q.consentPrompt)}</label>
-      <button type="submit">提交报名</button>
-      <p id="reg-err" class="err"></p>
-      <div id="reg-result"></div>
-    `;
+  wrap.innerHTML = `
+    ${pageHead({
+      title: '报名问卷',
+      sub: '三个维度的评分 + 1 道开放题；提交后立即给出等级、总分与逐维可解释明细。',
+    })}
+    <div id="reg-body">${loadingState({ rows: 4, label: '正在加载报名问卷…' })}</div>`;
 
-    form.addEventListener('submit', async (ev) => {
+  const body = wrap.querySelector('#reg-body');
+
+  /** 已评分的题目数（.radio-group 里被勾选的题）。 */
+  function countAnswered(form) {
+    return form.querySelectorAll('.radio-group input[type="radio"]:checked').length;
+  }
+
+  /** 加载问卷；错误态的「重试」按钮复用它（真的重跑一次，不是摆设）。 */
+  async function load() {
+    body.innerHTML = loadingState({ rows: 4, label: '正在加载报名问卷…' });
+    let criteria;
+    try {
+      criteria = await api.get('/api/registration-criteria');
+    } catch (e) {
+      body.innerHTML = errorState({
+        message: '报名问卷加载失败',
+        hint: '接口返回：' + e.message + '。点「重试」重新加载；若持续失败，请确认服务端已启动。',
+      });
+      body.querySelector('[data-action="retry"]')?.addEventListener('click', load);
+      return;
+    }
+    renderForm(criteria);
+  }
+
+  function renderForm(criteria) {
+    const q = buildQuestionnaire(criteria);
+    const total = q.dims.reduce((n, d) => n + d.items.length, 0);
+
+    // 空态：配置里还没有维度（本届问卷尚未发布）——必须告诉访客下一步做什么。
+    if (!q.dims.length) {
+      body.innerHTML = emptyState({
+        title: '本届还没有发布报名问卷',
+        hint: '组委会发布问卷后，这里会出现三维评分题与开放题；在此之前可以先去看榜单了解赛况。',
+      });
+      return;
+    }
+
+    const form = document.createElement('form');
+    form.className = 'stack';
+    form.noValidate = true;
+    form.innerHTML = `
+      ${noticeState({
+        tone: 'brand',
+        title: '筛选标准（公开透明：报名之前就告诉你）',
+        items: q.criteriaLines,
+        list: true,
+      })}
+      ${panel({
+        title: '合规与 IP 归属',
+        desc: '报名即代表你已阅读并接受下列约定（R-ENT-12）。',
+        body: `${kvList([
+          ['战队', q.ipOwnership?.team],
+          ['组委会', q.ipOwnership?.committee],
+          ['企业', q.ipOwnership?.enterprise],
+        ])}
+        ${redLineTexts(q.redLines).length
+          ? noticeState({ tone: 'warn', title: '合规红线', items: redLineTexts(q.redLines), list: true })
+          : ''}`,
+      })}
+      <div id="reg-progress">${buildProgressCard(0, total)}</div>
+      ${q.dims.map((d) => buildDimensionPanel(d)).join('')}
+      <div class="card">
+        <div class="field field--required">
+          <label class="field__label" for="reg-open">${escapeHtml(q.open.text || '开放题')}</label>
+          <textarea class="textarea" id="reg-open" name="open" maxlength="${q.open.maxLength}"
+            placeholder="请说明你的商业问题、目标客户与打算怎么验证（最多 ${q.open.maxLength} 字）"></textarea>
+          <p class="field__hint">${q.open.required ? '必填。' : '选填。'}最多 ${q.open.maxLength} 字。</p>
+          <p class="field__error" data-role="open-error" hidden></p>
+        </div>
+        <div class="field field--required">
+          <span class="field__label">参赛协议与数据合规</span>
+          <label class="checkbox">
+            <input type="checkbox" name="consent" />
+            <span>${escapeHtml(q.consentPrompt || '我已阅读并同意参赛协议、IP 归属说明与数据合规红线')}</span>
+          </label>
+          <p class="field__error" data-role="consent-error" hidden></p>
+        </div>
+        <div class="btn-group">
+          <button type="submit" class="btn btn--primary">提交报名</button>
+        </div>
+        <div id="reg-feedback" class="stack"></div>
+      </div>`;
+
+    // 进度随作答实时更新（「我答了几题」必须一眼可见）。
+    form.addEventListener('change', () => {
+      const box = form.querySelector('#reg-progress');
+      if (box) box.innerHTML = buildProgressCard(countAnswered(form), total);
+    });
+
+    form.addEventListener('submit', (ev) => {
       ev.preventDefault();
-      const err = form.querySelector('#reg-err');
-      const result = form.querySelector('#reg-result');
-      err.textContent = '';
-      result.innerHTML = '';
-      const answers = { open: form.querySelector('[name=open]').value.trim() };
-      for (const d of q.dims) {
-        answers[d.key] = d.items.map((_, i) => Number(form.querySelector(`[name="${d.key}-${i}"]`).value));
+      submit();
+    });
+
+    /** 提交（表单提交与错误态的「重试」都走它）。 */
+    async function submit() {
+      const feedback = form.querySelector('#reg-feedback');
+      const openErr = form.querySelector('[data-role="open-error"]');
+      const consentErr = form.querySelector('[data-role="consent-error"]');
+      const submitBtn = form.querySelector('button[type="submit"]');
+      feedback.innerHTML = '';
+      openErr.hidden = true;
+      openErr.textContent = '';
+      consentErr.hidden = true;
+      consentErr.textContent = '';
+
+      const answered = countAnswered(form);
+      const missing = total - answered;
+      const openValue = form.querySelector('[name="open"]').value.trim();
+      const consented = form.querySelector('[name="consent"]').checked;
+      // 同意项是否必填：以服务端配置为准（compliance.consent.required）。
+      const consentRequired = criteria?.consent?.required === true || Boolean(q.consentPrompt);
+      let invalid = false;
+
+      if (missing > 0) {
+        invalid = true;
+        feedback.innerHTML = noticeState({
+          tone: 'danger',
+          title: '还有题目没评分',
+          items: [`共 ${total} 题，已评分 ${answered} 题，还差 ${missing} 题 —— 每题都要选一个分数（${q.scale.min}–${q.scale.max}）才能提交。`],
+        });
       }
-      answers.consent = { accepted: form.querySelector('[name=consent]').checked };
+      if (q.open.required && !openValue) {
+        invalid = true;
+        openErr.textContent = '开放题必填：请说明你的商业问题。';
+        openErr.hidden = false;
+      }
+      if (consentRequired && !consented) {
+        invalid = true;
+        consentErr.textContent = '必须勾选同意参赛协议、IP 归属说明与数据合规红线。';
+        consentErr.hidden = false;
+      }
+      if (invalid) return;
+
+      const answers = { open: openValue };
+      for (const d of q.dims) {
+        answers[d.key] = d.items.map((_, i) => {
+          const hit = form.querySelector(`input[name="${d.key}-${i}"]:checked`);
+          return hit ? Number(hit.value) : null;
+        });
+      }
+      answers.consent = { accepted: consented };
+
+      submitBtn.disabled = true;
+      submitBtn.textContent = '提交中…';
       try {
         const reg = await api.post('/api/registrations', {
           editionId: criteria.editionId,
           answers,
         });
-        const levelLabel = q.levels.find((l) => l.key === reg.level)?.label ?? reg.level;
-        result.innerHTML = `
-          <h2>你被判为 ${escapeHtml(reg.level)} 级（${escapeHtml(levelLabel)}）</h2>
-          <p>总分 ${reg.grading.score} 分</p>
-          <ul>${formatExplain(reg.grading.explain, criteria.scale).map((e) => `<li>${escapeHtml(e.text)}</li>`).join('')}</ul>
-          <p>${reg.grading.accepted ? '你已被接收，可以去组队。' : '本级不接收，可向组委会提交申诉。'}</p>
-          <button id="go-team" type="button">去组队</button>`;
-        result.querySelector('#go-team').addEventListener('click', () => navigate('/team'));
+        showResult(reg, q, criteria);
+        // 提交成功后不再允许重复提交（服务端也会以 409 拒绝）。
+        submitBtn.disabled = true;
+        submitBtn.textContent = '已提交';
       } catch (e) {
-        err.textContent = e.message;
+        // ⚠️ 失败提示必须说清「下一步怎么办」，不能只回一句 e.message。
+        feedback.innerHTML = errorState({
+          message: '报名提交失败',
+          hint: '服务端返回：' + e.message + '。若是「已提交过本届报名」，说明你此前已报名成功，可直接去「我的战队」；若提示问卷不完整，请确认每题都已评分。',
+        });
+        // 错误态的「重试」= **重发同一份答案**（不是重新加载页面 —— 那会冲掉已答内容）。
+        feedback.querySelector('[data-action="retry"]')?.addEventListener('click', submit);
+        submitBtn.disabled = false;
+        submitBtn.textContent = '提交报名';
       }
-    });
+    }
 
-    wrap.replaceChildren(form);
-  })().catch((e) => {
-    wrap.innerHTML = `<div class="card err">${escapeHtml(e.message)}</div>`;
-  });
+    /** 提交成功：分级结果（等级 + 总分 + 逐维可解释明细）。 */
+    function showResult(reg, model, crit) {
+      const levelLabel = model.levels.find((l) => l.key === reg.level)?.label ?? reg.level;
+      const accepted = reg.grading?.accepted === true;
+      const lines = formatExplain(reg.grading?.explain, crit.scale);
+      const feedback = form.querySelector('#reg-feedback');
+      feedback.innerHTML = `
+        ${noticeState({
+          tone: accepted ? 'success' : 'warn',
+          title: `报名已提交：你被判为 ${reg.level} 级（${levelLabel}）`,
+          items: [accepted
+            ? '你已被接收，现在可以去组队了。'
+            : '本级不接收，可向组委会提交申诉（R-REG-08）。'],
+        })}
+        ${statRow([
+          { label: '总分', value: `${reg.grading?.score ?? 0} 分`, tone: 'brand' },
+          { label: '等级', value: `${reg.level}（${levelLabel}）` },
+          { label: '是否接收', value: accepted ? '已接收' : '不接收', tone: accepted ? 'success' : 'danger' },
+        ])}
+        ${panel({
+          title: '可解释明细',
+          desc: '每一维的均值、权重与加权值 —— 判分口径完全公开（R-REG-09）。',
+          body: kvList(explainPairs(lines)),
+        })}
+        <div class="btn-group">
+          <button type="button" class="btn btn--primary" id="go-team">去组队</button>
+        </div>`;
+      feedback.querySelector('#go-team')?.addEventListener('click', () => navigate('/team'));
+    }
 
+    body.replaceChildren(form);
+  }
+
+  load();
   return wrap;
 }
 ```
@@ -6000,12 +6236,34 @@ export function renderRegistration(ctx) {
 // web/views/team.js — 我的战队（选手视角）
 // 依据：设计文档 §9「我的战队 + 组队/汰换」
 // 依据：R-REG-01（建队即认领任务包）、R-REG-03（持续招募汰换）、R-REG-04（仅剩 1 人须并队）
+//
+// 本轮（P7）「现有页面打磨到生产级」的改动要点：
+//   ① 战队卡片用 .team-card + badge 标状态（组建中 / 已成立 / 须并队 / 已解散，四种色调）；
+//   ② 成员列表从裸 <ul> 改成紧凑表格，组长用 badge('组长','brand') 标出；
+//   ③ 成员数 / 里程碑数提到 statCard（信息密度）；
+//   ④ needsMerge 用 noticeState(danger) 醒目提示并写清并队截止时间；
+//   ⑤ 退出按钮按 canLeaveTeam 决定 disabled，并把「为什么不能退」写在按钮上；
+//   ⑥ 组队表单走 .field / .input / .select 体系，**空队名本地拦下**（不发无谓请求）；
+//   ⑦ 建队 / 退出后**就地刷新列表**，不再 location.reload()（整页刷新会冲掉用户输入）。
 import { escapeHtml } from '../escape.js';
+import {
+  badge, emptyRow, emptyState, errorState, loadingState, noticeState,
+  pageHead, panel, statRow, tableWrap,
+} from '../ui.js';
+
 const STATUS_LABELS = {
   forming: '组建中（未满 2 人）',
   active: '已成立',
   needs_merge: '仅剩 1 人，须并队',
   dissolved: '已解散',
+};
+
+/** 卡片上的状态徽章：短标签 + 色调（四种状态四种色调，扫一眼就知道战队处于什么阶段）。 */
+const STATUS_BADGES = {
+  forming: { label: '组建中', tone: 'info' },
+  active: { label: '已成立', tone: 'success' },
+  needs_merge: { label: '须并队', tone: 'danger' },
+  dissolved: { label: '已解散', tone: 'neutral' },
 };
 
 // 组长是谁：优先看成员表里的 role=captain，退回 team.captainId
@@ -6049,6 +6307,14 @@ export function canLeaveTeam(team, viewerId) {
   return (team?.members ?? []).some((m) => m.userId === viewerId);
 }
 
+/** 并队截止时间：能解析就显示本地时间，解析不了就原样显示（不吞数据）。 */
+export function formatDeadline(value) {
+  if (!value) return '（服务端未给出截止时间）';
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return String(value);
+  return d.toLocaleString('zh-CN', { hour12: false });
+}
+
 /**
  * 战队卡片 HTML（纯函数，不碰 document）。
  *
@@ -6057,88 +6323,262 @@ export function canLeaveTeam(team, viewerId) {
  *    （父代理变异检验实测：把 `canLeaveTeam(t, viewerId)` 换成老写法
  *     `s.captainId === viewerId`，变异体**存活** —— 说明调用点是盲区）。
  *    抽成纯函数后，这条路径能被直接断言。
+ *
+ * ⛔ 两条硬约束（测试直接断言渲染结果）：
+ *    ① 不许出现 data-user —— 服务端只认发起人自己，不接受 body.userId；
+ *    ② 组员视角的 HTML 里不许出现 disabled —— 组员**必须**能点退出。
  */
 export function buildTeamCards(teams, viewerId) {
   return (teams ?? []).map((t) => {
     const s = summarizeTeam(t);
     const leaveable = canLeaveTeam(t, viewerId);
-    const leaveHint = leaveable
-      ? ''
-      : ' title="组长不能直接退出，请先汰换成员并移交组长职责"';
+    const isCaptain = Boolean(viewerId) && s.captainId === viewerId;
+    const badgeInfo = STATUS_BADGES[s.status] ?? { label: s.status, tone: 'neutral' };
+    const hint = leaveable
+      ? '退出后若队内仅剩 1 人将触发并队（R-REG-04）；进出记录留档（R-REG-03），可重新组队。'
+      : (isCaptain
+        ? '组长不能直接退出：需先汰换成员并移交组长职责，否则服务端返回 409 CAPTAIN_MUST_REPLACE。'
+        : '你不是该战队成员，无法退出别人的战队。');
+    const members = t.members ?? [];
+    const memberRows = members.length
+      ? members.map((m) => `
+            <tr>
+              <td>${escapeHtml(m.userId)}</td>
+              <td>${m.role === 'captain' ? badge('组长', 'brand') : badge('组员', 'neutral')}</td>
+              <td class="muted small">${escapeHtml(m.joinedAt ?? '—')}</td>
+            </tr>`).join('')
+      : emptyRow(3, '暂无成员');
     return `
-        <section class="team-card">
-          <h2>${escapeHtml(s.title)}</h2>
-          <p class="muted">状态：${escapeHtml(s.statusLabel)}｜成员 ${s.memberCount} 人｜固定里程碑 ${s.milestoneCount} 项</p>
-          ${s.needsMerge ? `<p class="err">⚠️ 仅剩 1 人，须在 ${s.mergeDeadline ?? '期限内'} 前并入其他战队</p>` : ''}
-          ${s.formationErrors.map((e) => `<p class="err">${escapeHtml(e)}</p>`).join('')}
-          <ul>${t.members.map((m) => `<li>${escapeHtml(m.userId)}（${m.role === 'captain' ? '组长' : '组员'}）</li>`).join('')}</ul>
-          <button data-action="leave" data-team="${escapeHtml(t.id)}"${leaveable ? '' : ' disabled'}${leaveHint}>退出</button>
+        <section class="team-card" data-team="${escapeHtml(s.id)}">
+          <div class="row row--between">
+            <h3 class="panel__title">${escapeHtml(s.title)}</h3>
+            <div class="btn-group">${badge(badgeInfo.label, badgeInfo.tone)}</div>
+          </div>
+          <p class="muted small">状态：${escapeHtml(s.statusLabel)}</p>
+          ${s.needsMerge ? noticeState({
+            tone: 'danger',
+            title: '须并队：队内仅剩 1 人',
+            items: [`请在 ${formatDeadline(s.mergeDeadline)} 前并入其他战队，逾期将无法继续参赛（R-REG-04）。`],
+          }) : ''}
+          ${s.formationErrors.length ? noticeState({
+            tone: 'warn',
+            title: '组队校验未通过',
+            items: s.formationErrors,
+            list: true,
+          }) : ''}
+          ${statRow([
+            { label: '成员', value: s.memberCount, hint: isCaptain ? '你是本队组长' : '' },
+            { label: '固定里程碑', value: s.milestoneCount, hint: '报名时固定，赛程中不可自行新增（R-STG-03）' },
+            { label: '你的角色', value: isCaptain ? '组长' : (leaveable ? '组员' : '非成员') },
+          ])}
+          ${tableWrap(`
+            <thead><tr><th>成员</th><th>角色</th><th>加入时间</th></tr></thead>
+            <tbody>${memberRows}</tbody>`)}
+          <div class="btn-group">
+            <button type="button" class="btn btn--ghost btn--sm" data-action="leave" data-team="${escapeHtml(s.id)}"${leaveable ? '' : ' disabled'} title="${escapeHtml(hint)}">${leaveable ? '退出战队' : (isCaptain ? '组长不可退' : '非成员不可退')}</button>
+          </div>
+          <p class="muted small">${escapeHtml(hint)}</p>
         </section>`;
   });
 }
 
+/** 战队列表区（纯函数）：空数据时给「下一步做什么」。 */
+export function buildTeamList(teams, viewerId) {
+  if (!(teams ?? []).length) {
+    return emptyState({
+      title: '你还没有战队',
+      hint: '在下方认领一个任务包并建队 —— 报名是组队的前提（R-REG-01），建队后你自动成为组长。',
+    });
+  }
+  return `<div class="stack">${buildTeamCards(teams, viewerId).join('')}</div>`;
+}
+
 export function renderTeam(ctx) {
   const wrap = document.createElement('div');
-  wrap.className = 'card team';
-  wrap.innerHTML = '<p class="muted">正在加载我的战队…</p>';
+  wrap.className = 'team';
   const { api } = ctx;
 
-  (async () => {
-    const [criteria, teamsRes, packagesRes] = await Promise.all([
-      api.get('/api/registration-criteria'),
-      api.get('/api/teams'),
-      api.get('/api/task-packages'),
-    ]);
-    const teams = teamsRes.items ?? [];
-    const packages = packagesRes.items ?? [];
+  wrap.innerHTML = `
+    ${pageHead({
+      title: '我的战队',
+      sub: '查看你参与的战队、认领任务包并组队；组长需先移交职责才能退出（R-REG-03）。',
+    })}
+    <div id="team-body">${loadingState({ rows: 3, label: '正在加载我的战队…' })}</div>`;
 
-    const viewerId = ctx.getState().user?.id ?? null;
-    const cards = buildTeamCards(teams, viewerId);
+  const body = wrap.querySelector('#team-body');
+  const viewerId = ctx.getState().user?.id ?? null;
+  let criteria = null;
 
-    const opts = packages.map((p) => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.title)}</option>`).join('');
-    wrap.innerHTML = `
-      <h1>我的战队</h1>
-      ${cards.join('') || '<p class="muted">你还没有战队</p>'}
-      <section class="create">
-        <h2>组队（报名即认领任务包）</h2>
-        <label>队名<input name="team-name" placeholder="甲队" /></label>
-        <label>认领任务包<select name="package">${opts}</select></label>
-        <button id="create-team">建队</button>
-        <p id="team-err" class="err"></p>
-      </section>`;
+  /** 只刷新「战队列表」这一块：建队 / 退出后不必重载整页（也就不用 location.reload()）。 */
+  async function refreshTeams() {
+    const listBox = body.querySelector('#team-list');
+    if (!listBox) return;
+    const res = await api.get('/api/teams');
+    const teams = res?.items ?? res?.rows ?? [];
+    listBox.innerHTML = buildTeamList(teams, viewerId);
+    bindLeaveButtons();
+  }
 
-    wrap.querySelector('#create-team').addEventListener('click', async () => {
-      const err = wrap.querySelector('#team-err');
-      err.textContent = '';
+  /** 加载页面：问卷 + 战队 + 任务包一起取。 */
+  async function load() {
+    body.innerHTML = loadingState({ rows: 3, label: '正在加载我的战队…' });
+    try {
+      const [crit, teamsRes, packagesRes] = await Promise.all([
+        api.get('/api/registration-criteria'),
+        api.get('/api/teams'),
+        api.get('/api/task-packages'),
+      ]);
+      criteria = crit;
+      const teams = teamsRes?.items ?? teamsRes?.rows ?? [];
+      const packages = packagesRes?.items ?? packagesRes?.rows ?? [];
+      render(teams, packages);
+    } catch (e) {
+      body.innerHTML = errorState({
+        message: '我的战队加载失败',
+        hint: '接口返回：' + e.message + '。点「重试」重新加载；若持续失败，请确认服务端已启动且你已登录。',
+      });
+      body.querySelector('[data-action="retry"]')?.addEventListener('click', load);
+    }
+  }
+
+  function render(teams, packages) {
+    const opts = packages
+      .map((p) => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.title)}</option>`)
+      .join('');
+    body.innerHTML = `
+      <div class="stack">
+        <div id="team-list-feedback"></div>
+        <div id="team-list">${buildTeamList(teams, viewerId)}</div>
+        ${panel({
+          title: '组队（报名即认领任务包）',
+          desc: '认领的任务包必须已完成六维可解性分级（R-REG-01）；建队后你是组长。',
+          body: `
+            <div class="field field--required">
+              <label class="field__label" for="team-name">队名</label>
+              <input class="input" id="team-name" name="team-name" maxlength="40" placeholder="例：甲队" />
+              <p class="field__hint">队名会展示给组委会与对手，请勿填写敏感信息。</p>
+              <p class="field__error" data-role="name-error" hidden></p>
+            </div>
+            <div class="field">
+              <label class="field__label" for="team-package">认领任务包</label>
+              <select class="select" id="team-package" name="package">${opts}</select>
+              <p class="field__hint">${packages.length
+                ? '认领后不可自行更换（R-REG-01）。'
+                : '当前没有可认领的任务包 —— 请等组委会发布任务卡后再建队。'}</p>
+            </div>
+            <div class="btn-group">
+              <button type="button" class="btn btn--primary" id="create-team"${packages.length ? '' : ' disabled'}>建队</button>
+            </div>
+            <div id="team-feedback"></div>`,
+        })}
+      </div>`;
+
+    bindCreateButton(packages.length > 0);
+    bindLeaveButtons();
+  }
+
+  /** 建队：空队名**本地拦下**（不发请求），成功后就地刷新列表。 */
+  function bindCreateButton(enabled) {
+    const btn = body.querySelector('#create-team');
+    if (!btn) return;
+    btn.addEventListener('click', async () => {
+      const nameInput = body.querySelector('[name="team-name"]');
+      const nameErr = body.querySelector('[data-role="name-error"]');
+      const feedback = body.querySelector('#team-feedback');
+      nameErr.hidden = true;
+      nameErr.textContent = '';
+      feedback.innerHTML = '';
+
+      const name = nameInput.value.trim();
+      if (!name) {
+        // ⛔ 空队名本地拦下：发过去也是被服务端拒，没必要打一次网络。
+        nameErr.textContent = '队名不能为空：请先给战队起一个名字。';
+        nameErr.hidden = false;
+        nameInput.focus();
+        return;
+      }
+      const pkg = body.querySelector('[name="package"]');
+      if (!pkg || !pkg.value) {
+        feedback.innerHTML = errorState({
+          message: '建队失败',
+          hint: '没有可认领的任务包：请等组委会发布任务卡后再建队（R-REG-01）。',
+          retry: false,
+        });
+        return;
+      }
+
+      btn.disabled = true;
+      btn.textContent = '建队中…';
       try {
         await api.post('/api/teams', {
-          editionId: criteria.editionId,
-          name: wrap.querySelector('[name=team-name]').value,
-          taskPackageId: wrap.querySelector('[name=package]').value,
+          editionId: criteria?.editionId,
+          name,
+          taskPackageId: pkg.value,
         });
-        ctx.setState({});
-        location.reload();
+        nameInput.value = '';
+        feedback.innerHTML = noticeState({
+          tone: 'success',
+          title: '建队成功',
+          items: ['你已成为本队组长：可以招募组员，也可以在成员卡里管理退出与汰换。'],
+        });
+        await refreshTeams();
       } catch (e) {
-        err.textContent = e.message;
+        feedback.innerHTML = errorState({
+          message: '建队失败',
+          hint: '服务端返回：' + e.message + '。若是「没有建队的权限」或「任务包未分级」，请先完成报名或等组委会完成任务卡分级。',
+        });
+        // 重试 = 用**当前输入**再发一次（队名还在输入框里）。
+        feedback.querySelector('[data-action="retry"]')?.addEventListener('click', () => {
+          feedback.innerHTML = '';
+          btn.click();
+        });
+      } finally {
+        btn.disabled = !enabled;
+        btn.textContent = '建队';
       }
     });
+  }
 
-    for (const btn of wrap.querySelectorAll('[data-action=leave]')) {
+  /** 退出：组员可退，组长 / 非成员由 canLeaveTeam 判定为 disabled（服务端会 409）。 */
+  function bindLeaveButtons() {
+    for (const btn of body.querySelectorAll('[data-action="leave"]')) {
       btn.addEventListener('click', async () => {
+        if (btn.disabled) return;
+        const teamId = btn.dataset.team;
+        const feedback = body.querySelector('#team-list-feedback');
+        btn.disabled = true;
+        btn.textContent = '退出中…';
         try {
           // ⚠️ 父代理预审修正：退出**只作用于发起人自己** ——
           //    服务端不再接受 body.userId（否则任何人都能把别人踢出战队）。
-          await api.post(`/api/teams/${btn.dataset.team}/members`, { action: 'leave' });
-          location.reload();
+          await api.post(`/api/teams/${encodeURIComponent(teamId)}/members`, { action: 'leave' });
+          if (feedback) {
+            feedback.innerHTML = noticeState({
+              tone: 'success',
+              title: '已退出战队',
+              items: ['退出记录已留档（R-REG-03）；若队内仅剩 1 人，本队将进入并队观察期（R-REG-04）。'],
+            });
+          }
+          await refreshTeams();
         } catch (e) {
-          wrap.querySelector('#team-err').textContent = e.message;
+          if (feedback) {
+            feedback.innerHTML = errorState({
+              message: '退出失败',
+              hint: '服务端返回：' + e.message + '。若提示 CAPTAIN_MUST_REPLACE，说明你是组长：需先汰换成员并移交组长职责。',
+            });
+            feedback.querySelector('[data-action="retry"]')?.addEventListener('click', () => {
+              feedback.innerHTML = '';
+              btn.click();
+            });
+          }
+          btn.disabled = false;
+          btn.textContent = '退出战队';
         }
       });
     }
-  })().catch((e) => {
-    wrap.innerHTML = `<div class="card err">${escapeHtml(e.message)}</div>`;
-  });
+  }
 
+  load();
   return wrap;
 }
 ```
@@ -6148,9 +6588,23 @@ export function renderTeam(ctx) {
 ```javascript
 // web/views/admin-registration.js — 组委会筛选台
 // 依据：设计文档 §9「报名筛选台（含可解释明细）+ 复核/申诉/改级」「任务包与配比 70/30」
-// 溯源：R-REG-09 / R-REG-10 / R-ENT-09
+// 溯源：R-REG-09 / R-REG-10（5 阶段筛选漏斗）/ R-ENT-09（任务包配比）
+//
+// 本轮（P7）「现有页面打磨到生产级」的改动要点：
+//   ① 顶部 statRow：报名总数 + 各等级人数 + 任务包配比是否达标；
+//   ② 漏斗与分级分布从纯文本 <ul> 改成 barRow 条形图（第一段是实数，后续段标「待填充」）；
+//   ③ 主表用 tableWrap 包起来（窄屏横向滚动，表头 sticky），表头含「事件轨迹」一列；
+//   ④ 改级操作放在每行的操作列：复核级别 .select + 复核意见 .input + .btn--primary 按钮；
+//   ⑤ 改级成功**就地更新该行**并给成功提示，失败给错误提示 —— 不用 location.reload()
+//      （整页刷新会冲掉其他行已填的复核意见，是生产级事故）。
+//
+// ⛔ 前端**不做可见性过滤**（全局约束）：API 返回什么就渲染什么，一个都不许丢。
 import { escapeHtml } from '../escape.js';
 import { formatExplain } from './registration.js';
+import {
+  badge, barRow, emptyRow, emptyState, errorState, kvList, loadingState, noticeState,
+  pageHead, panel, statRow, tableWrap,
+} from '../ui.js';
 
 const STATUS_LABELS = {
   submitted: '已提交',
@@ -6158,6 +6612,15 @@ const STATUS_LABELS = {
   accepted: '已接收',
   rejected: '不接收',
   appealed: '申诉中',
+};
+
+/** 状态 → 徽章色调。 */
+const STATUS_TONES = {
+  submitted: 'info',
+  screening: 'info',
+  accepted: 'success',
+  rejected: 'danger',
+  appealed: 'warn',
 };
 
 export function buildScreeningRows(registrations, criteria) {
@@ -6211,79 +6674,279 @@ export function buildFunnelView(registrations, funnel) {
   }));
 }
 
+/** 等级键 → 「S（顶级种子）」这样的可读文本。 */
+export function levelText(key, levels) {
+  if (!key) return '—';
+  const label = (levels ?? []).find((l) => l.key === key)?.label ?? '';
+  return label ? `${key}（${label}）` : key;
+}
+
+/**
+ * 报名明细表（纯函数）：表头 + 每一行。
+ * ⚠️ 「事件轨迹」这一列必须真的渲染（测试直接断言表头与调用点）。
+ */
+export function buildScreeningTable(rows, criteria) {
+  const levels = criteria?.levels ?? [];
+  const head = `
+        <thead>
+          <tr>
+            <th>用户</th>
+            <th>系统分级</th>
+            <th>复核级别</th>
+            <th>分数</th>
+            <th>状态</th>
+            <th>可解释明细</th>
+            <th>事件轨迹</th>
+            <th>操作</th>
+          </tr>
+        </thead>`;
+  const body = (rows ?? []).map((r) => {
+    const trail = formatEventTrail(r.events);
+    return `
+          <tr data-id="${escapeHtml(r.id)}">
+            <td>${escapeHtml(r.userId)}</td>
+            <td>${escapeHtml(r.autoLevel)}</td>
+            <td data-cell="level">${escapeHtml(levelText(r.level, levels))}</td>
+            <td class="td-num" data-cell="score">${escapeHtml(r.score ?? '—')}</td>
+            <td data-cell="status">${badge(r.statusLabel, STATUS_TONES[r.status] ?? 'neutral')}</td>
+            <td>${r.explain.map((e) => escapeHtml(e.text)).join('<br />')}</td>
+            <td data-cell="events">${trail.length
+              ? trail.map((line) => escapeHtml(line)).join('<br />')
+              : '<span class="muted">—</span>'}</td>
+            <td>
+              <select class="select" data-role="level">
+                ${levels.map((l) => `<option value="${escapeHtml(l.key)}"${l.key === r.level ? ' selected' : ''}>${escapeHtml(l.key)}（${escapeHtml(l.label)}）</option>`).join('')}
+              </select>
+              <input class="input" data-role="note" placeholder="复核意见" />
+              <button type="button" class="btn btn--primary btn--sm" data-role="save">改级</button>
+              <p class="small" data-role="feedback" hidden></p>
+            </td>
+          </tr>`;
+  }).join('');
+  return `${head}
+        <tbody>${body || emptyRow(8, '本届还没有报名记录')}</tbody>`;
+}
+
 export function renderAdminRegistration(ctx) {
   const wrap = document.createElement('div');
-  wrap.className = 'card admin-registration';
-  wrap.innerHTML = '<p class="muted">正在加载报名筛选台…</p>';
+  wrap.className = 'admin-registration';
   const { api } = ctx;
 
-  (async () => {
-    const criteria = await api.get('/api/registration-criteria');
-    const editionId = criteria.editionId;
-    const [{ items: registrations }, { items: packages, mix }] = await Promise.all([
-      api.get(`/api/registrations?editionId=${editionId}`),
-      api.get(`/api/task-packages?editionId=${editionId}`),
-    ]);
+  wrap.innerHTML = `
+    ${pageHead({
+      title: '报名筛选台',
+      sub: '委员会工作台：查看分级分布与筛选漏斗，逐份复核并改级（每一行都能改，不需要刷新页面）。',
+    })}
+    <div id="admin-body">${loadingState({ rows: 4, label: '正在加载报名筛选台…' })}</div>`;
+
+  const body = wrap.querySelector('#admin-body');
+  let criteria = null;
+
+  /** 加载筛选台；错误态的「重试」按钮复用它（真的重跑一次）。 */
+  async function load() {
+    body.innerHTML = loadingState({ rows: 4, label: '正在加载报名筛选台…' });
+    let registrations = [];
+    let packages = [];
+    let mix = null;
+    try {
+      criteria = await api.get('/api/registration-criteria');
+      const edition = encodeURIComponent(criteria?.editionId ?? '');
+      const [regRes, pkgRes] = await Promise.all([
+        api.get(`/api/registrations?editionId=${edition}`),
+        api.get(`/api/task-packages?editionId=${edition}`),
+      ]);
+      // ⚠️ 真实后端返回 { items }，演示适配器返回 { rows } —— 两种都收下，
+      //    但**不按任何条件过滤**：API 返回什么就渲染什么。
+      registrations = regRes?.items ?? regRes?.rows ?? [];
+      packages = pkgRes?.items ?? pkgRes?.rows ?? [];
+      mix = pkgRes?.mix ?? null;
+    } catch (e) {
+      body.innerHTML = errorState({
+        message: '报名筛选台加载失败',
+        hint: '接口返回：' + e.message + '。点「重试」重新加载；若持续失败，请确认服务端已启动且你的账号有组委会权限。',
+      });
+      body.querySelector('[data-action="retry"]')?.addEventListener('click', load);
+      return;
+    }
+    render(registrations, packages, mix);
+  }
+
+  function render(registrations, packages, mix) {
     const { rows, distribution, total } = buildScreeningRows(registrations, criteria);
-    const funnel = buildFunnelView(registrations, criteria.funnel);
+    const funnel = buildFunnelView(registrations, criteria?.funnel);
+    const levels = criteria?.levels ?? [];
 
-    wrap.innerHTML = `
-      <h1>报名筛选台</h1>
-      <section class="funnel">
-        <h2>筛选漏斗（R-REG-10）</h2>
-        <ul>${funnel.map((f) => `<li>${escapeHtml(f.label)}：${f.rate === null ? '—' : `${Math.round(f.rate * 100)}%`}｜${f.current === null ? '待填充' : `当前 ${f.current} 人`}</li>`).join('')}</ul>
-      </section>
-      <section class="distribution">
-        <h2>分级分布（共 ${total} 人）</h2>
-        <ul>${Object.entries(distribution).map(([k, v]) => `<li>${escapeHtml(k)} 级 ${v} 人</li>`).join('')}</ul>
-      </section>
-      <section class="mix">
-        <h2>任务包配比（R-ENT-09：70% B 端 + 30% 自由）</h2>
-        <p>${mix ? `自由题 ${mix.free}/${mix.total}（${Math.round(mix.actualFree * 100)}%）｜B 端 ${mix.enterprise}｜${mix.ok ? '配比达标' : '配比未达标'}` : '无数据'}</p>
-        ${mix && !mix.ok ? `<ul class="err">${mix.errors.map((e) => `<li>${escapeHtml(e)}</li>`).join('')}</ul>` : ''}
-        <ul>${packages.map((p) => `<li>${escapeHtml(p.title)}｜${p.isFreeBrief ? '自由命题' : `B 端 ${escapeHtml(p.solvabilityGrade ?? '未分级')} 级`}｜${escapeHtml(p.agreement ?? '')}</li>`).join('')}</ul>
-      </section>
-      <table class="screening">
-        <thead><tr><th>用户</th><th>系统分级</th><th>复核级别</th><th>分数</th><th>状态</th><th>可解释明细</th><th>事件轨迹</th><th>操作</th></tr></thead>
-        <tbody>
-          ${rows.map((r) => `
-            <tr data-id="${escapeHtml(r.id)}">
-              <td>${escapeHtml(r.userId)}</td>
-              <td>${escapeHtml(r.autoLevel)}</td>
-              <td>${escapeHtml(r.level)}</td>
-              <td>${r.score}</td>
-              <td>${escapeHtml(r.statusLabel)}</td>
-              <td>${r.explain.map((e) => escapeHtml(e.text)).join('<br />')}</td>
-              <td>${formatEventTrail(r.events).map((line) => escapeHtml(line)).join('<br />')}</td>
-              <td>
-                <select data-role="level">
-                  ${criteria.levels.map((l) => `<option value="${escapeHtml(l.key)}" ${l.key === r.level ? 'selected' : ''}>${escapeHtml(l.key)}</option>`).join('')}
-                </select>
-                <input data-role="note" placeholder="复核意见" />
-                <button data-role="save">改级</button>
-              </td>
-            </tr>`).join('')}
-        </tbody>
-      </table>
-      <p id="admin-err" class="err"></p>`;
+    const statCards = [
+      { label: '报名总数', value: total, tone: 'brand' },
+      ...levels.map((l) => ({
+        label: `${l.key} 级 · ${l.label}`,
+        value: distribution[l.key] ?? 0,
+      })),
+      {
+        label: '任务包配比',
+        value: mix ? (mix.ok ? '达标' : '未达标') : '无数据',
+        hint: mix ? '自由命题 30% + B 端 70%' : '需要组委会权限且任务包已发布',
+        tone: mix ? (mix.ok ? 'success' : 'danger') : 'neutral',
+      },
+    ];
 
-    for (const btn of wrap.querySelectorAll('[data-role=save]')) {
+    const funnelBars = funnel.map((f) => barRow({
+      label: f.label,
+      // 第一段是本届报名实数；后续段还没有赛段结果 ⇒ 明确标注「待填充」，不假装有数。
+      value: f.current === null ? '待填充' : f.current,
+      max: total || 1,
+      note: f.target === null ? '无目标人数' : `目标 ${f.target} 人`,
+      tone: f.current === null ? 'info' : 'brand',
+    })).join('');
+
+    const distributionBars = levels.map((l) => {
+      const count = distribution[l.key] ?? 0;
+      return barRow({
+        label: `${l.key}（${l.label}）`,
+        value: count,
+        max: total || 1,
+        note: `${Math.round((count / (total || 1)) * 100)}%`,
+        tone: 'brand',
+      });
+    }).join('');
+
+    const packageRows = packages.map((p) => `
+            <tr>
+              <td>${escapeHtml(p.title)}</td>
+              <td>${p.isFreeBrief
+                ? badge('自由命题', 'brand')
+                : badge(`B 端 ${p.solvabilityGrade ?? '未分级'}`, p.solvabilityGrade ? 'info' : 'warn')}</td>
+              <td>${escapeHtml(p.agreement ?? '')}</td>
+            </tr>`).join('');
+
+    body.innerHTML = `
+      <div class="stack">
+        ${statRow(statCards)}
+        ${panel({
+          title: '筛选漏斗（R-REG-10）',
+          desc: '第一段是本届报名实数，后续阶段的结果要等赛段跑完才有。',
+          body: `${funnelBars || '<p class="muted">本届还没有配置筛选漏斗。</p>'}
+            ${criteria?.funnelNote ? noticeState({ tone: 'info', items: [criteria.funnelNote] }) : ''}`,
+        })}
+        ${panel({
+          title: `分级分布（共 ${total} 人）`,
+          desc: '按最终级别统计（含组委会改级后的结果）。',
+          body: distributionBars || '<p class="muted">本届还没有配置等级档位。</p>',
+        })}
+        ${panel({
+          title: '任务包配比（R-ENT-09：70% B 端 + 30% 自由）',
+          desc: '体检对象是已发布（进池）的任务卡。',
+          body: `${mix ? kvList([
+            ['自由命题', `${mix.free} / ${mix.total}（${Math.round(mix.actualFree * 100)}%）`],
+            ['B 端任务包', `${mix.enterprise} 张`],
+            ['目标', '自由命题 30% + B 端 70%（A 40% / B 20% / C 10%，容差 ±10 个百分点）'],
+            ['结论', mix.ok ? '配比达标' : '配比未达标'],
+          ]) : '<p class="muted">暂无配比体检数据（需要组委会权限且任务包已发布）。</p>'}
+            ${mix && !mix.ok ? noticeState({ tone: 'danger', title: '配比未达标', items: mix.errors ?? [], list: true }) : ''}
+            ${packageRows
+              ? tableWrap(`
+            <thead><tr><th>任务包</th><th>类型</th><th>企业承诺</th></tr></thead>
+            <tbody>${packageRows}</tbody>`)
+              : emptyState({ title: '还没有任务包', hint: '组委会提交并分级任务卡后，这里会列出全部任务包与配比体检结果。' })}`,
+        })}
+        ${panel({
+          title: '报名明细',
+          desc: '每行都能复核改级：选级别 → 写意见 → 点「改级」，结果就地更新。',
+          body: `${rows.length ? '' : emptyState({
+            title: '本届还没有报名记录',
+            hint: '有选手提交报名后，这里会逐条列出分级、分数、可解释明细与事件轨迹。',
+          })}
+            <div id="admin-feedback"></div>
+            ${rows.length ? tableWrap(buildScreeningTable(rows, criteria), { caption: '报名明细' }) : ''}`,
+        })}
+      </div>`;
+
+    bindSaveButtons();
+  }
+
+  /** 改级成功后就地刷新这一行（不整页刷新 —— 那会冲掉其他行已填的复核意见）。 */
+  function paintRow(tr, data) {
+    const levels = criteria?.levels ?? [];
+    const level = data.levelFinal ?? data.level;
+    const levelCell = tr.querySelector('[data-cell="level"]');
+    const scoreCell = tr.querySelector('[data-cell="score"]');
+    const statusCell = tr.querySelector('[data-cell="status"]');
+    const eventsCell = tr.querySelector('[data-cell="events"]');
+    if (levelCell) levelCell.textContent = levelText(level, levels);
+    if (scoreCell) scoreCell.textContent = String(data.grading?.score ?? data.rawScore ?? '—');
+    if (statusCell) {
+      statusCell.innerHTML = badge(STATUS_LABELS[data.status] ?? data.status, STATUS_TONES[data.status] ?? 'neutral');
+    }
+    if (eventsCell && Array.isArray(data.events)) {
+      const trail = formatEventTrail(data.events);
+      eventsCell.innerHTML = trail.length
+        ? trail.map((line) => escapeHtml(line)).join('<br />')
+        : '<span class="muted">—</span>';
+    }
+  }
+
+  /** 重新拉这一条报名（拿到权威的轨迹）；拉不到就用改级接口的返回值兜底。 */
+  async function refreshOne(regId, fallback) {
+    try {
+      return await api.get(`/api/registrations/${encodeURIComponent(regId)}`);
+    } catch {
+      return fallback;
+    }
+  }
+
+  function bindSaveButtons() {
+    for (const btn of body.querySelectorAll('[data-role="save"]')) {
       btn.addEventListener('click', async () => {
-        const row = btn.closest('tr');
-        const level = row.querySelector('[data-role=level]').value;
-        const note = row.querySelector('[data-role=note]').value;
+        const tr = btn.closest('tr');
+        const regId = tr.dataset.id;
+        const levelSelect = tr.querySelector('[data-role="level"]');
+        const noteInput = tr.querySelector('[data-role="note"]');
+        const feedbackCell = tr.querySelector('[data-role="feedback"]');
+        const level = levelSelect.value;
+        const note = noteInput.value.trim();
+        btn.disabled = true;
+        btn.textContent = '提交中…';
+        if (feedbackCell) feedbackCell.hidden = true;
         try {
-          await api.post(`/api/registrations/${row.dataset.id}/level`, { level, note });
-          location.reload();
+          const updated = await api.post(`/api/registrations/${encodeURIComponent(regId)}/level`, { level, note });
+          const fresh = await refreshOne(regId, updated);
+          paintRow(tr, fresh);
+          if (levelSelect) levelSelect.value = fresh.levelFinal ?? fresh.level ?? level;
+          const who = fresh.userId ?? '';
+          showFeedback('success', `已改级：${who} → ${levelSelect.value} 级`);
+          if (feedbackCell) {
+            feedbackCell.textContent = `已改级为 ${levelSelect.value} 级`;
+            feedbackCell.className = 'small muted';
+            feedbackCell.hidden = false;
+          }
         } catch (e) {
-          wrap.querySelector('#admin-err').textContent = e.message;
+          const message = '改级失败：' + e.message;
+          if (feedbackCell) {
+            feedbackCell.textContent = message;
+            feedbackCell.className = 'small err';
+            feedbackCell.hidden = false;
+          }
+          showFeedback('danger', message);
+        } finally {
+          btn.disabled = false;
+          btn.textContent = '改级';
         }
       });
     }
-  })().catch((e) => {
-    wrap.innerHTML = `<div class="card err">${escapeHtml(e.message)}</div>`;
-  });
+  }
 
+  /** 全局提示区（表格正上方）：成功 / 失败都看得见。 */
+  function showFeedback(tone, message) {
+    const box = body.querySelector('#admin-feedback');
+    if (!box) return;
+    box.innerHTML = noticeState({
+      tone,
+      title: tone === 'success' ? '改级成功' : '改级未完成',
+      items: [message],
+    });
+  }
+
+  load();
   return wrap;
 }
 ```

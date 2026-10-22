@@ -4923,82 +4923,353 @@ Run: `cd platform && node --test test/leaderboard-web.test.js` → Expected: FAI
 
 ```javascript
 // web/views/leaderboard.js — 榜单页（A 榜 / B 榜 / 个人榜 + 滚动总榜）
-// ⛔ 前端只渲染，不做过滤：可见性已在 API 层完成。
-// ⛔ 降级告警置顶：P2 计算出的 warnings 显式展示在最上方，不静默（S-5 / C-05）。
 //
+// 依据：本轮（P7）「现有页面打磨到生产级」
+//   + 设计文档 §9「榜单页：口径切换 + 赛段选择 + 降级告警置顶」+ §12 三件套
+//   + S-5 / C-05「降级状态必须显式展示，不静默」
+//
+// ⛔ 前端只渲染，不做过滤：可见性已在 API 层完成（设计文档 §6.6）。
+// ⛔ 降级告警置顶：P2 计算出的 warnings 显式展示在最上方，不静默（S-5 / C-05）。
+//    ⚠️ **位置是硬契约**：测试断言「告警的字符索引 < 队名的字符索引」，
+//        所以告警块必须排在整页最前（页头之前），不能塞到表格下面。
+// ⚠️ 口径切换靠 URL（?scope=）而不是前端状态机 —— 刷新 / 分享链接都停在同一屏。
 // ⚠️ 转义统一走 `web/escape.js`（P0 建立，全站唯一入口）——
 //    这里**不重复定义** escapeHtml：三个视图各写一份会漂移，且漏改一处就是一处 XSS。
 import { escapeHtml } from '../escape.js';
+import {
+  barRow, emptyState, errorState, loadingState, noticeState, pageHead,
+  rankBadge, sectionTitle, statRow, tableWrap, tabs,
+} from '../ui.js';
+// ⚠️ 段位徽章的映射住在 ./tier.js（段位语义的归属地），这里只取用不重复定义。
+import { tierBadge } from './tier.js';
 
+/**
+ * 口径元数据（纯数据）：标题 / 副标题 / 空态口径。
+ * ⚠️ 标题语义是既有契约：rank → A 榜、business → B 榜 · 商业战绩、
+ *    personal → 个人积分榜、rolling → 滚动总榜 · 全赛段累计（沿用打磨前的措辞）。
+ */
+const SCOPES = {
+  rank: {
+    id: 'rank',
+    label: 'A 榜',
+    title: 'A 榜 · 赛段名次',
+    sub: '本赛段名次：按总分排名，积分按赛段规则发放。',
+    empty: '本赛段还没有发榜 —— 组委会完成该赛段的评审、计算与发榜后，榜单会出现在这里。',
+  },
+  business: {
+    id: 'business',
+    label: 'B 榜',
+    title: 'B 榜 · 商业战绩',
+    sub: '商业战绩：里程碑达成进度公示（评分与签署细节不公开）。',
+    empty: '本赛段还没有商业里程碑记录 —— 企业确认后，这里会公示每支队伍的里程碑进度。',
+  },
+  personal: {
+    id: 'personal',
+    label: '个人榜',
+    title: '个人积分榜',
+    sub: '个人积分榜：按届期累计的个人积分排名，终生上榜。',
+    empty: '本届还没有个人积分 —— 赛段发榜后积分会累计到个人名下。',
+  },
+  rolling: {
+    id: 'rolling',
+    label: '滚动总榜',
+    title: '滚动总榜 · 全赛段累计',
+    sub: '滚动总榜：跨全部赛段累计积分，任意赛段发榜后自动更新。',
+    empty: '本届还没有已发榜的赛段 —— 任意一个赛段发榜后，总榜会自动出现。',
+  },
+};
+
+/**
+ * 降级告警（置顶）。
+ * ⚠️ 滚动总榜的告警来自【多个赛段】，必须标出是哪一段降级了（否则读者不知道该查哪段）。
+ *    赛段榜 / B 榜 / 个人榜的告警没有 stageName → 不渲染这一段。
+ */
 function warningsHtml(warnings) {
-  const list = Array.isArray(warnings) ? warnings || [] : [];
+  const list = Array.isArray(warnings) ? warnings : [];
   if (!list.length) return '';
-  // ⚠️ 滚动总榜的告警来自【多个赛段】，必须标出是哪一段降级了（否则读者不知道该查哪段）。
-  //    赛段榜 / B 榜 / 个人榜的告警没有 stageName → 不渲染这一段（保持原样）。
   const items = list.map((w) => {
-    const stage = w.stageName ? `<span class="warn-stage">${escapeHtml(w.stageName)}</span> ` : '';
-    return `<li class="warn-item"><span class="warn-code">${escapeHtml(w.code || 'WARN')}</span> ${stage}<span class="warn-msg">${escapeHtml(w.message || '')}</span></li>`;
+    const stage = w?.stageName ? `【${w.stageName}】` : '';
+    const code = w?.code ? `[${w.code}] ` : '';
+    return `${stage}${code}${w?.message ?? ''}`;
+  });
+  return noticeState({
+    tone: 'warn',
+    title: `本轮降级提示（${list.length}）—— 以下维度未按标准口径计算`,
+    items,
+    list: true,
+  });
+}
+
+/** 页头（标题 + 副标题 + 跨页入口）。 */
+function headHtml(meta) {
+  return pageHead({
+    title: meta.title,
+    sub: meta.sub,
+    actions: [{ label: '段位榜', href: '#/tier' }, { label: '总览', href: '#/' }],
+  });
+}
+
+/**
+ * 口径切换（tabs）。
+ * ⚠️ 靠 URL 而不是前端状态机：刷新不丢状态、链接可分享。
+ * ⚠️ 赛段口径（A/B/个人）必须带上赛段 id —— 滚动总榜是**届期级**的，没有赛段维度。
+ */
+function scopeTabsHtml(scope, stageId, stages) {
+  const target = stageId || stages[0]?.id || '';
+  const link = (id) => (target
+    ? `#/leaderboard/${encodeURIComponent(String(target))}?scope=${id}`
+    : `#/leaderboard?scope=${id}`);
+  return tabs({
+    items: [
+      { id: 'rank', label: SCOPES.rank.label, href: link('rank') },
+      { id: 'business', label: SCOPES.business.label, href: link('business') },
+      { id: 'personal', label: SCOPES.personal.label, href: link('personal') },
+      { id: 'rolling', label: SCOPES.rolling.label, href: '#/leaderboard?scope=rolling' },
+    ],
+    active: scope,
+  });
+}
+
+/**
+ * 赛段选择器。
+ * ⚠️ 拉不到赛段列表时**静默降级**（返回空串）：赛段列表挂了不能让整个榜单页报错。
+ * ⚠️ 滚动总榜是届期级的 ⇒ 此时点某个赛段 = 切到那个赛段的 A 榜。
+ */
+function stagePickerHtml(scope, stageId, stages) {
+  if (!stages.length) return '';
+  const stageScope = scope === 'rolling' ? 'rank' : scope;
+  const current = scope === 'rolling' ? '' : String(stageId ?? '');
+  const items = stages.map((s) => {
+    const id = String(s?.id ?? '');
+    const label = s?.name || s?.key || id;
+    const href = `#/leaderboard/${encodeURIComponent(id)}?scope=${stageScope}`;
+    return id === current
+      ? `<span class="btn btn--primary btn--sm" aria-current="page">${escapeHtml(label)}</span>`
+      : `<a class="btn btn--ghost btn--sm" href="${escapeHtml(href)}">${escapeHtml(label)}</a>`;
+  });
+  return `<div class="row"><span class="muted small">赛段</span><div class="btn-group">${items.join('')}</div></div>`;
+}
+
+/** 指标行：一眼可见的队伍数 / 分数 / 降级条数。 */
+function statsHtml(scope, rows, warnings) {
+  const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : null);
+  const totals = rows.map((r) => num(r?.total)).filter((v) => v !== null);
+  const points = rows.map((r) => num(r?.points)).filter((v) => v !== null);
+  const max = (arr) => (arr.length ? Math.max(...arr) : null);
+  const warnCount = Array.isArray(warnings) ? warnings.length : 0;
+  const cards = [];
+
+  if (scope === 'personal') {
+    const self = rows.find((r) => r?.isSelf);
+    cards.push({ label: '上榜选手', value: rows.length, tone: 'brand' });
+    cards.push({ label: '最高个人积分', value: max(totals) ?? '—', tone: 'success' });
+    cards.push({ label: '我的名次', value: self?.rank ?? '—' });
+  } else if (scope === 'business') {
+    const done = rows.reduce((acc, r) => acc + (num(r?.achievedCount) ?? 0), 0);
+    const all = rows.reduce((acc, r) => acc + (num(r?.milestoneCount) ?? 0), 0);
+    cards.push({ label: '上榜队伍', value: rows.length, tone: 'brand' });
+    cards.push({ label: '里程碑达成', value: done, tone: 'success', hint: `共 ${all} 项` });
+    cards.push({ label: '有进展队伍', value: rows.filter((r) => (num(r?.achievedCount) ?? 0) > 0).length });
+  } else if (scope === 'rolling') {
+    const stages = rows.map((r) => num(r?.stages)).filter((v) => v !== null);
+    cards.push({ label: '在榜队伍', value: rows.length, tone: 'brand' });
+    cards.push({ label: '最高累计积分', value: max(points) ?? '—', tone: 'success' });
+    cards.push({ label: '最多参赛赛段', value: max(stages) ?? '—' });
+  } else {
+    cards.push({ label: '在榜队伍', value: rows.length, tone: 'brand' });
+    cards.push({ label: '榜首总分', value: max(totals) ?? '—', tone: 'success' });
+    cards.push({ label: '最高积分', value: max(points) ?? '—' });
+  }
+  cards.push({
+    label: '降级告警',
+    value: warnCount,
+    tone: warnCount ? 'warn' : 'neutral',
+    hint: '降级必须显式处理，不静默',
+  });
+  return statRow(cards);
+}
+
+/** A 榜（赛段名次）表格。 */
+function rankRowsHtml(rows, meta) {
+  if (!rows.length) return emptyState({ title: '暂无数据', hint: meta.empty });
+  const body = rows.map((r, i) => {
+    // ⚠️ 名次：优先用 API 给的 rank；滚动总榜没有 rank 字段 ⇒ 用行序兜底
+    const rank = r?.rank ?? i + 1;
+    const tied = Array.isArray(r?.tiedWith) && r.tiedWith.length;
+    const pkg = r?.packageRank ? `包内第 ${escapeHtml(r.packageRank)} 名` : '—';
+    return `<tr>`
+      + `<td>${rankBadge(rank)}</td>`
+      + `<td>${escapeHtml(r?.teamName || r?.teamId)}`
+      + `${tied ? ' <span class="muted small">（并列）</span>' : ''}</td>`
+      + `<td class="td-num num">${escapeHtml(r?.total ?? '—')}</td>`
+      + `<td class="td-num num">${escapeHtml(r?.points ?? '—')}</td>`
+      + `<td>${tierBadge(r?.tier)}</td>`
+      + `<td class="td-num num">${pkg}</td>`
+      + `</tr>`;
   }).join('');
-  return `<div class="warnings" role="alert"><h3>⚠ 本轮降级提示（${list.length}）</h3><ul>${items}</ul></div>`;
+  return tableWrap(
+    `<thead><tr><th>名次</th><th>队伍</th><th class="td-num">总分</th>`
+    + `<th class="td-num">积分</th><th>段位</th><th class="td-num">包内</th></tr></thead>`
+    + `<tbody>${body}</tbody>`,
+    { caption: 'A 榜：本赛段名次' },
+  );
 }
 
-function rankRowsHtml(rows) {
-  if (!rows.length) return '<p class="muted">暂无数据</p>';
-  const body = rows.map((r) => {
-    const tied = Array.isArray(r.tiedWith) && r.tiedWith.length ? '（并列）' : '';
-    const pkg = r.packageRank ? `包内第 ${escapeHtml(r.packageRank)} 名` : '';
-    return `<tr><td class="rank">${escapeHtml(r.rank)}</td><td class="name">${escapeHtml(r.teamName || r.teamId)}${tied}</td>`
-      + `<td class="total">${escapeHtml(r.total)}</td><td class="points">${escapeHtml(r.points)}</td>`
-      + `<td class="tier">${escapeHtml(r.tier || '')}</td><td class="pkg">${pkg}</td></tr>`;
+/** 滚动总榜表格（届期级：累计积分 + 参赛赛段数 + 最好名次）。 */
+function rollingRowsHtml(rows, meta) {
+  if (!rows.length) return emptyState({ title: '暂无数据', hint: meta.empty });
+  const body = rows.map((r, i) => {
+    const rank = r?.rank ?? i + 1;
+    const best = r?.bestRank ?? '—';
+    return `<tr>`
+      + `<td>${rankBadge(rank)}</td>`
+      + `<td>${escapeHtml(r?.teamName || r?.teamId)}</td>`
+      + `<td class="td-num num">${escapeHtml(r?.points ?? '—')}</td>`
+      + `<td class="td-num num">${escapeHtml(r?.stages ?? '—')}</td>`
+      + `<td class="td-num num">${escapeHtml(best)}</td>`
+      + `<td>${tierBadge(r?.tier)}</td>`
+      + `</tr>`;
   }).join('');
-  return `<table class="board"><thead><tr><th>名次</th><th>队伍</th><th>总分</th><th>积分</th><th>段位</th><th>包内</th></tr></thead><tbody>${body}</tbody></table>`;
+  return tableWrap(
+    `<thead><tr><th>名次</th><th>队伍</th><th class="td-num">累计积分</th>`
+    + `<th class="td-num">参赛赛段</th><th class="td-num">最好名次</th><th>段位</th></tr></thead>`
+    + `<tbody>${body}</tbody>`,
+    { caption: '滚动总榜：全赛段累计' },
+  );
 }
 
-function businessRowsHtml(rows) {
-  if (!rows.length) return '<p class="muted">暂无数据</p>';
-  return `<div class="biz-grid">${rows.map((r) => {
-    const items = (r.milestones || []).map((m) => `<li class="${m.achieved ? 'done' : 'todo'}"><span class="mark">${m.achieved ? '☑' : '☐'}</span>${escapeHtml(m.label)}</li>`).join('');
-    return `<div class="card biz-card"><h3>${escapeHtml(r.teamName || r.teamId)}</h3><ul class="milestones">${items}</ul>`
-      + `<p class="muted">达成 ${escapeHtml(r.achievedCount)} / ${escapeHtml(r.milestoneCount)}</p></div>`;
-  }).join('')}</div>`;
+/** 个人榜表格。 */
+function personalRowsHtml(rows, meta) {
+  if (!rows.length) return emptyState({ title: '暂无数据', hint: meta.empty });
+  const body = rows.map((r, i) => `<tr>`
+    + `<td>${rankBadge(r?.rank ?? i + 1)}</td>`
+    + `<td>${escapeHtml(r?.name || r?.userId)}`
+    + `${r?.isSelf ? ' <span class="muted small">（我）</span>' : ''}</td>`
+    + `<td class="td-num num">${escapeHtml(r?.total ?? '—')}</td>`
+    + `</tr>`).join('');
+  return tableWrap(
+    `<thead><tr><th>名次</th><th>选手</th><th class="td-num">个人积分</th></tr></thead>`
+    + `<tbody>${body}</tbody>`,
+    { caption: '个人积分榜' },
+  );
 }
 
-function personalRowsHtml(rows) {
-  if (!rows.length) return '<p class="muted">暂无数据</p>';
-  const body = rows.map((r) => `<tr><td class="rank">${escapeHtml(r.rank)}</td><td class="name">${escapeHtml(r.name || r.userId)}${r.isSelf ? '（我）' : ''}</td><td class="total">${escapeHtml(r.total)}</td></tr>`).join('');
-  return `<table class="board"><thead><tr><th>名次</th><th>选手</th><th>个人积分</th></tr></thead><tbody>${body}</tbody></table>`;
+/** B 榜（商业战绩）：卡片网格 —— 每支队伍一张进度卡。 */
+function businessRowsHtml(rows, meta) {
+  if (!rows.length) return emptyState({ title: '暂无数据', hint: meta.empty });
+  const cards = rows.map((r) => {
+    const ms = Array.isArray(r?.milestones) ? r.milestones : [];
+    const done = ms.filter((m) => m?.achieved);
+    const items = ms.map((m) => `<li class="${m?.achieved ? 'done' : 'todo'}">`
+      + `<span class="mark" aria-hidden="true">${m?.achieved ? '☑' : '☐'}</span>`
+      + `<span>${escapeHtml(m?.label)}</span></li>`).join('');
+    const total = r?.milestoneCount ?? ms.length;
+    return `<article class="card biz-card">
+      <div class="row row--between">
+        <h3>${escapeHtml(r?.teamName || r?.teamId)}</h3>
+        ${tierBadge(r?.tier)}
+      </div>
+      ${barRow({
+        label: '里程碑达成',
+        value: r?.achievedCount ?? done.length,
+        max: total,
+        note: `/ ${total}`,
+        tone: 'success',
+      })}
+      <ul class="milestones">${items || '<li class="muted">暂无数据</li>'}</ul>
+    </article>`;
+  }).join('');
+  return `<div class="grid grid--2">${cards}</div>`;
 }
 
-/** 纯函数渲染（可单测） */
+/**
+ * 榜单页渲染（纯函数，可单测）。
+ *
+ * ⚠️ model.loading / model.error 是**视图自有的状态位**（不属于 API 返回形状）——
+ *    纯函数没法发请求，就靠这两个位表达外壳三件套。
+ * ⚠️ model.stages / model.stageId 是**赛段选择器**需要的额外字段（可选，缺了就不渲染选择器）。
+ */
 export function leaderboardHtml(model) {
-  const scope = model?.scope || 'rank';
-  const body = scope === 'business' ? businessRowsHtml(model?.rows || [])
-    : scope === 'personal' ? personalRowsHtml(model?.rows || [])
-      : rankRowsHtml(model?.rows || []);
-  const title = scope === 'business' ? 'B 榜 · 商业战绩'
-    : scope === 'personal' ? '个人积分榜'
-      : scope === 'rolling' ? '滚动总榜 · 全赛段累计'
-        : 'A 榜 · 赛段名次';
-  return `<section class="board-view">${warningsHtml(model?.warnings)}<h2>${title}</h2>${body}</section>`;
+  const scope = SCOPES[model?.scope] ? model.scope : 'rank';
+  const meta = SCOPES[scope];
+  const rows = Array.isArray(model?.rows) ? model.rows : [];
+  const warnings = Array.isArray(model?.warnings) ? model.warnings : [];
+  const stages = Array.isArray(model?.stages) ? model.stages : [];
+  const stageId = String(model?.stageId ?? '');
+
+  // ⚠️ 告警置顶（硬契约）：必须排在整页最前，不能排在表格后面。
+  const warnHtml = warningsHtml(warnings);
+  const head = headHtml(meta);
+  const switcher = scopeTabsHtml(scope, stageId, stages);
+
+  if (model?.loading) return `${warnHtml}${head}${switcher}${loadingState({ rows: 3, label: '正在加载榜单…' })}`;
+  if (model?.error) return `${warnHtml}${head}${switcher}${errorState({ message: model.error })}`;
+
+  const body = scope === 'business' ? businessRowsHtml(rows, meta)
+    : scope === 'personal' ? personalRowsHtml(rows, meta)
+      : scope === 'rolling' ? rollingRowsHtml(rows, meta)
+        : rankRowsHtml(rows, meta);
+
+  return `${warnHtml}${head}${switcher}`
+    + `${statsHtml(scope, rows, warnings)}`
+    + `${stagePickerHtml(scope, stageId, stages)}`
+    + `${sectionTitle(scope === 'business' ? '商业战绩' : '榜单')}`
+    + `${body}`;
 }
 
-/** 挂载（真实 API） */
+/** 挂载（真实 API / 演示适配器） */
 export async function renderLeaderboard(ctx) {
   const wrap = document.createElement('div');
-  wrap.className = 'card';
-  const stageId = ctx.params?.stageId || '';
-  const scope = ctx.query?.scope || 'rank';
+  wrap.className = 'leaderboard-view';
+  const routeStageId = String(ctx.params?.stageId ?? '');
+  const scopeParam = String(ctx.query?.scope ?? '');
   // ⚠️ 届期缺省取「当届」由服务端解析（resolveEditionId），前端不必先查届期
-  const edition = ctx.query?.editionId ? `?editionId=${encodeURIComponent(ctx.query.editionId)}` : '';
-  const url = stageId
-    ? `/api/leaderboard/${encodeURIComponent(stageId)}?scope=${encodeURIComponent(scope)}`
-    : `/api/leaderboard/rolling${edition}`;
-  try {
-    const data = await ctx.api.get(url);
-    wrap.innerHTML = leaderboardHtml({ ...data, scope: stageId ? scope : 'rolling' });
-  } catch (e) {
-    wrap.innerHTML = `<section class="board-view"><p class="err">${escapeHtml(e.message)}</p></section>`;
-  }
+  const editionQuery = ctx.query?.editionId ? `?editionId=${encodeURIComponent(ctx.query.editionId)}` : '';
+
+  const load = async () => {
+    wrap.innerHTML = leaderboardHtml({
+      scope: scopeParam || (routeStageId ? 'rank' : 'rolling'),
+      loading: true,
+    });
+
+    // ⚠️ 赛段列表：拉失败**静默降级**（空列表 ⇒ 不渲染选择器），
+    //    绝不能因为赛段列表挂了就让整个榜单页报错。
+    const stages = await ctx.api.get(`/api/stages${editionQuery}`)
+      .then((r) => (Array.isArray(r?.items) ? r.items : []))
+      .catch(() => []);
+
+    // 口径与赛段的解析（口径靠 URL，赛段没有就取赛段列表的第一个）
+    let scope = scopeParam || (routeStageId ? 'rank' : 'rolling');
+    let stageId = routeStageId;
+    if (!stageId && scope !== 'rolling') {
+      stageId = String(stages[0]?.id ?? '');
+      if (!stageId) scope = 'rolling';   // 没有赛段可用 ⇒ 退回届期级的滚动总榜
+    }
+    if (scope === 'rolling') stageId = '';   // ⚠️ 滚动总榜是届期级的，没有赛段维度
+
+    let data = null;
+    let error = null;
+    try {
+      const url = scope === 'rolling'
+        ? `/api/leaderboard/rolling${editionQuery}`
+        : `/api/leaderboard/${encodeURIComponent(stageId)}?scope=${encodeURIComponent(scope)}`;
+      data = await ctx.api.get(url);
+    } catch (e) {
+      error = e.message;
+    }
+
+    wrap.innerHTML = leaderboardHtml({
+      scope,
+      stageId,
+      stages,
+      rows: data?.rows ?? [],
+      warnings: data?.warnings ?? [],
+      error,
+    });
+    // ⚠️ 错误态的重试按钮必须真的能重跑（生产级错误态不能是死路一条）
+    wrap.querySelector('[data-action="retry"]')?.addEventListener('click', () => { load().catch(() => {}); });
+  };
+  await load();
   return wrap;
 }
 ```
@@ -5008,36 +5279,142 @@ export async function renderLeaderboard(ctx) {
 ```javascript
 // web/views/tier.js — 段位榜
 // 依据：冲突裁决 C-02 —— C 段及以上公示队名与名次；D 段不公示排名，只给本人进度卡。
-// ⛔ 前端不隐藏 D 段，而是【不渲染】它：D 段根本不会出现在 API 返回的 rows 里。
+//   + 本轮（P7）「现有页面打磨到生产级」：外壳三件套 + 页头 + 指标行 + 设计系统表格。
+// ⛔ 前端不隐藏 D 段，而是【不渲染】它：D 段根本不会出现在 API 返回的 rows 里
+//   （可见性在 API 层裁决，设计文档 §6.6 / C-02）⇒ 视图**不许自己 filter**。
 // ⚠️ 转义统一走 `web/escape.js`（P0 建立，全站唯一入口）。
 import { escapeHtml } from '../escape.js';
+import {
+  badge, emptyState, errorState, loadingState, pageHead, panel,
+  rankBadge, sectionTitle, statRow, tableWrap,
+} from '../ui.js';
 
+/**
+ * 段位 → 徽章色调（**全站唯一一份**）。
+ *
+ * ⚠️ 为什么住在段位视图里：段位徽章是「段位语义」的映射，
+ *    榜单页（./leaderboard.js）与战绩卡（./card.js）都要用同一套 ——
+ *    否则同一个 A 段在三个页面颜色不同，读者会以为它们是不同段位。
+ *    ⇒ 这里导出，那两个视图 import（视图之间**只共享这一份语义映射**，不共享渲染逻辑）。
+ *
+ * 映射口径（依据：设计文档 §9「段位 S / A / B / C / D」的强弱次序）：
+ *    S / A → brand（顶尖）｜ B → info ｜ C → success（刚够公示名次）｜ D → neutral（未公开）
+ */
+const TIER_TONES = { S: 'brand', A: 'brand', B: 'info', C: 'success', D: 'neutral' };
+
+/** 段位 → 色调；未知段位一律 neutral（颜色静默失效比样式错更糟）。 */
+export function tierTone(tier) {
+  return TIER_TONES[String(tier ?? '').trim().toUpperCase()] ?? 'neutral';
+}
+
+/** 段位徽章；空段位不渲染徽章（免得出现一个没有意义的空胶囊）。 */
+export function tierBadge(tier) {
+  const text = String(tier ?? '').trim();
+  return text ? badge(text, tierTone(text)) : '';
+}
+
+/**
+ * 段位榜渲染（纯函数，可单测）。
+ *
+ * ⚠️ `model.loading` / `model.error` 是**视图自有的状态位**（不属于 API 返回形状）——
+ *    纯函数没法发请求，就靠这两个位表达外壳三件套；
+ *    测试直接喂 API 形状时它们都是 undefined ⇒ 走正常渲染分支。
+ */
 export function tierHtml(model) {
   const rows = Array.isArray(model?.rows) ? model.rows : [];
   const self = model?.selfProgress || null;
+
+  const head = pageHead({
+    title: '段位榜',
+    sub: 'C 段及以上公示队名与名次；D 段只公示本人进度，不公示排名（C-02）。',
+    actions: [{ label: '看榜单', href: '#/leaderboard' }],
+  });
+  if (model?.loading) return `${head}${loadingState({ rows: 3, label: '正在加载段位榜…' })}`;
+  if (model?.error) return `${head}${errorState({ message: model.error })}`;
+
   const board = rows.length
-    ? `<table class="board tier-board"><thead><tr><th>名次</th><th>队伍</th><th>段位</th></tr></thead><tbody>`
-      + rows.map((r) => `<tr><td class="rank">${escapeHtml(r.tierRank)}</td><td class="name">${escapeHtml(r.teamName || r.teamId)}</td><td class="tier">${escapeHtml(r.tier)}</td></tr>`).join('')
-      + `</tbody></table>`
-    : '<p class="muted">暂无数据</p>';
-  const selfCard = self
-    ? `<div class="card self-progress"><h3>本人进度</h3><p>当前段位：<strong>${escapeHtml(self.tier)}</strong></p>`
-      + `<ul>${(self.progress?.milestones || []).map((m) => `<li>${escapeHtml(m.label)}</li>`).join('')}</ul></div>`
+    ? tableWrap(
+      `<thead><tr><th>名次</th><th>队伍</th><th>段位</th><th class="td-num">里程碑</th></tr></thead>`
+      + `<tbody>${rows.map((r) => `<tr>`
+        + `<td>${rankBadge(r.tierRank)}</td>`
+        + `<td>${escapeHtml(r.teamName || r.teamId)}</td>`
+        + `<td>${tierBadge(r.tier)}</td>`
+        + `<td class="td-num num">${escapeHtml(r.milestoneCount ?? '—')}</td>`
+        + `</tr>`).join('')}</tbody>`,
+      { caption: '段位榜：C 段及以上公示队名与名次' },
+    )
+    : emptyState({
+      title: '暂无数据',
+      hint: '还没有可公示的段位记录 —— 队伍完成里程碑并经企业确认后，段位会在发榜时出现在这里。',
+    });
+
+  // ⚠️ selfProgress 是 D 段选手**唯一**能看到的自己的信息（视图不渲染别人），
+  //    所以它必须自成一块、说清「这是你的」。
+  const selfPanel = self
+    ? panel({
+      title: '本人进度',
+      desc: '仅你可见：当前段位与里程碑清单（达成状态以发榜结果为准）。',
+      body: selfBodyHtml(self),
+    })
     : '';
-  return `<section class="tier-view"><h2>段位榜</h2>`
-    + `<p class="muted">C 段及以上公示队名与名次；D 段只公示个人进度，不公示排名。</p>${board}${selfCard}</section>`;
+
+  return `${head}${statRow(tierStats(rows))}`
+    + `${panel({ title: '公示榜单', desc: '按段位从高到低排列，名次为段位榜名次。', body: board })}`
+    + `${selfPanel}`;
 }
 
+/**
+ * 指标行：公示队伍总数 + 各段位队伍数。
+ * ⚠️ 只统计**确实出现在 rows 里**的段位：给没出现的段位写 0 是假数据
+ *    （D 段队伍的数前端根本看不到 —— API 不返回它们）。
+ */
+function tierStats(rows) {
+  const counts = new Map();
+  for (const r of rows) {
+    const t = String(r?.tier ?? '').trim();
+    if (!t) continue;
+    counts.set(t, (counts.get(t) ?? 0) + 1);
+  }
+  const cards = [{ label: '公示队伍', value: rows.length, tone: 'brand', hint: 'C 段及以上' }];
+  for (const t of ['S', 'A', 'B', 'C', 'D']) {
+    if (!counts.has(t)) continue;
+    cards.push({ label: `${t} 段`, value: counts.get(t), tone: tierTone(t) });
+  }
+  return cards;
+}
+
+/** 本人进度面板内容。 */
+function selfBodyHtml(self) {
+  const ms = Array.isArray(self?.progress?.milestones) ? self.progress.milestones : [];
+  const counted = self?.milestoneCount ?? self?.progress?.milestoneCount;
+  const items = ms.map((m) => `<li class="todo"><span class="mark" aria-hidden="true">·</span>`
+    + `<span>${escapeHtml(m.label)}</span></li>`).join('');
+  return `<div class="row row--between">
+      <span class="muted small">当前段位</span>
+      ${tierBadge(self?.tier) || '<span class="muted">—</span>'}
+    </div>
+    <p class="muted small">已计分里程碑 ${escapeHtml(counted ?? '—')} 项</p>
+    <ul class="milestones">${items || '<li class="muted">暂无数据</li>'}</ul>`;
+}
+
+/** 挂载（真实 API / 演示适配器） */
 export async function renderTier(ctx) {
   const wrap = document.createElement('div');
-  wrap.className = 'card';
+  wrap.className = 'tier-view';
   // ⚠️ 届期缺省取「当届」由服务端解析（resolveEditionId）
   const edition = ctx.query?.editionId ? `?editionId=${encodeURIComponent(ctx.query.editionId)}` : '';
-  try {
-    wrap.innerHTML = tierHtml(await ctx.api.get(`/api/leaderboard/tier${edition}`));
-  } catch (e) {
-    wrap.innerHTML = `<section class="tier-view"><p class="err">${escapeHtml(e.message)}</p></section>`;
-  }
+
+  const load = async () => {
+    wrap.innerHTML = tierHtml({ loading: true });
+    try {
+      wrap.innerHTML = tierHtml(await ctx.api.get(`/api/leaderboard/tier${edition}`));
+    } catch (e) {
+      wrap.innerHTML = tierHtml({ error: e.message });
+    }
+    // ⚠️ 错误态的重试按钮必须真的能重跑（生产级错误态不能是死路一条）
+    wrap.querySelector('[data-action="retry"]')?.addEventListener('click', () => { load().catch(() => {}); });
+  };
+  await load();
   return wrap;
 }
 ```
@@ -5047,33 +5424,121 @@ export async function renderTier(ctx) {
 ```javascript
 // web/views/card.js — 项目商业战绩卡
 // 依据：设计文档 §9「7 类里程碑勾选式 + 企业签字标识 + 不显示签字人」
+//   + 本轮（P7）「现有页面打磨到生产级」：外壳三件套 + 页头 + 指标行 + 分组面板。
 // ⛔ 不渲染签字人字段（企业签字不公开，R-ENT-04 / S10 §0.3）。
+// ⚠️ 渲染出去的 HTML 里**不许出现「签字人」三个字**（同一条约束的文案侧）——
+//    代码注释里可以写，输出里不行（测试直接扫输出字符串）。
 // ⚠️ 转义统一走 `web/escape.js`（P0 建立，全站唯一入口）。
 import { escapeHtml } from '../escape.js';
+import {
+  badge, emptyState, errorState, loadingState, pageHead, panel,
+  sectionTitle, statRow,
+} from '../ui.js';
+import { tierTone } from './tier.js';
 
+/**
+ * 战绩卡渲染（纯函数，可单测）。
+ *
+ * ⚠️ `model.loading` / `model.error` 是**视图自有的状态位**（不属于 API 返回形状）——
+ *    纯函数没法发请求，就靠这两个位表达外壳三件套。
+ */
 export function cardHtml(model) {
   const items = Array.isArray(model?.items) ? model.items : [];
-  const list = items.map((m) => `<li class="${m.achieved ? 'done' : 'todo'}"><span class="mark">${m.achieved ? '☑' : '☐'}</span>`
-    + `<span class="label">${escapeHtml(m.label)}</span>${m.signed ? '<span class="signed">已签</span>' : ''}</li>`).join('');
-  const benefits = (model?.benefits || []).map((b) => `<li>${escapeHtml(b)}</li>`).join('');
-  const never = (model?.neverUnlocks || []).map((b) => `<li>${escapeHtml(b)}</li>`).join('');
-  return `<section class="card-view"><h2>${escapeHtml(model?.teamName || '')} · 商业战绩卡</h2>`
-    + `<p class="muted">当前段位：<strong>${escapeHtml(model?.tier || '')}</strong></p>`
-    + `<ul class="milestones">${list || '<li class="muted">暂无里程碑</li>'}</ul>`
-    + `<p class="muted">达成 ${escapeHtml(model?.achievedCount)} / ${escapeHtml(model?.total)}</p>`
-    + `<div class="benefits"><h3>已解锁权益</h3><ul>${benefits || '<li class="muted">暂无</li>'}</ul>`
-    + `<h3>永不解锁</h3><ul>${never || '<li class="muted">暂无</li>'}</ul></div></section>`;
+  const teamName = String(model?.teamName ?? '');
+  const tier = String(model?.tier ?? '');
+  // ⚠️ 达成数 / 总数优先用 API 给的值；缺了才按 items 现算（视图不编造口径）。
+  const achieved = model?.achievedCount ?? items.filter((m) => m?.achieved).length;
+  const total = model?.total ?? items.length;
+
+  const head = pageHead({
+    title: teamName ? `${teamName} · 商业战绩卡` : '商业战绩卡',
+    sub: '里程碑按赛制清单逐项勾选；达成项自动打勾。',
+  });
+  if (model?.loading) return `${head}${loadingState({ rows: 3, label: '正在加载战绩卡…' })}`;
+  if (model?.error) return `${head}${errorState({ message: model.error })}`;
+
+  const done = items.filter((m) => m?.achieved);
+  const todo = items.filter((m) => !m?.achieved);
+
+  const milestoneBody = items.length
+    ? `${milestoneGroup('已达成', done, 'success', doneItemHtml)}`
+      + `${milestoneGroup('未达成', todo, 'neutral', todoItemHtml)}`
+    : emptyState({
+      title: '暂无数据',
+      hint: '这支队伍还没有登记任何里程碑 —— 报名组队后系统会按赛制生成里程碑清单。',
+    });
+
+  const benefits = Array.isArray(model?.benefits) ? model.benefits : [];
+  const never = Array.isArray(model?.neverUnlocks) ? model.neverUnlocks : [];
+
+  return `${head}${statRow([
+    { label: '当前段位', value: tier || '—', tone: tierTone(tier) },
+    { label: '已达成里程碑', value: achieved, tone: 'success', hint: `共 ${total} 项` },
+    { label: '里程碑总数', value: total },
+  ])}`
+    + `${panel({
+      title: '里程碑',
+      desc: '达成项自动打勾；企业确认后会补上「已签」标识。',
+      body: milestoneBody,
+    })}`
+    + `${panel({
+      title: '已解锁权益',
+      desc: `按当前段位（${tier || '—'}）解锁`,
+      body: benefits.length
+        ? `<ul class="list-divided">${benefits.map((b) => `<li>${escapeHtml(b)}</li>`).join('')}</ul>`
+        : '<p class="muted small">当前段位还没有解锁额外权益 —— 段位提升后会自动出现在这里。</p>',
+    })}`
+    // ⚠️ 「永不解锁」用 warn 面板：它需要和「已解锁权益」在视觉上分开 ——
+    //    否则读者会把它当成一份还没拿到的清单。
+    + `${panel({
+      title: '永不解锁',
+      desc: '以下权益与本赛段赛制不符，任何段位都不会解锁。',
+      body: never.length
+        ? `<ul class="list-divided">${never.map((b) => `<li>${escapeHtml(b)}</li>`).join('')}</ul>`
+        : '<p class="muted small">暂无数据</p>',
+      tone: 'warn',
+    })}`;
 }
 
+/** 里程碑分组（标题 + 计数徽章 + 勾选列表）。 */
+function milestoneGroup(title, items, tone, itemHtml) {
+  return `${sectionTitle(title, badge(`${items.length} 项`, tone))}`
+    + `${items.length
+      ? `<ul class="milestones">${items.map(itemHtml).join('')}</ul>`
+      : '<p class="muted small">暂无数据</p>'}`;
+}
+
+/** 已达成项：☑ + 标签 + 「已签」标识。 */
+function doneItemHtml(m) {
+  return `<li class="done"><span class="mark" aria-hidden="true">☑</span>`
+    + `<span>${escapeHtml(m?.label)}</span>`
+    + `${m?.signed ? `<span class="signed">${badge('已签', 'success')}</span>` : ''}</li>`;
+}
+
+/** 未达成项：☐ + 标签。 */
+function todoItemHtml(m) {
+  return `<li class="todo"><span class="mark" aria-hidden="true">☐</span>`
+    + `<span>${escapeHtml(m?.label)}</span></li>`;
+}
+
+/** 挂载（真实 API / 演示适配器） */
 export async function renderCard(ctx) {
   const wrap = document.createElement('div');
-  wrap.className = 'card';
-  try {
-    const data = await ctx.api.get(`/api/teams/${encodeURIComponent(ctx.params?.teamId || '')}/performance-card`);
-    wrap.innerHTML = cardHtml(data);
-  } catch (e) {
-    wrap.innerHTML = `<section class="card-view"><p class="err">${escapeHtml(e.message)}</p></section>`;
-  }
+  wrap.className = 'card-view';
+  const teamId = String(ctx.params?.teamId ?? '');
+
+  const load = async () => {
+    wrap.innerHTML = cardHtml({ loading: true });
+    try {
+      const data = await ctx.api.get(`/api/teams/${encodeURIComponent(teamId)}/performance-card`);
+      wrap.innerHTML = cardHtml(data);
+    } catch (e) {
+      wrap.innerHTML = cardHtml({ error: e.message });
+    }
+    // ⚠️ 错误态的重试按钮必须真的能重跑（生产级错误态不能是死路一条）
+    wrap.querySelector('[data-action="retry"]')?.addEventListener('click', () => { load().catch(() => {}); });
+  };
+  await load();
   return wrap;
 }
 ```

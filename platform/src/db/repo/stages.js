@@ -29,6 +29,22 @@ export function listStages(db, { editionId } = {}) {
 }
 
 /**
+ * 赛段**摘要**列表（P7 新增，给前端做赛段选择器 / 赛事时间线）。
+ *
+ * ⚠️ 为什么另起一个函数而不是直接复用 listStages()：
+ *    listStages 返回 `SELECT *`（含 freeze_at / scoring_config_key 等内部字段），
+ *    那是对内形状；对外只暴露「哪一段、叫什么、什么时候、什么状态」这四项。
+ *    ⛔ 仍然**不做任何可见性过滤** —— 赛段时间线是公开赛事信息，
+ *    真正需要按人过滤的是评分与名单（那些走 /api/leaderboard 等端点）。
+ */
+export function listStageSummaries(db, { editionId } = {}) {
+  const sql = `SELECT id, "key" AS key, name, kind, status, starts_at AS startsAt, ends_at AS endsAt
+                 FROM stages ${editionId ? 'WHERE edition_id = ?' : ''}
+                ORDER BY starts_at, id`;
+  return editionId ? db.prepare(sql).all(editionId) : db.prepare(sql).all();
+}
+
+/**
  * 默认利益冲突声明正文（评委被分配到赛段时即签署）。
  * 评委可另行声明存在冲突 → `has_conflict = 1` → 逐案回避（R-JDG-09 / R-JDG-18）。
  */

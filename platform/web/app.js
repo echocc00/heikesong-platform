@@ -1,7 +1,16 @@
-// web/app.js — 前端入口
+// web/app.js — 前端入口（应用外壳 + 路由 + 导航分区）
 // 溯源需求：R-OPS-06（?demo=1 走演示版适配器；正式版走真实 API）
+//
+// ⚠️ 本轮（P7）改动要点：
+//   ① **导航按角色分区**（web/nav.js）：打磨前首页是 6 个平铺链接，**所有人看到的一模一样**
+//      —— 组委会和选手看到同一个菜单。现在分区由 nav.js 的声明式数据驱动。
+//   ② **路由守卫**：未登录点「报名」不再渲染出一个必然 401 的表单，
+//      而是直接给「需要登录」的引导页。
+//   ③ **总览页重做**：从「一行链接」升级为「赛事总览」（指标行 + 分区入口 + 最新榜单）。
 import { route, match, navigate, currentPath } from './router.js';
 import { getState, setState, subscribe } from './store.js';
+import { navHtml, canAccess } from './nav.js';
+import { emptyState, errorState, loadingState, pageHead, statRow } from './ui.js';
 import { renderLogin } from './views/login.js';
 import { renderRegistration } from './views/registration.js';
 import { renderTeam } from './views/team.js';
@@ -12,6 +21,7 @@ import { renderCard } from './views/card.js';
 import { renderAudit } from './views/audit.js';
 import { renderFlags } from './views/flags.js';
 import { renderTasks } from './views/tasks.js';
+import { renderTaskIndex } from './views/task-index.js';
 import { escapeHtml } from './escape.js';
 
 // 演示版：?demo=1 时用 localStorage 适配器；正式版走真实 API。
@@ -48,33 +58,8 @@ route('/audit/:computationId', (c) => renderAudit(c));
 route('/flags', (c) => renderFlags(c));
 // P5 Task 6：任务清单页（只有「自主领取」一个入口，R-OPS-14 禁止岗位制）
 route('/tasks/:workflowId', (c) => renderTasks(c));
-
-function renderHome() {
-  const el = document.createElement('div');
-  el.className = 'card';
-  const { user } = getState();
-  el.innerHTML = `
-    <h1>赛事平台</h1>
-    ${user ? `<p>已登录：${escapeHtml(user.name)}</p>` : '<p class="muted">未登录</p>'}
-    <nav>
-      <a href="#/login">登录</a>
-      <a href="#/leaderboard">榜单</a>
-      <a href="#/flags">复核队列</a>
-      <a href="#/apply">报名</a>
-      <a href="#/team">我的战队</a>
-      <a href="#/admin/registration">筛选台</a>
-    </nav>
-  `;
-  return el;
-}
-
-function renderLogout() {
-  api.post('/api/auth/logout').finally(() => {
-    setState({ user: null });
-    navigate('/login');
-  });
-  return document.createElement('div');
-}
+// P7：工作流索引页（任务清单的入口 —— 此前 /tasks/:workflowId 没有可达路径）
+route('/tasks', (c) => renderTaskIndex(c));
 
 const ctx = { api, navigate, setState, getState };
 
@@ -100,6 +85,165 @@ function currentQuery() {
   return Object.fromEntries(new URLSearchParams(q));
 }
 
+// ── 主题（亮 / 暗）──────────────────────────────────────────────────────
+// ⚠️ 存在 localStorage 的访问在受限环境（隐私模式 / 沙箱）会抛 ⇒ 全部包 try。
+const THEME_KEY = 'heikesong:theme';
+
+function readTheme() {
+  try { return localStorage.getItem(THEME_KEY); } catch { return null; }
+}
+
+function writeTheme(value) {
+  try { localStorage.setItem(THEME_KEY, value); } catch { /* 存不下就算了，不影响功能 */ }
+}
+
+/** 应用主题到 <html data-theme>。传 null 表示跟随系统。 */
+function applyTheme(value) {
+  const el = document.documentElement;
+  if (!el || typeof el.setAttribute !== 'function') return;
+  if (value === 'light' || value === 'dark') el.setAttribute('data-theme', value);
+  else el.removeAttribute?.('data-theme');
+}
+
+function toggleTheme() {
+  const current = readTheme();
+  const next = current === 'light' ? 'dark' : 'light';
+  writeTheme(next);
+  applyTheme(next);
+}
+
+/** 启动时恢复主题（必须在首屏渲染前，否则会闪一下默认主题）。 */
+function restoreTheme() {
+  const saved = readTheme();
+  if (saved === 'light' || saved === 'dark') applyTheme(saved);
+}
+
+/**
+ * 总览页（赛事总览）。
+ *
+ * ⚠️ **同步渲染问候语，异步补数据**：
+ *    首屏必须**立刻**有内容（骨架屏也行），否则弱网下是白屏；
+ *    同时问候语不依赖任何请求 ⇒ 不会因为接口慢而看不到「你是谁」。
+ */
+function renderHome() {
+  const wrap = document.createElement('div');
+  wrap.className = 'home';
+  const { user } = getState();
+  const isAdmin = user?.isSuperadmin === true || (user?.roles ?? []).includes('admin');
+
+  wrap.innerHTML = `
+    ${pageHead({
+      title: '华东区 AI 商业黑客松',
+      sub: '赛事总览：报名、战队、赛段、榜单都在这里。',
+    })}
+    <section class="panel">
+      <div class="panel__body">
+        <p class="home__hello">${user
+          ? `已登录：<strong>${escapeHtml(user.name || '')}</strong>`
+          : '<span class="muted">未登录</span> —— <a href="#/login">登录</a>后可报名、组队、领任务'}</p>
+        <div class="home__kpi" id="home-kpi">${loadingState({ rows: 1, label: '正在汇总赛事数据…' })}</div>
+      </div>
+    </section>
+    <section class="grid grid--3" id="home-entries"></section>
+    <section class="panel" id="home-board-panel">
+      <div class="panel__head"><h2 class="panel__title">滚动总榜 · 前五</h2>
+        <p class="panel__desc">按全赛段累计积分排名</p></div>
+      <div class="panel__body" id="home-board"></div>
+    </section>`;
+
+  // 入口卡：按角色分区，只显示当前身份用得上的入口
+  const entries = [];
+  if (user) {
+    entries.push({ title: '我的赛事', desc: '报名、战队与任务领取', links: [
+      { href: '#/apply', label: '去报名' },
+      { href: '#/team', label: '我的战队' },
+      { href: '#/tasks', label: '任务清单' },
+    ] });
+  } else {
+    entries.push({ title: '开始参赛', desc: '先登录，再报名组队', links: [
+      { href: '#/login', label: '登录' },
+      { href: '#/register', label: '报名入口' },
+    ] });
+  }
+  entries.push({ title: '赛事公开信息', desc: '榜单与段位，无需登录', links: [
+    { href: '#/leaderboard', label: '看榜单' },
+    { href: '#/tier', label: '段位榜' },
+  ] });
+  if (isAdmin) {
+    entries.push({ title: '组委会工作台', desc: '筛选、复核与发榜留痕', links: [
+      { href: '#/admin/registration', label: '报名筛选台' },
+      { href: '#/flags', label: '复核队列' },
+    ] });
+  }
+  const entryBox = wrap.querySelector('#home-entries');
+  if (entryBox) {
+    entryBox.innerHTML = entries.map((e) => `
+      <article class="card home__entry">
+        <h3>${escapeHtml(e.title)}</h3>
+        <p class="muted small">${escapeHtml(e.desc)}</p>
+        <div class="btn-group">
+          ${e.links.map((l) => `<a class="btn btn--ghost btn--sm" href="${escapeHtml(l.href)}">${escapeHtml(l.label)}</a>`).join('')}
+        </div>
+      </article>`).join('');
+  }
+
+  // 异步补 KPI + 榜单（失败不阻塞首屏）
+  (async () => {
+    const kpiBox = wrap.querySelector('#home-kpi');
+    const boardBox = wrap.querySelector('#home-board');
+    const jobs = [];
+    if (user) jobs.push(api.get('/api/teams').then((r) => (r.items ?? []).length).catch(() => null));
+    jobs.push(api.get('/api/leaderboard/rolling').then((r) => (r.rows ?? []).length).catch(() => null));
+    const [teamCount, boardCount] = await Promise.all(jobs);
+    if (kpiBox) {
+      kpiBox.innerHTML = statRow([
+        { label: '参赛队伍', value: teamCount === null ? '—' : teamCount, tone: 'brand' },
+        { label: '在榜队伍', value: boardCount === null ? '—' : boardCount, tone: 'success' },
+        { label: '我的身份', value: user ? (isAdmin ? '组委会' : '参赛者') : '访客' },
+      ]);
+    }
+    if (boardBox) {
+      try {
+        const data = await api.get('/api/leaderboard/rolling');
+        const rows = (data.rows ?? []).slice(0, 5);
+        boardBox.innerHTML = rows.length
+          ? `<ul class="list-divided">${rows.map((r) => `<li class="row row--between">
+              <span>${escapeHtml(r.rank)}. ${escapeHtml(r.teamName || r.teamId)}</span>
+              <span class="num">${escapeHtml(r.total)} 分</span>
+            </li>`).join('')}</ul>`
+          : emptyState({ title: '榜单还没有数据', hint: '等组委会完成首个赛段的计算与发榜。' });
+      } catch (e) {
+        boardBox.innerHTML = errorState({ message: e.message });
+      }
+    }
+  })().catch(() => { /* 静默：首屏问候语已经在了 */ });
+
+  return wrap;
+}
+
+function renderLogout() {
+  api.post('/api/auth/logout').finally(() => {
+    setState({ user: null });
+    navigate('/login');
+  });
+  return document.createElement('div');
+}
+
+/** 路由守卫兜底页：未登录 / 无权限时给出**可执行的下一步**，不是一句报错。 */
+function renderGuard(user) {
+  const el = document.createElement('div');
+  el.className = 'guard';
+  const needLogin = !user;
+  el.innerHTML = emptyState({
+    title: needLogin ? '需要登录后才能访问' : '没有访问这个页面的权限',
+    hint: needLogin
+      ? '登录后就能报名、组队、领任务。登录使用报名时填写的手机号。'
+      : '这个页面属于组委会工作台。如果你确实需要这个权限，请联系组委会开通。',
+    action: needLogin ? { href: '#/login', label: '去登录' } : { href: '#/', label: '回到总览' },
+  });
+  return el;
+}
+
 function demoBanner() {
   if (!isDemo) return null;
   const el = document.createElement('div');
@@ -114,28 +258,46 @@ function demoBanner() {
 
 async function render() {
   const app = document.getElementById('app');
+  const topbar = document.getElementById('topbar');
+  const user = getState().user ?? null;
+  const path = currentPath();
+
+  // ⚠️ **顶栏先渲染**：渲染失败时页面不至于只剩一块白，
+  //    且 catch 分支写入的 app.innerHTML 不会被顶栏覆盖（写入顺序 = 视觉顺序）。
+  if (topbar) {
+    topbar.innerHTML = navHtml(user, path);
+    const themeBtn = topbar.querySelector?.('[data-action="theme"]');
+    themeBtn?.addEventListener?.('click', toggleTheme);
+  }
   const banner = demoBanner();
-  const found = match(currentPath());
+
+  const found = match(path);
   if (!found) {
     app.innerHTML = '<div class="card">页面不存在</div>';
-    if (banner) app.prepend(banner);
+    if (banner) app.prepend?.(banner);
     return;
   }
   try {
     // ⚠️ 路由参数与 query 必须透传给视图：P3 的视图要靠 params.stageId / params.teamId
     //    决定请求哪个赛段 / 哪支队伍，靠 query.scope / query.editionId 决定口径与届期。
     //    P0 原来只传 ctx —— 视图拿不到参数（前端 router.match 会把 '?query' 剥掉再匹配）。
+    if (!canAccess(path, user)) {
+      app.replaceChildren(renderGuard(user));
+      if (banner) app.prepend?.(banner);
+      return;
+    }
     const el = await found.view({ ...ctx, params: found.params, query: currentQuery() });
     app.replaceChildren(el);
-    if (banner) app.prepend(banner);
+    if (banner) app.prepend?.(banner);
   } catch (e) {
     app.innerHTML = `<div class="card err">${escapeHtml(e.message)}</div>`;
-    if (banner) app.prepend(banner);
+    if (banner) app.prepend?.(banner);
   }
 }
 
 window.addEventListener('hashchange', render);
 subscribe(() => render());
 // ⛔ 先恢复会话再首屏渲染 —— 否则首屏永远显示「未登录」
+restoreTheme();
 await restoreSession();
 render();

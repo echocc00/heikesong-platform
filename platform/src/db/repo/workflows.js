@@ -20,6 +20,31 @@ export function listWorkflowsByEdition(db, editionId) {
     .all(editionId);
 }
 
+/**
+ * 工作流**摘要**列表（P7 新增，给前端做任务清单入口页）。
+ *
+ * ⚠️ 为什么要带任务计数：
+ *    「任务清单」的入口页如果只有一列名字，选手点进去才知道有几件事 ——
+ *    入口页存在的意义就是让人**在点进去之前**就判断要不要点。
+ *    ⇒ LEFT JOIN 出 taskCount / doneCount（未完成 = 总数 - 已完成）。
+ * ⛔ 这是**新函数**，不改 listWorkflowsByEdition —— 那个函数有别的调用方，
+ *    改它的返回形状会波及既有链路。
+ */
+export function listWorkflowSummaries(db, editionId) {
+  return db
+    .prepare(
+      `SELECT w.id, w.name, w.task_package_id AS taskPackageId, w.created_at AS createdAt,
+              COUNT(t.id) AS taskCount,
+              SUM(CASE WHEN t.status = 'done' THEN 1 ELSE 0 END) AS doneCount
+         FROM workflows w
+         LEFT JOIN workflow_tasks t ON t.workflow_id = w.id
+        WHERE w.edition_id = ?
+        GROUP BY w.id, w.name, w.task_package_id, w.created_at
+        ORDER BY w.created_at, w.id`,
+    )
+    .all(editionId);
+}
+
 export function findWorkflowByPackage(db, editionId, taskPackageId) {
   return db
     .prepare('SELECT * FROM workflows WHERE edition_id = ? AND task_package_id = ? ORDER BY created_at, id')

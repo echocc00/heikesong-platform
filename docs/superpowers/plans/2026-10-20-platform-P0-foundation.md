@@ -4152,8 +4152,16 @@ import { appError } from '../../errors.js';
 /**
  * 对外用户形状（**唯一出口**）：字段转驼峰，绝不带 password_hash。
  * 所有要把用户放进 HTTP 响应的地方都必须走它。
+ *
+ * ⚠️ `roles`（P7 新增）：前端要按角色分区导航，必须知道「你是谁」。
+ *    此前 toPublicUser 不带角色 ⇒ /api/me 也拿不到 ⇒ 前端只能做出
+ *    「所有人看到同一个菜单」的水平导航。
+ *    ⇒ 这里加一个可选的 roles 参数（角色**键**列表，来源 listUserRoles）。
+ *    ⚠️ roles 只用于**导航入口分区**，**不构成任何授权依据** ——
+ *    可见性始终由 can() + scopeClause 在服务端裁决（全局约束）。
+ *    ⚠️ 默认空数组：缺省即「没有角色」，不能因为漏传就变成「有全部权限」。
  */
-export function toPublicUser(row) {
+export function toPublicUser(row, roles = []) {
   if (!row) return null;
   return {
     id: row.id,
@@ -4164,6 +4172,7 @@ export function toPublicUser(row) {
     isSuperadmin: row.is_superadmin === 1,
     active: row.active === 1,
     createdAt: row.created_at,
+    roles: Array.isArray(roles) ? roles.filter((r) => typeof r === 'string' && r) : [],
   };
 }
 
@@ -4205,6 +4214,35 @@ export function getCredentialsByPhone(db, phone) {
   return db
     .prepare('SELECT id, password_hash, active FROM users WHERE phone = ?')
     .get(phone) ?? null;
+}
+
+/**
+ * ⛔ 与 getCredentialsByPhone 同款纪律：**唯一会取出 password_hash 的地方**。
+ *    这里按 **userId** 取（改口令场景：已知自己是谁，不必再问手机号）。
+ *    取出的 hash 只用于服务端口令校验，**绝不进任何 HTTP 响应**。
+ *
+ * @param {string} id
+ * @returns {{id: string, password_hash: string, active: number}|null}
+ */
+export function getCredentialsById(db, id) {
+  return db
+    .prepare('SELECT id, password_hash, active FROM users WHERE id = ?')
+    .get(id) ?? null;
+}
+
+/**
+ * 改口令：写入新的 password_hash。
+ * ⛔ **只改口令，不动其它字段**（角色、能力点、停用状态一律不受影响）——
+ *    「改口令」不是「改权限」，这两件事混在一起会让审计失去意义。
+ *
+ * @param {string} userId
+ * @param {string} passwordHash 新哈希（hashPassword 的产物）
+ * @returns {number} 受影响行数（0 = 该用户不存在）
+ */
+export function updatePasswordHash(db, userId, passwordHash) {
+  return db
+    .prepare('UPDATE users SET password_hash = ? WHERE id = ?')
+    .run(passwordHash, userId).changes;
 }
 
 export function listUsers(db, { limit = 100, offset = 0 } = {}) {
@@ -7080,8 +7118,11 @@ import { parseSsePath, openSseStream, sendSseEvent, sendSseComment, reviewEvents
 import { createSession, resolveSession, revokeSession } from './auth/session.js';
 import { can } from './auth/permissions.js';
 import { verifyPassword, hashPassword } from './auth/password.js';
+import { changePassword, logoutAllSessions } from './services/auth.js';
 import { getUserById, getCredentialsByPhone, toPublicUser } from './db/repo/users.js';
-import { getStage, getStageJudge } from './db/repo/stages.js';
+import { listUserRoles } from './db/repo/roles.js';
+import { getStage, getStageJudge, listStageSummaries } from './db/repo/stages.js';
+import { listWorkflowSummaries } from './db/repo/workflows.js';
 import { appError, AppError } from './errors.js';
 import { registerRegistrationRoutes, pickCurrentEdition } from './http/routes/registration.js';
 import { registerTaskPackageRoutes } from './http/routes/taskPackage.js';
@@ -7283,7 +7324,30 @@ export function createApp({ db, rules, webDir }) {
       //    下游 `e instanceof AppError` 分支就再也进不去了。
       throw appError(401, 'UNAUTHENTICATED', '未登录');
     }
-    return { user: toPublicUser(user) };
+    // ⚠️ P7：带上**角色键**（roles）—— 前端要按角色分区导航（用户端 / 管理员端 / 组委会端），
+    //    没有它前端只能做出「所有人看到同一个菜单」的水平导航。
+    //    ⛔ roles 只用于导航入口分区，**不是授权依据**（授权仍由 can() 在服务端裁决）。
+    return { user: toPublicUser(user, listUserRoles(db, user.id)) };
+  });
+
+  // ── P7：赛段时间线 / 工作流列表（给前端做选择器与入口页）────────────
+  // ⚠️ 为什么补这两个只读端点：
+  //    打磨前端时发现「赛段榜没有赛段可选」「任务清单页没有入口」——
+  //    仓储层本来就有 listStages / listWorkflowsByEdition，只是**没有端点**，
+  //    前端只能靠人肉拼 URL ⇒ 页面在生产上是走不通的。
+  router.add('GET', '/api/stages', async ({ query }) => {
+    // 赛段时间线是公开赛事信息（与 /api/registration-criteria 同口径：公开透明）。
+    const editionId = query.editionId ? resolveEditionId(db, query.editionId) : null;
+    return { items: listStageSummaries(db, editionId ? { editionId } : {}) };
+  });
+
+  router.add('GET', '/api/workflows', async ({ user, query }) => {
+    if (!user) throw appError(401, 'UNAUTHENTICATED', '未登录');
+    if (!can(user, 'task_package:read', { scopeType: 'global' }, db)) {
+      throw appError(403, 'FORBIDDEN', '没有查看任务清单的权限');
+    }
+    const editionId = resolveEditionId(db, query.editionId);
+    return { items: listWorkflowSummaries(db, editionId) };
   });
 
   // ── P5 路由 ────────────────────────────────────────────────
@@ -7310,7 +7374,9 @@ export function createApp({ db, rules, webDir }) {
     const maxAge = Math.max(0, Math.floor((new Date(expiresAt).getTime() - Date.now()) / 1000));
     return {
       status: 200,
-      body: { user: toPublicUser(getUserById(db, cred.id)) },
+      // ⚠️ P7：登录响应同样带 roles —— 否则登录后前端拿不到角色，
+      //    导航要等下一次 /api/me 才分区（用户会看到「刚登录还是访客菜单」）。
+      body: { user: toPublicUser(getUserById(db, cred.id), listUserRoles(db, cred.id)) },
       headers: { 'Set-Cookie': sessionCookie(token, maxAge, secureCookies) },
     };
   });
@@ -7320,6 +7386,36 @@ export function createApp({ db, rules, webDir }) {
     return {
       status: 200,
       body: { ok: true },
+      headers: { 'Set-Cookie': sessionCookie('', 0, secureCookies) },
+    };
+  });
+
+  // ── P6 追加：改口令 + 强制下线 ──────────────────────────────────────
+  // ⚠️ 为什么这两个端点到现在才补：
+  //    设计文档 §7.5 早就写了「强制下线 | POST /api/auth/logout-all」，
+  //    但端点清单里从来没有它 —— 规格写了、代码没做。
+  //    而「改口令」的缺口更实在：口令是 seed 一次定死的（scripts/seed.js 幂等），
+  //    没有改口令端点 ⇒ 部署方只能一直用 seed 出来的初始口令。
+  router.add('POST', '/api/auth/password', async ({ user, body, sessionToken }) => {
+    if (!user) throw appError(401, 'UNAUTHENTICATED', '未登录');
+    const r = changePassword({
+      db,
+      userId: user.id,
+      oldPassword: body?.oldPassword,
+      newPassword: body?.newPassword,
+      // 当前这次会话保留 ⇒ 改完不用立刻重新登录；别的设备上的会话全部作废
+      keepSessionToken: sessionToken,
+    });
+    return { status: 200, body: { ok: true, revokedSessions: r.revokedSessions } };
+  });
+
+  router.add('POST', '/api/auth/logout-all', async ({ user }) => {
+    if (!user) throw appError(401, 'UNAUTHENTICATED', '未登录');
+    // 语义是「把他踢下线」⇒ **含当前会话**一起删
+    const r = logoutAllSessions({ db, userId: user.id });
+    return {
+      status: 200,
+      body: { ok: true, revokedSessions: r.revokedSessions },
       headers: { 'Set-Cookie': sessionCookie('', 0, secureCookies) },
     };
   });
@@ -8016,10 +8112,19 @@ export function renderLogin(ctx) {
 `platform/web/app.js`：
 
 ```javascript
-// web/app.js — 前端入口
+// web/app.js — 前端入口（应用外壳 + 路由 + 导航分区）
 // 溯源需求：R-OPS-06（?demo=1 走演示版适配器；正式版走真实 API）
+//
+// ⚠️ 本轮（P7）改动要点：
+//   ① **导航按角色分区**（web/nav.js）：打磨前首页是 6 个平铺链接，**所有人看到的一模一样**
+//      —— 组委会和选手看到同一个菜单。现在分区由 nav.js 的声明式数据驱动。
+//   ② **路由守卫**：未登录点「报名」不再渲染出一个必然 401 的表单，
+//      而是直接给「需要登录」的引导页。
+//   ③ **总览页重做**：从「一行链接」升级为「赛事总览」（指标行 + 分区入口 + 最新榜单）。
 import { route, match, navigate, currentPath } from './router.js';
 import { getState, setState, subscribe } from './store.js';
+import { navHtml, canAccess } from './nav.js';
+import { emptyState, errorState, loadingState, pageHead, statRow } from './ui.js';
 import { renderLogin } from './views/login.js';
 import { renderRegistration } from './views/registration.js';
 import { renderTeam } from './views/team.js';
@@ -8030,6 +8135,7 @@ import { renderCard } from './views/card.js';
 import { renderAudit } from './views/audit.js';
 import { renderFlags } from './views/flags.js';
 import { renderTasks } from './views/tasks.js';
+import { renderTaskIndex } from './views/task-index.js';
 import { escapeHtml } from './escape.js';
 
 // 演示版：?demo=1 时用 localStorage 适配器；正式版走真实 API。
@@ -8066,33 +8172,8 @@ route('/audit/:computationId', (c) => renderAudit(c));
 route('/flags', (c) => renderFlags(c));
 // P5 Task 6：任务清单页（只有「自主领取」一个入口，R-OPS-14 禁止岗位制）
 route('/tasks/:workflowId', (c) => renderTasks(c));
-
-function renderHome() {
-  const el = document.createElement('div');
-  el.className = 'card';
-  const { user } = getState();
-  el.innerHTML = `
-    <h1>赛事平台</h1>
-    ${user ? `<p>已登录：${escapeHtml(user.name)}</p>` : '<p class="muted">未登录</p>'}
-    <nav>
-      <a href="#/login">登录</a>
-      <a href="#/leaderboard">榜单</a>
-      <a href="#/flags">复核队列</a>
-      <a href="#/apply">报名</a>
-      <a href="#/team">我的战队</a>
-      <a href="#/admin/registration">筛选台</a>
-    </nav>
-  `;
-  return el;
-}
-
-function renderLogout() {
-  api.post('/api/auth/logout').finally(() => {
-    setState({ user: null });
-    navigate('/login');
-  });
-  return document.createElement('div');
-}
+// P7：工作流索引页（任务清单的入口 —— 此前 /tasks/:workflowId 没有可达路径）
+route('/tasks', (c) => renderTaskIndex(c));
 
 const ctx = { api, navigate, setState, getState };
 
@@ -8118,6 +8199,165 @@ function currentQuery() {
   return Object.fromEntries(new URLSearchParams(q));
 }
 
+// ── 主题（亮 / 暗）──────────────────────────────────────────────────────
+// ⚠️ 存在 localStorage 的访问在受限环境（隐私模式 / 沙箱）会抛 ⇒ 全部包 try。
+const THEME_KEY = 'heikesong:theme';
+
+function readTheme() {
+  try { return localStorage.getItem(THEME_KEY); } catch { return null; }
+}
+
+function writeTheme(value) {
+  try { localStorage.setItem(THEME_KEY, value); } catch { /* 存不下就算了，不影响功能 */ }
+}
+
+/** 应用主题到 <html data-theme>。传 null 表示跟随系统。 */
+function applyTheme(value) {
+  const el = document.documentElement;
+  if (!el || typeof el.setAttribute !== 'function') return;
+  if (value === 'light' || value === 'dark') el.setAttribute('data-theme', value);
+  else el.removeAttribute?.('data-theme');
+}
+
+function toggleTheme() {
+  const current = readTheme();
+  const next = current === 'light' ? 'dark' : 'light';
+  writeTheme(next);
+  applyTheme(next);
+}
+
+/** 启动时恢复主题（必须在首屏渲染前，否则会闪一下默认主题）。 */
+function restoreTheme() {
+  const saved = readTheme();
+  if (saved === 'light' || saved === 'dark') applyTheme(saved);
+}
+
+/**
+ * 总览页（赛事总览）。
+ *
+ * ⚠️ **同步渲染问候语，异步补数据**：
+ *    首屏必须**立刻**有内容（骨架屏也行），否则弱网下是白屏；
+ *    同时问候语不依赖任何请求 ⇒ 不会因为接口慢而看不到「你是谁」。
+ */
+function renderHome() {
+  const wrap = document.createElement('div');
+  wrap.className = 'home';
+  const { user } = getState();
+  const isAdmin = user?.isSuperadmin === true || (user?.roles ?? []).includes('admin');
+
+  wrap.innerHTML = `
+    ${pageHead({
+      title: '华东区 AI 商业黑客松',
+      sub: '赛事总览：报名、战队、赛段、榜单都在这里。',
+    })}
+    <section class="panel">
+      <div class="panel__body">
+        <p class="home__hello">${user
+          ? `已登录：<strong>${escapeHtml(user.name || '')}</strong>`
+          : '<span class="muted">未登录</span> —— <a href="#/login">登录</a>后可报名、组队、领任务'}</p>
+        <div class="home__kpi" id="home-kpi">${loadingState({ rows: 1, label: '正在汇总赛事数据…' })}</div>
+      </div>
+    </section>
+    <section class="grid grid--3" id="home-entries"></section>
+    <section class="panel" id="home-board-panel">
+      <div class="panel__head"><h2 class="panel__title">滚动总榜 · 前五</h2>
+        <p class="panel__desc">按全赛段累计积分排名</p></div>
+      <div class="panel__body" id="home-board"></div>
+    </section>`;
+
+  // 入口卡：按角色分区，只显示当前身份用得上的入口
+  const entries = [];
+  if (user) {
+    entries.push({ title: '我的赛事', desc: '报名、战队与任务领取', links: [
+      { href: '#/apply', label: '去报名' },
+      { href: '#/team', label: '我的战队' },
+      { href: '#/tasks', label: '任务清单' },
+    ] });
+  } else {
+    entries.push({ title: '开始参赛', desc: '先登录，再报名组队', links: [
+      { href: '#/login', label: '登录' },
+      { href: '#/register', label: '报名入口' },
+    ] });
+  }
+  entries.push({ title: '赛事公开信息', desc: '榜单与段位，无需登录', links: [
+    { href: '#/leaderboard', label: '看榜单' },
+    { href: '#/tier', label: '段位榜' },
+  ] });
+  if (isAdmin) {
+    entries.push({ title: '组委会工作台', desc: '筛选、复核与发榜留痕', links: [
+      { href: '#/admin/registration', label: '报名筛选台' },
+      { href: '#/flags', label: '复核队列' },
+    ] });
+  }
+  const entryBox = wrap.querySelector('#home-entries');
+  if (entryBox) {
+    entryBox.innerHTML = entries.map((e) => `
+      <article class="card home__entry">
+        <h3>${escapeHtml(e.title)}</h3>
+        <p class="muted small">${escapeHtml(e.desc)}</p>
+        <div class="btn-group">
+          ${e.links.map((l) => `<a class="btn btn--ghost btn--sm" href="${escapeHtml(l.href)}">${escapeHtml(l.label)}</a>`).join('')}
+        </div>
+      </article>`).join('');
+  }
+
+  // 异步补 KPI + 榜单（失败不阻塞首屏）
+  (async () => {
+    const kpiBox = wrap.querySelector('#home-kpi');
+    const boardBox = wrap.querySelector('#home-board');
+    const jobs = [];
+    if (user) jobs.push(api.get('/api/teams').then((r) => (r.items ?? []).length).catch(() => null));
+    jobs.push(api.get('/api/leaderboard/rolling').then((r) => (r.rows ?? []).length).catch(() => null));
+    const [teamCount, boardCount] = await Promise.all(jobs);
+    if (kpiBox) {
+      kpiBox.innerHTML = statRow([
+        { label: '参赛队伍', value: teamCount === null ? '—' : teamCount, tone: 'brand' },
+        { label: '在榜队伍', value: boardCount === null ? '—' : boardCount, tone: 'success' },
+        { label: '我的身份', value: user ? (isAdmin ? '组委会' : '参赛者') : '访客' },
+      ]);
+    }
+    if (boardBox) {
+      try {
+        const data = await api.get('/api/leaderboard/rolling');
+        const rows = (data.rows ?? []).slice(0, 5);
+        boardBox.innerHTML = rows.length
+          ? `<ul class="list-divided">${rows.map((r) => `<li class="row row--between">
+              <span>${escapeHtml(r.rank)}. ${escapeHtml(r.teamName || r.teamId)}</span>
+              <span class="num">${escapeHtml(r.total)} 分</span>
+            </li>`).join('')}</ul>`
+          : emptyState({ title: '榜单还没有数据', hint: '等组委会完成首个赛段的计算与发榜。' });
+      } catch (e) {
+        boardBox.innerHTML = errorState({ message: e.message });
+      }
+    }
+  })().catch(() => { /* 静默：首屏问候语已经在了 */ });
+
+  return wrap;
+}
+
+function renderLogout() {
+  api.post('/api/auth/logout').finally(() => {
+    setState({ user: null });
+    navigate('/login');
+  });
+  return document.createElement('div');
+}
+
+/** 路由守卫兜底页：未登录 / 无权限时给出**可执行的下一步**，不是一句报错。 */
+function renderGuard(user) {
+  const el = document.createElement('div');
+  el.className = 'guard';
+  const needLogin = !user;
+  el.innerHTML = emptyState({
+    title: needLogin ? '需要登录后才能访问' : '没有访问这个页面的权限',
+    hint: needLogin
+      ? '登录后就能报名、组队、领任务。登录使用报名时填写的手机号。'
+      : '这个页面属于组委会工作台。如果你确实需要这个权限，请联系组委会开通。',
+    action: needLogin ? { href: '#/login', label: '去登录' } : { href: '#/', label: '回到总览' },
+  });
+  return el;
+}
+
 function demoBanner() {
   if (!isDemo) return null;
   const el = document.createElement('div');
@@ -8132,29 +8372,47 @@ function demoBanner() {
 
 async function render() {
   const app = document.getElementById('app');
+  const topbar = document.getElementById('topbar');
+  const user = getState().user ?? null;
+  const path = currentPath();
+
+  // ⚠️ **顶栏先渲染**：渲染失败时页面不至于只剩一块白，
+  //    且 catch 分支写入的 app.innerHTML 不会被顶栏覆盖（写入顺序 = 视觉顺序）。
+  if (topbar) {
+    topbar.innerHTML = navHtml(user, path);
+    const themeBtn = topbar.querySelector?.('[data-action="theme"]');
+    themeBtn?.addEventListener?.('click', toggleTheme);
+  }
   const banner = demoBanner();
-  const found = match(currentPath());
+
+  const found = match(path);
   if (!found) {
     app.innerHTML = '<div class="card">页面不存在</div>';
-    if (banner) app.prepend(banner);
+    if (banner) app.prepend?.(banner);
     return;
   }
   try {
     // ⚠️ 路由参数与 query 必须透传给视图：P3 的视图要靠 params.stageId / params.teamId
     //    决定请求哪个赛段 / 哪支队伍，靠 query.scope / query.editionId 决定口径与届期。
     //    P0 原来只传 ctx —— 视图拿不到参数（前端 router.match 会把 '?query' 剥掉再匹配）。
+    if (!canAccess(path, user)) {
+      app.replaceChildren(renderGuard(user));
+      if (banner) app.prepend?.(banner);
+      return;
+    }
     const el = await found.view({ ...ctx, params: found.params, query: currentQuery() });
     app.replaceChildren(el);
-    if (banner) app.prepend(banner);
+    if (banner) app.prepend?.(banner);
   } catch (e) {
     app.innerHTML = `<div class="card err">${escapeHtml(e.message)}</div>`;
-    if (banner) app.prepend(banner);
+    if (banner) app.prepend?.(banner);
   }
 }
 
 window.addEventListener('hashchange', render);
 subscribe(() => render());
 // ⛔ 先恢复会话再首屏渲染 —— 否则首屏永远显示「未登录」
+restoreTheme();
 await restoreSession();
 render();
 ```
@@ -8162,42 +8420,655 @@ render();
 `platform/web/styles.css`：
 
 ```css
-/* web/styles.css — 基础样式 */
+/* web/styles.css — 赛事平台设计系统
+ * 依据：本轮（P7）「现有页面打磨到生产级」+ docs/three-port-alignment.md
+ *
+ * ⚠️ 打磨前这个文件只有 36 行 / 8 个颜色变量 / 一条 `.card` 规则，
+ *    11 个视图共用它 ⇒ 11 个页面长得一模一样、没有任何状态样式。
+ *    现在补齐三层：
+ *      ① **设计 token**：颜色 / 间距 / 字号 / 圆角 / 阴影 / 层级 —— 全部走变量，
+ *         换主题只换变量，不改任何组件规则；
+ *      ② **组件层**：按钮 / 徽章 / 表格 / 指标 / 条形 / 标签页 / 表单 / 提示 / 骨架屏；
+ *      ③ **状态层**：加载 / 空 / 错 三件套 + 响应式断点 + 焦点可见 + 无障碍。
+ *
+ * ⛔ 零依赖、零构建：纯 CSS，无预处理器、无 @import。
+ */
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * ① 设计 token
+ * ───────────────────────────────────────────────────────────────────────── */
 :root {
-  --bg: #0f1115;
-  --card: #171a21;
-  --fg: #e8eaed;
-  --muted: #9aa0a6;
-  --accent: #4c8dff;
-  --err: #ff6b6b;
-  --line: #262a33;
+  /* 色板 · 暗色为默认（品牌基调） */
+  --bg: #0b0e14;
+  --bg-subtle: #10141c;
+  --surface: #151a24;
+  --surface-raised: #1b2130;
+  --surface-sunken: #0e1219;
+  --overlay: rgba(4, 6, 10, 0.72);
+
+  --fg: #e6e9ef;
+  --fg-strong: #f7f9fc;
+  --fg-muted: #98a2b3;
+  --fg-subtle: #6b7688;
+
+  --border: #232a38;
+  --border-strong: #313a4d;
+
+  --brand: #4c8dff;
+  --brand-strong: #75a6ff;
+  --brand-soft: rgba(76, 141, 255, 0.14);
+  --on-brand: #ffffff;
+
+  --success: #35c88a;
+  --success-soft: rgba(53, 200, 138, 0.14);
+  --warn: #f0b429;
+  --warn-soft: rgba(240, 180, 41, 0.14);
+  --danger: #f2555a;
+  --danger-soft: rgba(242, 85, 90, 0.14);
+  --info: #38bdf8;
+  --info-soft: rgba(56, 189, 248, 0.14);
+
+  /* 间距（4px 基数） */
+  --sp-1: 4px;  --sp-2: 8px;   --sp-3: 12px; --sp-4: 16px;
+  --sp-5: 20px; --sp-6: 24px;  --sp-8: 32px; --sp-10: 40px; --sp-12: 48px;
+
+  /* 圆角 */
+  --r-sm: 6px; --r-md: 10px; --r-lg: 14px; --r-xl: 20px; --r-full: 999px;
+
+  /* 字号 / 行高 */
+  --fs-xs: 12px; --fs-sm: 13px; --fs-base: 14px; --fs-md: 15px;
+  --fs-lg: 17px; --fs-xl: 20px; --fs-2xl: 26px; --fs-3xl: 32px;
+
+  /* 阴影 */
+  --sh-1: 0 1px 2px rgba(0, 0, 0, 0.32);
+  --sh-2: 0 4px 16px rgba(0, 0, 0, 0.36);
+  --sh-3: 0 12px 40px rgba(0, 0, 0, 0.48);
+
+  /* 层级 */
+  --z-sticky: 100; --z-topbar: 200; --z-toast: 1000;
+
+  /* 布局 */
+  --maxw: 1240px;
+  --topbar-h: 60px;
+
+  /* 字体 */
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+          "Hiragino Sans GB", "Microsoft YaHei", "Source Han Sans SC", sans-serif;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+          "Liberation Mono", monospace;
 }
+
+/* 亮色主题：显式指定 [data-theme="light"]，或在系统偏好为亮色且未显式指定时跟随 */
+:root[data-theme="light"] {
+  --bg: #f5f7fa;
+  --bg-subtle: #eef1f6;
+  --surface: #ffffff;
+  --surface-raised: #ffffff;
+  --surface-sunken: #f0f3f8;
+  --overlay: rgba(24, 30, 42, 0.45);
+
+  --fg: #1c2430;
+  --fg-strong: #0d1218;
+  --fg-muted: #5b6675;
+  --fg-subtle: #7d8796;
+
+  --border: #dfe4ec;
+  --border-strong: #c4ccd9;
+
+  --brand: #2563eb;
+  --brand-strong: #1d4ed8;
+  --brand-soft: rgba(37, 99, 235, 0.10);
+  --on-brand: #ffffff;
+
+  --success: #0f9d58;
+  --success-soft: rgba(15, 157, 88, 0.12);
+  --warn: #b7791f;
+  --warn-soft: rgba(183, 121, 31, 0.14);
+  --danger: #d93036;
+  --danger-soft: rgba(217, 48, 54, 0.12);
+  --info: #0284c7;
+  --info-soft: rgba(2, 132, 199, 0.12);
+
+  --sh-1: 0 1px 2px rgba(16, 24, 40, 0.06);
+  --sh-2: 0 4px 14px rgba(16, 24, 40, 0.08);
+  --sh-3: 0 12px 32px rgba(16, 24, 40, 0.12);
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --bg: #f5f7fa;
+    --bg-subtle: #eef1f6;
+    --surface: #ffffff;
+    --surface-raised: #ffffff;
+    --surface-sunken: #f0f3f8;
+    --overlay: rgba(24, 30, 42, 0.45);
+
+    --fg: #1c2430;
+    --fg-strong: #0d1218;
+    --fg-muted: #5b6675;
+    --fg-subtle: #7d8796;
+
+    --border: #dfe4ec;
+    --border-strong: #c4ccd9;
+
+    --brand: #2563eb;
+    --brand-strong: #1d4ed8;
+    --brand-soft: rgba(37, 99, 235, 0.10);
+    --on-brand: #ffffff;
+
+    --success: #0f9d58;
+    --success-soft: rgba(15, 157, 88, 0.12);
+    --warn: #b7791f;
+    --warn-soft: rgba(183, 121, 31, 0.14);
+    --danger: #d93036;
+    --danger-soft: rgba(217, 48, 54, 0.12);
+    --info: #0284c7;
+    --info-soft: rgba(2, 132, 199, 0.12);
+
+    --sh-1: 0 1px 2px rgba(16, 24, 40, 0.06);
+    --sh-2: 0 4px 14px rgba(16, 24, 40, 0.08);
+    --sh-3: 0 12px 32px rgba(16, 24, 40, 0.12);
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * ② 基线
+ * ───────────────────────────────────────────────────────────────────────── */
 * { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
 body {
-  margin: 0; background: var(--bg); color: var(--fg);
-  font: 15px/1.6 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: var(--fs-base)/1.65 var(--font);
+  -webkit-font-smoothing: antialiased;
 }
-#app { max-width: 960px; margin: 0 auto; padding: 32px 20px; }
+
+h1, h2, h3, h4 { margin: 0; color: var(--fg-strong); font-weight: 650; line-height: 1.3; }
+h1 { font-size: var(--fs-2xl); }
+h2 { font-size: var(--fs-xl); }
+h3 { font-size: var(--fs-lg); }
+p { margin: 0 0 var(--sp-3); }
+ul, ol { margin: 0 0 var(--sp-3); padding-left: var(--sp-5); }
+li { margin-bottom: var(--sp-1); }
+a { color: var(--brand); text-decoration: none; }
+a:hover { text-decoration: underline; }
+code, .mono { font-family: var(--mono); font-size: 0.92em; }
+pre {
+  margin: 0 0 var(--sp-3);
+  padding: var(--sp-3);
+  background: var(--surface-sunken);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  overflow: auto;
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+}
+
+.muted { color: var(--fg-muted); }
+.small { font-size: var(--fs-sm); }
+.num { font-variant-numeric: tabular-nums; }
+.err { color: var(--danger); }
+.divider { height: 1px; margin: var(--sp-5) 0; background: var(--border); border: 0; }
+
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
+
+/* 键盘可达性：焦点环必须可见（打磨前完全没有） */
+:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+  border-radius: var(--r-sm);
+}
+
+.skip-link {
+  position: absolute; left: -9999px; top: 0; z-index: var(--z-toast);
+  padding: var(--sp-2) var(--sp-4);
+  background: var(--brand); color: var(--on-brand); border-radius: 0 0 var(--r-md) 0;
+}
+.skip-link:focus { left: 0; text-decoration: none; }
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * ③ 布局
+ * ───────────────────────────────────────────────────────────────────────── */
+#app {
+  max-width: var(--maxw);
+  margin: 0 auto;
+  padding: var(--sp-6) var(--sp-5) var(--sp-12);
+}
+
+.stack > * + * { margin-top: var(--sp-4); }
+.row { display: flex; gap: var(--sp-3); align-items: center; flex-wrap: wrap; }
+.row--between { justify-content: space-between; }
+
+.grid { display: grid; gap: var(--sp-4); }
+.grid--2 { grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+.grid--3 { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+.grid--4 { grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
+
+.page__head {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: var(--sp-4); flex-wrap: wrap; margin-bottom: var(--sp-5);
+}
+.page__titles { min-width: 0; }
+.page__title { font-size: var(--fs-2xl); }
+.page__sub { margin: var(--sp-1) 0 0; color: var(--fg-muted); font-size: var(--fs-sm); }
+.page__actions { display: flex; gap: var(--sp-2); flex-wrap: wrap; }
+
+.section-title {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: var(--sp-3); margin: var(--sp-6) 0 var(--sp-3);
+}
+.section-title h2 { font-size: var(--fs-lg); }
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * ④ 表面
+ * ───────────────────────────────────────────────────────────────────────── */
 .card {
-  background: var(--card); border: 1px solid var(--line);
-  border-radius: 12px; padding: 24px; margin-bottom: 16px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  padding: var(--sp-5);
+  margin-bottom: var(--sp-4);
 }
-h1 { font-size: 22px; margin: 0 0 12px; }
-.muted { color: var(--muted); }
-.err { color: var(--err); }
-label { display: block; margin: 12px 0; }
-input {
-  display: block; width: 100%; margin-top: 6px; padding: 10px 12px;
-  background: #0e1016; color: var(--fg);
-  border: 1px solid var(--line); border-radius: 8px; font-size: 15px;
+.card--flush { padding: 0; overflow: hidden; }
+
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  overflow: hidden;
 }
-button {
-  margin-top: 16px; padding: 10px 18px; border: 0; border-radius: 8px;
-  background: var(--accent); color: #fff; font-size: 15px; cursor: pointer;
+.panel__head {
+  padding: var(--sp-4) var(--sp-5);
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-sunken);
 }
-button:hover { filter: brightness(1.08); }
-nav a { color: var(--accent); margin-right: 16px; }
-.boot { color: var(--muted); padding: 40px; text-align: center; }
+.panel__title { font-size: var(--fs-lg); }
+.panel__desc { margin: var(--sp-1) 0 0; color: var(--fg-muted); font-size: var(--fs-sm); }
+.panel__body { padding: var(--sp-5); }
+.panel--warn { border-color: var(--warn); }
+.panel--danger { border-color: var(--danger); }
+/* ⚠️ 六种色调要**齐全**：视图里 panel({tone}) 用到了 neutral/brand/success/info/warn/danger
+    六种，只定义两种 ⇒ 四种是空操作（看起来「没生效」）。 */
+.panel--neutral { border-color: var(--border); }
+.panel--brand { border-color: var(--brand); }
+.panel--success { border-color: var(--success); }
+.panel--info { border-color: var(--info); }
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * ⑤ 顶栏（导航分区）
+ * ───────────────────────────────────────────────────────────────────────── */
+.topbar {
+  position: sticky; top: 0; z-index: var(--z-topbar);
+  background: color-mix(in srgb, var(--bg) 88%, transparent);
+  backdrop-filter: saturate(1.4) blur(10px);
+  border-bottom: 1px solid var(--border);
+}
+.topbar__inner {
+  max-width: var(--maxw);
+  margin: 0 auto;
+  padding: 0 var(--sp-5);
+  min-height: var(--topbar-h);
+  display: flex; align-items: center; gap: var(--sp-5);
+}
+.topbar__brand { display: flex; align-items: center; gap: var(--sp-3); color: var(--fg-strong); }
+.topbar__brand:hover { text-decoration: none; }
+.topbar__logo {
+  display: grid; place-items: center;
+  width: 30px; height: 30px; border-radius: var(--r-md);
+  background: var(--brand); color: var(--on-brand); font-size: var(--fs-md);
+}
+.topbar__names { display: flex; flex-direction: column; line-height: 1.25; }
+.topbar__title { font-size: var(--fs-md); }
+.topbar__sub { font-size: var(--fs-xs); color: var(--fg-muted); }
+
+.topbar__nav { display: flex; align-items: center; gap: var(--sp-4); flex: 1; overflow-x: auto; }
+.nav-group { display: flex; align-items: center; gap: var(--sp-2); }
+.nav-group__label {
+  font-size: var(--fs-xs); color: var(--fg-subtle);
+  padding-right: var(--sp-2); border-right: 1px solid var(--border); white-space: nowrap;
+}
+.nav-group__links { display: flex; gap: var(--sp-1); }
+.nav-link {
+  padding: var(--sp-1) var(--sp-3);
+  border-radius: var(--r-full);
+  color: var(--fg-muted); font-size: var(--fs-sm); white-space: nowrap;
+}
+.nav-link:hover { background: var(--surface-raised); color: var(--fg); text-decoration: none; }
+.nav-link.is-active { background: var(--brand-soft); color: var(--brand-strong); font-weight: 600; }
+
+.topbar__user { display: flex; align-items: center; gap: var(--sp-3); margin-left: auto; }
+.user-chip { display: flex; align-items: center; gap: var(--sp-2); }
+.user-chip__avatar {
+  display: grid; place-items: center; width: 30px; height: 30px;
+  border-radius: var(--r-full); background: var(--surface-raised);
+  border: 1px solid var(--border); font-size: var(--fs-sm); color: var(--fg-strong);
+}
+.user-chip__meta { display: flex; flex-direction: column; line-height: 1.25; }
+.user-chip__name { font-size: var(--fs-sm); color: var(--fg-strong); }
+.user-chip__role { font-size: var(--fs-xs); color: var(--fg-muted); }
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * ⑥ 按钮
+ * ───────────────────────────────────────────────────────────────────────── */
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-4);
+  border: 1px solid transparent; border-radius: var(--r-md);
+  background: var(--surface-raised); color: var(--fg);
+  font: inherit; font-size: var(--fs-base); cursor: pointer;
+  transition: filter .15s ease, background-color .15s ease;
+}
+.btn:hover { filter: brightness(1.08); text-decoration: none; }
+.btn:disabled { opacity: .45; cursor: not-allowed; filter: none; }
+.btn--primary { background: var(--brand); color: var(--on-brand); }
+.btn--ghost { background: transparent; border-color: var(--border-strong); color: var(--fg); }
+.btn--danger { background: var(--danger); color: #fff; }
+.btn--sm { padding: var(--sp-1) var(--sp-3); font-size: var(--fs-sm); }
+.btn--block { width: 100%; }
+.btn.is-static { cursor: default; color: var(--fg-muted); }
+.btn.is-static:hover { filter: none; }
+.btn-group { display: inline-flex; gap: var(--sp-2); flex-wrap: wrap; }
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * ⑦ 徽章 / 状态
+ * ───────────────────────────────────────────────────────────────────────── */
+.badge {
+  display: inline-flex; align-items: center; gap: var(--sp-1);
+  padding: 1px var(--sp-2);
+  border-radius: var(--r-full);
+  background: var(--surface-raised); border: 1px solid var(--border);
+  color: var(--fg-muted); font-size: var(--fs-xs); font-weight: 600; white-space: nowrap;
+}
+.badge--brand { background: var(--brand-soft); border-color: transparent; color: var(--brand-strong); }
+.badge--success { background: var(--success-soft); border-color: transparent; color: var(--success); }
+.badge--warn { background: var(--warn-soft); border-color: transparent; color: var(--warn); }
+.badge--danger { background: var(--danger-soft); border-color: transparent; color: var(--danger); }
+.badge--info { background: var(--info-soft); border-color: transparent; color: var(--info); }
+
+.rank-badge {
+  display: inline-grid; place-items: center;
+  min-width: 26px; height: 26px; padding: 0 var(--sp-2);
+  border-radius: var(--r-sm); font-variant-numeric: tabular-nums;
+  font-weight: 700; font-size: var(--fs-sm);
+  background: var(--surface-raised); color: var(--fg-muted);
+}
+.rank-badge--gold { background: #f5c451; color: #3a2a05; }
+.rank-badge--silver { background: #c9d1dc; color: #2b3340; }
+.rank-badge--bronze { background: #d19a63; color: #3a2410; }
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * ⑧ 状态三件套（加载 / 空 / 错）
+ * ───────────────────────────────────────────────────────────────────────── */
+.state {
+  display: flex; flex-direction: column; align-items: center; gap: var(--sp-2);
+  padding: var(--sp-10) var(--sp-5);
+  border: 1px dashed var(--border-strong); border-radius: var(--r-lg);
+  background: var(--surface-sunken); text-align: center;
+}
+.state__icon { font-size: var(--fs-2xl); color: var(--fg-subtle); line-height: 1; }
+.state__title { margin: 0; font-size: var(--fs-md); color: var(--fg-strong); }
+.state__hint { margin: 0; color: var(--fg-muted); font-size: var(--fs-sm); max-width: 46ch; }
+.state--error { border-style: solid; border-color: var(--danger); background: var(--danger-soft); }
+.state--error .state__icon { color: var(--danger); }
+.state--error .state__title { color: var(--danger); }
+.state--empty .state__icon { color: var(--fg-subtle); }
+/* ⚠️ 加载态要**居中**且不画虚线框（那是在说「这里没有内容」，与「正在加载」语义相反） */
+.state--loading { border-style: solid; border-color: var(--border); background: var(--surface); }
+
+.spinner {
+  width: 22px; height: 22px; border-radius: 50%;
+  border: 2px solid var(--border-strong); border-top-color: var(--brand);
+  animation: spin .8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .spinner { animation: none; }
+  * { transition-duration: .01ms !important; }
+}
+
+.skeleton { display: flex; flex-direction: column; gap: var(--sp-2); width: 100%; max-width: 460px; margin-top: var(--sp-3); }
+.skeleton__line {
+  height: 12px; border-radius: var(--r-sm);
+  background: linear-gradient(90deg, var(--surface-raised) 25%, var(--border) 37%, var(--surface-raised) 63%);
+  background-size: 400% 100%;
+  animation: shimmer 1.4s ease infinite;
+}
+.skeleton__line:nth-child(2) { width: 82%; }
+.skeleton__line:nth-child(3) { width: 64%; }
+@keyframes shimmer { 0% { background-position: 100% 0; } 100% { background-position: 0 0; } }
+@media (prefers-reduced-motion: reduce) { .skeleton__line { animation: none; } }
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * ⑨ 提示条
+ * ───────────────────────────────────────────────────────────────────────── */
+.notice {
+  padding: var(--sp-3) var(--sp-4);
+  border: 1px solid var(--border); border-left-width: 3px;
+  border-radius: var(--r-md); background: var(--surface-sunken);
+  margin-bottom: var(--sp-4);
+}
+.notice__title { margin: 0 0 var(--sp-1); font-weight: 650; color: var(--fg-strong); }
+.notice__text { margin: 0; font-size: var(--fs-sm); color: var(--fg-muted); }
+.notice__list { margin: var(--sp-1) 0 0; padding-left: var(--sp-5); font-size: var(--fs-sm); color: var(--fg-muted); }
+.notice--warn { border-color: var(--warn); border-left-color: var(--warn); background: var(--warn-soft); }
+.notice--danger { border-color: var(--danger); border-left-color: var(--danger); background: var(--danger-soft); }
+.notice--success { border-color: var(--success); border-left-color: var(--success); background: var(--success-soft); }
+.notice--info { border-color: var(--info); border-left-color: var(--info); background: var(--info-soft); }
+.notice--brand { border-color: var(--brand); border-left-color: var(--brand); background: var(--brand-soft); }
+
+.demo-banner {
+  border-color: var(--brand);
+  background: var(--brand-soft);
+  color: var(--fg-muted);
+  font-size: var(--fs-sm);
+}
+.demo-banner strong { color: var(--fg-strong); }
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * ⑩ 表格
+ * ───────────────────────────────────────────────────────────────────────── */
+.table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--border); border-radius: var(--r-lg);
+  background: var(--surface);
+}
+.table { width: 100%; border-collapse: collapse; font-size: var(--fs-sm); }
+.table th, .table td {
+  padding: var(--sp-3) var(--sp-4);
+  text-align: left; border-bottom: 1px solid var(--border); vertical-align: top;
+}
+.table th {
+  position: sticky; top: 0; z-index: 1;
+  background: var(--surface-sunken); color: var(--fg-muted);
+  font-weight: 650; font-size: var(--fs-xs); letter-spacing: .02em;
+  white-space: nowrap;
+}
+.table tbody tr:last-child td { border-bottom: 0; }
+.table tbody tr:hover { background: var(--bg-subtle); }
+.table td.td-num, .table th.td-num { text-align: right; font-variant-numeric: tabular-nums; }
+.table__empty td { text-align: center; padding: var(--sp-8); }
+.table--compact th, .table--compact td { padding: var(--sp-2) var(--sp-3); }
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * ⑪ 指标 / 键值 / 条形
+ * ───────────────────────────────────────────────────────────────────────── */
+.stat-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: var(--sp-3); }
+.stat {
+  padding: var(--sp-4); border: 1px solid var(--border); border-radius: var(--r-md);
+  background: var(--surface);
+}
+.stat__value { margin: 0; font-size: var(--fs-2xl); font-weight: 700; color: var(--fg-strong); font-variant-numeric: tabular-nums; line-height: 1.15; }
+.stat__label { margin: var(--sp-1) 0 0; color: var(--fg-muted); font-size: var(--fs-sm); }
+.stat__hint { margin: var(--sp-1) 0 0; color: var(--fg-subtle); font-size: var(--fs-xs); }
+.stat--brand .stat__value { color: var(--brand-strong); }
+.stat--success .stat__value { color: var(--success); }
+.stat--warn .stat__value { color: var(--warn); }
+.stat--danger .stat__value { color: var(--danger); }
+
+.kv { margin: 0; display: grid; gap: var(--sp-2); }
+.kv__row { display: grid; grid-template-columns: minmax(96px, 34%) 1fr; gap: var(--sp-3); align-items: baseline; }
+.kv__key { color: var(--fg-muted); font-size: var(--fs-sm); }
+.kv__val { margin: 0; font-size: var(--fs-sm); color: var(--fg-strong); }
+
+.bar { display: grid; grid-template-columns: minmax(96px, 26%) 1fr auto; gap: var(--sp-3); align-items: center; margin-bottom: var(--sp-2); }
+.bar__label { font-size: var(--fs-sm); color: var(--fg-muted); }
+.bar__track { height: 8px; border-radius: var(--r-full); background: var(--surface-sunken); overflow: hidden; }
+.bar__fill { display: block; height: 100%; border-radius: var(--r-full); background: var(--brand); }
+.bar__fill--success { background: var(--success); }
+.bar__fill--warn { background: var(--warn); }
+.bar__fill--danger { background: var(--danger); }
+.bar__fill--info { background: var(--info); }
+.bar__value { font-size: var(--fs-sm); color: var(--fg-strong); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.bar__note { color: var(--fg-subtle); margin-left: var(--sp-1); }
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * ⑫ 标签页 / 列表 / 里程碑
+ * ───────────────────────────────────────────────────────────────────────── */
+.tabs {
+  display: flex; gap: var(--sp-1); flex-wrap: wrap;
+  border-bottom: 1px solid var(--border); margin-bottom: var(--sp-4);
+}
+.tab {
+  padding: var(--sp-2) var(--sp-4); border-bottom: 2px solid transparent;
+  color: var(--fg-muted); font-size: var(--fs-sm);
+}
+.tab:hover { color: var(--fg); text-decoration: none; }
+.tab.is-active { color: var(--brand-strong); border-bottom-color: var(--brand); font-weight: 600; }
+
+.list-plain { list-style: none; padding: 0; }
+.list-divided > li { padding: var(--sp-2) 0; border-bottom: 1px solid var(--border); }
+.list-divided > li:last-child { border-bottom: 0; }
+
+.milestones { list-style: none; padding: 0; margin: 0; }
+.milestones li { display: flex; align-items: flex-start; gap: var(--sp-2); margin-bottom: var(--sp-2); font-size: var(--fs-sm); }
+.milestones .mark { color: var(--fg-subtle); }
+.milestones .done { color: var(--fg-strong); }
+.milestones .done .mark { color: var(--success); }
+.milestones .todo { color: var(--fg-muted); }
+.milestones .signed { margin-left: auto; color: var(--success); font-size: var(--fs-xs); }
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * ⑬ 表单
+ * ───────────────────────────────────────────────────────────────────────── */
+.field { display: block; margin-bottom: var(--sp-4); }
+.field__label { display: block; margin-bottom: var(--sp-1); font-size: var(--fs-sm); color: var(--fg-strong); font-weight: 600; }
+.field__hint { margin: var(--sp-1) 0 0; font-size: var(--fs-xs); color: var(--fg-muted); }
+.field__error { margin: var(--sp-1) 0 0; font-size: var(--fs-xs); color: var(--danger); }
+.field--required .field__label::after { content: " *"; color: var(--danger); }
+
+.input, .select, .textarea {
+  display: block; width: 100%;
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--surface-sunken); color: var(--fg);
+  border: 1px solid var(--border-strong); border-radius: var(--r-md);
+  font: inherit; font-size: var(--fs-base);
+}
+.input:focus, .select:focus, .textarea:focus { border-color: var(--brand); outline: none; box-shadow: 0 0 0 3px var(--brand-soft); }
+.textarea { min-height: 96px; resize: vertical; }
+.select { appearance: none; padding-right: var(--sp-8); background-image: none; }
+label { display: block; margin: var(--sp-3) 0; font-size: var(--fs-sm); color: var(--fg-muted); }
+label > input, label > select, label > textarea { margin-top: var(--sp-1); }
+.checkbox, .radio { display: inline-flex; align-items: center; gap: var(--sp-2); margin: 0; color: var(--fg); }
+.checkbox input, .radio input { margin: 0; width: auto; }
+
+.radio-group { display: flex; gap: var(--sp-2); flex-wrap: wrap; }
+.radio-group .radio {
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--border-strong); border-radius: var(--r-md);
+  background: var(--surface-sunken); cursor: pointer; font-size: var(--fs-sm);
+}
+.radio-group .radio:has(input:checked) { border-color: var(--brand); background: var(--brand-soft); color: var(--fg-strong); }
+.radio-group input { width: auto; margin: 0; }
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * ⑭ 轻提示 / 其他
+ * ───────────────────────────────────────────────────────────────────────── */
+.toast {
+  position: fixed; left: 50%; bottom: var(--sp-6); transform: translateX(-50%);
+  z-index: var(--z-toast);
+  padding: var(--sp-3) var(--sp-5);
+  border-radius: var(--r-full); box-shadow: var(--sh-3);
+  background: var(--surface-raised); border: 1px solid var(--border-strong);
+  font-size: var(--fs-sm); color: var(--fg-strong);
+}
+.toast--success { border-color: var(--success); }
+.toast--danger { border-color: var(--danger); }
+.toast--warn { border-color: var(--warn); }
+
+.boot { color: var(--fg-muted); padding: var(--sp-10); text-align: center; }
+
+/* ── 页面根类与视图区块 ─────────────────────────────────────────────
+ * ⛔ 这些类名是**视图的挂载点**（`wrap.className = '…'`）——
+ *    视图里写出来的 class 必须在样式表里**有对应规则**，
+ *    否则「class 拼错 / 没定义」在页面上完全看不出来（只表现为「样式没生效」）。
+ *    2026-10-22 实测：11 个视图用到的 class 里有 15 个在设计系统里没有对应规则
+ *    （page__titles / state--loading / panel--brand 等）⇒ 本段补齐。
+ * ─────────────────────────────────────────────────────────────────── */
+.home__hello { margin: 0 0 var(--sp-4); font-size: var(--fs-lg); }
+.home__kpi { margin: 0; }
+.home__entry { display: flex; flex-direction: column; gap: var(--sp-2); height: 100%; margin-bottom: 0; }
+.home__entry h3 { margin: 0; }
+.home__entry .btn-group { margin-top: auto; }
+
+.card-view, .leaderboard-view, .tier-view { display: block; }
+.card-view > h2, .leaderboard-view > h2, .tier-view > h2 { margin-bottom: var(--sp-4); }
+
+/* 登录页与守卫页：单列居中，比内容页窄（它们是「一次性的动作页」） */
+.login, .guard { max-width: 460px; margin: var(--sp-10) auto; text-align: center; }
+.login label, .guard label { text-align: left; }
+.login .btn--primary, .guard .btn--primary { width: 100%; }
+
+/* 视图根：给「分段的语义色」留出呼吸位 */
+.apply, .team, .tasks, .flags-queue, .audit-trace, .admin-registration, .task-index, .home { display: block; }
+
+.team-card { border: 1px solid var(--border); border-radius: var(--r-lg); padding: var(--sp-4); background: var(--surface); }
+.biz-card { margin: 0; }
+.warn-box { border-left: 3px solid var(--warn); background: var(--warn-soft); border-color: var(--warn); }
+.flag-row { margin-bottom: var(--sp-4); }
+.trace-actions { margin-top: var(--sp-5); display: flex; flex-direction: column; gap: var(--sp-3); }
+.team-trace { border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--sp-3) var(--sp-4); margin-bottom: var(--sp-2); background: var(--surface-sunken); }
+.team-trace summary { cursor: pointer; font-weight: 600; }
+.task-list { list-style: none; padding: 0; margin: 0; }
+.task { display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap; padding: var(--sp-3) 0; border-bottom: 1px solid var(--border); }
+.task:last-child { border-bottom: 0; }
+.task-title { font-weight: 600; color: var(--fg-strong); }
+.task-meta { color: var(--fg-muted); font-size: var(--fs-xs); }
+.task .input { width: auto; min-width: 180px; }
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * ⑮ 响应式
+ * ───────────────────────────────────────────────────────────────────────── */
+@media (max-width: 900px) {
+  .topbar__inner { flex-wrap: wrap; gap: var(--sp-3); padding: var(--sp-2) var(--sp-4); }
+  .topbar__nav { order: 3; width: 100%; padding-bottom: var(--sp-2); }
+  .topbar__user { margin-left: auto; }
+  #app { padding: var(--sp-4) var(--sp-4) var(--sp-10); }
+  .kv__row { grid-template-columns: 1fr; gap: var(--sp-1); }
+  .bar { grid-template-columns: 1fr auto; }
+  .bar__track { grid-column: 1 / -1; }
+}
+
+@media (max-width: 560px) {
+  .card, .panel__body { padding: var(--sp-4); }
+  .page__title { font-size: var(--fs-xl); }
+  .stat__value { font-size: var(--fs-xl); }
+  .user-chip__meta { display: none; }
+  .table th, .table td { padding: var(--sp-2) var(--sp-3); }
+}
+
+/* 打印：榜单/筛选台要能被打印成纸质材料 */
+@media print {
+  .topbar, .toast, .page__actions, .btn { display: none !important; }
+  body { background: #fff; color: #000; }
+  .card, .panel, .table-wrap { border-color: #ccc; box-shadow: none; }
+}
 ```
 
 - [ ] **Step 7: 补两个测试文件（种子脚本 + 前端骨架）**

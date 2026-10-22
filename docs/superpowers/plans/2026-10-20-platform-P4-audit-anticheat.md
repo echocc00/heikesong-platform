@@ -6922,11 +6922,24 @@ P2 的 `getReviewState` **当前不返回分数数组** —— 那一行要么�
 // web/views/audit.js — 计算留痕 trace 抽屉
 // 依据：设计文档 §9「发榜页：榜单 + trace 抽屉（点任一队伍 → 展开每一步：
 //   原始分 → z 分 → 去极值 → 加权 → 总分 → 破同分）；降级告警置顶」
-//   + §12 三件套结构 + S-5「降级状态可见」。
+//   + §12 三件套结构 + S-5「降级状态可见」
+//   + R-AUD-01（每次发榜/计分可复算）、R-AUD-02（计算留输入快照）
+//   + C-05（z-score 样本不足时必须显式暴露「本轮未做评委宽严归一化」）
 // ⛔ 降级告警置顶且不可折叠：榜单页必须显式提示"本轮该维度未做评委宽严归一化（样本不足 5）"。
 // ⛔ 复算 diff 必须**被看见**（不能只写一条日志）：抽屉里直接给出 identical + 逐条 path。
+//
+// ⚠️ **DOM 顺序是测试契约**（platform/test/audit-api.test.js）：
+//    wrap.children = [页头, 主体]；主体的子元素**只能**是三个且顺序固定：
+//    [0] 降级告警 / [1] 队伍 trace / [2] 复算操作区。
+//    ⇒ 加载态与错误态只能放进页头（#au-msg / #au-state）；
+//      往主体里插第 0 个子元素会把索引顶掉（测试按 children[i] 断言）。
+//    ⇒ 三个主体子元素**一次性建好**，之后只填内容 —— 重载不会多出子元素。
 import { escapeHtml } from '../escape.js';
+import {
+  badge, emptyState, errorState, loadingState, noticeState, pageHead, statRow,
+} from '../ui.js';
 
+/** 六步留痕（顺序 = 计算顺序，标签是测试契约，一个字都不能改）。 */
 const STEPS = [
   ['raw', '原始分'],
   ['z', 'z 分'],
@@ -6938,121 +6951,270 @@ const STEPS = [
 
 export function renderAudit(ctx) {
   const wrap = document.createElement('div');
-  wrap.className = 'card audit-trace';
+  wrap.className = 'audit-trace';
 
   const head = document.createElement('div');
-  head.innerHTML = '<h1>计算留痕</h1><p class="muted" id="au-msg">加载中…</p>';
+  head.innerHTML = `
+    ${pageHead({
+      title: '计算留痕',
+      sub: '每一步都能复算：原始分 → z 分 → 去极值 → 加权 → 总分 → 破同分',
+    })}
+    <p class="muted small" id="au-msg">正在加载计算快照…</p>
+    <div id="au-stats"></div>
+    <div id="au-state"></div>`;
   wrap.appendChild(head);
 
+  // ── 主体：三个子元素，位置固定（见文件头 ⚠️）────────────────────
   const body = document.createElement('div');
   body.id = 'au-body';
+
+  const warnBox = document.createElement('div');
+  warnBox.className = 'stack';
+
+  const teamsBox = document.createElement('div');
+  teamsBox.id = 'au-teams';
+
+  const actionsBox = document.createElement('div');
+  actionsBox.className = 'trace-actions';
+
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'btn btn--primary';
+  // ⚠️ textContent 必须**恰好**是这串（测试断言 === '用同一输入复算并比对'）
+  btn.textContent = '用同一输入复算并比对';
+
+  const diffBox = document.createElement('div');
+  diffBox.id = 'au-diff';
+  diffBox.innerHTML = '<p class="muted">尚未复算：点上面的按钮，用同一份输入重跑一遍引擎，逐字段与快照比对。</p>';
+
+  actionsBox.appendChild(btn);
+  actionsBox.appendChild(diffBox);
+
+  body.appendChild(warnBox);
+  body.appendChild(teamsBox);
+  body.appendChild(actionsBox);
   wrap.appendChild(body);
 
-  const computationId = ctx.params?.computationId || ctx.getState?.().computationId;
   const msg = wrap.querySelector('#au-msg');
+  const statsBox = wrap.querySelector('#au-stats');
+  const stateBox = wrap.querySelector('#au-state');
+
+  const computationId = ctx.params?.computationId || ctx.getState?.().computationId;
 
   if (!computationId) {
     msg.textContent = '缺少 computationId：请从发榜页点任一队伍进入。';
+    statsBox.innerHTML = '';
+    stateBox.innerHTML = emptyState({
+      title: '没有指定计算快照',
+      hint: '计算留痕是「从发榜页点某支队伍」进入的：回到榜单页，点任一队伍即可展开它的计算过程。',
+    });
     return wrap;
   }
 
-  (async () => {
+  // ⚠️ 重试用**事件委托**绑定：errorState() 生成的重试按钮没有固定 id，
+  //    委托到容器上，按钮标记变化也不会失效。
+  stateBox.addEventListener('click', (ev) => {
+    if (ev.target?.dataset?.action === 'retry') void reload();
+  });
+  diffBox.addEventListener('click', (ev) => {
+    if (ev.target?.dataset?.action === 'retry') void runDiff();
+  });
+
+  async function reload() {
+    msg.textContent = '正在加载计算快照…';
+    statsBox.innerHTML = '';
+    stateBox.innerHTML = loadingState({ rows: 2, label: '正在加载计算快照…' });
     let data;
     try {
       data = await ctx.api.get(`/api/audit/computations/${encodeURIComponent(computationId)}`);
     } catch (e) {
-      msg.textContent = e.message;
+      msg.textContent = '计算快照加载失败';
+      stateBox.innerHTML = errorState({
+        message: e.message,
+        hint: '快照没拉到。可以重试；若持续失败，回发榜页重新点开任一队伍。',
+      });
       return;
     }
-    msg.textContent = `规则版本 ${data.ruleVersion} ｜ revision ${data.revision} ｜ ${data.createdAt}`;
+    stateBox.innerHTML = '';
+    msg.textContent = `规则版本 ${data.ruleVersion} ｜ revision ${data.revision} ｜ 生成于 ${data.createdAt}`;
+    renderSnapshot(data);
+  }
 
-    // ── 降级告警置顶 ─────────────────────────────────────────
-    const warnBox = document.createElement('div');
-    warnBox.className = 'card warn-box';
+  /** 把快照画成：降级告警 + 每队六步 + 指标。 */
+  function renderSnapshot(data) {
     const norm = data.trace?.normalization ?? {};
-    const normWarnings = Object.entries(norm)
-      .filter(([, v]) => v && v.normalized === false)
-      .map(([dim, v]) => `${dim}：未做评委宽严归一化（${v.fallbackReason ?? '未知原因'}）`);
-    const engineWarnings = (data.trace?.warnings ?? []).map((w) => w.message ?? String(w));
-    const allWarnings = [...normWarnings, ...engineWarnings];
-    if (allWarnings.length) {
-      warnBox.innerHTML = `<strong>降级告警（${allWarnings.length}）</strong><ul>${
-        allWarnings.map((w) => `<li>${escapeHtml(w)}</li>`).join('')
-      }</ul>`;
-    } else {
-      warnBox.innerHTML = '<strong>降级告警</strong><p class="muted">无</p>';
-    }
-    body.appendChild(warnBox);
-
-    // ── 每队展开：原始分 → z 分 → 去极值 → 加权 → 总分 → 破同分 ──
-    const perTeam = data.trace?.perTeam ?? {};
     const teams = data.output?.teams ?? [];
-    const list = document.createElement('div');
-    for (const t of teams) {
-      const teamId = t.teamId;
-      const tr = perTeam[teamId] ?? {};
-      const item = document.createElement('details');
-      item.className = 'team-trace';
-      const rank = t.rank !== undefined ? `第 ${t.rank} 名` : '未排名';
-      const tied = Array.isArray(t.tiedWith) && t.tiedWith.length ? `（并列 ${t.tiedWith.join('、')}）` : '';
-      item.innerHTML = `<summary>${escapeHtml(teamId)} ｜ ${rank}${tied} ｜ 总分 ${t.total ?? '—'}</summary>
-        <ol>${STEPS.map(([key, label]) => {
-    const value = key === 'total' ? (t.total ?? '—')
-      : key === 'tiebreak' ? (t.tiedWith ? t.tiedWith.join('、') || '未触发破同分' : '未触发破同分')
-        : formatStep(tr, key);
-    return `<li><strong>${label}</strong>：${escapeHtml(String(value))}</li>`;
-  }).join('')}</ol>`;
-      list.appendChild(item);
-    }
-    body.appendChild(list);
 
-    // ── 复算并比对（diff 必须被看见，不能只写一条日志）──────────
-    const actions = document.createElement('div');
-    actions.className = 'trace-actions';
-    const btn = document.createElement('button');
-    btn.textContent = '用同一输入复算并比对';
-    const diffBox = document.createElement('div');
-    diffBox.id = 'au-diff';
-    btn.addEventListener('click', async () => {
-      diffBox.textContent = '复算中…';
-      try {
-        const d = await ctx.api.get(`/api/audit/computations/${encodeURIComponent(computationId)}/diff`);
-        const warnLines = (d.warnings ?? []).map((w) => `<li>${escapeHtml(w.message ?? w.code)}</li>`).join('');
-        const diffLines = (d.diff ?? []).map((x) => `<li><code>${escapeHtml(x.path)}</code>：${escapeHtml(String(x.before))} → ${escapeHtml(String(x.after))}</li>`).join('');
-        diffBox.innerHTML = `
-          <p><strong>identical = ${String(d.identical)}</strong>（${(d.diff ?? []).length} 处差异）</p>
-          ${warnLines ? `<ul>${warnLines}</ul>` : ''}
-          ${diffLines ? `<ul>${diffLines}</ul>` : '<p class="muted">无差异</p>'}
-        `;
-      } catch (e) {
-        diffBox.textContent = e.message;
+    // ── 降级告警（body.children[0]）：硬降级 vs 提示，分级呈现 ──
+    const hard = [];   // 硬降级：归一化没生效 ⇒ 直接影响得分口径
+    const soft = [];   // 提示：引擎告警，不改分
+    for (const [dim, v] of Object.entries(norm)) {
+      if (v && v.normalized === false) {
+        hard.push(`${dim}：未做评委宽严归一化（${v.fallbackReason ?? '未知原因'}）`);
       }
-    });
-    actions.appendChild(btn);
-    actions.appendChild(diffBox);
-    body.appendChild(actions);
-  })();
+    }
+    for (const w of (data.trace?.warnings ?? [])) {
+      soft.push(w?.message ?? String(w));
+    }
+    const all = [...hard, ...soft];
+    warnBox.innerHTML = `
+      <div class="row">
+        ${badge(`硬降级 ${hard.length}`, hard.length ? 'danger' : 'neutral')}
+        ${badge(`提示 ${soft.length}`, soft.length ? 'warn' : 'neutral')}
+      </div>
+      ${noticeState({
+        tone: 'warn',
+        title: `降级告警（${all.length}）`,
+        items: all.length
+          ? all.map((w, i) => `${i < hard.length ? '【硬降级】' : '【提示】'}${w}`)
+          : ['本轮计算没有触发任何降级：评委宽严归一化已生效。'],
+        list: true,
+      })}`;
 
+    statsBox.innerHTML = statRow([
+      { label: '参评队伍', value: teams.length, tone: 'brand' },
+      { label: '降级项', value: all.length, tone: all.length ? 'warn' : 'success' },
+      { label: '归一化维度', value: Object.keys(norm).length, tone: 'neutral' },
+    ]);
+
+    // ── 每队六步（body.children[1]）──────────────────────────────
+    const perTeam = data.trace?.perTeam ?? {};
+    teamsBox.replaceChildren();
+    if (!teams.length) {
+      teamsBox.innerHTML = emptyState({
+        title: '这份快照没有队伍结果',
+        hint: 'output.teams 为空：该赛段还没有有效评分。等组委会发榜后，这里会出现每支队伍的计算过程。',
+      });
+      return;
+    }
+    for (const t of teams) {
+      teamsBox.appendChild(renderTeamTrace(t, perTeam[t.teamId] ?? {}, data));
+    }
+  }
+
+  /** 单支队伍的时间线：六步各一行，数值右对齐。 */
+  function renderTeamTrace(t, tr, data) {
+    const item = document.createElement('details');
+    item.className = 'team-trace';
+    const rank = t.rank !== undefined && t.rank !== null ? `第 ${t.rank} 名` : '未排名';
+    const tied = Array.isArray(t.tiedWith) && t.tiedWith.length ? `并列 ${t.tiedWith.join('、')}` : '';
+    item.innerHTML = `
+      <summary>
+        <span class="row row--between">
+          <span>队伍 ${escapeHtml(t.teamId)}</span>
+          <span class="row">
+            ${badge(rank, t.rank === 1 ? 'brand' : 'neutral')}
+            ${badge(`总分 ${t.total ?? '—'}`, 'info')}
+            ${tied ? badge(tied, 'warn') : ''}
+          </span>
+        </span>
+      </summary>
+      <dl class="kv">
+        ${STEPS.map(([key, label]) => {
+          // ⚠️ 数值型步骤（原始分 / z 分 / 权重 / 总分）右对齐 + 表格数字；
+          //    文字型步骤（去极值 / 破同分）是句子，右对齐反而难读。
+          const numeric = key === 'raw' || key === 'z' || key === 'weights' || key === 'total';
+          return `
+          <div class="kv__row">
+            <dt class="kv__key">${label}</dt>
+            <dd class="${numeric ? 'kv__val num' : 'kv__val'}"${numeric ? ' style="text-align:right"' : ''}>${escapeHtml(stepValue(t, tr, key, data))}</dd>
+          </div>`;
+        }).join('')}
+      </dl>`;
+    return item;
+  }
+
+  /** 复算并比对（body.children[2]）：结论用徽章，差异逐条列出。 */
+  async function runDiff() {
+    diffBox.innerHTML = loadingState({ rows: 1, label: '正在用同一输入复算…' });
+    try {
+      const d = await ctx.api.get(`/api/audit/computations/${encodeURIComponent(computationId)}/diff`);
+      diffBox.innerHTML = renderDiff(d);
+    } catch (e) {
+      diffBox.innerHTML = errorState({
+        message: e.message,
+        hint: '复算没跑通：快照或规则版本可能已变动，可重试一次。',
+      });
+    }
+  }
+
+  btn.addEventListener('click', () => runDiff());
+
+  void reload();
   return wrap;
 }
 
-function formatStep(tr, key) {
-  if (key === 'raw' || key === 'z') {
-    const v = tr[key] ?? {};
-    const parts = Object.entries(v).map(([k, val]) => `${k}:${typeof val === 'number' ? round2(val) : val}`);
-    return parts.length ? parts.join('  ') : '—';
+/**
+ * 复算 diff 的展示：结论（一致 / 不一致）+ 告警 + 逐条 path。
+ * ⚠️ 文案里必须出现 `identical = false` 这样的原文字段（测试按它断言）。
+ */
+function renderDiff(d) {
+  const diffs = d?.diff ?? [];
+  const warnings = d?.warnings ?? [];
+  const identical = d?.identical === true;
+  const rows = diffs.map((x) => `
+    <tr>
+      <td><code>${escapeHtml(x.path)}</code></td>
+      <td class="td-num num">${escapeHtml(String(x.before))}</td>
+      <td class="td-num num">${escapeHtml(String(x.after))}</td>
+    </tr>`).join('');
+  return `
+    <div class="row row--between">
+      <h3>复算比对</h3>
+      ${badge(identical ? '一致' : '不一致', identical ? 'success' : 'danger')}
+    </div>
+    <p class="muted small">identical = ${String(d?.identical)} · ${diffs.length} 处差异</p>
+    ${warnings.length
+      ? noticeState({
+        tone: 'warn',
+        title: '复算告警',
+        items: warnings.map((w) => w?.message ?? w?.code ?? String(w)),
+        list: true,
+      })
+      : ''}
+    ${diffs.length
+      ? `<div class="table-wrap">
+          <table class="table table--compact">
+            <thead><tr><th>path</th><th class="td-num">before</th><th class="td-num">after</th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>`
+      : '<p class="muted">无差异：复算结果与快照逐字段一致。</p>'}`;
+}
+
+/** 六步各自的取值（服务端 trace 的真实形状见 src/domain/scoring.js）。 */
+function stepValue(t, tr, key, data) {
+  if (key === 'total') return String(t.total ?? '—');
+  if (key === 'tiebreak') {
+    return Array.isArray(t.tiedWith) && t.tiedWith.length ? t.tiedWith.join('、') : '未触发破同分';
   }
-  if (key === 'trim') {
-    const steps = (tr.steps ?? []).filter((s) => s.step === 'trim');
-    if (!steps.length) return '未触发去极值';
-    return steps.map((s) => `${s.dimension ?? ''} 去掉最高 ${s.removed?.max ?? '—'}／最低 ${s.removed?.min ?? '—'}`).join('；');
-  }
-  if (key === 'weights') {
-    const w = tr.weights ?? {};
-    const parts = Object.entries(w).map(([k, val]) => `${k}:${val}`);
-    return parts.length ? parts.join('  ') : '—';
-  }
+  if (key === 'raw' || key === 'z') return formatMap(tr?.[key]);
+  if (key === 'trim') return formatTrim(t.teamId, data?.trace?.steps ?? []);
+  if (key === 'weights') return formatMap(data?.trace?.weights ?? {});
   return '—';
+}
+
+/** 维度 → 数值（原始分 / z 分 / 权重表）。 */
+function formatMap(obj) {
+  const parts = Object.entries(obj ?? {}).map(
+    ([k, v]) => `${k} ${typeof v === 'number' ? round2(v) : v}`,
+  );
+  return parts.length ? parts.join(' · ') : '—';
+}
+
+/**
+ * 去极值：只取**本队**的 trim 步骤。
+ * ⚠️ 旧实现只按 step === 'trim' 过滤 ⇒ 把别的队伍的去极值也列进来了（每队都看到全赛段的记录）。
+ */
+function formatTrim(teamId, steps) {
+  const mine = (steps ?? []).filter((s) => s?.step === 'trim' && s.teamId === teamId);
+  if (!mine.length) return '未触发去极值';
+  return mine.map((s) => {
+    const dim = s.dimension ?? '—';
+    if (!s.trimmed) return `${dim}：未触发去极值`;
+    // ⚠️ removed 里存的是**被去掉的评委 id**（不是分值），文案别写成「去掉最高 95」。
+    return `${dim}：去掉最高（评委 ${s.removed?.max ?? '—'}）／最低（评委 ${s.removed?.min ?? '—'}）`;
+  }).join('；');
 }
 
 function round2(n) {
@@ -7065,16 +7227,75 @@ function round2(n) {
 ```javascript
 // web/views/flags.js — 复核队列
 // 依据：设计文档 §9「组委会视角 → 复核/申诉/改级」、§11.1（检测 → 进人工复核队列）
+//   + R-AUD-04（证据三列：URL / 发行方 / 独立性，按发行方去重）
+//   + R-AUD-05（空结果必须显式报错）
 // ⛔ 检测 ≠ 处罚：队列里只做"确认 / 驳回"的人工判断，系统不改分、不封号。
 // ⛔ 裁决必须写理由与证据（证据三列：URL / 发行方 / 独立性，按发行方去重）。
+//
+// ⚠️ **DOM 顺序是测试契约**（platform/test/audit-api.test.js）：
+//    wrap.children = [页头, 队列容器]；队列容器的**第一个子元素必须是第一条复核项卡片**
+//    ⇒ 指标条、筛选条都只能放在页头里，插进队列容器会把卡片的索引顶掉。
+// ⚠️ 卡片的**正文写在 innerHTML 里**，裁决表单作为卡片第一个 appendChild 的子元素
+//    （测试用 row.children[0] 取表单）。
 import { escapeHtml } from '../escape.js';
+import {
+  badge, emptyState, errorState, loadingState, noticeState, pageHead, statRow,
+} from '../ui.js';
+
+/** 状态 → 中文标签 / 徽章色调。 */
+function statusLabel(status) {
+  if (status === 'open') return '待处理';
+  if (status === 'confirmed') return '已确认';
+  if (status === 'rejected') return '已驳回';
+  return String(status ?? '未知');
+}
+
+function statusTone(status) {
+  if (status === 'open') return 'warn';
+  if (status === 'confirmed') return 'success';
+  if (status === 'rejected') return 'danger';
+  return 'neutral';
+}
+
+/** 卡片正文（重建时复用，保证「裁决前 / 裁决后」是同一套结构）。 */
+function cardHtml(flag, status, extra = '') {
+  const detail = flag.detail ?? {};
+  return `
+    <div class="row row--between">
+      <div class="row">
+        <strong>${escapeHtml(flag.kind)}</strong>
+        ${badge(statusLabel(status), statusTone(status))}
+      </div>
+      <span class="muted small">${escapeHtml(flag.id ?? '')}</span>
+    </div>
+    <p class="muted small">
+      赛段 ${escapeHtml(flag.stageId ?? '—')} ｜ 队伍 ${escapeHtml(flag.teamId ?? '—')} ｜ 评委 ${escapeHtml(flag.judgeId ?? '—')} ｜ 状态 ${escapeHtml(status)}
+    </p>
+    <details>
+      <summary class="muted small">原始检测详情</summary>
+      <pre class="muted">${escapeHtml(JSON.stringify(detail, null, 2))}</pre>
+    </details>
+    ${extra}`;
+}
 
 export function renderFlags(ctx) {
   const wrap = document.createElement('div');
-  wrap.className = 'card flags-queue';
+  wrap.className = 'flags-queue';
 
   const head = document.createElement('div');
-  head.innerHTML = '<h1>复核队列</h1><p class="muted" id="fl-msg">加载中…</p>';
+  head.innerHTML = `
+    ${pageHead({
+      title: '复核队列',
+      sub: '检测 ≠ 处罚：这里只做人工「确认 / 驳回」，不改分、不封号。',
+    })}
+    <div id="fl-stats">${loadingState({ rows: 1, label: '正在统计队列…' })}</div>
+    <div class="row" id="fl-filters">
+      <button type="button" class="btn btn--primary btn--sm" id="fl-filter-all">全部</button>
+      <button type="button" class="btn btn--ghost btn--sm" id="fl-filter-open">待处理</button>
+      <button type="button" class="btn btn--ghost btn--sm" id="fl-filter-done">已裁决</button>
+    </div>
+    <p class="muted small" id="fl-msg">正在加载复核队列…</p>
+    <div id="fl-state"></div>`;
   wrap.appendChild(head);
 
   const list = document.createElement('div');
@@ -7082,85 +7303,213 @@ export function renderFlags(ctx) {
   wrap.appendChild(list);
 
   const msg = wrap.querySelector('#fl-msg');
+  const statsBox = wrap.querySelector('#fl-stats');
+  const stateBox = wrap.querySelector('#fl-state');
 
-  (async () => {
+  /** 队列条目（含裁决后的状态），筛选与计数都从这里算。 */
+  const items = [];
+  let filter = 'all';
+
+  // ⚠️ 重试用事件委托：errorState() 的重试按钮没有固定 id，委托到容器更稳。
+  stateBox.addEventListener('click', (ev) => {
+    if (ev.target?.dataset?.action === 'retry') void load();
+  });
+
+  for (const [sel, value] of [['#fl-filter-all', 'all'], ['#fl-filter-open', 'open'], ['#fl-filter-done', 'done']]) {
+    head.querySelector(sel)?.addEventListener('click', () => {
+      filter = value;
+      applyFilter();
+      paintFilterButtons();
+    });
+  }
+
+  async function load() {
+    msg.textContent = '正在加载复核队列…';
+    stateBox.innerHTML = loadingState({ rows: 2, label: '正在加载复核队列…' });
     let data;
     try {
       data = await ctx.api.get('/api/audit/flags');
     } catch (e) {
-      msg.textContent = e.message;
+      msg.textContent = '复核队列加载失败';
+      statsBox.innerHTML = '';
+      stateBox.innerHTML = errorState({
+        message: e.message,
+        hint: '队列没拉到。可以重试；若持续失败，检查账号是否还有 audit:read 权限。',
+      });
       return;
     }
-    const rows = data.rows ?? [];
-    msg.textContent = `共 ${data.total ?? rows.length} 项待处理（只告警不处罚，改分与封禁由组委会线下决定）`;
+    stateBox.innerHTML = '';
+    const rows = data?.rows ?? [];
+    renderRows(rows);
+    updateStats();
+    msg.textContent = `共 ${data?.total ?? rows.length} 项（只告警不处罚，改分与封禁由组委会线下决定）`;
+  }
+
+  function renderRows(rows) {
+    list.replaceChildren();
+    items.length = 0;
     if (!rows.length) {
-      list.innerHTML = '<p class="muted">队列为空</p>';
+      list.innerHTML = emptyState({
+        title: '复核队列是空的',
+        hint: '没有待判定的检测项：要么这一轮还没跑反作弊扫描，要么上一轮的告警都已裁决。等赛段发榜后系统会自动再扫一轮。',
+      });
       return;
     }
     for (const flag of rows) {
-      list.appendChild(renderFlagRow(ctx, flag));
+      const card = document.createElement('div');
+      card.className = 'card flag-row';
+      card.innerHTML = cardHtml(flag, flag.status);
+      if (flag.status === 'open') card.appendChild(buildForm(ctx, flag, onResolved));
+      items.push({ flag, card, status: flag.status });
+      list.appendChild(card);
     }
-  })();
+    applyFilter();
+  }
 
-  return wrap;
-}
-
-function renderFlagRow(ctx, flag) {
-  const box = document.createElement('div');
-  box.className = 'flag-row card';
-  const detail = flag.detail ?? {};
-  box.innerHTML = `
-    <p><strong>${escapeHtml(flag.kind)}</strong> ｜ 状态 ${escapeHtml(flag.status)} ｜ 赛段 ${escapeHtml(flag.stageId ?? '—')} ｜ 队伍 ${escapeHtml(flag.teamId ?? '—')} ｜ 评委 ${escapeHtml(flag.judgeId ?? '—')}</p>
-    <pre class="muted">${escapeHtml(JSON.stringify(detail, null, 2))}</pre>
-  `;
-
-  if (flag.status === 'open') {
+  /**
+   * 裁决表单。
+   * ⚠️ 表单里的 id 是测试契约（#fl-status / #fl-reason / #fl-url / #fl-publisher /
+   *    #fl-independent / #fl-submit / #fl-note），一个都不能少、不能改名。
+   */
+  function buildForm(ctx, flag, onResolved) {
     const form = document.createElement('div');
-    form.className = 'flag-form';
     form.innerHTML = `
-      <label>裁决<select id="fl-status"><option value="confirmed">确认（确有异常）</option><option value="rejected">驳回（误报）</option></select></label>
-      <label>理由<input id="fl-reason" placeholder="写明判断依据（必填）" /></label>
-      <fieldset><legend>证据（三列必填：URL / 发行方 / 独立性）</legend>
-        <input id="fl-url" placeholder="https://…" />
-        <input id="fl-publisher" placeholder="发行方" />
-        <label class="inline"><input type="checkbox" id="fl-independent" /> 独立信源</label>
-      </fieldset>
-      <button id="fl-submit">提交裁决</button>
-      <p id="fl-note" class="err"></p>
-    `;
+      <div class="panel">
+        <div class="panel__head">
+          <h3 class="panel__title">人工裁决</h3>
+          <p class="panel__desc">裁决只留痕、不改分：确认 = 确有异常（记入观察），驳回 = 误报（不改结果）</p>
+        </div>
+        <div class="panel__body">
+          <div class="field">
+            <label class="field__label" for="fl-status">裁决结论</label>
+            <select class="select" id="fl-status">
+              <option value="confirmed">确认（确有异常）</option>
+              <option value="rejected">驳回（误报）</option>
+            </select>
+          </div>
+          <div class="field field--required">
+            <label class="field__label" for="fl-reason">裁决理由</label>
+            <input class="input" id="fl-reason" placeholder="写明判断依据（必填）" />
+            <p class="field__hint">无理由的裁决无法复盘 —— 必填。</p>
+          </div>
+          <div class="panel">
+            <div class="panel__head">
+              <h3 class="panel__title">证据三列</h3>
+              <p class="panel__desc">URL / 发行方 / 独立性 —— 要么三列都填，要么都不填（缺列的证据服务端会拒收）</p>
+            </div>
+            <div class="panel__body">
+              <div class="field">
+                <label class="field__label" for="fl-url">证据 URL</label>
+                <input class="input" id="fl-url" placeholder="https://…" />
+              </div>
+              <div class="field">
+                <label class="field__label" for="fl-publisher">发行方</label>
+                <input class="input" id="fl-publisher" placeholder="如：某媒体" />
+              </div>
+              <div class="field">
+                <label class="checkbox" for="fl-independent">
+                  <input type="checkbox" id="fl-independent" /> 独立信源
+                </label>
+                <p class="field__hint">同一发行方的多条报道只算 1 个独立信源。</p>
+              </div>
+            </div>
+          </div>
+          <div class="row">
+            <button type="button" class="btn btn--primary" id="fl-submit">提交裁决</button>
+          </div>
+          <p class="field__error" id="fl-note"></p>
+        </div>
+      </div>`;
+
     const note = form.querySelector('#fl-note');
     form.querySelector('#fl-submit').addEventListener('click', async () => {
+      note.className = 'field__error';
       note.textContent = '';
       const reason = form.querySelector('#fl-reason').value.trim();
       if (!reason) {
+        // ⚠️ 文案必须**恰好**是这六个字（测试断言 === '必须写理由'）
         note.textContent = '必须写理由';
         return;
       }
-      const evidence = [];
       const url = form.querySelector('#fl-url').value.trim();
       const publisher = form.querySelector('#fl-publisher').value.trim();
-      if (url || publisher) {
-        evidence.push({
-          url,
-          publisher,
-          independent: form.querySelector('#fl-independent').checked,
-        });
+      if ((url || publisher) && !(url && publisher)) {
+        note.textContent = '证据三列要么都填，要么都不填（还缺 URL 或发行方）';
+        return;
       }
+      const evidence = (url || publisher)
+        ? [{ url, publisher, independent: form.querySelector('#fl-independent').checked }]
+        : [];
+      const status = form.querySelector('#fl-status').value;
       try {
-        const out = await ctx.api.post(`/api/audit/flags/${encodeURIComponent(flag.id)}/resolve`, {
-          status: form.querySelector('#fl-status').value,
-          reason,
-          evidence,
-        });
-        note.className = 'muted';
-        note.textContent = `已裁决；独立发行方 ${out.detail?.evidence?.uniquePublishers ?? 0} 个（按发行方去重）`;
+        const out = await ctx.api.post(
+          `/api/audit/flags/${encodeURIComponent(flag.id)}/resolve`,
+          { status, reason, evidence },
+        );
+        const publishers = out?.detail?.evidence?.uniquePublishers ?? 0;
+        note.className = 'field__hint';
+        note.textContent = `已裁决；独立发行方 ${publishers} 个（按发行方去重）`;
+        onResolved(flag, { status: out?.status ?? status, publishers, reason });
       } catch (e) {
-        note.textContent = e.message;
+        note.textContent = `裁决失败：${e.message}`;
       }
     });
-    box.appendChild(form);
+    return form;
   }
-  return box;
+
+  /**
+   * 裁决成功：这一条**就地变成已裁决**（徽章换色 + 表单换成结果面板 + 计数与筛选同步），
+   * 不是只改一行提示 —— 用户必须看得见「这条已经处理掉了」。
+   */
+  function onResolved(flag, result) {
+    const rec = items.find((it) => it.flag.id === flag.id);
+    if (!rec) return;
+    rec.status = result.status;
+    rec.card.innerHTML = cardHtml(rec.flag, result.status, noticeState({
+      tone: 'success',
+      title: '裁决已记录',
+      items: [
+        `裁决结论：${statusLabel(result.status)}`,
+        `独立发行方 ${result.publishers} 个（按发行方去重）`,
+        '裁决理由与证据已写入审计日志（不改分、不封号）。',
+      ],
+      list: true,
+    }));
+    updateStats();
+    applyFilter();
+  }
+
+  function updateStats() {
+    const open = items.filter((it) => it.status === 'open').length;
+    const done = items.filter((it) => it.status !== 'open').length;
+    statsBox.innerHTML = statRow([
+      { label: '待处理', value: open, tone: 'warn' },
+      { label: '已裁决', value: done, tone: 'success' },
+      // ⚠️ 总数取**本页已加载的条数**：这样「待处理 + 已裁决 = 总数」自洽；
+      //    接口返回的 total（含分页）在页头 #fl-msg 里单独说明。
+      { label: '总数', value: items.length, tone: 'neutral' },
+    ]);
+  }
+
+  function applyFilter() {
+    for (const it of items) {
+      const show = filter === 'all'
+        || (filter === 'open' && it.status === 'open')
+        || (filter === 'done' && it.status !== 'open');
+      it.card.hidden = !show;
+    }
+  }
+
+  /** 当前筛选用主色按钮，其余用幽灵按钮（用户一眼知道在看哪一段）。 */
+  function paintFilterButtons() {
+    for (const [sel, value] of [['#fl-filter-all', 'all'], ['#fl-filter-open', 'open'], ['#fl-filter-done', 'done']]) {
+      const btn = head.querySelector(sel);
+      if (btn) btn.className = `btn btn--sm ${value === filter ? 'btn--primary' : 'btn--ghost'}`;
+    }
+  }
+
+  void load();
+  return wrap;
 }
 ```
 

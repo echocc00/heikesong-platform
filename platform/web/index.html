@@ -3,12 +3,19 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="dark light" />
   <title>AI 商业黑客松 · 赛事平台</title>
   <!-- 溯源需求：R-OPS-06（公网可访问：公网演示站入口页） -->
   <!-- ⚠️ 资源路径必须是相对路径：静态托管（公网演示站）可能挂在任意 base path 下 -->
   <link rel="stylesheet" href="./styles.css" />
 </head>
 <body>
+  <!-- ⚠️ 顶栏与内容容器是**两个独立元素**：
+       顶栏由 web/app.js 按角色分区渲染（登录态变化时要重画），
+       内容容器 #app 只放「当前页面的视图」——
+       两者分开 ⇒ 切页时不必重建整个页面骨架。 -->
+  <a class="skip-link" href="#app">跳到主内容</a>
+  <header id="topbar" class="topbar"></header>
   <div id="app"><div class="boot">正在加载…</div></div>
   <noscript>本演示版需要启用 JavaScript——规则引擎是在你的浏览器里真实运行的。</noscript>
   <script type="module" src="./app.js"></script>

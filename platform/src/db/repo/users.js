@@ -15,8 +15,16 @@ import { appError } from '../../errors.js';
 /**
  * 对外用户形状（**唯一出口**）：字段转驼峰，绝不带 password_hash。
  * 所有要把用户放进 HTTP 响应的地方都必须走它。
+ *
+ * ⚠️ `roles`（P7 新增）：前端要按角色分区导航，必须知道「你是谁」。
+ *    此前 toPublicUser 不带角色 ⇒ /api/me 也拿不到 ⇒ 前端只能做出
+ *    「所有人看到同一个菜单」的水平导航。
+ *    ⇒ 这里加一个可选的 roles 参数（角色**键**列表，来源 listUserRoles）。
+ *    ⚠️ roles 只用于**导航入口分区**，**不构成任何授权依据** ——
+ *    可见性始终由 can() + scopeClause 在服务端裁决（全局约束）。
+ *    ⚠️ 默认空数组：缺省即「没有角色」，不能因为漏传就变成「有全部权限」。
  */
-export function toPublicUser(row) {
+export function toPublicUser(row, roles = []) {
   if (!row) return null;
   return {
     id: row.id,
@@ -27,6 +35,7 @@ export function toPublicUser(row) {
     isSuperadmin: row.is_superadmin === 1,
     active: row.active === 1,
     createdAt: row.created_at,
+    roles: Array.isArray(roles) ? roles.filter((r) => typeof r === 'string' && r) : [],
   };
 }
 

@@ -51,6 +51,12 @@ const PLANS = [
   ['P4', 'docs/superpowers/plans/2026-10-20-platform-P4-audit-anticheat.md'],
   ['P5', 'docs/superpowers/plans/2026-10-20-platform-P5-workflow-pools.md'],
   ['P6', 'docs/superpowers/plans/2026-10-20-platform-P6-deploy-demo.md'],
+  // ⚠️ P7（前端生产级打磨）：新建文件（web/ui.js、web/nav.js、web/views/task-index.js）
+  //    的规格块在这里。**P7 不接管既有文件的块** —— 既有的前端文件仍归最早的阶段
+  //    （app.js/styles.css → P0，registration/team/admin-registration → P1，
+  //      leaderboard/tier/card → P3，audit/flags → P4，tasks → P5，api.demo → P6），
+  //    后续阶段只 Modify（追加）⇒ 改动后必须**逐字同步回 owning 阶段的计划块**。
+  ['P7', 'docs/superpowers/plans/2026-10-22-platform-P7-ui-production.md'],
 ];
 
 // ⚠️ 主流程（读计划、比对实现、打印清单）**只在直接运行时执行**。
@@ -156,30 +162,52 @@ const missing = [];
  * 行序保持率：块的行**按原顺序**能在这个文件里找到多少（贪心子序列匹配）。
  * ≈1 ⇒ 内容还在，只是**中间被插入了**别的阶段的东西（良性扩展）
  * ≪1 ⇒ 内容被**改写/替换**了（真漂移，计划块必须同步）
+ *
+ * ⚠️⚠️ **这个判据有个已知的致命特性（父代理踩过）**：
+ *    它是**贪心**子序列匹配 —— 一旦块里**靠前**的某一行在实现里不存在了
+ *    （哪怕只改了一行），匹配器会一路扫到文件末尾去找它，
+ *    后面所有行**全部失配** ⇒ 保持率从 ~1 直接掉到 ~0.02。
+ *    ⇒ **「C-RW 变多」的第一嫌疑永远是「你改了一行」，不是「内容被重写了」。**
+ *    真实样本（2026-10-22 P7）：只改了 `src/server.js` 的**一行 import** +
+ *    `src/db/repo/users.js` 的**一个函数签名** ⇒ 两个文件双双被判 C-RW
+ *    （保持率 0.043 / 0.176），而其余 ~505 / ~85 行**原封不动**。
+ *
+ * ⇒ 所以本函数**同时返回失配行**，好让工具直接告诉人「第一处失配是什么」，
+ *    而不是让人自己猜。判据仍然是「是否需要同步计划块」，但诊断信息必须自足。
  */
 function orderKeepRate(blockLines, implLines) {
-  if (blockLines.length === 0) return 0;
+  if (blockLines.length === 0) return { rate: 0, kept: 0, total: 0, lost: [] };
   let i = 0, kept = 0;
+  const lost = [];
   for (const bl of blockLines) {
     while (i < implLines.length && implLines[i] !== bl) i++;
     if (i < implLines.length) { kept++; i++; }
+    else lost.push(bl);
   }
-  return kept / blockLines.length;
+  return { rate: kept / blockLines.length, kept, total: blockLines.length, lost };
 }
 for (const [rel, b] of [...best].sort()) {
   let impl = null;
   try { impl = readFileSync(join(platformDir, rel), 'utf8').replace(/\n$/, ''); } catch { }
   let kind;
+  let diag = null;
   if (impl === null) kind = 'D';
   else if (impl === b.body) kind = 'A';
   else if (impl.includes(b.body)) kind = 'B';
   else {
-    const rate = orderKeepRate(b.body.split('\n'), impl.split('\n'));
-    kind = rate >= 0.6 ? 'CEXT' : 'CRW';
+    diag = orderKeepRate(b.body.split('\n'), impl.split('\n'));
+    kind = diag.rate >= 0.6 ? 'CEXT' : 'CRW';
   }
   counts[kind]++;
   if (kind === 'CEXT' || kind === 'CRW') {
     bad.push(`${kind === 'CEXT' ? '良性扩展' : '真重写'}  ${rel}  ← ${b.phase} 计划第 ${b.open + 1} 行（块 ${b.body.split('\n').length} 行）`);
+  }
+  // ⛔ C-RW **必须打印失配明细**：只计数不列清单 ⇒ 「只改了一行却被判真重写」
+  //    这种假阳性会静默潜伏（真实教训：P7 改一行 import ⇒ 保持率 0.043 ⇒ 看起来像整文件被重写）。
+  if (kind === 'CRW' && diag) {
+    bad.push(`  └ 保持率 ${diag.rate.toFixed(3)}（${diag.kept}/${diag.total} 行）｜第一处失配：`);
+    for (const l of diag.lost.slice(0, 3)) bad.push(`     ✗ ${l.trim().slice(0, 120)}`);
+    if (diag.lost.length > 3) bad.push(`     …（另有 ${diag.lost.length - 3} 行失配）`);
   }
   // ⛔ D 类**必须打印明细**：只计数不列清单 ⇒ 「路径被扩展名截断」这类假阳性会静默潜伏
   //    （真实教训：`rules/tiebreak.json` 被截成 `rules/tiebreak.js` ⇒ 18 个存在的文件被判 D）。
