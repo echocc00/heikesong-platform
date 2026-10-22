@@ -1995,7 +1995,7 @@ Expected: FAIL —— `Cannot find module '../src/config.js'`
 
 `platform/rules/tiebreak.json`：
 
-```json
+```javascript
 {
   "id": "tiebreak",
   "version": "2026-10-20",
@@ -2004,7 +2004,7 @@ Expected: FAIL —— `Cannot find module '../src/config.js'`
   "chain": [
     { "key": "total",          "label": "总分",           "direction": "desc", "scope": "always",     "source": "S7 §3.1 总分" },
     { "key": "tiebreak_extra", "label": "加时陈述复议分", "direction": "desc", "scope": "final_only", "manual": true, "source": "S10 §0.4 加时陈述复议" },
-    { "key": "peer",           "label": "互评分",         "direction": "desc", "scope": "tied_only",  "source": "S7 §3.3 互评（唯一破同分工具）" },
+    { "key": "peer",           "label": "互评分",         "direction": "desc", "scope": "tied_only",  "source": "S7 §3.3 互评（唯一破同分工具）｜R-RNK-05：互评**只**在破同分链里出现（scope=tied_only），**从不进入 A 榜的评审分** ⇒ 互评在评审分里的占比恒为 0% ≤ 20%（评审终评 ≥80% 由此满足）" },
     { "key": "enterprise_raw", "label": "企业确认原始分", "direction": "desc", "scope": "tied_only",  "source": "S7 §3.3 兜底（主观但独立于互评）" },
     { "key": "behavior",       "label": "行为分",         "direction": "desc", "scope": "tied_only",  "source": "S10 §3.3 过程参与度，≤10%，最弱" },
     { "key": "team_id",        "label": "队伍编号",       "direction": "asc",  "scope": "always", "deterministic": true, "source": "C-03 新增：三份文档都没写的最终确定性兜底，保证排序永远可复现（满足 R-AUD-01）" }
@@ -2141,11 +2141,11 @@ Expected: FAIL —— `Cannot find module '../src/config.js'`
 
 `platform/rules/milestones.default.json`：
 
-```json
+```javascript
 {
   "id": "milestones-default",
   "version": "2026-10-20",
-  "source": "S10 §4 商业里程碑 7 类 + §3.4 里程碑清单报名时固定",
+  "source": "S10 §4 商业里程碑 7 类 + §3.4 里程碑清单报名时固定｜R-PTS-11：下面这 7 类就是「L2 商业里程碑分」的完整类目（企业问题确认 / 真实数据接入 / 可演示原型 / 试点合同 / 业务迭代 N 轮 / 意向客户 M 家 / 确认收入 ¥X）｜R-PTS-12：里程碑与段位**共享「企业签字」这一个数据源**（countsTowardTier / signoffRequires），但**不共享任何一条规则** —— 里程碑表在这里，段位表在 rules/ranks.json，两边各自独立配置",
   "note": "报名时随战队固定，赛程中不可自行新增（S10 §3.4 防拆单刷里程碑）",
   "items": [
     { "key": "problem_confirmed", "label": "企业问题确认", "confirmedBy": "enterprise", "countsTowardTier": true },

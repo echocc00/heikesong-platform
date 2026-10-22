@@ -591,7 +591,7 @@ export function hasStageRoster(db, stageId) {
 
 `platform/rules/points.json`（INTERFACES.md §4 原文 + 任务书要求的 `fallbackPolicy` 注释位）：
 
-```json
+```javascript
 {
   "id": "points",
   "version": "2026-10-20",
@@ -599,7 +599,12 @@ export function hasStageRoster(db, stageId) {
   "stagePoints": [10, 8, 5],
   "stagePointsOnlyTopN": 3,
   "mvp": { "stagesCounted": 4, "roadshowWeight": 1.0, "perPackage": 1 },
-  "personal": { "lifetime": true, "includeMvpVote": true },
+  "personal": {
+    "lifetime": true,
+    "includeMvpVote": true,
+    "atomicKinds": ["stage_rank", "mvp", "roadshow"],
+    "rollupKind": "personal_rollup"
+  },
   "tieRankStyle": "1224",
   "prizeStructure": {
     "resourceToCashRatio": 1.55,

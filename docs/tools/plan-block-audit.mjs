@@ -21,8 +21,27 @@
 //   「每个 Task 收尾时对自己那几个块做逐字核验」（plan-blocks / block-by-path / fragment-check）。
 //
 // 用法： node docs/tools/plan-block-audit.mjs platform
+//   node docs/tools/plan-block-audit.mjs --selftest   （自检：正则与归因是否正确）
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+
+// ── 扩展名白名单 ──────────────────────────────────────────────────────
+// ⛔ **顺序敏感**：`(?:js|html|css|sql|json)` 里 `js` 排在 `json` 前面，
+//    而 `[\w./-]+` 是贪婪的 ⇒ `rules/tiebreak.json` 会被匹配成 `rules/tiebreak.js`
+//    ⇒ 该文件在实现里明明存在，却因「文件名对不上」被判成 **D(无实现)**。
+//    真实后果：本仓 18 个 rules/*.json 全部被误判成 D（假阳性），
+//    而真 C-RW（points.json / tiebreak.json / milestones.default.json）被淹没在噪声里。
+// ⇒ **扩展名必须按「长的在前」排列**，且必须**整体匹配**（下面用 `(?![A-Za-z0-9])` 兜住）。
+const EXTS = ['json', 'js', 'mjs', 'html', 'css', 'sql', 'sh', 'conf', 'service', 'yml', 'yaml'];
+const EXT_RE = new RegExp(`\\.(?:${EXTS.join('|')})(?![A-Za-z0-9])`);
+/**
+ * 从一行文本里提取**第一个**文件路径（带已知扩展名）。
+ * ⛔ 扩展名必须整体匹配：`foo.json` 不能被截成 `foo.js`。
+ */
+export function extractPath(text) {
+  const m = String(text).match(new RegExp(`[\\w./-]+\\.(?:${EXTS.join('|')})(?![A-Za-z0-9])`));
+  return m ? m[0] : null;
+}
 
 const PLANS = [
   ['P0', 'docs/superpowers/plans/2026-10-20-platform-P0-foundation.md'],
@@ -33,6 +52,12 @@ const PLANS = [
   ['P5', 'docs/superpowers/plans/2026-10-20-platform-P5-workflow-pools.md'],
   ['P6', 'docs/superpowers/plans/2026-10-20-platform-P6-deploy-demo.md'],
 ];
+
+// ⚠️ 主流程（读计划、比对实现、打印清单）**只在直接运行时执行**。
+//    否则 `import { extractPath } from '...plan-block-audit.mjs'`（回归测试要用）
+//    会在 import 时就去读相对路径下的计划文件 ⇒ cwd 不对就直接抛错。
+//    `import.meta.main`：Node ≥ 20.11 提供的「本文件是否为主入口」标志。
+if (import.meta.main) {
 const platformDir = process.argv[2] || 'platform';
 const best = new Map();  // rel → {phase, open, body, lang}
 for (const [pn, p] of PLANS) {
@@ -40,10 +65,20 @@ for (const [pn, p] of PLANS) {
   const OPEN = /^```(\w*)$/;
   function hintOf(i) {
     for (let k = i - 1; k > Math.max(-1, i - 6); k--) {
-      let m = lines[k].match(/\*\*Step \d+: (?:创建|修改|新建|补|改写)[^*]*?([\w./-]+\.(?:js|html|css|sql|json))/);
-      if (m) return m[1];
-      m = lines[k].match(/^\s*`(?:platform\/)?([\w./-]+\.(?:js|html|css|sql|json))/);
-      if (m) return m[1];
+      // 归因信号①-a：Step 标题里的路径（`**Step 3: 创建 src/xxx.js`）
+      if (/\*\*Step \d+: (?:创建|修改|新建|补|改写)/.test(lines[k])) {
+        const p = extractPath(lines[k]);
+        if (p) return p;
+      }
+      // 归因信号①-b：反引号包裹的路径行（`` `platform/src/xxx.js`： ``）
+      // ⛔ **只认行首第一个反引号 token**，不许从整行里「随便挑一个路径」——
+      //    否则散文里的提及会被当成文件声明（真实教训：`` `user_roles` 表已在
+      //    Task 2 的 `001_init.sql` 里建好 `` ⇒ 001_init.sql 被误归因成规格块）。
+      const bm = lines[k].match(/^\s*`([^`]+)`/);
+      if (bm) {
+        const p = extractPath(bm[1]);
+        if (p) return p;
+      }
     }
     return null;
   }
@@ -69,13 +104,18 @@ for (const [pn, p] of PLANS) {
     if (h) rel = h.replace(/^platform\//, '');
     const first = body.find((x) => x.trim());
     if (first) {
-      const m2 = first.match(/^\s*(?:\/\/|#)\s+(?:platform\/)?([\w./-]+\.(?:js|html|css|sql|json|sh|conf|service|yml))\s*[—\-:：]/);
+      // 归因信号②：块首行的文件头注释（`// src/xxx.js — 说明` / `# 路径 — 说明`）
+      const m2 = first.match(/^\s*(?:\/\/|#)\s+(?:platform\/)?([\w./-]+\.[A-Za-z0-9]+)\s*[—\-:：]/);
       if (m2) {
-        const cand = m2[1];
-        if (!rel) rel = cand;
-        else if (cand !== rel) {
-          // 两者不一致时，以**首行注释**为准（内容信号比 hint 信号更可靠）
-          rel = cand;
+        // ⛔ 头注释里的扩展名同样不许被截断：`rules/tiebreak.json — 说明`
+        //    必须整段匹配成 `.json`，不能只吃 `.js`。
+        const cand = extractPath(m2[1]);
+        if (cand) {
+          if (!rel) rel = cand;
+          else if (cand !== rel) {
+            // 两者不一致时，以**首行注释**为准（内容信号比 hint 信号更可靠）
+            rel = cand;
+          }
         }
       }
     }
@@ -111,6 +151,7 @@ best.clear();
 for (const [rel, c] of picked) best.set(rel, c);
 const counts = { A: 0, B: 0, CEXT: 0, CRW: 0, D: 0 };
 const bad = [];
+const missing = [];
 /**
  * 行序保持率：块的行**按原顺序**能在这个文件里找到多少（贪心子序列匹配）。
  * ≈1 ⇒ 内容还在，只是**中间被插入了**别的阶段的东西（良性扩展）
@@ -140,6 +181,11 @@ for (const [rel, b] of [...best].sort()) {
   if (kind === 'CEXT' || kind === 'CRW') {
     bad.push(`${kind === 'CEXT' ? '良性扩展' : '真重写'}  ${rel}  ← ${b.phase} 计划第 ${b.open + 1} 行（块 ${b.body.split('\n').length} 行）`);
   }
+  // ⛔ D 类**必须打印明细**：只计数不列清单 ⇒ 「路径被扩展名截断」这类假阳性会静默潜伏
+  //    （真实教训：`rules/tiebreak.json` 被截成 `rules/tiebreak.js` ⇒ 18 个存在的文件被判 D）。
+  if (kind === 'D') {
+    missing.push(`${rel}  ← ${b.phase} 计划第 ${b.open + 1} 行（块 ${b.body.split('\n').length} 行）`);
+  }
 }
 console.log('每个文件取最新阶段那块 ⇒ A(整文件一致)', counts.A,
   '| B(含片段)', counts.B,
@@ -148,3 +194,42 @@ console.log('每个文件取最新阶段那块 ⇒ A(整文件一致)', counts.A
   '| D(无实现)', counts.D);
 console.log('\n--- C 清单（良性扩展 = 结构性现象，只需在台账记一句；真重写 = 必须同步计划块）---');
 bad.forEach(x => console.log('  ' + x));
+if (missing.length) {
+  console.log('\n--- D 清单（计划里有、实现里没有）---');
+  missing.forEach(x => console.log('  ' + x));
+}
+
+// ── 自检（防假绿）───────────────────────────────────────────────────
+// ⛔ 这个工具的 bug 潜伏了很久，正是因为它**没有自检**：正则写错 ⇒ 全部判成 D ⇒
+//    数字看着「有输出」，没人发现判据本身是错的。
+// ⇒ 自检覆盖「扩展名不得被截断」这个真实教训。
+if (process.argv.includes('--selftest')) {
+  const cases = [
+    // [输入, 期望输出]
+    ['rules/tiebreak.json', 'rules/tiebreak.json'],
+    ['rules/points.json', 'rules/points.json'],
+    ['src/db/repo/users.js', 'src/db/repo/users.js'],
+    ['platform/rules/audit.json', 'platform/rules/audit.json'],
+    ['deploy/nginx-demo-static.conf', 'deploy/nginx-demo-static.conf'],
+    ['web/seed/demo-data.json', 'web/seed/demo-data.json'],
+    ['没有扩展名', null],
+    ['README', null],
+  ];
+  const problems = [];
+  for (const [input, want] of cases) {
+    const got = extractPath(input);
+    if (got !== want) problems.push(`extractPath(${JSON.stringify(input)}) = ${JSON.stringify(got)}，期望 ${JSON.stringify(want)}`);
+  }
+  // 反例：`foo.json` 绝不能被截成 `foo.js`
+  for (const trap of ['rules/tiebreak.json', 'web/seed/demo-data.json']) {
+    const got = extractPath(trap);
+    if (got && got.endsWith('.js')) problems.push(`扩展名被截断：${trap} → ${got}`);
+  }
+  if (problems.length) {
+    console.error('\n⛔ 自检失败：');
+    problems.forEach(p => console.error('  ' + p));
+    process.exit(2);
+  }
+  console.log('\n✅ 自检通过（扩展名提取无截断）');
+}
+} // ← import.meta.main 守卫闭合

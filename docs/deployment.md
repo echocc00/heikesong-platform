@@ -1168,6 +1168,32 @@ cd platform && node scripts/bash-var-scan.js ; echo "退出码=$?"
 
 > 这个坑本项目**踩过两次**，所以做成了闸（而不是靠人记）。
 
+### 18.8 计划块漂移审计：⚠️ 工具自己也会骗人
+
+```bash
+cd <repo> && node docs/tools/plan-block-audit.mjs platform
+node docs/tools/plan-block-audit.mjs platform --selftest   # 自检（防假绿）
+```
+
+判定含义：`A` 逐字一致 ｜ `B` 实现含该片段 ｜ `C-EXT` 良性扩展（中间被插入，只需台账记一句）｜
+`C-RW` **真漂移（必须同步回计划）** ｜ `D` 计划里有、实现里没有。
+
+⛔ **这个工具本身出过 bug，而且症状极具欺骗性**：
+
+- 扩展名正则写成 `(?:js|html|css|sql|json)` ⇒ **`js` 排在 `json` 前面**、路径部分贪婪
+  ⇒ `rules/tiebreak.json` 被匹配成 `rules/tiebreak.js`
+  ⇒ 文件明明在实现里，却被判成 **D(无实现)**。
+- ⛔ **D 类当时只计数、不打印明细** ⇒ 工具「有输出」⇒ **没人发现判据本身是错的**
+  ⇒ 18 个 `rules/*.json` 全是假阳性，而**真正的 C-RW 被淹没在噪声里**。
+
+⇒ 已修：扩展名**长的在前** + 负向断言整体匹配 ｜ 路径提取抽成可测函数 ｜
+**D 类打印明细** ｜ 新增 `--selftest`（正反样本判定不符即退出码 2）｜
+主流程用 `import.meta.main` 守卫（可被测试 import）。回归用例见
+`platform/test/plan-block-audit.test.js`（7 条，变异 7/7 全杀）。
+
+> **教训**：**审计工具必须自带自检 + 失败必须打印明细**。
+> 一个「有输出但判据是错的」工具，比没有工具更危险 —— 它会让人误以为已经查过了。
+
 ## 19. 实跑证据台账（2026-10-21 起）
 
 > 全部在**临时目录**（`mktemp -d`）里做，不碰工作树的库文件。
@@ -1220,6 +1246,8 @@ cd platform && node scripts/bash-var-scan.js ; echo "退出码=$?"
 | E44 | 根因定位（第二个坑）：**reload 没生效却报成功** | 真机 `ps` 显示**两个 nginx master**：`445717`（真 master，10-14 启动，持 8081 监听套接字）与 `488602`（**我用来验证 `return 308` 语法的临时 `nginx -c /tmp/t308.conf`**，未杀掉）。它把 `/run/nginx.pid` 覆盖了 ⇒ `systemctl reload nginx` 的 SIGHUP **发给了那个临时进程** ⇒ 真 master 从没收到 ⇒ 磁盘上是 308、线上仍在跑 301，而 `install.sh` **退出码 0** |
 | E45 | 清理与恢复 | kill 临时进程时，systemd 把它误认成 MainPID ⇒ 对**整个 cgroup** 发 SIGTERM ⇒ 真 nginx 一并倒下（80/18443/8081/8444 全部短暂不可用）。`systemctl reset-failed nginx` + `systemctl start nginx` ⇒ `active`、MainPID 与 pid 文件一致、`nginx -t` 通过；headscale 控制台（80）**200**、https 8444 **200**、明文口 **308** |
 | E46 | 修复二：`install.sh` 加 **reload 生效校验**（`assert_nginx_reload_took_effect`） | 判据：nginx 收到 SIGHUP **一定会起新 worker**（实测配置未变时 worker 仍从 `{488927,488928}` 换到 `{488927,488955,488956}`）⇒ reload 后 worker 集合没变 ⇒ **直接失败并说清原因**，不许报成功；读不到 pid 文件/worker 集合时**放行并告警**（不误伤首次部署与 BusyBox `ps`） |
+| E47 | 判别性用例 | `platform/test/deploy-tls-port.test.js` 增至 **24 条**（新增：308 保留 POST body 的可执行断言 + 规则写反的对照组 + reload 生效校验的三条）；变异检验 **18 个变异体**（新增 M16 退回 301 / M17 去掉校验调用 / M18 校验永远放行） |
+| E53 | **新增机器闸 `scripts/bash-var-scan.js`** | 扫全仓 **12 个 shell 文件，0 违规**（退出码 0）；自检通过（正反样本判定正确）。⚠️ 这个闸抓到的是**本轮真实踩的坑**：bash 允许非 ASCII 出现在标识符里 ⇒ `"$NGINX_SITE（模板…"` 会被解析成变量名 `NGINX_SITE（` ⇒ **运行时 unbound variable**（`bash -n` 查不出来）⇒ 写脚本时实际踩了 **8 处**，已全部改成 `${VAR}` |
 | E48 | **真机构建演示站**（`node scripts/build-demo.js --out /opt/heikesong/demo`） | 产物 **60 个文件 / 464K**；顶层 `build-manifest.json, index.html, rules, seed, src, web`；**规则文件 12 个**、领域层文件 23 个；「✅ 领域层浏览器安全检查通过」 |
 | E49 | **真机第一次发布**（`deploy-demo-site.sh`） | ⛔ **失败**：`nginx -t` 报 `unknown directive "http2"`（nginx **1.22.1** 不认 `http2 on;`，那是 ≥ 1.25.1 的语法）⇒ **回滚按设计生效**（站点文件与软链都撤销、平台未受影响）⇒ 补上 `nginx-http2-compat.sh` 兼容层（与 `install.sh` 同一套、同一顺序）后重跑 ⇒ **退出码 0** |
 | E50 | 真机发布成功的自检 | 兼容层输出 `nginx 1.22.1 < 1.25.1：已降级为 listen ... ssl http2;`；`nginx -t` 通过后 reload；**首页 200 ｜ index.html 200 ｜ web/app.js 200** |
@@ -1230,9 +1258,15 @@ cd platform && node scripts/bash-var-scan.js ; echo "退出码=$?"
 | E56 | 修复 | `scripts/build-demo.js` 在**产物**里把 `const isDemo = ...` 那一行改写成 `const isDemo = true;`（源文件不动 ⇒ 正式版的 `?demo=1` 行为完全不变）。<br>⛔ **找不到那一行就构建失败**（fail-fast）：宁可构建不出来，也不发一个「打开即坏」的包 |
 | E57 | 浏览器复测（换端口避开 5 分钟缓存） | **不带任何参数**打开 ⇒ 演示横幅出现（「当前是公网演示站……规则引擎是在你的浏览器里真实运行的」）、榜单页正常渲染、**控制台 0 错误** ⇒ 访客路径打通 |
 | E58 | 真机重新发布 | `install.sh` 同步源码（退出码 0）→ `deploy-demo-site.sh` 重建并发布（退出码 0）⇒ 产物 `isDemo = true` ✅；平台本体 **8444 → 200**、**8081 → 308**、演示站 **8445 → 200**，全绿 |
-| E53 | **新增机器闸 `scripts/bash-var-scan.js`** | 扫全仓 **12 个 shell 文件，0 违规**（退出码 0）；自检通过（正反样本判定正确）。⚠️ 这个闸抓到的是**本轮真实踩的坑**：bash 允许非 ASCII 出现在标识符里 ⇒ `"$NGINX_SITE（模板…"` 会被解析成变量名 `NGINX_SITE（` ⇒ **运行时 unbound variable**（`bash -n` 查不出来）⇒ 写脚本时实际踩了 **8 处**，已全部改成 `${VAR}` |
-| E47 | 判别性用例 | `platform/test/deploy-tls-port.test.js` 增至 **24 条**（新增：308 保留 POST body 的可执行断言 + 规则写反的对照组 + reload 生效校验的三条）；变异检验 **18 个变异体**（新增 M16 退回 301 / M17 去掉校验调用 / M18 校验永远放行） |
-| E40 | 真机最终体检 | `nginx`/`xray`/`headscale`/`frps`/`mongod`/`heikesong` **全部 active**；headscale 控制台（80）仍 **200**；ACME 校验路径仍由 `default_server` 提供（探测 404 = webroot 命中）；环境文件 `COOKIE_SECURE=true`；监听端口：80 / 443(xray) / 7000(frps) / 8081(跳转) / **8444(TLS)** / 8888(HydroOJ)，应用仍只绑 `127.0.0.1:8080` |
+| E59 | ⛔ **漂移审计工具自身有 bug**（本轮由 `plan-block-sync --verify` 报「找不到代码块」而暴露） | 工具的扩展名正则写成 `(?:js\|html\|css\|sql\|json)` —— **`js` 排在 `json` 前面**、而路径部分贪婪 ⇒ `rules/tiebreak.json` 被匹配成 `rules/tiebreak.js` ⇒ 该文件在实现里明明存在，却被判成 **D(无实现)**。<br>⚠️ **D 类只计数不打印明细** ⇒ 工具「有输出」⇒ 没人发现判据本身是错的 ⇒ **18 个 `rules/*.json` 全是假阳性**，而**真正的 C-RW 被淹没在噪声里** |
+| E60 | 修工具（根因修，不是打补丁） | 扩展名清单改为**长的在前**（`json` 在 `js` 前）并加**负向断言** `(?![A-Za-z0-9])` 兜住整体匹配；路径提取抽成可测函数 `extractPath()`；**D 类开始打印明细**（只计数不列清单 ⇒ 假阳性必然静默潜伏）；新增 **`--selftest`**（正反样本判定不符即退出码 2，防假绿）；主流程用 **`import.meta.main`** 守卫（否则被 import 时就去读相对路径下的计划文件 ⇒ cwd 不对直接抛错） |
+| E61 | 修第二个归因 bug | hint 归因信号①-b 原本是「行首是反引号 ⇒ 从**整行**里挑一个路径」⇒ 散文里的**提及**被当成文件声明（`` `user_roles` 表**已在 Task 2 的 `001_init.sql` 里建好** `` ⇒ `001_init.sql` 被误归因成规格块）⇒ 收紧为「只认**行首第一个反引号 token**」 |
+| E62 | 修完后的审计数字（**旧 → 新**） | **A 151 → 166 ｜ B 4 → 6 ｜ C-EXT 59 → 61 ｜ C-RW 0 → 3 → 0 ｜ D 18 → 0**<br>⚠️ 中途 C-RW 冒出 **3** 条（`rules/points.json`、`rules/tiebreak.json`、`rules/milestones.default.json`）—— 那是被假 D 掩盖的**真漂移**（后续阶段给规则加了溯源注释/字段，实现更新了但计划块没同步）⇒ 已用 `plan-block-sync.mjs` **逐字同步回 owning 阶段计划**（P0 两份 / P3 一份）⇒ `--verify` 复验**全部逐字一致** ⇒ C-RW 归零<br>⚠️ **归因总数 232 → 233**，数量对得上 ⇒ 是**重新归因**而非丢失 |
+| E63 | 新增回归用例 | `platform/test/plan-block-audit.test.js`（**7 条**）：`.json` 整体匹配不截断 / 其它扩展名整体匹配 / 无扩展名返回 null / 工具 `--selftest` 退出码 0 / 本仓审计 D=0 且 C-RW=0 / D 类必须打印明细 / 散文提及不得被误归因 |
+| E64 | 变异检验（**判别性**） | **7 个变异体 / 7 全杀 / 0 存活 / 0 失配**：M1 扩展名顺序退回 / M2 去掉负向断言 / M3 `extractPath` 恒返回 null / M4 hint 归因退回整行挑路径 / M5 D 类明细不打印 / M6 自检判别性失效 / M7 `import.meta.main` 守卫失效 |
+| E65 | 演示站发布资产变异检验（**第 9 轮 M4/M9 修复后的复跑**） | **9 个变异体 / 9 全杀 / 0 存活 / 0 失配**：M4（去掉 `DEMO_DIR` 在 `APP_DIR` 内部的守卫）改用**行为断言**后落地被杀；M9（塞进真实违规「$变量紧跟全角括号」）锚点修正后落地被杀 |
+| E66 | 本轮全量复跑 | `cd platform && node --disable-warning=ExperimentalWarning --test` ⇒ **1371 例 / 1370 通过 / 0 失败 / 1 跳过**（测于本轮工作树；**以实跑为准**）；三个机器闸 `audit-scan` / `temp-leak-scan` / `bash-var-scan` **退出码均 0** |
+| E40 | 真机最终体检 | `nginx`/`xray`/`headscale`/`frps`/`mongod`/`heikesong` **全部 active**；headscale 控制台（80）仍 **200**；ACME 校验路径仍由 `default_server` 提供（探测 404 = webroot 命中）；环境文件 `COOKIE_SECURE=true`；监听端口：80 / 443(xray) / 7000(frps) / 8081(跳转) / **8444(TLS)** / **8445(演示站)** / 8888(HydroOJ)，应用仍只绑 `127.0.0.1:8080` |
 
 ---
 
