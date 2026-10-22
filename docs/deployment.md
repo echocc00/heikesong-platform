@@ -1087,7 +1087,88 @@ systemctl restart heikesong
 > 回滚只删**本次新增**的东西；`default`（headscale）、`headscale-tls`、xray、frps、
 > HydroOJ、mongod 一律不碰。
 
-## 18. 实跑证据台账（2026-10-21 起）
+## 18. 公网演示站（静态包）的发布
+
+> 演示站 = `node scripts/build-demo.js` 的产物：规则引擎在**浏览器里**真实运行，
+> **不启后端、不建库、不连数据库**。与平台本体是**两个独立站点、两个独立 origin**。
+> 本节形态已在真机（8.133.200.235）实跑。
+
+### 18.1 三个交付路径（选哪个都不需要「云账号」，只有第三条要）
+
+| 路径 | 需要什么 | 得到什么 |
+|---|---|---|
+| **① 独立端口的静态站**（本节形态，推荐） | 云侧放行一个 TCP 端口 | `https://8.133.200.235:8445/`；与平台**不同 origin**（cookie / localStorage 互不串） |
+| ② 对方本地起静态服务 | 对方有 Node 或 Python | 解压后 `node scripts/serve-demo.js` → `http://127.0.0.1:8090/`（**完全离线**） |
+| ③ 第三方静态托管 | **要云账号**（GitHub Pages / Cloudflare Pages / 对象存储…） | 一个公共 URL；这条路只是选项之一 |
+
+### 18.2 ⛔ 演示包不能「双击打开」
+
+`index.html` 用的是 `<script type="module">` ⇒ **ES module 受 CORS 约束** ⇒
+浏览器会拦截 `file://` 下的模块脚本（Chrome / Edge / Firefox / Safari 都拦）⇒
+**压缩包发过去双击 index.html 是打不开的**，必须「起个静态服务」（路径 ① 或 ②）。
+
+⇒ 正因如此，演示站的 `index.html` 里资源引的是**相对路径**（`./web/app.js`），
+挂到任意 base path 下都能正常加载。
+
+### 18.3 发布命令
+
+```bash
+sudo SERVER_NAME=8.133.200.235 \
+     DEMO_PORT=8445 \
+     CERT_PATH=/etc/letsencrypt/live/8.133.200.235/fullchain.pem \
+     KEY_PATH=/etc/letsencrypt/live/8.133.200.235/privkey.pem \
+     ./platform/deploy/deploy-demo-site.sh
+```
+
+这个脚本（`platform/deploy/deploy-demo-site.sh`）会依次做：
+
+1. **构建**：`cd /opt/heikesong/platform && node scripts/build-demo.js --out /opt/heikesong/demo`
+   ⇒ 演示站与平台本体**永远来自同一份源码**，不存在「演示站是旧版本」；
+2. **写 nginx 站点**（模板 `deploy/nginx-demo-static.conf`）：只发静态文件，
+   ⛔ **没有 upstream、也没有 proxy_pass** ⇒ 演示站碰不到平台的任何 API；
+3. **HTTP/2 兼容**（与 `install.sh` 同一套兼容层、同一顺序：先兼容、后替换占位符）；
+4. **nginx -t 通过才 reload**；不通过 ⇒ **回滚**（撤销站点文件与软链，坏配置不留在线上）；
+5. **实跑校验**：首页 / index.html / web/app.js 三项都必须 200，否则判失败。
+
+### 18.4 ⚠️ 云侧端口要放行
+
+主机侧**零防火墙**（iptables INPUT 0 条 / nftables 空 / firewalld 未装）⇒
+**能不能从公网访问，取决于云侧的入方向规则**。
+
+⚠️ 端口是**逐个放行**的，不是区间：实测 **8444 通、8445 不通**（8443 / 8082 / 8088 也不通）⇒
+新开一个端口就要加一条规则。
+
+### 18.5 更新演示站
+
+重跑同一条命令即可（幂等）：构建会先清空产物目录 ⇒ 不会有残留旧文件。
+⚠️ 注意：演示站的资源文件名**没有内容哈希** ⇒ 缓存只给 5 分钟（`max-age=300`），
+不要改成长期缓存，否则发新版后浏览器还用旧文件。
+
+### 18.6 回滚
+
+```bash
+rm -f /etc/nginx/sites-enabled/heikesong-demo.conf /etc/nginx/sites-available/heikesong-demo.conf
+nginx -t && systemctl reload nginx
+```
+
+> 只删**本次新增**的东西；平台本体的站点文件（`heikesong.conf` / `heikesong-tls.conf`）不碰。
+> 产物目录（`/opt/heikesong/demo`）建议先改名留档，确认无影响后再清理。
+
+### 18.7 机器闸：bash 变量名吞非 ASCII
+
+⚠️ **bash 允许非 ASCII 字符出现在标识符里** ⇒ `"$NGINX_SITE（模板…"` 里的变量名会被
+解析成 `NGINX_SITE（` ⇒ **运行时 unbound variable** ⇒ 脚本当场死。
+而 `bash -n` **查不出来**（那行语法是合法的，只是运行时才炸）。
+
+⇒ 一律写 `${VAR}`。机器闸：
+
+```bash
+cd platform && node scripts/bash-var-scan.js ; echo "退出码=$?"
+```
+
+> 这个坑本项目**踩过两次**，所以做成了闸（而不是靠人记）。
+
+## 19. 实跑证据台账（2026-10-21 起）
 
 > 全部在**临时目录**（`mktemp -d`）里做，不碰工作树的库文件。
 > 环境：macOS（darwin 27.0.0 arm64）、Node **v22.23.2**、**本机没装 nginx**（正好用来验证降级路径与探测失败路径）。
@@ -1139,6 +1220,17 @@ systemctl restart heikesong
 | E44 | 根因定位（第二个坑）：**reload 没生效却报成功** | 真机 `ps` 显示**两个 nginx master**：`445717`（真 master，10-14 启动，持 8081 监听套接字）与 `488602`（**我用来验证 `return 308` 语法的临时 `nginx -c /tmp/t308.conf`**，未杀掉）。它把 `/run/nginx.pid` 覆盖了 ⇒ `systemctl reload nginx` 的 SIGHUP **发给了那个临时进程** ⇒ 真 master 从没收到 ⇒ 磁盘上是 308、线上仍在跑 301，而 `install.sh` **退出码 0** |
 | E45 | 清理与恢复 | kill 临时进程时，systemd 把它误认成 MainPID ⇒ 对**整个 cgroup** 发 SIGTERM ⇒ 真 nginx 一并倒下（80/18443/8081/8444 全部短暂不可用）。`systemctl reset-failed nginx` + `systemctl start nginx` ⇒ `active`、MainPID 与 pid 文件一致、`nginx -t` 通过；headscale 控制台（80）**200**、https 8444 **200**、明文口 **308** |
 | E46 | 修复二：`install.sh` 加 **reload 生效校验**（`assert_nginx_reload_took_effect`） | 判据：nginx 收到 SIGHUP **一定会起新 worker**（实测配置未变时 worker 仍从 `{488927,488928}` 换到 `{488927,488955,488956}`）⇒ reload 后 worker 集合没变 ⇒ **直接失败并说清原因**，不许报成功；读不到 pid 文件/worker 集合时**放行并告警**（不误伤首次部署与 BusyBox `ps`） |
+| E48 | **真机构建演示站**（`node scripts/build-demo.js --out /opt/heikesong/demo`） | 产物 **60 个文件 / 464K**；顶层 `build-manifest.json, index.html, rules, seed, src, web`；**规则文件 12 个**、领域层文件 23 个；「✅ 领域层浏览器安全检查通过」 |
+| E49 | **真机第一次发布**（`deploy-demo-site.sh`） | ⛔ **失败**：`nginx -t` 报 `unknown directive "http2"`（nginx **1.22.1** 不认 `http2 on;`，那是 ≥ 1.25.1 的语法）⇒ **回滚按设计生效**（站点文件与软链都撤销、平台未受影响）⇒ 补上 `nginx-http2-compat.sh` 兼容层（与 `install.sh` 同一套、同一顺序）后重跑 ⇒ **退出码 0** |
+| E50 | 真机发布成功的自检 | 兼容层输出 `nginx 1.22.1 < 1.25.1：已降级为 listen ... ssl http2;`；`nginx -t` 通过后 reload；**首页 200 ｜ index.html 200 ｜ web/app.js 200** |
+| E51 | 本机验证演示站（`--resolve` 走**真证书链**，不用 `-k`） | `/` 200（715B）/ `/index.html` 200 / `/web/app.js` 200（5784B）/ `/rules/points.json` 200（1993B）；`ssl_verify=0`（**证书链真实校验通过**） |
+| E52 | ⚠️ **公网 8445 不通** | 公网侧全部 `000`（连不上）；对照：**8444 通**、8443 / 8082 / 8088 / 9090 等均不通 ⇒ 云侧是**逐个端口放行**、不是区间 ⇒ 新端口要加一条入方向规则（我此前说「8444 不需要改安全组 ⇒ 8445 也不用」是基于 8444 的经验，对 8445 **不成立**） |
+| E54 | ⚠️ **真实浏览器实测发现演示站「打开即坏」** | 用浏览器打开演示站（**不带任何参数**）⇒ 榜单页白屏报 **`Unexpected non-whitespace character after JSON at position 4 (line 1 column 5)`**；网络面板显示它在请求 `/api/me`、`/api/leaderboard/rolling` ⇒ 静态站上这两个路径全 **404** |
+| E55 | 根因 | 源前端用**查询参数**判定演示模式：`const isDemo = new URLSearchParams(window.location.search).get('demo') === '1'` ⇒ 不带 `?demo=1` 就走**真实 API 适配器**（`web/api.js`）。<br>⚠️ 同一份前端要同时当「正式版」和「演示版」，所以判定放在运行时 —— 但**对外发布的静态包没人会记得加这个参数**。⇒ 构建层必须钉死 |
+| E56 | 修复 | `scripts/build-demo.js` 在**产物**里把 `const isDemo = ...` 那一行改写成 `const isDemo = true;`（源文件不动 ⇒ 正式版的 `?demo=1` 行为完全不变）。<br>⛔ **找不到那一行就构建失败**（fail-fast）：宁可构建不出来，也不发一个「打开即坏」的包 |
+| E57 | 浏览器复测（换端口避开 5 分钟缓存） | **不带任何参数**打开 ⇒ 演示横幅出现（「当前是公网演示站……规则引擎是在你的浏览器里真实运行的」）、榜单页正常渲染、**控制台 0 错误** ⇒ 访客路径打通 |
+| E58 | 真机重新发布 | `install.sh` 同步源码（退出码 0）→ `deploy-demo-site.sh` 重建并发布（退出码 0）⇒ 产物 `isDemo = true` ✅；平台本体 **8444 → 200**、**8081 → 308**、演示站 **8445 → 200**，全绿 |
+| E53 | **新增机器闸 `scripts/bash-var-scan.js`** | 扫全仓 **12 个 shell 文件，0 违规**（退出码 0）；自检通过（正反样本判定正确）。⚠️ 这个闸抓到的是**本轮真实踩的坑**：bash 允许非 ASCII 出现在标识符里 ⇒ `"$NGINX_SITE（模板…"` 会被解析成变量名 `NGINX_SITE（` ⇒ **运行时 unbound variable**（`bash -n` 查不出来）⇒ 写脚本时实际踩了 **8 处**，已全部改成 `${VAR}` |
 | E47 | 判别性用例 | `platform/test/deploy-tls-port.test.js` 增至 **24 条**（新增：308 保留 POST body 的可执行断言 + 规则写反的对照组 + reload 生效校验的三条）；变异检验 **18 个变异体**（新增 M16 退回 301 / M17 去掉校验调用 / M18 校验永远放行） |
 | E40 | 真机最终体检 | `nginx`/`xray`/`headscale`/`frps`/`mongod`/`heikesong` **全部 active**；headscale 控制台（80）仍 **200**；ACME 校验路径仍由 `default_server` 提供（探测 404 = webroot 命中）；环境文件 `COOKIE_SECURE=true`；监听端口：80 / 443(xray) / 7000(frps) / 8081(跳转) / **8444(TLS)** / 8888(HydroOJ)，应用仍只绑 `127.0.0.1:8080` |
 

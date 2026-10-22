@@ -690,3 +690,53 @@ test('package.json 必须登记 P6 的脚本，.gitignore 必须忽略产物目�
     '.gitignore 必须有独立成行的 platform/web/dist/（产物不入库）',
   );
 });
+
+// ── 演示模式必须被「构建」钉死（不是靠访客记得加 ?demo=1）────────────────
+test('⛔ 构建产物必须强制演示模式（访客打开就是坏页面 ⇒ 不能靠 ?demo=1）', () => {
+  // 背景（真机浏览器实测）：源前端用查询参数判定 —— `?demo=1` 时用 localStorage 适配器
+  //   （web/api.demo.js），否则用真实 API 适配器（web/api.js）。
+  //   ⇒ 对外发布的静态包里，访客**不会**带 ?demo=1 ⇒ 走真实 API ⇒ 静态站上 /api/* 全 404
+  //   ⇒ 页面白屏报「Unexpected non-whitespace character after JSON」。
+  //   ⇒ 构建时把产物里的判定钉死成 true。
+  const root = mkdtempSync(join(tmpdir(), 'hks-demomode-'));
+  try {
+    const out = join(root, 'dist');
+    buildDemoSite({ outDir: out, platformDir });
+    const appJs = readFileSync(join(out, 'web', 'app.js'), 'utf8');
+    assert.match(appJs, /const isDemo = true;/, '产物里必须把 isDemo 钉成 true');
+    assert.ok(
+      !/new URLSearchParams\(window\.location\.search\)/.test(appJs),
+      '⛔ 产物里不该再靠查询参数判定（访客不会带 ?demo=1）',
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('⛔ 源前端找不到 isDemo 判定行 ⇒ 构建必须失败（fail-fast，不许发出「打开即坏」的包）', () => {
+  const root = mkdtempSync(join(tmpdir(), 'hks-demomode-bad-'));
+  try {
+    const copyRoot = join(root, 'platform');
+    mkdirSync(copyRoot, { recursive: true });
+    cpSync(join(platformDir, 'rules'), join(copyRoot, 'rules'), { recursive: true });
+    cpSync(join(platformDir, 'src', 'domain'), join(copyRoot, 'src', 'domain'), { recursive: true });
+    cpSync(join(platformDir, 'web'), join(copyRoot, 'web'), {
+      recursive: true,
+      filter: (src) => !src.includes(`${sep}dist${sep}`) && !src.endsWith(`${sep}dist`),
+    });
+    // 把 isDemo 判定行删掉（模拟源前端被重构了）
+    const appJs = join(copyRoot, 'web', 'app.js');
+    writeFileSync(appJs, readFileSync(appJs, 'utf8').replace(/^\s*const isDemo\s*=.*$/m, ''), 'utf8');
+
+    let thrown = null;
+    try {
+      buildDemoSite({ outDir: join(root, 'dist'), platformDir: copyRoot });
+    } catch (err) {
+      thrown = err;
+    }
+    assert.ok(thrown, '⛔ 找不到 isDemo 判定行必须抛错（不许默默发一个坏包）');
+    assert.match(thrown.message, /isDemo/, '报错要说清是 isDemo 判定行不见了');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

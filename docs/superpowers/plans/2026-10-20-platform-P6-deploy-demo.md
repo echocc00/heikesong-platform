@@ -6922,6 +6922,34 @@ export function buildDemoSite({
   const rootHtml = srcHtml.replace(/(src|href)="\.\/([^"]+)"/g, '$1="./web/$2"');
   writeFileSync(join(outDir, 'index.html'), rootHtml, 'utf8');
 
+  // 8.5 ⛔ 强制「演示模式」：改写**产物里**的 isDemo 判定
+  //    背景：源前端用查询参数判定 —— `?demo=1` 时用 localStorage 适配器
+  //    （web/api.demo.js），否则用真实 API 适配器（web/api.js）。
+  //    同一份前端要同时当「正式版」和「演示版」，所以判定放在运行时。
+  //    ⚠️ 但**对外发布的静态包**没人会记得加这个参数：
+  //    不带 ?demo=1 打开 ⇒ 走真实 API ⇒ 浏览器去请求 /api/* ⇒ 静态站上 404
+  //    ⇒ 页面白屏报「Unexpected non-whitespace character after JSON」。
+  //    ⇒ 构建时直接把产物里的判定钉死成 true（产物永远是演示站）。
+  //    ⛔ 找不到那一行就**构建失败**（fail-fast）：宁可构建不出来，
+  //       也不发一个「打开就是坏页面」的包。
+  const appJsPath = join(outDir, 'web', 'app.js');
+  const appJs = readFileSync(appJsPath, 'utf8');
+  const isDemoLine = /^\s*const isDemo\s*=.*$/m;
+  if (!isDemoLine.test(appJs)) {
+    throw new Error(
+      '产物 web/app.js 里找不到 `const isDemo = ...` 判定行 ⇒ 无法强制演示模式。'
+      + '（源前端结构变了 ⇒ 请同步更新 build-demo.js 的这一步，否则会发出一个「打开即坏」的包）',
+    );
+  }
+  writeFileSync(
+    appJsPath,
+    appJs.replace(
+      isDemoLine,
+      'const isDemo = true;   // build-demo.js 改写：静态演示包永远是演示模式（不需要 ?demo=1）',
+    ),
+    'utf8',
+  );
+
   // 9. 构建清单（可追溯：规则版本 + 构建时间 + 文件数）
   const manifest = {
     builtAt: new Date().toISOString(),
@@ -10801,3 +10829,51 @@ TLS 作为可选增强、不 force。
 
 ⇒ 临时进程要么用完立刻 kill（并确认 `systemctl show <unit> -p MainPID` 仍指向真 master），
 要么**别在生产机上起**。
+
+---
+
+## 第 9 轮补充：公网演示站（静态包）发布 + bash 变量名机器闸（DP-39 ~ DP-45）
+
+> 触发：用户选定「挂到现有 nginx，开 8445 端口（零新增云账号）」。
+> **结论先行**：演示站已构建并发布到真机（8445，HTTPS + 同一张证书），
+> 本机实测全 200、`ssl_verify=0`；⛔ **公网暂不通** —— 8445 不在云侧放行清单里
+> （8444 是恰好已放行的，逐个端口放行、不是区间）。
+
+### A. 三个交付路径的口径澄清（DP-39）
+
+| 编号 | 项 | 结论 |
+|---|---|---|
+| DP-39 | 「静态演示站要不要云账号」 | **不要**。用户理解正确：产物是**自包含静态包**（60 文件 / 464K，规则引擎在浏览器里跑，不启后端、不建库）。<br>⚠️ 但有一个技术前提：`index.html` 用 `<script type="module">` ⇒ **ES module 受 CORS 约束** ⇒ 浏览器拦截 `file://` 下的模块脚本 ⇒ **压缩包双击打开打不开**，必须「起个静态服务」。<br>⇒ 三条路里**只有第三方静态托管**需要云账号（GitHub Pages / Cloudflare Pages / 对象存储…），另两条都不需要。 |
+
+### B. 新增资产（DP-40 ~ DP-42）
+
+| 编号 | 项 | 设计 |
+|---|---|---|
+| DP-40 | `deploy/nginx-demo-static.conf`（**新增资产**） | 演示站专用静态站点：`listen __TLS_PORT__ ssl` + `root __DEMO_DIR__` + `try_files $uri $uri/ =404`（不列目录）+ 入口页 `no-cache`、其余 5 分钟短缓存（演示站资源**没有内容哈希** ⇒ 不能长缓存）。<br>⛔ **没有 upstream、也没有 proxy_pass** ⇒ 演示站是**独立 origin**、碰不到平台的任何 API（一旦出现 proxy_pass，它就退化成平台的第二个入口，origin 隔离也没了）。 |
+| DP-41 | `deploy/deploy-demo-site.sh`（**新增资产**） | 发布脚本：① 用**同一台机器上的同一份源码**构建（`build-demo.js --out`）⇒ 演示站与平台本体永远同步；② 写站点；③ **HTTP/2 兼容**（与 `install.sh` 同一套兼容层、同一顺序：先兼容、后替换占位符）；④ `nginx -t` 通过才 reload、**不通过就回滚**（坏配置不留在线上）；⑤ 实跑校验（首页 / index.html / web/app.js 三项必须 200）。<br>⛔ `DEMO_DIR` **不得在 `APP_DIR` 内部** —— `install.sh` 的 `copy_app` 是**镜像式同步**（目标目录里多出来的文件会被清掉）⇒ 放在里面会被删掉。 |
+| DP-42 | `scripts/bash-var-scan.js`（**新增机器闸**） | 扫全仓 shell 脚本里的「`$变量` 紧跟非 ASCII 字符」⇒ bash 允许非 ASCII 出现在标识符里 ⇒ `"$NGINX_SITE（模板…"` 会被解析成变量名 `NGINX_SITE（` ⇒ **运行时 unbound variable**，而 `bash -n` **查不出来**（语法合法、只是运行时才炸）。<br>⚠️ 这个坑本项目**踩过两次** ⇒ 做成了闸而不是靠人记。闸自带**自检**（正反样本判定不符就退出码 2）⇒ 防「一条都不判违规」的假绿。 |
+
+### C. 真机实测（DP-43 ~ DP-44）
+
+| 编号 | 步骤 | 结果 |
+|---|---|---|
+| DP-43 | **第一次发布** | ⛔ **失败**：`nginx -t` 报 `unknown directive "http2"`（nginx **1.22.1** 不认 `http2 on;`，那是 ≥ 1.25.1 的语法）⇒ **回滚按设计生效**（站点文件与软链都撤销、**平台未受影响**）⇒ 补兼容层后重跑 ⇒ **退出码 0**；首页 / index.html / web/app.js 全 **200** |
+| DP-44 | 公网可达性 | ⛔ **8445 公网不通**（全部 `000`）；对照 **8444 通**、8443 / 8082 / 8088 / 9090 均不通 ⇒ 云侧**逐个端口放行、不是区间** ⇒ 新端口要加一条入方向规则。<br>⚠️ 订正上一轮的说法：「8444 不需要改安全组 ⇒ 8445 也不用」是基于 8444 的经验，**对 8445 不成立**。 |
+
+### D. 判别性与同步（DP-45）
+
+- 新用例 `platform/test/deploy-demo-site.test.js`（**13 条**）+ `platform/test/bash-var-scan.test.js`（**5 条**）；
+  判别性对照：模板混入 `proxy_pass` / 混入 `upstream`、漏掉 HTTP/2 兼容层、去掉 `DEMO_DIR` 守卫、
+  不回滚、不校验站点内容、闸的规则放宽、闸的自检失效、脚本里塞一个真实违规。
+- **变异检验：9 个变异体 / 9 KILLED / 0 存活**。
+- 部署手册新增 **§18 公网演示站（静态包）的发布**（三个交付路径 / ES module 限制 / 发布命令 / 云侧放行 / 更新 / 回滚 / 机器闸），台账顺延为 **§19**（新增 E48–E53）。
+- 设计文档 §8 / 需求落地表：**未改动**（不新增端点、不新增编号需求）。
+- 计划块：本轮**未改动**任何既有计划代码块（新增的是独立资产）⇒ C-RW 仍为 0。
+
+### E. 浏览器实测揪出的「演示站打开即坏」（DP-46 ~ DP-48）
+
+| 编号 | 项 | 结论 |
+|---|---|---|
+| DP-46 | 症状 | 真实浏览器打开演示站（**不带任何参数**）⇒ 榜单页白屏报 `Unexpected non-whitespace character after JSON at position 4`；网络面板显示它在请求 `/api/me`、`/api/leaderboard/rolling` ⇒ 静态站上这两个路径全 **404**。 |
+| DP-47 | 根因 | 源前端用**查询参数**判定演示模式（`?demo=1` ⇒ localStorage 适配器，否则真实 API 适配器）—— 同一份前端要同时当「正式版」和「演示版」，判定只能放运行时。<br>⚠️ 但**对外发布的静态包没人会记得加这个参数** ⇒ 这是**构建层**该管的事，不是访客该记住的事。 |
+| DP-48 | 修复 | `scripts/build-demo.js` 在**产物**里把 `const isDemo = ...` 改写成 `const isDemo = true;`（**源文件不动** ⇒ 正式版的 `?demo=1` 行为一字不变）。<br>⛔ 找不到那一行 ⇒ **构建失败**（fail-fast，不发坏包）。<br>判别性：`test/demo-static.test.js` 增 2 条（产物必须钉死 / 源结构变了必须构建失败）。 |

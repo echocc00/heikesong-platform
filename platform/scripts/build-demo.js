@@ -335,6 +335,34 @@ export function buildDemoSite({
   const rootHtml = srcHtml.replace(/(src|href)="\.\/([^"]+)"/g, '$1="./web/$2"');
   writeFileSync(join(outDir, 'index.html'), rootHtml, 'utf8');
 
+  // 8.5 ⛔ 强制「演示模式」：改写**产物里**的 isDemo 判定
+  //    背景：源前端用查询参数判定 —— `?demo=1` 时用 localStorage 适配器
+  //    （web/api.demo.js），否则用真实 API 适配器（web/api.js）。
+  //    同一份前端要同时当「正式版」和「演示版」，所以判定放在运行时。
+  //    ⚠️ 但**对外发布的静态包**没人会记得加这个参数：
+  //    不带 ?demo=1 打开 ⇒ 走真实 API ⇒ 浏览器去请求 /api/* ⇒ 静态站上 404
+  //    ⇒ 页面白屏报「Unexpected non-whitespace character after JSON」。
+  //    ⇒ 构建时直接把产物里的判定钉死成 true（产物永远是演示站）。
+  //    ⛔ 找不到那一行就**构建失败**（fail-fast）：宁可构建不出来，
+  //       也不发一个「打开就是坏页面」的包。
+  const appJsPath = join(outDir, 'web', 'app.js');
+  const appJs = readFileSync(appJsPath, 'utf8');
+  const isDemoLine = /^\s*const isDemo\s*=.*$/m;
+  if (!isDemoLine.test(appJs)) {
+    throw new Error(
+      '产物 web/app.js 里找不到 `const isDemo = ...` 判定行 ⇒ 无法强制演示模式。'
+      + '（源前端结构变了 ⇒ 请同步更新 build-demo.js 的这一步，否则会发出一个「打开即坏」的包）',
+    );
+  }
+  writeFileSync(
+    appJsPath,
+    appJs.replace(
+      isDemoLine,
+      'const isDemo = true;   // build-demo.js 改写：静态演示包永远是演示模式（不需要 ?demo=1）',
+    ),
+    'utf8',
+  );
+
   // 9. 构建清单（可追溯：规则版本 + 构建时间 + 文件数）
   const manifest = {
     builtAt: new Date().toISOString(),
