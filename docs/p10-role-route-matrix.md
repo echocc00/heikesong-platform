@@ -72,7 +72,7 @@
 |---|---|---|---|---|
 | 首页（落地页） | `GET /api/event-info`、`GET /api/leaderboard/rolling` | ✅ | ✅ | 免登录，数据来自**服务端投影**（演示站与正式站同一函数，不可能漂） |
 | 榜单 | `GET /api/stages`、`GET /api/leaderboard/rolling`、`GET /api/leaderboard/tier` | ✅ | ✅ | 告警分层：匿名只看人话 + code；`detail` 只给 `audit:read` |
-| 段位榜 | 同上 | ✅ | ✅ | D 段只给本人进度卡（可见性在 API 层） |
+| 段位榜 | 同上 | ⚠️ **返回空集** | ✅ | ⛔ **正式站段位记录从不被写入**（`publishLeaderboard` 无生产调用方，台账 E149）⇒ 段位永远兜底 D 段、段位榜 `rows: []`、段位权益不解锁。**演示站是另一条实现**（浏览器内现算段位）⇒ 两边不一致。 |
 | 工作台 | `GET /api/leaderboard/rolling`、`GET /api/teams` | ✅ | ✅ | 需登录 |
 | 报名 | `POST /api/registrations`、`GET /api/registration-criteria`、`POST /api/appeals` | ✅ | ✅ | 可提交；报名结果可申诉（DP-106） |
 | 我的战队 | `GET /api/teams` | ✅ | ✅ | 只见**我参与的**队伍（与正式站同口径，E139） |
@@ -118,7 +118,8 @@
 
 | 事项 | 说明 |
 |---|---|
-| 企业确认**无法撤回/改签** | 仓储层 `softDeleteEnterpriseConfirmation` 无调用方、无对外写端点 ⇒ 一条**缺双签**的确认落库后按 R2 计 0 分且产品内修不了。<br>⇒ 界面层**如实显示**「缺跨领域评委这一签」，并在提交前**强制一次带齐双签**（从源头不产生半条确认）。台账 E141。 |
+| ⛔ **正式站的「发榜」只做了计算，没做发榜** | 「赛段发榜」页只调 `POST /api/stages/:stageId/compute` ⇒ 只写 `stage_results` + `computation_snapshots`；**名次积分台账、段位记录、榜单快照、发榜审计日志**四样都不写（那四样在 `publishLeaderboard` 里，而它**全仓无生产调用方**）。实测（真实服务端 + 隔离库）：compute 后 `points_ledger` / `tier_records` / `leaderboard_snapshots` 均为 **0 行**，段位榜与个人榜 `rows: []`；手工调一次 `publishLeaderboard` 后四样齐全、个人榜才有数据。⇒ 与「看起来已接线」的单元测试并存（测试直接调服务层函数，不经产品路径）。台账 E149。 |
+| 企业确认**无法撤回/改签** | 仓储层 `softDeleteEnterpriseConfirmation` 无调用方、无对外写端点 ⇒ 一条**缺双签**的确认落库后按 R2 计 0 分且产品内修不了。<br>⇒ 界面层**如实显示**「缺跨领域评委这一签」，并在提交前**强制一次带齐双签**（从源头不产生半条确认）。⚠️ 但**写端点不强制 `crossJudgeId`** ⇒ 直接调 API 仍能落一条 `cross_judge_id = NULL` 的半条（实测 HTTP 200）；同格重签还会撞唯一索引并冒成 **HTTP 500**。台账 E141 / E148。 |
 | 公开页 `dimension_no_scores` 重复 | 真机上同维度多队缺分 ⇒ 会出现多条措辞相同的告警。**条数不许减**（S-5 / C-05：降级必须显式展示，不静默）。 |
 | 告警正文不写队伍名 | `scoreStage` 是纯函数（无 db），队伍名要查库 ⇒ SQL 只能放仓储层，超出「只改文案分层」的范围。当前靠 `detail` 里的队伍 id 定位（有 `audit:read` 的人可见）。 |
 | 演示站只有一个身份 | 演示站是**公开演示**，只有「演示组委会」一个账号 ⇒ 角色差异要在**真机**上验（真机有管理员 / 队长 / 评委 / 企业代表四种账号）。 |
