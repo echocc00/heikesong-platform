@@ -10625,3 +10625,65 @@ TLS 作为可选增强、不 force。
    要能按部署方要求调整，得把它挪进 `rules/`（那会动规则文件计数与 `validateRules` 的期望条数）。
 3. **纯 HTTP 形态下口令明文过网** —— 轮换解决的是「口令泄露在日志/对话里」，
    解决不了「传输中被窃听」。正解是 TLS（云侧放行 443 或加 TLS 终结层）。
+
+---
+
+## 第 7 轮补充：HTTPS 升级 —— TLS + 自定义端口形态（DP-21 ~ DP-31）
+
+> 触发：用户在选项里选定「按推荐走 —— nginx 新开 8444 TLS 端口」。
+> **结论先行**：真机已上 **https://8.133.200.235:8444/**（HTTP/2，Let's Encrypt **IP 短周期证书**），
+> 明文入口 8081 已改为 **301 跳转**，`COOKIE_SECURE=true` ⇒ 登录 Cookie 带 `Secure`。
+> ⚠️ **8444 公网直接可达，全程未改安全组** —— 此前那轮只探过一组固定端口清单，8444 不在其中（属探测覆盖盲区，不是运气）。
+
+### A. 新增资产与开关（DP-21 ~ DP-24）
+
+| 编号 | 项 | 设计 |
+|---|---|---|
+| DP-21 | `deploy/nginx-tls-port.conf`（**新增资产**） | TLS 监听在自定义端口（`__TLS_PORT__` 占位）。⛔ **没有 80 端口的 server 块**：① 80 常被既有业务以 `default_server` 占用，再加一个 `server_name` 更精确的块 ⇒ **IP 直访时命中精确 server_name**（nginx 先精确后通配）⇒ 抢走别人的入口；② 证书续期靠 ACME HTTP-01，校验目录恰好挂在 80 的 `default_server` 上 ⇒ 抢 80 等于**掐断自己的续期链路**（6 天短周期证书一旦续不上，过期当天服务不可用）。⛔ **upstream 故意叫 `heikesong_app_tls`**（另两个模板叫 `heikesong_app`）：nginx 的 upstream 名是**全局**的，同名会让 `nginx -t` 报 `duplicate upstream` 且**整个 nginx 起不来**（连带把别人的业务一起带崩）。 |
+| DP-22 | `deploy/nginx-https-redirect.conf`（**新增资产**） | 明文入口只做 301 跳到 TLS 端口。**跳转目标必须显式带端口** —— `$host` **不含端口**（客户端发 `8.133.200.235:8081` 时 `$host` = `8.133.200.235`），不写端口就会跳到 443（默认 https 口）⇒ 跳了个寂寞。本模板**无 upstream 块**（不代理业务 ⇒ 不会与别的站点撞名）。 |
+| DP-23 | `install.sh` 的 `NGINX_TLS_PORT` 开关（**追加**） | 默认 **443**（不给变量时行为与「没加这个开关」完全一样）；`validate_tls_port` 在**动任何东西之前** fail-fast。两个端口开关的校验**抽成公共 `check_port`** —— 复制两份必然漂移（改一处忘一处）。 |
+| DP-24 | `nginx-http2-compat.sh` 的端口匹配（**追加**） | 降级正则从**写死 443** 改为匹配「任意数字端口 **或** `__TLS_PORT__` 占位符」。⚠️ **顺序陷阱**：install.sh 是**先跑兼容脚本、后替换占位符** ⇒ 脚本看到的永远是 `listen __TLS_PORT__ ssl;`。若只认 443，占位符形态匹配不上 ⇒ 降级时 `http2 on;` 被删、`http2` 又没补回 listen 行 ⇒ **HTTP/2 被静默丢弃**（功能不坏，但与模板声明的形态不符，且没人会发现）。 |
+
+### B. 判别性与变异（DP-25）
+
+新用例 `platform/test/deploy-tls-port.test.js`（**19 条**），含判别性对照：
+
+- 「模板混入 80 端口块 ⇒ 必须被抓到」（抢 default_server / 掐断续期）
+- 「upstream 与另两个模板撞名 ⇒ 必须被抓到」
+- 「跳转目标丢掉 TLS 端口 ⇒ 必须被抓到」（`$host` 不含端口）
+- 「端口校验被复制成两份 ⇒ 必须被抓到」（数 `必须是 1-65535 的整数` 的出现次数）
+- 「http2 降级丢失（`listen 8444 ssl;` 而不是 `ssl http2;`）⇒ 必须被抓到」
+
+**变异检验：15 个变异体 / 15 KILLED / 0 存活 / 0 失配**（详见部署手册 §18 E32）。
+
+### C. 真机上线（DP-26 ~ DP-30）
+
+| 编号 | 步骤 | 结果 |
+|---|---|---|
+| DP-26 | **部署前预检**（不写 `/etc/nginx/**`、不 reload） | `8444` 空闲；兼容脚本在 nginx 1.22.1 上正确降级为 `listen 8444 ssl http2;`；占位符**零残留**；临时主配置 `nginx -t` ⇒ `syntax is ok`（退出码 0）；**系统既有配置的 `nginx -t` 仍正常** |
+| DP-27 | **Stage 1**：`install.sh`（TLS 模板 + `NGINX_TLS_PORT=8444` + **独立站点文件** `heikesong-tls.conf` + `COOKIE_SECURE=false`） | 退出码 **0**；服务 **active**；`8444` 监听 `0.0.0.0`；**明文 8081 未受影响**（仍 200）；既有业务全 active<br>⚠️ 管理员已存在 ⇒ `seed.js` 走「已存在」分支、**口令用不上** ⇒ 真口令**不必上机**（用占位值即可） |
+| DP-28 | **Stage 2**（明文入口 301 + `COOKIE_SECURE=true`，一次完成） | 退出码 **0**；`http://…:8081/…` ⇒ **301** → `https://…:8444/…`；https 登录 ⇒ `Set-Cookie` 带 **Secure**；`/api/me`、`/api/registrations` ⇒ 200；SSE 首段 `event: connected` ✅（经 https 未缓冲） |
+| DP-29 | **公网实测** | `8444` **公网直接可达**（**未改安全组**）；首页 / 静态资源 / 健康检查 / 榜单全 200；登录 **HTTP/2 200**；`ssl_verify=0`（**真证书链校验通过**，未用 `-k`） |
+| DP-30 | **证书续期链路演练**（`certbot renew --dry-run`） | `Congratulations, all simulated renewals succeeded` ⇒ **ACME 链路未被掐断**（短周期证书的关键前置） |
+
+### D. 契约与文档同步（DP-31）
+
+| 文档 | 动作 |
+|---|---|
+| 部署手册 | 新增 **§17 HTTPS 升级**（模板选型 / 两个坑 / 两阶段切换 / 明文入口三选项 / 续期必看 / 回滚）；证据台账顺延为 **§18**（新增 E30–E40）；未覆盖项新增 **U-10**（正式形态未实跑）、**U-11**（Windows 未实跑）；**U-9 订正**为已解决 |
+| 设计文档 §8 | **未改动** —— 本轮是**部署形态**，不新增端点，端点清单仍是 58 |
+| 需求落地表 | **未改动** —— 无新增编号需求 |
+| 计划块 | 被改的两个文件（`deploy/install.sh`、`deploy/nginx-http2-compat.sh`）已用 `plan-block-sync.mjs` **逐字同步回本计划**，`--verify` 复验逐字一致 ⇒ **C-RW 归零**；两个新模板与新测试文件属**新增资产** ⇒ C-EXT，只在本台账记一句 |
+
+### E. frps 的 token —— 仍未闭环（**需要你给值**）
+
+本轮把 token 的真实状况彻底查清了（`journalctl -u frps` + 全盘搜索）：
+
+- `frps.toml` 里**现在没有 token** ⇒ 服务端期望的 token 是**空串**；
+- 客户端带 token ⇒ 「`token in login doesn't match token from configuration`」（带 token 的那批**现在全是连不上的**）；
+- 客户端**不带** token ⇒ 空串 == 空串 ⇒ **畅通无阻进了隧道**；
+- ⚛️ **该 token 的值在本机任何文件里都不存在**（`/root/frp/frpc.toml` 是测试配置、无 token；无 frps.toml 副本；shell history 无痕迹）⇒ **无法从服务器侧恢复**。
+
+⇒ 只能由你给出**现用 token 值**，我写进 `/root/frp/frps.toml`（`auth.token = "..."`）并重启 frps；
+带 token 的客户端**零改动**即可恢复，不带 token 的会被拒掉（这正是安全方向）。
+⚠️ 备选：授权生成新 token ⇒ 所有客户端都要改配置，现在能连的那批会断。

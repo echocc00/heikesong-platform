@@ -779,7 +779,7 @@ heikesong-platform 启动于 http://127.0.0.1:8080（规则版本 2026-10-20）
 | U-6 | **多机 / Postgres 方案** | 超出本阶段范围。§0.2 与 §4 只把**边界**说清楚（多机必须换 Postgres，没有第三条路） |
 | U-7 | **计划代码块原样保留，未作改动** | 计划 Task 7 的 `docs/deployment.md` 代码块在本文件里**逐字连续**保留（§0–§7），补写内容全部落在 §8–§18。计划文档本身只**追加**了「Task 7 实施台账」一章 |
 | U-8 | **systemd 侧未在真机验证** | 本手册写作环境是 macOS（无 systemd）。§8.3 的「确认生效」三条命令里，②（`systemctl show -p EnvironmentFiles`）与 ③（读 `/proc/<pid>/environ`）**未在真机跑过** —— 但 ③ 读的是内核暴露的进程环境，语义不依赖 systemd 版本。⚠️ 刻意**不用** `systemctl show -p Environment`：那条**看不到** `EnvironmentFile=` 的内容（systemd issue #14723），会让人误判「环境文件没生效」。<br>⚠️ **2026-10-21 补充**：单元文件本身已在**真机 systemd 252** 上过 `systemd-analyze verify`（零告警，见 §18 E20）；仍未验证的是「**服务真跑起来之后**那三条确认命令」（那需要真的把服务装上并启动）<br>✅ **2026-10-21 晚补充**：让路形态部署后服务**真的跑起来了**（`systemctl is-active heikesong` ⇒ `active`，`Main PID` 为 `node /opt/heikesong/platform/src/server.js`），见 §18 E25；「确认生效」三条命令仍可自行跑 |
-| U-9 | **平台在公网打不开**（真机部署后实测） | 主机侧**零防火墙规则**（iptables INPUT 0 条 / nftables 空 / firewalld 未装），`8081` 确实在监听 `0.0.0.0` ⇒ **过滤在云侧**（安全组 / 端口映射只放行了 22 / 80 / 443 / 7000 / 8888）。让路形态部署在 8081 ⇒ 机内全通（E26/E27），公网不通（E29）。<br>⇒ **不是应用问题**：在云控制台加一条 **TCP 8081** 的入方向规则即可（代码与主机配置零改动）；在此之前可用 `ssh -L 8081:127.0.0.1:8081` 本机隧道访问 |
+| U-9 | **平台在公网打不开**（真机部署后实测） | 主机侧**零防火墙规则**（iptables INPUT 0 条 / nftables 空 / firewalld 未装），`8081` 确实在监听 `0.0.0.0` ⇒ **过滤在云侧**（安全组 / 端口映射只放行了 22 / 80 / 443 / 7000 / 8888）。让路形态部署在 8081 ⇒ 机内全通（E26/E27），公网不通（E29）。<br>⇒ **不是应用问题**：在云控制台加一条 **TCP 8081** 的入方向规则即可（代码与主机配置零改动）；在此之前可用 `ssh -L 8081:127.0.0.1:8081` 本机隧道访问<br>✅ **2026-10-22 已解决**：用户放行 **TCP 8081** ⇒ 公网 `http://8.133.200.235:8081/` 实测 200（见 §18 E37）。<br>✅ **2026-10-22 再进一步**：该入口已升级为 **TLS**（`https://8.133.200.235:8444/`，见 §17），**8444 公网直接可达**（当时**未**改安全组 —— 此前只探过一组固定端口，8444 不在其中）；8081 入口已改为 **301 跳转到 https**，明文入口不再承载任何业务流量 |
 
 ---
 
@@ -899,6 +899,8 @@ curl -s -X POST http://127.0.0.1:8081/api/auth/logout-all -H 'Cookie: hk_session
 ⚠️ 纯 HTTP 形态下口令每次登录都**明文过网** ⇒ 换口令的同时把安全组来源 IP 限定住。
 
 ---
+| U-10 | **正式形态（域名 + 443 TLS）的 `install.sh` 完整执行仍未实跑** | 真机跑通的是**让路形态**（§14 纯 HTTP）与**TLS 端口形态**（§17 `nginx-tls-port.conf`）。正式形态 `deploy/nginx.conf`（80 301 → 443 + 域名）依赖**真实域名 + 80/443 空闲**，这台机两个前提都不满足 ⇒ 未跑。<br>⚠️ 但它的**关键部件已分别验过**：TLS 监听与证书挂载（§17 E35–E37）、HTTP→HTTPS 跳转（§17 E38）、HTTP/2 兼容降级（§18 E34）、证书续期链路（§18 E39） |
+| U-11 | **Windows 从未实跑** | 跨平台只验到 macOS（darwin arm64）与 Linux（Debian 12 / ext4）。`test/portability.test.js` 覆盖的是**代码层**的可移植性（路径、换行、locale 排序），不等于在 Windows 上跑过。<br>⚠️ 风险点：`install.sh` 是 bash 脚本（Windows 需 WSL/Git Bash）；`node:sqlite` 在 Windows 上路径分隔符与文件锁的行为与 POSIX 不同 |
 
 ## 17. HTTPS 升级：TLS + 自定义端口（80/443 被占，但手上有证书）
 
@@ -1072,6 +1074,17 @@ systemctl restart heikesong
 | E27 | 真机**登录链路**（经 nginx 8081，重点验 `COOKIE_SECURE=false`） | 登录 ⇒ **200**，响应头 `Set-Cookie: hk_session=…; HttpOnly; SameSite=Lax; Path=/; Max-Age=604799` —— **不带 Secure** ✅（否则明文 HTTP 下浏览器会拒收 ⇒ 登录失效）；带该 Cookie 访问 `/api/me` ⇒ **200**、`/api/registrations` ⇒ **200**；公开榜单 `/api/leaderboard/rolling` ⇒ **200**；SSE `/api/stages/ed_1/events` ⇒ 首段 `event: connected` ✅（经 nginx 未被缓冲） |
 | E28 | 真机上**既有业务未受影响**（部署前后逐项比对） | `nginx` / `xray` / `headscale` / `frps` / `mongod` **全部 active**；80 / 443 / 7000 / 8888 仍在听；`/etc/nginx/sites-enabled/` 里 `default`（headscale）与 `headscale-tls` **原样保留**，只是**新增**了 `heikesong.conf` 软链；headscale 控制台（80）仍 HTTP **200** |
 | E29 | **公网可达性实测**（从公网侧扫这台机的端口） | 公网可达的只有 **22 / 80 / 443 / 7000 / 8888** 五个端口；`8080`/`8081`/`6000`/`7001`/`18080`/`19090`/`8443`/`27017`/`18443`/`8082`/`8088`/`9090`/`10000` **全部不通**。<br>⚠️ **对照（决定性）**：主机侧 `8081` **确实在监听 0.0.0.0**（`ss -lnt` 可见），且主机**零防火墙规则**（`iptables -L INPUT` 0 条 / nftables 空 / firewalld 未装）⇒ **过滤发生在云侧**，不在主机。<br>⇒ 结论：这是**云控制台入方向规则**的事（安全组 / 端口映射）：加一条 **TCP 8081** 的入方向规则即可，**代码与主机配置零改动**。<br>⚠️ 旁证：`7001`（frp 隧道的对外端口）现在也不通，而 2026-10-14 的 frps 日志里还有人连它 ⇒ **云侧的白名单被改过** |
+| E30 | **本机全量测试**（提交 `788b582`） | **1339 例 / 1338 通过 / 0 失败 / 1 跳过**（macOS / darwin arm64，耗时 12.1 秒）；`audit-scan` 与 `temp-leak-scan` 两个机器闸**退出码均 0** |
+| E31 | 判别性用例 `platform/test/deploy-tls-port.test.js` | **19 条全绿**（含判别性对照：模板混入 80 块 / upstream 撞名 / 跳转目标丢端口 / 端口校验被架空 / http2 降级丢失） |
+| E32 | **变异检验**（`/tmp/mutate-tls-port.mjs`） | **15 个变异体 / 15 KILLED / 0 存活 / 0 失配**；覆盖：模板去 TLS、模板塞 80 块、upstream 撞名、删 SSE 关缓冲、放宽 TLS 版本下限、占位符串台、`install.sh` 不替换占位符、不调校验、默认值被改、校验复制成两份、兼容脚本退回只认 443、兼容脚本不删 `http2 on;`、证书路径写死、跳转目标丢端口、跳转模板也定义 upstream |
+| E33 | **漂移审计 + 计划块同步** | A 151 ｜ B 4 ｜ C-EXT 59 ｜ **C-RW 0** ｜ D 18；被改的两个文件（`deploy/install.sh`、`deploy/nginx-http2-compat.sh`）已用 `plan-block-sync.mjs` **逐字同步回 P6 计划块**，`--verify` 复验 ⇒ 计划第 2364 行 / 2120 行**逐字一致** |
+| E34 | **真机部署前预检**（TLS 端口形态；全程未写 `/etc/nginx/**`、未 reload） | `8444` 空闲；兼容脚本在 **nginx 1.22.1** 上正确降级为 `listen 8444 ssl http2;`（`http2 on;` 独立行已消失）；占位符**零残留**；**临时主配置** `nginx -t -c <临时>` ⇒ `syntax is ok` / `test is successful`（退出码 0）；**系统既有配置的 `nginx -t` 仍正常** |
+| E35 | **真机 Stage 1**：`install.sh`（`NGINX_TEMPLATE=…/nginx-tls-port.conf` + `NGINX_TLS_PORT=8444` + **独立站点文件** `heikesong-tls.conf` + `COOKIE_SECURE=false`） | 退出码 **0**：迁移（版本 6）/种子（管理员已存在 ⇒ **口令用不上**，故真口令不必上机）/系统单元/nginx 站点全部落地；`nginx -t` 通过后 reload；服务 **active**；`8444` 监听 `0.0.0.0`；**明文 8081 未受影响**（仍 200）；既有业务全 active |
+| E36 | 本机 TLS 验证（`curl --resolve 8.133.200.235:8444:127.0.0.1`，**不用 `-k`** ⇒ 验的是真证书链） | `ssl_verify=0`（**校验通过**）；`/api/health` ⇒ 200 `{"ok":true,...}`；首页 ⇒ 200（707 字节） |
+| E37 | **公网 https 实测** | `8444` **公网直接可达**（**未改安全组** —— 此前那轮只探过一组固定端口清单，8444 不在其中）；首页 200 / `styles.css` 200（1192B）/ `app.js` 200（5784B，`text/javascript`）/ 健康检查 200 / 公开榜单 200；登录 ⇒ **HTTP/2 200** |
+| E38 | **真机 Stage 2**（明文入口 301 + `COOKIE_SECURE=true`） | `install.sh` 退出码 **0**；`http://…:8081/api/health` ⇒ **301** → `https://8.133.200.235:8444/api/health`；https 登录 ⇒ `Set-Cookie: …; HttpOnly; SameSite=Lax; Path=/; Max-Age=604799; **Secure**`；带该 Cookie 访问 `/api/me` ⇒ 200、`/api/registrations` ⇒ 200；SSE `/api/stages/ed_1/events` ⇒ 首段 `event: connected` ✅（经 https 未被缓冲） |
+| E39 | **证书续期链路演练**（`certbot renew --dry-run`，6 天短周期证书的关键前置） | `Congratulations, all simulated renewals succeeded: /etc/letsencrypt/live/8.133.200.235/fullchain.pem (success)` ⇒ **ACME webroot 校验链路未被本次部署掐断**（TLS 模板不碰 80 就是为了这个） |
+| E40 | 真机最终体检 | `nginx`/`xray`/`headscale`/`frps`/`mongod`/`heikesong` **全部 active**；headscale 控制台（80）仍 **200**；ACME 校验路径仍由 `default_server` 提供（探测 404 = webroot 命中）；环境文件 `COOKIE_SECURE=true`；监听端口：80 / 443(xray) / 7000(frps) / 8081(跳转) / **8444(TLS)** / 8888(HydroOJ)，应用仍只绑 `127.0.0.1:8080` |
 
 ---
 
