@@ -94,7 +94,8 @@ export function homeEntryCards({ user = null, isAdmin = false } = {}) {
       { href: '#/apply', label: '报名入口' },
     ] });
   }
-  entries.push({ title: '赛事公开信息', desc: '榜单与段位，无需登录', links: [
+  entries.push({ title: '赛事公开信息', desc: '首页、榜单与段位，无需登录', links: [
+    { href: '#/', label: '赛事首页' },
     { href: '#/leaderboard', label: '看榜单' },
     { href: '#/tier', label: '段位榜' },
   ] });
@@ -109,9 +110,12 @@ export function homeEntryCards({ user = null, isAdmin = false } = {}) {
 
 /** 入口卡 HTML。 */
 export function homeEntryCardsHtml(entries) {
+  // ⚠️ **标题层级**：pageHead() 已经给了 h1，这里再用 h3 会造成 h1 → h3 跳级
+  //    （读屏用户按 H 键导航时会「跳过 H2」，层级失真）。
+  //    ⇒ 入口卡是 h1 下的**同级区块**，用 h2。
   return (entries ?? []).map((e) => `
       <article class="card home__entry">
-        <h3>${escapeHtml(e.title)}</h3>
+        <h2>${escapeHtml(e.title)}</h2>
         <p class="muted small">${escapeHtml(e.desc)}</p>
         <div class="btn-group">
           ${e.links.map((l) => `<a class="btn btn--ghost btn--sm" href="${escapeHtml(l.href)}">${escapeHtml(l.label)}</a>`).join('')}
@@ -137,8 +141,8 @@ export function renderHome(ctx) {
 
   wrap.innerHTML = `
     ${pageHead({
-      title: '华东区 AI 商业黑客松',
-      sub: '赛事总览：报名、战队、赛段、榜单都在这里。',
+      title: '赛事工作台',
+      sub: '报名、战队、赛段、榜单都在这里。赛事介绍与赛制说明在<a href="#/">首页</a>。',
     })}
     <section class="panel">
       <div class="panel__body">

@@ -12,6 +12,7 @@
 // ⚠️ 转义统一走 `web/escape.js`（P0 建立，全站唯一入口）——
 //    这里**不重复定义** escapeHtml：三个视图各写一份会漂移，且漏改一处就是一处 XSS。
 import { escapeHtml } from '../escape.js';
+import { milestoneMark } from '../icons.js';
 import {
   barRow, emptyState, errorState, loadingState, noticeState, pageHead,
   rankBadge, sectionTitle, statRow, tableWrap, tabs,
@@ -237,7 +238,7 @@ function businessRowsHtml(rows, meta) {
     const ms = Array.isArray(r?.milestones) ? r.milestones : [];
     const done = ms.filter((m) => m?.achieved);
     const items = ms.map((m) => `<li class="${m?.achieved ? 'done' : 'todo'}">`
-      + `<span class="mark" aria-hidden="true">${m?.achieved ? '☑' : '☐'}</span>`
+      + `<span class="mark">${milestoneMark(Boolean(m?.achieved))}</span>`
       + `<span>${escapeHtml(m?.label)}</span></li>`).join('');
     const total = r?.milestoneCount ?? ms.length;
     return `<article class="card biz-card">

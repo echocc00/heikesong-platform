@@ -178,11 +178,18 @@ test('死链闸：路由表必须含首页与报名页（防扫描正则失效�
 test('结构闸：首页逻辑在 views/home.js 里，app.js 只负责挂路由', () => {
   assert.ok(
     /import \{ renderHome \} from '\.\/views\/home\.js'/.test(APP_JS),
-    'app.js 必须从 views/home.js 引入首页视图',
+    'app.js 必须从 views/home.js 引入总览视图',
+  );
+  // ⚠️ P9：总览（工作台）从 `/` 迁到了 `/dashboard` —— `/` 让位给落地页。
+  //    断言要跟着改：**两条路由都要把上下文透传给视图**
+  //    （否则 ctx.api 为 undefined，页面直接崩）。
+  assert.ok(
+    /route\('\/dashboard',\s*\(\w+\)\s*=>\s*renderHome\(\w+\)\)/.test(APP_JS),
+    '工作台路由必须把上下文透传给视图（否则 ctx.api 为 undefined，页面直接崩）',
   );
   assert.ok(
-    /route\('\/',\s*\(\w+\)\s*=>\s*renderHome\(\w+\)\)/.test(APP_JS),
-    '首页路由必须把上下文透传给视图（否则 ctx.api 为 undefined，页面直接崩）',
+    /route\('\/',\s*\(\w+\)\s*=>\s*renderLanding\(\w+\)\)/.test(APP_JS),
+    '落地页必须挂在 / 并透传上下文',
   );
   assert.ok(!/function renderHome/.test(APP_JS), 'app.js 不该再自带一份 renderHome（两份实现 = 迟早走偏）');
 });

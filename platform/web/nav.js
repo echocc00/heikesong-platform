@@ -12,6 +12,7 @@
 //   任何页面拿到的数据仍然由 API 层按 capability + assignment 过滤 ——
 //   前端隐藏一个入口 ≠ 用户就看不到数据（后端仍然拦得住）。
 import { escapeHtml } from './escape.js';
+import { iconLogo, iconTheme } from './icons.js';
 
 /**
  * 角色元数据。
@@ -49,7 +50,7 @@ export const NAV_SECTIONS = [
     id: 'public',
     label: '赛事',
     items: [
-      { path: '/', label: '总览', exact: true },
+      { path: '/', label: '首页', exact: true },
       { path: '/leaderboard', label: '榜单' },
       { path: '/tier', label: '段位榜' },
     ],
@@ -59,6 +60,8 @@ export const NAV_SECTIONS = [
     label: '我的赛事',
     auth: true,
     items: [
+      // ⚠️ P9：工作台 = 原「赛事总览」仪表盘，从 `/` 迁到这里（首页让位给落地页）。
+      { path: '/dashboard', label: '工作台' },
       { path: '/apply', label: '报名' },
       { path: '/team', label: '我的战队' },
       { path: '/tasks', label: '任务清单' },
@@ -105,6 +108,8 @@ export const NAV_SECTIONS = [
  *   它不阻断任何页面的可达性 —— 真正的拦截交给服务端。
  */
 export const PROTECTED_ROUTES = [
+  // P9：工作台（原总览仪表盘）需要登录
+  { pattern: /^\/dashboard\/?$/, auth: true },
   { pattern: /^\/apply\/?$/, auth: true },
   { pattern: /^\/team\/?$/, auth: true },
   { pattern: /^\/tasks(\/|$)/, auth: true },
@@ -203,15 +208,18 @@ export function navHtml(user, path = '/') {
             <span class="user-chip__role">${escapeHtml(roleLabel(user))}</span>
           </span>
         </span>` : ''}
-    <button type="button" class="btn btn--ghost btn--sm" data-action="theme" aria-label="切换亮色 / 暗色主题">◐</button>
+    <button type="button" class="btn btn--ghost btn--sm btn--icon" data-action="theme" aria-label="切换亮色 / 暗色主题">${iconTheme(16)}</button>
     ${user
       ? '<a class="btn btn--ghost btn--sm" href="#/logout">退出</a>'
-      : '<a class="btn btn--primary btn--sm" href="#/login">登录</a>'}
+      // ⚠️ 访客的「登录」用**描边**按钮，不用实底强调色：
+      //    实底强调色留给「落地页那个唯一的主 CTA」（立即报名）——
+      //    一屏两个实底强调按钮 ⇒ 强调色就不再指向任何东西了。
+      : '<a class="btn btn--ghost btn--sm" href="#/login">登录</a>'}
   </div>`;
 
   return `<div class="topbar__inner">
     <a class="topbar__brand" href="#/">
-      <span class="topbar__logo" aria-hidden="true">⬢</span>
+      <span class="topbar__logo" aria-hidden="true">${iconLogo(18)}</span>
       <span class="topbar__names">
         <strong class="topbar__title">华东区 AI 商业黑客松</strong>
         <span class="topbar__sub">赛事平台</span>

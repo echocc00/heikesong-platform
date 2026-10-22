@@ -7160,7 +7160,7 @@ function renderDiff(d) {
     </tr>`).join('');
   return `
     <div class="row row--between">
-      <h3>复算比对</h3>
+      <h2>复算比对</h2>
       ${badge(identical ? '一致' : '不一致', identical ? 'success' : 'danger')}
     </div>
     <p class="muted small">identical = ${String(d?.identical)} · ${diffs.length} 处差异</p>
@@ -7376,7 +7376,7 @@ export function renderFlags(ctx) {
     form.innerHTML = `
       <div class="panel">
         <div class="panel__head">
-          <h3 class="panel__title">人工裁决</h3>
+          <h2 class="panel__title">人工裁决</h2>
           <p class="panel__desc">裁决只留痕、不改分：确认 = 确有异常（记入观察），驳回 = 误报（不改结果）</p>
         </div>
         <div class="panel__body">
@@ -7394,7 +7394,7 @@ export function renderFlags(ctx) {
           </div>
           <div class="panel">
             <div class="panel__head">
-              <h3 class="panel__title">证据三列</h3>
+              <h2 class="panel__title">证据三列</h2>
               <p class="panel__desc">URL / 发行方 / 独立性 —— 要么三列都填，要么都不填（缺列的证据服务端会拒收）</p>
             </div>
             <div class="panel__body">

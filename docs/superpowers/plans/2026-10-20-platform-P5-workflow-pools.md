@@ -5508,6 +5508,7 @@ Expected: FAIL —— `Cannot find module '../src/services/public-api.js'`
 import { createHash, randomBytes } from 'node:crypto';
 import { appError } from '../errors.js';
 import { applyVisibility } from '../domain/visibility.js';
+import { buildEventInfo } from '../domain/event-info.js';
 import * as tokenRepo from '../db/repo/public-tokens.js';
 import * as srcRepo from '../db/repo/pool-sources.js';
 import { buildICalendarText } from '../domain/icalendar.js';
@@ -5714,6 +5715,36 @@ function projectPublicRows(rows, rules, warnings, stageId) {
 }
 
 /**
+ * 赛事公开信息（落地页的赛制数据源）。
+ *
+ * ⚠️⚠️ **为什么要有这个投影，而不是让前端直接读 rules/**：
+ *   落地页要「介绍赛事与赛制」⇒ 前端需要赛段的起止与交付物、评审维度权重、段位表、
+ *   筛选漏斗、组队规则、名次积分、破同分链、合规红线。
+ *   这些**全部**只在 `platform/rules/*.json` 里（赛制的唯一出处），
+ *   而 rules 是**服务端**配置、浏览器读不到 ⇒ 只能由服务端投影出去。
+ *   ⇒ 前端**一个字都不许硬编码**赛制数字（改 rules/*.json 即改落地页，不必改前端）。
+ *
+ * ⛔⛔ **白名单投影，不是整体倒 rules**：
+ *   rules 里大量字段是**内部工作备注**（「此为待组委会确认口径」「首届后回测」…），
+ *   整体倒出去 = 把内部待办状态公开发布。
+ *   ⇒ 投影本身在 **src/domain/event-info.js**（纯函数、零依赖、可进浏览器），
+ *     演示站（web/api.demo.js）import **同一个函数** ⇒ 正式站与演示站的落地页内容**不可能漂移**。
+ *
+ * ⛔ **公开的是「规则」，不是「数据」**：
+ *   规则（权重、赛程、段位）本来就该公开 —— 参赛者有权知道自己被怎么评；
+ *   而**分数、名次、企业名、签字人**由 applyVisibility 负责，不在这个函数里。
+ *
+ * @param {object} rules  已加载的规则配置（src/config.js 的 loadRules 结果）
+ * @returns {object}      落地页用的赛制数据（形状固定，见 platform/test/event-info-api.test.js）
+ */
+export function getEventInfo(rules) {
+  if (!rules || typeof rules !== 'object') {
+    throw appError(500, 'RULES_MISSING', '规则配置未加载');
+  }
+  return buildEventInfo(rules);
+}
+
+/**
  * 赛程日历（iCal）。
  * 溯源：R-STG-01（5 赛段时间轴与交付物）—— 依据 INTERFACES.md §6 / 设计文档 §8
  * @param db        数据库
@@ -5886,10 +5917,12 @@ export function registerPoolsRoutes(router, { db, rules }) {
 - [ ] **Step 6: 创建 `src/http/routes/public.js`**
 
 ```javascript
-// src/http/routes/public.js — 公开接口（无需登录，token 鉴权）
-// 依据：INTERFACES.md §6 的 P5 API 清单
+// src/http/routes/public.js — 公开接口
+//   ① /api/public/* —— **token 鉴权**的公开数据（榜单 / 日历）：公开 ≠ 无鉴权。
+//   ② /api/event-info —— **免 token**的赛事规则说明（落地页用）：规则本来就该公开。
+//
 // ⚠️ token 走 query 参数（契约如此）：部署时应在 nginx 层关掉 query 串的访问日志（P6 负责）。
-import { getPublicLeaderboard, buildICalendar, resolvePublicToken } from '../../services/public-api.js';
+import { getPublicLeaderboard, buildICalendar, resolvePublicToken, getEventInfo } from '../../services/public-api.js';
 
 export function registerPublicRoutes(router, { db, rules }) {
   router.add('GET', '/api/public/leaderboard', async ({ query }) =>
@@ -5908,6 +5941,17 @@ export function registerPublicRoutes(router, { db, rules }) {
     const body = buildICalendar({ db, editionId: query.editionId });
     return { __rawText: true, body, contentType: 'text/calendar; charset=utf-8' };
   });
+
+  // ── P9：赛事规则说明（落地页）──────────────────────────────────
+  // ⚠️ **为什么它不要 token，而上面两条要**：
+  //   上面两条吐的是**比赛数据**（榜单行、赛程实例）⇒ 公开访问要有门槛（token 可撤销、可限范围）。
+  //   这一条吐的是**规则本身**（赛段、权重、段位、漏斗）⇒ 参赛者有权知道「我按什么被评」，
+  //   规则里**不含任何参赛数据**（白名单投影，见 getEventInfo）⇒ 匿名可读是应该的，
+  //   而且落地页要给「还没注册的人」看 ⇒ 不能要求先有 token。
+  //
+  // ⛔ 它返回的是**配置投影**，不是数据库查询 ⇒ 无 db 依赖、无可见性过滤需求
+  //    （规则不是「谁可见」的数据，是「大家都知道」的约定）。
+  router.add('GET', '/api/event-info', async () => getEventInfo(rules));
 }
 ```
 

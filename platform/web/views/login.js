@@ -43,9 +43,15 @@ export function renderLogin(ctx) {
   wrap.innerHTML = `
     <h1>AI 商业黑客松 · 赛事平台</h1>
     <p class="muted">用报名手机号登录</p>
-    <label>手机号<input id="phone" autocomplete="username" placeholder="13800000000" /></label>
-    <label>密码<input id="password" type="password" autocomplete="current-password" /></label>
-    <button id="submit">登录</button>
+    <label class="field">
+      <span class="field__label">手机号</span>
+      <input class="input" id="phone" autocomplete="username" placeholder="13800000000" />
+    </label>
+    <label class="field">
+      <span class="field__label">密码</span>
+      <input class="input" id="password" type="password" autocomplete="current-password" />
+    </label>
+    <button id="submit" class="btn btn--primary btn--block">登录</button>
     <p id="err" class="err"></p>
   `;
   const err = wrap.querySelector('#err');

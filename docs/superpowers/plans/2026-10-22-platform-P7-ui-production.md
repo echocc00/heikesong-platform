@@ -219,6 +219,7 @@ B1 / B2 / B4 三条都藏在 `app.js` 的异步闭包里 ⇒ 只能靠人点页�
 //
 // ⛔ 纯函数、零依赖、零 IO：只 import web/escape.js（P0 建立的全站唯一转义入口）。
 import { escapeHtml } from './escape.js';
+import { iconEmpty, iconWarn } from './icons.js';
 
 /** 语义色调白名单 —— 徽章/提示条只允许这些值，避免拼出无法识别的 class。 */
 export const TONES = ['neutral', 'brand', 'success', 'warn', 'danger', 'info'];
@@ -252,14 +253,25 @@ export function loadingState({ rows = 3, label = '正在加载…' } = {}) {
  * 空态：标题 + 解释 + 可选的下一步动作。
  * ⚠️ 「空」不等于「没有话说」——生产级空态必须告诉访客**下一步做什么**，
  *    否则用户只看到一个灰盒子（这是打磨前 11 个页面的真实状态）。
+ *
+ * @param {object}  o
+ * @param {string}  [o.title]
+ * @param {string}  [o.hint]
+ * @param {object}  [o.action]  { href, label }
+ * @param {string}  [o.titleTag='p']  标题用的标签。
+ *   ⚠️ 默认 'p'（空态多数是**页面中段**的局部状态，不能每个都抢 h1）；
+ *      只有「整页就是这一个状态」时才传 'h1' ——
+ *      路由守卫兜底页就是这种（它是整个页面的唯一内容）。
  */
-export function emptyState({ title = '暂无数据', hint = '', action = null } = {}) {
+export function emptyState({ title = '暂无数据', hint = '', action = null, titleTag = 'p' } = {}) {
   const actionHtml = action && action.label
     ? `<a class="btn btn--primary btn--sm" href="${escapeHtml(action.href ?? '#')}">${escapeHtml(action.label)}</a>`
     : '';
+  // ⚠️ titleTag 只允许白名单：它是拼进 HTML 的标签名，不能是外部输入。
+  const tag = titleTag === 'h1' ? 'h1' : 'p';
   return `<div class="state state--empty">
-    <div class="state__icon" aria-hidden="true">◍</div>
-    <p class="state__title">${escapeHtml(title)}</p>
+    <div class="state__icon" aria-hidden="true">${iconEmpty(32)}</div>
+    <${tag} class="state__title">${escapeHtml(title)}</${tag}>
     ${hint ? `<p class="state__hint">${escapeHtml(hint)}</p>` : ''}
     ${actionHtml}
   </div>`;
@@ -281,7 +293,7 @@ export function errorState({ message = '加载失败', retry = true, hint = '' }
     ? '<button type="button" class="btn btn--ghost btn--sm" data-action="retry">重试</button>'
     : '';
   return `<div class="state state--error" role="alert">
-    <div class="state__icon" aria-hidden="true">⚠</div>
+    <div class="state__icon" aria-hidden="true">${iconWarn(32)}</div>
     <p class="state__title">${escapeHtml(text)}</p>
     ${hint ? `<p class="state__hint">${escapeHtml(hint)}</p>` : ''}
     ${retryHtml}
@@ -476,6 +488,7 @@ export function sectionTitle(text, extra = '') {
 //   任何页面拿到的数据仍然由 API 层按 capability + assignment 过滤 ——
 //   前端隐藏一个入口 ≠ 用户就看不到数据（后端仍然拦得住）。
 import { escapeHtml } from './escape.js';
+import { iconLogo, iconTheme } from './icons.js';
 
 /**
  * 角色元数据。
@@ -513,7 +526,7 @@ export const NAV_SECTIONS = [
     id: 'public',
     label: '赛事',
     items: [
-      { path: '/', label: '总览', exact: true },
+      { path: '/', label: '首页', exact: true },
       { path: '/leaderboard', label: '榜单' },
       { path: '/tier', label: '段位榜' },
     ],
@@ -523,6 +536,8 @@ export const NAV_SECTIONS = [
     label: '我的赛事',
     auth: true,
     items: [
+      // ⚠️ P9：工作台 = 原「赛事总览」仪表盘，从 `/` 迁到这里（首页让位给落地页）。
+      { path: '/dashboard', label: '工作台' },
       { path: '/apply', label: '报名' },
       { path: '/team', label: '我的战队' },
       { path: '/tasks', label: '任务清单' },
@@ -569,6 +584,8 @@ export const NAV_SECTIONS = [
  *   它不阻断任何页面的可达性 —— 真正的拦截交给服务端。
  */
 export const PROTECTED_ROUTES = [
+  // P9：工作台（原总览仪表盘）需要登录
+  { pattern: /^\/dashboard\/?$/, auth: true },
   { pattern: /^\/apply\/?$/, auth: true },
   { pattern: /^\/team\/?$/, auth: true },
   { pattern: /^\/tasks(\/|$)/, auth: true },
@@ -667,15 +684,18 @@ export function navHtml(user, path = '/') {
             <span class="user-chip__role">${escapeHtml(roleLabel(user))}</span>
           </span>
         </span>` : ''}
-    <button type="button" class="btn btn--ghost btn--sm" data-action="theme" aria-label="切换亮色 / 暗色主题">◐</button>
+    <button type="button" class="btn btn--ghost btn--sm btn--icon" data-action="theme" aria-label="切换亮色 / 暗色主题">${iconTheme(16)}</button>
     ${user
       ? '<a class="btn btn--ghost btn--sm" href="#/logout">退出</a>'
-      : '<a class="btn btn--primary btn--sm" href="#/login">登录</a>'}
+      // ⚠️ 访客的「登录」用**描边**按钮，不用实底强调色：
+      //    实底强调色留给「落地页那个唯一的主 CTA」（立即报名）——
+      //    一屏两个实底强调按钮 ⇒ 强调色就不再指向任何东西了。
+      : '<a class="btn btn--ghost btn--sm" href="#/login">登录</a>'}
   </div>`;
 
   return `<div class="topbar__inner">
     <a class="topbar__brand" href="#/">
-      <span class="topbar__logo" aria-hidden="true">⬢</span>
+      <span class="topbar__logo" aria-hidden="true">${iconLogo(18)}</span>
       <span class="topbar__names">
         <strong class="topbar__title">华东区 AI 商业黑客松</strong>
         <span class="topbar__sub">赛事平台</span>
@@ -734,7 +754,7 @@ export function buildWorkflowCards(workflows) {
 export function workflowCardsHtml(cards) {
   return cards.map((c) => `
     <article class="card home__entry">
-      <h3>${escapeHtml(c.name)}</h3>
+      <h2>${escapeHtml(c.name)}</h2>
       <p class="muted small">共 ${c.total} 个任务 · 已完成 ${c.done} · 待办 ${c.open}</p>
       <div class="bar" role="img" aria-label="完成进度 ${c.percent}%">
         <span class="bar__track"><span class="bar__fill bar__fill--success" style="width:${c.percent}%"></span></span>
@@ -1154,11 +1174,22 @@ test('顶栏：已登录时显示姓名与身份；未登录时显示登录入�
   assert.ok(!anon.topbar.innerHTML.includes('报名筛选台'), '未登录不该看到组委会入口');
 });
 
-test('总览页：未登录也要有内容（首屏不能白屏）', async () => {
-  const dom = await bootApp('#/', { user: null }, 'home-anon');
+test('工作台：未登录也要有内容（首屏不能白屏）', async () => {
+  // ⚠️ P9：总览（工作台）从 `/` 迁到 `/dashboard` 并**纳入登录守卫**
+  //   （首页让位给落地页；工作台是「我的赛事」分区的一部分）。
+  // ⇒ 访客看到的是**引导页**（需要登录 + 去登录），不是空白，也不是 401 报错。
+  const dom = await bootApp('#/dashboard', { user: null }, 'home-anon');
   const html = dom.app.children?.[0]?.innerHTML ?? '';
-  assert.ok(html.includes('未登录'), `首屏必须显示未登录状态，实际：${html}`);
-  assert.ok(html.includes('赛事'), '首屏要有内容');
+  assert.ok(html.includes('需要登录'), `首屏必须说清「要登录」，实际：${html}`);
+  assert.ok(html.includes('#/login'), '必须给出「去登录」这个可执行的下一步');
+  assert.ok(html.includes('赛事') || html.includes('报名'), '首屏要有内容');
+});
+
+test('工作台：已登录才看到真正的仪表盘（反向对照：上一条不是恒绿）', async () => {
+  const dom = await bootApp('#/dashboard', { user: { id: 'u_a', name: '甲', roles: ['member'] } }, 'home-authed');
+  const html = dom.app.children?.[0]?.innerHTML ?? '';
+  assert.ok(html.includes('工作台'), `已登录应看到工作台，实际：${html}`);
+  assert.ok(!html.includes('需要登录'), '已登录不该看到引导页');
 });
 
 // ══════════════════════════════════════════════════════════════════
@@ -1194,7 +1225,7 @@ test('错误态：错误消息过一遍友好化（唯一出口 ⇒ 11 个视图
 // ══════════════════════════════════════════════════════════════════
 
 test('总览页：未登录不请求需要登录态的 /api/teams', async () => {
-  const dom = await bootApp('#/', { user: null }, 'home-no-teams');
+  const dom = await bootApp('#/dashboard', { user: null }, 'home-no-teams');
   assert.ok(
     !dom.calls.some((c) => c.includes('/api/teams')),
     `未登录不该请求 /api/teams，实际：${JSON.stringify(dom.calls)}`,
@@ -1202,7 +1233,7 @@ test('总览页：未登录不请求需要登录态的 /api/teams', async () => 
 });
 
 test('总览页：已登录才请求 /api/teams（反向对照：上一条不是恒绿）', async () => {
-  const dom = await bootApp('#/', { user: { id: 'u_a', name: '甲', roles: ['member'] } }, 'home-teams');
+  const dom = await bootApp('#/dashboard', { user: { id: 'u_a', name: '甲', roles: ['member'] } }, 'home-teams');
   assert.ok(
     dom.calls.some((c) => c.includes('/api/teams')),
     `已登录必须请求 /api/teams，实际：${JSON.stringify(dom.calls)}`,
@@ -1265,6 +1296,10 @@ async function bootDemo() {
  */
 const VIEW_ENDPOINTS = [
   { method: 'GET', path: '/api/me' },
+  // P9：落地页的赛制数据源（公开、免 token）
+  // ⚠️ 形状必须与真实后端一致 ⇒ 演示适配器**复用同一个领域层函数**
+  //    （src/domain/event-info.js），不可能漂移。
+  { method: 'GET', path: '/api/event-info' },
   { method: 'GET', path: '/api/registration-criteria' },
   { method: 'GET', path: '/api/teams' },
   { method: 'GET', path: '/api/task-packages' },
@@ -1326,6 +1361,29 @@ test('演示适配器的「端点未实现」必须用**专属错误码**（不�
       return true;
     },
   );
+});
+
+test('演示适配器的赛事规则（落地页）：形状与真实后端**逐字段一致**', async () => {
+  // ⚠️ P8 的教训：parity 闸不能只覆盖「端点存在」，必须覆盖**形状** ——
+  //    演示适配器曾把「错误的形状」锁进测试（body 里传 judgeId、进度按评委分组）。
+  const { api, rules } = await bootDemo();
+  const got = await api.get('/api/event-info');
+  const { buildEventInfo } = await import('../src/domain/event-info.js');
+  // ⚠️ 两边**必须逐字段相同**：演示站与正式站复用同一个领域层函数
+  //    ⇒ 落地页上显示的赛制不可能两边不一样。
+  assert.deepEqual(got, buildEventInfo(rules), '演示站的赛制投影与真实后端必须逐字段一致');
+  assert.ok(got.stages.length > 0, '必须有赛段');
+  assert.ok(got.scoring.initial.dimensions.length > 0, '必须有初赛权重表');
+  assert.ok(got.tiers.length > 0, '必须有段位表');
+});
+
+test('演示适配器的赛事规则：⛔ 不得夹带内部备注（白名单投影）', async () => {
+  const { api } = await bootDemo();
+  const got = await api.get('/api/event-info');
+  const dumped = JSON.stringify(got);
+  assert.ok(!dumped.includes('待组委会确认'), '内部待确认状态不得进公开响应');
+  assert.ok(!dumped.includes('note'), '内部说明字段不得出现');
+  assert.ok(!dumped.includes('awardPointsNote'), '内部口径说明不得出现');
 });
 
 test('演示适配器的报名筛选标准：形状与真实后端 buildCriteria 一致', async () => {
@@ -1674,7 +1732,8 @@ export function homeEntryCards({ user = null, isAdmin = false } = {}) {
       { href: '#/apply', label: '报名入口' },
     ] });
   }
-  entries.push({ title: '赛事公开信息', desc: '榜单与段位，无需登录', links: [
+  entries.push({ title: '赛事公开信息', desc: '首页、榜单与段位，无需登录', links: [
+    { href: '#/', label: '赛事首页' },
     { href: '#/leaderboard', label: '看榜单' },
     { href: '#/tier', label: '段位榜' },
   ] });
@@ -1689,9 +1748,12 @@ export function homeEntryCards({ user = null, isAdmin = false } = {}) {
 
 /** 入口卡 HTML。 */
 export function homeEntryCardsHtml(entries) {
+  // ⚠️ **标题层级**：pageHead() 已经给了 h1，这里再用 h3 会造成 h1 → h3 跳级
+  //    （读屏用户按 H 键导航时会「跳过 H2」，层级失真）。
+  //    ⇒ 入口卡是 h1 下的**同级区块**，用 h2。
   return (entries ?? []).map((e) => `
       <article class="card home__entry">
-        <h3>${escapeHtml(e.title)}</h3>
+        <h2>${escapeHtml(e.title)}</h2>
         <p class="muted small">${escapeHtml(e.desc)}</p>
         <div class="btn-group">
           ${e.links.map((l) => `<a class="btn btn--ghost btn--sm" href="${escapeHtml(l.href)}">${escapeHtml(l.label)}</a>`).join('')}
@@ -1717,8 +1779,8 @@ export function renderHome(ctx) {
 
   wrap.innerHTML = `
     ${pageHead({
-      title: '华东区 AI 商业黑客松',
-      sub: '赛事总览：报名、战队、赛段、榜单都在这里。',
+      title: '赛事工作台',
+      sub: '报名、战队、赛段、榜单都在这里。赛事介绍与赛制说明在<a href="#/">首页</a>。',
     })}
     <section class="panel">
       <div class="panel__body">
@@ -1971,11 +2033,18 @@ test('死链闸：路由表必须含首页与报名页（防扫描正则失效�
 test('结构闸：首页逻辑在 views/home.js 里，app.js 只负责挂路由', () => {
   assert.ok(
     /import \{ renderHome \} from '\.\/views\/home\.js'/.test(APP_JS),
-    'app.js 必须从 views/home.js 引入首页视图',
+    'app.js 必须从 views/home.js 引入总览视图',
+  );
+  // ⚠️ P9：总览（工作台）从 `/` 迁到了 `/dashboard` —— `/` 让位给落地页。
+  //    断言要跟着改：**两条路由都要把上下文透传给视图**
+  //    （否则 ctx.api 为 undefined，页面直接崩）。
+  assert.ok(
+    /route\('\/dashboard',\s*\(\w+\)\s*=>\s*renderHome\(\w+\)\)/.test(APP_JS),
+    '工作台路由必须把上下文透传给视图（否则 ctx.api 为 undefined，页面直接崩）',
   );
   assert.ok(
-    /route\('\/',\s*\(\w+\)\s*=>\s*renderHome\(\w+\)\)/.test(APP_JS),
-    '首页路由必须把上下文透传给视图（否则 ctx.api 为 undefined，页面直接崩）',
+    /route\('\/',\s*\(\w+\)\s*=>\s*renderLanding\(\w+\)\)/.test(APP_JS),
+    '落地页必须挂在 / 并透传上下文',
   );
   assert.ok(!/function renderHome/.test(APP_JS), 'app.js 不该再自带一份 renderHome（两份实现 = 迟早走偏）');
 });

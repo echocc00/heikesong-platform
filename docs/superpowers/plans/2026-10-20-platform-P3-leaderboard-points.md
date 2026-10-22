@@ -4936,6 +4936,7 @@ Run: `cd platform && node --test test/leaderboard-web.test.js` → Expected: FAI
 // ⚠️ 转义统一走 `web/escape.js`（P0 建立，全站唯一入口）——
 //    这里**不重复定义** escapeHtml：三个视图各写一份会漂移，且漏改一处就是一处 XSS。
 import { escapeHtml } from '../escape.js';
+import { milestoneMark } from '../icons.js';
 import {
   barRow, emptyState, errorState, loadingState, noticeState, pageHead,
   rankBadge, sectionTitle, statRow, tableWrap, tabs,
@@ -5161,7 +5162,7 @@ function businessRowsHtml(rows, meta) {
     const ms = Array.isArray(r?.milestones) ? r.milestones : [];
     const done = ms.filter((m) => m?.achieved);
     const items = ms.map((m) => `<li class="${m?.achieved ? 'done' : 'todo'}">`
-      + `<span class="mark" aria-hidden="true">${m?.achieved ? '☑' : '☐'}</span>`
+      + `<span class="mark">${milestoneMark(Boolean(m?.achieved))}</span>`
       + `<span>${escapeHtml(m?.label)}</span></li>`).join('');
     const total = r?.milestoneCount ?? ms.length;
     return `<article class="card biz-card">
@@ -5286,6 +5287,7 @@ export async function renderLeaderboard(ctx) {
 //   （可见性在 API 层裁决，设计文档 §6.6 / C-02）⇒ 视图**不许自己 filter**。
 // ⚠️ 转义统一走 `web/escape.js`（P0 建立，全站唯一入口）。
 import { escapeHtml } from '../escape.js';
+import { iconDot } from '../icons.js';
 import {
   badge, emptyState, errorState, loadingState, pageHead, panel,
   rankBadge, sectionTitle, statRow, tableWrap,
@@ -5385,11 +5387,19 @@ function tierStats(rows) {
   return cards;
 }
 
-/** 本人进度面板内容。 */
+/**
+ * 本人进度面板内容。
+ *
+ * ⚠️ **这里不能用 milestoneMark()**：服务层 `progress.milestones` 只给
+ *    `{ key, label }`（见 src/services/tier.js），**没有 achieved 字段** ——
+ *    「哪些已达成」这个信息服务端没给前端。
+ *    ⇒ 若此处渲染成「未达成」，就是**前端在编造状态** ⇒ 读屏用户会被告知错误信息。
+ *    ⇒ 用中性圆点（纯装饰），达成数由旁边的「已计分里程碑 N 项」承担。
+ */
 function selfBodyHtml(self) {
   const ms = Array.isArray(self?.progress?.milestones) ? self.progress.milestones : [];
   const counted = self?.milestoneCount ?? self?.progress?.milestoneCount;
-  const items = ms.map((m) => `<li class="todo"><span class="mark" aria-hidden="true">·</span>`
+  const items = ms.map((m) => `<li class="todo"><span class="mark">${iconDot(14)}</span>`
     + `<span>${escapeHtml(m.label)}</span></li>`).join('');
   return `<div class="row row--between">
       <span class="muted small">当前段位</span>
@@ -5432,6 +5442,7 @@ export async function renderTier(ctx) {
 //    代码注释里可以写，输出里不行（测试直接扫输出字符串）。
 // ⚠️ 转义统一走 `web/escape.js`（P0 建立，全站唯一入口）。
 import { escapeHtml } from '../escape.js';
+import { milestoneMark } from '../icons.js';
 import {
   badge, emptyState, errorState, loadingState, pageHead, panel,
   sectionTitle, statRow,
@@ -5510,16 +5521,16 @@ function milestoneGroup(title, items, tone, itemHtml) {
       : '<p class="muted small">暂无数据</p>'}`;
 }
 
-/** 已达成项：☑ + 标签 + 「已签」标识。 */
+/** 已达成项：✓ 图标 + 标签 + 「已签」标识。 */
 function doneItemHtml(m) {
-  return `<li class="done"><span class="mark" aria-hidden="true">☑</span>`
+  return `<li class="done"><span class="mark">${milestoneMark(true)}</span>`
     + `<span>${escapeHtml(m?.label)}</span>`
     + `${m?.signed ? `<span class="signed">${badge('已签', 'success')}</span>` : ''}</li>`;
 }
 
-/** 未达成项：☐ + 标签。 */
+/** 未达成项：○ 图标 + 标签。 */
 function todoItemHtml(m) {
-  return `<li class="todo"><span class="mark" aria-hidden="true">☐</span>`
+  return `<li class="todo"><span class="mark">${milestoneMark(false)}</span>`
     + `<span>${escapeHtml(m?.label)}</span></li>`;
 }
 

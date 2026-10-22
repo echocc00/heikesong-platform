@@ -4974,6 +4974,7 @@ import { computeStagePoints, computePersonalPoints } from '../src/domain/points.
 import { computeTier, classifyDepartment, isDataOrPrototypeMilestone } from '../src/domain/tier.js';
 import { behaviorScore } from '../src/domain/behavior.js';
 import { applyVisibility } from '../src/domain/visibility.js';
+import { buildEventInfo } from '../src/domain/event-info.js';
 
 export const STORAGE_KEY = 'hks_demo_store_v1';
 export const SEED_URL = './seed/demo-data.json';
@@ -4997,6 +4998,10 @@ export const DEMO_RULE_FILES = {
   //    （src/http/routes/registration.js 的 buildCriteria 从 rules.compliance 取）。
   //    缺它 ⇒ 演示站的报名页缺三块**明示内容**（R-ENT-11 / R-ENT-12 / 同意条款）。
   compliance: 'compliance.json',
+  // ⚠️ P9 新增：**赛段表**（赛程、交付物、晋级率）—— 落地页的赛程脊就靠它。
+  //    缺它 ⇒ 演示站的落地页**赛程是空的**（spine 没有任何节点），
+  //    而正式平台读的是服务端 loadRules（那份加载全部 17 份规则）⇒ 两边不一致。
+  schedule: 'schedule.json',
 };
 
 export function createMemoryStorage() {
@@ -5829,6 +5834,14 @@ export function createDemoApi({ storage = defaultStorage(), seed = null, rules =
     if (method === 'GET' && clean === '/api/health') {
       return { ok: true, demo: true, ruleVersion: r.tiebreak?.version ?? null };
     }
+    // ── P9：赛事规则说明（落地页）────────────────────────────────
+    // ⚠️ **与正式后端共用同一个领域层函数**（src/domain/event-info.js）——
+    //    演示站与正式站的落地页内容因此**不可能漂移**。
+    //    P8 的教训：演示适配器曾把「错误的形状」（body 传 judgeId、进度按评委分组）
+    //    锁进测试 ⇒ 形状必须**同源**，不能各写一份。
+    if (method === 'GET' && clean === '/api/event-info') {
+      return buildEventInfo(r);
+    }
     // 当前用户
     if (method === 'GET' && clean === '/api/me') {
       if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
@@ -6302,6 +6315,8 @@ export async function loadDemoRules(base = RULES_BASE) {
     points: loaded.points,
     criteria: loaded.criteria,
     compliance: loaded.compliance,
+    // ⚠️ P9：赛程表（落地页的赛程脊）
+    schedule: loaded.schedule,
   };
 }
 
@@ -7874,12 +7889,25 @@ server.listen(port, () => {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>AI 商业黑客松 · 赛事平台</title>
+  <meta name="color-scheme" content="dark light" />
+  <!-- P9：落地页需要被搜到、被分享出卡片 ⇒ 补 description 与主题色。
+       ⚠️ 主题色跟 CSS 的 --bg 同值（暗色 #0b0d12 / 亮色 #f4f6fa），
+          浏览器地址栏才不会在暗色系统上出现一条亮白边。 -->
+  <meta name="description" content="华东区 AI 商业黑客松：五段赛程、六个评审维度、公开的破同分链。赛制写在明处，报名即开始。" />
+  <meta name="theme-color" content="#0b0d12" media="(prefers-color-scheme: dark)" />
+  <meta name="theme-color" content="#f4f6fa" media="(prefers-color-scheme: light)" />
+  <title>华东区 AI 商业黑客松 · 赛事平台</title>
   <!-- 溯源需求：R-OPS-06（公网可访问：公网演示站入口页） -->
   <!-- ⚠️ 资源路径必须是相对路径：静态托管（公网演示站）可能挂在任意 base path 下 -->
   <link rel="stylesheet" href="./styles.css" />
 </head>
 <body>
+  <!-- ⚠️ 顶栏与内容容器是**两个独立元素**：
+       顶栏由 web/app.js 按角色分区渲染（登录态变化时要重画），
+       内容容器 #app 只放「当前页面的视图」——
+       两者分开 ⇒ 切页时不必重建整个页面骨架。 -->
+  <a class="skip-link" href="#app">跳到主内容</a>
+  <header id="topbar" class="topbar"></header>
   <div id="app"><div class="boot">正在加载…</div></div>
   <noscript>本演示版需要启用 JavaScript——规则引擎是在你的浏览器里真实运行的。</noscript>
   <script type="module" src="./app.js"></script>

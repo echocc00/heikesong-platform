@@ -1,5 +1,6 @@
 /* web/styles.css — 赛事平台设计系统
  * 依据：本轮（P7）「现有页面打磨到生产级」+ docs/three-port-alignment.md
+ *        ＋ 本轮（P9）「UI 重构：落地页 + 科技感」→ docs/superpowers/plans/2026-10-22-platform-P9-ui-redesign.md
  *
  * ⚠️ 打磨前这个文件只有 36 行 / 8 个颜色变量 / 一条 `.card` 规则，
  *    11 个视图共用它 ⇒ 11 个页面长得一模一样、没有任何状态样式。
@@ -9,39 +10,54 @@
  *      ② **组件层**：按钮 / 徽章 / 表格 / 指标 / 条形 / 标签页 / 表单 / 提示 / 骨架屏；
  *      ③ **状态层**：加载 / 空 / 错 三件套 + 响应式断点 + 焦点可见 + 无障碍。
  *
+ * ⚠️⚠️ **P9 换了视觉语言，但没换信息架构**：
+ *   视觉方向 = 「Midnight / Developer Tool」：暗色优先、1px 边框分隔（不用阴影）、
+ *   强调色只留给焦点环与活动态、数字一律等宽。
+ *   ⇒ 下面 ③ 之前的 token 段被整体改写，组件规则**一条没删**（11 个视图照常工作）。
+ *
  * ⛔ 零依赖、零构建：纯 CSS，无预处理器、无 @import。
+ * ⛔ **不引网络字体**：字体栈里 "IBM Plex Sans/Mono" 只是**可选增强**（装了就用），
+ *    没装就落到系统栈 —— 本机没装 ⇒ 截图即真实，不假装。
  */
 
 /* ─────────────────────────────────────────────────────────────────────────
  * ① 设计 token
  * ───────────────────────────────────────────────────────────────────────── */
 :root {
-  /* 色板 · 暗色为默认（品牌基调） */
-  --bg: #0b0e14;
-  --bg-subtle: #10141c;
-  --surface: #151a24;
-  --surface-raised: #1b2130;
-  --surface-sunken: #0e1219;
+  /* 色板 · 暗色为默认（Midnight 派生：界面后退，让数据承担对比） */
+  --bg: #0b0d12;
+  --bg-subtle: #10131a;
+  --surface: #151922;
+  --surface-raised: #1b202b;
+  --surface-sunken: #10131a;
   --overlay: rgba(4, 6, 10, 0.72);
 
   --fg: #e6e9ef;
-  --fg-strong: #f7f9fc;
+  --fg-strong: #f5f7fa;
   --fg-muted: #98a2b3;
-  --fg-subtle: #808b9b;
+  /* ⚠️ --fg-subtle 必须对**最亮的暗底**（--surface-raised）也 ≥ 4.5:1 ——
+   *    它用在 .nav-group__label / .state__icon / .stat__hint / .bar__note 上，
+   *    这些是**真实文本**，不是装饰。#7c8698 在 #1b202b 上只有 4.44:1 ⇒ 提到 #7e8899。 */
+  --fg-subtle: #7e8899;
 
-  --border: #232a38;
-  --border-strong: #313a4d;
+  --border: #232936;
+  /* ⚠️ 输入框 / 交互边界用 --border-strong：它对 --surface-sunken 的对比度 ≥ 3:1
+   *    （WCAG 1.4.11 非文本对比度）。--border 是纯装饰分隔线，不要求 3:1。 */
+  --border-strong: #55617a;
 
-  --brand: #4c8dff;
-  --brand-strong: #75a6ff;
-  --brand-soft: rgba(76, 141, 255, 0.14);
+  --brand: #7c9cff;
+  --brand-strong: #a8bfff;
+  --brand-soft: rgba(124, 156, 255, 0.14);
+  --brand-line: rgba(124, 156, 255, 0.32);
   /* ⚠️ --on-brand 是**压在 --brand 实底上的文字色**，不是「品牌色文字」。
    *    实底上的文字必须满足 4.5:1（WCAG AA 普通文本）——
-   *    白字压 #4c8dff 只有 3.20:1（不合格），
-   *    而深色底字 #0b0e14 压 #4c8dff 是 6.04:1（合格）。
+   *    白字压 #7c9cff 只有 2.6:1（不合格），
+   *    而深色底字 #0b0d12 压 #7c9cff 是 7.5:1（合格）。
    *    ⇒ 实底按钮/徽标用深色字，--brand 本身继续做「文字与描边色」
-   *      （#4c8dff 压 --bg 是 6.04:1，作为文字色合格）。 */
-  --on-brand: #0b0e14;
+   *      （#7c9cff 压 --bg 是 7.5:1，作为文字色合格）。 */
+  --on-brand: #0b0d12;
+  /* 亮底上的文字（浅色主题里反过来用） */
+  --fg-inverse: #ffffff;
 
   --success: #35c88a;
   --success-soft: rgba(53, 200, 138, 0.14);
@@ -51,20 +67,21 @@
   --danger-soft: rgba(245, 110, 114, 0.14);
   --info: #38bdf8;
   --info-soft: rgba(56, 189, 248, 0.14);
-  --on-danger: #0b0e14;
+  --on-danger: #0b0d12;
 
   /* 间距（4px 基数） */
   --sp-1: 4px;  --sp-2: 8px;   --sp-3: 12px; --sp-4: 16px;
   --sp-5: 20px; --sp-6: 24px;  --sp-8: 32px; --sp-10: 40px; --sp-12: 48px;
+  --sp-16: 64px; --sp-20: 80px;
 
-  /* 圆角 */
-  --r-sm: 6px; --r-md: 10px; --r-lg: 14px; --r-xl: 20px; --r-full: 999px;
+  /* 圆角（P9 收紧：比上一版更方 ⇒ 更技术感） */
+  --r-sm: 4px; --r-md: 6px; --r-lg: 10px; --r-xl: 14px; --r-full: 9999px;
 
   /* 字号 / 行高 */
   --fs-xs: 12px; --fs-sm: 13px; --fs-base: 14px; --fs-md: 15px;
   --fs-lg: 17px; --fs-xl: 20px; --fs-2xl: 26px; --fs-3xl: 32px;
 
-  /* 阴影 */
+  /* 阴影：⚠️ **只给浮层用**（Midnight 签名动作①：卡片之间靠 1px 边框，不靠阴影） */
   --sh-1: 0 1px 2px rgba(0, 0, 0, 0.32);
   --sh-2: 0 4px 16px rgba(0, 0, 0, 0.36);
   --sh-3: 0 12px 40px rgba(0, 0, 0, 0.48);
@@ -76,33 +93,43 @@
   --maxw: 1240px;
   --topbar-h: 60px;
 
-  /* 字体 */
-  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+  /* 字体
+   * ⚠️ "IBM Plex Sans/Mono" 是**可选增强**：装了用它，没装落到系统栈。
+   *    本仓硬约束「零依赖、零构建」⇒ 不引任何网络字体（Google Fonts）。
+   *    CJK 一律走系统栈（PingFang SC / 微软雅黑 / 思源黑体）。 */
+  --font: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
           "Hiragino Sans GB", "Microsoft YaHei", "Source Han Sans SC", sans-serif;
-  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+  --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
           "Liberation Mono", monospace;
+
+  /* 动效（P9）：两档时长 + 一条缓动；全部尊重 prefers-reduced-motion */
+  --dur-1: 120ms;
+  --dur-2: 260ms;
+  --ease: cubic-bezier(.2, .8, .2, 1);
 }
 
 /* 亮色主题：显式指定 [data-theme="light"]，或在系统偏好为亮色且未显式指定时跟随 */
 :root[data-theme="light"] {
-  --bg: #f5f7fa;
-  --bg-subtle: #eef1f6;
+  --bg: #f4f6fa;
+  --bg-subtle: #eef1f7;
   --surface: #ffffff;
   --surface-raised: #ffffff;
-  --surface-sunken: #f0f3f8;
+  --surface-sunken: #f2f5fa;
   --overlay: rgba(24, 30, 42, 0.45);
 
-  --fg: #1c2430;
-  --fg-strong: #0d1218;
-  --fg-muted: #5b6675;
-  --fg-subtle: #636d7b;
+  --fg: #161b24;
+  --fg-strong: #0b0f16;
+  --fg-muted: #566072;
+  /* ⚠️ 同上：#6b7484 在 --bg-subtle (#eef1f7) 上只有 4.16:1 ⇒ 提到 #656d7c（色相不变）。 */
+  --fg-subtle: #656d7c;
 
-  --border: #dfe4ec;
-  --border-strong: #c4ccd9;
+  --border: #dfe4ed;
+  --border-strong: #8a93a6;
 
-  --brand: #2563eb;
-  --brand-strong: #1d4ed8;
-  --brand-soft: rgba(37, 99, 235, 0.10);
+  --brand: #2f5fe0;
+  --brand-strong: #1f47b8;
+  --brand-soft: rgba(47, 95, 224, 0.10);
+  --brand-line: rgba(47, 95, 224, 0.28);
   --on-brand: #ffffff;
 
   --success: #0a6d3c;
@@ -122,24 +149,25 @@
 
 @media (prefers-color-scheme: light) {
   :root:not([data-theme="dark"]) {
-    --bg: #f5f7fa;
-    --bg-subtle: #eef1f6;
+    --bg: #f4f6fa;
+    --bg-subtle: #eef1f7;
     --surface: #ffffff;
     --surface-raised: #ffffff;
-    --surface-sunken: #f0f3f8;
+    --surface-sunken: #f2f5fa;
     --overlay: rgba(24, 30, 42, 0.45);
 
-    --fg: #1c2430;
-    --fg-strong: #0d1218;
-    --fg-muted: #5b6675;
-    --fg-subtle: #636d7b;
+    --fg: #161b24;
+    --fg-strong: #0b0f16;
+    --fg-muted: #566072;
+    --fg-subtle: #656d7c;
 
-    --border: #dfe4ec;
-    --border-strong: #c4ccd9;
+    --border: #dfe4ed;
+    --border-strong: #8a93a6;
 
-    --brand: #2563eb;
-    --brand-strong: #1d4ed8;
-    --brand-soft: rgba(37, 99, 235, 0.10);
+    --brand: #2f5fe0;
+    --brand-strong: #1f47b8;
+    --brand-soft: rgba(47, 95, 224, 0.10);
+    --brand-line: rgba(47, 95, 224, 0.28);
     --on-brand: #ffffff;
 
     --success: #0a6d3c;
@@ -173,7 +201,7 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-h1, h2, h3, h4 { margin: 0; color: var(--fg-strong); font-weight: 650; line-height: 1.3; }
+h1, h2, h3, h4 { margin: 0; color: var(--fg-strong); font-weight: 650; line-height: 1.3; text-wrap: balance; }
 h1 { font-size: var(--fs-2xl); }
 h2 { font-size: var(--fs-xl); }
 h3 { font-size: var(--fs-lg); }
@@ -183,6 +211,11 @@ li { margin-bottom: var(--sp-1); }
 a { color: var(--brand); text-decoration: none; }
 a:hover { text-decoration: underline; }
 code, .mono { font-family: var(--mono); font-size: 0.92em; }
+
+/* ⚠️ 选中态：浏览器默认的高饱和蓝压在暗底上很难读（深蓝底 + 深蓝字 = 看不见）。
+ *    统一用「强调色半透明底 + 强调色字」，两边都读得出来。 */
+::selection { background: var(--brand-soft); color: var(--fg-strong); }
+
 pre {
   margin: 0 0 var(--sp-3);
   padding: var(--sp-3);
@@ -362,10 +395,13 @@ pre {
 .btn.is-static { cursor: default; color: var(--fg-muted); }
 .btn.is-static:hover { filter: none; }
 .btn-group { display: inline-flex; gap: var(--sp-2); flex-wrap: wrap; }
+/* 仅图标按钮（主题切换）：固定成方形，避免图标左右有多余空白 */
+.btn--icon { padding: var(--sp-2); width: 32px; height: 32px; }
 
 /* ⚠️ **图标尺寸**：SVG 图标必须显式给尺寸，否则在 flex 容器里会被拉伸变形。
- *    图标默认垂直居中（inline-block 的 baseline 对齐会让它偏下 1-2px）。 */
-.icon { flex: 0 0 auto; vertical-align: middle; }
+ *    图标默认垂直居中（inline-block 的 baseline 对齐会让它偏下 1-2px）。
+ *    ⚠️ .icon 的完整规则在下方「⑩ 内联 SVG 图标」段（P8 补的）——**只留一处**，
+ *    两处重复定义会让「谁生效」取决于源码顺序（实测踩过：fill 被覆盖成实心块）。 */
 
 /* ─────────────────────────────────────────────────────────────────────────
  * ⑦ 徽章 / 状态
@@ -414,7 +450,7 @@ pre {
 .state--loading { border-style: solid; border-color: var(--border); background: var(--surface); }
 
 .spinner {
-  width: 22px; height: 22px; border-radius: 50%;
+  width: 22px; height: 22px; border-radius: var(--r-full);
   border: 2px solid var(--border-strong); border-top-color: var(--brand);
   animation: spin .8s linear infinite;
 }
@@ -511,8 +547,14 @@ pre {
 .bar { display: grid; grid-template-columns: minmax(96px, 26%) 1fr auto; gap: var(--sp-3); align-items: center; margin-bottom: var(--sp-2); }
 .bar__label { font-size: var(--fs-sm); color: var(--fg-muted); }
 /* 内联 SVG 图标（web/icons.js）：跟着所在文字的颜色走，别变成一个异色方块。
-   ⚠️ P8 的 class 差集核对查出来的**唯一**一个缺口（P6 遗留）。 */
-.icon { flex: none; fill: currentColor; vertical-align: -0.15em; }.bar__track { height: 8px; border-radius: var(--r-full); background: var(--surface-sunken); overflow: hidden; }
+   ⚠️ P8 的 class 差集核对查出来的**唯一**一个缺口（P6 遗留）。
+   ⚠️ **fill 必须是 none**：本项目的图标是**描边型**（stroke=currentColor），
+      若在 .icon 上写 `fill: currentColor`，CSS 的 fill 会**覆盖** SVG 元素上的
+      fill="none" 表现属性 ⇒ 描边图形被填成实心块（2026-10-22 实测截图确认：
+      收件箱图标变成一块实心梯形）。
+      ⇒ 填充色由**各个图形自己**声明（需要实心的路径显式写 fill="currentColor"）。 */
+.icon { flex: none; fill: none; vertical-align: -0.15em; }
+.bar__track { height: 8px; border-radius: var(--r-full); background: var(--surface-sunken); overflow: hidden; }
 .bar__fill { display: block; height: 100%; border-radius: var(--r-full); background: var(--brand); }
 .bar__fill--success { background: var(--success); }
 .bar__fill--warn { background: var(--warn); }
@@ -541,7 +583,11 @@ pre {
 
 .milestones { list-style: none; padding: 0; margin: 0; }
 .milestones li { display: flex; align-items: flex-start; gap: var(--sp-2); margin-bottom: var(--sp-2); font-size: var(--fs-sm); }
-.milestones .mark { color: var(--fg-subtle); }
+/* ⚠️ .mark 现在装的是**内联 SVG**（不是 emoji 字符）：
+ *    - display:inline-flex + line-height:0 ⇒ SVG 紧贴文字顶边，不被行高撑开；
+ *    - 颜色走 currentColor ⇒ .done / .todo 的着色规则继续生效（SVG 是描边字形，
+ *      靠 stroke="currentColor" 继承，跟 emoji 的彩色位图是两回事）。 */
+.milestones .mark { display: inline-flex; align-items: center; line-height: 0; color: var(--fg-subtle); }
 .milestones .done { color: var(--fg-strong); }
 .milestones .done .mark { color: var(--success); }
 .milestones .todo { color: var(--fg-muted); }
@@ -563,6 +609,10 @@ pre {
   border: 1px solid var(--border-strong); border-radius: var(--r-md);
   font: inherit; font-size: var(--fs-base);
 }
+/* ⚠️ **placeholder 必须显式设色**：浏览器默认是 rgb(117,117,117)，
+ *    在**两种主题下都一样** —— 暗色主题里它是 4.06:1（不合格），
+ *    亮色主题里也偏淡。⇒ 统一用 --fg-subtle（两套主题都已 ≥4.5:1）。 */
+.input::placeholder, .textarea::placeholder, .select::placeholder { color: var(--fg-subtle); opacity: 1; }
 .input:focus, .select:focus, .textarea:focus { border-color: var(--brand); outline: none; box-shadow: 0 0 0 3px var(--brand-soft); }
 .textarea { min-height: 96px; resize: vertical; }
 .select { appearance: none; padding-right: var(--sp-8); background-image: none; }
@@ -607,7 +657,7 @@ label > input, label > select, label > textarea { margin-top: var(--sp-1); }
 .home__hello { margin: 0 0 var(--sp-4); font-size: var(--fs-lg); }
 .home__kpi { margin: 0; }
 .home__entry { display: flex; flex-direction: column; gap: var(--sp-2); height: 100%; margin-bottom: 0; }
-.home__entry h3 { margin: 0; }
+.home__entry h2 { margin: 0; font-size: var(--fs-lg); }
 .home__entry .btn-group { margin-top: auto; }
 
 .card-view, .leaderboard-view, .tier-view { display: block; }
@@ -654,12 +704,411 @@ label > input, label > select, label > textarea { margin-top: var(--sp-1); }
   .bar__track { grid-column: 1 / -1; }
 }
 
+/* ─────────────────────────────────────────────────────────────────────────
+ * ⑯ 触控目标（Apple HIG 44×44 / WCAG 2.5.5 AA）
+ * ─────────────────────────────────────────────────────────────────────────
+ * ⚠️ **只在真触屏上放大**，桌面鼠标不需要 —— 鼠标能精确指着 29px 的链接点，
+ *    手指点不准。
+ * ⚠️ 用 `@media (pointer: coarse)` 而不是屏幕宽度：窄窗口的桌面浏览器
+ *    仍然用鼠标，不该被放大（放大会让顶栏挤成两行）。
+ * ⚠️ 放大的方式是**加内边距**，不是加字号 —— 字号不变，视觉密度不变，
+ *    只是可点区域变大了。
+ */
+@media (pointer: coarse) {
+  .nav-link { padding-top: var(--sp-3); padding-bottom: var(--sp-3); }
+  .topbar__brand { padding-top: var(--sp-2); padding-bottom: var(--sp-2); }
+  /* ⚠️ 44px 的算法：内容高（--fs-sm 13px × 1.65 行高 ≈ 21px）+ 上下内边距 2×p + 上下边框 2px
+   *    ⇒ 44 - 21 - 2 = 21 ⇒ p ≈ 10.5px ⇒ 取 --sp-3 (12px) ⇒ 实测 47px（够）。 */
+  .btn { padding-top: var(--sp-3); padding-bottom: var(--sp-3); }
+  .btn--sm { padding-top: var(--sp-3); padding-bottom: var(--sp-3); }
+  .btn--icon { width: 44px; height: 44px; padding: var(--sp-3); }
+  .tab { padding-top: var(--sp-3); padding-bottom: var(--sp-3); }
+  .topbar__user .btn { min-width: 44px; }
+  .skip-link { padding-top: var(--sp-3); padding-bottom: var(--sp-3); }
+  /* 表单控件：正文 14px × 1.65 ≈ 23px + 2×p + 2px 边框 ⇒ 44px 需 p ≈ 9.5px ⇒ 取 --sp-3 */
+  .input, .select, .textarea { padding-top: var(--sp-3); padding-bottom: var(--sp-3); }
+  .textarea { min-height: 96px; }
+}
+
 @media (max-width: 560px) {
   .card, .panel__body { padding: var(--sp-4); }
   .page__title { font-size: var(--fs-xl); }
   .stat__value { font-size: var(--fs-xl); }
   .user-chip__meta { display: none; }
   .table th, .table td { padding: var(--sp-2) var(--sp-3); }
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * ⑰ P9 · 落地页（landing）与「规则即图形」组件层
+ * ─────────────────────────────────────────────────────────────────────────
+ * ⛔ **签名元素**：本赛事每一条规则都用**同一个几何语法**呈现，从不用段落散文 ——
+ *    条(bar)=权重 · 脊(spine)=赛程 · 阶(ladder)=段位 · 流(funnel)=漏斗。
+ *    一个语法、四种载体 ⇒ 这页是「黑客松的赛制页」，不是通用 SaaS 首页。
+ *
+ * ⛔ **强调色纪律**：每屏强调色元素 ≤ 3（主 CTA + 焦点环 + 活动节点）。
+ *    所以下面所有 .is-active / --accent 变体都是**单选**态，不是装饰。
+ * ⛔ **卡片零阴影**：靠 1px 边框分隔（Midnight 签名动作①）。
+ */
+.landing { display: block; }
+
+/* ── ① Hero ──────────────────────────────────────────────────────── */
+/* 背景 = 细网格（工程图纸感）+ 顶部一层极淡的强调色辉光。 */
+.landing__hero {
+  position: relative;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--r-xl);
+  background-color: var(--surface);
+  background-image:
+    linear-gradient(var(--brand-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--brand-line) 1px, transparent 1px);
+  background-size: 48px 48px;
+  background-position: center top;
+}
+.landing__hero::before {
+  /* 指针辉光层：位置由 JS 写 --glow-x / --glow-y（无 JS 时不移动，也不报错） */
+  content: "";
+  position: absolute; inset: 0;
+  pointer-events: none;
+  background: radial-gradient(
+    420px circle at var(--glow-x, 50%) var(--glow-y, 0%),
+    var(--brand-soft), transparent 70%
+  );
+  opacity: .9;
+}
+.landing__hero-grid {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1.05fr) minmax(0, 0.95fr);
+  gap: var(--sp-10);
+  padding: var(--sp-12) var(--sp-10);
+}
+@media (max-width: 900px) {
+  .landing__hero-grid { grid-template-columns: 1fr; gap: var(--sp-8); padding: var(--sp-8) var(--sp-5); }
+}
+
+/* 等宽 eyebrow：所有小标签用等宽 + 字距 ⇒ 「控制台」而不是「海报」 */
+.landing__eyebrow {
+  display: inline-flex; align-items: center; gap: var(--sp-2);
+  margin: 0 0 var(--sp-4);
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--brand);
+}
+/* 登录状态行：首屏必须**一眼看出自己是谁**（访客 vs 已登录）。 */
+.landing__hello { margin: 0 0 var(--sp-3); color: var(--fg-muted); font-size: var(--fs-sm); }
+.landing__hello strong { color: var(--fg-strong); }
+.landing__eyebrow::before {
+  content: "";
+  width: 18px; height: 1px;
+  background: var(--brand);
+}
+
+/* ⚠️ **全页唯一的 oversized moment**（契约 M5）：
+ *    hero 标题 30–40px，其余标题一律 ≤ 24px。
+ *    紧字距 + 中等字重 ⇒ 读起来像赛事控制台，不像创业公司落地页。 */
+.landing__title {
+  margin: 0 0 var(--sp-4);
+  font-size: clamp(30px, 4.2vw, 40px);
+  line-height: 1.15;
+  letter-spacing: -.02em;
+  font-weight: 650;
+  /* ⚠️ 中文默认**可以在任意两字之间断行** ⇒ 窄屏上「方案」会被拆成「方 / 案」。
+ *    keep-all 让它按「词」断（方案、问题、接住…），技术文档的中文排版基本都这么做。 */
+  word-break: keep-all;
+}
+.landing__lede {
+  margin: 0 0 var(--sp-6);
+  max-width: 46ch;
+  color: var(--fg-muted);
+  font-size: var(--fs-lg);
+  line-height: 1.6;
+}
+.landing__cta { display: flex; gap: var(--sp-3); flex-wrap: wrap; margin-bottom: var(--sp-8); }
+.landing__cta .btn { padding: var(--sp-3) var(--sp-5); font-size: var(--fs-md); }
+.landing__cta-note {
+  width: 100%;
+  margin: 0;
+  color: var(--fg-subtle);
+  font-size: var(--fs-sm);
+}
+
+/* 关键数字：等宽 + tabular-nums（Midnight 签名动作③「可复制回终端的值」） */
+.landing__stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(128px, 1fr));
+  gap: 1px;
+  background: var(--border);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  overflow: hidden;
+}
+.landing__stat { padding: var(--sp-4); background: var(--surface); }
+.landing__stat-value {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: var(--fs-2xl);
+  font-weight: 600;
+  line-height: 1.1;
+  color: var(--fg-strong);
+  font-variant-numeric: tabular-nums;
+}
+.landing__stat-label { margin: var(--sp-1) 0 0; color: var(--fg-muted); font-size: var(--fs-xs); }
+
+/* ── ② 赛程脊（spine）──────────────────────────────────────────────── */
+/* 竖线 + 节点：每个节点是一个**按钮**（可点、可聚焦），右栏详情随之切换。 */
+.spine { position: relative; padding-left: var(--sp-6); }
+.spine::before {
+  content: "";
+  position: absolute; left: 7px; top: 10px; bottom: 10px;
+  width: 1px;
+  background: var(--border-strong);
+}
+.spine__node {
+  position: relative;
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: var(--sp-2) var(--sp-3);
+  margin-bottom: var(--sp-1);
+  border: 1px solid transparent;
+  border-radius: var(--r-md);
+  background: transparent;
+  color: var(--fg-muted);
+  font: inherit;
+  cursor: pointer;
+  transition: background-color var(--dur-1) var(--ease), color var(--dur-1) var(--ease);
+}
+.spine__node:hover { background: var(--surface-raised); color: var(--fg); }
+.spine__node::before {
+  content: "";
+  position: absolute; left: -22px; top: 14px;
+  width: 9px; height: 9px;
+  border-radius: var(--r-full);
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+}
+/* 活动节点：唯一使用强调色的非 CTA 元素 */
+.spine__node.is-active {
+  background: var(--brand-soft);
+  border-color: var(--brand-line);
+  color: var(--fg-strong);
+}
+.spine__node.is-active::before { background: var(--brand); border-color: var(--brand); }
+.spine__node-head { display: flex; align-items: baseline; gap: var(--sp-2); }
+.spine__node-key {
+  font-family: var(--mono); font-size: var(--fs-xs);
+  color: var(--fg-subtle); letter-spacing: .06em;
+}
+.spine__node.is-active .spine__node-key { color: var(--brand); }
+.spine__node-name { font-weight: 600; color: var(--fg-strong); font-size: var(--fs-base); }
+.spine__node-date {
+  font-family: var(--mono); font-size: var(--fs-xs);
+  color: var(--fg-subtle); font-variant-numeric: tabular-nums;
+}
+.spine__detail {
+  margin-top: var(--sp-4);
+  padding: var(--sp-4);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-sunken);
+}
+.spine__detail-title { margin: 0 0 var(--sp-2); font-size: var(--fs-base); color: var(--fg-strong); }
+.spine__detail-list { margin: 0; padding-left: var(--sp-5); color: var(--fg-muted); font-size: var(--fs-sm); }
+.spine__detail-list li { margin-bottom: var(--sp-1); }
+.spine__detail-note {
+  margin: var(--sp-3) 0 0;
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--border);
+  color: var(--fg-subtle); font-size: var(--fs-xs);
+}
+
+/* ── ③ 分节 ──────────────────────────────────────────────────────── */
+.landing__section { margin-top: var(--sp-16); }
+.landing__section-head { margin-bottom: var(--sp-6); max-width: 62ch; }
+.landing__section-title {
+  margin: 0 0 var(--sp-2);
+  font-size: var(--fs-xl);
+  letter-spacing: -.01em;
+}
+.landing__section-desc { margin: 0; color: var(--fg-muted); font-size: var(--fs-base); }
+
+.rulegrid { display: grid; gap: var(--sp-4); grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+/* ⚠️ **成对布局**：auto-fit 在 1200px 内容宽下会排成 3 列 ⇒ 4 个 tile 变成「3 + 1」的残行。
+ *    ⇒ 需要成对的分节显式用 --2（2×2），单数 tile 会被拉成半宽的空位。
+ *    窄屏一律回落成 1 列。 */
+.rulegrid--2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+@media (max-width: 860px) {
+  .rulegrid, .rulegrid--2 { grid-template-columns: 1fr; }
+}
+.ruletile {
+  padding: var(--sp-5);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  background: var(--surface);
+}
+.ruletile--wide { grid-column: 1 / -1; }
+.ruletile__head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--sp-3); margin-bottom: var(--sp-4); }
+.ruletile__title { margin: 0; font-size: var(--fs-md); color: var(--fg-strong); }
+.ruletile__meta { font-family: var(--mono); font-size: var(--fs-xs); color: var(--fg-subtle); font-variant-numeric: tabular-nums; }
+.ruletile__desc { margin: 0 0 var(--sp-3); color: var(--fg-muted); font-size: var(--fs-sm); }
+
+/* ── ④ 权重条（bar）───────────────────────────────────────────────── */
+/* 权重是赛制里最该被「看见」的数字 ⇒ 给它一条真实的比例条。 */
+.weightbars { display: flex; flex-direction: column; gap: var(--sp-3); }
+.weightbar { display: grid; grid-template-columns: 8rem 1fr 4rem; gap: var(--sp-3); align-items: center; }
+.weightbar__label { font-size: var(--fs-sm); color: var(--fg); }
+.weightbar__seat {
+  display: block;
+  font-family: var(--mono); font-size: var(--fs-xs);
+  color: var(--fg-subtle);
+}
+.weightbar__track { height: 8px; border-radius: var(--r-full); background: var(--surface-sunken); overflow: hidden; border: 1px solid var(--border); }
+.weightbar__fill {
+  display: block; height: 100%;
+  border-radius: var(--r-full);
+  background: var(--brand);
+  width: var(--w, 0%);
+  transform-origin: left center;
+}
+.weightbar__value {
+  font-family: var(--mono); font-size: var(--fs-sm);
+  color: var(--fg-strong); text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+/* 悬停某维度 ⇒ 对应条高亮（权重条与维度表一一对应） */
+.weightbar:hover .weightbar__fill { background: var(--brand-strong); }
+.weightbar.is-active .weightbar__fill { background: var(--brand-strong); }
+
+/* ── ⑤ 段位阶（ladder）────────────────────────────────────────────── */
+.ladder { display: grid; gap: 1px; background: var(--border); border: 1px solid var(--border); border-radius: var(--r-lg); overflow: hidden; }
+.ladder__step {
+  display: grid;
+  grid-template-columns: 3rem minmax(6rem, 1fr) minmax(8rem, 2fr);
+  gap: var(--sp-3);
+  align-items: center;
+  padding: var(--sp-3) var(--sp-4);
+  background: var(--surface);
+  transition: background-color var(--dur-1) var(--ease);
+}
+.ladder__step:hover { background: var(--surface-raised); }
+.ladder__key {
+  display: inline-grid; place-items: center;
+  width: 26px; height: 26px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--border-strong);
+  background: var(--surface-raised);
+  font-family: var(--mono); font-size: var(--fs-sm); font-weight: 600;
+  color: var(--fg-strong);
+}
+.ladder__name { font-weight: 600; color: var(--fg-strong); font-size: var(--fs-base); }
+.ladder__req { display: block; color: var(--fg-subtle); font-size: var(--fs-xs); font-weight: 400; }
+.ladder__benefits { margin: 0; padding-left: var(--sp-5); color: var(--fg-muted); font-size: var(--fs-sm); }
+.ladder__benefits li { margin-bottom: 0; }
+.ladder__none { color: var(--fg-subtle); font-size: var(--fs-sm); }
+
+/* ── ⑥ 漏斗流（funnel）────────────────────────────────────────────── */
+.funnel { display: flex; flex-direction: column; gap: var(--sp-2); }
+.funnel__stage {
+  display: grid;
+  grid-template-columns: 8rem 1fr 4rem;
+  gap: var(--sp-3);
+  align-items: center;
+}
+.funnel__label { font-size: var(--fs-sm); color: var(--fg); }
+.funnel__track { height: 26px; border-radius: var(--r-sm); background: var(--surface-sunken); border: 1px solid var(--border); overflow: hidden; }
+.funnel__bar {
+  display: block; height: 100%;
+  background: linear-gradient(90deg, var(--brand), var(--brand-strong));
+  width: var(--w, 0%);
+  border-radius: var(--r-sm);
+  transition: width var(--dur-2) var(--ease);
+}
+.funnel__rate {
+  font-family: var(--mono); font-size: var(--fs-sm);
+  color: var(--fg-strong); text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── ⑦ 破同分链 / 行为分 / 红线：紧凑列表 ────────────────────────── */
+.chain { display: flex; flex-wrap: wrap; gap: var(--sp-2); }
+.chain__item {
+  display: inline-flex; align-items: center; gap: var(--sp-2);
+  padding: var(--sp-1) var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--r-full);
+  background: var(--surface-sunken);
+  font-size: var(--fs-sm);
+  color: var(--fg);
+}
+.chain__order { font-family: var(--mono); font-size: var(--fs-xs); color: var(--fg-muted); }
+.chain__scope { font-family: var(--mono); font-size: var(--fs-xs); color: var(--fg-subtle); }
+
+.redlines { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: var(--sp-2); }
+.redlines li {
+  display: grid; grid-template-columns: 1.25rem 1fr; gap: var(--sp-2);
+  align-items: start;
+  margin: 0;
+  color: var(--fg-muted); font-size: var(--fs-sm);
+}
+.redlines__mark { color: var(--warn); line-height: 1.5; }
+
+/* ── ⑧ CTA 带 ────────────────────────────────────────────────────── */
+.ctaband {
+  margin-top: var(--sp-16);
+  padding: var(--sp-10);
+  border: 1px solid var(--border);
+  border-radius: var(--r-xl);
+  background: var(--surface);
+  display: flex; align-items: center; justify-content: space-between;
+  gap: var(--sp-6); flex-wrap: wrap;
+}
+.ctaband__title { margin: 0 0 var(--sp-2); font-size: var(--fs-xl); }
+.ctaband__desc { margin: 0; color: var(--fg-muted); font-size: var(--fs-base); max-width: 52ch; }
+.ctaband__actions { display: flex; gap: var(--sp-3); flex-wrap: wrap; }
+.ctaband .btn { padding: var(--sp-3) var(--sp-5); }
+
+.landing__footer {
+  margin-top: var(--sp-12);
+  padding-top: var(--sp-6);
+  border-top: 1px solid var(--border);
+  display: flex; justify-content: space-between; gap: var(--sp-4); flex-wrap: wrap;
+  color: var(--fg-subtle); font-size: var(--fs-xs);
+}
+.landing__footer-links { display: flex; gap: var(--sp-4); flex-wrap: wrap; }
+/* ⚠️ 落地页页脚链接在窄屏上只有 20px 高 —— 手指点不准。
+ *    与全局触控目标规则同口径（pointer: coarse 时加内边距，字号不变）。 */
+@media (pointer: coarse) {
+  .landing__footer-links a { padding-top: var(--sp-3); padding-bottom: var(--sp-3); }
+}
+
+/* ── ⑨ 进入视口的揭示动画 ────────────────────────────────────────── */
+/* ⚠️ 刻意**不做**「每段滚动淡入」（skill 的 tell 目录把 scroll-fade-sections 列为俗套）——
+ *    只有「条 / 漏斗」这类**比例图形**才在进入视口时伸展，读起来是「数值在生长」，
+ *    不是「页面在表演」。 */
+.reveal { opacity: 0; transform: translateY(6px); }
+.reveal.is-revealed { opacity: 1; transform: none; transition: opacity var(--dur-2) var(--ease), transform var(--dur-2) var(--ease); }
+
+@media (prefers-reduced-motion: reduce) {
+  .reveal { opacity: 1; transform: none; }
+  .reveal.is-revealed { transition: none; }
+  .weightbar__fill, .funnel__bar { transition: none; }
+}
+
+/* ── ⑩ 窄屏收敛 ──────────────────────────────────────────────────── */
+@media (max-width: 700px) {
+  .landing__section { margin-top: var(--sp-12); }
+  /* ⚠️ 窄屏上 hero 标题要**降一档**：30px × 11 字放不进 390px 的内容宽，
+   *    会被拆成「方 / 案」。⇒ ≤560px 用 26px（仍是全页最大的字号）。 */
+  .landing__title { font-size: 26px; }
+  .weightbar { grid-template-columns: 6rem 1fr 3.5rem; }
+  .funnel__stage { grid-template-columns: 6rem 1fr 3.5rem; }
+  .ladder__step { grid-template-columns: 2.5rem 1fr; }
+  .ladder__benefits { grid-column: 1 / -1; padding-left: var(--sp-8); }
+  .ctaband { padding: var(--sp-6); }
+  .landing__footer { flex-direction: column; }
 }
 
 /* 打印：榜单/筛选台要能被打印成纸质材料 */

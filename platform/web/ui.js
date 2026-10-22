@@ -12,6 +12,7 @@
 //
 // ⛔ 纯函数、零依赖、零 IO：只 import web/escape.js（P0 建立的全站唯一转义入口）。
 import { escapeHtml } from './escape.js';
+import { iconEmpty, iconWarn } from './icons.js';
 
 /** 语义色调白名单 —— 徽章/提示条只允许这些值，避免拼出无法识别的 class。 */
 export const TONES = ['neutral', 'brand', 'success', 'warn', 'danger', 'info'];
@@ -45,14 +46,25 @@ export function loadingState({ rows = 3, label = '正在加载…' } = {}) {
  * 空态：标题 + 解释 + 可选的下一步动作。
  * ⚠️ 「空」不等于「没有话说」——生产级空态必须告诉访客**下一步做什么**，
  *    否则用户只看到一个灰盒子（这是打磨前 11 个页面的真实状态）。
+ *
+ * @param {object}  o
+ * @param {string}  [o.title]
+ * @param {string}  [o.hint]
+ * @param {object}  [o.action]  { href, label }
+ * @param {string}  [o.titleTag='p']  标题用的标签。
+ *   ⚠️ 默认 'p'（空态多数是**页面中段**的局部状态，不能每个都抢 h1）；
+ *      只有「整页就是这一个状态」时才传 'h1' ——
+ *      路由守卫兜底页就是这种（它是整个页面的唯一内容）。
  */
-export function emptyState({ title = '暂无数据', hint = '', action = null } = {}) {
+export function emptyState({ title = '暂无数据', hint = '', action = null, titleTag = 'p' } = {}) {
   const actionHtml = action && action.label
     ? `<a class="btn btn--primary btn--sm" href="${escapeHtml(action.href ?? '#')}">${escapeHtml(action.label)}</a>`
     : '';
+  // ⚠️ titleTag 只允许白名单：它是拼进 HTML 的标签名，不能是外部输入。
+  const tag = titleTag === 'h1' ? 'h1' : 'p';
   return `<div class="state state--empty">
-    <div class="state__icon" aria-hidden="true">◍</div>
-    <p class="state__title">${escapeHtml(title)}</p>
+    <div class="state__icon" aria-hidden="true">${iconEmpty(32)}</div>
+    <${tag} class="state__title">${escapeHtml(title)}</${tag}>
     ${hint ? `<p class="state__hint">${escapeHtml(hint)}</p>` : ''}
     ${actionHtml}
   </div>`;
@@ -74,7 +86,7 @@ export function errorState({ message = '加载失败', retry = true, hint = '' }
     ? '<button type="button" class="btn btn--ghost btn--sm" data-action="retry">重试</button>'
     : '';
   return `<div class="state state--error" role="alert">
-    <div class="state__icon" aria-hidden="true">⚠</div>
+    <div class="state__icon" aria-hidden="true">${iconWarn(32)}</div>
     <p class="state__title">${escapeHtml(text)}</p>
     ${hint ? `<p class="state__hint">${escapeHtml(hint)}</p>` : ''}
     ${retryHtml}

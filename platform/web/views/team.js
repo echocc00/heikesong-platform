@@ -116,7 +116,7 @@ export function buildTeamCards(teams, viewerId) {
     return `
         <section class="team-card" data-team="${escapeHtml(s.id)}">
           <div class="row row--between">
-            <h3 class="panel__title">${escapeHtml(s.title)}</h3>
+            <h2 class="panel__title">${escapeHtml(s.title)}</h2>
             <div class="btn-group">${badge(badgeInfo.label, badgeInfo.tone)}</div>
           </div>
           <p class="muted small">状态：${escapeHtml(s.statusLabel)}</p>

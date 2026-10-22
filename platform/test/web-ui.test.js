@@ -366,11 +366,22 @@ test('顶栏：已登录时显示姓名与身份；未登录时显示登录入�
   assert.ok(!anon.topbar.innerHTML.includes('报名筛选台'), '未登录不该看到组委会入口');
 });
 
-test('总览页：未登录也要有内容（首屏不能白屏）', async () => {
-  const dom = await bootApp('#/', { user: null }, 'home-anon');
+test('工作台：未登录也要有内容（首屏不能白屏）', async () => {
+  // ⚠️ P9：总览（工作台）从 `/` 迁到 `/dashboard` 并**纳入登录守卫**
+  //   （首页让位给落地页；工作台是「我的赛事」分区的一部分）。
+  // ⇒ 访客看到的是**引导页**（需要登录 + 去登录），不是空白，也不是 401 报错。
+  const dom = await bootApp('#/dashboard', { user: null }, 'home-anon');
   const html = dom.app.children?.[0]?.innerHTML ?? '';
-  assert.ok(html.includes('未登录'), `首屏必须显示未登录状态，实际：${html}`);
-  assert.ok(html.includes('赛事'), '首屏要有内容');
+  assert.ok(html.includes('需要登录'), `首屏必须说清「要登录」，实际：${html}`);
+  assert.ok(html.includes('#/login'), '必须给出「去登录」这个可执行的下一步');
+  assert.ok(html.includes('赛事') || html.includes('报名'), '首屏要有内容');
+});
+
+test('工作台：已登录才看到真正的仪表盘（反向对照：上一条不是恒绿）', async () => {
+  const dom = await bootApp('#/dashboard', { user: { id: 'u_a', name: '甲', roles: ['member'] } }, 'home-authed');
+  const html = dom.app.children?.[0]?.innerHTML ?? '';
+  assert.ok(html.includes('工作台'), `已登录应看到工作台，实际：${html}`);
+  assert.ok(!html.includes('需要登录'), '已登录不该看到引导页');
 });
 
 // ══════════════════════════════════════════════════════════════════
@@ -406,7 +417,7 @@ test('错误态：错误消息过一遍友好化（唯一出口 ⇒ 11 个视图
 // ══════════════════════════════════════════════════════════════════
 
 test('总览页：未登录不请求需要登录态的 /api/teams', async () => {
-  const dom = await bootApp('#/', { user: null }, 'home-no-teams');
+  const dom = await bootApp('#/dashboard', { user: null }, 'home-no-teams');
   assert.ok(
     !dom.calls.some((c) => c.includes('/api/teams')),
     `未登录不该请求 /api/teams，实际：${JSON.stringify(dom.calls)}`,
@@ -414,7 +425,7 @@ test('总览页：未登录不请求需要登录态的 /api/teams', async () => 
 });
 
 test('总览页：已登录才请求 /api/teams（反向对照：上一条不是恒绿）', async () => {
-  const dom = await bootApp('#/', { user: { id: 'u_a', name: '甲', roles: ['member'] } }, 'home-teams');
+  const dom = await bootApp('#/dashboard', { user: { id: 'u_a', name: '甲', roles: ['member'] } }, 'home-teams');
   assert.ok(
     dom.calls.some((c) => c.includes('/api/teams')),
     `已登录必须请求 /api/teams，实际：${JSON.stringify(dom.calls)}`,

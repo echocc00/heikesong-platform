@@ -43,6 +43,7 @@ import { computeStagePoints, computePersonalPoints } from '../src/domain/points.
 import { computeTier, classifyDepartment, isDataOrPrototypeMilestone } from '../src/domain/tier.js';
 import { behaviorScore } from '../src/domain/behavior.js';
 import { applyVisibility } from '../src/domain/visibility.js';
+import { buildEventInfo } from '../src/domain/event-info.js';
 
 export const STORAGE_KEY = 'hks_demo_store_v1';
 export const SEED_URL = './seed/demo-data.json';
@@ -66,6 +67,10 @@ export const DEMO_RULE_FILES = {
   //    （src/http/routes/registration.js 的 buildCriteria 从 rules.compliance 取）。
   //    缺它 ⇒ 演示站的报名页缺三块**明示内容**（R-ENT-11 / R-ENT-12 / 同意条款）。
   compliance: 'compliance.json',
+  // ⚠️ P9 新增：**赛段表**（赛程、交付物、晋级率）—— 落地页的赛程脊就靠它。
+  //    缺它 ⇒ 演示站的落地页**赛程是空的**（spine 没有任何节点），
+  //    而正式平台读的是服务端 loadRules（那份加载全部 17 份规则）⇒ 两边不一致。
+  schedule: 'schedule.json',
 };
 
 export function createMemoryStorage() {
@@ -898,6 +903,14 @@ export function createDemoApi({ storage = defaultStorage(), seed = null, rules =
     if (method === 'GET' && clean === '/api/health') {
       return { ok: true, demo: true, ruleVersion: r.tiebreak?.version ?? null };
     }
+    // ── P9：赛事规则说明（落地页）────────────────────────────────
+    // ⚠️ **与正式后端共用同一个领域层函数**（src/domain/event-info.js）——
+    //    演示站与正式站的落地页内容因此**不可能漂移**。
+    //    P8 的教训：演示适配器曾把「错误的形状」（body 传 judgeId、进度按评委分组）
+    //    锁进测试 ⇒ 形状必须**同源**，不能各写一份。
+    if (method === 'GET' && clean === '/api/event-info') {
+      return buildEventInfo(r);
+    }
     // 当前用户
     if (method === 'GET' && clean === '/api/me') {
       if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
@@ -1371,6 +1384,8 @@ export async function loadDemoRules(base = RULES_BASE) {
     points: loaded.points,
     criteria: loaded.criteria,
     compliance: loaded.compliance,
+    // ⚠️ P9：赛程表（落地页的赛程脊）
+    schedule: loaded.schedule,
   };
 }
 

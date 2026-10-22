@@ -48,6 +48,10 @@ async function bootDemo() {
  */
 const VIEW_ENDPOINTS = [
   { method: 'GET', path: '/api/me' },
+  // P9：落地页的赛制数据源（公开、免 token）
+  // ⚠️ 形状必须与真实后端一致 ⇒ 演示适配器**复用同一个领域层函数**
+  //    （src/domain/event-info.js），不可能漂移。
+  { method: 'GET', path: '/api/event-info' },
   { method: 'GET', path: '/api/registration-criteria' },
   { method: 'GET', path: '/api/teams' },
   { method: 'GET', path: '/api/task-packages' },
@@ -109,6 +113,29 @@ test('演示适配器的「端点未实现」必须用**专属错误码**（不�
       return true;
     },
   );
+});
+
+test('演示适配器的赛事规则（落地页）：形状与真实后端**逐字段一致**', async () => {
+  // ⚠️ P8 的教训：parity 闸不能只覆盖「端点存在」，必须覆盖**形状** ——
+  //    演示适配器曾把「错误的形状」锁进测试（body 里传 judgeId、进度按评委分组）。
+  const { api, rules } = await bootDemo();
+  const got = await api.get('/api/event-info');
+  const { buildEventInfo } = await import('../src/domain/event-info.js');
+  // ⚠️ 两边**必须逐字段相同**：演示站与正式站复用同一个领域层函数
+  //    ⇒ 落地页上显示的赛制不可能两边不一样。
+  assert.deepEqual(got, buildEventInfo(rules), '演示站的赛制投影与真实后端必须逐字段一致');
+  assert.ok(got.stages.length > 0, '必须有赛段');
+  assert.ok(got.scoring.initial.dimensions.length > 0, '必须有初赛权重表');
+  assert.ok(got.tiers.length > 0, '必须有段位表');
+});
+
+test('演示适配器的赛事规则：⛔ 不得夹带内部备注（白名单投影）', async () => {
+  const { api } = await bootDemo();
+  const got = await api.get('/api/event-info');
+  const dumped = JSON.stringify(got);
+  assert.ok(!dumped.includes('待组委会确认'), '内部待确认状态不得进公开响应');
+  assert.ok(!dumped.includes('note'), '内部说明字段不得出现');
+  assert.ok(!dumped.includes('awardPointsNote'), '内部口径说明不得出现');
 });
 
 test('演示适配器的报名筛选标准：形状与真实后端 buildCriteria 一致', async () => {

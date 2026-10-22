@@ -57,6 +57,14 @@ const PLANS = [
   //      leaderboard/tier/card → P3，audit/flags → P4，tasks → P5，api.demo → P6），
   //    后续阶段只 Modify（追加）⇒ 改动后必须**逐字同步回 owning 阶段的计划块**。
   ['P7', 'docs/superpowers/plans/2026-10-22-platform-P7-ui-production.md'],
+  // ⚠️ P9（UI 重构：落地页 + 科技感设计系统）：新建文件的规格块在这里 ——
+  //    src/domain/event-info.js（赛制投影）、web/views/landing.js（落地页）、
+  //    test/web-landing.test.js、test/event-info-api.test.js。
+  //    **P9 不接管既有文件的块** —— 被改写的既有文件（styles.css / app.js → P0、
+  //    index.html / api.demo.js → P6、nav.js / ui.js / home.js → P7、
+  //    public-api.js / routes/public.js → P5）仍归最早阶段，
+  //    改写后必须**逐字同步回 owning 阶段的计划块**（C-RW 必须清零）。
+  ['P9', 'docs/superpowers/plans/2026-10-22-platform-P9-ui-redesign.md'],
 ];
 
 // ⚠️ 主流程（读计划、比对实现、打印清单）**只在直接运行时执行**。

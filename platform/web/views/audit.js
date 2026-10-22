@@ -239,7 +239,7 @@ function renderDiff(d) {
     </tr>`).join('');
   return `
     <div class="row row--between">
-      <h3>复算比对</h3>
+      <h2>复算比对</h2>
       ${badge(identical ? '一致' : '不一致', identical ? 'success' : 'danger')}
     </div>
     <p class="muted small">identical = ${String(d?.identical)} · ${diffs.length} 处差异</p>

@@ -23,6 +23,7 @@ import { renderFlags } from './views/flags.js';
 import { renderTasks } from './views/tasks.js';
 import { renderTaskIndex } from './views/task-index.js';
 import { renderHome } from './views/home.js';
+import { renderLanding } from './views/landing.js';
 import { renderReview } from './views/review.js';
 import { renderPublish } from './views/publish.js';
 import { escapeHtml } from './escape.js';
@@ -40,7 +41,13 @@ const { api } = isDemo ? await import('./api.demo.js') : await import('./api.js'
 // ⇒ 视图里的校验按 `ctx.api.isDemo` 分档：演示站只要求「非空」，真实平台才校验格式。
 api.isDemo = isDemo;
 
-route('/', (c) => renderHome(c));
+// ⚠️ **P9：首页是落地页，原「赛事总览」仪表盘迁到 /dashboard**。
+//   理由：首页是访客的第一印象 —— 一个还没注册的人看到 KPI 卡只会困惑，
+//   看不到「这是什么赛、赛制怎么算、我能不能参加」。
+//   ⇒ `/` = 落地页（公开，讲赛事与赛制、吸引报名）；
+//     `/dashboard` = 原仪表盘（登录后可达，一行内容没删，可逆）。
+route('/', (c) => renderLanding(c));
+route('/dashboard', (c) => renderHome(c));
 route('/login', () => renderLogin(ctx));
 route('/logout', () => renderLogout());
 // P1 三页：报名 / 我的战队 / 组委会筛选台
@@ -147,6 +154,10 @@ function renderGuard(user) {
       ? '登录后就能报名、组队、领任务。登录使用报名时填写的手机号。'
       : '这个页面属于组委会工作台。如果你确实需要这个权限，请联系组委会开通。',
     action: needLogin ? { href: '#/login', label: '去登录' } : { href: '#/', label: '回到总览' },
+    // ⚠️ 这一页的**全部内容**就是这个守卫状态 ⇒ 它就是整页的标题 ⇒ 用 h1。
+    //    否则 /team /tasks /apply /flags /review 五个路由（未登录时都落到这里）
+    //    会**一个标题都没有** —— 读屏用户无法按标题导航，也拿不到页面名。
+    titleTag: 'h1',
   });
   return el;
 }

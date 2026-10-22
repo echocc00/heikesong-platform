@@ -4,7 +4,13 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="color-scheme" content="dark light" />
-  <title>AI 商业黑客松 · 赛事平台</title>
+  <!-- P9：落地页需要被搜到、被分享出卡片 ⇒ 补 description 与主题色。
+       ⚠️ 主题色跟 CSS 的 --bg 同值（暗色 #0b0d12 / 亮色 #f4f6fa），
+          浏览器地址栏才不会在暗色系统上出现一条亮白边。 -->
+  <meta name="description" content="华东区 AI 商业黑客松：五段赛程、六个评审维度、公开的破同分链。赛制写在明处，报名即开始。" />
+  <meta name="theme-color" content="#0b0d12" media="(prefers-color-scheme: dark)" />
+  <meta name="theme-color" content="#f4f6fa" media="(prefers-color-scheme: light)" />
+  <title>华东区 AI 商业黑客松 · 赛事平台</title>
   <!-- 溯源需求：R-OPS-06（公网可访问：公网演示站入口页） -->
   <!-- ⚠️ 资源路径必须是相对路径：静态托管（公网演示站）可能挂在任意 base path 下 -->
   <link rel="stylesheet" href="./styles.css" />

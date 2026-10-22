@@ -8,6 +8,7 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { appError } from '../errors.js';
 import { applyVisibility } from '../domain/visibility.js';
+import { buildEventInfo } from '../domain/event-info.js';
 import * as tokenRepo from '../db/repo/public-tokens.js';
 import * as srcRepo from '../db/repo/pool-sources.js';
 import { buildICalendarText } from '../domain/icalendar.js';
@@ -211,6 +212,36 @@ function projectPublicRows(rows, rules, warnings, stageId) {
     warnings.push({ code: 'tier_below_public_threshold_hidden', stageId, count: hidden });
   }
   return out;
+}
+
+/**
+ * 赛事公开信息（落地页的赛制数据源）。
+ *
+ * ⚠️⚠️ **为什么要有这个投影，而不是让前端直接读 rules/**：
+ *   落地页要「介绍赛事与赛制」⇒ 前端需要赛段的起止与交付物、评审维度权重、段位表、
+ *   筛选漏斗、组队规则、名次积分、破同分链、合规红线。
+ *   这些**全部**只在 `platform/rules/*.json` 里（赛制的唯一出处），
+ *   而 rules 是**服务端**配置、浏览器读不到 ⇒ 只能由服务端投影出去。
+ *   ⇒ 前端**一个字都不许硬编码**赛制数字（改 rules/*.json 即改落地页，不必改前端）。
+ *
+ * ⛔⛔ **白名单投影，不是整体倒 rules**：
+ *   rules 里大量字段是**内部工作备注**（「此为待组委会确认口径」「首届后回测」…），
+ *   整体倒出去 = 把内部待办状态公开发布。
+ *   ⇒ 投影本身在 **src/domain/event-info.js**（纯函数、零依赖、可进浏览器），
+ *     演示站（web/api.demo.js）import **同一个函数** ⇒ 正式站与演示站的落地页内容**不可能漂移**。
+ *
+ * ⛔ **公开的是「规则」，不是「数据」**：
+ *   规则（权重、赛程、段位）本来就该公开 —— 参赛者有权知道自己被怎么评；
+ *   而**分数、名次、企业名、签字人**由 applyVisibility 负责，不在这个函数里。
+ *
+ * @param {object} rules  已加载的规则配置（src/config.js 的 loadRules 结果）
+ * @returns {object}      落地页用的赛制数据（形状固定，见 platform/test/event-info-api.test.js）
+ */
+export function getEventInfo(rules) {
+  if (!rules || typeof rules !== 'object') {
+    throw appError(500, 'RULES_MISSING', '规则配置未加载');
+  }
+  return buildEventInfo(rules);
 }
 
 /**

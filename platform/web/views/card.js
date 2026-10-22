@@ -6,6 +6,7 @@
 //    代码注释里可以写，输出里不行（测试直接扫输出字符串）。
 // ⚠️ 转义统一走 `web/escape.js`（P0 建立，全站唯一入口）。
 import { escapeHtml } from '../escape.js';
+import { milestoneMark } from '../icons.js';
 import {
   badge, emptyState, errorState, loadingState, pageHead, panel,
   sectionTitle, statRow,
@@ -84,16 +85,16 @@ function milestoneGroup(title, items, tone, itemHtml) {
       : '<p class="muted small">暂无数据</p>'}`;
 }
 
-/** 已达成项：☑ + 标签 + 「已签」标识。 */
+/** 已达成项：✓ 图标 + 标签 + 「已签」标识。 */
 function doneItemHtml(m) {
-  return `<li class="done"><span class="mark" aria-hidden="true">☑</span>`
+  return `<li class="done"><span class="mark">${milestoneMark(true)}</span>`
     + `<span>${escapeHtml(m?.label)}</span>`
     + `${m?.signed ? `<span class="signed">${badge('已签', 'success')}</span>` : ''}</li>`;
 }
 
-/** 未达成项：☐ + 标签。 */
+/** 未达成项：○ 图标 + 标签。 */
 function todoItemHtml(m) {
-  return `<li class="todo"><span class="mark" aria-hidden="true">☐</span>`
+  return `<li class="todo"><span class="mark">${milestoneMark(false)}</span>`
     + `<span>${escapeHtml(m?.label)}</span></li>`;
 }
 

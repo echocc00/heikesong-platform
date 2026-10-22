@@ -42,7 +42,7 @@ export function buildWorkflowCards(workflows) {
 export function workflowCardsHtml(cards) {
   return cards.map((c) => `
     <article class="card home__entry">
-      <h3>${escapeHtml(c.name)}</h3>
+      <h2>${escapeHtml(c.name)}</h2>
       <p class="muted small">共 ${c.total} 个任务 · 已完成 ${c.done} · 待办 ${c.open}</p>
       <div class="bar" role="img" aria-label="完成进度 ${c.percent}%">
         <span class="bar__track"><span class="bar__fill bar__fill--success" style="width:${c.percent}%"></span></span>
