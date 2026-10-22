@@ -7938,6 +7938,43 @@ export const api = {
 
 ```javascript
 // web/views/login.js — 登录视图
+//
+// ⚠️ 本轮（P6 第 12 轮）新增 `readLoginForm` / `validateLoginInput` 两个**纯函数**：
+//   真机实测抓到：浏览器发出的请求里 **`phone` 是空字符串**（口令却完全正确），
+//   而后端对「手机号为空」和「口令错误」返回**同一个** 401 `INVALID_CREDENTIALS`
+//   ⇒ 访客看到的是「手机号或密码不正确」，**完全指错方向** —— 真因是手机号没输入。
+//   ⇒ 本地先校验、**不发无谓请求**、并把提示说清楚。
+//
+// 纪律：输入校验的判据必须**可测**（纯函数导出），不能只写在 DOM 事件里。
+export function readLoginForm({ phone = '', password = '' } = {}) {
+  return {
+    phone: String(phone ?? '').trim(),
+    password: String(password ?? ''),
+  };
+}
+
+/**
+ * 登录输入的本地校验。
+ * @param {{ phone: string, password: string }} input
+ * @param {{ isDemo?: boolean }} [opts] `isDemo` = 演示站（适配器不校验凭据）
+ * @returns {{ ok: true } | { ok: false, message: string }}
+ */
+export function validateLoginInput({ phone, password }, { isDemo = false } = {}) {
+  if (!phone) {
+    return { ok: false, message: '请输入手机号（上面的 13800000000 是示例占位，不是已填内容）' };
+  }
+  // ⚠️ **演示站不校验手机号格式**：它的适配器根本不校验凭据（填什么都给演示管理员）
+  //    ⇒ 强制 11 位格式会把「随便看看」变成填表 ⇒ 破坏演示体验。
+  //    真实平台才要求 11 位、以 1 开头的数字。
+  if (!isDemo && !/^1\d{10}$/.test(phone)) {
+    return { ok: false, message: '手机号格式不对：应为 11 位、以 1 开头的数字' };
+  }
+  if (!password) {
+    return { ok: false, message: '请输入密码' };
+  }
+  return { ok: true };
+}
+
 export function renderLogin(ctx) {
   const { api, navigate } = ctx;
   const wrap = document.createElement('div');
@@ -7953,10 +7990,19 @@ export function renderLogin(ctx) {
   const err = wrap.querySelector('#err');
   wrap.querySelector('#submit').addEventListener('click', async () => {
     err.textContent = '';
+    const form = readLoginForm({
+      phone: wrap.querySelector('#phone').value,
+      password: wrap.querySelector('#password').value,
+    });
+    // ⛔ 本地先校验：手机号为空时**不发请求** ——
+    //    否则后端会回「手机号或密码不正确」，把「没填手机号」误报成「口令错」。
+    const check = validateLoginInput(form, { isDemo: !!ctx.api?.isDemo });
+    if (!check.ok) {
+      err.textContent = check.message;
+      return;
+    }
     try {
-      const phone = wrap.querySelector('#phone').value.trim();
-      const password = wrap.querySelector('#password').value;
-      const res = await api.post('/api/auth/login', { phone, password });
+      const res = await api.post('/api/auth/login', { phone: form.phone, password: form.password });
       ctx.setState({ user: res.user });
       navigate('/');
     } catch (e) {
@@ -7971,18 +8017,55 @@ export function renderLogin(ctx) {
 
 ```javascript
 // web/app.js — 前端入口
+// 溯源需求：R-OPS-06（?demo=1 走演示版适配器；正式版走真实 API）
 import { route, match, navigate, currentPath } from './router.js';
 import { getState, setState, subscribe } from './store.js';
 import { renderLogin } from './views/login.js';
+import { renderRegistration } from './views/registration.js';
+import { renderTeam } from './views/team.js';
+import { renderAdminRegistration } from './views/admin-registration.js';
+import { renderLeaderboard } from './views/leaderboard.js';
+import { renderTier } from './views/tier.js';
+import { renderCard } from './views/card.js';
+import { renderAudit } from './views/audit.js';
+import { renderFlags } from './views/flags.js';
+import { renderTasks } from './views/tasks.js';
 import { escapeHtml } from './escape.js';
 
 // 演示版：?demo=1 时用 localStorage 适配器；正式版走真实 API。
+// ⚠️ 演示版的规则引擎在浏览器里真实运行（web/api.demo.js 直接 import ../src/domain/*.js），
+//    所以「演示好看、正式不一样」这件事不会发生。
 const isDemo = new URLSearchParams(window.location.search).get('demo') === '1';
 const { api } = isDemo ? await import('./api.demo.js') : await import('./api.js');
+// ⚠️ 把「当前是不是演示模式」挂到 api 上 ⇒ 视图能据此调整**输入校验**。
+//    真实理由（P6 第 12 轮）：登录视图新增了「手机号格式」本地校验
+//    （真实平台的手机号必须 11 位、以 1 开头），但**演示站的适配器不校验凭据**
+//    （填什么都直接给一个演示管理员）⇒ 演示站访客若被要求填 11 位手机号，
+//    就把「随便看看」的演示变成了填表 ⇒ **演示体验被破坏**。
+// ⇒ 视图里的校验按 `ctx.api.isDemo` 分档：演示站只要求「非空」，真实平台才校验格式。
+api.isDemo = isDemo;
 
 route('/', () => renderHome());
 route('/login', () => renderLogin(ctx));
 route('/logout', () => renderLogout());
+// P1 三页：报名 / 我的战队 / 组委会筛选台
+route('/apply', () => renderRegistration(ctx));
+route('/team', () => renderTeam(ctx));
+route('/admin/registration', () => renderAdminRegistration(ctx));
+// P3 三页：榜单（A 榜 / B 榜 / 个人榜 + 滚动总榜）/ 段位榜 / 战绩卡
+// ⚠️ 前端路由是**注册顺序**先匹配（不像服务端 router 那样排序），
+//    但 '/leaderboard' 与 '/leaderboard/:stageId' 的正则互斥，顺序不影响结果。
+route('/leaderboard', (c) => renderLeaderboard(c));
+route('/leaderboard/:stageId', (c) => renderLeaderboard(c));
+route('/tier', (c) => renderTier(c));
+route('/card/:teamId', (c) => renderCard(c));
+// P4 两页：计算留痕 trace 抽屉（从发榜页点队伍进入）/ 复核队列
+// ⚠️ 必须透传路由参数（c = {...ctx, params, query}）：trace 抽屉靠 params.computationId
+//    决定拉哪份快照 —— 只传模块级 ctx 会把 params 丢掉，抽屉永远拿不到 computationId。
+route('/audit/:computationId', (c) => renderAudit(c));
+route('/flags', (c) => renderFlags(c));
+// P5 Task 6：任务清单页（只有「自主领取」一个入口，R-OPS-14 禁止岗位制）
+route('/tasks/:workflowId', (c) => renderTasks(c));
 
 function renderHome() {
   const el = document.createElement('div');
@@ -7994,6 +8077,10 @@ function renderHome() {
     <nav>
       <a href="#/login">登录</a>
       <a href="#/leaderboard">榜单</a>
+      <a href="#/flags">复核队列</a>
+      <a href="#/apply">报名</a>
+      <a href="#/team">我的战队</a>
+      <a href="#/admin/registration">筛选台</a>
     </nav>
   `;
   return el;
@@ -8025,18 +8112,43 @@ async function restoreSession() {
   }
 }
 
+/** 当前 hash 上的 query（router.match 会把 '?xxx' 剥掉再匹配，所以要自己解析） */
+function currentQuery() {
+  const q = currentPath().split('?')[1] || '';
+  return Object.fromEntries(new URLSearchParams(q));
+}
+
+function demoBanner() {
+  if (!isDemo) return null;
+  const el = document.createElement('div');
+  el.className = 'card demo-banner';
+  el.innerHTML = `
+    <strong>演示版</strong>：当前是公网演示站——所有数据只存在你的浏览器里（不跨人共享），
+    但<b>规则引擎是在你的浏览器里真实运行的</b>（z-score 归一化 / 去极值 / 双签 / 破同分链 / 段位判定），
+    算法行为与正式系统一致。
+  `;
+  return el;
+}
+
 async function render() {
   const app = document.getElementById('app');
+  const banner = demoBanner();
   const found = match(currentPath());
   if (!found) {
     app.innerHTML = '<div class="card">页面不存在</div>';
+    if (banner) app.prepend(banner);
     return;
   }
   try {
-    const el = await found.view(ctx);
+    // ⚠️ 路由参数与 query 必须透传给视图：P3 的视图要靠 params.stageId / params.teamId
+    //    决定请求哪个赛段 / 哪支队伍，靠 query.scope / query.editionId 决定口径与届期。
+    //    P0 原来只传 ctx —— 视图拿不到参数（前端 router.match 会把 '?query' 剥掉再匹配）。
+    const el = await found.view({ ...ctx, params: found.params, query: currentQuery() });
     app.replaceChildren(el);
+    if (banner) app.prepend(banner);
   } catch (e) {
     app.innerHTML = `<div class="card err">${escapeHtml(e.message)}</div>`;
+    if (banner) app.prepend(banner);
   }
 }
 

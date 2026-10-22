@@ -260,3 +260,55 @@ test('筛选台：事件轨迹的纯文本格式（状态变迁 + 原因）', ()
   assert.ok(lines[1].includes('accepted'));
   assert.deepEqual(formatEventTrail(null), [], '事件缺省时不得抛错');
 });
+
+// ─────────────────────────────────────────────────────────────────────
+// 登录表单：本地校验（P6 第 12 轮）
+//
+// 真机实测抓到的事实：浏览器发出的 `POST /api/auth/login` 里
+//   **`phone` 是空字符串**（口令却逐字正确，24 位码点全对），
+//   而后端对「手机号为空」与「口令错误」返回**同一个** 401 `INVALID_CREDENTIALS`
+//   ⇒ 访客看到的提示是「手机号或密码不正确」，**完全指错方向**。
+// ⇒ 本地必须先校验、且不发无谓请求；判据是可测的纯函数。
+// ─────────────────────────────────────────────────────────────────────
+
+test('登录输入校验：手机号为空 ⇒ 本地拦下并说清是「没填手机号」', async () => {
+  const { readLoginForm, validateLoginInput } = await import('../web/views/login.js');
+  const form = readLoginForm({ phone: '   ', password: 'whatever' });
+  assert.equal(form.phone, '', '手机号应被 trim 成空串');
+  const r = validateLoginInput(form);
+  assert.equal(r.ok, false, '⛔ 手机号为空必须本地拦下');
+  assert.match(r.message, /手机号/, `提示要说清是手机号的问题：${r.message}`);
+  // ⛔ 关键：提示里必须**区分**「没填手机号」与「口令错」
+  assert.ok(!/密码/.test(r.message), `⛔ 手机号为空时不该提密码（会指错方向）：${r.message}`);
+});
+
+test('登录输入校验：手机号格式不对 ⇒ 本地拦下', async () => {
+  const { validateLoginInput } = await import('../web/views/login.js');
+  for (const bad of ['1380000000', '138000000000', '23800000000', '1380000000a']) {
+    const r = validateLoginInput({ phone: bad, password: 'x'.repeat(24) });
+    assert.equal(r.ok, false, `⛔ ${bad} 必须被判不合格`);
+    assert.match(r.message, /手机号/, '提示应指向手机号');
+  }
+});
+
+test('登录输入校验：口令为空 ⇒ 本地拦下', async () => {
+  const { validateLoginInput } = await import('../web/views/login.js');
+  const r = validateLoginInput({ phone: '13800000000', password: '' });
+  assert.equal(r.ok, false, '⛔ 口令为空必须本地拦下');
+  assert.match(r.message, /密码/, '提示应指向密码');
+});
+
+test('登录输入校验：手机号 + 口令都合法 ⇒ 通过', async () => {
+  const { validateLoginInput } = await import('../web/views/login.js');
+  const r = validateLoginInput({ phone: '13800000000', password: 'XpLEdKLuUV2iDLriXHZ7TbZJ' });
+  assert.equal(r.ok, true, `合法输入必须通过：${JSON.stringify(r)}`);
+});
+
+test('登录输入校验：readLoginForm 必须**原样保留口令**（不许 trim / 不许大小写变换）', async () => {
+  const { readLoginForm } = await import('../web/views/login.js');
+  // ⛔ 口令里的空格是**有效字符**（本仓口令策略允许任意可打印字符）⇒ 只 trim 手机号。
+  const pw = ' a b C ';
+  const form = readLoginForm({ phone: ' 13800000000 ', password: pw });
+  assert.equal(form.phone, '13800000000', '手机号应被 trim');
+  assert.equal(form.password, pw, `⛔ 口令不得被 trim 或变换：得到 ${JSON.stringify(form.password)}`);
+});

@@ -19,6 +19,13 @@ import { escapeHtml } from './escape.js';
 //    所以「演示好看、正式不一样」这件事不会发生。
 const isDemo = new URLSearchParams(window.location.search).get('demo') === '1';
 const { api } = isDemo ? await import('./api.demo.js') : await import('./api.js');
+// ⚠️ 把「当前是不是演示模式」挂到 api 上 ⇒ 视图能据此调整**输入校验**。
+//    真实理由（P6 第 12 轮）：登录视图新增了「手机号格式」本地校验
+//    （真实平台的手机号必须 11 位、以 1 开头），但**演示站的适配器不校验凭据**
+//    （填什么都直接给一个演示管理员）⇒ 演示站访客若被要求填 11 位手机号，
+//    就把「随便看看」的演示变成了填表 ⇒ **演示体验被破坏**。
+// ⇒ 视图里的校验按 `ctx.api.isDemo` 分档：演示站只要求「非空」，真实平台才校验格式。
+api.isDemo = isDemo;
 
 route('/', () => renderHome());
 route('/login', () => renderLogin(ctx));
