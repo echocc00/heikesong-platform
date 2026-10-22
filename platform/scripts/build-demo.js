@@ -27,7 +27,6 @@ import {
 import { join, dirname, relative, resolve, sep, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DEMO_RULE_FILES } from '../web/api.demo.js';
-
 const here = dirname(fileURLToPath(import.meta.url));
 
 /**
@@ -268,7 +267,83 @@ export function assertDomainIsBrowserSafe(domainDir) {
  *   ⇒ 附带好处：适配器里 '../src/domain/*.js' 的相对导入落在 <out>/src/domain/，
  *     **在产物内** ⇒ 站点挂在任意 base path 下都不会 404 白屏。
  */
-export function buildDemoSite({
+/**
+ * 按 `DEMO_RULE_FILES` 加载**演示适配器实际会用的**那批规则，重组成适配器要的形状。
+ *
+ * ⚠️ 为什么不用 `src/config.js` 的 `loadRules`：
+ *    那份加载的是**平台全量**规则（含 schedule / compliance / pools / audit），
+ *    而演示适配器只认 `DEMO_RULE_FILES` 这 12 份 ⇒ 用错清单会算出「浏览器里算不出来的结果」。
+ *    ⇒ 这里**必须与浏览器侧同一批配置**（同一个 `DEMO_RULE_FILES`），
+ *      否则「构建时算的」与「浏览器里跑的」就不是同一件事 ⇒ 演示价值归零。
+ */
+export function loadDemoRulesFrom(rulesDir) {
+  const loaded = {};
+  for (const [key, file] of Object.entries(DEMO_RULE_FILES)) {
+    const p = join(rulesDir, file);
+    if (!existsSync(p)) throw new Error(`演示规则配置缺失：${p}`);
+    loaded[key] = JSON.parse(readFileSync(p, 'utf8'));
+  }
+  return {
+    scoring: { initial: loaded.scoringInitial, final: loaded.scoringFinal },
+    tiebreak: loaded.tiebreak,
+    ranks: loaded.ranks,
+    behavior: loaded.behavior,
+    visibility: loaded.visibility,
+    registration: loaded.registration,
+    solvability: loaded.solvability,
+    milestones: loaded.milestones,
+    teamFormation: loaded.teamFormation,
+    points: loaded.points,
+    criteria: loaded.criteria,
+  };
+}
+
+/**
+ * **构建期预计算**：用真实引擎跑一次，把结果写进种子。
+ *
+ * 背景（真机浏览器实测）：榜单数据来自 `state.results[stageId]`，
+ *   而 results 只在 `POST /api/stages/:stageId/compute` 时被写入 ——
+ *   正式平台由管理员在后台发榜时触发，**演示站没有后台** ⇒ 访客打开永远是「暂无数据」。
+ * ⇒ 这里在构建时把计算跑完，结果落到**产物里的种子** ⇒ 访客打开即见榜单。
+ *
+ * ⚠️ 只改**产物**的种子，**源种子不动**（`web/seed/demo-data.json` 保持人可读、可评审）。
+ * ⚠️ 规则引擎仍在**浏览器里真实可复算** —— 访客自己触发 compute 会重算（可看到同样结果）。
+ * ⛔ 计算失败 ⇒ 抛错让构建失败（fail-fast）：宁可构建不出来，也不发一个空榜包。
+ */
+export async function precomputeDemoSeed({ platformDir, seed }) {
+  // ⚠️ 用**绝对路径 + file URL** 动态 import：`platformDir` 可配置（测试会换一份拷贝），
+  //    相对导入会解析到脚本自身所在目录 ⇒ 算的是「脚本旁边的平台」而不是「要构建的那个平台」。
+  const { pathToFileURL } = await import('node:url');
+  const demo = await import(pathToFileURL(join(platformDir, 'web', 'api.demo.js')).href);
+  const rules = loadDemoRulesFrom(join(platformDir, 'rules'));
+
+  const state = demo.buildDemoState(seed);
+  const stageId = 'stage_final';
+  let result;
+  try {
+    result = demo.runDemoCompute({
+      state,
+      rules,
+      stageId,
+      // ⛔ 时间戳用**固定值**：构建产物必须可复现（同一个输入 ⇒ 同一个产物 ⇒ 便于比对与缓存）
+      now: '1970-01-01T00:00:00.000Z',
+    });
+  } catch (err) {
+    throw new Error(`演示种子预计算失败，拒绝构建（否则会发出一个「打开就是空榜单」的包）：${err.message}`);
+  }
+  if (!result || !Array.isArray(result.ordered) || result.ordered.length === 0) {
+    throw new Error('演示种子预计算没有产出任何排名，拒绝构建（否则会发出一个「打开就是空榜单」的包）');
+  }
+
+  return {
+    ...seed,
+    computations: { [result.computationId]: result },
+    results: { [stageId]: result },
+    lastStageId: stageId,
+  };
+}
+
+export async function buildDemoSite({
   // ⚠️ platformDir 必须排第一个：后面的默认值要引用它（JS 的解构默认值按顺序求值）
   platformDir = join(here, '..'),
   outDir = join(platformDir, 'web', 'dist'),
@@ -276,7 +351,6 @@ export function buildDemoSite({
   rulesDir = join(platformDir, 'rules'),
 } = {}) {
   const domainDir = join(platformDir, 'src', 'domain');
-
   // 1. 先守卫：领域层有 Node 依赖 → 构建失败（不产出半成品）
   const violations = assertDomainIsBrowserSafe(domainDir);
   if (violations.length) {
@@ -319,14 +393,22 @@ export function buildDemoSite({
   // 6. 规则配置拷到产物根（= 适配器的父目录 = RULES_BASE 的来源基准）
   copyDir(rulesDir, join(outDir, 'rules'));
 
-  // 7. 种子数据：拷两份（同一份内容，同源）
+  // 7. 种子数据：预计算后拷两份（同一份内容，同源）
   //    ① <out>/web/seed/demo-data.json —— 随 web/ 整目录拷过来的（SEED_URL 的来源基准）
   //    ② <out>/seed/demo-data.json     —— 浏览器里 fetch() 相对【文档基准】解析，
   //       文档在站点根 ⇒ 真正被取到的是这一份
+  //    ⚠️ **两份必须都是预计算后的版本** ⇒ 浏览器无论按哪个基准取到种子，榜单都有数据。
+  //       （web/ 那份是第 4 步整目录拷过来的 ⇒ 这里必须**覆盖**它，否则它还是未预计算的源种子。）
   const seedSrc = join(webDir, 'seed', 'demo-data.json');
   if (!existsSync(seedSrc)) throw new Error(`缺少演示种子数据：${seedSrc}`);
+  const seedRaw = JSON.parse(readFileSync(seedSrc, 'utf8'));
+  // 7.1 ⛔ 构建期预计算：用**真实引擎**跑一次，结果写进种子
+  //     （否则访客打开榜单页永远是「暂无数据」—— results 只在 compute 时才被写入）
+  const precomputed = await precomputeDemoSeed({ platformDir, seed: seedRaw });
+  const seedJson = `${JSON.stringify(precomputed, null, 2)}\n`;
   mkdirSync(join(outDir, 'seed'), { recursive: true });
-  copyFileSync(seedSrc, join(outDir, 'seed', 'demo-data.json'));
+  writeFileSync(join(outDir, 'seed', 'demo-data.json'), seedJson, 'utf8');
+  writeFileSync(join(outDir, 'web', 'seed', 'demo-data.json'), seedJson, 'utf8');
 
   // 8. 入口页放【站点根】（静态托管的硬要求：根目录必须有 index.html）
   //    ⚠️ app 在 <out>/web/ 下 ⇒ 资源路径要指到 ./web/…；
@@ -368,6 +450,11 @@ export function buildDemoSite({
     builtAt: new Date().toISOString(),
     ruleFiles: Object.values(DEMO_RULE_FILES),
     note: '演示站：规则引擎在浏览器里真实运行；数据不跨人共享（各自浏览器独立）。',
+    precomputed: {
+      stageId: precomputed.lastStageId,
+      teams: precomputed.results[precomputed.lastStageId]?.ordered?.length ?? 0,
+      note: '构建期用真实引擎预计算的结果（访客打开即见榜单）',
+    },
   };
   writeFileSync(join(outDir, 'build-manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
 
@@ -376,6 +463,8 @@ export function buildDemoSite({
     files: readdirSync(outDir),
     domainFiles: readdirSync(join(outDir, 'src', 'domain')),
     ruleFiles: Object.values(DEMO_RULE_FILES),
+    precomputedStageId: precomputed.lastStageId,
+    precomputedRows: precomputed.results[precomputed.lastStageId]?.ordered?.length ?? 0,
   };
 }
 
@@ -385,11 +474,12 @@ if (isMain) {
   const outIdx = args.indexOf('--out');
   const outDir = outIdx >= 0 ? resolve(process.cwd(), args[outIdx + 1]) : join(here, '..', 'web', 'dist');
   try {
-    const result = buildDemoSite({ outDir });
+    const result = await buildDemoSite({ outDir });
     console.log(`[build-demo] 产物目录：${result.outDir}`);
     console.log(`[build-demo] 顶层条目：${result.files.join(', ')}`);
     console.log(`[build-demo] 领域层文件 ${result.domainFiles.length} 个，规则文件 ${result.ruleFiles.length} 个`);
-    console.log('[build-demo] ✅ 领域层浏览器安全检查通过');
+    console.log(`[build-demo] ✅ 领域层浏览器安全检查通过`);
+    console.log(`[build-demo] ✅ 构建期预计算完成：赛段 ${result.precomputedStageId}，排名 ${result.precomputedRows} 支队伍`);
   } catch (err) {
     console.error(`[build-demo] ✗ ${err.message}`);
     process.exit(1);

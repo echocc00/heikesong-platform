@@ -130,8 +130,14 @@ export function buildDemoState(seed) {
     signoffs: deepCopy(seed?.signoffs) ?? [],
     behaviorEvents: deepCopy(seed?.behaviorEvents) ?? [],
     registrations: [],
-    computations: {},
-    results: {},
+    // ⚠️ results / computations / lastStageId **透传种子里的预计算结果**：
+    //    演示站的种子由**构建期**跑一次真实引擎生成（build-demo.js），
+    //    目的就是让访客打开就能看到榜单（否则 results 永远空 ⇒ 榜单页「暂无数据」）。
+    //    ⛔ 之前这里硬编码 `{}` / `null` ⇒ 把种子里的预计算结果**全丢了**（预计算白做）。
+    //    ⚠️ 字段名保持与 runDemoCompute 写入的一致（stageId → result 的映射）。
+    computations: deepCopy(seed?.computations) ?? {},
+    results: deepCopy(seed?.results) ?? {},
+    lastStageId: deepCopy(seed?.lastStageId) ?? null,
     me: null,
   };
 }
@@ -653,6 +659,15 @@ export function createDemoApi({ storage = defaultStorage(), seed = null, rules =
     if (!state.results || typeof state.results !== 'object') state.results = {};
     if (!Array.isArray(state.registrations)) state.registrations = [];
     if (!state.reviews || typeof state.reviews !== 'object') state.reviews = {};
+    // ⚠️ **localStorage 里的旧 state 不带 results**（旧版演示站访问时留下的）⇒
+    //    榜单会是空的（访客明明是第一次看到新版演示站，却看到「暂无数据」）。
+    // ⇒ 补齐：**只补缺失的计算结果**，不覆盖访客自己的操作数据（报名/评审等）。
+    //    判据：localStorage 的 results 里**没有任何赛段** ⇒ 视为「旧版遗留」⇒ 从种子补。
+    if (Object.keys(state.results).length === 0 && seed?.results) {
+      state.results = deepCopy(seed.results) ?? {};
+      state.computations = { ...(deepCopy(seed?.computations) ?? {}), ...state.computations };
+      if (!state.lastStageId) state.lastStageId = deepCopy(seed?.lastStageId) ?? null;
+    }
     return state;
   };
   const persist = () => storage.setItem(STORAGE_KEY, JSON.stringify(state));

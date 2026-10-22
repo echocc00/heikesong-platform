@@ -5061,8 +5061,14 @@ export function buildDemoState(seed) {
     signoffs: deepCopy(seed?.signoffs) ?? [],
     behaviorEvents: deepCopy(seed?.behaviorEvents) ?? [],
     registrations: [],
-    computations: {},
-    results: {},
+    // ⚠️ results / computations / lastStageId **透传种子里的预计算结果**：
+    //    演示站的种子由**构建期**跑一次真实引擎生成（build-demo.js），
+    //    目的就是让访客打开就能看到榜单（否则 results 永远空 ⇒ 榜单页「暂无数据」）。
+    //    ⛔ 之前这里硬编码 `{}` / `null` ⇒ 把种子里的预计算结果**全丢了**（预计算白做）。
+    //    ⚠️ 字段名保持与 runDemoCompute 写入的一致（stageId → result 的映射）。
+    computations: deepCopy(seed?.computations) ?? {},
+    results: deepCopy(seed?.results) ?? {},
+    lastStageId: deepCopy(seed?.lastStageId) ?? null,
     me: null,
   };
 }
@@ -5584,6 +5590,15 @@ export function createDemoApi({ storage = defaultStorage(), seed = null, rules =
     if (!state.results || typeof state.results !== 'object') state.results = {};
     if (!Array.isArray(state.registrations)) state.registrations = [];
     if (!state.reviews || typeof state.reviews !== 'object') state.reviews = {};
+    // ⚠️ **localStorage 里的旧 state 不带 results**（旧版演示站访问时留下的）⇒
+    //    榜单会是空的（访客明明是第一次看到新版演示站，却看到「暂无数据」）。
+    // ⇒ 补齐：**只补缺失的计算结果**，不覆盖访客自己的操作数据（报名/评审等）。
+    //    判据：localStorage 的 results 里**没有任何赛段** ⇒ 视为「旧版遗留」⇒ 从种子补。
+    if (Object.keys(state.results).length === 0 && seed?.results) {
+      state.results = deepCopy(seed.results) ?? {};
+      state.computations = { ...(deepCopy(seed?.computations) ?? {}), ...state.computations };
+      if (!state.lastStageId) state.lastStageId = deepCopy(seed?.lastStageId) ?? null;
+    }
     return state;
   };
   const persist = () => storage.setItem(STORAGE_KEY, JSON.stringify(state));
@@ -5923,6 +5938,10 @@ import { buildDemoSite, assertDomainIsBrowserSafe, collectBrowserModules, loadNo
 import { DEMO_RULE_FILES, SEED_URL, RULES_BASE } from '../web/api.demo.js';
 import { loadRules } from '../src/config.js';
 import { serveStatic } from '../src/http/static.js';
+import { isolateTempDir } from '../test-helpers/tmp.js';
+
+// ⚠️ 隔离本进程临时目录：进程退出时整体回收（防临时目录泄漏，详见 test-helpers/tmp.js）
+isolateTempDir();
 
 const here = dirname(fileURLToPath(import.meta.url));
 const platformDir = join(here, '..');
@@ -5936,9 +5955,9 @@ function walk(dir, out = []) {
   return out;
 }
 
-test('构建产物是自包含静态站：根目录有 index.html，且没有绝对路径资源引用', () => {
+test('构建产物是自包含静态站：根目录有 index.html，且没有绝对路径资源引用', async () => {
   const out = mkdtempSync(join(tmpdir(), 'hks-dist-'));
-  buildDemoSite({ outDir: out, platformDir });
+  await buildDemoSite({ outDir: out, platformDir });
   assert.ok(existsSync(join(out, 'index.html')), '根目录必须有 index.html（静态托管的硬要求）');
 
   const html = readFileSync(join(out, 'index.html'), 'utf8');
@@ -5949,9 +5968,9 @@ test('构建产物是自包含静态站：根目录有 index.html，且没有绝
   rmSync(out, { recursive: true, force: true });
 });
 
-test('构建产物带上领域层与规则配置（浏览器里才跑得起来）', () => {
+test('构建产物带上领域层与规则配置（浏览器里才跑得起来）', async () => {
   const out = mkdtempSync(join(tmpdir(), 'hks-dist-'));
-  buildDemoSite({ outDir: out, platformDir });
+  await buildDemoSite({ outDir: out, platformDir });
 
   assert.ok(existsSync(join(out, 'src', 'domain', 'scoring.js')), '领域层必须拷进产物');
   assert.ok(existsSync(join(out, 'rules', 'scoring-final.json')), '规则配置必须拷进产物');
@@ -6055,6 +6074,9 @@ test('Node 专属全局禁用清单缺失或为空 ⇒ 守卫必须报错，不�
   writeFileSync(emptyFile, '# 只有注释，没有词条\n\n', 'utf8');
   assert.throws(() => loadNodeOnlyGlobals(emptyFile), /是空的/, '空清单必须报错');
   assert.throws(() => loadNodeOnlyGlobals(emptyFile), /空清单 ≠ 已保护/, '报错要说清空清单等于没保护');
+  // ⚠️ 这个临时目录也要回收 —— macOS 上 $TMPDIR 会自动清，Linux 的 /tmp 不会
+  //    （真机实测：2026-10-21 一次全量跑就在 /tmp 堆出 80+ 个 hks-* 目录）
+  rmSync(dirname(emptyFile), { recursive: true, force: true });
 
   // 正常清单读得到 5 条，且包含两个 __ 前缀的
   const tokens = loadNodeOnlyGlobals();
@@ -6084,9 +6106,9 @@ test('领域层之外的兄弟目录不得被当成领域层（目录边界按�
   rmSync(root, { recursive: true, force: true });
 });
 
-test('构建产物里不出现 data/ 与 node_modules/（不泄漏本机数据）', () => {
+test('构建产物里不出现 data/ 与 node_modules/（不泄漏本机数据）', async () => {
   const out = mkdtempSync(join(tmpdir(), 'hks-dist-'));
-  buildDemoSite({ outDir: out, platformDir });
+  await buildDemoSite({ outDir: out, platformDir });
   const rel = walk(out).map((f) => relative(out, f).split(sep).join('/'));
   assert.ok(!rel.some((f) => f.startsWith('data/')), '产物里不能有 data/');
   assert.ok(!rel.some((f) => f.includes('node_modules')), '产物里不能有 node_modules/');
@@ -6097,9 +6119,9 @@ test('构建产物里不出现 data/ 与 node_modules/（不泄漏本机数据�
 // D5-13：两个相对基准（相对 web/ 与相对 platform/）必须同时满足
 // ══════════════════════════════════════════════════════════════════════
 
-test('D5-13：产物布局让「模块目录基准」与「模块父目录基准」都指得到文件', () => {
+test('D5-13：产物布局让「模块目录基准」与「模块父目录基准」都指得到文件', async () => {
   const out = mkdtempSync(join(tmpdir(), 'hks-dist-'));
-  buildDemoSite({ outDir: out, platformDir });
+  await buildDemoSite({ outDir: out, platformDir });
 
   // 产物里适配器的位置 ⇒ 三个基准
   const adapterDir = join(out, 'web');   // 模块目录基准（源码里 = web/）
@@ -6147,7 +6169,7 @@ test('D5-13：产物布局让「模块目录基准」与「模块父目录基准
 
 test('D5-13：演示站在浏览器语义下真能起来（文档基准取种子与 12 份规则）', async () => {
   const out = mkdtempSync(join(tmpdir(), 'hks-dist-'));
-  buildDemoSite({ outDir: out, platformDir });
+  await buildDemoSite({ outDir: out, platformDir });
 
   const originalFetch = globalThis.fetch;
   // ⚠️ 浏览器语义：相对 URL 相对**文档基准**解析（不是相对模块、也不是相对 cwd）
@@ -6166,8 +6188,20 @@ test('D5-13：演示站在浏览器语义下真能起来（文档基准取种子
     const seed = await mod.loadDemoSeed(SEED_URL);
     const loaded = await mod.loadDemoRules(RULES_BASE);
 
+    // 种子同源：D5-13 的核心是「两个相对基准取到的是**同一份**种子」。
+    // ⚠️ 比较口径：产物种子 = 源种子 **+ 构建期预计算的 results**（build-demo.js），
+    //    所以不能拿它跟源种子逐字比（那样会把预计算当成"不一致"）。
+    //    ⇒ 改为：① 产物两份种子彼此逐字相同（同一份内容）；
+    //      ② 产物种子是源种子的**超集**（源种子的每个键都在、值不变）。
+    const outSeedRoot = JSON.parse(readFileSync(join(out, 'seed', 'demo-data.json'), 'utf8'));
+    const outSeedWeb = JSON.parse(readFileSync(join(out, 'web', 'seed', 'demo-data.json'), 'utf8'));
+    assert.deepEqual(seed, outSeedRoot, '两个相对基准取到的必须是同一份种子（文档基准 vs 根目录）');
+    assert.deepEqual(seed, outSeedWeb, '两个相对基准取到的必须是同一份种子（文档基准 vs web/ 基准）');
+
     const platformSeed = JSON.parse(readFileSync(join(platformDir, 'web', 'seed', 'demo-data.json'), 'utf8'));
-    assert.deepEqual(seed, platformSeed, '浏览器加载的种子必须与仓库里的是同一份');
+    for (const [k, v] of Object.entries(platformSeed)) {
+      assert.deepEqual(outSeedRoot[k], v, `产物种子的源字段 ${k} 不得被构建改写`);
+    }
 
     // 规则同源：浏览器加载的 12 份配置 ≡ 正式系统 loadRules() 的结果
     const { rules } = loadRules(join(platformDir, 'rules'));
@@ -6198,7 +6232,7 @@ test('D5-13：演示站在浏览器语义下真能起来（文档基准取种子
 // 可移植性：换一份拷贝也得能构建（不许偷偷用脚本所在目录的资源）
 // ══════════════════════════════════════════════════════════════════════
 
-test('构建必须以 platformDir 为准（换一份拷贝也能构建，不许用脚本所在目录的资源）', () => {
+test('构建必须以 platformDir 为准（换一份拷贝也能构建，不许用脚本所在目录的资源）', async () => {
   const root = mkdtempSync(join(tmpdir(), 'hks-port-'));
   const copyRoot = join(root, 'platform');
   mkdirSync(copyRoot, { recursive: true });
@@ -6213,7 +6247,7 @@ test('构建必须以 platformDir 为准（换一份拷贝也能构建，不许�
   writeFileSync(copyHtml, readFileSync(copyHtml, 'utf8').replace('<title>', '<title>【副本】'), 'utf8');
 
   const out = join(root, 'dist');
-  buildDemoSite({ outDir: out, platformDir: copyRoot });
+  await buildDemoSite({ outDir: out, platformDir: copyRoot });
 
   const html = readFileSync(join(out, 'index.html'), 'utf8');
   assert.ok(html.includes('【副本】'), '必须用 platformDir 指定的资源构建（不许回落到脚本所在目录）');
@@ -6223,7 +6257,7 @@ test('构建必须以 platformDir 为准（换一份拷贝也能构建，不许�
   rmSync(root, { recursive: true, force: true });
 });
 
-test('产物里不得夹带 macOS 的 AppleDouble 伴生文件（._xxx）', () => {
+test('产物里不得夹带 macOS 的 AppleDouble 伴生文件（._xxx）', async () => {
   // 真机实测（2026-10-21，8.133.200.235 / Debian 12 / ext4）：
   //   按 P6 计划 Step 4 的「跨平台复现」配方从 macOS 拷到 Linux 时，
   //   `tar` 会给每个文件配一个 `._xxx` 资源叉载体 —— 内容是二进制，不是真资源。
@@ -6245,7 +6279,7 @@ test('产物里不得夹带 macOS 的 AppleDouble 伴生文件（._xxx）', () =
   writeFileSync(join(copyRoot, 'web', '._app.js'), ad);
 
   const out = join(root, 'dist');
-  buildDemoSite({ outDir: out, platformDir: copyRoot });
+  await buildDemoSite({ outDir: out, platformDir: copyRoot });
 
   const leaked = [];
   const walk = (dir) => {
@@ -6265,13 +6299,13 @@ test('产物里不得夹带 macOS 的 AppleDouble 伴生文件（._xxx）', () =
   rmSync(root, { recursive: true, force: true });
 });
 
-test('构建前必须清空产物目录（陈旧文件不得混进产物）', () => {
+test('构建前必须清空产物目录（陈旧文件不得混进产物）', async () => {
   const out = mkdtempSync(join(tmpdir(), 'hks-dist-'));
   writeFileSync(join(out, 'stale.txt'), '上一版的残留\n', 'utf8');
   mkdirSync(join(out, 'old-dir'), { recursive: true });
   writeFileSync(join(out, 'old-dir', 'x.js'), 'export const x = 1;\n', 'utf8');
 
-  buildDemoSite({ outDir: out, platformDir });
+  await buildDemoSite({ outDir: out, platformDir });
 
   assert.ok(!existsSync(join(out, 'stale.txt')), '陈旧文件必须被清掉（产物目录每次重建）');
   assert.ok(!existsSync(join(out, 'old-dir')), '陈旧目录必须被清掉（产物目录每次重建）');
@@ -6280,7 +6314,7 @@ test('构建前必须清空产物目录（陈旧文件不得混进产物）', ()
   rmSync(out, { recursive: true, force: true });
 });
 
-test('产物目录落在 web/ 里面时也不能把自己拷进自己（--out 指向 web/ 内部）', () => {
+test('产物目录落在 web/ 里面时也不能把自己拷进自己（--out 指向 web/ 内部）', async () => {
   // ⚠️ 这是变异检验 M13 实跑炸出来的真缺陷：
   //    产物目录默认在 web/dist/，靠名字 'dist' 排除就够；
   //    但 --out 可以指向 web/ 里的**任何**目录 ⇒ 产物会把自己拷进自己 ⇒ 无限递归 ⇒ ENAMETOOLONG。
@@ -6292,7 +6326,7 @@ test('产物目录落在 web/ 里面时也不能把自己拷进自己（--out �
   });
   const inner = join(webCopy, 'inner-dist');
   try {
-    buildDemoSite({ outDir: inner, platformDir, webDir: webCopy });
+    await buildDemoSite({ outDir: inner, platformDir, webDir: webCopy });
     assert.ok(existsSync(join(inner, 'index.html')), '构建必须成功');
     assert.ok(
       !existsSync(join(inner, 'web', 'inner-dist')),
@@ -6309,7 +6343,7 @@ test('产物目录落在 web/ 里面时也不能把自己拷进自己（--out �
 test('产物挂在子路径下也不跑出站点（领域层 / 种子 / 规则都还在站点内）', async () => {
   const site = mkdtempSync(join(tmpdir(), 'hks-site-'));
   const dist = join(site, 'dist');
-  buildDemoSite({ outDir: dist, platformDir });
+  await buildDemoSite({ outDir: dist, platformDir });
 
   // 用仓库自己的静态服务器把 site/ 当根 ⇒ 站点实际挂在 /dist/ 下
   const server = http.createServer((req, res) => {
@@ -6501,8 +6535,8 @@ test('演示版横幅：?demo=1 才渲染，正式版不渲染', async () => {
   }
 });
 
-test('默认产物目录必须是 platform/web/dist（唯一口径 —— F-1 裁决）', () => {
-  const result = buildDemoSite({ platformDir });
+test('默认产物目录必须是 platform/web/dist（唯一口径 —— F-1 裁决）', async () => {
+  const result = await buildDemoSite({ platformDir });
   assert.equal(
     resolve(result.outDir),
     resolve(join(platformDir, 'web', 'dist')),
@@ -6542,7 +6576,7 @@ test('本地预览服务器（scripts/serve-demo.js）真的在 serve 产物目�
 // 登记：脚本与忽略规则（机器守住，不靠自觉）
 // ══════════════════════════════════════════════════════════════════════
 
-test('规则配置缺失时构建必须失败（绝不静默少一个 —— 演示站会起不了引擎）', () => {
+test('规则配置缺失时构建必须失败（绝不静默少一个 —— 演示站会起不了引擎）', async () => {
   const root = mkdtempSync(join(tmpdir(), 'hks-rules-'));
   const partial = join(root, 'rules');
   mkdirSync(partial, { recursive: true });
@@ -6551,8 +6585,9 @@ test('规则配置缺失时构建必须失败（绝不静默少一个 —— 演
     copyFileSync(join(platformDir, 'rules', file), join(partial, file));
   }
   const out = join(root, 'dist');
-  assert.throws(
-    () => buildDemoSite({ outDir: out, platformDir, rulesDir: partial }),
+  // ⚠️ buildDemoSite 现在是 async ⇒ 用 assert.rejects（assert.throws 不接受 async 回调）
+  await assert.rejects(
+    async () => buildDemoSite({ outDir: out, platformDir, rulesDir: partial }),
     (err) => {
       assert.match(err.message, /规则配置缺失/, `必须说清是规则配置缺失：${err.message}`);
       return true;
@@ -6572,6 +6607,227 @@ test('package.json 必须登记 P6 的脚本，.gitignore 必须忽略产物目�
     /^platform\/web\/dist\/$/m.test(ignore),
     '.gitignore 必须有独立成行的 platform/web/dist/（产物不入库）',
   );
+});
+
+// ── 演示模式必须被「构建」钉死（不是靠访客记得加 ?demo=1）────────────────
+test('⛔ 构建产物必须强制演示模式（访客打开就是坏页面 ⇒ 不能靠 ?demo=1）', async () => {
+  // 背景（真机浏览器实测）：源前端用查询参数判定 —— `?demo=1` 时用 localStorage 适配器
+  //   （web/api.demo.js），否则用真实 API 适配器（web/api.js）。
+  //   ⇒ 对外发布的静态包里，访客**不会**带 ?demo=1 ⇒ 走真实 API ⇒ 静态站上 /api/* 全 404
+  //   ⇒ 页面白屏报「Unexpected non-whitespace character after JSON」。
+  //   ⇒ 构建时把产物里的判定钉死成 true。
+  const root = mkdtempSync(join(tmpdir(), 'hks-demomode-'));
+  try {
+    const out = join(root, 'dist');
+    await buildDemoSite({ outDir: out, platformDir });
+    const appJs = readFileSync(join(out, 'web', 'app.js'), 'utf8');
+    assert.match(appJs, /const isDemo = true;/, '产物里必须把 isDemo 钉成 true');
+    assert.ok(
+      !/new URLSearchParams\(window\.location\.search\)/.test(appJs),
+      '⛔ 产物里不该再靠查询参数判定（访客不会带 ?demo=1）',
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('⛔ 源前端找不到 isDemo 判定行 ⇒ 构建必须失败（fail-fast，不许发出「打开即坏」的包）', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'hks-demomode-bad-'));
+  try {
+    const copyRoot = join(root, 'platform');
+    mkdirSync(copyRoot, { recursive: true });
+    cpSync(join(platformDir, 'rules'), join(copyRoot, 'rules'), { recursive: true });
+    cpSync(join(platformDir, 'src', 'domain'), join(copyRoot, 'src', 'domain'), { recursive: true });
+    cpSync(join(platformDir, 'web'), join(copyRoot, 'web'), {
+      recursive: true,
+      filter: (src) => !src.includes(`${sep}dist${sep}`) && !src.endsWith(`${sep}dist`),
+    });
+    // 把 isDemo 判定行删掉（模拟源前端被重构了）
+    const appJs = join(copyRoot, 'web', 'app.js');
+    writeFileSync(appJs, readFileSync(appJs, 'utf8').replace(/^\s*const isDemo\s*=.*$/m, ''), 'utf8');
+
+    let thrown = null;
+    try {
+      await buildDemoSite({ outDir: join(root, 'dist'), platformDir: copyRoot });
+    } catch (err) {
+      thrown = err;
+    }
+    assert.ok(thrown, '⛔ 找不到 isDemo 判定行必须抛错（不许默默发一个坏包）');
+    assert.match(thrown.message, /isDemo/, '报错要说清是 isDemo 判定行不见了');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// 构建期预计算：访客打开就能看到榜单（不用先点「计算」）
+//
+// 背景（真机浏览器实测）：榜单数据来自 `state.results[stageId]`，
+//   而 results 只在 `POST /api/stages/:stageId/compute` 时被写入 ——
+//   正式平台由管理员在后台发榜时触发，**演示站没有后台**
+//   ⇒ 访客打开榜单页永远是「暂无数据」。
+// ⇒ 修法（用户选定）：**构建期预计算** —— 构建演示包时跑一次**真实引擎**，
+//   把 results 写进产物里的种子 ⇒ 访客打开即见榜单，
+//   而规则引擎仍在浏览器里真实可复算（访客自己再触发 compute 会重算）。
+//
+// ⚠️ 关键约束：**构建时算的**与**浏览器里跑的**必须是同一批规则配置
+//   ⇒ 构建期按 `DEMO_RULE_FILES`（演示适配器实际会用的那 12 份）加载，
+//   不用 `src/config.js` 的 `loadRules`（那份含演示站用不到的 schedule/compliance/pools/audit）。
+// ─────────────────────────────────────────────────────────────────────
+
+test('构建期预计算：产物种子必须带上 results（访客打开即见榜单）', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'hks-precompute-'));
+  try {
+    const out = join(root, 'dist');
+    await buildDemoSite({ outDir: out, platformDir });
+
+    // 两份种子都要带（SEED_URL 基准 = web/seed/；文档基准 = 根 seed/）
+    for (const rel of [['web', 'seed', 'demo-data.json'], ['seed', 'demo-data.json']]) {
+      const seed = JSON.parse(readFileSync(join(out, ...rel), 'utf8'));
+      assert.ok(seed.results && typeof seed.results === 'object',
+        `产物种子 ${rel.join('/')} 缺 results ⇒ 访客会看到空榜单`);
+      assert.ok(Object.keys(seed.results).length > 0, `产物种子 ${rel.join('/')} 的 results 是空的`);
+      assert.ok(seed.lastStageId, `产物种子 ${rel.join('/')} 缺 lastStageId ⇒ 榜单不知道取哪个赛段`);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('构建期预计算：产物种子里的结果必须能真的算出榜单行（不是空壳）', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'hks-precompute-rows-'));
+  try {
+    const out = join(root, 'dist');
+    await buildDemoSite({ outDir: out, platformDir });
+    const seed = JSON.parse(readFileSync(join(out, 'seed', 'demo-data.json'), 'utf8'));
+
+    // 用**产物里的适配器 + 产物里的规则**跑一遍（模拟浏览器）
+    const demo = await import(pathToFileURL(join(out, 'web', 'api.demo.js')).href);
+    const rules = {};
+    for (const [key, file] of Object.entries(DEMO_RULE_FILES)) {
+      rules[key] = JSON.parse(readFileSync(join(out, 'rules', file), 'utf8'));
+    }
+    const shaped = {
+      scoring: { initial: rules.scoringInitial, final: rules.scoringFinal },
+      tiebreak: rules.tiebreak,
+      ranks: rules.ranks,
+      behavior: rules.behavior,
+      visibility: rules.visibility,
+      registration: rules.registration,
+      solvability: rules.solvability,
+      milestones: rules.milestones,
+      teamFormation: rules.teamFormation,
+      points: rules.points,
+      criteria: rules.criteria,
+    };
+
+    const state = demo.buildDemoState(seed);
+    assert.ok(Object.keys(state.results).length > 0,
+      '⛔ buildDemoState 必须透传种子里的 results（否则预计算白做）');
+
+    const lb = demo.demoRollingLeaderboard({ state, rules: shaped, viewer: null });
+    assert.ok(Array.isArray(lb.rows) && lb.rows.length > 0,
+      `⛔ 预计算后榜单仍是空的（rows=${JSON.stringify(lb.rows)}）`);
+    assert.ok(!lb.empty, '⛔ 预计算后不该再报 empty');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('构建期预计算：源种子文件不得被构建改写（预计算只落在产物里）', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'hks-precompute-src-'));
+  try {
+    const srcSeed = join(platformDir, 'web', 'seed', 'demo-data.json');
+    const before = readFileSync(srcSeed, 'utf8');
+    const out = join(root, 'dist');
+    await buildDemoSite({ outDir: out, platformDir });
+    const after = readFileSync(srcSeed, 'utf8');
+    assert.equal(after, before, '⛔ 源种子不得被构建改写（产物与源码必须分离）');
+    assert.ok(!JSON.parse(before).results,
+      '⛔ 源种子本来不该有 results（预计算是构建期的事）');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('构建期预计算：算出空排名 ⇒ 构建必须失败（fail-fast，不许发一个空榜包）', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'hks-precompute-fail-'));
+  try {
+    const copyRoot = join(root, 'platform');
+    mkdirSync(copyRoot, { recursive: true });
+    cpSync(join(platformDir, 'rules'), join(copyRoot, 'rules'), { recursive: true });
+    cpSync(join(platformDir, 'src', 'domain'), join(copyRoot, 'src', 'domain'), { recursive: true });
+    cpSync(join(platformDir, 'web'), join(copyRoot, 'web'), {
+      recursive: true,
+      filter: (src) => !src.includes(`${sep}dist${sep}`) && !src.endsWith(`${sep}dist`),
+    });
+    // 把种子里的战队清空 ⇒ 计算能跑完但**产不出任何排名**
+    // （⚠️ 不是塞非法分数：引擎对非数字是**有意跳过**的（`!Number.isFinite(v) ⇒ continue`），
+    //    那是设计好的容错，不会抛错 —— 用它当"计算失败"是选错了场景。）
+    const seedPath = join(copyRoot, 'web', 'seed', 'demo-data.json');
+    const seed = JSON.parse(readFileSync(seedPath, 'utf8'));
+    seed.teams = [];
+    seed.reviews = {};
+    writeFileSync(seedPath, JSON.stringify(seed, null, 2), 'utf8');
+
+    let thrown = null;
+    try {
+      await buildDemoSite({ outDir: join(root, 'dist'), platformDir: copyRoot });
+    } catch (err) {
+      thrown = err;
+    }
+    assert.ok(thrown, '⛔ 预计算算出空排名必须抛错（不许默默发一个空榜包）');
+    assert.match(thrown.message, /预计算|计算/, '报错要说清是预计算这一步挂了');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('构建期预计算：老访客的 localStorage（无 results）⇒ 榜单仍要有数据', async () => {
+  // 背景：演示站把访客的操作存进 localStorage（STORAGE_KEY），
+  //   而 `ensure()` 是 **storage 优先、seed 兜底** ⇒ 旧版演示站访问过的人，
+  //   localStorage 里留着一份**不带 results** 的 state ⇒ 榜单会空。
+  // ⇒ 这些访客明明是第一次看到新版演示站，却看到「暂无数据」⇒ 必须兜底。
+  const root = mkdtempSync(join(tmpdir(), 'hks-precompute-old-'));
+  try {
+    const out = join(root, 'dist');
+    await buildDemoSite({ outDir: out, platformDir });
+    const seed = JSON.parse(readFileSync(join(out, 'seed', 'demo-data.json'), 'utf8'));
+
+    const demo = await import(pathToFileURL(join(out, 'web', 'api.demo.js')).href);
+    const rules = {};
+    for (const [key, file] of Object.entries(DEMO_RULE_FILES)) {
+      rules[key] = JSON.parse(readFileSync(join(out, 'rules', file), 'utf8'));
+    }
+    const shaped = {
+      scoring: { initial: rules.scoringInitial, final: rules.scoringFinal },
+      tiebreak: rules.tiebreak, ranks: rules.ranks, behavior: rules.behavior,
+      visibility: rules.visibility, registration: rules.registration, solvability: rules.solvability,
+      milestones: rules.milestones, teamFormation: rules.teamFormation, points: rules.points, criteria: rules.criteria,
+    };
+
+    // 模拟旧版遗留的 localStorage：**基础数据齐全**（teams/users/judges/reviews 都来自旧种子，
+    //   访客不会改这些），但**没有 results**（旧版演示站的种子里没有预计算结果）
+    //   ⇒ 还带一份访客自己产生的报名数据（必须保留，不能被种子覆盖）。
+    const oldState = { ...demo.buildDemoState(seed), results: {}, computations: {} };
+    oldState.registrations = [{ id: 'r_old_visitor' }];
+    const storage = {
+      getItem: () => JSON.stringify(oldState),
+      setItem: () => {},
+      removeItem: () => {},
+    };
+    const api = demo.createDemoApi({ storage, seed, rules: shaped });
+    const lb = await api.get('/api/leaderboard/rolling');
+    assert.ok(Array.isArray(lb.rows) && lb.rows.length > 0,
+      `⛔ 老访客（localStorage 无 results）看到的榜单是空的 ⇒ 预计算被旧 state 盖掉了`);
+
+    // ⛔ 补 results **不得覆盖访客自己的操作数据**
+    const regs = await api.get('/api/registrations');
+    assert.deepEqual(regs.rows, [{ id: 'r_old_visitor' }],
+      '⛔ 补预计算结果时不得覆盖访客自己的报名数据');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 ```
 
@@ -6614,7 +6870,6 @@ import {
 import { join, dirname, relative, resolve, sep, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DEMO_RULE_FILES } from '../web/api.demo.js';
-
 const here = dirname(fileURLToPath(import.meta.url));
 
 /**
@@ -6855,7 +7110,83 @@ export function assertDomainIsBrowserSafe(domainDir) {
  *   ⇒ 附带好处：适配器里 '../src/domain/*.js' 的相对导入落在 <out>/src/domain/，
  *     **在产物内** ⇒ 站点挂在任意 base path 下都不会 404 白屏。
  */
-export function buildDemoSite({
+/**
+ * 按 `DEMO_RULE_FILES` 加载**演示适配器实际会用的**那批规则，重组成适配器要的形状。
+ *
+ * ⚠️ 为什么不用 `src/config.js` 的 `loadRules`：
+ *    那份加载的是**平台全量**规则（含 schedule / compliance / pools / audit），
+ *    而演示适配器只认 `DEMO_RULE_FILES` 这 12 份 ⇒ 用错清单会算出「浏览器里算不出来的结果」。
+ *    ⇒ 这里**必须与浏览器侧同一批配置**（同一个 `DEMO_RULE_FILES`），
+ *      否则「构建时算的」与「浏览器里跑的」就不是同一件事 ⇒ 演示价值归零。
+ */
+export function loadDemoRulesFrom(rulesDir) {
+  const loaded = {};
+  for (const [key, file] of Object.entries(DEMO_RULE_FILES)) {
+    const p = join(rulesDir, file);
+    if (!existsSync(p)) throw new Error(`演示规则配置缺失：${p}`);
+    loaded[key] = JSON.parse(readFileSync(p, 'utf8'));
+  }
+  return {
+    scoring: { initial: loaded.scoringInitial, final: loaded.scoringFinal },
+    tiebreak: loaded.tiebreak,
+    ranks: loaded.ranks,
+    behavior: loaded.behavior,
+    visibility: loaded.visibility,
+    registration: loaded.registration,
+    solvability: loaded.solvability,
+    milestones: loaded.milestones,
+    teamFormation: loaded.teamFormation,
+    points: loaded.points,
+    criteria: loaded.criteria,
+  };
+}
+
+/**
+ * **构建期预计算**：用真实引擎跑一次，把结果写进种子。
+ *
+ * 背景（真机浏览器实测）：榜单数据来自 `state.results[stageId]`，
+ *   而 results 只在 `POST /api/stages/:stageId/compute` 时被写入 ——
+ *   正式平台由管理员在后台发榜时触发，**演示站没有后台** ⇒ 访客打开永远是「暂无数据」。
+ * ⇒ 这里在构建时把计算跑完，结果落到**产物里的种子** ⇒ 访客打开即见榜单。
+ *
+ * ⚠️ 只改**产物**的种子，**源种子不动**（`web/seed/demo-data.json` 保持人可读、可评审）。
+ * ⚠️ 规则引擎仍在**浏览器里真实可复算** —— 访客自己触发 compute 会重算（可看到同样结果）。
+ * ⛔ 计算失败 ⇒ 抛错让构建失败（fail-fast）：宁可构建不出来，也不发一个空榜包。
+ */
+export async function precomputeDemoSeed({ platformDir, seed }) {
+  // ⚠️ 用**绝对路径 + file URL** 动态 import：`platformDir` 可配置（测试会换一份拷贝），
+  //    相对导入会解析到脚本自身所在目录 ⇒ 算的是「脚本旁边的平台」而不是「要构建的那个平台」。
+  const { pathToFileURL } = await import('node:url');
+  const demo = await import(pathToFileURL(join(platformDir, 'web', 'api.demo.js')).href);
+  const rules = loadDemoRulesFrom(join(platformDir, 'rules'));
+
+  const state = demo.buildDemoState(seed);
+  const stageId = 'stage_final';
+  let result;
+  try {
+    result = demo.runDemoCompute({
+      state,
+      rules,
+      stageId,
+      // ⛔ 时间戳用**固定值**：构建产物必须可复现（同一个输入 ⇒ 同一个产物 ⇒ 便于比对与缓存）
+      now: '1970-01-01T00:00:00.000Z',
+    });
+  } catch (err) {
+    throw new Error(`演示种子预计算失败，拒绝构建（否则会发出一个「打开就是空榜单」的包）：${err.message}`);
+  }
+  if (!result || !Array.isArray(result.ordered) || result.ordered.length === 0) {
+    throw new Error('演示种子预计算没有产出任何排名，拒绝构建（否则会发出一个「打开就是空榜单」的包）');
+  }
+
+  return {
+    ...seed,
+    computations: { [result.computationId]: result },
+    results: { [stageId]: result },
+    lastStageId: stageId,
+  };
+}
+
+export async function buildDemoSite({
   // ⚠️ platformDir 必须排第一个：后面的默认值要引用它（JS 的解构默认值按顺序求值）
   platformDir = join(here, '..'),
   outDir = join(platformDir, 'web', 'dist'),
@@ -6863,7 +7194,6 @@ export function buildDemoSite({
   rulesDir = join(platformDir, 'rules'),
 } = {}) {
   const domainDir = join(platformDir, 'src', 'domain');
-
   // 1. 先守卫：领域层有 Node 依赖 → 构建失败（不产出半成品）
   const violations = assertDomainIsBrowserSafe(domainDir);
   if (violations.length) {
@@ -6906,14 +7236,22 @@ export function buildDemoSite({
   // 6. 规则配置拷到产物根（= 适配器的父目录 = RULES_BASE 的来源基准）
   copyDir(rulesDir, join(outDir, 'rules'));
 
-  // 7. 种子数据：拷两份（同一份内容，同源）
+  // 7. 种子数据：预计算后拷两份（同一份内容，同源）
   //    ① <out>/web/seed/demo-data.json —— 随 web/ 整目录拷过来的（SEED_URL 的来源基准）
   //    ② <out>/seed/demo-data.json     —— 浏览器里 fetch() 相对【文档基准】解析，
   //       文档在站点根 ⇒ 真正被取到的是这一份
+  //    ⚠️ **两份必须都是预计算后的版本** ⇒ 浏览器无论按哪个基准取到种子，榜单都有数据。
+  //       （web/ 那份是第 4 步整目录拷过来的 ⇒ 这里必须**覆盖**它，否则它还是未预计算的源种子。）
   const seedSrc = join(webDir, 'seed', 'demo-data.json');
   if (!existsSync(seedSrc)) throw new Error(`缺少演示种子数据：${seedSrc}`);
+  const seedRaw = JSON.parse(readFileSync(seedSrc, 'utf8'));
+  // 7.1 ⛔ 构建期预计算：用**真实引擎**跑一次，结果写进种子
+  //     （否则访客打开榜单页永远是「暂无数据」—— results 只在 compute 时才被写入）
+  const precomputed = await precomputeDemoSeed({ platformDir, seed: seedRaw });
+  const seedJson = `${JSON.stringify(precomputed, null, 2)}\n`;
   mkdirSync(join(outDir, 'seed'), { recursive: true });
-  copyFileSync(seedSrc, join(outDir, 'seed', 'demo-data.json'));
+  writeFileSync(join(outDir, 'seed', 'demo-data.json'), seedJson, 'utf8');
+  writeFileSync(join(outDir, 'web', 'seed', 'demo-data.json'), seedJson, 'utf8');
 
   // 8. 入口页放【站点根】（静态托管的硬要求：根目录必须有 index.html）
   //    ⚠️ app 在 <out>/web/ 下 ⇒ 资源路径要指到 ./web/…；
@@ -6955,6 +7293,11 @@ export function buildDemoSite({
     builtAt: new Date().toISOString(),
     ruleFiles: Object.values(DEMO_RULE_FILES),
     note: '演示站：规则引擎在浏览器里真实运行；数据不跨人共享（各自浏览器独立）。',
+    precomputed: {
+      stageId: precomputed.lastStageId,
+      teams: precomputed.results[precomputed.lastStageId]?.ordered?.length ?? 0,
+      note: '构建期用真实引擎预计算的结果（访客打开即见榜单）',
+    },
   };
   writeFileSync(join(outDir, 'build-manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
 
@@ -6963,6 +7306,8 @@ export function buildDemoSite({
     files: readdirSync(outDir),
     domainFiles: readdirSync(join(outDir, 'src', 'domain')),
     ruleFiles: Object.values(DEMO_RULE_FILES),
+    precomputedStageId: precomputed.lastStageId,
+    precomputedRows: precomputed.results[precomputed.lastStageId]?.ordered?.length ?? 0,
   };
 }
 
@@ -6972,11 +7317,12 @@ if (isMain) {
   const outIdx = args.indexOf('--out');
   const outDir = outIdx >= 0 ? resolve(process.cwd(), args[outIdx + 1]) : join(here, '..', 'web', 'dist');
   try {
-    const result = buildDemoSite({ outDir });
+    const result = await buildDemoSite({ outDir });
     console.log(`[build-demo] 产物目录：${result.outDir}`);
     console.log(`[build-demo] 顶层条目：${result.files.join(', ')}`);
     console.log(`[build-demo] 领域层文件 ${result.domainFiles.length} 个，规则文件 ${result.ruleFiles.length} 个`);
-    console.log('[build-demo] ✅ 领域层浏览器安全检查通过');
+    console.log(`[build-demo] ✅ 领域层浏览器安全检查通过`);
+    console.log(`[build-demo] ✅ 构建期预计算完成：赛段 ${result.precomputedStageId}，排名 ${result.precomputedRows} 支队伍`);
   } catch (err) {
     console.error(`[build-demo] ✗ ${err.message}`);
     process.exit(1);
@@ -10924,3 +11270,50 @@ TLS 作为可选增强、不 force。
 - 三个机器闸：`audit-scan` / `temp-leak-scan` / `bash-var-scan` **退出码均 0**
 - 漂移审计：**A 166 ｜ B 6 ｜ C-EXT 61 ｜ C-RW 0 ｜ D 0**
 - 真机：六个服务全 active；演示站 **8445 → 200**（本机 `--resolve` 验真证书链）；平台 **8444 → 200**；**8081 → 308**；产物 `isDemo = true` ✅
+
+---
+
+## 第 11 轮补充：演示站公网放行 + 构建期预计算（DP-57 ~ DP-64）
+
+> 触发：用户放行了安全组 TCP 8445 ⇒ 公网可达；浏览器实测随即发现「**访客打开就是空榜单**」。
+> **结论先行**：演示站已公网可用（`https://8.133.200.235:8445/`），访客打开**直接看到榜单**
+> （5 支队伍 + 7 条降级告警），控制台 0 错误、网络 0 失败请求。
+> ⇒ 修法（**用户选定**）：**构建期预计算** —— 构建演示包时跑一次真实引擎，把 results 写进产物里的种子。
+
+### A. 公网放行与实测（DP-57 ~ DP-59）
+
+| 编号 | 项 | 结论 |
+|---|---|---|
+| DP-57 | 公网放行 | 用户放行安全组 TCP 8445 ⇒ 公网 `https://8.133.200.235:8445/` **200**；`ssl_verify=0`（**真实证书链校验通过**，未用 `-k`）；**HTTP/2**；关键路径全 200。 |
+| DP-58 | ⛔ **浏览器实测发现「访客打开就是空榜单」** | 真实浏览器打开（**不带任何参数**）⇒ 榜单页「**暂无数据**」；**演示横幅正常、控制台 0 错误、网络 0 失败请求** ⇒ ⛔ **不是加载失败，是真的没数据**。 |
+| DP-59 | 根因 | 榜单数据来自 `state.results[stageId]`，而 results **只在 `POST /api/stages/:stageId/compute` 时被写入** —— 正式平台由管理员在后台发榜时触发，**演示站没有后台**。<br>⚠️ 计划 Task 4 写的是「**点一下「计算」**，就能看到 z-score 降级…全部真实发生」⇒ 但**前端根本没有任何地方调 compute**（`web/app.js` + 10 个 view 全都没有）⇒ 那个「计算」按钮在 UI 上**并不存在** ⇒ 计划与实现脱节。 |
+
+### B. 修复：构建期预计算（DP-60 ~ DP-62）
+
+| 编号 | 项 | 设计 |
+|---|---|---|
+| DP-60 | **构建期预计算** | `scripts/build-demo.js` 在构建时用**真实引擎**跑一次（`runDemoCompute`），把 `results` / `lastStageId` / `computations` 写进**产物里的两份种子**（根 `seed/` 与 `web/seed/`）⇒ 访客打开即见榜单。<br>⚠️ **源种子不动**（`web/seed/demo-data.json` 保持人可读、可评审）⇒ 产物与源码分离。<br>⚠️ 规则引擎**仍在浏览器里真实可复算**（访客自己触发 compute 会重算）⇒ 演示价值不打折。<br>⚠️ 构建期加载的规则**必须与浏览器侧同一批**（用 `DEMO_RULE_FILES` 那 12 份，**不用** `src/config.js` 的 `loadRules` —— 那份含演示站用不到的 schedule/compliance/pools/audit）⇒ 否则「构建时算的」≠「浏览器里跑的」。<br>⚠️ `buildDemoSite` 由同步改 **async**（预计算要 await）⇒ 19 处调用点全部加 `await`；`assert.throws` 改 `assert.rejects`（**`assert.throws` 不接受 async 回调**）。 |
+| DP-61 | ⛔ **fail-fast** | 算出**空排名** ⇒ 构建**失败**（退出码非 0）⇒ 宁可构建不出来，也不发一个「打开就是空榜单」的包。 |
+| DP-62 | ⛔ **老访客兜底**（第二个 bug） | 演示站把访客状态存 localStorage（`STORAGE_KEY`），而 `ensure()` 是 **storage 优先、seed 兜底** ⇒ **旧版演示站访问过的人** localStorage 里留着一份**不带 results** 的旧 state ⇒ 榜单仍空（明明是第一次看到新版）。⇒ 兜底：localStorage 的 results **一个赛段都没有** ⇒ 视为旧版遗留 ⇒ 从种子补 `results`/`computations`/`lastStageId`。⛔ **只补计算结果，不覆盖访客自己的操作数据**（报名/评审等）。 |
+
+### C. 判别性与变异（DP-63）
+
+| 编号 | 项 | 结论 |
+|---|---|---|
+| DP-63 | 回归用例 + 变异 | `platform/test/demo-static.test.js` 增至 **31 条**（新增 5 条）。⚠️ 既有 D5-13 用例的**比较口径**改了：原断言「浏览器加载的种子 ≡ 仓库里的种子」与预计算冲突 ⇒ 改为「**两份产物种子彼此逐字相同** + **产物种子是源种子的超集**」（D5-13 的**意图**「两个相对基准取到同一份」**未变**，只是比较对象从「源种子」换成「两份产物种子」）。<br>**变异检验：9 个变异体 / 9 KILLED / 0 存活 / 0 失配**（M1 `buildDemoState` 退回丢弃 results / M2 退回不透传 lastStageId / M3 不写回 `web/seed` / M4 不写回根 `seed` / M5 空排名不再 fail-fast / M6 预计算用**不同的规则集** / M7 构建期改写源种子 / M8 去掉老访客兜底 / M9 兜底时覆盖访客数据）。 |
+
+### D. 文档与同步（DP-64）
+
+| 文档 | 动作 |
+|---|---|
+| 部署手册 | 台账新增 **E67–E76**（公网放行 / 空榜单实测 / 根因 / 三层修复 / 判别性 / 变异 / 真机重发 / 浏览器验收）。 |
+| 计划块 | 改动的三个文件（`scripts/build-demo.js`、`web/api.demo.js`、`test/demo-static.test.js`）已用 `plan-block-sync.mjs` **逐字同步回本计划** ⇒ `--verify` 复验逐字一致 ⇒ **C-RW 归零**。<br>⚠️ 顺带发现：同步前审计报 **C-RW = 3**（正是这三个文件）⇒ **漂移审计这把尺子真的在干活**。 |
+| 设计文档 §8 / 需求落地表 | **未改动**（不新增端点、不新增编号需求）。 |
+
+### E. 本轮实跑
+
+- 本机全量：**1376 例 / 1375 通过 / 0 失败 / 1 跳过**（以实跑为准）
+- 三个机器闸：`audit-scan` / `temp-leak-scan` / `bash-var-scan` **退出码均 0**
+- 漂移审计：**A 167 ｜ B 6 ｜ C-EXT 60 ｜ C-RW 0 ｜ D 0**
+- 真机：演示站重新发布（退出码 0）；产物 **536K**（含预计算 12K，trace 留痕 5.4K）；构建输出「✅ 构建期预计算完成：赛段 stage_final，排名 **5 支队伍**」
+- 浏览器（公网）：**滚动总榜 5 支队伍带数据** + **降级告警 7 条全部真实展示**；控制台 0 错误、网络 0 失败请求
