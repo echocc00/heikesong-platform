@@ -245,9 +245,19 @@ export function getReviewState({ db, stageId, viewer, dimensions = null }) {
   const dimList = Array.isArray(dimensions) && dimensions.length ? [...dimensions].sort() : observedDimensions;
   const judges = listStageJudges(db, stageId).filter((j) => j.seat !== 'observer');
 
+  // ⛔ P9.1 修正（真机复验抓出）：**有投票权的席位数**必须同时决定 `total` 与 `dimensionProgress`。
+  //    原来非评委视角的 `total` 照算「队伍数 × 维度数」，可 `missing` 只在下面
+  //    `else if (seat)` 分支里填 ⇒ **没有本赛段席位**的账号拿到
+  //    `{submitted: 0, total: 20, missing: []}` —— 三个数自相矛盾：
+  //    前端据此把「missing 为空」当成「都交了」，于是同一屏上
+  //    「0 我的已交 / 应交 20 格 / 完成度 0%」与「本赛段的评分都交了」并排出现。
+  //    口径：**没有席位 ⇒ 这个人在这个赛段没有任何属于他的格子 ⇒ total 必须是 0**。
+  //    （写路径本来就被 `assertVotingJudge` 挡住 —— 这里是让「读到的数」与「写得到的」一致。）
+  const seatCount = isAdmin ? judges.length : (seat ? 1 : 0);
+
   const dimensionProgress = {};
   for (const dim of dimList) {
-    const total = isAdmin ? judges.length * teams.length : teams.length;
+    const total = seatCount * teams.length;
     const submitted = all.filter((r) => r.dimension === dim && (isAdmin || r.judge_id === viewer.userId)).length;
     dimensionProgress[dim] = { submitted, total };
   }
@@ -272,7 +282,7 @@ export function getReviewState({ db, stageId, viewer, dimensions = null }) {
   }
 
   const submitted = isAdmin ? all.length : all.filter((r) => r.judge_id === viewer?.userId).length;
-  const total = isAdmin ? judges.length * teams.length * dimList.length : teams.length * dimList.length;
+  const total = seatCount * teams.length * dimList.length;
   return { submitted, total, missing, dimensionProgress };
 }
 

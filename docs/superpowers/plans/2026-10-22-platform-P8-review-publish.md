@@ -403,15 +403,36 @@ export function reviewHtml(model) {
   const forms = teams.map((t) => reviewTeamFormHtml(t, dims, board.myScores)).join('');
   const stageScope = board.progress?.scope === 'stage';
   const missingCount = (board.progress?.missing ?? []).length;
-  const notice = missingCount
+  // ⛔ P9.1 修正（真机复验抓出）：状态行**必须由数字判定**，不能拿「missing 为空」当「都交了」。
+  //    原来 `missingCount === 0 ⇒ 「本赛段的评分都交了」`，而「没有本赛段席位」的账号
+  //    后端给的 missing 是空的（他本来就没有格子可打）⇒ 同一屏上出现
+  //    「0 我的已交 / 应交 20 格 / 完成度 0%」+「本赛段的评分都交了」——自相矛盾。
+  //    现在四个分支各自由 `total` / `submitted` 决定，任何一屏都不会出现互相打架的话。
+  const total = Number(board.progress?.total ?? 0);
+  const submitted = Number(board.progress?.submitted ?? 0);
+  const notice = total === 0
     ? noticeState({
-      tone: 'warn',
-      title: stageScope ? '还有未交的打分' : '还有未打的格子',
-      text: stageScope
-        ? `本赛段还差 ${missingCount} 格（按评委 × 队伍 × 维度计）。`
-        : `你还差 ${missingCount} 格没打分。缺格的队伍会在计算时被记为「没有该维度得分」。`,
+      tone: 'info',
+      title: stageScope ? '这个赛段还没有需要打分的格子' : '你不是本赛段的评委',
+      items: [stageScope
+        ? '还没给这个赛段安排评委，所以现在没有任何需要打分的格子。'
+        : '你没有被分配到这个赛段 —— 评审打分只对本赛段的评委开放。'],
     })
-    : noticeState({ tone: 'success', title: '本赛段的评分都交了', text: '组委会计算发榜后会采用最新的一次打分。' });
+    : missingCount > 0
+      ? noticeState({
+        tone: 'warn',
+        title: stageScope ? '还有未交的打分' : '还有未打的格子',
+        items: [stageScope
+          ? `本赛段还差 ${missingCount} 格（按评委 × 队伍 × 维度计）。`
+          : `你还差 ${missingCount} 格没打分。缺格的队伍会在计算时被记为「没有该维度得分」。`],
+      })
+      : submitted >= total
+        ? noticeState({ tone: 'success', title: '本赛段的评分都交了', items: ['组委会计算发榜后会采用最新的一次打分。'] })
+        : noticeState({
+          tone: 'warn',
+          title: '还有格子没交齐',
+          items: [`已交 ${submitted} 格，应交 ${total} 格 —— 还差 ${total - submitted} 格。`],
+        });
 
   return head + stats + notice
     + sectionTitle('赛段名册')
@@ -496,7 +517,7 @@ export async function renderReview(ctx) {
         done.innerHTML = noticeState({
           tone: 'success',
           title: '已提交',
-          text: `本队 ${items.length} 个维度已记入（改分同样走这里，会留审计痕）。`,
+          items: [`本队 ${items.length} 个维度已记入（改分同样走这里，会留审计痕）。`],
         });
       }
     } catch (e) {
@@ -588,7 +609,7 @@ export function publishStats(board, result) {
       label: '本次落榜',
       value: scored === null ? '未发榜' : scored,
       tone: scored === null ? 'neutral' : 'success',
-      hint: scored === null ? '还没有执行过计算' : '本轮有得分并参与排名的队伍',
+      hint: scored === null ? '还没有执行过计算' : '参与本轮排名的队伍（没打分的队伍按「没有该维度得分」计入）',
     },
     {
       label: '告警',
@@ -687,24 +708,40 @@ export function publishHtml(model) {
 
   const progress = board.progress ?? {};
   const missingTeams = [...new Set((progress.missing ?? []).map((m) => m.teamId))];
+  // ⛔ P9.1 修正（真机复验抓出）：「名册里的队伍都有打分」**不能**只看 `missingTeams` 是否为空。
+  //    该赛段**一个评委都没派**时，`progress.total` 与 `submitted` 都是 0、missing 也是空
+  //    ⇒ 旧判据会报「名册里的队伍都有打分 / 可以执行计算发榜」，
+  //    而真发榜后引擎对每支队伍每个维度都产出 `dimension_no_scores` 告警（实测 30 条）。
+  //    现在三个分支各自由数字决定：没有格子 ⇒ 直说「一格都没打」；有格子且有缺格 ⇒ 催评；
+  //    有格子且不缺 ⇒ 才算「都有打分」。
+  const submitted = Number(progress.submitted ?? 0);
+  const total = Number(progress.total ?? 0);
   const checkBody = `
     <div class="row">
-      ${badge(`已交 ${progress.submitted ?? 0} 格`, (progress.submitted ?? 0) >= (progress.total ?? 0) && (progress.total ?? 0) > 0 ? 'success' : 'warn')}
-      ${badge(`应交 ${progress.total ?? 0} 格`, 'neutral')}
+      ${badge(`已交 ${submitted} 格`, total > 0 && submitted >= total ? 'success' : 'warn')}
+      ${badge(`应交 ${total} 格`, 'neutral')}
       ${badge(`名册 ${(board.teams ?? []).length} 支`, 'brand')}
     </div>
-    ${missingTeams.length
+    ${total === 0
       ? noticeState({
         tone: 'warn',
-        title: `有 ${missingTeams.length} 支队伍还缺打分`,
-        text: '没被评到的队伍不参与排名（引擎按「没有任何评分」处理），发榜前最好先催评。',
-        items: missingTeams.map((id) => {
-          const t = (board.teams ?? []).find((x) => x.id === id);
-          return t ? t.name : id;
-        }),
-        list: true,
+        title: '这个赛段一格都还没打',
+        items: ['还没有给赛段派评委，或一格都没交 —— 现在发榜，每支队伍的每个维度都会按「没有该维度得分」处理（引擎会逐条告警）。'],
       })
-      : noticeState({ tone: 'success', title: '名册里的队伍都有打分', text: '可以执行计算发榜。' })}`;
+      : missingTeams.length
+        ? noticeState({
+          tone: 'warn',
+          title: `有 ${missingTeams.length} 支队伍还缺打分`,
+          items: [
+            '没被评到的队伍不参与排名（引擎按「没有任何评分」处理），发榜前最好先催评。',
+            ...missingTeams.map((id) => {
+              const t = (board.teams ?? []).find((x) => x.id === id);
+              return t ? t.name : id;
+            }),
+          ],
+          list: true,
+        })
+        : noticeState({ tone: 'success', title: '名册里的队伍都有打分', items: ['可以执行计算发榜。'] })}`;
 
   const actionBody = `
     <div class="btn-group" data-publish-actions>
@@ -726,7 +763,7 @@ export function publishHtml(model) {
         items: [...warns.hard, ...warns.soft],
         list: true,
       })
-      : noticeState({ tone: 'success', title: '本轮没有告警', text: '归一化生效、评委池合规、无回避剔除。' }))
+      : noticeState({ tone: 'success', title: '本轮没有告警', items: ['归一化生效、评委池合规、无回避剔除。'] }))
     : '';
 
   return head

@@ -194,15 +194,36 @@ export function reviewHtml(model) {
   const forms = teams.map((t) => reviewTeamFormHtml(t, dims, board.myScores)).join('');
   const stageScope = board.progress?.scope === 'stage';
   const missingCount = (board.progress?.missing ?? []).length;
-  const notice = missingCount
+  // ⛔ P9.1 修正（真机复验抓出）：状态行**必须由数字判定**，不能拿「missing 为空」当「都交了」。
+  //    原来 `missingCount === 0 ⇒ 「本赛段的评分都交了」`，而「没有本赛段席位」的账号
+  //    后端给的 missing 是空的（他本来就没有格子可打）⇒ 同一屏上出现
+  //    「0 我的已交 / 应交 20 格 / 完成度 0%」+「本赛段的评分都交了」——自相矛盾。
+  //    现在四个分支各自由 `total` / `submitted` 决定，任何一屏都不会出现互相打架的话。
+  const total = Number(board.progress?.total ?? 0);
+  const submitted = Number(board.progress?.submitted ?? 0);
+  const notice = total === 0
     ? noticeState({
-      tone: 'warn',
-      title: stageScope ? '还有未交的打分' : '还有未打的格子',
-      text: stageScope
-        ? `本赛段还差 ${missingCount} 格（按评委 × 队伍 × 维度计）。`
-        : `你还差 ${missingCount} 格没打分。缺格的队伍会在计算时被记为「没有该维度得分」。`,
+      tone: 'info',
+      title: stageScope ? '这个赛段还没有需要打分的格子' : '你不是本赛段的评委',
+      items: [stageScope
+        ? '还没给这个赛段安排评委，所以现在没有任何需要打分的格子。'
+        : '你没有被分配到这个赛段 —— 评审打分只对本赛段的评委开放。'],
     })
-    : noticeState({ tone: 'success', title: '本赛段的评分都交了', text: '组委会计算发榜后会采用最新的一次打分。' });
+    : missingCount > 0
+      ? noticeState({
+        tone: 'warn',
+        title: stageScope ? '还有未交的打分' : '还有未打的格子',
+        items: [stageScope
+          ? `本赛段还差 ${missingCount} 格（按评委 × 队伍 × 维度计）。`
+          : `你还差 ${missingCount} 格没打分。缺格的队伍会在计算时被记为「没有该维度得分」。`],
+      })
+      : submitted >= total
+        ? noticeState({ tone: 'success', title: '本赛段的评分都交了', items: ['组委会计算发榜后会采用最新的一次打分。'] })
+        : noticeState({
+          tone: 'warn',
+          title: '还有格子没交齐',
+          items: [`已交 ${submitted} 格，应交 ${total} 格 —— 还差 ${total - submitted} 格。`],
+        });
 
   return head + stats + notice
     + sectionTitle('赛段名册')
@@ -287,7 +308,7 @@ export async function renderReview(ctx) {
         done.innerHTML = noticeState({
           tone: 'success',
           title: '已提交',
-          text: `本队 ${items.length} 个维度已记入（改分同样走这里，会留审计痕）。`,
+          items: [`本队 ${items.length} 个维度已记入（改分同样走这里，会留审计痕）。`],
         });
       }
     } catch (e) {

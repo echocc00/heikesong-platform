@@ -341,17 +341,29 @@ export function demoReviewBoard({ state, rules, stageId = 'stage_final' }) {
   }
   const subs = expandSubmissions(state);
   const dimKeys = judgeDimensions.map((d) => d.key);
-  const total = teams.length * dimKeys.length;
+  // ⛔ P9.1 修正：与真实后端 `getReviewState`（组委会口径）**同口径** ——
+  //    应交格数 = **有投票权的席位数** × 队伍数 × 维度数。
+  //    原来漏乘评委数 ⇒ 演示站显示的「应交 N 格 / 完成度 %」只有正式站的 1/N
+  //    （演示种子有 6 名评委，正式站是按**本赛段实际派出的席位**算）。
+  //    ⛔ 这一条 P8 的 parity 闸抓不到：它只比**形状**，不比数值（形状对、数值漂移，
+  //    正是 P8 复盘写下的「演示适配器把错误形状锁进测试」同款陷阱的数值版）。
+  //    ⛔ 席型词表也必须与真实后端一致（judge | enterprise | observer）——
+  //    种子原来写的是 'expert' ⇒ 真实引擎的 `checkJudgePool` 认不出来
+  //    （knownSeats = votingSeats + nonVotingSeats = {judge, enterprise, observer}）
+  //    ⇒ 演示站每次计算都会多出一条 `judge_pool_invalid` 告警，正式站不会有。
+  const votingJudges = (state.judges ?? []).filter((j) => (j.seat ?? 'judge') !== 'observer');
+  const seatCount = votingJudges.length;
+  const total = seatCount * teams.length * dimKeys.length;
   const submitted = subs.filter((x) => dimKeys.includes(x.dimension)).length;
   const dimensionProgress = {};
   for (const d of dimKeys) {
     dimensionProgress[d] = {
       submitted: subs.filter((x) => x.dimension === d).length,
-      total: teams.length,
+      total: seatCount * teams.length,
     };
   }
   const missing = [];
-  for (const j of (state.judges ?? [])) {
+  for (const j of votingJudges) {
     for (const t of teams) {
       for (const d of dimKeys) {
         const hit = subs.some((x) => x.judgeId === j.id && x.teamId === t.id && x.dimension === d);
@@ -394,7 +406,7 @@ export function demoTeamsRoster(state) {
 export function runDemoCompute({ state, rules, stageId = 'stage_final', now = null }) {
   const config = rules.scoring.final;
   const submissions = expandSubmissions(state);
-  const judges = (state.judges ?? []).map((j) => ({ judgeId: j.id, seat: j.seat ?? 'expert' }));
+  const judges = (state.judges ?? []).map((j) => ({ judgeId: j.id, seat: j.seat ?? 'judge' }));
   const teams = demoTeamsRoster(state);
 
   const scored = scoreStage({
@@ -1246,7 +1258,7 @@ export function createDemoApi({ storage = defaultStorage(), seed = null, rules =
       //    真实系统里评委由 stage_judges 指派；演示站只有一个账号 ⇒ **打分时自动入池**，
       //    否则演示站会出现「提交成功但榜单纹丝不动」的假象。
       if (!(s.judges ?? []).some((j) => j.id === judgeId)) {
-        s.judges = [...(s.judges ?? []), { id: judgeId, name: s.me.name ?? '演示评审', seat: 'expert' }];
+        s.judges = [...(s.judges ?? []), { id: judgeId, name: s.me.name ?? '演示评审', seat: 'judge' }];
       }
       const items = Array.isArray(body?.items) ? body.items : [];
       if (!s.reviews[judgeId]) s.reviews[judgeId] = {};

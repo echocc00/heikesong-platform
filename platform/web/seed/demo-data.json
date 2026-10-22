@@ -19,12 +19,12 @@
     { "id": "tp_free", "title": "自由命题 · 社区助餐排班", "enterpriseId": null, "enterpriseName": null, "isFreeBrief": true, "grade": null, "commitment": "无" }
   ],
   "judges": [
-    { "id": "j_lenient", "name": "评委甲（宽松）", "seat": "expert" },
-    { "id": "j_strict", "name": "评委乙（严格）", "seat": "expert" },
-    { "id": "j_mid1", "name": "评委丙", "seat": "expert" },
-    { "id": "j_mid2", "name": "评委丁", "seat": "expert" },
-    { "id": "j_cross", "name": "评委戊（跨领域）", "seat": "expert" },
-    { "id": "j_partial", "name": "评委己（只交了一份打分）", "seat": "expert" }
+    { "id": "j_lenient", "name": "评委甲（宽松）", "seat": "judge" },
+    { "id": "j_strict", "name": "评委乙（严格）", "seat": "judge" },
+    { "id": "j_mid1", "name": "评委丙", "seat": "judge" },
+    { "id": "j_mid2", "name": "评委丁", "seat": "judge" },
+    { "id": "j_cross", "name": "评委戊（跨领域）", "seat": "judge" },
+    { "id": "j_partial", "name": "评委己（只交了一份打分）", "seat": "judge" }
   ],
   "teams": [
     { "id": "t_alpha", "name": "拾光队", "packageId": "tp_retail", "captainId": "mba_captain", "memberIds": ["mba_captain", "demo_member_1", "demo_member_2"] },
