@@ -39,7 +39,7 @@ test('投影：顶层字段固定（缺配置也给空数组，不给 undefined�
   const keys = Object.keys(info).sort();
   assert.deepEqual(keys, [
     'advancement', 'behaviorEvents', 'behaviorMaxWeightShare', 'formation', 'funnel',
-    'redLines', 'registration', 'scoring', 'scoringPoints', 'stages', 'tiebreak',
+    'redLines', 'registration', 'scoring', 'scoringPoints', 'solvability', 'stages', 'tiebreak',
     'tierNeverUnlocks', 'tiers', 'visibility',
   ].sort());
   assert.deepEqual(info.stages, []);
@@ -67,6 +67,37 @@ test('投影：数值字段拒绝 NaN / Infinity（前端会渲染成 "NaN"）',
 test('投影：配置写错形状时不炸（维度不是数组 → 空数组）', () => {
   const info = buildEventInfo({ scoring: { initial: { dimensions: 'oops' } } });
   assert.deepEqual(info.scoring.initial.dimensions, []);
+});
+
+// ── P10 · W4-a：六维可解性规格投影 ──────────────────────────────────
+test('P10：投影带出六维可解性规格（生产站冷启动也拿得到评估表）', () => {
+  const info = buildEventInfo(rules);
+  assert.equal(info.solvability.dimensions.length, 6, '六维');
+  assert.equal(info.solvability.grades.length, 4, '四档');
+  assert.ok(info.solvability.vetoes.length >= 1);
+  const dim = info.solvability.dimensions[0];
+  assert.deepEqual(Object.keys(dim).sort(), ['key', 'label', 'max', 'weight']);
+  assert.ok(dim.label.length > 0, '维度要有人读的名字');
+  assert.ok(info.solvability.grades.every((g) => typeof g.minScore === 'number'));
+});
+
+test('P10：可解性投影**不泄内部备注与判定条件**（只给白名单字段）', () => {
+  const info = buildEventInfo(rules);
+  const veto = info.solvability.vetoes.find((v) => v.auto);
+  assert.ok(veto, '至少有一条自动否决项');
+  // ⛔ 判定条件（维度 + 取值）**不投影**出去：投影它等于把判定规则交给前端重算
+  assert.equal(veto.dimension, undefined, '不许带判定维度');
+  assert.equal(veto.equals, undefined, '不许带判定取值');
+  // ⛔ 任务包配比体检是组委会的事，不进公开投影
+  assert.equal(info.solvability.taskMix, undefined, '配比口径不进公开投影');
+  assert.equal(info.solvability.note, undefined, '内部备注不进公开投影');
+});
+
+test('P10：可解性配置缺失时给空骨架（不炸、不给 undefined）', () => {
+  const info = buildEventInfo({});
+  assert.deepEqual(info.solvability.dimensions, []);
+  assert.deepEqual(info.solvability.grades, []);
+  assert.deepEqual(info.solvability.vetoes, []);
 });
 
 // ══════════════════════════════════════════════════════════════════

@@ -8,6 +8,13 @@
 //   ✅ 破同分最后一级用【队伍编号（行 ID）】而不是时间戳：借 CTFd
 //      `utils/scores/__init__.py` 的 `ORDER BY score DESC, date ASC, id ASC` 双保险，
 //      官方注释理由是【不同数据库的时间精度不同】，只用时间字段排序不稳。
+//
+// 【告警文案分层 2026-10-23 —— 与 src/domain/scoring.js 同一套口径】
+//   { code, message, detail?, ...原有字段 }
+//   ⛔ 触发条件与口径没改，只改文案分层：
+//   ① `message` 只给人读 ⇒ 破同分键用**中文 label**（rules/tiebreak.json 的 label），
+//      label 缺失时**不许**退回英文 key（team_id / peer …），退成中性说法。
+//   ② `detail` 是内部明细（键的英文 key + 缺可比值的队伍 id）⇒ 只给 audit:read 的人看。
 import { cmpStr, toNumber } from './util.js';
 
 // 破同分链的键 → 候选队伍上的字段名（INTERFACES.md §4 的 teams 字段名）
@@ -98,10 +105,13 @@ export function applyTiebreakChain({ candidates, chain, data }) {
       if (group.length < 2 || !scopeActive) { next.push(group); continue; }
       const missing = group.filter((c) => readValue(c, item.key, data) === null);
       if (missing.length) {
+        const label = item.label || '未命名依据';
+        const missingIds = missing.map((c) => c.teamId);
         warnings.push({
           code: 'tiebreak_key_unusable',
-          message: `破同分键「${item.label || item.key}」在本组缺少可比较的值，本组不使用该键`,
-          teamIds: missing.map((c) => c.teamId),
+          message: `破同分键「${label}」在本组缺少可比较的值，本组不使用该键`,
+          detail: `破同分键 ${item.key}：以下队伍在本组没有可比较的值（${missingIds.join('、')}）`,
+          teamIds: missingIds,
         });
         next.push(group);
         continue;

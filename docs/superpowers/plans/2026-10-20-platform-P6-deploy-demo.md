@@ -3849,7 +3849,11 @@ test('追加·归一化降级真的发生（告警指向期望的维度与评委
   const judge = seed.expectations.unnormalizedJudge;
   const hit = out.warnings.find((w) => w.code === 'normalization_fallback' && w.dimension === dim);
   assert.ok(hit, `必须出现维度 ${dim} 的归一化降级告警，实际告警：${JSON.stringify(out.warnings.map((w) => w.code))}`);
-  assert.ok(String(hit.message).includes(judge), `告警必须点名评委 ${judge}：${hit.message}`);
+  // ⚠️ 文案分层（2026-10-23）：告警分两层 —— message 只给人读，detail 是内部明细。
+  //    评委 id 属于内部标识 ⇒ 点名评委的职责挪到 detail（只给 audit:read 的人看），
+  //    正文里不许再出现（公开榜单页会把正文原样摊给每一个访客）。
+  assert.ok(String(hit.detail ?? '').includes(judge), `告警的内部明细必须点名评委 ${judge}：${hit.detail}`);
+  assert.ok(!String(hit.message).includes(judge), `评委 id 不该出现在公开正文里：${hit.message}`);
   const agg = out.trace.normalization[dim];
   assert.equal(agg.normalized, false, '该维度的归一化状态必须是「已降级」');
   assert.ok(agg.judgeSampleSizes[judge] < rules.scoring.final.minSamplesForJudgeNormalization,
@@ -4001,9 +4005,11 @@ Expected: FAIL —— `ENOENT: no such file or directory, open 'platform/web/see
     { "id": "demo_member_3", "name": "演示组员丙", "mbaStatus": "other" }
   ],
   "taskPackages": [
-    { "id": "tp_retail", "title": "门店缺货预测与补货建议", "enterpriseId": "ent_demo_retail", "enterpriseName": "演示零售集团", "isFreeBrief": false, "grade": "A", "commitment": "试点承诺" },
-    { "id": "tp_manu", "title": "质检工单智能分派", "enterpriseId": "ent_demo_mfg", "enterpriseName": "演示制造集团", "isFreeBrief": false, "grade": "B", "commitment": "对标试点" },
-    { "id": "tp_free", "title": "自由命题 · 社区助餐排班", "enterpriseId": null, "enterpriseName": null, "isFreeBrief": true, "grade": null, "commitment": "无" }
+    { "id": "tp_retail", "title": "门店缺货预测与补货建议", "enterpriseId": "ent_demo_retail", "enterpriseName": "演示零售集团", "isFreeBrief": false, "grade": "A", "status": "published", "commitment": "试点承诺" },
+    { "id": "tp_manu", "title": "质检工单智能分派", "enterpriseId": "ent_demo_mfg", "enterpriseName": "演示制造集团", "isFreeBrief": false, "grade": "B", "status": "published", "commitment": "对标试点" },
+    { "id": "tp_free", "title": "自由命题 · 社区助餐排班", "enterpriseId": null, "enterpriseName": null, "isFreeBrief": true, "grade": null, "status": "published", "commitment": "无" },
+    { "id": "tp_demo_assess", "title": "演示待评估卡 · 门店客流预测", "enterpriseId": "ent_demo_retail", "enterpriseName": "演示零售集团", "isFreeBrief": false, "grade": null, "status": "submitted", "painPoint": "客流预测靠人工经验，节假日排班经常错配", "expectedDelivery": "可运行预测服务 + 一周回测报告", "acceptanceCriteria": "提供回测数据集，MAPE 低于历史基线 15%", "commitment": "" },
+    { "id": "tp_demo_sign", "title": "演示待签级卡 · 冷链温控告警", "enterpriseId": "ent_demo_mfg", "enterpriseName": "演示制造集团", "isFreeBrief": false, "grade": null, "status": "assessed", "solvabilityScore": 12, "solvabilityGrade": "A", "solvability": { "score": 12, "grade": "A", "vetoes": [], "computedGrade": "A", "assessedBy": "demo_admin", "assessedAt": "2026-10-20T09:00:00.000Z" }, "painPoint": "冷链运输温控告警滞后，货损难追溯", "expectedDelivery": "车载温控告警接入与货损归因看板", "acceptanceCriteria": "接入 3 台模拟车辆，告警延迟低于 2 分钟", "commitment": "" }
   ],
   "judges": [
     { "id": "j_lenient", "name": "评委甲（宽松）", "seat": "judge" },
@@ -5013,6 +5019,11 @@ export function createMemoryStorage() {
   };
 }
 
+// ⚠️ 任务卡状态机（与正式站 src/services/taskPackage.js 的 ASSESSABLE / APPROVABLE 同值）。
+//    「可评估」= 已提交 / 已评估 / 已退回；「可签级」= 已评估 / 已退回。
+const DEMO_ASSESSABLE = new Set(['submitted', 'assessed', 'returned']);
+const DEMO_APPROVABLE = new Set(['assessed', 'returned']);
+
 function defaultStorage() {
   try {
     if (typeof globalThis.localStorage !== 'undefined' && globalThis.localStorage) {
@@ -5066,6 +5077,10 @@ export function buildDemoState(seed) {
     enterpriseConfirmations: deepCopy(seed?.enterpriseConfirmations) ?? [],
     peerReviews: deepCopy(seed?.peerReviews) ?? [],
     selfReviews: deepCopy(seed?.selfReviews) ?? [],
+    // ⚠️ P10 评委前置：回避台账与校准分（演示站原先**没有**这两个容器）。
+    //    正式站对应：recusal_records / calibrations 两张表。
+    recusals: deepCopy(seed?.recusals) ?? [],
+    calibrations: deepCopy(seed?.calibrations) ?? [],
     milestones: deepCopy(seed?.milestones) ?? [],
     signoffs: deepCopy(seed?.signoffs) ?? [],
     behaviorEvents: deepCopy(seed?.behaviorEvents) ?? [],
@@ -5076,6 +5091,10 @@ export function buildDemoState(seed) {
     workflowTasks: deepCopy(seed?.workflowTasks) ?? [],
     // ⚠️ P7：复核队列（此前演示适配器没有 /api/audit/* ⇒ 两页 404）
     flags: deepCopy(seed?.flags) ?? [],
+    // ⚠️ DP-106：申诉队列（选手提交 + 组委会裁决）。
+    //    此前演示适配器**完全没有** /api/appeals ⇒ 公网演示站的「申诉裁决」页是错误态，
+    //    而选手侧的报名结果页也提交不了申诉（404）。
+    appeals: deepCopy(seed?.appeals) ?? [],
     // ⚠️ results / computations / lastStageId **透传种子里的预计算结果**：
     //    演示站的种子由**构建期**跑一次真实引擎生成（build-demo.js），
     //    目的就是让访客打开就能看到榜单（否则 results 永远空 ⇒ 榜单页「暂无数据」）。
@@ -5118,6 +5137,37 @@ export function demoFlags(state) {
 }
 
 /**
+ * 演示站的申诉行投影（**唯一的一份形状**）。
+ *
+ * ⚠️ P9 教训：演示站与正式站的形状必须**逐字一致**，不能各写一份 ——
+ *    这里对齐的是正式后端 `src/services/review-state.js` 的 `listAppeals`
+ *    （GET /api/appeals 的 { rows, total } 里的每一行）。
+ *    列表 / 单条（POST 提交后返回）/ 裁决结果三处**共用这一个函数**，
+ *    ⇒ 演示站内部不可能出现「列表一种形状、单条另一种形状」。
+ *
+ * ⚠️ 与正式站的**唯一**差别（有意为之，写在这里备查）：
+ *    正式站的 `decideAppeal` 返回的 `appeal` 是**数据库原始行**（snake_case：
+ *    subject_type / decided_by / decision_note），
+ *    而演示站返回的是这个 camelCase 投影。
+ *    ⇒ 前端两种拼写都读（web/views/admin-appeals.js：`out?.appeal?.decision_note ?? out?.appeal?.decisionNote`），
+ *    页面表现完全一致；演示站内部状态统一用 camelCase（与 registrations / flags 一致）。
+ */
+export function demoAppealView(a) {
+  return {
+    id: a?.id ?? null,
+    subjectType: a?.subjectType ?? null,
+    subjectId: a?.subjectId ?? null,
+    filedBy: a?.filedBy ?? null,
+    reason: a?.reason ?? null,
+    status: a?.status ?? null,
+    decidedBy: a?.decidedBy ?? null,
+    decidedAt: a?.decidedAt ?? null,
+    decisionNote: a?.decisionNote ?? null,
+    createdAt: a?.createdAt ?? null,
+  };
+}
+
+/**
  * 演示站的战队视图（纯函数）。
  * ⚠️ 形状必须与真实后端 `src/services/team.js` 的 teamView() **一致** ——
  *    演示站的种子用 `memberIds`（用户 id 数组），
@@ -5148,6 +5198,92 @@ export function demoTeamView(team, state) {
     mergeDeadline: team?.mergeDeadline ?? null,
     milestones: team?.milestones ?? { items: [] },
     formation: team?.formation ?? { ok: true, errors: [] },
+  };
+}
+
+/**
+ * 演示站的「我参与的队伍」（**纯函数**）。
+ *
+ * ⚠️ **必须与正式站同口径**（src/services/team.js 的 `listMyTeams`）：
+ *    正式站 = 「我是队长」**或**「我在册成员」的队伍。
+ *    ⛔ 演示站原先 `GET /api/teams` 返回**全部**队伍 ⇒
+ *       ① 「我的战队」页列出别支队的内部信息；
+ *       ② **互评页的目标列表会把别支队也列出来**（前端用 `GET /api/teams`
+ *          算「我参与哪些队」，返回全部 ⇒ 发起队 = 全部 ⇒ 被评队 = 空）。
+ *    ⇒ P9 教训：**形状与数值都要对齐**，不能只对齐形状。
+ *
+ * ⚠️ **队长也算参与**（与正式站同口径）：建队只写 `captainId`，
+ *    不一定有 `memberIds` 条目 ⇒ 只查 memberIds 会把队长漏掉。
+ *
+ * ⚠️ 演示站只有**一个**账号（`demo_admin`，委员会身份），
+ *    它在种子的 `memberIds` 里**没有位置** ⇒ 额外认 `me.teamId`
+ *    （登录时写入的「我的那一支队」）—— 这是演示站对「我在队里」的等价表达。
+ */
+export function demoMyTeams(state) {
+  const me = state?.me ?? null;
+  if (!me) return [];
+  const meId = me.id ?? null;
+  const myTeamId = me.teamId ?? null;
+  return (state?.teams ?? []).filter((t) => (
+    (meId && t.captainId === meId)
+    || (meId && (t.memberIds ?? []).includes(meId))
+    || (myTeamId && t.id === myTeamId)
+  ));
+}
+
+/**
+ * 演示站的**评委席维度白名单**（与正式站 `assertJudgeDimensions` 同口径）。
+ *
+ * ⚠️ 正式站（src/http/routes/review.js）的口径必须**逐字同码**：
+ *   未知维度 → **400 UNKNOWN_DIMENSION**；非评委席维度 → **403 DIMENSION_SEAT_FORBIDDEN**。
+ *   校准入口与打分入口用**同一个**函数（正式站已这样接线，P10 补齐）⇒ 演示站同理。
+ * @param {string} dimension 维度键
+ * @param {object} rules    演示规则（rules.scoring.final / .initial）
+ * @returns {object} 该维度
+ */
+export function demoAssertJudgeDimension(dimension, rules) {
+  const config = rules?.scoring?.final ?? rules?.scoring?.initial ?? {};
+  const dims = config.dimensions ?? [];
+  const dim = dims.find((d) => d.key === dimension);
+  if (!dim) throw httpError(400, 'UNKNOWN_DIMENSION', `未知评分维度：${dimension}`);
+  if (dim.seat !== 'judge') {
+    throw httpError(403, 'DIMENSION_SEAT_FORBIDDEN', `维度 ${dimension} 不属于评委席，不能由评委打分`);
+  }
+  return dim;
+}
+
+/** 演示站的分值校验（与正式站 `assertScoreInRange` 同码：400 SCORE_OUT_OF_RANGE）。 */
+export function demoAssertScore(rawScore, label) {
+  const n = Number(rawScore);
+  if (!Number.isFinite(n) || n < 0 || n > 100) {
+    throw httpError(400, 'SCORE_OUT_OF_RANGE', `${label}必须是 0–100 之间的数字`);
+  }
+  return n;
+}
+
+/**
+ * 演示站的回避记录投影（**唯一的一份形状**）。
+ *
+ * ⚠️ 形状必须与正式后端 `getRecusalLedger`（src/services/review.js）**逐字一致**：
+ *    正式站内部存的是**数据库原始行**（snake_case），对外投影成 camelCase。
+ *    演示站照抄这个「原始行 → 投影」两步 ⇒ 演示站不可能出现第二种拼写。
+ */
+export function demoRecusalView(r, state) {
+  const team = (state?.teams ?? []).find((t) => t.id === r?.team_id) ?? null;
+  const user = (state?.users ?? []).find((u) => u.id === r?.judge_id) ?? null;
+  const isMe = state?.me?.id && r?.judge_id === state.me.id;
+  return {
+    id: r?.id ?? null,
+    stageId: r?.stage_id ?? null,
+    judgeId: r?.judge_id ?? null,
+    judgeName: user?.name ?? (isMe ? (state?.me?.name ?? null) : null),
+    teamId: r?.team_id ?? null,
+    teamName: team?.name ?? null,
+    reason: r?.reason ?? null,
+    source: r?.source ?? null,
+    auditBy: r?.audit_by ?? null,
+    createdAt: r?.declared_at ?? null,
+    status: r?.action ?? null,
   };
 }
 
@@ -5189,13 +5325,16 @@ export function demoTaskPackageView(p, state) {
  *    ⇒ 这里按种子里的**任务包**合成一条演示工作流：
  *      每张任务包 = 一个可自主领取的任务（题目取任务包标题，细节取企业承诺）。
  *    ⛔ 合成只在**内存里**做（不写回种子文件），且只在 seed 没有工作流时兜底。
+ * ⚠️ **只合成已发布的卡**：未发布的卡（待评估 / 待签级）还没进任务池，
+ *    不该是可领取的任务（真实站是发布后才进池）⇒ 演示任务清单的条数 =
+ *    已发布卡数。
  */
 export function ensureDemoWorkflows(state) {
   if (!state) return state;
   if (!Array.isArray(state.workflows)) state.workflows = [];
   if (!Array.isArray(state.workflowTasks)) state.workflowTasks = [];
   if (state.workflows.length) return state;
-  const packages = (state.taskPackages ?? []).filter((p) => p && p.status !== 'draft');
+  const packages = (state.taskPackages ?? []).filter((p) => p && p.status === 'published');
   const workflowId = 'wf_demo_1';
   state.workflows.push({
     id: workflowId,
@@ -5270,6 +5409,26 @@ export function demoReviewBoard({ state, rules, stageId = 'stage_final' }) {
       myScores.push({ teamId, dimension, rawScore: Number(rawScore) });
     }
   }
+  // ⚠️ **P10 评委前置**：三个「我已经交过哪些」——
+  //    形状与正式站 `getReviewBoard`（src/services/review.js）**逐字一致**：
+  //      myPeerReviews  [{ fromTeamId, toTeamId, score }]
+  //      mySelfReviews  [{ teamId, dimension, rawScore }]
+  //      myCalibrations [{ dimension, rawScore }]
+  //    ⛔ **只含当前 viewer 自己的**（同 myScores 口径；组委会也只看自己的）。
+  //    ⚠️ 三个「我的」含义各不相同（与各自的写入口对齐）：
+  //      互评是「队 → 队」⇒ 我的 = **我参与的那些队**发起的互评；
+  //      自评是**队伍**行为（R-JDG-13 不加分）⇒ 我的 = **我参与的队**的自评；
+  //      校准是**评委个人**行为（R-JDG-12）⇒ 我的 = judgeId = 自己。
+  const myTeamIds = new Set(demoMyTeams(state).map((t) => t.id));
+  const myPeerReviews = (state.peerReviews ?? [])
+    .filter((p) => myTeamIds.has(p.fromTeamId))
+    .map((p) => ({ fromTeamId: p.fromTeamId, toTeamId: p.toTeamId, score: Number(p.score) }));
+  const mySelfReviews = (state.selfReviews ?? [])
+    .filter((r) => myTeamIds.has(r.teamId))
+    .map((r) => ({ teamId: r.teamId, dimension: r.dimension, rawScore: Number(r.rawScore) }));
+  const myCalibrations = (state.calibrations ?? [])
+    .filter((c) => meId && c.judgeId === meId)
+    .map((c) => ({ dimension: c.dimension, rawScore: Number(c.rawScore) }));
   const subs = expandSubmissions(state);
   const dimKeys = judgeDimensions.map((d) => d.key);
   // ⛔ P9.1 修正：与真实后端 `getReviewState`（组委会口径）**同口径** ——
@@ -5315,6 +5474,10 @@ export function demoReviewBoard({ state, rules, stageId = 'stage_final' }) {
     judgeDimensions,
     teams,
     myScores,
+    // ⚠️ P10 评委前置：三个「我已经交过哪些」——只含当前 viewer 自己的。
+    myPeerReviews,
+    mySelfReviews,
+    myCalibrations,
     progress: { scope: 'stage', submitted, total, missing, dimensionProgress },
   };
 }
@@ -5538,6 +5701,24 @@ function collectDemoWarnings(result) {
   return out;
 }
 
+/**
+ * 演示站的「审计权限」判定（DP-107 同口径）。
+ *
+ * ⛔ 告警的内部明细（`detail` / 队伍 id / 英文维度键）只给有 `audit:read` 的人看。
+ *    真实后端的能力点判定走 `can(viewer, 'audit:read', null, db)`（读 role_capabilities 表）；
+ *    演示站没有数据库 ⇒ 用角色键判定。
+ *
+ * ⚠️ 角色 → 能力点的矩阵在真实系统里是**数据**（role_capabilities 表，种子见
+ *    scripts/seed.js 的 ROLE_CAPABILITIES），那里 `audit:read` **只有 admin 持有**。
+ *    演示站也只有一个身份（demo_admin / roles=['admin']）⇒ 口径与真实系统一致。
+ *    ⚠️ 若日后演示站新增角色，必须同步核对 scripts/seed.js 的 ROLE_CAPABILITIES，
+ *       否则这里会与真实系统漂（fail-closed：认不准就当没有审计权限）。
+ */
+function demoCanAudit(viewer) {
+  const roles = Array.isArray(viewer?.roles) ? viewer.roles : [];
+  return roles.includes('admin');
+}
+
 export function demoLeaderboard({ state, rules, scope = 'rank', viewer = null }) {
   if (scope === 'tier') return demoTierBoard({ state, rules, viewer });
   if (scope === 'rolling') return demoRollingLeaderboard({ state, rules, viewer });
@@ -5570,7 +5751,7 @@ export function demoLeaderboard({ state, rules, scope = 'rank', viewer = null })
       payload: { scope, rows, warnings, demo: true },
       viewer,
       visibilityConfig: rules.visibility,
-      context: { scope, viewerTeamId: viewer?.teamId ?? null },
+      context: { scope, viewerTeamId: viewer?.teamId ?? null, canAudit: demoCanAudit(viewer) },
     });
   }
 
@@ -5591,7 +5772,7 @@ export function demoLeaderboard({ state, rules, scope = 'rank', viewer = null })
       payload: { scope, rows, warnings, demo: true },
       viewer,
       visibilityConfig: rules.visibility,
-      context: { scope, viewerTeamId: viewer?.teamId ?? null },
+      context: { scope, viewerTeamId: viewer?.teamId ?? null, canAudit: demoCanAudit(viewer) },
     });
   }
 
@@ -5621,7 +5802,7 @@ export function demoLeaderboard({ state, rules, scope = 'rank', viewer = null })
     payload: { scope, rows, warnings, demo: true },
     viewer,
     visibilityConfig: rules.visibility,
-    context: { scope, viewerTeamId: viewer?.teamId ?? null },
+    context: { scope, viewerTeamId: viewer?.teamId ?? null, canAudit: demoCanAudit(viewer) },
   });
 }
 
@@ -5678,7 +5859,7 @@ export function demoTierBoard({ state, rules, viewer = null }) {
     payload: { scope: 'tier', rows, warnings: [], demo: true },
     viewer,
     visibilityConfig: rules.visibility,
-    context: { scope: 'tier', viewerTeamId: viewer?.teamId ?? null, tierOrder: order },
+    context: { scope: 'tier', viewerTeamId: viewer?.teamId ?? null, tierOrder: order, canAudit: demoCanAudit(viewer) },
   });
 }
 
@@ -5704,8 +5885,150 @@ export function demoRollingLeaderboard({ state, rules, viewer = null }) {
     payload: { scope: 'rolling', rows, warnings: collectDemoWarnings(result), demo: true },
     viewer,
     visibilityConfig: rules.visibility,
-    context: { scope: 'rolling', viewerTeamId: viewer?.teamId ?? null },
+    context: { scope: 'rolling', viewerTeamId: viewer?.teamId ?? null, canAudit: demoCanAudit(viewer) },
   });
+}
+
+// ── P10 · W4-b：企业签字台（里程碑签字 + 企业双签）─────────────────────────
+//
+// ⚠️ **形状必须与真实后端逐字段一致**（同一份前端在演示站与正式站必须表现一致）：
+//    GET  /api/signoffs/mine                            ← src/services/signoff-board.js getSignoffWorklist
+//    GET  /api/stages/:stageId/enterprise-confirmations ← getEnterpriseConfirmationBoard
+//    POST /api/milestones/:id/signoff                   ← src/services/milestone.js createSignoff
+//    POST /api/milestones/:id/signoff/withdraw          ← src/services/milestone.js withdrawSignoff
+//    POST /api/stages/:stageId/enterprise-confirmations  ← src/http/routes/review.js
+//
+// ⛔ 此前演示适配器**一个都没有实现** ⇒ 公网演示站的「企业签字台」页是两块错误卡片
+//    （两个读口都落到 DEMO_ENDPOINT_MISSING）⇒ 导航里放这个入口就是放一个死链。
+//
+// ⚠️ 里程碑槽位口径：**每支队的每个 rules.milestones.items 都算一个槽位**
+//    （真实站建队时就是全量插入，见 src/services/team.js 的 insertMilestones）⇒
+//    清单条数与真实站同口径。
+// ⚠️ 演示站只有一个身份（演示组委会）⇒ 种子里的签字没有记录签字人时，
+//    视为「本账号所签」（否则页面上的「撤回」永远不可点 = 只做展示）。
+
+/** 里程碑 id（确定性：队伍 id + 里程碑 key ⇒ 刷新后不变，可当 URL 段用） */
+function demoMilestoneId(teamId, key) {
+  return `ms_${teamId}_${key}`;
+}
+
+/** 由里程碑 id 反查 (teamId, key) —— 遍历而不是拆字符串（队伍 id 本身带下划线）。 */
+function demoFindMilestone(state, rules, milestoneId) {
+  const items = rules?.milestones?.items ?? [];
+  for (const t of state?.teams ?? []) {
+    for (const def of items) {
+      if (demoMilestoneId(t.id, def.key) === milestoneId) {
+        return { teamId: t.id, key: def.key, label: def.label ?? def.key };
+      }
+    }
+  }
+  return null;
+}
+
+/** 签字数组（补上稳定的 id —— 种子里的签字没有 id，写入的签字有） */
+function demoSignoffRows(state) {
+  return (state.signoffs ?? []).map((s, i) => ({
+    ...s,
+    id: s.id ?? `so_${i + 1}`,
+    content: s.content ?? '',
+    signedAt: s.signedAt ?? null,
+    enterpriseId: s.enterpriseId ?? null,
+  }));
+}
+
+/**
+ * 某里程碑上的**有效签字**（最新一条未被撤回的）。
+ * ⚠️ 与真实站同口径（src/db/repo/signoff-board.js 的 ROW_NUMBER()）：
+ *    先按「未撤回优先」，再按时间取最新 ⇒ 全部被撤回时返回那条被撤回的。
+ */
+function demoEffectiveSignoff(state, teamId, key) {
+  const list = demoSignoffRows(state).filter((s) => s.teamId === teamId && s.milestoneKey === key);
+  if (!list.length) return null;
+  const alive = list.filter((s) => !s.revokedAt);
+  return alive.length ? alive[alive.length - 1] : list[list.length - 1];
+}
+
+/** 里程碑签字台（"我要签的东西"）—— 与 getSignoffWorklist 同形状。 */
+export function demoSignoffWorklist({ state, rules, viewer = null }) {
+  const items = rules?.milestones?.items ?? [];
+  const out = [];
+  for (const t of state.teams ?? []) {
+    for (const def of items) {
+      const milestoneId = demoMilestoneId(t.id, def.key);
+      const so = demoEffectiveSignoff(state, t.id, def.key);
+      const signed = Boolean(so) && !so.revokedAt;
+      // ⛔ **不返回签字人姓名**（R-ENT-04「签字不公开」）：只回签字内容 + 「是不是我签的」。
+      const signedByMe = Boolean(so) && (so.enterpriseId == null || so.enterpriseId === viewer?.id);
+      out.push({
+        milestoneId,
+        teamId: t.id,
+        teamName: t.name ?? t.id,
+        key: def.key,
+        label: def.label ?? def.key,
+        countsTowardTier: def.countsTowardTier === true,
+        signed,
+        signoffId: so?.id ?? null,
+        signedAt: so?.signedAt ?? null,
+        department: so?.department ?? null,
+        content: so?.content ?? null,
+        revokedAt: so?.revokedAt ?? null,
+        signedByMe,
+        canWithdraw: signed && signedByMe,
+      });
+    }
+  }
+  // ⚠️ 确定性排序：队伍顺序（种子顺序）→ 里程碑在 rules 里的固定顺序。
+  return { scope: 'committee', items: out };
+}
+
+/** 企业双签待签清单（某赛段）—— 与 getEnterpriseConfirmationBoard 同形状。 */
+export function demoEnterpriseConfirmationBoard({ state, rules, stageId = 'stage_final', viewer = null }) {
+  const config = rules?.scoring?.final ?? rules?.scoring?.initial ?? {};
+  const dims = (config.dimensions ?? [])
+    .filter((d) => d.seat === 'enterprise')
+    .map((d) => ({ key: d.key, name: d.name, weight: d.weight, seat: d.seat }));
+  const pkgById = new Map((state.taskPackages ?? []).map((p) => [p.id, p]));
+  const teams = (state.teams ?? []).map((t) => {
+    const pkg = pkgById.get(t.packageId) ?? {};
+    return {
+      teamId: t.id,
+      teamName: t.name ?? t.id,
+      taskPackageTitle: pkg.title ?? null,
+      enterpriseId: pkg.enterpriseId ?? null,
+      isFreeBrief: pkg.isFreeBrief === true,
+      canSign: true,
+    };
+  });
+  const confirmations = (state.enterpriseConfirmations ?? []).map((c) => ({
+    id: c.id,
+    teamId: c.teamId,
+    enterpriseId: c.enterpriseId,
+    dimension: c.dimension,
+    rawScore: c.rawScore,
+    hasCrossJudge: Boolean(c.crossJudgeId),
+    signedAt: c.signedAt ?? null,
+    content: c.content ?? '',
+  }));
+  // 跨领域评委候选（⛔ 排除「我」—— 后端会拒绝 crossJudgeId === 出题企业签字人）。
+  const crossJudgeCandidates = (state.judges ?? [])
+    .filter((j) => (j.seat ?? 'judge') === 'judge')
+    .filter((j) => !viewer || j.id !== viewer.id)
+    .map((j) => ({ userId: j.id, name: j.name ?? j.id, seat: j.seat ?? 'judge' }));
+  return {
+    stage: {
+      id: stageId,
+      key: stageId,
+      name: stageId === state.lastStageId ? '决赛赛段' : `赛段 ${stageId}`,
+      kind: 'final',
+      status: 'computed',
+    },
+    scope: 'committee',
+    myEnterpriseId: viewer?.id ?? null,
+    dimensions: dims,
+    teams,
+    confirmations,
+    crossJudgeCandidates,
+  };
 }
 
 export function demoPools({ state, rules, kind }) {
@@ -5823,6 +6146,8 @@ export function createDemoApi({ storage = defaultStorage(), seed = null, rules =
     ensureDemoWorkflows(state);
     // ⚠️ 复核队列容器兜底（老版 localStorage 里没有）
     if (!Array.isArray(state.flags)) state.flags = [];
+    // ⚠️ 申诉队列容器兜底（老版 localStorage 里没有）
+    if (!Array.isArray(state.appeals)) state.appeals = [];
     // ⚠️ **localStorage 里的旧 state 不带 results**（旧版演示站访问时留下的）⇒
     //    榜单会是空的（访客明明是第一次看到新版演示站，却看到「暂无数据」）。
     // ⇒ 补齐：**只补缺失的计算结果**，不覆盖访客自己的操作数据（报名/评审等）。
@@ -5953,16 +6278,23 @@ export function createDemoApi({ storage = defaultStorage(), seed = null, rules =
     }
     // ── P7：我的战队（列表）────────────────────────────────────
     // ⚠️ 此前演示适配器**没有** GET /api/teams ⇒ 「我的战队」页 404。
+    // ⚠️ **P10 修正：口径必须与正式站一致** —— 正式站 `GET /api/teams`
+    //    只返回「我参与的」队伍（src/services/team.js listMyTeams），
+    //    而演示站原先返回**全部**队伍 ⇒ 互评页的目标列表口径与正式站分叉
+    //    （发起队 = 全部 ⇒ 被评队 = 空）。详见 demoMyTeams 的注释。
     if (method === 'GET' && clean === '/api/teams') {
       if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
-      return { items: (s.teams ?? []).map((t) => demoTeamView(t, s)) };
+      return { items: demoMyTeams(s).map((t) => demoTeamView(t, s)) };
     }
     // ── P7：任务包列表 ────────────────────────────────────────
     // ⚠️ 此前演示适配器**没有** GET /api/task-packages ⇒ 「我的战队」的认领下拉空、
     //    「报名筛选台」的配比体检与任务包清单也拿不到数据。
     if (method === 'GET' && clean === '/api/task-packages') {
       const items = (s.taskPackages ?? []).map((p) => demoTaskPackageView(p, s));
-      const mix = checkTaskMix(items, r.solvability);
+      // ⚠️ 与正式站同口径（src/http/routes/taskPackage.js）：
+      //    配比体检的对象是**已发布（进池）的卡** —— 未分级的卡（待评估 / 待签级）
+      //    还没进池，算进去会让体检失真。
+      const mix = checkTaskMix(items.filter((p) => p.status === 'published'), r.solvability);
       return { items, mix };
     }
     // ── P7：退出战队（加入 / 退出 / 汰换共用一个端点）────────────
@@ -6016,10 +6348,102 @@ export function createDemoApi({ storage = defaultStorage(), seed = null, rules =
       persist();
       return { ok: true, registration: reg };
     }
-    // 任务卡可解性评估（演示"六维准入 + 一票否决"）
-    if (method === 'POST' && clean === '/api/task-packages/solvability') {
-      const out = scoreSolvability({ answers: body?.answers ?? {}, config: r.solvability });
-      return out;
+    // ── P10 · W4-a：任务卡六维评估 + 分级签级（写）──────────────────
+    // ⚠️ 此前演示适配器**只有**一个**不带 id**的通用端点
+    //    （POST /api/task-packages/solvability），而前端调的是**带 id**的
+    //    /api/task-packages/:id/solvability ⇒ 演示站「任务卡审批」页的
+    //    「提交评估 / 签级」按钮**点不动**（= 只做展示）。
+    //    ⇒ 通用端点已删（没有任何调用方），换成与真实后端同形的两个。
+    // ⚠️ 形状与正式后端一致（src/services/taskPackage.js）：两个写端点都返回
+    //    **任务卡视图**（presentTaskPackage），前端拿它换掉那张卡。
+    // ⚠️ 与真实站同码同判：INVALID_SOLVABILITY_ANSWERS / INVALID_VETO_KEY /
+    //    INVALID_GRADE / RETURN_REASON_REQUIRED / SOLVABILITY_NOT_ASSESSED /
+    //    TASK_PACKAGE_STATE_INVALID。
+    const pkgm = clean.match(/^\/api\/task-packages\/([^\/]+)\/solvability$/);
+    if (method === 'POST' && pkgm) {
+      if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
+      const pkg = (s.taskPackages ?? []).find((p) => p.id === pkgm[1]);
+      if (!pkg) throw httpError(404, 'TASK_PACKAGE_NOT_FOUND', '任务包不存在');
+      if (!DEMO_ASSESSABLE.has(pkg.status)) {
+        throw httpError(409, 'TASK_PACKAGE_STATE_INVALID', `当前状态（${pkg.status}）不允许重新评估`);
+      }
+      const answers = body?.answers ?? body ?? {};
+      for (const dim of r.solvability.dimensions ?? []) {
+        const v = Number(answers?.[dim.key]);
+        if (!Number.isInteger(v) || v < 0 || v > dim.max) {
+          throw httpError(400, 'INVALID_SOLVABILITY_ANSWERS', `${dim.label} 必须为 0–${dim.max} 的整数`);
+        }
+      }
+      const declared = Array.isArray(answers?.vetoes) ? answers.vetoes : [];
+      for (const key of declared) {
+        if (!(r.solvability.vetoes ?? []).some((v) => v.key === key)) {
+          throw httpError(400, 'INVALID_VETO_KEY', `未知的否决项：${key}`);
+        }
+      }
+      const result = scoreSolvability({ answers, config: r.solvability });
+      pkg.solvabilityScore = result.score;
+      pkg.solvabilityGrade = result.grade;
+      pkg.commitment = result.commitment ?? '';
+      pkg.agreement = result.agreement ?? '';
+      pkg.status = 'assessed';
+      pkg.solvability = {
+        score: result.score,
+        grade: result.grade,
+        vetoes: result.vetoes,
+        explain: result.explain,
+        computedGrade: result.computedGrade,
+        assessedBy: s.me.id,
+        assessedAt: new Date().toISOString(),
+      };
+      persist();
+      return demoTaskPackageView(pkg, s);
+    }
+    const pkgm2 = clean.match(/^\/api\/task-packages\/([^\/]+)\/approve$/);
+    if (method === 'POST' && pkgm2) {
+      if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
+      const pkg = (s.taskPackages ?? []).find((p) => p.id === pkgm2[1]);
+      if (!pkg) throw httpError(404, 'TASK_PACKAGE_NOT_FOUND', '任务包不存在');
+      const grades = r.solvability.grades ?? [];
+      const grade = body?.grade;
+      const reason = body?.reason ?? null;
+      const gradeCfg = grades.find((g) => g.key === grade);
+      if (!gradeCfg) {
+        throw httpError(400, 'INVALID_GRADE', `等级必须是 ${grades.map((g) => g.key).join(' / ')}`);
+      }
+      // ⛔ P10（W4-a）：主动签 D 级（退回）必须写理由 —— 与正式站同码同判。
+      if (grade === 'D' && !String(reason ?? '').trim()) {
+        throw httpError(400, 'RETURN_REASON_REQUIRED', '退回任务卡必须写明退回理由（企业要照着改）');
+      }
+      // ⛔ 必须先做六维评估才能签级（正式站的 SOLVABILITY_NOT_ASSESSED 闸门）。
+      if (typeof pkg.solvability?.score !== 'number') {
+        throw httpError(400, 'SOLVABILITY_NOT_ASSESSED', '任务卡必须先完成六维可解性评估，才能分级签约');
+      }
+      if (!DEMO_APPROVABLE.has(pkg.status)) {
+        throw httpError(409, 'TASK_PACKAGE_STATE_INVALID', `当前状态（${pkg.status}）不允许分级签约`);
+      }
+      // ⛔ 命中一票否决 ⇒ 不得签成 A/B/C，强制退回（正式站同口径）。
+      const vetoes = pkg.solvability.vetoes ?? [];
+      const finalGrade = vetoes.length && grade !== 'D' ? 'D' : grade;
+      const finalCfg = grades.find((g) => g.key === finalGrade) ?? gradeCfg;
+      const now = new Date().toISOString();
+      pkg.grade = finalGrade;
+      pkg.status = finalGrade === 'D' ? 'returned' : 'published';
+      pkg.commitment = pkg.isFreeBrief ? '无' : (finalCfg.commitment ?? '');
+      pkg.agreement = pkg.isFreeBrief ? '自由命题不签约，无企业协议' : (finalCfg.agreement ?? '');
+      pkg.approvedBy = s.me.id;
+      pkg.approvedAt = now;
+      pkg.solvability = {
+        ...(pkg.solvability ?? {}),
+        decision: {
+          grade: finalGrade,
+          requestedGrade: grade,
+          reason: reason ? String(reason).trim() : null,
+          decidedBy: s.me.id,
+          decidedAt: now,
+        },
+      };
+      persist();
+      return demoTaskPackageView(pkg, s);
     }
     // ── P7：审计三端点（复核队列 / 计算留痕 / 复算 diff）───────────
     // ⚠️ 此前演示适配器**完全没有** /api/audit/* ⇒ 公网演示站的
@@ -6071,6 +6495,84 @@ export function createDemoApi({ storage = defaultStorage(), seed = null, rules =
       const publishers = new Set(evidence.map((e) => e?.publisher).filter(Boolean));
       persist();
       return { status: flag.status, detail: { evidence: { uniquePublishers: publishers.size } } };
+    }
+    // ── P10/DP-106：申诉（选手提交 + 组委会裁决）─────────────────────
+    // ⚠️ **形状与正式后端逐字一致**（P9 教训：演示站与正式站不能各写一份形状）：
+    //    GET  /api/appeals            → { rows: [...], total }
+    //    POST /api/appeals            → 新建的申诉
+    //    POST /api/appeals/:id/decide → { appeal, transitions, recomputeRequired }
+    //    （正式站口径：src/services/review-state.js 的 listAppeals / fileAppeal / decideAppeal）
+    if (method === 'GET' && clean === '/api/appeals') {
+      const rows = (s.appeals ?? []).map(demoAppealView);
+      return { rows, total: rows.length };
+    }
+    let apm = clean.match(/^\/api\/appeals\/([^/]+)\/decide$/);
+    if (method === 'POST' && apm) {
+      const appeal = (s.appeals ?? []).find((a) => a.id === apm[1]);
+      if (!appeal) throw httpError(404, 'NOT_FOUND', `申诉不存在: ${apm[1]}`);
+      const decision = body?.decision ?? '';
+      if (!['accepted', 'rejected'].includes(decision)) {
+        throw httpError(400, 'BAD_REQUEST', '裁决只能是 accepted 或 rejected');
+      }
+      const note = String(body?.note ?? '').trim();
+      if (!note) throw httpError(400, 'BAD_REQUEST', '裁决必须写说明（无说明的裁决无法复盘）');
+      appeal.status = decision;
+      appeal.decidedBy = s.me?.id ?? 'demo_admin';
+      appeal.decidedAt = new Date().toISOString();
+      appeal.decisionNote = note;
+      // ⚠️ 报名类申诉成立 ⇒ **撤销分级裁定、回到待复核**（正式站同一口径：
+      //    src/services/review-state.js 的 decideAppeal —— 清 level_final、status 置回 submitted、
+      //    并追加一条 registration_events）。演示站没有赛段重算引擎 ⇒ 不假装重算。
+      const isRegistration = appeal.subjectType === 'registration';
+      if (decision === 'accepted' && isRegistration) {
+        const reg = (s.registrations ?? []).find((r) => r.id === appeal.subjectId);
+        if (reg) {
+          const fromStatus = reg.status;
+          reg.levelFinal = null;
+          reg.status = 'submitted';
+          reg.events = [...(reg.events ?? []), {
+            fromStatus, toStatus: 'submitted', reason: note,
+          }];
+        }
+      }
+      persist();
+      return {
+        appeal: demoAppealView(appeal),
+        // 报名类不触发赛段状态迁移（正式站同口径：transitions 为空数组）
+        transitions: [],
+        recomputeRequired: decision === 'accepted' && !isRegistration,
+      };
+    }
+    if (method === 'POST' && clean === '/api/appeals') {
+      const subjectType = body?.subjectType ?? 'team_result';
+      const subjectId = String(body?.subjectId ?? '').trim();
+      if (!subjectId) throw httpError(400, 'BAD_REQUEST', '申诉必须给 subjectId');
+      const reason = String(body?.reason ?? '').trim();
+      if (!reason) throw httpError(400, 'BAD_REQUEST', '申诉必须写理由（空理由 = 无法复核）');
+      if (subjectType === 'registration') {
+        const reg = (s.registrations ?? []).find((r) => r.id === subjectId);
+        if (!reg) throw httpError(404, 'NOT_FOUND', `报名记录不存在: ${subjectId}`);
+      }
+      // 防重复提交（正式站同一口径：同一报名同时只允许一条待裁决的申诉）
+      const dup = (s.appeals ?? []).some((a) => a.subjectType === subjectType
+        && a.subjectId === subjectId
+        && ['submitted', 'reviewing'].includes(a.status));
+      if (dup) throw httpError(409, 'CONFLICT', '该报名已有未裁决的申诉，请等待组委会裁决');
+      const appeal = {
+        id: `appeal_demo_${(s.appeals ?? []).length + 1}`,
+        subjectType,
+        subjectId,
+        filedBy: s.me?.id ?? 'demo_user',
+        reason,
+        status: 'submitted',
+        decidedBy: null,
+        decidedAt: null,
+        decisionNote: null,
+        createdAt: new Date().toISOString(),
+      };
+      s.appeals.push(appeal);
+      persist();
+      return demoAppealView(appeal);
     }
     // ── P7：赛段时间线（前端赛段选择器用）─────────────────────
     if (method === 'GET' && clean === '/api/stages') {
@@ -6199,6 +6701,304 @@ export function createDemoApi({ storage = defaultStorage(), seed = null, rules =
       }
       persist();
       return { stageId: m[1], judgeId, submitted: items.length, items: [] };
+    }
+    // ── P10 评委前置：回避台账（读 + 写）─────────────────────────
+    // ⚠️ **形状与正式后端逐字一致**（P9 教训：演示站与正式站不能各写一份形状）：
+    //    GET  /api/stages/:stageId/recusals → { items: [...] }（camelCase 投影）
+    //    POST /api/stages/:stageId/recusals → **数据库原始行**（snake_case）
+    //      （正式站 declareRecusal / reinstateRecusal 返回的就是 insertRecusal 的原始行）
+    //    ⛔ 可见性口径与正式站一致：**本人只看自己的**；委员会看全部。
+    //      演示站只有一个委员会账号 ⇒ 它看得到全部（与正式站组委会同口径）。
+    m = clean.match(/^\/api\/stages\/([^/]+)\/recusals$/);
+    if (method === 'GET' && m) {
+      if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
+      const rows = (s.recusals ?? [])
+        .filter((r) => r.stage_id === m[1])
+        .map((r) => demoRecusalView(r, s));
+      return { items: rows };
+    }
+    if (method === 'POST' && m) {
+      if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
+      const action = body?.action ?? 'recused';
+      if (!['recused', 'reinstated'].includes(action)) {
+        throw httpError(400, 'INVALID_RECUSAL_ACTION', `未知的回避动作：${action}`);
+      }
+      const reason = String(body?.reason ?? '').trim();
+      if (!reason) {
+        throw httpError(400, 'RECUSAL_REASON_REQUIRED', '回避必须填写原因（供应方 / 投资方 / 前雇主）');
+      }
+      const teamId = body?.teamId ?? null;
+      if (teamId != null && !(s.teams ?? []).some((t) => t.id === teamId)) {
+        throw httpError(404, 'TEAM_NOT_IN_STAGE', `队伍 ${teamId} 不在本赛段名册内`);
+      }
+      // ⚠️ 评委必须**在本赛段评委名单里**（正式站 getStageJudge → 404 JUDGE_NOT_ASSIGNED）。
+      //    演示站只有一个账号 ⇒ 与 POST /reviews 一样**自动入池**（否则演示站是死路）。
+      const judgeId = body?.judgeId ?? s.me.id;
+      const knownJudge = judgeId === s.me.id || (s.users ?? []).some((u) => u.id === judgeId);
+      if (!knownJudge) throw httpError(404, 'JUDGE_NOT_ASSIGNED', '该评委未被分配到本赛段');
+      if (!(s.judges ?? []).some((j) => j.id === judgeId)) {
+        s.judges = [...(s.judges ?? []), { id: judgeId, name: s.me.name ?? '演示评审', seat: 'judge' }];
+      }
+      const row = {
+        id: `rec_demo_${(s.recusals ?? []).length + 1}`,
+        stage_id: m[1],
+        judge_id: judgeId,
+        team_id: teamId,
+        reason,
+        source: action === 'reinstated' ? 'reinstated' : 'declared',
+        declared_at: new Date().toISOString(),
+        audit_by: s.me.id,
+        action,
+      };
+      s.recusals = [...(s.recusals ?? []), row];
+      persist();
+      return row;
+    }
+    // ── P10 · W4-b：企业签字台（读 + 写）────────────────────────────
+    // ⚠️ 形状与正式后端逐字一致（src/services/signoff-board.js / src/services/milestone.js /
+    //    src/http/routes/review.js）。
+    // ⛔ 此前演示适配器**完全没有**这组端点 ⇒ 公网演示站的「企业签字台」页是两块错误卡片
+    //    （两个读口都落到 DEMO_ENDPOINT_MISSING）⇒ 导航里放这个入口就是放一个死链。
+    if (method === 'GET' && clean === '/api/signoffs/mine') {
+      if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
+      return demoSignoffWorklist({ state: s, rules: r, viewer: s.me });
+    }
+    m = clean.match(/^\/api\/stages\/([^/]+)\/enterprise-confirmations$/);
+    if (method === 'GET' && m) {
+      if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
+      return demoEnterpriseConfirmationBoard({ state: s, rules: r, stageId: m[1], viewer: s.me });
+    }
+    if (method === 'POST' && m) {
+      if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
+      const teamId = body?.teamId;
+      const team = (s.teams ?? []).find((t) => t.id === teamId);
+      if (!team) throw httpError(404, 'TEAM_NOT_FOUND', '队伍不存在');
+      const pkg = (s.taskPackages ?? []).find((p) => p.id === team.packageId);
+      const enterpriseId = body?.enterpriseId ?? s.me.id;
+      const dimension = body?.dimension ?? 'enterprise';
+      const content = String(body?.content ?? '').trim();
+      if (!content) throw httpError(400, 'MISSING_CONTENT', '必须写清企业确认内容');
+      const rawScore = Number(body?.rawScore);
+      // ⛔ 与正式站同码同判（src/services/review.js 的 assertScoreInRange）
+      if (!Number.isFinite(rawScore) || rawScore < 0 || rawScore > 100) {
+        throw httpError(400, 'SCORE_OUT_OF_RANGE', '企业确认分必须是 0–100 之间的数字');
+      }
+      const crossJudgeId = body?.crossJudgeId ?? null;
+      if (crossJudgeId && crossJudgeId === enterpriseId) {
+        throw httpError(400, 'CROSS_JUDGE_SAME_AS_SIGNATORY', '跨领域评委签字人不能与出题企业签字人相同');
+      }
+      if (crossJudgeId && !(s.judges ?? []).some((j) => j.id === crossJudgeId)) {
+        throw httpError(404, 'JUDGE_NOT_ASSIGNED', '跨领域评委不在本赛段名单内');
+      }
+      const now = new Date().toISOString();
+      const row = {
+        id: `ec_demo_${(s.enterpriseConfirmations ?? []).length + 1}`,
+        teamId,
+        enterpriseId,
+        dimension,
+        rawScore,
+        crossJudgeId,
+        signatoryUserId: enterpriseId,
+        content,
+        signedAt: now,
+        stageId: m[1],
+        packageEnterpriseId: pkg?.enterpriseId ?? null,
+      };
+      s.enterpriseConfirmations = [...(s.enterpriseConfirmations ?? []), row];
+      persist();
+      return row;
+    }
+    // ── P10 · W4-b：里程碑签字 + 撤回（写）──────────────────────────
+    // ⚠️ 与正式站同码同判（src/services/milestone.js）：
+    //    缺部门 → 400 MISSING_DEPARTMENT；缺内容 → 400 MISSING_CONTENT；
+    //    里程碑不存在 → 404 MILESTONE_NOT_FOUND；签字不存在 → 404 SIGNOFF_NOT_FOUND；
+    //    已撤回 → 409 ALREADY_REVOKED。
+    m = clean.match(/^\/api\/milestones\/([^/]+)\/signoff$/);
+    if (method === 'POST' && m) {
+      if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
+      const ms = demoFindMilestone(s, r, m[1]);
+      if (!ms) throw httpError(404, 'MILESTONE_NOT_FOUND', '里程碑不存在');
+      const requires = r.milestones?.signoffRequires ?? {};
+      const department = String(body?.department ?? '').trim();
+      const content = String(body?.content ?? '').trim();
+      if (requires.department !== false && !department) {
+        throw httpError(400, 'MISSING_DEPARTMENT', '必须填写签字部门');
+      }
+      if (requires.content !== false && !content) {
+        throw httpError(400, 'MISSING_CONTENT', '必须写清签字内容（解决哪个环节 / 落地时间 / 我方角色）');
+      }
+      const now = new Date().toISOString();
+      const id = `so_demo_${demoSignoffRows(s).length + 1}`;
+      s.signoffs = [...(s.signoffs ?? []), {
+        id,
+        teamId: ms.teamId,
+        milestoneKey: ms.key,
+        department,
+        content,
+        enterpriseId: s.me.id,
+        signedAt: now,
+        revokedAt: null,
+        isBusinessDepartment: true,
+      }];
+      persist();
+      return { id, milestoneId: m[1], teamId: ms.teamId, department, content, signedAt: now, revokedAt: null };
+    }
+    m = clean.match(/^\/api\/milestones\/([^/]+)\/signoff\/withdraw$/);
+    if (method === 'POST' && m) {
+      if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
+      const ms = demoFindMilestone(s, r, m[1]);
+      if (!ms) throw httpError(404, 'MILESTONE_NOT_FOUND', '里程碑不存在');
+      const signoffId = body?.signoffId;
+      const rows = demoSignoffRows(s);
+      const idx = rows.findIndex((x) => x.id === signoffId
+        && x.teamId === ms.teamId && x.milestoneKey === ms.key);
+      if (idx < 0) throw httpError(404, 'SIGNOFF_NOT_FOUND', '签字不存在');
+      if (rows[idx].revokedAt) throw httpError(409, 'ALREADY_REVOKED', '该签字已被撤回');
+      const now = new Date().toISOString();
+      const next = [...(s.signoffs ?? [])];
+      next[idx] = { ...next[idx], revokedAt: now };
+      s.signoffs = next;
+      persist();
+      return { id: signoffId, milestoneId: m[1], revokedAt: now };
+    }
+    // ── P10 评委前置：互评（写）──────────────────────────────────
+    // ⚠️ **形状与正式后端一致**：POST /peer-reviews → { stageId, submitted, items }
+    //    其中 items 是**数据库原始行**（snake_case）。
+    // ⚠️ 但**内部状态保持 camelCase**（种子与 scoreStage 的入参都是 camelCase：
+    //    src/domain/scoring.js 的 peerReviews = [{fromTeamId, toTeamId, score}]）
+    //    ⇒ 状态用 camelCase、**返回**用 snake_case，两件事分开。
+    // ⛔ 写入口的闸门与正式站同码：不是本队成员 → 403 NOT_TEAM_MEMBER；
+    //    给自己互评 → 400 SELF_PEER_REVIEW；分值越界 → 400 SCORE_OUT_OF_RANGE。
+    m = clean.match(/^\/api\/stages\/([^/]+)\/peer-reviews$/);
+    if (method === 'POST' && m) {
+      if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
+      const myTeamIds = new Set(demoMyTeams(s).map((t) => t.id));
+      const items = Array.isArray(body?.items) ? body.items : [];
+      const written = [];
+      for (const item of items) {
+        if (!myTeamIds.has(item.fromTeamId)) {
+          throw httpError(403, 'NOT_TEAM_MEMBER', '只能代表本队提交互评');
+        }
+        if (item.fromTeamId === item.toTeamId) {
+          throw httpError(400, 'SELF_PEER_REVIEW', '不能给自己互评');
+        }
+        if (!(s.teams ?? []).some((t) => t.id === item.toTeamId)) {
+          throw httpError(404, 'TEAM_NOT_IN_STAGE', `队伍 ${item.toTeamId} 不在本赛段名册内`);
+        }
+        const score = demoAssertScore(item.score, '互评分');
+        const existing = (s.peerReviews ?? []).find(
+          (p) => p.fromTeamId === item.fromTeamId && p.toTeamId === item.toTeamId,
+        );
+        const now = new Date().toISOString();
+        if (existing) {
+          existing.score = score;
+          written.push(existing);
+        } else {
+          const row = {
+            id: `pr_demo_${(s.peerReviews ?? []).length + 1}`,
+            fromTeamId: item.fromTeamId,
+            toTeamId: item.toTeamId,
+            score,
+            requestId: body?.requestId ?? null,
+            createdAt: now,
+          };
+          s.peerReviews = [...(s.peerReviews ?? []), row];
+          written.push(row);
+        }
+      }
+      persist();
+      return {
+        stageId: m[1],
+        submitted: written.length,
+        // ⚠️ 返回**原始行**（snake_case）—— 与正式站 submitPeerReviews 的返回一致
+        items: written.map((p) => ({
+          id: p.id,
+          stage_id: m[1],
+          from_team_id: p.fromTeamId,
+          to_team_id: p.toTeamId,
+          score: p.score,
+          request_id: p.requestId ?? null,
+          created_at: p.createdAt,
+        })),
+      };
+    }
+    // ── P10 评委前置：自评（写）──────────────────────────────────
+    // ⚠️ **形状与正式后端一致**：POST /self-review → { stageId, teamId, submitted, items }
+    //    items 是**数据库原始行**（snake_case）；内部状态保持 camelCase（scoreStage 的入参）。
+    m = clean.match(/^\/api\/stages\/([^/]+)\/self-review$/);
+    if (method === 'POST' && m) {
+      if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
+      const teamId = body?.teamId;
+      if (!teamId) throw httpError(400, 'MISSING_TEAM_ID', '缺少队伍');
+      const myTeamIds = new Set(demoMyTeams(s).map((t) => t.id));
+      if (!myTeamIds.has(teamId)) {
+        throw httpError(403, 'NOT_TEAM_MEMBER', '只能为本队提交自评');
+      }
+      const items = Array.isArray(body?.items) ? body.items : [];
+      const written = [];
+      for (const item of items) {
+        const rawScore = demoAssertScore(item.rawScore, '自评分');
+        const existing = (s.selfReviews ?? []).find(
+          (r) => r.teamId === teamId && r.dimension === item.dimension,
+        );
+        const now = new Date().toISOString();
+        if (existing) {
+          existing.rawScore = rawScore;
+          written.push(existing);
+        } else {
+          const row = {
+            id: `sr_demo_${(s.selfReviews ?? []).length + 1}`,
+            teamId,
+            dimension: item.dimension,
+            rawScore,
+            requestId: body?.requestId ?? null,
+            submittedAt: now,
+          };
+          s.selfReviews = [...(s.selfReviews ?? []), row];
+          written.push(row);
+        }
+      }
+      persist();
+      return {
+        stageId: m[1],
+        teamId,
+        submitted: written.length,
+        // ⚠️ 返回**原始行**（snake_case）—— 与正式站 submitSelfReviews 的返回一致
+        items: written.map((r) => ({
+          id: r.id,
+          stage_id: m[1],
+          team_id: r.teamId,
+          dimension: r.dimension,
+          raw_score: r.rawScore,
+          submitted_at: r.submittedAt,
+          request_id: r.requestId ?? null,
+        })),
+      };
+    }
+    // ── P10 评委前置：校准（写）──────────────────────────────────
+    // ⚠️ **形状与正式后端一致**：POST /calibration → { stageId, judgeId, submitted }
+    // ⛔ **维度白名单与打分入口同口径**（正式站 P10 已给校准入口补上 assertJudgeDimensions）：
+    //    未知维度 → 400 UNKNOWN_DIMENSION；非评委席维度 → 403 DIMENSION_SEAT_FORBIDDEN。
+    m = clean.match(/^\/api\/stages\/([^/]+)\/calibration$/);
+    if (method === 'POST' && m) {
+      if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
+      const items = Array.isArray(body?.items) ? body.items : [];
+      for (const item of items) {
+        demoAssertJudgeDimension(item.dimension, r);
+        demoAssertScore(item.rawScore, '校准打分');
+      }
+      const judgeId = s.me.id;
+      const now = new Date().toISOString();
+      const rows = items.map((item) => ({
+        id: `cal_demo_${(s.calibrations ?? []).length + 1}`,
+        judgeId,
+        dimension: item.dimension,
+        rawScore: Number(item.rawScore),
+        createdAt: now,
+      }));
+      s.calibrations = [...(s.calibrations ?? []), ...rows];
+      persist();
+      return { stageId: m[1], judgeId, submitted: items.length };
     }
     // ⚠️ **评审工作台（P8）**：形状必须与真实后端 `GET /api/stages/:stageId/review-board`
     //    **逐字段一致**（否则同一份前端在演示站与正式站表现不同 ⇒ 演示就失去意义）。

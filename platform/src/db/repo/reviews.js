@@ -67,6 +67,26 @@ export function listCalibrations(db, stageId) {
   return db.prepare('SELECT * FROM calibrations WHERE stage_id = ? ORDER BY created_at').all(stageId);
 }
 
+// ── 【P10 评委前置】校准分的「我交过哪些」读口 ──────────────────────────────
+//
+// ⚠️ 校准分是**按评委**记的（judge_id）⇒ 「我的校准」= judge_id = 自己。
+//    与互评/自评（按队记、我在队里才算）口径不同 —— 校准本来就是评委个人行为
+//    （R-JDG-12：用同一组样例作品校准**宽严尺度**，是评委自己的事）。
+//
+// ⚠️ 排序兜底键用 SQLite 隐式 `rowid`（全局约定 #43）：
+//    `id` 是 randomUUID（随机）⇒ 不能排序；`created_at` 同毫秒并列时必须有 rowid 兜底。
+export function listCalibrationsForJudge(db, { stageId, judgeId }) {
+  if (!judgeId) return [];
+  return db
+    .prepare(
+      `SELECT dimension, raw_score AS rawScore, created_at AS createdAt
+         FROM calibrations
+        WHERE stage_id = ? AND judge_id = ?
+        ORDER BY created_at, rowid`,
+    )
+    .all(stageId, judgeId);
+}
+
 /** score_stats：增量维护 n / mean / sum_sq（stdev 由 sum_sq 现算） */
 export function getScoreStat(db, judgeId, dimension) {
   return db.prepare('SELECT * FROM score_stats WHERE judge_id = ? AND dimension = ?').get(judgeId, dimension) ?? null;

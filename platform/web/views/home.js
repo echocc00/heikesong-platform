@@ -142,7 +142,12 @@ export function renderHome(ctx) {
   wrap.innerHTML = `
     ${pageHead({
       title: '赛事工作台',
-      sub: '报名、战队、赛段、榜单都在这里。赛事介绍与赛制说明在<a href="#/">首页</a>。',
+      // ⚠️ P10：`pageHead` 的 `sub` 会**转义**（防 XSS）⇒ 这里**不能塞 HTML**。
+      //    原来写的是「…说明在<a href="#/">首页</a>。」⇒ 页面上直接显示出一段
+      //    `<a href="#/">首页</a>` 的**字面文本**（真机截图证据）。
+      //    ⇒ 链接改走 `actions`（那里本来就是渲染 <a> 的地方），`sub` 只放纯文本。
+      sub: '报名、战队、赛段、榜单都在这里。赛事介绍与赛制说明在首页。',
+      actions: [{ href: '#/', label: '看赛事首页' }],
     })}
     <section class="panel">
       <div class="panel__body">

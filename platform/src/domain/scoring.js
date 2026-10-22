@@ -17,6 +17,18 @@
 //
 // 纯函数：无 IO、无 Date.now()、无 Math.random()。
 //
+// 【告警文案分层 2026-10-23 —— 本文件产出的每条 warning 都是两层】
+//   { code, message, detail?, ...原有字段 }
+//   ⛔ **触发条件与口径一个字没改**（那是 P2 的计算逻辑，有大量测试钉着）；
+//      这一轮只改【文案怎么分层】：
+//   ① `message` —— **只给人读**。禁止出现英文维度键（feasibility / self_eval …）、
+//      队伍 id、评委 id、内部原因码（partial:judge_sample_too_small …）。
+//      维度中文名取 config.dimensions[].name（取不到就不写维度名，**不许退回英文 key**）。
+//   ② `detail` —— **内部明细**（评委 id + 原因码、队伍 id、原始片段），
+//      只给有 `audit:read` 的人看 ⇒ 由 API 层（src/services/leaderboard.js）裁剪。
+//   ③ `code` —— **保留**（审计与机器判据要用），只是前端不再把它当正文渲染。
+//   ⚠️ 队伍名领域层取不到（纯函数没有 db；SQL 只能写在 src/db/repo/）⇒ 正文不写队伍名。
+//
 // 【父代理预审修正 2026-10-21 —— 本文件有 4 处修正，读代码前先看这段】
 //   ① **自评能填补评委席维度 → 自评加分路径**（本文件最严重的一处）。
 //      原实现里，评委席维度若没有评委打分，会去 `selfReviews` 里找同维度的自评记录顶上；
@@ -59,6 +71,32 @@ function weightedAverage(scores, dims) {
     den += d.weight;
   }
   return den > 0 ? num / den : null;
+}
+
+/**
+ * 维度 key → 中文名（config.dimensions[].name）。
+ * ⚠️ 取不到就返回 **null**，**不许退回英文 key**：
+ *    告警正文是给人读的（公开榜单页会把它们原样展示给每一个访客），
+ *    英文维度键（feasibility / self_eval …）属于**内部标识**，
+ *    出现在正文里等于把内部工作语言摊给所有人。
+ * @returns {string|null}
+ */
+function dimensionLabel(dimensions, key) {
+  const hit = (Array.isArray(dimensions) ? dimensions : []).find((d) => d.key === key);
+  const name = hit?.name;
+  return typeof name === 'string' && name.trim() ? name.trim() : null;
+}
+
+/**
+ * 分差取 2 位小数（去掉浮点噪声）。
+ * ⚠️ 为什么不用 toFixed(2)：toFixed 会补零（15.20），而 15.200000000000003
+ *    这种二进制误差的正解是「四舍五入到 2 位小数」⇒ 15.2（见 S-5 文案层）。
+ * @returns {string} 便于直接拼进文案（不会把 15.200000000000003 漏给人看）
+ */
+function round2(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return '0';
+  return String(Math.round(n * 100) / 100);
 }
 
 /**
@@ -190,9 +228,15 @@ export function scoreStage({
     normalization[dim] = agg;
     if (agg.fallbackReason) {
       const degraded = Object.entries(agg.judgeReasons).map(([j, r]) => `${j}:${r}`).join('、');
+      const label = dimensionLabel(dimensions, dim);
       warnings.push({
         code: 'normalization_fallback',
-        message: `维度 ${dim} 评委宽严归一化降级（${degraded}）——本维度未按评委宽严做校正`,
+        // ⚠️ 文案分层（S-5 / C-05 的「显式展示」不变）：
+        //    正文只给人话 —— 英文维度键与「评委 id : 原因码」是**内部明细**，进 detail。
+        message: label
+          ? `维度「${label}」的评委宽严归一化已降级 —— 本维度未按评委宽严做校正`
+          : '相关维度的评委宽严归一化已降级 —— 本维度未按评委宽严做校正',
+        detail: `降级明细（评委 id : 原因码）：${degraded}`,
         dimension: dim,
       });
     }
@@ -241,14 +285,17 @@ export function scoreStage({
         selfAligned.add(`${flag.teamId}::${flag.dimension}`);
         warnings.push({
           code: 'self_eval_written_explanation',
-          message: `自评分比评委分高 ${flag.d} 分，须提交书面说明；不成立则自评分对齐评委分（不加分）`,
+          // ⚠️ round2：${flag.d} 是二进制浮点差值，直接拼会露出 15.200000000000003。
+          message: `自评分比评委分高 ${round2(flag.d)} 分，须提交书面说明；不成立则自评分对齐评委分（不加分）`,
+          detail: `队伍 ${flag.teamId} / 维度 ${flag.dimension}：自评分与评委分相差 ${round2(flag.d)} 分`,
           teamId: flag.teamId,
           dimension: flag.dimension,
         });
       } else {
         warnings.push({
           code: 'self_eval_judge_question',
-          message: `自评分比评委分低 ${Math.abs(flag.d)} 分，评委须向团队提问（只提问，不改分）`,
+          message: `自评分比评委分低 ${round2(Math.abs(flag.d))} 分，评委须向团队提问（只提问，不改分）`,
+          detail: `队伍 ${flag.teamId} / 维度 ${flag.dimension}：自评分与评委分相差 ${round2(flag.d)} 分`,
           teamId: flag.teamId,
           dimension: flag.dimension,
         });
@@ -291,9 +338,13 @@ export function scoreStage({
         //    企业席会静默变成 0 分（自由命题组白丢 20%），而告警却写着
         //    「改由评委打分」—— 队伍和组委会都看不出来少了这一块。
         //    现在必须显式说清楚：替代维度没分，企业项按 0 分计。
+        const r4Label = dimensionLabel(dimensions, r4.dimension);
         warnings.push({
           code: 'R4_substitute_no_scores',
-          message: `自由命题组触发 R4，但替代维度 ${r4.dimension} 上该队没有任何评委打分，企业项按 0 分计`,
+          message: r4Label
+            ? `自由命题组触发 R4，但替代维度「${r4Label}」上该队没有任何评委打分，企业项按 0 分计`
+            : '自由命题组触发 R4，但替代维度上该队没有任何评委打分，企业项按 0 分计',
+          detail: `队伍 ${teamId} / 替代维度 ${r4.dimension}`,
           teamId,
           dimension: r4.dimension,
         });
@@ -343,7 +394,8 @@ export function scoreStage({
             pScores[k] = judgeSeatAvg;
             warnings.push({
               code: 'self_eval_written_explanation',
-              message: `自评分比评委席分高 ${d.toFixed(2)} 分，须提交书面说明；不成立则自评分对齐评委席分（不加分）`,
+              message: `自评分比评委席分高 ${round2(d)} 分，须提交书面说明；不成立则自评分对齐评委席分（不加分）`,
+              detail: `队伍 ${teamId} / 维度 ${k}：自评分与评委席分相差 ${round2(d)} 分`,
               teamId,
               dimension: k,
             });
@@ -352,7 +404,8 @@ export function scoreStage({
           if (d < -selfThreshold) {
             warnings.push({
               code: 'self_eval_judge_question',
-              message: `自评分比评委席分低 ${Math.abs(d).toFixed(2)} 分，评委须向团队提问（只提问，不改分）`,
+              message: `自评分比评委席分低 ${round2(Math.abs(d))} 分，评委须向团队提问（只提问，不改分）`,
+              detail: `队伍 ${teamId} / 维度 ${k}：自评分与评委席分相差 ${round2(d)} 分`,
               teamId,
               dimension: k,
             });
@@ -380,9 +433,16 @@ export function scoreStage({
     for (const k of pSeatKeys) pWeights[k] = effW[k] ?? 0;
     const pSeat = seatScore({ dimensionScores: pScores, weights: pWeights });
     for (const missing of pSeat.missing) {
+      const missingLabel = dimensionLabel(dimensions, missing);
       warnings.push({
         code: 'dimension_no_scores',
-        message: `队伍 ${teamId} 在维度 ${missing} 上没有任何评分，该维度权重记 0`,
+        // ⚠️ 队伍名在领域层**取不到**：scoreStage 是纯函数（无 db），
+        //    队伍名要查 teams 表 ⇒ SQL 只能写在 src/db/repo/ ⇒ 这里不写队伍名，
+        //    队伍 id 与英文维度键进 detail（只给有 audit:read 的人看）。
+        message: missingLabel
+          ? `有队伍在「${missingLabel}」维度上没有任何评分，该维度权重记 0`
+          : '有队伍在某个维度上没有任何评分，该维度权重记 0',
+        detail: `队伍 ${teamId} / 维度 ${missing}`,
         teamId,
         dimension: missing,
       });
@@ -439,7 +499,8 @@ export function scoreStage({
     if (!hasAny) {
       warnings.push({
         code: 'team_no_reviews',
-        message: `队伍 ${t.teamId} 没有任何评分，不参与排名`,
+        message: '有队伍没有任何评分，不参与排名',
+        detail: `队伍 ${t.teamId}`,
         teamId: t.teamId,
       });
     }

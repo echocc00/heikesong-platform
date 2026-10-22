@@ -31,6 +31,7 @@ import {
   submitSelfReviews,
   declareRecusal,
   reinstateRecusal,
+  getRecusalLedger,
   submitEnterpriseConfirmation,
 } from '../../services/review.js';
 import { computeStage, getComputation } from '../../services/compute.js';
@@ -237,11 +238,22 @@ export function registerReviewRoutes(router) {
 
   router.add('POST', '/api/stages/:stageId/calibration', async (ctx) => {
     requireStageCapability(ctx, 'score:write');
+    // ⚠️ **校准分也必须过维度白名单**（P10 补齐，与 `POST /reviews` **同口径**）：
+    //   原来这里**没有**校验 ⇒ 任何有 `score:write` 的人可以给**任意维度键**写校准分，
+    //   包括 `seat='self'` 的「自评测」与 `seat='enterprise'` 的「企业确认」。
+    //   ⚠️ 校准分**不进总分**（writeCalibrations 不参与计分）—— 但口径不一致的后果是：
+    //     ① 审计说不清「这条校准记录是哪一维度的」；
+    //     ② `calibrations` 表被污染（混进非评委席维度的记录）；
+    //     ③ 口径分叉会让「评委只能给评委席维度打分」这条规则**在校准入口形同虚设**。
+    //   ⇒ 复用**同一个** `assertJudgeDimensions` 函数（不是另写一份）——
+    //     两处口径必须**逐字同源**，否则改一处就会分叉。
+    const items = ctx.body?.items ?? [];
+    assertJudgeDimensions(ctx, items);
     return submitCalibration({
       db: ctx.db,
       stageId: ctx.params.stageId,
       judgeId: ctx.user.id,
-      items: ctx.body?.items ?? [],
+      items,
       now: new Date().toISOString(),
     });
   });
@@ -383,6 +395,25 @@ export function registerReviewRoutes(router) {
       reason: ctx.body?.reason,
       actorId: ctx.user.id,
       now: new Date().toISOString(),
+    });
+  });
+
+  // ⛔ P10：回避台账的**读口**（以前只有 POST ⇒ 前端只能显示「本次会话刚提交的」）。
+  //
+  // ⚠️ 权限口径（与 `POST /api/stages/:stageId/recusals` 的 isCommittee **完全一致**）：
+  //   · **登录即可**读，但普通用户**只看自己的**（服务层收窄到 judge_id = 本人）；
+  //   · **组委会**（`stage:compute`）看**全部**（含别的评委的记录）。
+  //   ⛔ 「看全部」只给组委会 —— 回避原因是利益冲突（供应方 / 投资方 / 前雇主），
+  //      让所有评委互相看见对方的回避理由，等于把「谁跟哪支队有关系」广播出去。
+  //
+  // ⚠️ 三态状态码：赛段不存在 → 404（STAGE_NOT_FOUND）；赛段存在但没有记录
+  //    → **200 + `{ items: [] }`**（⛔ 不是 404 —— 列表端点没有记录是常态，不是错误）。
+  router.add('GET', '/api/stages/:stageId/recusals', async (ctx) => {
+    requireUser(ctx);
+    return getRecusalLedger({
+      db: ctx.db,
+      stageId: ctx.params.stageId,
+      viewer: { userId: ctx.user.id, isAdmin: isCommittee(ctx) },
     });
   });
 

@@ -2494,6 +2494,15 @@ Expected: FAIL —— `Cannot find module '../src/domain/enterprise-seat.js'`
 //
 // 纯函数：无 IO、无 Date.now()、无 Math.random()。
 //
+// 【告警文案分层 2026-10-23 —— 与 src/domain/scoring.js 同一套口径】
+//   { code, message, detail?, ...原有字段 }
+//   ⛔ **触发条件与口径没改**，只改文案分层：
+//   ① `message` 只给人读（禁止英文维度键 / 队伍 id / 评委 id / 内部原因码）。
+//      本文件的告警正文本来就是人话（R1–R4 / R-JDG-14 的中文说法）⇒ **保持不变**。
+//   ② `detail` 是内部明细（队伍 id）⇒ 只给有 `audit:read` 的人看，
+//      由 API 层（src/services/leaderboard.js）裁剪。
+//   ③ `code` 保留（审计与机器判据要用）。
+//
 // 【父代理预审修正 2026-10-21 —— 本文件有 8 处修正，读代码前先看这段】
 //   ① **R-JDG-14「签字必须有内容」零校验**：content 为空/纯空白的确认照样计入分数。
 //      领域层会被 `computeStage` 从库里读数据时调用 —— 服务层的写入口校验挡不住
@@ -2625,6 +2634,7 @@ export function applyEnterpriseRules({ confirmations = [], teams = [], judges = 
         message: valid.length
           ? '有非本赛道企业的有效确认（已忽略，不影响本赛道企业的签字）'
           : '企业席评了非本企业题目，该队「企业确认」权重降为 0',
+        detail: `队伍 ${team.teamId}`,
         teamId: team.teamId,
       });
     }
@@ -2635,6 +2645,7 @@ export function applyEnterpriseRules({ confirmations = [], teams = [], judges = 
       warnings.push({
         code: 'R2_missing_dual_signature',
         message: '企业确认缺双签（出题企业签字 / 跨领域评委签字），该项按 0 分计',
+        detail: `队伍 ${team.teamId}`,
         teamId: team.teamId,
       });
     } else if (hasReason('content')) {
@@ -2643,6 +2654,7 @@ export function applyEnterpriseRules({ confirmations = [], teams = [], judges = 
       warnings.push({
         code: 'R_JDG14_missing_content',
         message: '企业确认缺签字内容（R-JDG-14 要求写明解决哪个环节 / 落地时间 / 我方角色），该项按 0 分计',
+        detail: `队伍 ${team.teamId}（规则 R-JDG-14：签字必须有内容）`,
         teamId: team.teamId,
       });
     } else if (hasReason('score_range')) {
@@ -2651,6 +2663,7 @@ export function applyEnterpriseRules({ confirmations = [], teams = [], judges = 
       warnings.push({
         code: 'enterprise_score_out_of_range',
         message: '企业确认分不在 0–100 区间，该项按 0 分计',
+        detail: `队伍 ${team.teamId}`,
         teamId: team.teamId,
       });
     } else if (valid.length) {
@@ -2660,6 +2673,7 @@ export function applyEnterpriseRules({ confirmations = [], teams = [], judges = 
       warnings.push({
         code: 'no_enterprise_confirmation',
         message: '该队没有有效的企业确认记录，企业席按 0 分计',
+        detail: `队伍 ${team.teamId}`,
         teamId: team.teamId,
       });
     }
@@ -2677,6 +2691,7 @@ export function applyEnterpriseRules({ confirmations = [], teams = [], judges = 
       warnings.push({
         code: 'R4_free_brief_judge_scored',
         message: '自由命题组无企业签字，「企业确认」项改由评委按需求真实性的公开证据打分',
+        detail: `队伍 ${team.teamId}`,
         teamId: team.teamId,
       });
     }
@@ -2691,6 +2706,7 @@ export function applyEnterpriseRules({ confirmations = [], teams = [], judges = 
         warnings.push({
           code: 'R3_enterprise_weight_capped',
           message: `企业席合计权重 ${wE} 超过上限 ${wEnterprise}，已封顶`,
+          detail: `队伍 ${team.teamId}：企业席合计权重 ${wE}，封顶后为 ${wEnterprise}`,
           teamId: team.teamId,
         });
       }
@@ -4330,6 +4346,26 @@ export function listCalibrations(db, stageId) {
   return db.prepare('SELECT * FROM calibrations WHERE stage_id = ? ORDER BY created_at').all(stageId);
 }
 
+// ── 【P10 评委前置】校准分的「我交过哪些」读口 ──────────────────────────────
+//
+// ⚠️ 校准分是**按评委**记的（judge_id）⇒ 「我的校准」= judge_id = 自己。
+//    与互评/自评（按队记、我在队里才算）口径不同 —— 校准本来就是评委个人行为
+//    （R-JDG-12：用同一组样例作品校准**宽严尺度**，是评委自己的事）。
+//
+// ⚠️ 排序兜底键用 SQLite 隐式 `rowid`（全局约定 #43）：
+//    `id` 是 randomUUID（随机）⇒ 不能排序；`created_at` 同毫秒并列时必须有 rowid 兜底。
+export function listCalibrationsForJudge(db, { stageId, judgeId }) {
+  if (!judgeId) return [];
+  return db
+    .prepare(
+      `SELECT dimension, raw_score AS rawScore, created_at AS createdAt
+         FROM calibrations
+        WHERE stage_id = ? AND judge_id = ?
+        ORDER BY created_at, rowid`,
+    )
+    .all(stageId, judgeId);
+}
+
 /** score_stats：增量维护 n / mean / sum_sq（stdev 由 sum_sq 现算） */
 export function getScoreStat(db, judgeId, dimension) {
   return db.prepare('SELECT * FROM score_stats WHERE judge_id = ? AND dimension = ?').get(judgeId, dimension) ?? null;
@@ -4453,6 +4489,37 @@ export function updatePeerReviewScore(db, { id, score, now }) {
 export function listPeerReviews(db, stageId) {
   return db.prepare('SELECT * FROM peer_reviews WHERE stage_id = ? ORDER BY from_team_id, to_team_id').all(stageId);
 }
+
+// ── 【P10 评委前置】互评的「我交过哪些」读口 ────────────────────────────────
+//
+// ⚠️ **口径与写入口完全一致**（src/http/routes/review.js 的 POST /peer-reviews）：
+//    「提交者必须是**发起队**的在册成员」⇒ 所以「我的互评」= **我参与的那些队发起的互评**。
+//    ⛔ 不是「我打过分」——互评是「队 → 队」的行为，记录里没有评委维度。
+//
+// ⚠️ **队长也算参与**（与正式站 listMyTeams 同一口径，src/services/team.js）：
+//    建队时只写 `teams.captain_id`，**不一定**有 team_members 行
+//    ⇒ 只查 team_members 会把队长漏掉（队长的互评就消失了）。
+//
+// ⚠️ 排序兜底键用 SQLite 隐式 `rowid`（全局约定 #43）：
+//    `id` 是 randomUUID（随机）⇒ 不能排序；`from/to_team_id` 是 UUID ⇒ 也不是稳定序。
+export function listPeerReviewsForViewer(db, { stageId, userId }) {
+  if (!userId) return [];
+  return db
+    .prepare(
+      `SELECT pr.from_team_id AS fromTeamId,
+              pr.to_team_id   AS toTeamId,
+              pr.score        AS score,
+              pr.created_at   AS createdAt
+         FROM peer_reviews pr
+         JOIN teams t ON t.id = pr.from_team_id
+        WHERE pr.stage_id = ?
+          AND ( t.captain_id = ?
+                OR EXISTS (SELECT 1 FROM team_members m
+                            WHERE m.team_id = t.id AND m.user_id = ? AND m.left_at IS NULL) )
+        ORDER BY pr.from_team_id, pr.to_team_id, pr.rowid`,
+    )
+    .all(stageId, userId, userId);
+}
 ```
 
 `platform/src/db/repo/self-reviews.js`：
@@ -4496,6 +4563,33 @@ export function updateSelfReviewScore(db, { id, rawScore, now }) {
 export function listSelfReviews(db, stageId) {
   return db.prepare('SELECT * FROM self_reviews WHERE stage_id = ? ORDER BY team_id, dimension').all(stageId);
 }
+
+// ── 【P10 评委前置】自评的「我交过哪些」读口 ────────────────────────────────
+//
+// ⚠️ **口径与写入口完全一致**（src/http/routes/review.js 的 POST /self-review）：
+//    「自评只能由**本队成员**提交」⇒ 「我的自评」= **我参与的队**的自评。
+//    ⛔ 不是「评委的自评」——自评是队伍行为（R-JDG-13：不加分，只触发说明与提问）。
+//
+// ⚠️ **队长也算参与**（与正式站 listMyTeams 同一口径）：队长不一定有 team_members 行。
+// ⚠️ 排序兜底键用 SQLite 隐式 `rowid`（全局约定 #43，不用随机 UUID 的 id）。
+export function listSelfReviewsForViewer(db, { stageId, userId }) {
+  if (!userId) return [];
+  return db
+    .prepare(
+      `SELECT sr.team_id    AS teamId,
+              sr.dimension  AS dimension,
+              sr.raw_score  AS rawScore,
+              sr.submitted_at AS createdAt
+         FROM self_reviews sr
+         JOIN teams t ON t.id = sr.team_id
+        WHERE sr.stage_id = ?
+          AND ( t.captain_id = ?
+                OR EXISTS (SELECT 1 FROM team_members m
+                            WHERE m.team_id = t.id AND m.user_id = ? AND m.left_at IS NULL) )
+        ORDER BY sr.team_id, sr.dimension, sr.rowid`,
+    )
+    .all(stageId, userId, userId);
+}
 ```
 
 `platform/src/db/repo/recusals.js`：
@@ -4523,6 +4617,50 @@ export function listRecusals(db, { stageId, judgeId = null } = {}) {
   // ⚠️ `declared_at` 并列时必须有**确定性**兜底（全局约定 #43：用 rowid，不用随机 UUID）。
   //    「取最后一条记录」是回避撤销语义的基础（同秒申报两条时必须可复现）。
   return db.prepare('SELECT * FROM recusal_records WHERE stage_id = ? ORDER BY declared_at, rowid').all(stageId);
+}
+
+// ── 【P10 评委前置】回避台账的**读口** ─────────────────────────────────────
+//
+// ⚠️ 为什么另起一个函数，**不改** listRecusals：
+//   listRecusals 是领域层在用的**原始行**读取（assertNotRecused / reinstateRecusal
+//   都要拿 `action` / `declared_at` 的原始值，且 reinstateRecusal 取「最后一条」）。
+//   改它的返回形状 ⇒ 会牵动回避的**撤销语义**（checkRecusal 取最后一条记录）——
+//   ⇒ 读口另起函数，原始行一个字节都不动。
+//
+// ⚠️ 队伍名/评委名不是敏感数据：榜单本来就公开队名（R1/R2 公示口径）。
+//    但**可见性在 API 层**裁决（全局约束「前端隐藏 = 数据已泄露」）——
+//    这里只负责「取数 + 确定性排序」，「谁能看哪些行」由服务层按 viewer 决定。
+//
+// ⚠️ 排序兜底键用 SQLite 隐式 `rowid`（全局约定 #43）：
+//    `id` 是 `crypto.randomUUID()` ⇒ 随机 UUID ⇒ 不能当排序键；
+//    `declared_at` 是 ISO 字符串（毫秒精度）⇒ 同刻并列时必须有 rowid 兜底。
+export function listRecusalViews(db, { stageId, judgeId = null } = {}) {
+  const where = ['r.stage_id = ?'];
+  const params = [stageId];
+  if (judgeId) {
+    where.push('r.judge_id = ?');
+    params.push(judgeId);
+  }
+  return db
+    .prepare(
+      `SELECT r.id                AS id,
+              r.stage_id          AS stageId,
+              r.judge_id          AS judgeId,
+              r.team_id           AS teamId,
+              r.reason            AS reason,
+              r.source            AS source,
+              r.declared_at       AS createdAt,
+              r.audit_by          AS auditBy,
+              r.action            AS status,
+              t.name              AS teamName,
+              u.name              AS judgeName
+         FROM recusal_records r
+         LEFT JOIN teams t ON t.id = r.team_id
+         LEFT JOIN users u ON u.id = r.judge_id
+        WHERE ${where.join(' AND ')}
+        ORDER BY r.declared_at, r.rowid`,
+    )
+    .all(...params);
 }
 ```
 
@@ -4619,7 +4757,7 @@ export function listAuditLog(db, { entity = null, entityId = null, limit = 100 }
 - [ ] **Step 4: 创建 src/services/review.js**
 
 ```javascript
-// src/services/review.js — 评审提交类用例
+// src/services/review.js — 评审提交类用例 + 评审读口
 //
 // 依据：INTERFACES.md §3 服务层 + S7 §3.1 / §4.3 + S10 §0.4。
 //   幂等：同一 request_id 重复提交只生效一次（⛔ 不用「先查再插」判断重复灌分，
@@ -4627,6 +4765,11 @@ export function listAuditLog(db, { entity = null, entityId = null, limit = 100 }
 //   增量：写 stage_reviews 后增量更新 score_stats（n / mean / sum_sq），
 //         stdev 由 sum_sq 现算 —— 避免每次发榜全表重算（成本随评委数×队伍数相乘增长）。
 //   ⛔ 但每次发榜仍会做一次全量重算并落快照（可复算要求能从原始数据重放）。
+//
+// ⚠️ **读口也在这一层**（P10 补齐）：`getReviewBoard`（评审工作台，附带
+//    `myPeerReviews` / `mySelfReviews` / `myCalibrations`）与 `getRecusalLedger`
+//    （回避台账）—— ⛔ 可见性一律在**服务层（= API 层）**裁决，
+//    前端拿到的就已经是「该给他看的」（全局约束：前端隐藏 = 数据已泄露）。
 //
 // 【父代理预审修正 2026-10-21 —— 本文件有 6 处修正，读代码前先看这段】
 //   ① **「先抢键」与「写数据」必须同事务**：原来抢键成功后写数据失败（如评委被回避 → 403），
@@ -4652,14 +4795,27 @@ import {
   listReviews,
   listReviewCells,
   insertCalibration,
+  listCalibrationsForJudge,
   applyScoreStatDelta,
 } from '../db/repo/reviews.js';
 import { listStageJudges, getStageJudge, getStage, listStageTeams, listStageTeamRows } from '../db/repo/stages.js';
 import { claimRequestKey } from '../db/repo/request-keys.js';
 import { insertEnterpriseConfirmation, listEnterpriseConfirmations } from '../db/repo/enterprise-confirmations.js';
-import { findPeerReviewsByRequestId, findPeerReview, insertPeerReview, updatePeerReviewScore } from '../db/repo/peer-reviews.js';
-import { findSelfReviewsByRequestId, findSelfReview, insertSelfReview, updateSelfReviewScore } from '../db/repo/self-reviews.js';
-import { insertRecusal, listRecusals } from '../db/repo/recusals.js';
+import {
+  findPeerReviewsByRequestId,
+  findPeerReview,
+  insertPeerReview,
+  updatePeerReviewScore,
+  listPeerReviewsForViewer,
+} from '../db/repo/peer-reviews.js';
+import {
+  findSelfReviewsByRequestId,
+  findSelfReview,
+  insertSelfReview,
+  updateSelfReviewScore,
+  listSelfReviewsForViewer,
+} from '../db/repo/self-reviews.js';
+import { insertRecusal, listRecusals, listRecusalViews } from '../db/repo/recusals.js';
 import { writeAuditLog } from '../audit/log.js';
 import { checkRecusal, checkPeerEligibility } from '../domain/review-eligibility.js';
 import { appError } from '../errors.js';
@@ -4940,6 +5096,26 @@ export function getReviewBoard({ db, stageId, viewer, rules = null }) {
   const teams = listStageTeamRows(db, stageId);
   const myScores = listReviews(db, { stageId, judgeId: viewer?.userId ?? null })
     .map((r) => ({ teamId: r.team_id, dimension: r.dimension, rawScore: r.raw_score }));
+  // ── 【P10 评委前置】三个「我已经交过哪些」 ──────────────────────────────
+  // ⚠️ **同族口径**：`myScores` 只返回本人 ⇒ 这三个字段也**只返回当前 viewer 自己的**。
+  //    ⛔ **组委会也只看自己的**（不实现「看全部」）——
+  //    「看全部」要额外判定（谁能看别人的互评/自评？评委能看同赛段其他评委的？
+  //    答案必须是「不能」）⇒ 一律不做，避免出现「有的页面看得到、有的看不到」的漂移。
+  //    若将来要放开，必须**同时**放开 `myScores` 并写清口径（否则评审页会出现两套口径）。
+  //
+  // ⚠️ **三者的「我的」含义各不相同**（与各自的写入口对齐）：
+  //   myPeerReviews  互评是「队 → 队」的行为 ⇒ 「我的」= **我参与的那些队**发起的互评
+  //                  （写入口：提交者必须是发起队的在册成员）
+  //   mySelfReviews  自评是**队伍**行为（R-JDG-13 不加分）⇒ 「我的」= **我参与的队**的自评
+  //                  （写入口：只能由本队成员提交）
+  //   myCalibrations 校准是**评委个人**行为（R-JDG-12 对齐宽严尺度）⇒ 「我的」= judge_id = 自己
+  const viewerUserId = viewer?.userId ?? null;
+  const myPeerReviews = listPeerReviewsForViewer(db, { stageId, userId: viewerUserId })
+    .map((r) => ({ fromTeamId: r.fromTeamId, toTeamId: r.toTeamId, score: r.score }));
+  const mySelfReviews = listSelfReviewsForViewer(db, { stageId, userId: viewerUserId })
+    .map((r) => ({ teamId: r.teamId, dimension: r.dimension, rawScore: r.rawScore }));
+  const myCalibrations = listCalibrationsForJudge(db, { stageId, judgeId: viewerUserId })
+    .map((r) => ({ dimension: r.dimension, rawScore: r.rawScore }));
   const progress = getReviewState({
     db,
     stageId,
@@ -4959,6 +5135,10 @@ export function getReviewBoard({ db, stageId, viewer, rules = null }) {
     judgeDimensions,
     teams,
     myScores,
+    // ⚠️ 【P10 评委前置】三个「我已经交过哪些」——**只含当前 viewer 自己的**（同 myScores 口径）。
+    myPeerReviews,
+    mySelfReviews,
+    myCalibrations,
     // ⚠️ **scope 必须带上**（P8 DP-99）：getReviewState 对两种身份返回的是**两套口径** ——
     //    组委会 = 全赛段（已交 N 格 / 缺了谁的哪一格），评委 = 只看自己（我还差几格）。
     //    前端拿到同一个 {submitted,total,missing} 却不知道是哪套口径 ⇒
@@ -5183,6 +5363,54 @@ export function declareRecusal({ db, stageId, judgeId, teamId = null, reason, ac
     detail: { judgeId, teamId, reason }, now,
   });
   return row;
+}
+
+/**
+ * 回避台账（**读**）—— P10 评委前置页的「已回避清单」数据源。
+ *
+ * ⚠️ 为什么以前没有这个读口（这正是 P10 补上的缺口）：
+ *   全仓只有 `POST /api/stages/:stageId/recusals`，**没有**配套的 GET ——
+ *   `recusal_records` 只在计算（computeStage）与复核（checkRecusal）里被读。
+ *   ⇒ 前端只能显示「本次会话里我刚提交过的那一条」，
+ *      历史上申报过的、别的评委申报过的（组委会要看的），**全都看不到**。
+ *
+ * ⛔ **可见性在服务层（= API 层）裁决**（全局约束「可见性在 API 层过滤，
+ *    前端隐藏 = 数据已泄露」）：
+ *   · **本人**（普通登录用户）⇒ 只看**自己**的回避记录；
+ *   · **组委会**（`stage:compute`，与 POST /recusals 的 isCommittee 口径一致）
+ *     ⇒ 看**全部**（含别的评委的记录）。
+ *   ⛔ 「看全部」**只给组委会** —— 回避原因是利益冲突（供应方 / 投资方 / 前雇主），
+ *      让所有评委互相看见对方的回避理由，等于把「谁跟哪支队有关系」广播出去。
+ *
+ * ⚠️ **记录只增不改**（R-JDG-09 留档）：撤销是**再写一条** `action='reinstated'`，
+ *    所以台账里同一支队的回避会有**两行**（原申报 + 撤销）——
+ *    这是「留档 + 可复算」的语义，**不是**重复行。
+ *    每行都带自己的 `status`（recused / reinstated），前端按需取最后一条。
+ *
+ * ⚠️ 三态状态码：赛段不存在 → 404；赛段存在但没有记录 → **200 + `{ items: [] }`**（不是 404）。
+ */
+export function getRecusalLedger({ db, stageId, viewer }) {
+  assertStageExists(db, stageId);
+  const isAdmin = viewer?.isAdmin === true;
+  // ⛔ 非组委会一律收窄到「本人」—— 判定在**这里**（服务层），不在前端。
+  const judgeId = isAdmin ? null : (viewer?.userId ?? null);
+  const rows = listRecusalViews(db, { stageId, judgeId });
+  return {
+    items: rows.map((r) => ({
+      id: r.id,
+      stageId: r.stageId,
+      judgeId: r.judgeId,
+      judgeName: r.judgeName,
+      teamId: r.teamId,
+      teamName: r.teamName,
+      reason: r.reason,
+      source: r.source,
+      auditBy: r.auditBy,
+      createdAt: r.createdAt,
+      // ⚠️ `status` = 记录自身的动作（recused 生效 / reinstated 撤销）
+      status: r.status,
+    })),
+  };
 }
 ```
 
@@ -7319,6 +7547,18 @@ Expected: FAIL —— `Cannot find module '../src/domain/scoring.js'`
 //
 // 纯函数：无 IO、无 Date.now()、无 Math.random()。
 //
+// 【告警文案分层 2026-10-23 —— 本文件产出的每条 warning 都是两层】
+//   { code, message, detail?, ...原有字段 }
+//   ⛔ **触发条件与口径一个字没改**（那是 P2 的计算逻辑，有大量测试钉着）；
+//      这一轮只改【文案怎么分层】：
+//   ① `message` —— **只给人读**。禁止出现英文维度键（feasibility / self_eval …）、
+//      队伍 id、评委 id、内部原因码（partial:judge_sample_too_small …）。
+//      维度中文名取 config.dimensions[].name（取不到就不写维度名，**不许退回英文 key**）。
+//   ② `detail` —— **内部明细**（评委 id + 原因码、队伍 id、原始片段），
+//      只给有 `audit:read` 的人看 ⇒ 由 API 层（src/services/leaderboard.js）裁剪。
+//   ③ `code` —— **保留**（审计与机器判据要用），只是前端不再把它当正文渲染。
+//   ⚠️ 队伍名领域层取不到（纯函数没有 db；SQL 只能写在 src/db/repo/）⇒ 正文不写队伍名。
+//
 // 【父代理预审修正 2026-10-21 —— 本文件有 4 处修正，读代码前先看这段】
 //   ① **自评能填补评委席维度 → 自评加分路径**（本文件最严重的一处）。
 //      原实现里，评委席维度若没有评委打分，会去 `selfReviews` 里找同维度的自评记录顶上；
@@ -7361,6 +7601,32 @@ function weightedAverage(scores, dims) {
     den += d.weight;
   }
   return den > 0 ? num / den : null;
+}
+
+/**
+ * 维度 key → 中文名（config.dimensions[].name）。
+ * ⚠️ 取不到就返回 **null**，**不许退回英文 key**：
+ *    告警正文是给人读的（公开榜单页会把它们原样展示给每一个访客），
+ *    英文维度键（feasibility / self_eval …）属于**内部标识**，
+ *    出现在正文里等于把内部工作语言摊给所有人。
+ * @returns {string|null}
+ */
+function dimensionLabel(dimensions, key) {
+  const hit = (Array.isArray(dimensions) ? dimensions : []).find((d) => d.key === key);
+  const name = hit?.name;
+  return typeof name === 'string' && name.trim() ? name.trim() : null;
+}
+
+/**
+ * 分差取 2 位小数（去掉浮点噪声）。
+ * ⚠️ 为什么不用 toFixed(2)：toFixed 会补零（15.20），而 15.200000000000003
+ *    这种二进制误差的正解是「四舍五入到 2 位小数」⇒ 15.2（见 S-5 文案层）。
+ * @returns {string} 便于直接拼进文案（不会把 15.200000000000003 漏给人看）
+ */
+function round2(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return '0';
+  return String(Math.round(n * 100) / 100);
 }
 
 /**
@@ -7492,9 +7758,15 @@ export function scoreStage({
     normalization[dim] = agg;
     if (agg.fallbackReason) {
       const degraded = Object.entries(agg.judgeReasons).map(([j, r]) => `${j}:${r}`).join('、');
+      const label = dimensionLabel(dimensions, dim);
       warnings.push({
         code: 'normalization_fallback',
-        message: `维度 ${dim} 评委宽严归一化降级（${degraded}）——本维度未按评委宽严做校正`,
+        // ⚠️ 文案分层（S-5 / C-05 的「显式展示」不变）：
+        //    正文只给人话 —— 英文维度键与「评委 id : 原因码」是**内部明细**，进 detail。
+        message: label
+          ? `维度「${label}」的评委宽严归一化已降级 —— 本维度未按评委宽严做校正`
+          : '相关维度的评委宽严归一化已降级 —— 本维度未按评委宽严做校正',
+        detail: `降级明细（评委 id : 原因码）：${degraded}`,
         dimension: dim,
       });
     }
@@ -7543,14 +7815,17 @@ export function scoreStage({
         selfAligned.add(`${flag.teamId}::${flag.dimension}`);
         warnings.push({
           code: 'self_eval_written_explanation',
-          message: `自评分比评委分高 ${flag.d} 分，须提交书面说明；不成立则自评分对齐评委分（不加分）`,
+          // ⚠️ round2：${flag.d} 是二进制浮点差值，直接拼会露出 15.200000000000003。
+          message: `自评分比评委分高 ${round2(flag.d)} 分，须提交书面说明；不成立则自评分对齐评委分（不加分）`,
+          detail: `队伍 ${flag.teamId} / 维度 ${flag.dimension}：自评分与评委分相差 ${round2(flag.d)} 分`,
           teamId: flag.teamId,
           dimension: flag.dimension,
         });
       } else {
         warnings.push({
           code: 'self_eval_judge_question',
-          message: `自评分比评委分低 ${Math.abs(flag.d)} 分，评委须向团队提问（只提问，不改分）`,
+          message: `自评分比评委分低 ${round2(Math.abs(flag.d))} 分，评委须向团队提问（只提问，不改分）`,
+          detail: `队伍 ${flag.teamId} / 维度 ${flag.dimension}：自评分与评委分相差 ${round2(flag.d)} 分`,
           teamId: flag.teamId,
           dimension: flag.dimension,
         });
@@ -7593,9 +7868,13 @@ export function scoreStage({
         //    企业席会静默变成 0 分（自由命题组白丢 20%），而告警却写着
         //    「改由评委打分」—— 队伍和组委会都看不出来少了这一块。
         //    现在必须显式说清楚：替代维度没分，企业项按 0 分计。
+        const r4Label = dimensionLabel(dimensions, r4.dimension);
         warnings.push({
           code: 'R4_substitute_no_scores',
-          message: `自由命题组触发 R4，但替代维度 ${r4.dimension} 上该队没有任何评委打分，企业项按 0 分计`,
+          message: r4Label
+            ? `自由命题组触发 R4，但替代维度「${r4Label}」上该队没有任何评委打分，企业项按 0 分计`
+            : '自由命题组触发 R4，但替代维度上该队没有任何评委打分，企业项按 0 分计',
+          detail: `队伍 ${teamId} / 替代维度 ${r4.dimension}`,
           teamId,
           dimension: r4.dimension,
         });
@@ -7645,7 +7924,8 @@ export function scoreStage({
             pScores[k] = judgeSeatAvg;
             warnings.push({
               code: 'self_eval_written_explanation',
-              message: `自评分比评委席分高 ${d.toFixed(2)} 分，须提交书面说明；不成立则自评分对齐评委席分（不加分）`,
+              message: `自评分比评委席分高 ${round2(d)} 分，须提交书面说明；不成立则自评分对齐评委席分（不加分）`,
+              detail: `队伍 ${teamId} / 维度 ${k}：自评分与评委席分相差 ${round2(d)} 分`,
               teamId,
               dimension: k,
             });
@@ -7654,7 +7934,8 @@ export function scoreStage({
           if (d < -selfThreshold) {
             warnings.push({
               code: 'self_eval_judge_question',
-              message: `自评分比评委席分低 ${Math.abs(d).toFixed(2)} 分，评委须向团队提问（只提问，不改分）`,
+              message: `自评分比评委席分低 ${round2(Math.abs(d))} 分，评委须向团队提问（只提问，不改分）`,
+              detail: `队伍 ${teamId} / 维度 ${k}：自评分与评委席分相差 ${round2(d)} 分`,
               teamId,
               dimension: k,
             });
@@ -7682,9 +7963,16 @@ export function scoreStage({
     for (const k of pSeatKeys) pWeights[k] = effW[k] ?? 0;
     const pSeat = seatScore({ dimensionScores: pScores, weights: pWeights });
     for (const missing of pSeat.missing) {
+      const missingLabel = dimensionLabel(dimensions, missing);
       warnings.push({
         code: 'dimension_no_scores',
-        message: `队伍 ${teamId} 在维度 ${missing} 上没有任何评分，该维度权重记 0`,
+        // ⚠️ 队伍名在领域层**取不到**：scoreStage 是纯函数（无 db），
+        //    队伍名要查 teams 表 ⇒ SQL 只能写在 src/db/repo/ ⇒ 这里不写队伍名，
+        //    队伍 id 与英文维度键进 detail（只给有 audit:read 的人看）。
+        message: missingLabel
+          ? `有队伍在「${missingLabel}」维度上没有任何评分，该维度权重记 0`
+          : '有队伍在某个维度上没有任何评分，该维度权重记 0',
+        detail: `队伍 ${teamId} / 维度 ${missing}`,
         teamId,
         dimension: missing,
       });
@@ -7741,7 +8029,8 @@ export function scoreStage({
     if (!hasAny) {
       warnings.push({
         code: 'team_no_reviews',
-        message: `队伍 ${t.teamId} 没有任何评分，不参与排名`,
+        message: '有队伍没有任何评分，不参与排名',
+        detail: `队伍 ${t.teamId}`,
         teamId: t.teamId,
       });
     }
@@ -8233,6 +8522,7 @@ import {
   submitSelfReviews,
   declareRecusal,
   reinstateRecusal,
+  getRecusalLedger,
   submitEnterpriseConfirmation,
 } from '../../services/review.js';
 import { computeStage, getComputation } from '../../services/compute.js';
@@ -8439,11 +8729,22 @@ export function registerReviewRoutes(router) {
 
   router.add('POST', '/api/stages/:stageId/calibration', async (ctx) => {
     requireStageCapability(ctx, 'score:write');
+    // ⚠️ **校准分也必须过维度白名单**（P10 补齐，与 `POST /reviews` **同口径**）：
+    //   原来这里**没有**校验 ⇒ 任何有 `score:write` 的人可以给**任意维度键**写校准分，
+    //   包括 `seat='self'` 的「自评测」与 `seat='enterprise'` 的「企业确认」。
+    //   ⚠️ 校准分**不进总分**（writeCalibrations 不参与计分）—— 但口径不一致的后果是：
+    //     ① 审计说不清「这条校准记录是哪一维度的」；
+    //     ② `calibrations` 表被污染（混进非评委席维度的记录）；
+    //     ③ 口径分叉会让「评委只能给评委席维度打分」这条规则**在校准入口形同虚设**。
+    //   ⇒ 复用**同一个** `assertJudgeDimensions` 函数（不是另写一份）——
+    //     两处口径必须**逐字同源**，否则改一处就会分叉。
+    const items = ctx.body?.items ?? [];
+    assertJudgeDimensions(ctx, items);
     return submitCalibration({
       db: ctx.db,
       stageId: ctx.params.stageId,
       judgeId: ctx.user.id,
-      items: ctx.body?.items ?? [],
+      items,
       now: new Date().toISOString(),
     });
   });
@@ -8585,6 +8886,25 @@ export function registerReviewRoutes(router) {
       reason: ctx.body?.reason,
       actorId: ctx.user.id,
       now: new Date().toISOString(),
+    });
+  });
+
+  // ⛔ P10：回避台账的**读口**（以前只有 POST ⇒ 前端只能显示「本次会话刚提交的」）。
+  //
+  // ⚠️ 权限口径（与 `POST /api/stages/:stageId/recusals` 的 isCommittee **完全一致**）：
+  //   · **登录即可**读，但普通用户**只看自己的**（服务层收窄到 judge_id = 本人）；
+  //   · **组委会**（`stage:compute`）看**全部**（含别的评委的记录）。
+  //   ⛔ 「看全部」只给组委会 —— 回避原因是利益冲突（供应方 / 投资方 / 前雇主），
+  //      让所有评委互相看见对方的回避理由，等于把「谁跟哪支队有关系」广播出去。
+  //
+  // ⚠️ 三态状态码：赛段不存在 → 404（STAGE_NOT_FOUND）；赛段存在但没有记录
+  //    → **200 + `{ items: [] }`**（⛔ 不是 404 —— 列表端点没有记录是常态，不是错误）。
+  router.add('GET', '/api/stages/:stageId/recusals', async (ctx) => {
+    requireUser(ctx);
+    return getRecusalLedger({
+      db: ctx.db,
+      stageId: ctx.params.stageId,
+      viewer: { userId: ctx.user.id, isAdmin: isCommittee(ctx) },
     });
   });
 

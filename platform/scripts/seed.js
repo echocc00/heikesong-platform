@@ -76,6 +76,10 @@ const ROLE_CAPABILITIES = [
   ['captain', 'peer_review:write'], ['captain', 'self_review:write'], ['captain', 'appeal:write'],
   ['member', 'registration:write'], ['member', 'team:read'], ['member', 'pool:read'], ['member', 'behavior:write'],
   ['member', 'task_package:read'], ['member', 'peer_review:write'], ['member', 'self_review:write'],
+  // ⚠️ DP-106：**组员也是选手** —— 他同样要对自己的**报名分级结果**提申诉
+  //    （R-REG-08：分级不接收时选手可向组委会申诉）。
+  //    此前只有 captain 与 admin 持有 appeal:write ⇒ 组员点「提交申诉」被 403「无权提交申诉」。
+  ['member', 'appeal:write'],
   ['judge', 'score:write'], ['judge', 'score:read'], ['judge', 'peer_review:write'], ['judge', 'task_package:read'],
   ['enterprise', 'score:write'], ['enterprise', 'score:read'], ['enterprise', 'signoff:create'],
   ['enterprise', 'task_package:read'], ['enterprise', 'task_package:write'], ['enterprise', 'pool:read'],
@@ -232,7 +236,13 @@ function seedP1({ db, rules, adminId, now = '2026-10-20T00:00:00.000Z' }) {
       pkg = { ...pkg, status: 'assessed' };
     }
     if (pkg.status === 'assessed') {
-      approveTaskPackage({ db, taskPackageId: pkg.id, grade: spec.grade, actorId: adminId, now, rules });
+      approveTaskPackage({
+        db, taskPackageId: pkg.id, grade: spec.grade, actorId: adminId, now, rules,
+        // ⚠️ P10（W4-a）：**D 级退回必须写明退回理由**（企业要照着改）——
+        //    种子里的 D 级卡是「六维 0 分」那张，不给理由 ⇒ 服务层抛 400 RETURN_REASON_REQUIRED
+        //    ⇒ 整个种子跑不完（演示数据缺失）。非 D 级不给理由（不改原语义）。
+        reason: spec.grade === 'D' ? '六维全 0：任务描述不可执行，退回让企业重写后再提交' : null,
+      });
       pkg = { ...pkg, status: spec.grade === 'D' ? 'returned' : 'published' };
     }
     packages.push(pkg);

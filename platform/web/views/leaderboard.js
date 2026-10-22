@@ -8,13 +8,15 @@
 // ⛔ 降级告警置顶：P2 计算出的 warnings 显式展示在最上方，不静默（S-5 / C-05）。
 //    ⚠️ **位置是硬契约**：测试断言「告警的字符索引 < 队名的字符索引」，
 //        所以告警块必须排在整页最前（页头之前），不能塞到表格下面。
+// ⛔ 告警正文不许出现内部工作语言：英文维度键 / 队伍 id / 评委 id / 内部原因码
+//    一律由后端分层（message = 人话，detail = 内部明细），前端只渲染。
 // ⚠️ 口径切换靠 URL（?scope=）而不是前端状态机 —— 刷新 / 分享链接都停在同一屏。
 // ⚠️ 转义统一走 `web/escape.js`（P0 建立，全站唯一入口）——
 //    这里**不重复定义** escapeHtml：三个视图各写一份会漂移，且漏改一处就是一处 XSS。
 import { escapeHtml } from '../escape.js';
 import { milestoneMark } from '../icons.js';
 import {
-  barRow, emptyState, errorState, loadingState, noticeState, pageHead,
+  barRow, emptyState, errorState, loadingState, pageHead,
   rankBadge, sectionTitle, statRow, tableWrap, tabs,
 } from '../ui.js';
 // ⚠️ 段位徽章的映射住在 ./tier.js（段位语义的归属地），这里只取用不重复定义。
@@ -60,21 +62,40 @@ const SCOPES = {
  * 降级告警（置顶）。
  * ⚠️ 滚动总榜的告警来自【多个赛段】，必须标出是哪一段降级了（否则读者不知道该查哪段）。
  *    赛段榜 / B 榜 / 个人榜的告警没有 stageName → 不渲染这一段。
+ *
+ * 【文案分层 2026-10-23 —— 内部工作语言不许出现在公开页正文】
+ *   ⛔ 原来把 `[code]`（normalization_fallback / R2_missing_dual_signature 这种
+ *      内部审计键）当正文前缀直接打出来 ⇒ 每个访客都看得见内部规则键。
+ *      现在：**人话 message 为主体**，code 降级成**小号等宽标签**跟在后面
+ *      （`.warn__code`，title 属性做 tooltip），`detail`（内部明细）单独一行
+ *      （`.warn__detail`，更弱的颜色）。
+ *   ⚠️ 可见性在 API 层裁决：`detail` 有没有、是什么，由后端按 `audit:read` 决定
+ *      （领域层唯一入口 src/domain/visibility.js 的 applyWarningVisibility，
+ *      由 applyVisibility 内部调用；正式站与演示站共用同一份）⇒ 前端只「有就显示」，不自己判断。
+ *   ⚠️ **位置是硬契约**：告警块仍然置顶（S-5 / C-05；测试断言「告警的字符索引 < 队名的字符索引」）。
+ *   ⚠️ 这一段不直接用 ui.js 的 noticeState()：它的 items 是**纯文本**（统一 escapeHtml），
+ *      渲染不出「正文 + 代码标签 + 明细行」的三段结构；这里自己拼这段结构，
+ *      但沿用 notice 的 class 契约（notice / notice--warn / notice__title / notice__list）。
  */
 function warningsHtml(warnings) {
   const list = Array.isArray(warnings) ? warnings : [];
   if (!list.length) return '';
   const items = list.map((w) => {
-    const stage = w?.stageName ? `【${w.stageName}】` : '';
-    const code = w?.code ? `[${w.code}] ` : '';
-    return `${stage}${code}${w?.message ?? ''}`;
+    const stage = w?.stageName ? `【${escapeHtml(w.stageName)}】` : '';
+    const msg = escapeHtml(w?.message ?? '');
+    const code = w?.code
+      ? `<span class="warn__code" title="内部规则键：${escapeHtml(w.code)}">${escapeHtml(w.code)}</span>`
+      : '';
+    const detail = w?.detail
+      ? `<div class="warn__detail">${escapeHtml(String(w.detail))}</div>`
+      : '';
+    return `<li class="warn__item">${stage}${msg}${code ? ` ${code}` : ''}${detail}</li>`;
   });
-  return noticeState({
-    tone: 'warn',
-    title: `本轮降级提示（${list.length}）—— 以下维度未按标准口径计算`,
-    items,
-    list: true,
-  });
+  const title = `本轮降级提示（${list.length}）—— 以下维度未按标准口径计算`;
+  return `<div class="notice notice--warn" role="alert">`
+    + `<p class="notice__title">${escapeHtml(title)}</p>`
+    + `<ul class="notice__list">${items.join('')}</ul>`
+    + `</div>`;
 }
 
 /** 页头（标题 + 副标题 + 跨页入口）。 */

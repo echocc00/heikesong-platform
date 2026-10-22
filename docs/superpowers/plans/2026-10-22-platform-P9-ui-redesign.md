@@ -252,7 +252,7 @@ P8（E108–E113 / DP-94–DP-99）重号。
 
 **Step: 创建 `platform/src/domain/event-info.js`**
 
-```js
+```javascript
 // src/domain/event-info.js — 赛事规则投影（落地页的数据源）
 // 依据：P9「UI 重构：落地页 + 科技感设计系统」；赛制的唯一出处是 platform/rules/*.json
 //
@@ -339,6 +339,7 @@ export function buildEventInfo(rules) {
   const behavior = r.behavior ?? {};
   const compliance = r.compliance ?? {};
   const visibility = r.visibility ?? {};
+  const solvability = r.solvability ?? {};
 
   return {
     /** 赛段表（脊）：起止是**相对日序**（月-日），由届期起始日落到日历。 */
@@ -433,6 +434,41 @@ export function buildEventInfo(rules) {
     visibility: {
       publicFromTier: str(visibility.rank?.publicFromTier),
     },
+    /**
+     * 任务卡「六维可解性」评估规格（P10 · W4-a）。
+     * ⚠️ **为什么要进这个投影**：任务卡审批页要画「六维评估表」，
+     *    而服务端**没有**单独的规格端点 ⇒ 冷启动时（一张卡都没评估过）
+     *    前端拿不到维度清单，页面就画不出表。
+     *    ⛔ 生产部署默认**不挂** `/rules/`（只有 DEMO_MODE=1 才挂）⇒
+     *    「前端去站点里读 rules/solvability.json」这条路在生产是**断的**。
+     *    ⇒ 规格必须由**服务端**投影出去。
+     * ⛔ 逐字段白名单（与本文件同一纪律）：只给 key / 名称 / 权重 / 满分 / 档位 / 否决项，
+     *    **不给**配置里的内部备注、来源出处、配比容忍度等内部工作语言。
+     *    （任务包配比体检是组委会的事，不进公开投影。）
+     */
+    solvability: {
+      dimensions: arr(solvability.dimensions).map((d) => ({
+        key: str(d?.key),
+        label: str(d?.label),
+        weight: num(d?.weight),
+        max: num(d?.max),
+      })),
+      grades: arr(solvability.grades).map((g) => ({
+        key: str(g?.key),
+        minScore: num(g?.minScore),
+        maxScore: num(g?.maxScore),
+        commitment: str(g?.commitment),
+        agreement: str(g?.agreement),
+      })),
+      vetoes: arr(solvability.vetoes).map((v) => ({
+        key: str(v?.key),
+        label: str(v?.label),
+        // ⚠️ `auto` 只是**一个布尔标记**（这条否决项是不是由某一维的取值自动命中的），
+        //    不是判定逻辑本身（判定条件「维度 + 取值」**不投影**出去）——
+        //    投影判定条件等于把判定规则交给前端重算 ⇒ 不投影。
+        auto: v?.auto !== undefined && v?.auto !== null,
+      })),
+    },
   };
 }
 ```
@@ -441,7 +477,7 @@ export function buildEventInfo(rules) {
 
 **Step: 创建 `platform/web/views/landing.js`**
 
-```js
+```javascript
 // web/views/landing.js — 落地页（首页）：介绍赛事与赛制，吸引报名
 // 溯源需求：P9「UI 重构：落地页 + 科技感设计系统」
 //          → docs/superpowers/plans/2026-10-22-platform-P9-ui-redesign.md
@@ -516,11 +552,28 @@ export function landingStats({ info = {}, boardCount = null } = {}) {
  * @returns {Array<{key:string,name:string,date:string}>}
  */
 export function landingSpineNodes(stages) {
-  return (Array.isArray(stages) ? stages : []).map((s) => ({
-    key: String(s?.key ?? ''),
-    name: String(s?.name ?? ''),
-    date: s?.start && s?.end ? `${s.start} – ${s.end}` : String(s?.start ?? ''),
-    raw: s,
+  const list = Array.isArray(stages) ? stages : [];
+  const nodes = list.map((s) => {
+    const a = pseudoDay(s?.start);
+    const b = pseudoDay(s?.end);
+    const days = (a === null || b === null || b < a) ? null : (b - a + 1);
+    return {
+      key: String(s?.key ?? ''),
+      name: String(s?.name ?? ''),
+      date: s?.start && s?.end ? `${s.start} – ${s.end}` : String(s?.start ?? ''),
+      days,
+      daysText: days === null ? '' : `${days} 天`,
+      raw: s,
+    };
+  });
+  // ⚠️ **share = 该赛段占整条赛程的天数比例** ⇒ 赛程脊的长度**就是时间占比**，
+  //    不是等距列表（P10 签名：条=权重 / 脊=赛程 / 阶=段位 / 流=漏斗，一个语法四种载体）。
+  //    日期解析不出来的赛段 share 为 null ⇒ 渲染时退回等分，绝不假装是 0 天。
+  const known = nodes.filter((n) => n.days !== null);
+  const total = known.reduce((sum, n) => sum + n.days, 0);
+  return nodes.map((n) => ({
+    ...n,
+    share: total > 0 && n.days !== null ? n.days / total : null,
   }));
 }
 
@@ -535,8 +588,13 @@ export function landingSpineNodes(stages) {
 export function landingSpineDetail(stage) {
   const s = stage ?? {};
   const items = Array.isArray(s.deliverables) ? s.deliverables.map((d) => String(d)) : [];
+  const a = pseudoDay(s.start);
+  const b = pseudoDay(s.end);
+  const days = (a === null || b === null || b < a) ? null : (b - a + 1);
   return {
     title: `${s.key ? `${s.key} · ` : ''}${s.name ?? ''}`.trim() || '赛段',
+    date: s.start && s.end ? `${s.start} – ${s.end}` : '',
+    daysText: days === null ? '' : `${days} 天`,
     items,
     hardRequirement: s.hardRequirement !== false,
   };
@@ -561,6 +619,62 @@ export function landingWeightBars(dimensions) {
   }));
 }
 
+/**
+ * 权重双轨对照（P10 · M10）。
+ *
+ * ⚠️ **为什么要双轨**：初赛与决赛各有一张权重表，**分开看两张表是看不出变化的** ——
+ *    「企业确认在决赛里从 10% 涨到 25%」这件事，只有把两张表**对齐到同一条轴**上才读得出来。
+ *    ⇒ 同一维度**上下两轨**（上=初赛、下=决赛），中间标 Δ（百分点）。
+ *
+ * ⚠️ **Δ 的算法**：Δ = (决赛 − 初赛) × 100，单位「百分点」（pp）。
+ *    0.25 − 0.10 = 0.15000000000000002 ⇒ 必须先 ×100 再四舍五入到一位小数，
+ *    否则会渲染成 `+15.000000000000002pp`。
+ *    ⛔ **只有两轨都存在时才算 Δ**；只在一侧出现的维度标「仅初赛 / 仅决赛」
+ *    （不许拿 0 冒充另一侧 —— 0 会被读成「这一轨权重是 0%」）。
+ *
+ * @param {Array<object>} initialDimensions 初赛维度（scoring.initial.dimensions）
+ * @param {Array<object>} finalDimensions   决赛维度（scoring.final.dimensions）
+ * @returns {Array<{key:string,label:string,seat:string,initial:object|null,final:object|null,
+ *                  delta:number|null,deltaText:string,direction:string}>}
+ */
+export function landingWeightTracks(initialDimensions, finalDimensions) {
+  const initial = landingWeightBars(initialDimensions);
+  const final = landingWeightBars(finalDimensions);
+  const order = [];
+  const map = new Map();
+  for (const b of initial) {
+    if (map.has(b.key)) continue;
+    order.push(b.key);
+    map.set(b.key, { key: b.key, label: b.label, seat: b.seat, initial: b, final: null });
+  }
+  for (const b of final) {
+    const cur = map.get(b.key);
+    if (cur) {
+      cur.final = b;
+      continue;
+    }
+    order.push(b.key);
+    map.set(b.key, { key: b.key, label: b.label, seat: b.seat, initial: null, final: b });
+  }
+  return order.map((key) => {
+    const t = map.get(key);
+    const both = Boolean(t.initial && t.final);
+    const delta = both ? Math.round((t.final.value - t.initial.value) * 1000) / 10 : null;
+    return {
+      key: t.key,
+      label: t.label,
+      seat: t.seat,
+      initial: t.initial ? { value: t.initial.value, text: t.initial.text } : null,
+      final: t.final ? { value: t.final.value, text: t.final.text } : null,
+      delta,
+      deltaText: delta === null
+        ? (t.initial ? '仅初赛' : '仅决赛')
+        : `${delta > 0 ? '+' : ''}${delta}pp`,
+      direction: delta === null ? 'none' : delta > 0 ? 'up' : delta < 0 ? 'down' : 'flat',
+    };
+  });
+}
+
 /** 席位的中文名（配置里是英文键）。 */
 export function seatLabel(seat) {
   const map = { judge: '评委席', enterprise: '企业席', self: '自评', observer: '观察员' };
@@ -568,15 +682,37 @@ export function seatLabel(seat) {
 }
 
 /**
- * 段位阶（ladder）。
+ * 段位阶（ladder）· 真阶梯（P10 · M8）。
  * ⚠️ 权益取自 rules.ranks.benefits；某段位没有权益时**明说**「暂无额外权益」，
  *    不留空白（空白读起来像"没加载出来"）。
  *
+ * ⚠️ **必须按等级升序排序**：rules 里的 `tiers` 数组顺序只是**配置顺序**，
+ *    而「阶」的语义是从低到高（D → C → B → A → S）——
+ *    不排序的话台阶高度就没法递增，签名元素当场塌掉。
+ *    排序键用**规则字段** `minMilestones`（里程碑门槛越高＝等级越高），
+ *    同值用 `key` 升序兜底（⛔ 不用 `localeCompare`：它受区域设置影响，不可复算）。
+ *
+ * ⚠️ `height` 是 **0–1 的比例**（不是像素）：CSS 用它算出台阶实高
+ *    （`calc(var(--ladder-base) + var(--h) * var(--ladder-rise))`），
+ *    这样「台阶高度」这件事留在样式层，JS 只负责**等级次序**。
+ *
  * @param {Array<object>} tiers
- * @returns {Array<{key:string,name:string,requirement:string,benefits:string[]}>}
+ * @returns {Array<{key:string,name:string,requirement:string,benefits:string[],index:number,height:number}>}
  */
 export function landingLadderSteps(tiers) {
-  return (Array.isArray(tiers) ? tiers : []).map((t) => {
+  const list = Array.isArray(tiers) ? tiers : [];
+  const sorted = [...list].sort((a, b) => {
+    const am = Number(a?.minMilestones) || 0;
+    const bm = Number(b?.minMilestones) || 0;
+    if (am !== bm) return am - bm;
+    const ak = String(a?.key ?? '');
+    const bk = String(b?.key ?? '');
+    if (ak < bk) return -1;
+    if (ak > bk) return 1;
+    return 0;
+  });
+  const n = sorted.length;
+  return sorted.map((t, i) => {
     const reqs = [];
     if (Number(t?.minMilestones) > 0) reqs.push(`里程碑 ≥ ${t.minMilestones}`);
     if (t?.requiresDataOrPrototype === true) reqs.push('需数据接入或原型里程碑');
@@ -586,24 +722,40 @@ export function landingLadderSteps(tiers) {
       name: String(t?.name ?? ''),
       requirement: reqs.join(' · '),
       benefits: Array.isArray(t?.benefits) ? t.benefits.map((b) => String(b)) : [],
+      index: i + 1,
+      // 第 i 级占满高的 i/n ⇒ 严格递增，最后一级 = 1
+      height: n > 0 ? Math.round(((i + 1) / n) * 1000) / 1000 : 0,
     };
   });
 }
 
 /**
- * 漏斗（流）。
+ * 漏斗（流）· 真梯形（P10 · M9）。
  * ⚠️ rate 为 null 表示「比例待定」（rules 里辅导期就是 null）⇒ 显示「—」，
  *    **不许显示 0%**（0% 会被读成「这一届一个人都进不去」）。
+ * ⚠️ 流失率只在**相邻两段都能算出比例**时才有意义（段间流失）；
+ *    上一段比例未知 ⇒ 流失率未知（显示「—」），不许拿 0 顶替。
  * @param {Array<object>} funnel
- * @returns {Array<{key:string,label:string,rate:number|null,text:string}>}
+ * @returns {Array<{key:string,label:string,rate:number|null,text:string,churn:number|null,churnText:string}>}
  */
 export function landingFunnelStages(funnel) {
-  return (Array.isArray(funnel) ? funnel : []).map((f) => ({
-    key: String(f?.key ?? ''),
-    label: String(f?.label ?? ''),
-    rate: f?.rate === null || f?.rate === undefined ? null : Number(f.rate),
-    text: f?.rate === null || f?.rate === undefined ? '—' : pctText(f.rate),
-  }));
+  const list = Array.isArray(funnel) ? funnel : [];
+  const rates = list.map((f) => (
+    f?.rate === null || f?.rate === undefined ? null : Number(f.rate)
+  ));
+  return list.map((f, i) => {
+    const rate = rates[i];
+    const prev = i > 0 ? rates[i - 1] : null;
+    const churn = rate !== null && prev !== null && prev > 0 ? 1 - rate / prev : null;
+    return {
+      key: String(f?.key ?? ''),
+      label: String(f?.label ?? ''),
+      rate,
+      text: rate === null ? '—' : pctText(rate),
+      churn,
+      churnText: churn === null ? '' : `流失 ${Math.round(churn * 100)}%`,
+    };
+  });
 }
 
 /**
@@ -646,6 +798,56 @@ export function landingCta(user) {
   };
 }
 
+/**
+ * 伪日序：把 rules 里的 "MM-DD" 换成可比较的天数。
+ * ⚠️ **固定用 2000 年（闰年）**：只求**同一年内**的天数差，年份本身没有意义；
+ *    固定闰年是为了让 02-29 也合法（否则 Date.UTC 会滚到 3-01，天数差多算一天）。
+ * ⚠️ 解析失败一律返回 null —— 调用方必须能处理「日期不可解析」，
+ *    不许拿 0 冒充（0 会被画成「这个赛段一天都没有」）。
+ */
+function pseudoDay(text) {
+  const m = /^(\d{1,2})-(\d{1,2})$/.exec(String(text ?? '').trim());
+  if (!m) return null;
+  const month = Number(m[1]);
+  const day = Number(m[2]);
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+  const t = Date.UTC(2000, month - 1, day);
+  const d = new Date(t);
+  if (d.getUTCMonth() !== month - 1 || d.getUTCDate() !== day) return null;
+  return Math.floor(t / 86400000);
+}
+
+/**
+ * 首屏关键事实条（P10）：赛期 / 决赛名额 / 入围率。
+ * ⚠️ **全部来自 rules**（schedule.json 的起止日与 advancement）——
+ *    落地页一个字都不许硬编码赛事事实（契约 M12）。
+ *
+ * @param {object} info /api/event-info 的投影
+ * @returns {Array<{label:string,value:string}>}
+ */
+export function landingFacts(info) {
+  const stages = Array.isArray(info?.stages) ? info.stages : [];
+  const first = stages[0];
+  const last = stages[stages.length - 1];
+  const adv = info?.advancement ?? {};
+  const out = [];
+  if (first?.start && last?.end) out.push({ label: '赛期', value: `${first.start} – ${last.end}` });
+  if (Number(adv.finalTopN) > 0) out.push({ label: '决赛名额', value: `${adv.finalTopN} 支` });
+  if (Number(adv.rate) > 0) out.push({ label: '入围率', value: `${Math.round(Number(adv.rate) * 100)}%` });
+  return out;
+}
+
+/** 关键事实条 HTML。 */
+export function landingFactsHtml(facts) {
+  const items = (facts ?? []).filter((f) => f && f.label && f.value);
+  if (!items.length) return '';
+  return `<dl class="landing__facts">${items.map((f) => `
+    <div class="landing__fact">
+      <dt class="landing__fact-label">${escapeHtml(f.label)}</dt>
+      <dd class="landing__fact-value">${escapeHtml(f.value)}</dd>
+    </div>`).join('')}</dl>`;
+}
+
 /** CTA 下方那句说明（按登录态变化）。 */
 export function landingCtaNote(user) {
   return user
@@ -669,53 +871,112 @@ export function landingStatsHtml(stats) {
 /** 赛程脊 HTML。detail 为**初始**（第一个赛段）的详情 ⇒ 无 JS 时也有内容。 */
 export function landingSpineHtml(nodes, detail) {
   return `<div class="spine" data-spine>
+    <div class="spine__track" data-spine-track>
     ${(nodes ?? []).map((n, i) => `
       <button type="button" class="spine__node${i === 0 ? ' is-active' : ''}"
-              data-stage-key="${escapeHtml(n.key)}" aria-pressed="${i === 0 ? 'true' : 'false'}">
+              data-stage-key="${escapeHtml(n.key)}" aria-pressed="${i === 0 ? 'true' : 'false'}"
+              ${n.share === null ? '' : `style="--share:${n.share.toFixed(4)}"`}
+              title="${escapeHtml(`${n.key} ${n.name}｜${n.date}${n.daysText ? `｜${n.daysText}` : ''}`)}">
         <span class="spine__node-head">
           <span class="spine__node-key">${escapeHtml(n.key)}</span>
           <span class="spine__node-name">${escapeHtml(n.name)}</span>
         </span>
-        <span class="spine__node-date">${escapeHtml(n.date)}</span>
+        ${n.daysText ? `<span class="spine__node-days">${escapeHtml(n.daysText)}</span>` : ''}
       </button>`).join('')}
+    </div>
     <div class="spine__detail" data-spine-detail>${landingSpineDetailHtml(detail)}</div>
   </div>`;
 }
 
-/** 权重条 HTML。 */
-export function landingWeightBarsHtml(bars) {
-  return `<div class="weightbars">${(bars ?? []).map((b) => `
-    <div class="weightbar" data-dim-key="${escapeHtml(b.key)}">
-      <span class="weightbar__label">${escapeHtml(b.label)}
-        <span class="weightbar__seat">${escapeHtml(seatLabel(b.seat))}</span>
-      </span>
-      <span class="weightbar__track"><span class="weightbar__fill" style="--w:${escapeHtml(b.text)}"></span></span>
-      <span class="weightbar__value">${escapeHtml(b.text)}</span>
+/**
+ * 权重双轨对照 HTML（P10 · M10）。
+ * ⚠️ **同一个 data-dim-key 挂在三处**（行 + 上轨 + 下轨）：
+ *    联动高亮的代码按 `data-dim-key` 相等来判定 ⇒ 悬停一行时，
+ *    **上下两轨会同时亮**（契约 M10「联动高亮时两端同时带 is-active」）。
+ *    事件只挂在**行**上（不挂轨道）—— 否则从上轨移到下轨时会先 mouseleave 熄灭再亮起，
+ *    出现闪烁。
+ */
+export function landingWeightTracksHtml(tracks) {
+  const rows = (tracks ?? []).map((t) => {
+    const rail = (side, data) => `
+      <div class="wtrack__rail" data-dim-key="${escapeHtml(t.key)}">
+        <span class="wtrack__rail-label">${side === 'initial' ? '初赛' : '决赛'}</span>
+        <span class="wtrack__track"><span class="wtrack__fill" style="--w:${escapeHtml(data ? data.text : '0%')}"></span></span>
+        <span class="wtrack__value">${escapeHtml(data ? data.text : '—')}</span>
+      </div>`;
+    return `
+    <div class="wtrack" data-dim-key="${escapeHtml(t.key)}">
+      <div class="wtrack__head">
+        <span class="wtrack__label">${escapeHtml(t.label)}</span>
+        <span class="wtrack__seat">${escapeHtml(seatLabel(t.seat))}</span>
+        <span class="wtrack__delta ${t.direction}">${escapeHtml(t.deltaText)}</span>
+      </div>
+      ${rail('initial', t.initial)}
+      ${rail('final', t.final)}
+    </div>`;
+  });
+  if (!rows.length) return '';
+  return `<div class="wtracks">
+    <div class="wtracks__legend">
+      <span class="wtracks__legend-item"><i class="wtracks__swatch wtracks__swatch--initial"></i>初赛</span>
+      <span class="wtracks__legend-item"><i class="wtracks__swatch wtracks__swatch--final"></i>决赛</span>
+      <span class="wtracks__legend-item wtracks__legend-item--delta">Δ = 决赛 − 初赛</span>
+    </div>
+    ${rows.join('')}
+  </div>`;
+}
+
+/**
+ * 段位阶 HTML（真阶梯 · P10 · M8）。
+ * @param {Array<object>} steps landingLadderSteps 的结果
+ * @param {{currentKey?:string|null,currentLabel?:string}} opts
+ *   currentKey 缺省 ⇒ 取**最高一级**（落地页是公开页，没有「我的段位」，
+ *   这时高亮的是**目标段位**）。
+ */
+export function landingLadderHtml(steps, opts = {}) {
+  const list = Array.isArray(steps) ? steps : [];
+  const keys = list.map((s) => s.key);
+  const wanted = opts?.currentKey ?? null;
+  const current = wanted && keys.includes(wanted)
+    ? wanted
+    : (keys.length ? keys[keys.length - 1] : null);
+  const label = opts?.currentLabel ?? '目标段位';
+  return `<div class="ladder">${list.map((s) => `
+    <div class="ladder__step${s.key === current ? ' is-current' : ''}" data-tier-key="${escapeHtml(s.key)}" style="--h:${escapeHtml(String(s.height))}">
+      <span class="ladder__block" aria-hidden="true"></span>
+      <div class="ladder__body">
+        <p class="ladder__title">
+          <span class="ladder__key">${escapeHtml(s.key)}</span>
+          <span class="ladder__name">${escapeHtml(s.name)}</span>
+          ${s.key === current ? `<span class="ladder__badge">${escapeHtml(label)}</span>` : ''}
+        </p>
+        ${s.requirement ? `<p class="ladder__req">${escapeHtml(s.requirement)}</p>` : ''}
+        ${s.benefits.length
+          ? `<ul class="ladder__benefits">${s.benefits.map((b) => `<li>${escapeHtml(b)}</li>`).join('')}</ul>`
+          : '<span class="ladder__none">暂无额外权益</span>'}
+      </div>
     </div>`).join('')}</div>`;
 }
 
-/** 段位阶 HTML。 */
-export function landingLadderHtml(steps) {
-  return `<div class="ladder">${(steps ?? []).map((s) => `
-    <div class="ladder__step" data-tier-key="${escapeHtml(s.key)}">
-      <span class="ladder__key">${escapeHtml(s.key)}</span>
-      <span class="ladder__name">${escapeHtml(s.name)}
-        ${s.requirement ? `<span class="ladder__req">${escapeHtml(s.requirement)}</span>` : ''}
-      </span>
-      ${s.benefits.length
-        ? `<ul class="ladder__benefits">${s.benefits.map((b) => `<li>${escapeHtml(b)}</li>`).join('')}</ul>`
-        : '<span class="ladder__none">暂无额外权益</span>'}
-    </div>`).join('')}</div>`;
-}
-
-/** 漏斗 HTML。 */
+/**
+ * 漏斗 HTML（真梯形 · P10 · M9）。
+ * ⚠️ 流失率**标在两段之间**（漏斗的「段间」）—— 它描述的是「上一段到这一段掉了多少」。
+ */
 export function landingFunnelHtml(stages) {
-  return `<div class="funnel">${(stages ?? []).map((s) => `
+  const list = Array.isArray(stages) ? stages : [];
+  const parts = [];
+  list.forEach((s, i) => {
+    if (i > 0 && s.churnText) {
+      parts.push(`<p class="funnel__churn">${escapeHtml(s.churnText)}</p>`);
+    }
+    parts.push(`
     <div class="funnel__stage">
       <span class="funnel__label">${escapeHtml(s.label)}</span>
-      <span class="funnel__track"><span class="funnel__bar" style="--w:${escapeHtml(s.rate === null ? '0' : s.text)}"></span></span>
+      <span class="funnel__track"><span class="funnel__bar" style="--w:${escapeHtml(s.rate === null ? '0%' : s.text)};--i:${i}"></span></span>
       <span class="funnel__rate">${escapeHtml(s.text)}</span>
-    </div>`).join('')}</div>`;
+    </div>`);
+  });
+  return `<div class="funnel">${parts.join('')}</div>`;
 }
 
 /** 破同分链 HTML。 */
@@ -797,17 +1058,25 @@ export function wireLanding(wrap, ctx) {
     if (detailBox) detailBox.innerHTML = landingSpineDetailHtml(landingSpineDetail(stage));
   });
 
-  // ② 初赛 / 决赛**同维度**联动高亮（企业确认 10% → 25% 这类对比，一眼看懂）
-  const bars = wrap.querySelectorAll('[data-dim-key]');
+  // ② 初赛 / 决赛**同维度**联动高亮（P10 · M10：悬停一行 ⇒ **上下两轨同时**亮）
+  //    ⚠️ 事件只挂在**行**（.wtrack）上，不挂轨道：
+  //    轨道也带 data-dim-key（联动判定靠它），但若轨道上也挂事件，
+  //    从上轨移到下轨时会先触发上轨的 mouseleave（熄灭）再触发下轨的 mouseenter（点亮）⇒ 闪烁。
+  const bars = wrap.querySelectorAll('.wtrack[data-dim-key]');
+  const rails = wrap.querySelectorAll('.wtrack__rail[data-dim-key]');
   for (const bar of bars) {
     bar.addEventListener?.('mouseenter', () => {
       const key = bar.getAttribute('data-dim-key');
       for (const other of bars) {
         other.classList.toggle('is-active', other.getAttribute('data-dim-key') === key);
       }
+      for (const rail of rails) {
+        rail.classList.toggle('is-active', rail.getAttribute('data-dim-key') === key);
+      }
     });
     bar.addEventListener?.('mouseleave', () => {
       for (const other of bars) other.classList.remove('is-active');
+      for (const rail of rails) rail.classList.remove('is-active');
     });
   }
 
@@ -824,6 +1093,12 @@ export function wireLanding(wrap, ctx) {
   });
 
   // ④ 进入视口：揭示 + 数字 count-up + 漏斗伸展
+  //    ⚠️ P10 修正：漏斗条**以前根本不会动** —— 观察器给 `.funnel__bar` 加了
+  //    `is-revealed`，但没有任何 CSS 规则认这个组合 ⇒ 「漏斗依次伸展」是句空话。
+  //    现在给漏斗条补上 `.reveal`，`is-revealed` 时播放伸展动画，并按 --i 逐段延迟。
+  //    ⛔ `.reveal` **不把宽度收到 0**（内容必须永远可见）：
+  //    动画用 `animation-fill-mode: both` 播放，播放前仍是满宽 ⇒
+  //    未进视口时截图/静态导出是正确的，观察器没触发时也是正确的。
   const revealables = wrap.querySelectorAll('.reveal, .landing__stat-value, .funnel__bar');
   if (typeof IntersectionObserver === 'undefined') {
     for (const el of revealables) {
@@ -831,6 +1106,9 @@ export function wireLanding(wrap, ctx) {
       if (el.classList?.contains('landing__stat-value')) countUp(el);
     }
     return;
+  }
+  for (const el of revealables) {
+    if (el.classList?.contains('funnel__bar')) el.classList?.add('reveal');
   }
   const io = new IntersectionObserver((entries) => {
     for (const entry of entries) {
@@ -850,7 +1128,9 @@ export function landingSpineDetailHtml(detail) {
   const hard = detail?.hardRequirement === false
     ? '<p class="spine__detail-note">本赛段不做硬性交付要求</p>'
     : '';
+  const when = [detail?.date, detail?.daysText].filter(Boolean).join(' · ');
   return `<p class="spine__detail-title">${escapeHtml(detail?.title ?? '')}</p>
+    ${when ? `<p class="spine__detail-when">${escapeHtml(when)}</p>` : ''}
     ${items ? `<ul class="spine__detail-list">${items}</ul>` : '<p class="spine__detail-note">本赛段无固定交付物清单。</p>'}
     ${hard}`;
 }
@@ -888,6 +1168,7 @@ export function renderLanding(ctx) {
             五段赛程、六个评审维度、公开的破同分链 —— 赛制全部写在明处。
             你和评委看的是同一张评分表。
           </p>
+          <div id="landing-facts"></div>
           <div class="landing__cta">
             <a class="btn btn--primary" href="${escapeHtml(cta.primary.href)}">${escapeHtml(cta.primary.label)}</a>
             ${cta.secondary.map((s) => `<a class="btn btn--ghost" href="${escapeHtml(s.href)}">${escapeHtml(s.label)}</a>`).join('')}
@@ -902,29 +1183,22 @@ export function renderLanding(ctx) {
       </div>
     </section>
 
-    <section class="landing__section" id="landing-rules">
+    <section class="landing__section landing__section--alt" id="landing-rules">
       <div class="landing__section-head">
         <p class="landing__eyebrow">赛制 · 怎么算</p>
         <h2 class="landing__section-title">每一分从哪来，权重是多少</h2>
         <p class="landing__section-desc">
-          初赛与决赛各有一张权重表。把鼠标移到任一维度上，两张表里的同名维度会一起亮起 ——
-          权重怎么随赛段变化的，一眼就能看出来。
+          初赛与决赛各有一张权重表，这里把它们对齐到同一条轴上：上轨是初赛、下轨是决赛，
+          中间标出 Δ —— 权重怎么随赛段变化，一眼就能看出来。
         </p>
       </div>
       <div class="rulegrid rulegrid--2">
-        <article class="ruletile">
+        <article class="ruletile ruletile--wide">
           <div class="ruletile__head">
-            <h3 class="ruletile__title">初赛权重表</h3>
-            <span class="ruletile__meta" id="landing-initial-meta"></span>
+            <h3 class="ruletile__title">权重双轨对照</h3>
+            <span class="ruletile__meta" id="landing-weight-meta"></span>
           </div>
-          <div id="landing-initial"></div>
-        </article>
-        <article class="ruletile">
-          <div class="ruletile__head">
-            <h3 class="ruletile__title">决赛权重表</h3>
-            <span class="ruletile__meta" id="landing-final-meta"></span>
-          </div>
-          <div id="landing-final"></div>
+          <div id="landing-weights"></div>
         </article>
         <article class="ruletile">
           <div class="ruletile__head"><h3 class="ruletile__title">同分怎么决</h3></div>
@@ -939,7 +1213,7 @@ export function renderLanding(ctx) {
       </div>
     </section>
 
-    <section class="landing__section">
+    <section class="landing__section" id="landing-track">
       <div class="landing__section-head">
         <p class="landing__eyebrow">赛程与晋级</p>
         <h2 class="landing__section-title">五段赛程，各有交付物</h2>
@@ -966,7 +1240,7 @@ export function renderLanding(ctx) {
       </div>
     </section>
 
-    <section class="landing__section">
+    <section class="landing__section landing__section--alt">
       <div class="landing__section-head">
         <p class="landing__eyebrow">段位与权益</p>
         <h2 class="landing__section-title">走过的每一步都算数</h2>
@@ -1011,7 +1285,7 @@ export function renderLanding(ctx) {
       </div>
     </section>
 
-    <section class="landing__section">
+    <section class="landing__section landing__section--alt">
       <div class="landing__section-head">
         <p class="landing__eyebrow">合规</p>
         <h2 class="landing__section-title">红线写在报名之前</h2>
@@ -1057,6 +1331,8 @@ export function renderLanding(ctx) {
     const boardCount = board ? (board.rows ?? []).length : null;
 
     if (statsBox) statsBox.innerHTML = landingStatsHtml(landingStats({ info, boardCount }));
+    const factsBox = wrap.querySelector('#landing-facts');
+    if (factsBox) factsBox.innerHTML = landingFactsHtml(landingFacts(info));
 
     const nodes = landingSpineNodes(info.stages);
     if (spineBox) {
@@ -1065,16 +1341,17 @@ export function renderLanding(ctx) {
         : '<p class="muted small">赛程尚未公布。</p>';
     }
 
-    const initialBars = landingWeightBars(info.scoring?.initial?.dimensions);
-    const finalBars = landingWeightBars(info.scoring?.final?.dimensions);
-    const initialBox = wrap.querySelector('#landing-initial');
-    const finalBox = wrap.querySelector('#landing-final');
-    if (initialBox) initialBox.innerHTML = landingWeightBarsHtml(initialBars);
-    if (finalBox) finalBox.innerHTML = landingWeightBarsHtml(finalBars);
-    const initialMeta = wrap.querySelector('#landing-initial-meta');
-    const finalMeta = wrap.querySelector('#landing-final-meta');
-    if (initialMeta) initialMeta.textContent = `${initialBars.length} 个维度`;
-    if (finalMeta) finalMeta.textContent = `${finalBars.length} 个维度`;
+    // ⚠️ P10：初赛 / 决赛**合成一条双轨**（不是两张独立的表）——
+    //    分开两张表看不出「同一维度在赛段之间怎么变」。
+    const tracks = landingWeightTracks(info.scoring?.initial?.dimensions, info.scoring?.final?.dimensions);
+    const weightsBox = wrap.querySelector('#landing-weights');
+    if (weightsBox) weightsBox.innerHTML = landingWeightTracksHtml(tracks);
+    const weightMeta = wrap.querySelector('#landing-weight-meta');
+    if (weightMeta) {
+      weightMeta.textContent = tracks.length
+        ? `${tracks.length} 个维度 · 决赛 ${tracks.filter((t) => t.final).length} 个`
+        : '';
+    }
 
     const chainBox = wrap.querySelector('#landing-chain');
     if (chainBox) chainBox.innerHTML = landingChainHtml(landingChainItems(info.tiebreak));
@@ -1211,7 +1488,7 @@ export function renderLanding(ctx) {
 
 **Step: 创建 `platform/test/web-landing.test.js`**
 
-```js
+```javascript
 // platform/test/web-landing.test.js —— 落地页（首页）的行为闸
 //
 // 规则溯源：
@@ -1234,8 +1511,10 @@ import { fileURLToPath } from 'node:url';
 
 import {
   landingStats, landingSpineNodes, landingSpineDetail, landingWeightBars, seatLabel,
+  landingFacts, landingFactsHtml,
   landingLadderSteps, landingFunnelStages, landingChainItems, landingCta, landingCtaNote,
-  landingStatsHtml, landingSpineHtml, landingSpineDetailHtml, landingWeightBarsHtml, landingLadderHtml,
+  landingStatsHtml, landingSpineHtml, landingSpineDetailHtml,
+  landingWeightTracks, landingWeightTracksHtml, landingLadderHtml,
   landingFunnelHtml, landingChainHtml, landingRedlinesHtml, renderLanding, pctText,
 } from '../web/views/landing.js';
 
@@ -1420,17 +1699,108 @@ test('权重条：权重取自维度，百分比正确，席位中文化', () =>
   assert.equal(seatLabel('unknown'), 'unknown');
 });
 
-test('段位阶：无权益的段位要明说「暂无额外权益」（不留空白）', () => {
+test('契约闸（P10 · M10）：权重双轨 —— 同一维度上下两轨 + Δ（百分点）', () => {
+  const tracks = landingWeightTracks(
+    [
+      { key: 'enterprise', name: '企业确认', weight: 0.1, seat: 'enterprise' },
+      { key: 'innovation', name: '创新性', weight: 0.2, seat: 'judge' },
+    ],
+    [
+      { key: 'enterprise', name: '企业确认', weight: 0.25, seat: 'enterprise' },
+      { key: 'innovation', name: '创新性', weight: 0.1, seat: 'judge' },
+    ],
+  );
+  assert.equal(tracks.length, 2);
+  const ent = tracks[0];
+  assert.equal(ent.initial.text, '10%');
+  assert.equal(ent.final.text, '25%');
+  // ⚠️ 0.25 − 0.10 = 0.15000000000000002 ⇒ 必须四舍五入到一位小数（否则渲染出 15.000000000000002pp）
+  assert.equal(ent.delta, 15);
+  assert.equal(ent.deltaText, '+15pp');
+  assert.equal(ent.direction, 'up');
+  const inv = tracks[1];
+  assert.equal(inv.deltaText, '-10pp');
+  assert.equal(inv.direction, 'down');
+  const html = landingWeightTracksHtml(tracks);
+  // ⚠️ 两轨必须**都**带 data-dim-key ⇒ 联动高亮时两端同时亮（M10 的核心）
+  const railKeys = [...html.matchAll(/class="wtrack__rail" data-dim-key="([^"]+)"/g)].map((m) => m[1]);
+  assert.equal(railKeys.length, 4, '两个维度 × 两轨 = 4 条轨');
+  assert.deepEqual(railKeys, ['enterprise', 'enterprise', 'innovation', 'innovation']);
+  assert.ok(html.includes('+15pp') && html.includes('-10pp'), 'Δ 必须渲染出来');
+});
+
+test('权重双轨：只在一侧出现的维度标「仅初赛 / 仅决赛」（不许拿 0 冒充另一轨）', () => {
+  const tracks = landingWeightTracks(
+    [{ key: 'only_initial', name: '仅初赛项', weight: 0.2, seat: 'judge' }],
+    [{ key: 'only_final', name: '仅决赛项', weight: 0.3, seat: 'judge' }],
+  );
+  assert.equal(tracks[0].deltaText, '仅初赛');
+  assert.equal(tracks[0].final, null);
+  assert.equal(tracks[0].delta, null);
+  assert.equal(tracks[1].deltaText, '仅决赛');
+  assert.equal(tracks[1].initial, null);
+});
+
+test('权重双轨：只有一侧维度表时也不许崩（另一轨显示「—」）', () => {
+  const tracks = landingWeightTracks([{ key: 'a', name: 'A', weight: 0.2, seat: 'judge' }], []);
+  assert.equal(tracks.length, 1);
+  assert.equal(tracks[0].final, null);
+  const html = landingWeightTracksHtml(tracks);
+  assert.ok(html.includes('—'), '缺失的一轨要显示 —');
+});
+
+test('段位阶：按等级**升序**排序（不排序就成不了阶梯），权益与门槛齐全', () => {
   const steps = landingLadderSteps([
     { key: 'S', name: '验证', minMilestones: 5, requiresBusinessSignoff: true, benefits: ['完赛证明'] },
     { key: 'D', name: '出题', minMilestones: 0, benefits: [] },
   ]);
-  assert.ok(steps[0].requirement.includes('里程碑 ≥ 5'));
-  assert.ok(steps[0].requirement.includes('需企业签字'));
-  assert.deepEqual(steps[0].benefits, ['完赛证明']);
-  assert.deepEqual(steps[1].benefits, []);
+  // ⚠️ rules 里的顺序只是**配置顺序** ⇒ 视图必须自己按等级排（否则台阶高度没法递增）
+  assert.deepEqual(steps.map((s) => s.key), ['D', 'S']);
+  const top = steps[1];
+  assert.ok(top.requirement.includes('里程碑 ≥ 5'));
+  assert.ok(top.requirement.includes('需企业签字'));
+  assert.deepEqual(top.benefits, ['完赛证明']);
+  assert.deepEqual(steps[0].benefits, []);
   const html = landingLadderHtml(steps);
   assert.ok(html.includes('暂无额外权益'), '空白会被读成「没加载出来」');
+});
+
+test('契约闸（P10 · M8）：段位阶是**真阶梯** —— 高度递增，且目标段位高亮', () => {
+  const steps = landingLadderSteps([
+    { key: 'D', name: '出题', minMilestones: 0 },
+    { key: 'C', name: '立项', minMilestones: 1 },
+    { key: 'B', name: '原型', minMilestones: 2 },
+    { key: 'A', name: '接入', minMilestones: 3 },
+    { key: 'S', name: '验证', minMilestones: 5 },
+  ]);
+  assert.equal(steps.length, 5);
+  for (let i = 1; i < steps.length; i++) {
+    assert.ok(
+      steps[i].height > steps[i - 1].height,
+      `第 ${i + 1} 级（${steps[i].key}）必须比第 ${i} 级（${steps[i - 1].key}）高`,
+    );
+  }
+  assert.equal(steps.at(-1).height, 1, '最高一级必须占满高');
+  assert.equal(steps[0].height, 0.2, '最低一级占 1/5');
+  const html = landingLadderHtml(steps);
+  // 公开页没有「我的段位」⇒ 默认高亮**最高一级**（目标段位）
+  assert.ok(/class="ladder__step is-current"/.test(html), '必须有一级被高亮');
+  assert.equal((html.match(/is-current/g) ?? []).length, 1, '只能高亮一级');
+  assert.ok(html.includes('目标段位'), '要说明高亮的是目标段位');
+  // ⚠️ 高度必须真的写进 HTML（否则还是等高表格）
+  assert.ok(/style="--h:[\d.]+"/.test(html), '台阶必须带 --h');
+});
+
+test('契约闸（P10 · M8）：调用方给了当前段位就高亮它（不是最高一级）', () => {
+  const steps = landingLadderSteps([
+    { key: 'D', name: '出题', minMilestones: 0 },
+    { key: 'C', name: '立项', minMilestones: 1 },
+    { key: 'S', name: '验证', minMilestones: 5 },
+  ]);
+  const html = landingLadderHtml(steps, { currentKey: 'C', currentLabel: '当前段位' });
+  const m = html.match(/class="ladder__step is-current"[^>]*data-tier-key="([^"]+)"/);
+  assert.equal(m?.[1], 'C', '高亮的必须是调用方指定的段位');
+  assert.ok(html.includes('当前段位'));
 });
 
 test('漏斗：rate 为 null 时显示「—」（不许显示 0%）', () => {
@@ -1446,6 +1816,41 @@ test('漏斗：rate 为 null 时显示「—」（不许显示 0%）', () => {
   //   所以这里断言「比例格里的内容**恰好**是 —」。
   assert.ok(html.includes('<span class="funnel__rate">—</span>'), 'null 比例的比例格必须显示 —');
   assert.ok(!html.includes('>0%</span>'), 'null 比例不得渲染成 0%');
+});
+
+test('漏斗：段间标注流失率（只有相邻两段都算出比例才有流失率）', () => {
+  const stages = landingFunnelStages([
+    { key: 'registration', label: '报名筛选', rate: 0.3 },
+    { key: 'incubation', label: '孵化', rate: 0.2 },
+    { key: 'coaching', label: '辅导期', rate: null },
+  ]);
+  assert.equal(stages[0].churn, null, '第一段没有「上一段」⇒ 流失率未知');
+  assert.equal(stages[0].churnText, '');
+  // 1 − 0.2 / 0.3 = 33.33% ⇒ 四舍五入到整数
+  assert.equal(stages[1].churnText, '流失 33%');
+  assert.equal(stages[2].churn, null, '本段比例未知 ⇒ 流失率未知，不许拿 0 顶替');
+  const html = landingFunnelHtml(stages);
+  assert.ok(html.includes('流失 33%'), '流失率必须渲染出来');
+  assert.ok(html.includes('funnel__churn'), '流失率要有独立的标记（段间）');
+});
+
+test('契约闸（P10 · M9）：漏斗每段宽度**逐字等于** rules 里的比例（偏差 ≤ 2%）', () => {
+  const stages = landingFunnelStages([
+    { key: 'registration', label: '报名筛选', rate: 0.3 },
+    { key: 'incubation', label: '孵化', rate: 0.2 },
+    { key: 'sprint', label: '冲刺', rate: 0.1 },
+  ]);
+  const html = landingFunnelHtml(stages);
+  const widths = [...html.matchAll(/--w:([\d.]+%)/g)].map((m) => m[1]);
+  assert.deepEqual(widths, ['30%', '20%', '10%']);
+  for (let i = 0; i < stages.length; i++) {
+    const got = parseFloat(widths[i]);
+    const want = stages[i].rate * 100;
+    assert.ok(
+      Math.abs(got - want) <= 2,
+      `第 ${i + 1} 段宽度 ${got}% 偏离规则比例 ${want}% 超过 2%`,
+    );
+  }
 });
 
 test('破同分链：顺序号连续，作用域中文化', () => {
@@ -1679,9 +2084,110 @@ test('契约闸：圆角已收紧到 midnight 的量级（sm 4 / md 6 / lg 10 / 
 
 test('契约闸：暗色是默认主题，且实底按钮用深色字（白字压强调色不合格）', () => {
   const root = STYLES_CSS.slice(0, STYLES_CSS.indexOf(':root[data-theme="light"]'));
-  assert.ok(/--bg:\s*#0b0d12/.test(root), '暗色底必须是默认');
+  // ⚠️ **P10 契约修订**：底色由 #0b0d12 加深到 #08090d（让卡片面真正浮起来）
+  assert.ok(/--bg:\s*#08090d/.test(root), '暗色底必须是默认（P10 值 #08090d）');
   assert.ok(/--brand:\s*#7c9cff/.test(root));
   assert.ok(/--on-brand:\s*#0b0d12/.test(root), '压 accent 实底的文字必须是深色（白字只有 2.6:1）');
+});
+
+test('契约闸（P10 · M7）：暗色**不跟随系统** —— 系统是亮色偏好的人第一眼也必须是暗底', () => {
+  // ⚠️ P9 时代有一段「按系统偏好自动切亮色」的媒体查询 ⇒
+  //    「暗色优先」只对系统偏好深色的人生效 ⇒ 绝大多数访客看到的是亮色（截图即证据）。
+  //    P10 起暗色是**默认**，亮色必须由用户显式切换（顶栏主题按钮）。
+  // ⚠️ 先剥掉注释再匹配 —— 否则「解释这段历史」的注释本身会被当成规则命中。
+  const code = STYLES_CSS.replace(/\/\*[\s\S]*?\*\//g, '');
+  const auto = code.match(/@media\s*\(prefers-color-scheme:\s*light\)/);
+  assert.equal(auto, null, '不许再按系统偏好自动切亮色（暗色是默认）');
+  assert.ok(/:root\[data-theme="light"\]/.test(code), '亮色主题仍必须保留（显式切换用）');
+});
+
+test('契约闸（P10 · M4）：卡片有顶边高光但**没有外阴影**（深度不靠阴影堆）', () => {
+  const card = STYLES_CSS.slice(STYLES_CSS.indexOf('.card {'), STYLES_CSS.indexOf('.card--flush'));
+  assert.ok(/box-shadow:\s*inset/.test(card), '卡片必须有 inset 高光（顶边）');
+  // ⚠️ 不用 `box-shadow:\s*(?!inset)` —— **前瞻会被 \s* 回溯绕过**
+  //    （`\s*` 可以退成零宽，于是 "inset" 前面的那个空格成了"非 inset"⇒ 误判）。
+  //    改成把每条 box-shadow 的值取出来，逐条断言它以 inset 开头。
+  const shadows = [...card.matchAll(/box-shadow:\s*([^;]+);/g)].map((m) => m[1].trim());
+  assert.ok(shadows.length > 0, '卡片必须声明 box-shadow');
+  for (const v of shadows) {
+    assert.ok(v.startsWith('inset'), `卡片不许有外阴影（实际：${v}）`);
+  }
+});
+
+test('首屏事实条：赛期 / 决赛名额 / 入围率**全部来自 rules**', () => {
+  const facts = landingFacts({
+    stages: [{ key: 'S1', name: '调研', start: '10-01', end: '10-10' }, { key: 'S5', name: '落地', start: '10-29', end: '10-31' }],
+    advancement: { rate: 0.25, finalTopN: 32 },
+  });
+  assert.equal(facts.length, 3);
+  assert.deepEqual(facts.map((f) => f.label), ['赛期', '决赛名额', '入围率']);
+  assert.equal(facts[0].value, '10-01 – 10-31');
+  assert.equal(facts[1].value, '32 支');
+  assert.equal(facts[2].value, '25%');
+  const html = landingFactsHtml(facts);
+  assert.ok(html.includes('10-01 – 10-31') && html.includes('32 支') && html.includes('25%'));
+});
+
+test('首屏事实条：数据缺失时**不许编**（空集 ⇒ 不渲染）', () => {
+  assert.deepEqual(landingFacts({}), []);
+  assert.equal(landingFactsHtml([]), '');
+  assert.equal(landingFactsHtml([{ label: '', value: '' }]), '');
+});
+
+test('赛程脊 2.0：每个赛段的高度 = 它占整条赛程的**天数占比**', () => {
+  const nodes = landingSpineNodes([
+    { key: 'S1', name: '调研', start: '10-01', end: '10-10' },
+    { key: 'S2', name: '任务', start: '10-10', end: '10-13' },
+    { key: 'S3', name: '开发', start: '10-13', end: '10-25' },
+    { key: 'S4', name: '路演', start: '10-26', end: '10-28' },
+    { key: 'S5', name: '落地', start: '10-29', end: '10-31' },
+  ]);
+  assert.equal(nodes.length, 5);
+  assert.equal(nodes[0].days, 10);
+  assert.equal(nodes[2].days, 13);
+  assert.equal(nodes[4].days, 3);
+  const sum = nodes.reduce((a, n) => a + n.share, 0);
+  assert.ok(Math.abs(sum - 1) < 1e-9, `占比之和必须是 1，实际 ${sum}`);
+  // 最长的赛段占比必须最大（13 天 > 3 天）
+  assert.ok(nodes[2].share > nodes[4].share);
+  // 占比必须真的写进 HTML（否则时间轴还是等距的）
+  const html = landingSpineHtml(nodes, landingSpineDetail(nodes[0].raw));
+  assert.ok(/style="--share:[0-9.]+"/.test(html), '节点必须带 --share');
+  assert.ok(html.includes('10 天'), '节点要显示天数');
+});
+
+test('赛程脊 2.0：日期解析不出来 ⇒ share 为 null（不许画成 0 天）', () => {
+  const nodes = landingSpineNodes([
+    { key: 'S1', name: '调研', start: '10-01', end: '10-10' },
+    { key: 'SX', name: '未知', start: '', end: '' },
+  ]);
+  assert.equal(nodes[1].share, null);
+  assert.equal(nodes[1].days, null);
+  assert.equal(nodes[1].daysText, '');
+});
+
+test('契约闸（P10）：分节**交替**底色，且换底色时内容左边缘不跳', async () => {
+  const html = await renderLandingHtml();
+  // ⚠️ 正则必须钉住「class 名**恰好**是 landing__section」：
+  //    写成 `class="landing__section([^"]*)"` 会把 `landing__section-head`
+  //    也当成一个分节（捕获到 "-head"）⇒ 交替判定必然误报。
+  const sections = [...html.matchAll(/class="landing__section( [^"]*)?"/g)].map((m) => m[1] ?? '');
+  assert.ok(sections.length >= 4, `至少要有 4 个分节，实际 ${sections.length}`);
+  // ⚠️ 必须**隔一节换一个底**（连着两节同底 = 没在交替）
+  const alt = sections.map((s) => s.includes('landing__section--alt'));
+  for (let i = 1; i < alt.length; i++) {
+    assert.notEqual(alt[i], alt[i - 1], `第 ${i + 1} 节与第 ${i} 节底色必须不同`);
+  }
+  // ⚠️ 所有分节内边距一致 ⇒ 换底色时左边缘不跳
+  const rule = STYLES_CSS.match(/\.landing__section\s*\{([^}]*)\}/)?.[1] ?? '';
+  assert.ok(
+    /padding:\s*var\(--sp-8\)\s*var\(--sp-10\)/.test(rule),
+    `分节必须有统一的横向内边距（与 hero / CTA 带对齐），实际：${rule}`,
+  );
+  assert.ok(
+    /\.landing__section--alt\s*\{[^}]*background:\s*var\(--bg-subtle\)/.test(STYLES_CSS),
+    '交替底色必须用 --bg-subtle（不许写字面色值）',
+  );
 });
 
 test('契约闸：所有动效都尊重 prefers-reduced-motion', () => {
@@ -1736,7 +2242,7 @@ async function renderLandingHtml() {
 
 **Step: 创建 `platform/test/event-info-api.test.js`**
 
-```js
+```javascript
 // platform/test/event-info-api.test.js —— 赛事规则公开接口（落地页的数据源）
 //
 // 规则溯源：
@@ -1778,7 +2284,7 @@ test('投影：顶层字段固定（缺配置也给空数组，不给 undefined�
   const keys = Object.keys(info).sort();
   assert.deepEqual(keys, [
     'advancement', 'behaviorEvents', 'behaviorMaxWeightShare', 'formation', 'funnel',
-    'redLines', 'registration', 'scoring', 'scoringPoints', 'stages', 'tiebreak',
+    'redLines', 'registration', 'scoring', 'scoringPoints', 'solvability', 'stages', 'tiebreak',
     'tierNeverUnlocks', 'tiers', 'visibility',
   ].sort());
   assert.deepEqual(info.stages, []);
@@ -1806,6 +2312,37 @@ test('投影：数值字段拒绝 NaN / Infinity（前端会渲染成 "NaN"）',
 test('投影：配置写错形状时不炸（维度不是数组 → 空数组）', () => {
   const info = buildEventInfo({ scoring: { initial: { dimensions: 'oops' } } });
   assert.deepEqual(info.scoring.initial.dimensions, []);
+});
+
+// ── P10 · W4-a：六维可解性规格投影 ──────────────────────────────────
+test('P10：投影带出六维可解性规格（生产站冷启动也拿得到评估表）', () => {
+  const info = buildEventInfo(rules);
+  assert.equal(info.solvability.dimensions.length, 6, '六维');
+  assert.equal(info.solvability.grades.length, 4, '四档');
+  assert.ok(info.solvability.vetoes.length >= 1);
+  const dim = info.solvability.dimensions[0];
+  assert.deepEqual(Object.keys(dim).sort(), ['key', 'label', 'max', 'weight']);
+  assert.ok(dim.label.length > 0, '维度要有人读的名字');
+  assert.ok(info.solvability.grades.every((g) => typeof g.minScore === 'number'));
+});
+
+test('P10：可解性投影**不泄内部备注与判定条件**（只给白名单字段）', () => {
+  const info = buildEventInfo(rules);
+  const veto = info.solvability.vetoes.find((v) => v.auto);
+  assert.ok(veto, '至少有一条自动否决项');
+  // ⛔ 判定条件（维度 + 取值）**不投影**出去：投影它等于把判定规则交给前端重算
+  assert.equal(veto.dimension, undefined, '不许带判定维度');
+  assert.equal(veto.equals, undefined, '不许带判定取值');
+  // ⛔ 任务包配比体检是组委会的事，不进公开投影
+  assert.equal(info.solvability.taskMix, undefined, '配比口径不进公开投影');
+  assert.equal(info.solvability.note, undefined, '内部备注不进公开投影');
+});
+
+test('P10：可解性配置缺失时给空骨架（不炸、不给 undefined）', () => {
+  const info = buildEventInfo({});
+  assert.deepEqual(info.solvability.dimensions, []);
+  assert.deepEqual(info.solvability.grades, []);
+  assert.deepEqual(info.solvability.vetoes, []);
 });
 
 // ══════════════════════════════════════════════════════════════════

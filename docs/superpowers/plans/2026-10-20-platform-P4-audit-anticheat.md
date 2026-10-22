@@ -5184,15 +5184,40 @@ export function getTeamTierRow(db, teamId) {
 //   ② 每次状态迁移写 audit_log(from_state, to_state, reason, at) → 否则申诉无法复盘
 //   ③ 幂等守卫：重复触发不产生二次迁移
 //   ④ 申诉触发 revision + 1 重算，不覆盖历史（旧 revision 保留）
+//     ⚠️ DP-106：**只对赛段结果类申诉（team_result）成立** ——
+//        报名类申诉（registration）撤销的是**分级裁定**，不涉及赛段分数 ⇒ 不触发重算。
 import { findLatestTransition } from '../db/repo/audit-log.js';
 import { findIdempotency, insertIdempotency } from '../db/repo/idempotency.js';
 import { insertAppeal, getAppeal, listAppealRows, updateAppeal } from '../db/repo/appeals.js';
 import { getTeamTierRow } from '../db/repo/tiers.js';
+// ⚠️ DP-106（报名类申诉）：报名的行与状态事件也要落库 ——
+//    SQL 一律走仓储层（全局约束「SQL 只在 src/db/repo/」），服务层**不写 SQL**。
+import { getRegistration as findRegistrationRow, updateRegistrationRow } from '../db/repo/registrations.js';
+import { insertRegistrationEvent } from '../db/repo/registrationEvents.js';
+import { getUserById } from '../db/repo/users.js';
 import { writeAuditLog } from '../audit/log.js';
 import { can } from '../auth/permissions.js';
 import { badRequest, conflict, forbidden, notFound } from '../errors.js';
 
 export const REVIEW_STATES = ['SUBMITTED', 'PENDING_REVIEW', 'CONFIRMED', 'FINALIZED', 'REJECTED', 'FLAGGED'];
+
+/**
+ * ⚠️ DP-106：**申诉是两件事，同一条队列**。
+ *
+ *   subjectType = 'team_result'  → 赛段结果类申诉（已 FINALIZED 的条目），**原有逻辑一字未改**。
+ *   subjectType = 'registration' → 报名类申诉（选手对**自己的报名分级结果**不服），DP-106 新增。
+ *
+ * 两条申诉共用 appeals 表与同一个裁决队列（`listAppeals`），
+ * 但**裁决口径完全不同**：赛段结果类要撤销终稿 + 重算；报名类只撤销**分级裁定**、回到待复核。
+ * ⇒ 裁决分支必须先看 `appeal.subject_type`，不能一律按赛段结果处理。
+ */
+export const APPEAL_SUBJECT_TYPES = ['team_result', 'registration'];
+
+/** 报名的**终态裁定**（委员会已拍板）—— 终态不可被选手改写（口径见 src/services/registration.js 的 decideRegistration）。 */
+const REGISTRATION_TERMINAL_STATUSES = ['accepted', 'rejected'];
+
+/** 申诉的**未裁决**状态（还有一条在队列里等人处理）⇒ 不许重复提交。 */
+const APPEAL_PENDING_STATUSES = ['submitted', 'reviewing'];
 
 // 合法迁移表。REJECTED → PENDING_REVIEW 是"选手申诉后重新复核"；
 // FINALIZED → REJECTED 是"申诉成立、撤销终稿"，随后走 revision + 1 重算。
@@ -5321,12 +5346,28 @@ export function filterVisibleScores({ db, stageId, viewer = null, scores = [] })
 
 /**
  * 提交申诉。范围：已 FINALIZED 且处于低可见档的条目（设计文档 §11.2）。
+ *
+ * ⚠️ DP-106：**按 subjectType 分支**。
+ *   'team_result'（缺省）→ 下面的**原逻辑一字未改**（赛段结果类申诉，已上线有测试）。
+ *   'registration'        → 报名类申诉（选手对**自己的报名分级结果**不服）。
+ *
+ * 为什么必须分支（这是 DP-106 的根因）：
+ *   选手侧前端（web/views/registration.js）提交的是
+ *   `{ subjectType: 'registration', subjectId: <报名 id> }`，
+ *   而原实现无条件 `parseAppealSubject(subjectId)` 把它拆成 `stageId:teamId`
+ *   ⇒ 报名 id 被当成赛段 id ⇒ 要求该 stage_result 已 FINALIZED ⇒ **必然 409**
+ *   ⇒ 选手点「提交申诉」永远失败。
  */
 export function fileAppeal({
   db, subjectType = 'team_result', subjectId, filedBy = null, reason, now = new Date().toISOString(), rules,
 }) {
   if (!subjectId) throw badRequest('申诉必须给 subjectId');
   if (!reason || !String(reason).trim()) throw badRequest('申诉必须写理由（空理由 = 无法复核）');
+
+  // ── 报名类申诉（DP-106）：独立的校验口径，见 fileRegistrationAppeal ──────
+  if (subjectType === 'registration') {
+    return fileRegistrationAppeal({ db, subjectId, filedBy, reason, now, rules });
+  }
 
   const { stageId, teamId } = parseAppealSubject(subjectId);
   const state = stageId ? getSubjectState({ db, subjectType: 'stage_result', subjectId: stageId }) : null;
@@ -5358,6 +5399,84 @@ export function fileAppeal({
 }
 
 /**
+ * 报名类申诉（DP-106）：选手对**自己的报名分级结果**不服，交给组委会复核。
+ *
+ * ⚠️ **校验顺序是有意设计的**（先查存在 → 再查权限 → 最后才查状态）：
+ *   ① 报名记录必须存在 ⇒ 404
+ *   ② 本人（或组委会代提交）⇒ 否则 403
+ *   ③ 该报名**不得是终态裁定** ⇒ 否则 409
+ *   ④ 该报名**不得已有未裁决的申诉** ⇒ 否则 409
+ *   （⑤ 理由非空 —— 通用校验，已在 fileAppeal 入口挡住）
+ *
+ * 为什么是这个顺序：
+ *   - 先存在后权限：不存在时不该泄露「这条报名存在但你无权」；
+ *     先权限后状态同理 —— 别人家的报名不该被探出「委员会已经裁定过了」。
+ *   - 状态排在最后：前两道是**身份**问题（404/403），状态是**业务**问题（409）；
+ *     身份不成立时一律不谈业务状态，避免用 409 泄露他人报名的裁定进度。
+ *
+ * 口径依据：
+ *   - ③ 的依据是 `src/services/registration.js` 的 decideRegistration 注释：
+ *     「终态裁定不可被选手改写」—— 委员会已拍板（accepted / rejected）的报名，
+ *     选手不能再申诉（要改只能走组委会直接复核那条路径）。
+ *   - ④ 是防重复提交：同一报名同时只允许一条**待裁决**的申诉在队列里。
+ */
+function fileRegistrationAppeal({ db, subjectId, filedBy, reason, now, rules }) {
+  // ① 存在性 → 404
+  const reg = findRegistrationRow(db, subjectId);
+  if (!reg) throw notFound(`报名记录不存在: ${subjectId}`);
+
+  // ② 权限 → 403（本人，或组委会代提交）
+  //    ⚠️ 组委会的判定走 can()（唯一的权限判定入口）：
+  //    'registration:review' 是**分级复核**权限（按届期作用域），
+  //    'audit:write' 是**审计写**权限（申诉裁决用的那一支）—— 两者都认。
+  const isOwner = !!filedBy && reg.user_id === filedBy;
+  const actor = filedBy ? getUserById(db, filedBy) : null;
+  const isCommittee = !!actor && (
+    can(actor, 'registration:review', { scopeType: 'edition', scopeId: reg.edition_id }, db)
+    || can(actor, 'audit:write', null, db)
+  );
+  if (!isOwner && !isCommittee) throw forbidden('无权对该报名提交申诉');
+  // ⚠️ 组委会代提交必须**留痕**（detail.onBehalf = true）：
+  //    否则复盘时分不清「选手自己提交的」与「组委会替某个人提交的」。
+  const onBehalf = isCommittee && !isOwner;
+
+  // ③ 终态裁定 → 409（委员会已拍板，选手不能再申诉）
+  if (REGISTRATION_TERMINAL_STATUSES.includes(reg.status)) {
+    throw conflict(`该报名已由委员会裁定（${reg.status}），不可再申诉`);
+  }
+
+  // ④ 重复提交 → 409（同一报名同时只允许一条待裁决的申诉）
+  //    ⚠️ 按状态分别查（而不是一次查全量再在 JS 里过滤）：
+  //    listAppealRows 自带 limit ⇒ 全量查可能因分页**漏掉**那条待裁决的申诉
+  //    （查「有没有」不需要看全量，只需要知道「有没有」）。
+  const hasPending = APPEAL_PENDING_STATUSES.some(
+    (st) => listAppealRows(db, { status: st, subjectType: 'registration', subjectId }).rows.length > 0,
+  );
+  if (hasPending) {
+    throw conflict('该报名已有未裁决的申诉，请等待组委会裁决');
+  }
+
+  const id = insertAppeal(db, {
+    subjectType: 'registration', subjectId, filedBy, reason, status: 'submitted', now,
+  });
+  writeAuditLog(db, {
+    actorId: filedBy,
+    action: 'appeal.filed',
+    entity: 'appeal',
+    entityId: id,
+    detail: {
+      subjectType: 'registration',
+      subjectId,
+      reason,
+      registrationStatus: reg.status,
+      onBehalf,
+    },
+    now,
+  });
+  return getAppeal(db, id);
+}
+
+/**
  * 裁决申诉。成立 → 撤销终稿（FINALIZED → REJECTED → PENDING_REVIEW）并要求 revision + 1 重算。
  * 旧 revision 保留（重算走新记录，不覆盖历史）。
  */
@@ -5376,19 +5495,53 @@ export function decideAppeal({
   }
 
   const transitions = [];
+  // ⚠️ DP-106：**先看 subject_type** —— 报名类与赛段结果类的裁决口径完全不同。
+  //   'registration'（报名类）：成立 ⇒ 撤销**分级裁定**，让它回到待复核（不重算赛段）。
+  //   其它（赛段结果类）：成立 ⇒ 撤销终稿（FINALIZED → REJECTED → PENDING_REVIEW）+ 重算。**原逻辑一字未改**。
+  const isRegistrationAppeal = appeal.subject_type === 'registration';
+  // 只有赛段结果类成立才要求重算（重算走 revision + 1，旧 revision 保留）。
+  const recomputeRequired = decision === 'accepted' && !isRegistrationAppeal;
   if (decision === 'accepted') {
-    const { stageId } = parseAppealSubject(appeal.subject_id);
-    if (stageId) {
-      transitions.push(transition({
-        db, subjectType: 'stage_result', subjectId: stageId,
-        from: 'FINALIZED', to: 'REJECTED', actorId: decidedBy,
-        reason: `申诉成立：${note}`, idempotencyKey: `appeal:${appealId}:revoke`, now,
-      }));
-      transitions.push(transition({
-        db, subjectType: 'stage_result', subjectId: stageId,
-        from: 'REJECTED', to: 'PENDING_REVIEW', actorId: decidedBy,
-        reason: `申诉重新复核：${note}`, idempotencyKey: `appeal:${appealId}:reopen`, now,
-      }));
+    if (isRegistrationAppeal) {
+      // ── 报名类：撤销分级裁定 → 回到待复核 ──────────────────────────────
+      // ⚠️ 为什么**不**触发赛段重算：报名分级与赛段分数是两套独立的量
+      //    （设计文档 §9「报名分级」 vs §11.2「赛段复核」）。
+      //    撤销一条分级裁定要重算的是**这条报名的分级**，由委员会重新复核落 level_final；
+      //    赛段分数一个字都不受影响 ⇒ recomputeRequired 必须为 false、transitions 为空。
+      const reg = findRegistrationRow(db, appeal.subject_id);
+      if (!reg) throw notFound(`报名记录不存在: ${appeal.subject_id}`);
+      const fromStatus = reg.status;
+      // ⚠️ 改报名行**必须走仓储层**（全局约束：SQL 只在 src/db/repo/）。
+      //    updateRegistrationRow 的可更新列白名单里含 level_final ⇒ 传 null 即清空裁定等级。
+      //    （decided_by / decided_at / decision_note **保留**：那是上一次裁定的来源，
+      //      撤销与否决都留在 registration_events 与审计日志里，不靠覆盖字段抹历史。）
+      updateRegistrationRow(db, appeal.subject_id, {
+        level_final: null,
+        status: 'submitted',
+      });
+      // 事件轨迹（追加式，历史不覆盖）：from_status = 申诉前的状态，to_status = 回到待复核。
+      insertRegistrationEvent(db, {
+        registrationId: appeal.subject_id,
+        fromStatus,
+        toStatus: 'submitted',
+        actorId: decidedBy,
+        reason: note,
+        now,
+      });
+    } else {
+      const { stageId } = parseAppealSubject(appeal.subject_id);
+      if (stageId) {
+        transitions.push(transition({
+          db, subjectType: 'stage_result', subjectId: stageId,
+          from: 'FINALIZED', to: 'REJECTED', actorId: decidedBy,
+          reason: `申诉成立：${note}`, idempotencyKey: `appeal:${appealId}:revoke`, now,
+        }));
+        transitions.push(transition({
+          db, subjectType: 'stage_result', subjectId: stageId,
+          from: 'REJECTED', to: 'PENDING_REVIEW', actorId: decidedBy,
+          reason: `申诉重新复核：${note}`, idempotencyKey: `appeal:${appealId}:reopen`, now,
+        }));
+      }
     }
   }
 
@@ -5398,7 +5551,7 @@ export function decideAppeal({
     action: 'appeal.decided',
     entity: 'appeal',
     entityId: appealId,
-    detail: { decision, note, subjectType: appeal.subject_type, subjectId: appeal.subject_id, recomputeRequired: decision === 'accepted' },
+    detail: { decision, note, subjectType: appeal.subject_type, subjectId: appeal.subject_id, recomputeRequired },
     now,
   });
 
@@ -5406,7 +5559,7 @@ export function decideAppeal({
     appeal: getAppeal(db, appealId),
     transitions,
     // 申诉成立必须重算；重算走 revision + 1，旧 revision 保留（不覆盖历史）
-    recomputeRequired: decision === 'accepted',
+    recomputeRequired,
   };
 }
 

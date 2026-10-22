@@ -51,6 +51,45 @@ export function hasRoleCapability(db, userId, capability) {
 }
 
 /**
+ * 列出用户**持有的能力点键**（角色能力 ∪ 全局资源授权）。
+ *
+ * ⚠️ 为什么需要它（W1-b · DP-105）：
+ *    前端要按「能力点」拦路由（而不是按角色），就必须知道自己**持有哪些能力点** ——
+ *    授权模型是「能力 + 授权记录」，一个人可以**被直接授权**某个能力点而没有对应角色，
+ *    只看角色表会漏掉这种人。
+ *
+ * ⛔ **只取 scope_type = 'global' 的资源级授权**：
+ *    赛段级（stage / edition 等）授权**不算数** —— 前端只声明「API 同样要求**全局**能力点」
+ *    的页面（分区级），赛段级页面的可达性由 API 逐资源裁决。
+ *    把赛段级授权也算进来，会让前端「以为有权限」而 API 403，或反过来误伤。
+ *
+ * ⚠️ **去重与确定性排序**：UNION 天然去重；ORDER BY capability 用 SQLite 的
+ *    二进制序（不是 localeCompare）⇒ 同一份数据每次跑出来的顺序完全一样。
+ *
+ * @param {object} db
+ * @param {string} userId
+ * @returns {string[]} 能力点键数组（原始键，不做驼峰变换）
+ */
+export function listUserCapabilities(db, userId) {
+  return db
+    .prepare(
+      `SELECT capability FROM (
+         SELECT rc.capability AS capability
+           FROM user_roles ur
+           JOIN role_capabilities rc ON rc.role_id = ur.role_key
+          WHERE ur.user_id = ?
+         UNION
+         SELECT a.capability AS capability
+           FROM assignments a
+          WHERE a.user_id = ? AND a.scope_type = 'global'
+       )
+       ORDER BY capability`,
+    )
+    .all(userId, userId)
+    .map((r) => r.capability);
+}
+
+/**
  * 能力点是否已注册。
  * ⛔ 评审修正（Important）：授权前校验用 —— 不校验就是让 SQLite 的原始外键错误
  *    「FOREIGN KEY constraint failed」冒到 HTTP 层（只能回 500，且泄露表结构）。

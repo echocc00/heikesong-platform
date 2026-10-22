@@ -1078,6 +1078,13 @@ export function omit(obj, keys) {
 //   ✅ 破同分最后一级用【队伍编号（行 ID）】而不是时间戳：借 CTFd
 //      `utils/scores/__init__.py` 的 `ORDER BY score DESC, date ASC, id ASC` 双保险，
 //      官方注释理由是【不同数据库的时间精度不同】，只用时间字段排序不稳。
+//
+// 【告警文案分层 2026-10-23 —— 与 src/domain/scoring.js 同一套口径】
+//   { code, message, detail?, ...原有字段 }
+//   ⛔ 触发条件与口径没改，只改文案分层：
+//   ① `message` 只给人读 ⇒ 破同分键用**中文 label**（rules/tiebreak.json 的 label），
+//      label 缺失时**不许**退回英文 key（team_id / peer …），退成中性说法。
+//   ② `detail` 是内部明细（键的英文 key + 缺可比值的队伍 id）⇒ 只给 audit:read 的人看。
 import { cmpStr, toNumber } from './util.js';
 
 // 破同分链的键 → 候选队伍上的字段名（INTERFACES.md §4 的 teams 字段名）
@@ -1168,10 +1175,13 @@ export function applyTiebreakChain({ candidates, chain, data }) {
       if (group.length < 2 || !scopeActive) { next.push(group); continue; }
       const missing = group.filter((c) => readValue(c, item.key, data) === null);
       if (missing.length) {
+        const label = item.label || '未命名依据';
+        const missingIds = missing.map((c) => c.teamId);
         warnings.push({
           code: 'tiebreak_key_unusable',
-          message: `破同分键「${item.label || item.key}」在本组缺少可比较的值，本组不使用该键`,
-          teamIds: missing.map((c) => c.teamId),
+          message: `破同分键「${label}」在本组缺少可比较的值，本组不使用该键`,
+          detail: `破同分键 ${item.key}：以下队伍在本组没有可比较的值（${missingIds.join('、')}）`,
+          teamIds: missingIds,
         });
         next.push(group);
         continue;
@@ -2979,6 +2989,10 @@ Run: `cd platform && node --test test/visibility.test.js` → Expected: FAIL —
 //   + 冲突裁决 C-02（C 段及以上公示名次；D 段只给本人进度卡）
 //   ⛔ 可见性必须在 API 层过滤：前端隐藏 = 数据已经发到浏览器 = 任何人都能看到。
 //      前端只负责渲染，不承担过滤职责。
+//   ⛔ **告警的内部明细也是可见性问题**（DP-107）：`detail`（评委 id + 内部原因码 +
+//      队伍 id / 英文维度键）只给有 `audit:read` 的人看。裁剪放在**这个唯一入口**里，
+//      演示站（web/api.demo.js）与正式站（src/services/leaderboard.js）因此**自动同口径**
+//      —— 以前两处各写一份，演示站把内部明细泄给了匿名访客。
 import { omit } from './util.js';
 
 const DEFAULT_TIER_ORDER = ['D', 'C', 'B', 'A', 'S'];
@@ -2986,12 +3000,39 @@ const DEFAULT_TIER_ORDER = ['D', 'C', 'B', 'A', 'S'];
 const PEER_SOURCE_KEYS = ['peerSource', 'fromTeamId', 'fromUserId', 'peerFrom', 'peerScore'];
 // 企业名字段：段位公示时不公示（S10 §8）
 const ENTERPRISE_NAME_KEYS = ['enterpriseName', 'enterprise_name', 'enterpriseId', 'enterprise_id'];
+// 告警内部明细字段：只给有 audit:read 的人看（DP-107）
+const WARNING_INTERNAL_KEYS = ['detail', 'teamId', 'teamIds', 'dimension'];
+
+/**
+ * 告警可见性裁剪（纯函数，⛔ 必须在 API 层裁决 —— 「前端隐藏 = 数据已经发到浏览器」）。
+ *
+ * 口径：
+ *   - 有 `audit:read` 能力点 ⇒ 完整告警（含 `detail` 内部明细与内部标识）。
+ *   - 没有（匿名访客 / 普通参与者）⇒ 只保留**人话部分**：
+ *       `detail`（内部明细：评委 id + 原因码、队伍 id、原始片段）
+ *       `teamId` / `teamIds` / `dimension`（内部标识：队伍 id、英文维度键）
+ *     这三类字段前端**根本不渲染** ⇒ 不发出去。
+ *   - `code` **保留**（机器判据 / 审计要靠它定位），`message` 保留（人话正文）。
+ *
+ * ⚠️ 告警**一条都不许少**：裁剪的是字段，不是告警本身
+ *    （S-5 / C-05「降级必须显式展示，不静默」—— 降级不许藏）。
+ *
+ * @param warnings 告警数组
+ * @param canAudit 是否具备 audit:read 能力点（默认 false = fail-closed）
+ */
+export function applyWarningVisibility(warnings, { canAudit = false } = {}) {
+  const list = Array.isArray(warnings) ? warnings : [];
+  if (canAudit === true) return list;
+  return list.map((w) => omit(w ?? {}, WARNING_INTERNAL_KEYS));
+}
 
 /**
  * @param payload    { scope, rows: [...] }
  * @param viewer     当前查看者（可为 null = 未登录 / 旁观）
  * @param visibilityConfig rules.visibility
- * @param context    { scope, viewerTeamIds?, viewerTeamId?, tierOrder? }
+ * @param context    { scope, viewerTeamIds?, viewerTeamId?, tierOrder?, canAudit? }
+ *                  canAudit = 是否具备 `audit:read` 能力点（决定告警内部明细可见与否，
+ *                  缺省 false = fail-closed，与本文件「默认关」的取向一致）
  */
 export function applyVisibility({ payload, viewer, visibilityConfig, context }) {
   const cfg = visibilityConfig || {};
@@ -3056,6 +3097,13 @@ export function applyVisibility({ payload, viewer, visibilityConfig, context }) 
   }
 
   out.rows = rows;
+
+  // ⛔ 告警的内部明细同属「可见性」⇒ 也在这个**唯一入口**里裁掉（DP-107）。
+  //    口径与 src/services/leaderboard.js 的旧口径逐字一致：无 audit:read ⇒ 只留 code + message。
+  //    ⚠️ 告警一条都不许少（S-5 / C-05）：裁的是字段，不是告警本身。
+  if (Array.isArray(payload?.warnings)) {
+    out.warnings = applyWarningVisibility(payload.warnings, { canAudit: ctx.canAudit === true });
+  }
   return out;
 }
 ```
@@ -3995,6 +4043,11 @@ export function revokeSignoff(db, { id, revokedAt }) {
 //   ⛔ 双榜并列不合成一个总分：A 榜（名次/奖金/MVP）与 B 榜（商业战绩/完赛/资源解锁）
 //      走两条不同的表、两条不同的计算路径，任何一条都不读另一条的分数字段。
 //   ⛔ 可见性在 API 层过滤：本模块【读】原始 payload，【写】快照；对外一律走 applyVisibility。
+//   ⛔ 告警的内部明细同理在 API 层裁剪（applyWarningVisibility，在 applyVisibility 内执行）：
+//      公开端点（滚动总榜 / 赛段榜）只有拿到 `audit:read` 的人才能看到 `detail` 与
+//      队伍 id / 英文维度键 —— 前端不判断权限。
+//      ⚠️ 裁剪口径放在**领域层唯一入口**（src/domain/visibility.js），演示站与正式站
+//         复用同一份 ⇒ 不可能再漂（以前两处各写一份，演示站把内部明细泄给了匿名访客）。
 import { randomUUID } from 'node:crypto';
 import { AppError } from '../errors.js';
 import { can } from '../auth/permissions.js';
@@ -4190,6 +4243,16 @@ const buildPayload = ({ db, stage, scope, rules: R }) => (scope === 'rank'
   ? buildRankPayload({ db, stage, R })
   : scope === 'business' ? buildBusinessPayload({ db, stage }) : buildPersonalPayload({ db, stage, R }));
 
+/**
+ * 告警可见性裁剪的**能力判定**：有 `audit:read` 才能看内部明细。
+ * ⛔ 真正的裁剪在领域层唯一入口（src/domain/visibility.js 的 applyWarningVisibility，
+ *    由 applyVisibility 内部调用）—— 本函数只回答「这个人有没有审计权限」。
+ * ⚠️ `can(null, ...)` 安全返回 false（见 src/auth/permissions.js）⇒ 匿名访客自动落到「无权限」。
+ */
+function canAuditWarnings({ db, viewer }) {
+  return viewer ? can(viewer, 'audit:read', null, db) : false;
+}
+
 /** 对外读接口：先算原始 payload，再在 API 层过滤 */
 export function getLeaderboard({ db, stageId, scope = 'rank', viewer = null, rules = null }) {
   const R = rules || getDefaultRules();
@@ -4202,7 +4265,7 @@ export function getLeaderboard({ db, stageId, scope = 'rank', viewer = null, rul
   if (scope === 'business' && R.visibility?.business?.milestoneProgressPublic === false) {
     throw new AppError(403, 'LEADERBOARD_DISABLED', '该赛段 B 榜已关闭');
   }
-  return applyVisibility({
+  const out = applyVisibility({
     payload: buildPayload({ db, stage, scope, rules: R }),
     viewer,
     visibilityConfig: R.visibility,
@@ -4210,8 +4273,11 @@ export function getLeaderboard({ db, stageId, scope = 'rank', viewer = null, rul
       scope,
       viewerTeamIds: repo.listTeamIdsByUser(db, viewer?.id),
       tierOrder: (R.ranks?.tiers || []).map((t) => t.key),
+      // ⛔ 告警的内部明细也要在 API 层裁剪（公开端点任何人可看）
+      canAudit: canAuditWarnings({ db, viewer }),
     },
   });
+  return out;
 }
 
 /** 滚动总榜：全程公开（任务书 §七 明文） */
@@ -4251,7 +4317,7 @@ export function getRollingLeaderboard({ db, editionId, viewer = null, rules = nu
     .map((r) => ({ ...r, tier: tiers[r.teamId] ?? 'D' }))
     .sort((a, b) => b.points - a.points || (a.bestRank ?? 99) - (b.bestRank ?? 99) || cmpStr(a.teamId, b.teamId));
 
-  return applyVisibility({
+  const out = applyVisibility({
     payload: {
       scope: 'rolling', editionId, rows, warnings,
       stages: stages.map((s) => ({ id: s.id, key: s.key, name: s.name })),
@@ -4262,8 +4328,11 @@ export function getRollingLeaderboard({ db, editionId, viewer = null, rules = nu
       scope: 'rank',   // 滚动总榜与 A 榜同口径：全员公开
       viewerTeamIds: repo.listTeamIdsByUser(db, viewer?.id),
       tierOrder: (R.ranks?.tiers || []).map((t) => t.key),
+      // ⛔ 滚动总榜是**公开端点**（任何人可看）⇒ 告警的内部明细必须在这里裁掉
+      canAudit: canAuditWarnings({ db, viewer }),
     },
   });
+  return out;
 }
 
 /** 发榜：显式动作。写快照 + 审计日志 + 积分流水（追加式 + 幂等）。 */
@@ -4932,13 +5001,15 @@ Run: `cd platform && node --test test/leaderboard-web.test.js` → Expected: FAI
 // ⛔ 降级告警置顶：P2 计算出的 warnings 显式展示在最上方，不静默（S-5 / C-05）。
 //    ⚠️ **位置是硬契约**：测试断言「告警的字符索引 < 队名的字符索引」，
 //        所以告警块必须排在整页最前（页头之前），不能塞到表格下面。
+// ⛔ 告警正文不许出现内部工作语言：英文维度键 / 队伍 id / 评委 id / 内部原因码
+//    一律由后端分层（message = 人话，detail = 内部明细），前端只渲染。
 // ⚠️ 口径切换靠 URL（?scope=）而不是前端状态机 —— 刷新 / 分享链接都停在同一屏。
 // ⚠️ 转义统一走 `web/escape.js`（P0 建立，全站唯一入口）——
 //    这里**不重复定义** escapeHtml：三个视图各写一份会漂移，且漏改一处就是一处 XSS。
 import { escapeHtml } from '../escape.js';
 import { milestoneMark } from '../icons.js';
 import {
-  barRow, emptyState, errorState, loadingState, noticeState, pageHead,
+  barRow, emptyState, errorState, loadingState, pageHead,
   rankBadge, sectionTitle, statRow, tableWrap, tabs,
 } from '../ui.js';
 // ⚠️ 段位徽章的映射住在 ./tier.js（段位语义的归属地），这里只取用不重复定义。
@@ -4984,21 +5055,40 @@ const SCOPES = {
  * 降级告警（置顶）。
  * ⚠️ 滚动总榜的告警来自【多个赛段】，必须标出是哪一段降级了（否则读者不知道该查哪段）。
  *    赛段榜 / B 榜 / 个人榜的告警没有 stageName → 不渲染这一段。
+ *
+ * 【文案分层 2026-10-23 —— 内部工作语言不许出现在公开页正文】
+ *   ⛔ 原来把 `[code]`（normalization_fallback / R2_missing_dual_signature 这种
+ *      内部审计键）当正文前缀直接打出来 ⇒ 每个访客都看得见内部规则键。
+ *      现在：**人话 message 为主体**，code 降级成**小号等宽标签**跟在后面
+ *      （`.warn__code`，title 属性做 tooltip），`detail`（内部明细）单独一行
+ *      （`.warn__detail`，更弱的颜色）。
+ *   ⚠️ 可见性在 API 层裁决：`detail` 有没有、是什么，由后端按 `audit:read` 决定
+ *      （领域层唯一入口 src/domain/visibility.js 的 applyWarningVisibility，
+ *      由 applyVisibility 内部调用；正式站与演示站共用同一份）⇒ 前端只「有就显示」，不自己判断。
+ *   ⚠️ **位置是硬契约**：告警块仍然置顶（S-5 / C-05；测试断言「告警的字符索引 < 队名的字符索引」）。
+ *   ⚠️ 这一段不直接用 ui.js 的 noticeState()：它的 items 是**纯文本**（统一 escapeHtml），
+ *      渲染不出「正文 + 代码标签 + 明细行」的三段结构；这里自己拼这段结构，
+ *      但沿用 notice 的 class 契约（notice / notice--warn / notice__title / notice__list）。
  */
 function warningsHtml(warnings) {
   const list = Array.isArray(warnings) ? warnings : [];
   if (!list.length) return '';
   const items = list.map((w) => {
-    const stage = w?.stageName ? `【${w.stageName}】` : '';
-    const code = w?.code ? `[${w.code}] ` : '';
-    return `${stage}${code}${w?.message ?? ''}`;
+    const stage = w?.stageName ? `【${escapeHtml(w.stageName)}】` : '';
+    const msg = escapeHtml(w?.message ?? '');
+    const code = w?.code
+      ? `<span class="warn__code" title="内部规则键：${escapeHtml(w.code)}">${escapeHtml(w.code)}</span>`
+      : '';
+    const detail = w?.detail
+      ? `<div class="warn__detail">${escapeHtml(String(w.detail))}</div>`
+      : '';
+    return `<li class="warn__item">${stage}${msg}${code ? ` ${code}` : ''}${detail}</li>`;
   });
-  return noticeState({
-    tone: 'warn',
-    title: `本轮降级提示（${list.length}）—— 以下维度未按标准口径计算`,
-    items,
-    list: true,
-  });
+  const title = `本轮降级提示（${list.length}）—— 以下维度未按标准口径计算`;
+  return `<div class="notice notice--warn" role="alert">`
+    + `<p class="notice__title">${escapeHtml(title)}</p>`
+    + `<ul class="notice__list">${items.join('')}</ul>`
+    + `</div>`;
 }
 
 /** 页头（标题 + 副标题 + 跨页入口）。 */

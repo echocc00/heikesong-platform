@@ -3,6 +3,11 @@
 //   ⛔ 双榜并列不合成一个总分：A 榜（名次/奖金/MVP）与 B 榜（商业战绩/完赛/资源解锁）
 //      走两条不同的表、两条不同的计算路径，任何一条都不读另一条的分数字段。
 //   ⛔ 可见性在 API 层过滤：本模块【读】原始 payload，【写】快照；对外一律走 applyVisibility。
+//   ⛔ 告警的内部明细同理在 API 层裁剪（applyWarningVisibility，在 applyVisibility 内执行）：
+//      公开端点（滚动总榜 / 赛段榜）只有拿到 `audit:read` 的人才能看到 `detail` 与
+//      队伍 id / 英文维度键 —— 前端不判断权限。
+//      ⚠️ 裁剪口径放在**领域层唯一入口**（src/domain/visibility.js），演示站与正式站
+//         复用同一份 ⇒ 不可能再漂（以前两处各写一份，演示站把内部明细泄给了匿名访客）。
 import { randomUUID } from 'node:crypto';
 import { AppError } from '../errors.js';
 import { can } from '../auth/permissions.js';
@@ -198,6 +203,16 @@ const buildPayload = ({ db, stage, scope, rules: R }) => (scope === 'rank'
   ? buildRankPayload({ db, stage, R })
   : scope === 'business' ? buildBusinessPayload({ db, stage }) : buildPersonalPayload({ db, stage, R }));
 
+/**
+ * 告警可见性裁剪的**能力判定**：有 `audit:read` 才能看内部明细。
+ * ⛔ 真正的裁剪在领域层唯一入口（src/domain/visibility.js 的 applyWarningVisibility，
+ *    由 applyVisibility 内部调用）—— 本函数只回答「这个人有没有审计权限」。
+ * ⚠️ `can(null, ...)` 安全返回 false（见 src/auth/permissions.js）⇒ 匿名访客自动落到「无权限」。
+ */
+function canAuditWarnings({ db, viewer }) {
+  return viewer ? can(viewer, 'audit:read', null, db) : false;
+}
+
 /** 对外读接口：先算原始 payload，再在 API 层过滤 */
 export function getLeaderboard({ db, stageId, scope = 'rank', viewer = null, rules = null }) {
   const R = rules || getDefaultRules();
@@ -210,7 +225,7 @@ export function getLeaderboard({ db, stageId, scope = 'rank', viewer = null, rul
   if (scope === 'business' && R.visibility?.business?.milestoneProgressPublic === false) {
     throw new AppError(403, 'LEADERBOARD_DISABLED', '该赛段 B 榜已关闭');
   }
-  return applyVisibility({
+  const out = applyVisibility({
     payload: buildPayload({ db, stage, scope, rules: R }),
     viewer,
     visibilityConfig: R.visibility,
@@ -218,8 +233,11 @@ export function getLeaderboard({ db, stageId, scope = 'rank', viewer = null, rul
       scope,
       viewerTeamIds: repo.listTeamIdsByUser(db, viewer?.id),
       tierOrder: (R.ranks?.tiers || []).map((t) => t.key),
+      // ⛔ 告警的内部明细也要在 API 层裁剪（公开端点任何人可看）
+      canAudit: canAuditWarnings({ db, viewer }),
     },
   });
+  return out;
 }
 
 /** 滚动总榜：全程公开（任务书 §七 明文） */
@@ -259,7 +277,7 @@ export function getRollingLeaderboard({ db, editionId, viewer = null, rules = nu
     .map((r) => ({ ...r, tier: tiers[r.teamId] ?? 'D' }))
     .sort((a, b) => b.points - a.points || (a.bestRank ?? 99) - (b.bestRank ?? 99) || cmpStr(a.teamId, b.teamId));
 
-  return applyVisibility({
+  const out = applyVisibility({
     payload: {
       scope: 'rolling', editionId, rows, warnings,
       stages: stages.map((s) => ({ id: s.id, key: s.key, name: s.name })),
@@ -270,8 +288,11 @@ export function getRollingLeaderboard({ db, editionId, viewer = null, rules = nu
       scope: 'rank',   // 滚动总榜与 A 榜同口径：全员公开
       viewerTeamIds: repo.listTeamIdsByUser(db, viewer?.id),
       tierOrder: (R.ranks?.tiers || []).map((t) => t.key),
+      // ⛔ 滚动总榜是**公开端点**（任何人可看）⇒ 告警的内部明细必须在这里裁掉
+      canAudit: canAuditWarnings({ db, viewer }),
     },
   });
+  return out;
 }
 
 /** 发榜：显式动作。写快照 + 审计日志 + 积分流水（追加式 + 幂等）。 */

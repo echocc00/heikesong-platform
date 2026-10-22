@@ -10,6 +10,15 @@
 //
 // 纯函数：无 IO、无 Date.now()、无 Math.random()。
 //
+// 【告警文案分层 2026-10-23 —— 与 src/domain/scoring.js 同一套口径】
+//   { code, message, detail?, ...原有字段 }
+//   ⛔ **触发条件与口径没改**，只改文案分层：
+//   ① `message` 只给人读（禁止英文维度键 / 队伍 id / 评委 id / 内部原因码）。
+//      本文件的告警正文本来就是人话（R1–R4 / R-JDG-14 的中文说法）⇒ **保持不变**。
+//   ② `detail` 是内部明细（队伍 id）⇒ 只给有 `audit:read` 的人看，
+//      由 API 层（src/services/leaderboard.js）裁剪。
+//   ③ `code` 保留（审计与机器判据要用）。
+//
 // 【父代理预审修正 2026-10-21 —— 本文件有 8 处修正，读代码前先看这段】
 //   ① **R-JDG-14「签字必须有内容」零校验**：content 为空/纯空白的确认照样计入分数。
 //      领域层会被 `computeStage` 从库里读数据时调用 —— 服务层的写入口校验挡不住
@@ -141,6 +150,7 @@ export function applyEnterpriseRules({ confirmations = [], teams = [], judges = 
         message: valid.length
           ? '有非本赛道企业的有效确认（已忽略，不影响本赛道企业的签字）'
           : '企业席评了非本企业题目，该队「企业确认」权重降为 0',
+        detail: `队伍 ${team.teamId}`,
         teamId: team.teamId,
       });
     }
@@ -151,6 +161,7 @@ export function applyEnterpriseRules({ confirmations = [], teams = [], judges = 
       warnings.push({
         code: 'R2_missing_dual_signature',
         message: '企业确认缺双签（出题企业签字 / 跨领域评委签字），该项按 0 分计',
+        detail: `队伍 ${team.teamId}`,
         teamId: team.teamId,
       });
     } else if (hasReason('content')) {
@@ -159,6 +170,7 @@ export function applyEnterpriseRules({ confirmations = [], teams = [], judges = 
       warnings.push({
         code: 'R_JDG14_missing_content',
         message: '企业确认缺签字内容（R-JDG-14 要求写明解决哪个环节 / 落地时间 / 我方角色），该项按 0 分计',
+        detail: `队伍 ${team.teamId}（规则 R-JDG-14：签字必须有内容）`,
         teamId: team.teamId,
       });
     } else if (hasReason('score_range')) {
@@ -167,6 +179,7 @@ export function applyEnterpriseRules({ confirmations = [], teams = [], judges = 
       warnings.push({
         code: 'enterprise_score_out_of_range',
         message: '企业确认分不在 0–100 区间，该项按 0 分计',
+        detail: `队伍 ${team.teamId}`,
         teamId: team.teamId,
       });
     } else if (valid.length) {
@@ -176,6 +189,7 @@ export function applyEnterpriseRules({ confirmations = [], teams = [], judges = 
       warnings.push({
         code: 'no_enterprise_confirmation',
         message: '该队没有有效的企业确认记录，企业席按 0 分计',
+        detail: `队伍 ${team.teamId}`,
         teamId: team.teamId,
       });
     }
@@ -193,6 +207,7 @@ export function applyEnterpriseRules({ confirmations = [], teams = [], judges = 
       warnings.push({
         code: 'R4_free_brief_judge_scored',
         message: '自由命题组无企业签字，「企业确认」项改由评委按需求真实性的公开证据打分',
+        detail: `队伍 ${team.teamId}`,
         teamId: team.teamId,
       });
     }
@@ -207,6 +222,7 @@ export function applyEnterpriseRules({ confirmations = [], teams = [], judges = 
         warnings.push({
           code: 'R3_enterprise_weight_capped',
           message: `企业席合计权重 ${wE} 超过上限 ${wEnterprise}，已封顶`,
+          detail: `队伍 ${team.teamId}：企业席合计权重 ${wE}，封顶后为 ${wEnterprise}`,
           teamId: team.teamId,
         });
       }

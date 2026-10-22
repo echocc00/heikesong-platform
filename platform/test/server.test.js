@@ -705,11 +705,14 @@ test('登录响应体必须带回当前用户，且不得含 password_hash（复
   //    真假判断在 JS 里是**真的**（`1` 与 `0` 都是 truthy）→ 停用用户会被当成超管。
   assert.deepEqual(
     Object.keys(body.user).sort(),
-    ['active', 'createdAt', 'id', 'isSuperadmin', 'mbaStatus', 'name', 'org', 'phone', 'roles'],
+    ['active', 'capabilities', 'createdAt', 'id', 'isSuperadmin', 'mbaStatus', 'name', 'org', 'phone', 'roles'],
     `登录响应的 user 键集合必须精确等于 toPublicUser 的对外形状，实际 ${JSON.stringify(Object.keys(body.user))}`
-    + '｜⚠️ P7 新增 roles：前端按角色分区导航必须要它（角色键列表，非敏感字段）。',
+    + '｜⚠️ P7 新增 roles：前端按角色分区导航必须要它（角色键列表，非敏感字段）。'
+    + '｜⚠️ W1-b（DP-105）新增 capabilities：前端按能力点拦分区级路由必须要它'
+    + '（能力点键列表，非敏感字段；只作提示，不是授权依据）。',
   );
   assert.ok(Array.isArray(body.user.roles), 'roles 必须是数组（前端按数组读）');
+  assert.ok(Array.isArray(body.user.capabilities), 'capabilities 必须是数组（前端按数组读）');
   assert.equal(typeof body.user.active, 'boolean', 'active 必须是布尔（数字 0/1 都是 truthy）');
   assert.equal(typeof body.user.isSuperadmin, 'boolean', 'isSuperadmin 必须是布尔');
   assert.equal(body.user.active, true);

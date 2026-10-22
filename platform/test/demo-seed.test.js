@@ -231,7 +231,11 @@ test('追加·归一化降级真的发生（告警指向期望的维度与评委
   const judge = seed.expectations.unnormalizedJudge;
   const hit = out.warnings.find((w) => w.code === 'normalization_fallback' && w.dimension === dim);
   assert.ok(hit, `必须出现维度 ${dim} 的归一化降级告警，实际告警：${JSON.stringify(out.warnings.map((w) => w.code))}`);
-  assert.ok(String(hit.message).includes(judge), `告警必须点名评委 ${judge}：${hit.message}`);
+  // ⚠️ 文案分层（2026-10-23）：告警分两层 —— message 只给人读，detail 是内部明细。
+  //    评委 id 属于内部标识 ⇒ 点名评委的职责挪到 detail（只给 audit:read 的人看），
+  //    正文里不许再出现（公开榜单页会把正文原样摊给每一个访客）。
+  assert.ok(String(hit.detail ?? '').includes(judge), `告警的内部明细必须点名评委 ${judge}：${hit.detail}`);
+  assert.ok(!String(hit.message).includes(judge), `评委 id 不该出现在公开正文里：${hit.message}`);
   const agg = out.trace.normalization[dim];
   assert.equal(agg.normalized, false, '该维度的归一化状态必须是「已降级」');
   assert.ok(agg.judgeSampleSizes[judge] < rules.scoring.final.minSamplesForJudgeNormalization,

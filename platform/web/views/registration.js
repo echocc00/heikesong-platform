@@ -13,7 +13,14 @@
 //   ④ 顶部加「答题进度」指标卡，提交前就知道还差几题；
 //   ⑤ 提交成功展示分级结果（等级 + 总分 + 逐维可解释明细），失败给**说清楚原因**的错误提示。
 //
-// ⛔ buildQuestionnaire / formatExplain 是纯函数，不得触碰 document（便于 node:test 直接测）
+// 本轮（P10 · W4-c）「申诉提交（选手侧）」的改动要点：
+//   ⑥ 报名**不接收**时，结果区多一个「提交申诉」入口（R-REG-08）——
+//      此前这句话只写在提示条里，**全站没有任何可点的申诉按钮**，
+//      选手被告知可以做一件做不到的事；
+//   ⑦ 申诉理由**必填**（服务端 fileAppeal 会拒收空理由），提交后就地反馈（成功 / 失败 + 重试）；
+//   ⑧ 已接收的选手**看不到**这个入口（没有可申诉的东西，给了就是死路）。
+//
+// ⛔ buildQuestionnaire / formatExplain / buildResultHtml 是纯函数，不得触碰 document（便于 node:test 直接测）
 import { escapeHtml } from '../escape.js';
 import {
   emptyState, errorState, kvList, loadingState, noticeState, pageHead, panel,
@@ -138,6 +145,178 @@ export function explainPairs(lines) {
     const value = e.text.startsWith(prefix) ? e.text.slice(prefix.length) : e.text;
     return [e.label, value];
   });
+}
+
+// ── 申诉（R-REG-08 · 选手侧）───────────────────────────────────────────────
+//
+// ⚠️ **端点契约一律以源码为准**（src/http/routes/audit.js + src/services/review-state.js）：
+//   POST /api/appeals  body = { subjectType, subjectId, reason }
+//     · reason **必填**：服务端 fileAppeal 对空理由抛 400「申诉必须写理由（空理由 = 无法复核）」；
+//     · 需要 appeal:write 能力点（seed 里给了 captain / admin）；
+//     · 限频：5 秒提交锁 + 60 秒 3 次滑动窗（触发即 429 + Retry-After）。
+//   ⇒ 前端**先本地校验空理由**，不发无谓请求；失败必须说清「下一步怎么办」。
+
+/** 申诉理由长度上限（与输入框 maxlength 一致）。 */
+export const APPEAL_REASON_MAX = 1000;
+
+/**
+ * 申诉入口的出现条件（R-REG-08）：报名**不接收**时才给。
+ * ⚠️ 判定口径与结果区的 accepted **逐字一致**（grading.accepted === true 即接收），
+ *    两处各判各的会出现「文案说不接收、却没有申诉入口」。
+ * ⛔ 没有报名记录 ⇒ 不给入口（没有可申诉的对象）。
+ */
+export function isAppealable(reg) {
+  if (!reg) return false;
+  return reg.grading?.accepted !== true;
+}
+
+/**
+ * 申诉理由校验（纯函数）：空理由**不得提交**（服务端也会拒收）。
+ * @returns {{ok: boolean, reason?: string, message?: string}}
+ */
+export function validateAppealReason(reason) {
+  const text = String(reason ?? '').trim();
+  if (!text) return { ok: false, message: '申诉理由必填：空理由的申诉无法复核。' };
+  if (text.length > APPEAL_REASON_MAX) {
+    return { ok: false, message: `申诉理由最多 ${APPEAL_REASON_MAX} 字。` };
+  }
+  return { ok: true, reason: text };
+}
+
+/**
+ * 申诉表单（纯函数）：标题 + 理由输入 + 提交按钮 + 反馈区。
+ * ⚠️ 表单里的 id 是**契约**（#reg-appeal-reason / #reg-appeal-error /
+ *    #reg-appeal-submit / #reg-appeal-feedback）—— 视图与测试都按它取节点。
+ */
+export function buildAppealForm() {
+  return panel({
+    title: '提交申诉（R-REG-08）',
+    desc: '本级不接收：把理由交给组委会复核。理由必填 —— 空理由的申诉无法复核。',
+    body: `
+        <div class="field field--required">
+          <label class="field__label" for="reg-appeal-reason">申诉理由</label>
+          <textarea class="textarea" id="reg-appeal-reason" maxlength="${APPEAL_REASON_MAX}"
+            placeholder="说明你为什么认为自己应当被接收（必填）"></textarea>
+          <p class="field__hint">最多 ${APPEAL_REASON_MAX} 字。组委会会逐条给结论并写明理由。</p>
+          <p class="field__error" id="reg-appeal-error" hidden></p>
+        </div>
+        <div class="btn-group">
+          <button type="button" class="btn btn--primary" id="reg-appeal-submit">提交申诉</button>
+        </div>
+        <div id="reg-appeal-feedback" class="stack"></div>`,
+  });
+}
+
+/**
+ * 挂载申诉表单并绑定提交（渲染与事件绑定分离）。
+ *
+ * ⚠️ 为什么**就地反馈**而不是刷新页面：刷新会冲掉选手已经写好的理由，
+ *    而且「提交成功/失败」必须一眼可见（点了没反应 = 事故）。
+ *
+ * @param {object} o
+ * @param {HTMLElement} o.container 挂载容器（结果区里的 #reg-appeal）
+ * @param {object} o.reg            报名记录（取 id 当申诉对象）
+ * @param {object} o.api            API 客户端
+ */
+export function mountAppealForm({ container, reg, api }) {
+  if (!container) return null;
+  container.innerHTML = buildAppealForm();
+  const btn = container.querySelector('#reg-appeal-submit');
+  const reasonBox = container.querySelector('#reg-appeal-reason');
+  const errBox = container.querySelector('#reg-appeal-error');
+  const out = container.querySelector('#reg-appeal-feedback');
+
+  /** 提交申诉：空理由本地拦下；失败给**可点重试**；成功禁用表单（防重复提交）。 */
+  async function submitAppeal() {
+    const check = validateAppealReason(reasonBox?.value ?? '');
+    if (!check.ok) {
+      if (errBox) {
+        errBox.textContent = check.message;
+        errBox.hidden = false;
+      }
+      return;
+    }
+    if (errBox) {
+      errBox.textContent = '';
+      errBox.hidden = true;
+    }
+    if (out) out.innerHTML = '';
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = '提交中…';
+    }
+    try {
+      const res = await api.post('/api/appeals', {
+        subjectType: 'registration',
+        subjectId: reg?.id ?? '',
+        reason: check.reason,
+      });
+      if (out) {
+        out.innerHTML = noticeState({
+          tone: 'success',
+          title: '申诉已提交',
+          items: [
+            `申诉编号：${res?.id ?? '—'}。组委会会逐条给结论。`,
+            '裁决结果会留在报名记录的事件轨迹里，你可以随时回来看。',
+          ],
+        });
+      }
+      if (reasonBox) reasonBox.disabled = true;
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = '已提交';
+      }
+    } catch (e) {
+      if (out) {
+        out.innerHTML = errorState({
+          message: '申诉提交失败',
+          hint: '服务端返回：' + e.message
+            + '。可点「重试」再提交一次；若持续失败，请联系组委会在报名筛选台直接复核你的报名。',
+        });
+        out.querySelector('[data-action="retry"]')?.addEventListener('click', submitAppeal);
+      }
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = '提交申诉';
+      }
+    }
+  }
+
+  btn?.addEventListener('click', submitAppeal);
+  return container;
+}
+
+/**
+ * 结果区 HTML（纯函数）：分级结果 + 申诉入口。
+ * ⚠️ **申诉入口只在「不接收」时出现**（R-REG-08）——
+ *    已接收的选手没有可申诉的东西，给了入口就是给一条死路。
+ */
+export function buildResultHtml(reg, model, crit) {
+  const levelLabel = model.levels.find((l) => l.key === reg.level)?.label ?? reg.level;
+  const accepted = reg.grading?.accepted === true;
+  const lines = formatExplain(reg.grading?.explain, crit.scale);
+  return `
+        ${noticeState({
+          tone: accepted ? 'success' : 'warn',
+          title: `报名已提交：你被判为 ${reg.level} 级（${levelLabel}）`,
+          items: [accepted
+            ? '你已被接收，现在可以去组队了。'
+            : '本级不接收，可向组委会提交申诉（R-REG-08）。'],
+        })}
+        ${statRow([
+          { label: '总分', value: `${reg.grading?.score ?? 0} 分`, tone: 'brand' },
+          { label: '等级', value: `${reg.level}（${levelLabel}）` },
+          { label: '是否接收', value: accepted ? '已接收' : '不接收', tone: accepted ? 'success' : 'danger' },
+        ])}
+        ${panel({
+          title: '可解释明细',
+          desc: '每一维的均值、权重与加权值 —— 判分口径完全公开（R-REG-09）。',
+          body: kvList(explainPairs(lines)),
+        })}
+        ${accepted ? '' : '<div id="reg-appeal"></div>'}
+        <div class="btn-group">
+          <button type="button" class="btn btn--primary" id="go-team">去组队</button>
+        </div>`;
 }
 
 export function renderRegistration(ctx) {
@@ -319,34 +498,14 @@ export function renderRegistration(ctx) {
       }
     }
 
-    /** 提交成功：分级结果（等级 + 总分 + 逐维可解释明细）。 */
+    /** 提交成功：分级结果（等级 + 总分 + 逐维可解释明细）+ 申诉入口（不接收时才给）。 */
     function showResult(reg, model, crit) {
-      const levelLabel = model.levels.find((l) => l.key === reg.level)?.label ?? reg.level;
-      const accepted = reg.grading?.accepted === true;
-      const lines = formatExplain(reg.grading?.explain, crit.scale);
       const feedback = form.querySelector('#reg-feedback');
-      feedback.innerHTML = `
-        ${noticeState({
-          tone: accepted ? 'success' : 'warn',
-          title: `报名已提交：你被判为 ${reg.level} 级（${levelLabel}）`,
-          items: [accepted
-            ? '你已被接收，现在可以去组队了。'
-            : '本级不接收，可向组委会提交申诉（R-REG-08）。'],
-        })}
-        ${statRow([
-          { label: '总分', value: `${reg.grading?.score ?? 0} 分`, tone: 'brand' },
-          { label: '等级', value: `${reg.level}（${levelLabel}）` },
-          { label: '是否接收', value: accepted ? '已接收' : '不接收', tone: accepted ? 'success' : 'danger' },
-        ])}
-        ${panel({
-          title: '可解释明细',
-          desc: '每一维的均值、权重与加权值 —— 判分口径完全公开（R-REG-09）。',
-          body: kvList(explainPairs(lines)),
-        })}
-        <div class="btn-group">
-          <button type="button" class="btn btn--primary" id="go-team">去组队</button>
-        </div>`;
+      feedback.innerHTML = buildResultHtml(reg, model, crit);
       feedback.querySelector('#go-team')?.addEventListener('click', () => navigate('/team'));
+      // ⚠️ 申诉入口**只在不接收时**出现（R-REG-08）：容器由 buildResultHtml 一并给出。
+      const appealBox = feedback.querySelector('#reg-appeal');
+      if (appealBox) mountAppealForm({ container: appealBox, reg, api });
     }
 
     body.replaceChildren(form);

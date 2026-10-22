@@ -23,8 +23,15 @@ import { appError } from '../../errors.js';
  *    ⚠️ roles 只用于**导航入口分区**，**不构成任何授权依据** ——
  *    可见性始终由 can() + scopeClause 在服务端裁决（全局约束）。
  *    ⚠️ 默认空数组：缺省即「没有角色」，不能因为漏传就变成「有全部权限」。
+ *
+ * ⚠️ `capabilities`（W1-b · DP-105 新增）：前端要按**能力点**拦路由，
+ *    必须知道这个人持有哪些能力点（来源 listUserCapabilities）。
+ *    ⇒ 这里加第三个可选参数 capabilities（能力点**键**列表）。
+ *    ⚠️ capabilities 只用于前端**提示 / 分区级路由守卫**，
+ *    **不构成任何授权依据** —— 授权的唯一裁决者仍然是服务端 can() + scopeClause。
+ *    ⚠️ 默认空数组：缺省即「没有能力点」，不能因为漏传就变成「有全部权限」。
  */
-export function toPublicUser(row, roles = []) {
+export function toPublicUser(row, roles = [], capabilities = []) {
   if (!row) return null;
   return {
     id: row.id,
@@ -36,6 +43,9 @@ export function toPublicUser(row, roles = []) {
     active: row.active === 1,
     createdAt: row.created_at,
     roles: Array.isArray(roles) ? roles.filter((r) => typeof r === 'string' && r) : [],
+    capabilities: Array.isArray(capabilities)
+      ? [...new Set(capabilities.filter((c) => typeof c === 'string' && c))]
+      : [],
   };
 }
 

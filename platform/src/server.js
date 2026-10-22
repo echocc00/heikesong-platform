@@ -22,6 +22,7 @@ import { verifyPassword, hashPassword } from './auth/password.js';
 import { changePassword, logoutAllSessions } from './services/auth.js';
 import { getUserById, getCredentialsByPhone, toPublicUser } from './db/repo/users.js';
 import { listUserRoles } from './db/repo/roles.js';
+import { listUserCapabilities } from './db/repo/assignments.js';
 import { getStage, getStageJudge, listStageSummaries } from './db/repo/stages.js';
 import { listWorkflowSummaries } from './db/repo/workflows.js';
 import { appError, AppError } from './errors.js';
@@ -30,6 +31,7 @@ import { registerTaskPackageRoutes } from './http/routes/taskPackage.js';
 import { registerTeamRoutes } from './http/routes/team.js';
 import { registerReviewRoutes } from './http/routes/review.js';
 import { registerMilestoneRoutes } from './http/routes/milestone.js';
+import { registerSignoffRoutes } from './http/routes/signoff.js';
 import { registerBehaviorRoutes } from './http/routes/behavior.js';
 import { registerAuditRoutes } from './http/routes/audit.js';
 import { getLeaderboard, getRollingLeaderboard } from './services/leaderboard.js';
@@ -172,6 +174,9 @@ export function createApp({ db, rules, webDir }) {
   // P3 写入路由（企业里程碑签字 / 行为分事件）
   registerMilestoneRoutes(router);
   registerBehaviorRoutes(router);
+  // P10 · W4-b：企业签字台**读**端点（里程碑签字清单 + 企业双签待签清单）
+  // ⚠️ 可见性在服务层过滤（src/services/signoff-board.js）—— 前端只负责呈现。
+  registerSignoffRoutes(router);
   // 生产环境 Cookie 加 Secure；开发环境不加（http://127.0.0.1 会被浏览器拒收）
   //
   // ⚠️ COOKIE_SECURE 是**显式覆盖**（不设 = 跟随 NODE_ENV）：
@@ -228,7 +233,12 @@ export function createApp({ db, rules, webDir }) {
     // ⚠️ P7：带上**角色键**（roles）—— 前端要按角色分区导航（用户端 / 管理员端 / 组委会端），
     //    没有它前端只能做出「所有人看到同一个菜单」的水平导航。
     //    ⛔ roles 只用于导航入口分区，**不是授权依据**（授权仍由 can() 在服务端裁决）。
-    return { user: toPublicUser(user, listUserRoles(db, user.id)) };
+    // ⚠️ W1-b（DP-105）：再带上**能力点**（capabilities）—— 前端要按能力点拦分区级路由，
+    //    授权模型是「能力 + 授权记录」，只看角色会漏掉「被直接授权」的人。
+    //    ⛔ capabilities 同样**只是提示**，不是授权依据（服务端仍然是唯一裁决者）。
+    return {
+      user: toPublicUser(user, listUserRoles(db, user.id), listUserCapabilities(db, user.id)),
+    };
   });
 
   // ── P7：赛段时间线 / 工作流列表（给前端做选择器与入口页）────────────
@@ -277,7 +287,15 @@ export function createApp({ db, rules, webDir }) {
       status: 200,
       // ⚠️ P7：登录响应同样带 roles —— 否则登录后前端拿不到角色，
       //    导航要等下一次 /api/me 才分区（用户会看到「刚登录还是访客菜单」）。
-      body: { user: toPublicUser(getUserById(db, cred.id), listUserRoles(db, cred.id)) },
+      // ⚠️ W1-b（DP-105）：同样带 capabilities —— 否则登录后前端拿不到能力点，
+      //    登录完直接点组委会页面会被前端拦下（而服务端其实是放行的）。
+      body: {
+        user: toPublicUser(
+          getUserById(db, cred.id),
+          listUserRoles(db, cred.id),
+          listUserCapabilities(db, cred.id),
+        ),
+      },
       headers: { 'Set-Cookie': sessionCookie(token, maxAge, secureCookies) },
     };
   });

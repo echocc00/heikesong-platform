@@ -84,6 +84,7 @@ export function buildEventInfo(rules) {
   const behavior = r.behavior ?? {};
   const compliance = r.compliance ?? {};
   const visibility = r.visibility ?? {};
+  const solvability = r.solvability ?? {};
 
   return {
     /** 赛段表（脊）：起止是**相对日序**（月-日），由届期起始日落到日历。 */
@@ -177,6 +178,41 @@ export function buildEventInfo(rules) {
     /** 分层公开门槛：C 段及以上公开。 */
     visibility: {
       publicFromTier: str(visibility.rank?.publicFromTier),
+    },
+    /**
+     * 任务卡「六维可解性」评估规格（P10 · W4-a）。
+     * ⚠️ **为什么要进这个投影**：任务卡审批页要画「六维评估表」，
+     *    而服务端**没有**单独的规格端点 ⇒ 冷启动时（一张卡都没评估过）
+     *    前端拿不到维度清单，页面就画不出表。
+     *    ⛔ 生产部署默认**不挂** `/rules/`（只有 DEMO_MODE=1 才挂）⇒
+     *    「前端去站点里读 rules/solvability.json」这条路在生产是**断的**。
+     *    ⇒ 规格必须由**服务端**投影出去。
+     * ⛔ 逐字段白名单（与本文件同一纪律）：只给 key / 名称 / 权重 / 满分 / 档位 / 否决项，
+     *    **不给**配置里的内部备注、来源出处、配比容忍度等内部工作语言。
+     *    （任务包配比体检是组委会的事，不进公开投影。）
+     */
+    solvability: {
+      dimensions: arr(solvability.dimensions).map((d) => ({
+        key: str(d?.key),
+        label: str(d?.label),
+        weight: num(d?.weight),
+        max: num(d?.max),
+      })),
+      grades: arr(solvability.grades).map((g) => ({
+        key: str(g?.key),
+        minScore: num(g?.minScore),
+        maxScore: num(g?.maxScore),
+        commitment: str(g?.commitment),
+        agreement: str(g?.agreement),
+      })),
+      vetoes: arr(solvability.vetoes).map((v) => ({
+        key: str(v?.key),
+        label: str(v?.label),
+        // ⚠️ `auto` 只是**一个布尔标记**（这条否决项是不是由某一维的取值自动命中的），
+        //    不是判定逻辑本身（判定条件「维度 + 取值」**不投影**出去）——
+        //    投影判定条件等于把判定规则交给前端重算 ⇒ 不投影。
+        auto: v?.auto !== undefined && v?.auto !== null,
+      })),
     },
   };
 }

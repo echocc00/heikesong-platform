@@ -14,9 +14,11 @@
     { "id": "demo_member_3", "name": "演示组员丙", "mbaStatus": "other" }
   ],
   "taskPackages": [
-    { "id": "tp_retail", "title": "门店缺货预测与补货建议", "enterpriseId": "ent_demo_retail", "enterpriseName": "演示零售集团", "isFreeBrief": false, "grade": "A", "commitment": "试点承诺" },
-    { "id": "tp_manu", "title": "质检工单智能分派", "enterpriseId": "ent_demo_mfg", "enterpriseName": "演示制造集团", "isFreeBrief": false, "grade": "B", "commitment": "对标试点" },
-    { "id": "tp_free", "title": "自由命题 · 社区助餐排班", "enterpriseId": null, "enterpriseName": null, "isFreeBrief": true, "grade": null, "commitment": "无" }
+    { "id": "tp_retail", "title": "门店缺货预测与补货建议", "enterpriseId": "ent_demo_retail", "enterpriseName": "演示零售集团", "isFreeBrief": false, "grade": "A", "status": "published", "commitment": "试点承诺" },
+    { "id": "tp_manu", "title": "质检工单智能分派", "enterpriseId": "ent_demo_mfg", "enterpriseName": "演示制造集团", "isFreeBrief": false, "grade": "B", "status": "published", "commitment": "对标试点" },
+    { "id": "tp_free", "title": "自由命题 · 社区助餐排班", "enterpriseId": null, "enterpriseName": null, "isFreeBrief": true, "grade": null, "status": "published", "commitment": "无" },
+    { "id": "tp_demo_assess", "title": "演示待评估卡 · 门店客流预测", "enterpriseId": "ent_demo_retail", "enterpriseName": "演示零售集团", "isFreeBrief": false, "grade": null, "status": "submitted", "painPoint": "客流预测靠人工经验，节假日排班经常错配", "expectedDelivery": "可运行预测服务 + 一周回测报告", "acceptanceCriteria": "提供回测数据集，MAPE 低于历史基线 15%", "commitment": "" },
+    { "id": "tp_demo_sign", "title": "演示待签级卡 · 冷链温控告警", "enterpriseId": "ent_demo_mfg", "enterpriseName": "演示制造集团", "isFreeBrief": false, "grade": null, "status": "assessed", "solvabilityScore": 12, "solvabilityGrade": "A", "solvability": { "score": 12, "grade": "A", "vetoes": [], "computedGrade": "A", "assessedBy": "demo_admin", "assessedAt": "2026-10-20T09:00:00.000Z" }, "painPoint": "冷链运输温控告警滞后，货损难追溯", "expectedDelivery": "车载温控告警接入与货损归因看板", "acceptanceCriteria": "接入 3 台模拟车辆，告警延迟低于 2 分钟", "commitment": "" }
   ],
   "judges": [
     { "id": "j_lenient", "name": "评委甲（宽松）", "seat": "judge" },

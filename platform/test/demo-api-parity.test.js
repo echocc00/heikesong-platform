@@ -80,6 +80,66 @@ const VIEW_ENDPOINTS = [
     // ⚠️ **body 里没有 judgeId** —— 真实后端从**会话**取评委（P8 修正演示适配器时发现的形状不一致）
     body: { items: [{ teamId: 't_alpha', dimension: 'innovation', rawScore: 90 }] },
   },
+  // ── P10：四个新页面用到的端点 ────────────────────────────────────
+  // ⚠️ **P10 漏了一组**：企业签字台的两个读口（/api/signoffs/mine 与
+  //    /api/stages/:stageId/enterprise-confirmations）在演示适配器里**压根没实现**
+  //    ⇒ 公网演示站那页是两块错误卡片 ⇒ 正是「只做了展示、点不动」的形态。
+  //    ⇒ 下面这组端点全部进闸，以后新增页面漏端点会被**立刻**抓住。
+  { method: 'GET', path: '/api/teams' },
+  // 评委前置（回避 / 互评 / 自评 / 校准）
+  { method: 'GET', path: '/api/stages/stage_final/recusals' },
+  { method: 'POST', path: '/api/stages/stage_final/recusals', body: { reason: '演示回避' } },
+  { method: 'POST', path: '/api/stages/stage_final/peer-reviews', body: { items: [] } },
+  { method: 'POST', path: '/api/stages/stage_final/self-review', body: { items: [] } },
+  { method: 'POST', path: '/api/stages/stage_final/calibration', body: { items: [] } },
+  // 企业签字台（里程碑签字 + 企业双签）
+  { method: 'GET', path: '/api/signoffs/mine' },
+  { method: 'GET', path: '/api/stages/stage_final/enterprise-confirmations' },
+  {
+    method: 'POST',
+    path: '/api/milestones/ms_t_alpha_problem_confirmed/signoff',
+    body: { department: '业务部', content: '演示签字内容' },
+  },
+  {
+    method: 'POST',
+    path: '/api/milestones/ms_t_alpha_problem_confirmed/signoff/withdraw',
+    body: { signoffId: 'so_1' },
+  },
+  {
+    method: 'POST',
+    path: '/api/stages/stage_final/enterprise-confirmations',
+    body: {
+      teamId: 't_alpha',
+      dimension: 'enterprise',
+      rawScore: 80,
+      crossJudgeId: 'j_lenient',
+      content: '演示企业确认',
+    },
+  },
+  // 任务卡审批（六维评估 + 签级 / 退回）
+  { method: 'GET', path: '/api/task-packages' },
+  {
+    method: 'POST',
+    path: '/api/task-packages/tp_retail/solvability',
+    body: {
+      dimensions: [
+        { key: 'problem_real', score: 4 },
+        { key: 'data_ready', score: 4 },
+        { key: 'demoable', score: 4 },
+        { key: 'deliverable', score: 4 },
+        { key: 'acceptance', score: 4 },
+        { key: 'reward', score: 4 },
+      ],
+    },
+  },
+  { method: 'POST', path: '/api/task-packages/tp_retail/approve', body: { grade: 'A' } },
+  // 申诉裁决
+  { method: 'GET', path: '/api/appeals' },
+  {
+    method: 'POST',
+    path: '/api/appeals/ap_demo_1/decide',
+    body: { decision: 'accepted', note: '演示裁决' },
+  },
 ];
 
 test('演示适配器必须实现前端用到的**每一个**端点（缺一个 ⇒ 演示站那页就是 404）', async () => {

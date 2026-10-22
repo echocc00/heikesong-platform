@@ -7,6 +7,7 @@ import {
   createTaskPackage, getTaskPackage, listTaskPackagesByEdition, updateTaskPackage,
 } from '../db/repo/taskPackages.js';
 import { getEdition } from '../db/repo/editions.js';
+import { writeAuditLog } from '../audit/log.js';
 import { can } from '../auth/permissions.js';
 
 // ⚠️ 父代理预审修正（Important，状态机）：任务卡的生命周期是
@@ -146,7 +147,9 @@ export function assessSolvability({ db, taskPackageId, answers, actorId, now = n
   return presentTaskPackage(updated);
 }
 
-export function approveTaskPackage({ db, taskPackageId, grade, actorId, now = new Date().toISOString(), rules }) {
+export function approveTaskPackage({
+  db, taskPackageId, grade, reason = null, actorId, now = new Date().toISOString(), rules,
+}) {
   const config = rules.solvability;
   const row = getTaskPackage(db, taskPackageId);
   if (!row) throw new AppError(404, 'TASK_PACKAGE_NOT_FOUND', '任务包不存在');
@@ -154,6 +157,14 @@ export function approveTaskPackage({ db, taskPackageId, grade, actorId, now = ne
   let gradeCfg = config.grades.find((g) => g.key === grade);
   if (!gradeCfg) {
     throw new AppError(400, 'INVALID_GRADE', `等级必须是 ${config.grades.map((g) => g.key).join(' / ')}`);
+  }
+  // ⚠️ P10（W4-a）：**主动退回（D 级）必须写理由** ——
+  //    「退回了但没说为什么」= 企业拿到一张退回通知，却不知道该改什么
+  //    （R-ENT-08 的《问题可解性诊断报告》是产物，但退回理由是**给人看的话**，不是数据）。
+  //    ⛔ 只在**委员会自己选 D** 时强制：因一票否决被系统强制降到 D 的情形
+  //    已有诊断报告说明原因（命中了哪条否决项）⇒ 不在这里卡人。
+  if (grade === 'D' && (!reason || !String(reason).trim())) {
+    throw new AppError(400, 'RETURN_REASON_REQUIRED', '退回任务卡必须写明退回理由（企业要照着改）');
   }
 
   const meta = parseJson(row.meta_json, {}) ?? {};
@@ -207,10 +218,28 @@ export function approveTaskPackage({ db, taskPackageId, grade, actorId, now = ne
     //    现在签非 D 级时**清掉**旧报告：诊断报告只对 D 级成立。
     delete solvability.diagnosticReport;
   }
+  // ⚠️ P10：签级结论写进 meta（前端可见、可复盘）
+  solvability.decision = {
+    grade: finalGrade,
+    requestedGrade: grade,
+    reason: reason ? String(reason).trim() : null,
+    decidedBy: actorId,
+    decidedAt: now,
+  };
   meta.solvability = solvability;
   patch.meta_json = meta;
-
   const updated = updateTaskPackage(db, taskPackageId, patch);
+  // ⚠️ P10：签级结论**必须留痕**（可复盘）。
+  //    · meta.solvability.decision ⇒ 前端能看到「谁在什么时候签的、理由是什么」；
+  //    · 审计日志 ⇒ 与其它「改级会留痕」的动作同规格（可被复核队列检索）。
+  writeAuditLog(db, {
+    actorId,
+    action: 'task_package.approve',
+    entity: 'task_package',
+    entityId: taskPackageId,
+    detail: { grade: finalGrade, requestedGrade: grade, reason: reason ? String(reason).trim() : null },
+    now,
+  });
   return presentTaskPackage(updated);
 }
 

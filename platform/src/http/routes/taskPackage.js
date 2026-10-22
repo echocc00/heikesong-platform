@@ -48,6 +48,11 @@ export function registerTaskPackageRoutes({ router, db, rules }) {
     if (!can(user, 'task_package:approve', { scopeType: 'task_package', scopeId: params.id }, db)) {
       throw new AppError(403, 'FORBIDDEN', '没有分级签约的权限');
     }
-    return approveTaskPackage({ db, taskPackageId: params.id, grade: body?.grade, actorId: user.id, rules });
+    // ⚠️ P10（W4-a）：**退回理由**一并收（body.reason）——
+    //    主动签 D 级时理由必填（服务层校验），理由落进 meta 与审计日志。
+    return approveTaskPackage({
+      db, taskPackageId: params.id, grade: body?.grade, reason: body?.reason ?? null,
+      actorId: user.id, rules,
+    });
   });
 }

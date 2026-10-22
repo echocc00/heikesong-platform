@@ -128,7 +128,7 @@ test('D 级必须出《问题可解性诊断报告》，不得静默丢弃（R-E
     },
     actorId: enterprise.id, now: NOW, rules,
   });
-  const approved = approveTaskPackage({ db, taskPackageId: pkg.id, grade: 'D', actorId: enterprise.id, now: NOW, rules });
+  const approved = approveTaskPackage({ db, taskPackageId: pkg.id, grade: 'D', reason: '可解性不足：补齐数据授权与责任归属后重提', actorId: enterprise.id, now: NOW, rules });
   assert.equal(approved.grade, 'D');
   assert.equal(approved.status, 'returned');
   assert.equal(approved.commitment, '无');
@@ -139,8 +139,41 @@ test('D 级必须出《问题可解性诊断报告》，不得静默丢弃（R-E
   rmSync(dataDir, { recursive: true, force: true });
 });
 
-test('存在一票否决时不得签成 A 级（强制降到 D）', () => {
+test('P10：主动退回（D 级）必须写退回理由 —— 没说为什么，企业就不知道要改什么', () => {
   const { db, close, dataDir, rules, edition, enterprise } = setup();
+  const pkg = submitTaskPackage({
+    db, userId: enterprise.id, payload: { ...PAYLOAD, editionId: edition.id }, now: NOW, rules,
+  });
+  assessSolvability({
+    db, taskPackageId: pkg.id,
+    answers: {
+      problem_clarity: 0, data_access: 0, validation: 0,
+      decision_chain: 0, accountability: 0, precedent: 0,
+    },
+    actorId: enterprise.id, now: NOW, rules,
+  });
+  // ⛔ 缺理由 ⇒ 400（理由是**给人看的话**，不是数据）
+  assert.throws(
+    () => approveTaskPackage({ db, taskPackageId: pkg.id, grade: 'D', actorId: enterprise.id, now: NOW, rules }),
+    (err) => err.status === 400 && err.code === 'RETURN_REASON_REQUIRED',
+  );
+  assert.throws(
+    () => approveTaskPackage({ db, taskPackageId: pkg.id, grade: 'D', reason: '   ', actorId: enterprise.id, now: NOW, rules }),
+    (err) => err.status === 400 && err.code === 'RETURN_REASON_REQUIRED',
+  );
+  // 给了理由 ⇒ 通过，且理由**留痕**（meta 里能读到）
+  const ok = approveTaskPackage({
+    db, taskPackageId: pkg.id, grade: 'D', reason: '数据授权拿不到', actorId: enterprise.id, now: NOW, rules,
+  });
+  assert.equal(ok.status, 'returned');
+  assert.equal(ok.meta.solvability.decision.grade, 'D');
+  assert.equal(ok.meta.solvability.decision.reason, '数据授权拿不到');
+  assert.equal(ok.meta.solvability.decision.decidedBy, enterprise.id);
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('存在一票否决时不得签成 A 级（强制降到 D）', () => {  const { db, close, dataDir, rules, edition, enterprise } = setup();
   const pkg = submitTaskPackage({
     db, userId: enterprise.id, payload: { ...PAYLOAD, editionId: edition.id }, now: NOW, rules,
   });
@@ -228,7 +261,7 @@ test('D 级诊断报告必须带上分数（不能恒为 null）', () => {
     },
     actorId: enterprise.id, now: NOW, rules,
   });
-  const approved = approveTaskPackage({ db, taskPackageId: pkg.id, grade: 'D', actorId: enterprise.id, now: NOW, rules });
+  const approved = approveTaskPackage({ db, taskPackageId: pkg.id, grade: 'D', reason: '可解性不足：补齐数据授权与责任归属后重提', actorId: enterprise.id, now: NOW, rules });
   const report = approved.meta.solvability.diagnosticReport;
   assert.equal(typeof report.score, 'number', '诊断报告必须带分数');
   assert.equal(report.grade, 'D');
@@ -289,7 +322,7 @@ test('returned → 重新评估 → 复活为 published（D 级退回后可以�
     },
     actorId: enterprise.id, now: NOW, rules,
   });
-  const returned = approveTaskPackage({ db, taskPackageId: pkg.id, grade: 'D', actorId: enterprise.id, now: NOW, rules });
+  const returned = approveTaskPackage({ db, taskPackageId: pkg.id, grade: 'D', reason: '可解性不足：补齐数据授权与责任归属后重提', actorId: enterprise.id, now: NOW, rules });
   assert.equal(returned.status, 'returned');
   assert.ok(returned.meta.solvability.diagnosticReport, 'D 级必须带诊断报告');
 
@@ -326,7 +359,7 @@ test('D 级诊断报告的内容必须能指导企业补短板（不是空壳）
     },
     actorId: enterprise.id, now: NOW, rules,
   });
-  const approved = approveTaskPackage({ db, taskPackageId: pkg.id, grade: 'D', actorId: enterprise.id, now: NOW, rules });
+  const approved = approveTaskPackage({ db, taskPackageId: pkg.id, grade: 'D', reason: '可解性不足：补齐数据授权与责任归属后重提', actorId: enterprise.id, now: NOW, rules });
   const report = approved.meta.solvability.diagnosticReport;
   assert.equal(report.title, '问题可解性诊断报告');
   assert.equal(report.grade, 'D');
@@ -360,7 +393,7 @@ test('重签级后旧的 D 级诊断报告不得残留（published 卡上不能�
   });
   // 先评估（六维满分、无否决）→ 组委会直接签 D 级
   assessSolvability({ db, taskPackageId: pkg.id, answers: FULL, actorId: enterprise.id, now: NOW, rules });
-  const downgraded = approveTaskPackage({ db, taskPackageId: pkg.id, grade: 'D', actorId: enterprise.id, now: NOW, rules });
+  const downgraded = approveTaskPackage({ db, taskPackageId: pkg.id, grade: 'D', reason: '可解性不足：补齐数据授权与责任归属后重提', actorId: enterprise.id, now: NOW, rules });
   assert.equal(downgraded.status, 'returned');
   assert.ok(downgraded.meta.solvability.diagnosticReport, 'D 级必须带诊断报告');
 

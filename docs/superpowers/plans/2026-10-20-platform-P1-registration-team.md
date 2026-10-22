@@ -3096,6 +3096,10 @@ import { grantAssignment } from '../src/auth/permissions.js';
 import {
   submitTaskPackage, assessSolvability, approveTaskPackage, listTaskPackages,
 } from '../src/services/taskPackage.js';
+import { isolateTempDir } from '../test-helpers/tmp.js';
+
+// ⚠️ 隔离本进程临时目录：进程退出时整体回收（防临时目录泄漏，详见 test-helpers/tmp.js）
+isolateTempDir();
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrationsDir = join(here, '..', 'db', 'migrations');
@@ -3206,7 +3210,7 @@ test('D 级必须出《问题可解性诊断报告》，不得静默丢弃（R-E
     },
     actorId: enterprise.id, now: NOW, rules,
   });
-  const approved = approveTaskPackage({ db, taskPackageId: pkg.id, grade: 'D', actorId: enterprise.id, now: NOW, rules });
+  const approved = approveTaskPackage({ db, taskPackageId: pkg.id, grade: 'D', reason: '可解性不足：补齐数据授权与责任归属后重提', actorId: enterprise.id, now: NOW, rules });
   assert.equal(approved.grade, 'D');
   assert.equal(approved.status, 'returned');
   assert.equal(approved.commitment, '无');
@@ -3217,8 +3221,41 @@ test('D 级必须出《问题可解性诊断报告》，不得静默丢弃（R-E
   rmSync(dataDir, { recursive: true, force: true });
 });
 
-test('存在一票否决时不得签成 A 级（强制降到 D）', () => {
+test('P10：主动退回（D 级）必须写退回理由 —— 没说为什么，企业就不知道要改什么', () => {
   const { db, close, dataDir, rules, edition, enterprise } = setup();
+  const pkg = submitTaskPackage({
+    db, userId: enterprise.id, payload: { ...PAYLOAD, editionId: edition.id }, now: NOW, rules,
+  });
+  assessSolvability({
+    db, taskPackageId: pkg.id,
+    answers: {
+      problem_clarity: 0, data_access: 0, validation: 0,
+      decision_chain: 0, accountability: 0, precedent: 0,
+    },
+    actorId: enterprise.id, now: NOW, rules,
+  });
+  // ⛔ 缺理由 ⇒ 400（理由是**给人看的话**，不是数据）
+  assert.throws(
+    () => approveTaskPackage({ db, taskPackageId: pkg.id, grade: 'D', actorId: enterprise.id, now: NOW, rules }),
+    (err) => err.status === 400 && err.code === 'RETURN_REASON_REQUIRED',
+  );
+  assert.throws(
+    () => approveTaskPackage({ db, taskPackageId: pkg.id, grade: 'D', reason: '   ', actorId: enterprise.id, now: NOW, rules }),
+    (err) => err.status === 400 && err.code === 'RETURN_REASON_REQUIRED',
+  );
+  // 给了理由 ⇒ 通过，且理由**留痕**（meta 里能读到）
+  const ok = approveTaskPackage({
+    db, taskPackageId: pkg.id, grade: 'D', reason: '数据授权拿不到', actorId: enterprise.id, now: NOW, rules,
+  });
+  assert.equal(ok.status, 'returned');
+  assert.equal(ok.meta.solvability.decision.grade, 'D');
+  assert.equal(ok.meta.solvability.decision.reason, '数据授权拿不到');
+  assert.equal(ok.meta.solvability.decision.decidedBy, enterprise.id);
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('存在一票否决时不得签成 A 级（强制降到 D）', () => {  const { db, close, dataDir, rules, edition, enterprise } = setup();
   const pkg = submitTaskPackage({
     db, userId: enterprise.id, payload: { ...PAYLOAD, editionId: edition.id }, now: NOW, rules,
   });
@@ -3306,7 +3343,7 @@ test('D 级诊断报告必须带上分数（不能恒为 null）', () => {
     },
     actorId: enterprise.id, now: NOW, rules,
   });
-  const approved = approveTaskPackage({ db, taskPackageId: pkg.id, grade: 'D', actorId: enterprise.id, now: NOW, rules });
+  const approved = approveTaskPackage({ db, taskPackageId: pkg.id, grade: 'D', reason: '可解性不足：补齐数据授权与责任归属后重提', actorId: enterprise.id, now: NOW, rules });
   const report = approved.meta.solvability.diagnosticReport;
   assert.equal(typeof report.score, 'number', '诊断报告必须带分数');
   assert.equal(report.grade, 'D');
@@ -3367,7 +3404,7 @@ test('returned → 重新评估 → 复活为 published（D 级退回后可以�
     },
     actorId: enterprise.id, now: NOW, rules,
   });
-  const returned = approveTaskPackage({ db, taskPackageId: pkg.id, grade: 'D', actorId: enterprise.id, now: NOW, rules });
+  const returned = approveTaskPackage({ db, taskPackageId: pkg.id, grade: 'D', reason: '可解性不足：补齐数据授权与责任归属后重提', actorId: enterprise.id, now: NOW, rules });
   assert.equal(returned.status, 'returned');
   assert.ok(returned.meta.solvability.diagnosticReport, 'D 级必须带诊断报告');
 
@@ -3404,7 +3441,7 @@ test('D 级诊断报告的内容必须能指导企业补短板（不是空壳）
     },
     actorId: enterprise.id, now: NOW, rules,
   });
-  const approved = approveTaskPackage({ db, taskPackageId: pkg.id, grade: 'D', actorId: enterprise.id, now: NOW, rules });
+  const approved = approveTaskPackage({ db, taskPackageId: pkg.id, grade: 'D', reason: '可解性不足：补齐数据授权与责任归属后重提', actorId: enterprise.id, now: NOW, rules });
   const report = approved.meta.solvability.diagnosticReport;
   assert.equal(report.title, '问题可解性诊断报告');
   assert.equal(report.grade, 'D');
@@ -3438,7 +3475,7 @@ test('重签级后旧的 D 级诊断报告不得残留（published 卡上不能�
   });
   // 先评估（六维满分、无否决）→ 组委会直接签 D 级
   assessSolvability({ db, taskPackageId: pkg.id, answers: FULL, actorId: enterprise.id, now: NOW, rules });
-  const downgraded = approveTaskPackage({ db, taskPackageId: pkg.id, grade: 'D', actorId: enterprise.id, now: NOW, rules });
+  const downgraded = approveTaskPackage({ db, taskPackageId: pkg.id, grade: 'D', reason: '可解性不足：补齐数据授权与责任归属后重提', actorId: enterprise.id, now: NOW, rules });
   assert.equal(downgraded.status, 'returned');
   assert.ok(downgraded.meta.solvability.diagnosticReport, 'D 级必须带诊断报告');
 
@@ -4151,6 +4188,7 @@ import {
   createTaskPackage, getTaskPackage, listTaskPackagesByEdition, updateTaskPackage,
 } from '../db/repo/taskPackages.js';
 import { getEdition } from '../db/repo/editions.js';
+import { writeAuditLog } from '../audit/log.js';
 import { can } from '../auth/permissions.js';
 
 // ⚠️ 父代理预审修正（Important，状态机）：任务卡的生命周期是
@@ -4290,7 +4328,9 @@ export function assessSolvability({ db, taskPackageId, answers, actorId, now = n
   return presentTaskPackage(updated);
 }
 
-export function approveTaskPackage({ db, taskPackageId, grade, actorId, now = new Date().toISOString(), rules }) {
+export function approveTaskPackage({
+  db, taskPackageId, grade, reason = null, actorId, now = new Date().toISOString(), rules,
+}) {
   const config = rules.solvability;
   const row = getTaskPackage(db, taskPackageId);
   if (!row) throw new AppError(404, 'TASK_PACKAGE_NOT_FOUND', '任务包不存在');
@@ -4298,6 +4338,14 @@ export function approveTaskPackage({ db, taskPackageId, grade, actorId, now = ne
   let gradeCfg = config.grades.find((g) => g.key === grade);
   if (!gradeCfg) {
     throw new AppError(400, 'INVALID_GRADE', `等级必须是 ${config.grades.map((g) => g.key).join(' / ')}`);
+  }
+  // ⚠️ P10（W4-a）：**主动退回（D 级）必须写理由** ——
+  //    「退回了但没说为什么」= 企业拿到一张退回通知，却不知道该改什么
+  //    （R-ENT-08 的《问题可解性诊断报告》是产物，但退回理由是**给人看的话**，不是数据）。
+  //    ⛔ 只在**委员会自己选 D** 时强制：因一票否决被系统强制降到 D 的情形
+  //    已有诊断报告说明原因（命中了哪条否决项）⇒ 不在这里卡人。
+  if (grade === 'D' && (!reason || !String(reason).trim())) {
+    throw new AppError(400, 'RETURN_REASON_REQUIRED', '退回任务卡必须写明退回理由（企业要照着改）');
   }
 
   const meta = parseJson(row.meta_json, {}) ?? {};
@@ -4351,10 +4399,28 @@ export function approveTaskPackage({ db, taskPackageId, grade, actorId, now = ne
     //    现在签非 D 级时**清掉**旧报告：诊断报告只对 D 级成立。
     delete solvability.diagnosticReport;
   }
+  // ⚠️ P10：签级结论写进 meta（前端可见、可复盘）
+  solvability.decision = {
+    grade: finalGrade,
+    requestedGrade: grade,
+    reason: reason ? String(reason).trim() : null,
+    decidedBy: actorId,
+    decidedAt: now,
+  };
   meta.solvability = solvability;
   patch.meta_json = meta;
-
   const updated = updateTaskPackage(db, taskPackageId, patch);
+  // ⚠️ P10：签级结论**必须留痕**（可复盘）。
+  //    · meta.solvability.decision ⇒ 前端能看到「谁在什么时候签的、理由是什么」；
+  //    · 审计日志 ⇒ 与其它「改级会留痕」的动作同规格（可被复核队列检索）。
+  writeAuditLog(db, {
+    actorId,
+    action: 'task_package.approve',
+    entity: 'task_package',
+    entityId: taskPackageId,
+    detail: { grade: finalGrade, requestedGrade: grade, reason: reason ? String(reason).trim() : null },
+    now,
+  });
   return presentTaskPackage(updated);
 }
 
@@ -4483,7 +4549,12 @@ export function registerTaskPackageRoutes({ router, db, rules }) {
     if (!can(user, 'task_package:approve', { scopeType: 'task_package', scopeId: params.id }, db)) {
       throw new AppError(403, 'FORBIDDEN', '没有分级签约的权限');
     }
-    return approveTaskPackage({ db, taskPackageId: params.id, grade: body?.grade, actorId: user.id, rules });
+    // ⚠️ P10（W4-a）：**退回理由**一并收（body.reason）——
+    //    主动签 D 级时理由必填（服务层校验），理由落进 meta 与审计日志。
+    return approveTaskPackage({
+      db, taskPackageId: params.id, grade: body?.grade, reason: body?.reason ?? null,
+      actorId: user.id, rules,
+    });
   });
 }
 ```
@@ -5886,7 +5957,14 @@ Expected: FAIL —— `Cannot find module '../web/views/registration.js'`
 //   ④ 顶部加「答题进度」指标卡，提交前就知道还差几题；
 //   ⑤ 提交成功展示分级结果（等级 + 总分 + 逐维可解释明细），失败给**说清楚原因**的错误提示。
 //
-// ⛔ buildQuestionnaire / formatExplain 是纯函数，不得触碰 document（便于 node:test 直接测）
+// 本轮（P10 · W4-c）「申诉提交（选手侧）」的改动要点：
+//   ⑥ 报名**不接收**时，结果区多一个「提交申诉」入口（R-REG-08）——
+//      此前这句话只写在提示条里，**全站没有任何可点的申诉按钮**，
+//      选手被告知可以做一件做不到的事；
+//   ⑦ 申诉理由**必填**（服务端 fileAppeal 会拒收空理由），提交后就地反馈（成功 / 失败 + 重试）；
+//   ⑧ 已接收的选手**看不到**这个入口（没有可申诉的东西，给了就是死路）。
+//
+// ⛔ buildQuestionnaire / formatExplain / buildResultHtml 是纯函数，不得触碰 document（便于 node:test 直接测）
 import { escapeHtml } from '../escape.js';
 import {
   emptyState, errorState, kvList, loadingState, noticeState, pageHead, panel,
@@ -6011,6 +6089,178 @@ export function explainPairs(lines) {
     const value = e.text.startsWith(prefix) ? e.text.slice(prefix.length) : e.text;
     return [e.label, value];
   });
+}
+
+// ── 申诉（R-REG-08 · 选手侧）───────────────────────────────────────────────
+//
+// ⚠️ **端点契约一律以源码为准**（src/http/routes/audit.js + src/services/review-state.js）：
+//   POST /api/appeals  body = { subjectType, subjectId, reason }
+//     · reason **必填**：服务端 fileAppeal 对空理由抛 400「申诉必须写理由（空理由 = 无法复核）」；
+//     · 需要 appeal:write 能力点（seed 里给了 captain / admin）；
+//     · 限频：5 秒提交锁 + 60 秒 3 次滑动窗（触发即 429 + Retry-After）。
+//   ⇒ 前端**先本地校验空理由**，不发无谓请求；失败必须说清「下一步怎么办」。
+
+/** 申诉理由长度上限（与输入框 maxlength 一致）。 */
+export const APPEAL_REASON_MAX = 1000;
+
+/**
+ * 申诉入口的出现条件（R-REG-08）：报名**不接收**时才给。
+ * ⚠️ 判定口径与结果区的 accepted **逐字一致**（grading.accepted === true 即接收），
+ *    两处各判各的会出现「文案说不接收、却没有申诉入口」。
+ * ⛔ 没有报名记录 ⇒ 不给入口（没有可申诉的对象）。
+ */
+export function isAppealable(reg) {
+  if (!reg) return false;
+  return reg.grading?.accepted !== true;
+}
+
+/**
+ * 申诉理由校验（纯函数）：空理由**不得提交**（服务端也会拒收）。
+ * @returns {{ok: boolean, reason?: string, message?: string}}
+ */
+export function validateAppealReason(reason) {
+  const text = String(reason ?? '').trim();
+  if (!text) return { ok: false, message: '申诉理由必填：空理由的申诉无法复核。' };
+  if (text.length > APPEAL_REASON_MAX) {
+    return { ok: false, message: `申诉理由最多 ${APPEAL_REASON_MAX} 字。` };
+  }
+  return { ok: true, reason: text };
+}
+
+/**
+ * 申诉表单（纯函数）：标题 + 理由输入 + 提交按钮 + 反馈区。
+ * ⚠️ 表单里的 id 是**契约**（#reg-appeal-reason / #reg-appeal-error /
+ *    #reg-appeal-submit / #reg-appeal-feedback）—— 视图与测试都按它取节点。
+ */
+export function buildAppealForm() {
+  return panel({
+    title: '提交申诉（R-REG-08）',
+    desc: '本级不接收：把理由交给组委会复核。理由必填 —— 空理由的申诉无法复核。',
+    body: `
+        <div class="field field--required">
+          <label class="field__label" for="reg-appeal-reason">申诉理由</label>
+          <textarea class="textarea" id="reg-appeal-reason" maxlength="${APPEAL_REASON_MAX}"
+            placeholder="说明你为什么认为自己应当被接收（必填）"></textarea>
+          <p class="field__hint">最多 ${APPEAL_REASON_MAX} 字。组委会会逐条给结论并写明理由。</p>
+          <p class="field__error" id="reg-appeal-error" hidden></p>
+        </div>
+        <div class="btn-group">
+          <button type="button" class="btn btn--primary" id="reg-appeal-submit">提交申诉</button>
+        </div>
+        <div id="reg-appeal-feedback" class="stack"></div>`,
+  });
+}
+
+/**
+ * 挂载申诉表单并绑定提交（渲染与事件绑定分离）。
+ *
+ * ⚠️ 为什么**就地反馈**而不是刷新页面：刷新会冲掉选手已经写好的理由，
+ *    而且「提交成功/失败」必须一眼可见（点了没反应 = 事故）。
+ *
+ * @param {object} o
+ * @param {HTMLElement} o.container 挂载容器（结果区里的 #reg-appeal）
+ * @param {object} o.reg            报名记录（取 id 当申诉对象）
+ * @param {object} o.api            API 客户端
+ */
+export function mountAppealForm({ container, reg, api }) {
+  if (!container) return null;
+  container.innerHTML = buildAppealForm();
+  const btn = container.querySelector('#reg-appeal-submit');
+  const reasonBox = container.querySelector('#reg-appeal-reason');
+  const errBox = container.querySelector('#reg-appeal-error');
+  const out = container.querySelector('#reg-appeal-feedback');
+
+  /** 提交申诉：空理由本地拦下；失败给**可点重试**；成功禁用表单（防重复提交）。 */
+  async function submitAppeal() {
+    const check = validateAppealReason(reasonBox?.value ?? '');
+    if (!check.ok) {
+      if (errBox) {
+        errBox.textContent = check.message;
+        errBox.hidden = false;
+      }
+      return;
+    }
+    if (errBox) {
+      errBox.textContent = '';
+      errBox.hidden = true;
+    }
+    if (out) out.innerHTML = '';
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = '提交中…';
+    }
+    try {
+      const res = await api.post('/api/appeals', {
+        subjectType: 'registration',
+        subjectId: reg?.id ?? '',
+        reason: check.reason,
+      });
+      if (out) {
+        out.innerHTML = noticeState({
+          tone: 'success',
+          title: '申诉已提交',
+          items: [
+            `申诉编号：${res?.id ?? '—'}。组委会会逐条给结论。`,
+            '裁决结果会留在报名记录的事件轨迹里，你可以随时回来看。',
+          ],
+        });
+      }
+      if (reasonBox) reasonBox.disabled = true;
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = '已提交';
+      }
+    } catch (e) {
+      if (out) {
+        out.innerHTML = errorState({
+          message: '申诉提交失败',
+          hint: '服务端返回：' + e.message
+            + '。可点「重试」再提交一次；若持续失败，请联系组委会在报名筛选台直接复核你的报名。',
+        });
+        out.querySelector('[data-action="retry"]')?.addEventListener('click', submitAppeal);
+      }
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = '提交申诉';
+      }
+    }
+  }
+
+  btn?.addEventListener('click', submitAppeal);
+  return container;
+}
+
+/**
+ * 结果区 HTML（纯函数）：分级结果 + 申诉入口。
+ * ⚠️ **申诉入口只在「不接收」时出现**（R-REG-08）——
+ *    已接收的选手没有可申诉的东西，给了入口就是给一条死路。
+ */
+export function buildResultHtml(reg, model, crit) {
+  const levelLabel = model.levels.find((l) => l.key === reg.level)?.label ?? reg.level;
+  const accepted = reg.grading?.accepted === true;
+  const lines = formatExplain(reg.grading?.explain, crit.scale);
+  return `
+        ${noticeState({
+          tone: accepted ? 'success' : 'warn',
+          title: `报名已提交：你被判为 ${reg.level} 级（${levelLabel}）`,
+          items: [accepted
+            ? '你已被接收，现在可以去组队了。'
+            : '本级不接收，可向组委会提交申诉（R-REG-08）。'],
+        })}
+        ${statRow([
+          { label: '总分', value: `${reg.grading?.score ?? 0} 分`, tone: 'brand' },
+          { label: '等级', value: `${reg.level}（${levelLabel}）` },
+          { label: '是否接收', value: accepted ? '已接收' : '不接收', tone: accepted ? 'success' : 'danger' },
+        ])}
+        ${panel({
+          title: '可解释明细',
+          desc: '每一维的均值、权重与加权值 —— 判分口径完全公开（R-REG-09）。',
+          body: kvList(explainPairs(lines)),
+        })}
+        ${accepted ? '' : '<div id="reg-appeal"></div>'}
+        <div class="btn-group">
+          <button type="button" class="btn btn--primary" id="go-team">去组队</button>
+        </div>`;
 }
 
 export function renderRegistration(ctx) {
@@ -6192,34 +6442,14 @@ export function renderRegistration(ctx) {
       }
     }
 
-    /** 提交成功：分级结果（等级 + 总分 + 逐维可解释明细）。 */
+    /** 提交成功：分级结果（等级 + 总分 + 逐维可解释明细）+ 申诉入口（不接收时才给）。 */
     function showResult(reg, model, crit) {
-      const levelLabel = model.levels.find((l) => l.key === reg.level)?.label ?? reg.level;
-      const accepted = reg.grading?.accepted === true;
-      const lines = formatExplain(reg.grading?.explain, crit.scale);
       const feedback = form.querySelector('#reg-feedback');
-      feedback.innerHTML = `
-        ${noticeState({
-          tone: accepted ? 'success' : 'warn',
-          title: `报名已提交：你被判为 ${reg.level} 级（${levelLabel}）`,
-          items: [accepted
-            ? '你已被接收，现在可以去组队了。'
-            : '本级不接收，可向组委会提交申诉（R-REG-08）。'],
-        })}
-        ${statRow([
-          { label: '总分', value: `${reg.grading?.score ?? 0} 分`, tone: 'brand' },
-          { label: '等级', value: `${reg.level}（${levelLabel}）` },
-          { label: '是否接收', value: accepted ? '已接收' : '不接收', tone: accepted ? 'success' : 'danger' },
-        ])}
-        ${panel({
-          title: '可解释明细',
-          desc: '每一维的均值、权重与加权值 —— 判分口径完全公开（R-REG-09）。',
-          body: kvList(explainPairs(lines)),
-        })}
-        <div class="btn-group">
-          <button type="button" class="btn btn--primary" id="go-team">去组队</button>
-        </div>`;
+      feedback.innerHTML = buildResultHtml(reg, model, crit);
       feedback.querySelector('#go-team')?.addEventListener('click', () => navigate('/team'));
+      // ⚠️ 申诉入口**只在不接收时**出现（R-REG-08）：容器由 buildResultHtml 一并给出。
+      const appealBox = feedback.querySelector('#reg-appeal');
+      if (appealBox) mountAppealForm({ container: appealBox, reg, api });
     }
 
     body.replaceChildren(form);
@@ -7610,6 +7840,10 @@ const ROLE_CAPABILITIES = [
   ['captain', 'peer_review:write'], ['captain', 'self_review:write'], ['captain', 'appeal:write'],
   ['member', 'registration:write'], ['member', 'team:read'], ['member', 'pool:read'], ['member', 'behavior:write'],
   ['member', 'task_package:read'], ['member', 'peer_review:write'], ['member', 'self_review:write'],
+  // ⚠️ DP-106：**组员也是选手** —— 他同样要对自己的**报名分级结果**提申诉
+  //    （R-REG-08：分级不接收时选手可向组委会申诉）。
+  //    此前只有 captain 与 admin 持有 appeal:write ⇒ 组员点「提交申诉」被 403「无权提交申诉」。
+  ['member', 'appeal:write'],
   ['judge', 'score:write'], ['judge', 'score:read'], ['judge', 'peer_review:write'], ['judge', 'task_package:read'],
   ['enterprise', 'score:write'], ['enterprise', 'score:read'], ['enterprise', 'signoff:create'],
   ['enterprise', 'task_package:read'], ['enterprise', 'task_package:write'], ['enterprise', 'pool:read'],
@@ -7766,7 +8000,13 @@ function seedP1({ db, rules, adminId, now = '2026-10-20T00:00:00.000Z' }) {
       pkg = { ...pkg, status: 'assessed' };
     }
     if (pkg.status === 'assessed') {
-      approveTaskPackage({ db, taskPackageId: pkg.id, grade: spec.grade, actorId: adminId, now, rules });
+      approveTaskPackage({
+        db, taskPackageId: pkg.id, grade: spec.grade, actorId: adminId, now, rules,
+        // ⚠️ P10（W4-a）：**D 级退回必须写明退回理由**（企业要照着改）——
+        //    种子里的 D 级卡是「六维 0 分」那张，不给理由 ⇒ 服务层抛 400 RETURN_REASON_REQUIRED
+        //    ⇒ 整个种子跑不完（演示数据缺失）。非 D 级不给理由（不改原语义）。
+        reason: spec.grade === 'D' ? '六维全 0：任务描述不可执行，退回让企业重写后再提交' : null,
+      });
       pkg = { ...pkg, status: spec.grade === 'D' ? 'returned' : 'published' };
     }
     packages.push(pkg);

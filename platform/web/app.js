@@ -7,9 +7,11 @@
 //   ② **路由守卫**：未登录点「报名」不再渲染出一个必然 401 的表单，
 //      而是直接给「需要登录」的引导页。
 //   ③ **总览页重做**：从「一行链接」升级为「赛事总览」（指标行 + 分区入口 + 最新榜单）。
+//   ④ **W1-b（DP-105）能力点守卫**：登录了但**缺这个页面要的能力点** ⇒ 给「无权限页」
+//      （说明这页属于组委会 + 缺哪个能力点 + 可点的下一步），不再渲染「全是 0」的组委会界面。
 import { route, match, navigate, currentPath } from './router.js';
 import { getState, setState, subscribe } from './store.js';
-import { navHtml, canAccess } from './nav.js';
+import { navHtml, canAccess, canReach, requiredCapability, routeLabel } from './nav.js';
 import { emptyState } from './ui.js';
 import { renderLogin } from './views/login.js';
 import { renderRegistration } from './views/registration.js';
@@ -26,6 +28,11 @@ import { renderHome } from './views/home.js';
 import { renderLanding } from './views/landing.js';
 import { renderReview } from './views/review.js';
 import { renderPublish } from './views/publish.js';
+// P10：四个新页面（接口早就有了，只是没有界面）
+import { renderReviewPrep } from './views/review-prep.js';
+import { renderAdminTaskPackages } from './views/admin-task-packages.js';
+import { renderAdminAppeals } from './views/admin-appeals.js';
+import { renderSignoff } from './views/signoff.js';
 import { escapeHtml } from './escape.js';
 
 // 演示版：?demo=1 时用 localStorage 适配器；正式版走真实 API。
@@ -73,10 +80,20 @@ route('/tasks', (c) => renderTaskIndex(c));
 // P8：评审打分页 + 赛段计算发榜页（赛事能跑起来的最小闭环）
 // ⚠️ 两条都注册「带赛段」与「不带赛段」两个入口：
 //    不带赛段 ⇒ 页面内给赛段选择器（导航入口 `#/review` / `#/publish` 落到那里）。
+// ⛔ **P10：`/review/prep` 必须注册在 `/review/:stageId` 之前** ——
+//    前端路由是**注册顺序**先匹配（`web/router.js`），
+//    晚注册 ⇒ `/review/prep` 会被 `/review/:stageId` 吃掉（stageId='prep'），
+//    页面就永远打不开。
+route('/review/prep', (c) => renderReviewPrep(c));
+route('/review/prep/:stageId', (c) => renderReviewPrep(c));
 route('/review', (c) => renderReview(c));
 route('/review/:stageId', (c) => renderReview(c));
 route('/publish', (c) => renderPublish(c));
 route('/publish/:stageId', (c) => renderPublish(c));
+// P10：任务卡分级审批（上游总闸）+ 申诉裁决 + 企业签字台
+route('/admin/task-packages', (c) => renderAdminTaskPackages(c));
+route('/admin/appeals', (c) => renderAdminAppeals(c));
+route('/signoff', (c) => renderSignoff(c));
 
 const ctx = { api, navigate, setState, getState };
 
@@ -162,6 +179,37 @@ function renderGuard(user) {
   return el;
 }
 
+/**
+ * 无权限页（W1-b · DP-105）：**登录了，但没有这个页面要的能力点**。
+ *
+ * ⚠️ 为什么必须单独一页（而不是让页面自己渲染）：
+ *   打磨前，任何登录用户用 URL 就能打开组委会专属页面（报名筛选台 / 复核队列 / 赛段发榜），
+ *   页面渲染出**完整界面但全是 0**（API 层返回空集，可见性过滤是对的）——
+ *   用户看不懂「这是组委会的东西」，只以为页面坏了。
+ *   ⇒ 现在前端按**能力点**提前说不行，并说清**缺哪个能力点**。
+ *
+ * ⛔ 服务端仍然是唯一裁决者：这一页**不放行**任何数据请求（视图根本没被调用）。
+ * ⚠️ 复用 web/ui.js 的 emptyState（不新造 UI 组件）。
+ */
+function renderNoPermission(path) {
+  const need = requiredCapability(path);
+  const label = routeLabel(path) || path;
+  const el = document.createElement('div');
+  el.className = 'guard';
+  el.innerHTML = emptyState({
+    title: '这个页面属于组委会工作台',
+    hint: need
+      ? `「${label}」需要「${need}」能力点，当前账号没有这个权限。`
+        + '如果你确实需要这个权限，请联系组委会开通。'
+      : `「${label}」需要组委会权限，当前账号没有这个权限。`
+        + '如果你确实需要这个权限，请联系组委会开通。',
+    action: { href: '#/', label: '回到首页' },
+    // ⚠️ 整页只有这一个状态 ⇒ 它就是页面标题 ⇒ 用 h1（与 renderGuard 同理）。
+    titleTag: 'h1',
+  });
+  return el;
+}
+
 function demoBanner() {
   if (!isDemo) return null;
   const el = document.createElement('div');
@@ -201,6 +249,15 @@ async function render() {
     //    P0 原来只传 ctx —— 视图拿不到参数（前端 router.match 会把 '?query' 剥掉再匹配）。
     if (!canAccess(path, user)) {
       app.replaceChildren(renderGuard(user));
+      if (banner) app.prepend?.(banner);
+      return;
+    }
+    // ⚠️ W1-b（DP-105）：登录了，但**没有这个页面要的能力点** ⇒ 给「无权限页」，
+    //    而不是渲染出一个「完整界面但全是 0」的组委会界面。
+    //    ⛔ 只拦 web/nav.js 里**声明了能力点**的分区级页面；赛段级页面一律不拦
+    //    （评委的能力点可能是赛段级授权，前端无从判断）。
+    if (!canReach(path, user)) {
+      app.replaceChildren(renderNoPermission(path));
       if (banner) app.prepend?.(banner);
       return;
     }

@@ -1,4 +1,4 @@
-// src/services/review.js — 评审提交类用例
+// src/services/review.js — 评审提交类用例 + 评审读口
 //
 // 依据：INTERFACES.md §3 服务层 + S7 §3.1 / §4.3 + S10 §0.4。
 //   幂等：同一 request_id 重复提交只生效一次（⛔ 不用「先查再插」判断重复灌分，
@@ -6,6 +6,11 @@
 //   增量：写 stage_reviews 后增量更新 score_stats（n / mean / sum_sq），
 //         stdev 由 sum_sq 现算 —— 避免每次发榜全表重算（成本随评委数×队伍数相乘增长）。
 //   ⛔ 但每次发榜仍会做一次全量重算并落快照（可复算要求能从原始数据重放）。
+//
+// ⚠️ **读口也在这一层**（P10 补齐）：`getReviewBoard`（评审工作台，附带
+//    `myPeerReviews` / `mySelfReviews` / `myCalibrations`）与 `getRecusalLedger`
+//    （回避台账）—— ⛔ 可见性一律在**服务层（= API 层）**裁决，
+//    前端拿到的就已经是「该给他看的」（全局约束：前端隐藏 = 数据已泄露）。
 //
 // 【父代理预审修正 2026-10-21 —— 本文件有 6 处修正，读代码前先看这段】
 //   ① **「先抢键」与「写数据」必须同事务**：原来抢键成功后写数据失败（如评委被回避 → 403），
@@ -31,14 +36,27 @@ import {
   listReviews,
   listReviewCells,
   insertCalibration,
+  listCalibrationsForJudge,
   applyScoreStatDelta,
 } from '../db/repo/reviews.js';
 import { listStageJudges, getStageJudge, getStage, listStageTeams, listStageTeamRows } from '../db/repo/stages.js';
 import { claimRequestKey } from '../db/repo/request-keys.js';
 import { insertEnterpriseConfirmation, listEnterpriseConfirmations } from '../db/repo/enterprise-confirmations.js';
-import { findPeerReviewsByRequestId, findPeerReview, insertPeerReview, updatePeerReviewScore } from '../db/repo/peer-reviews.js';
-import { findSelfReviewsByRequestId, findSelfReview, insertSelfReview, updateSelfReviewScore } from '../db/repo/self-reviews.js';
-import { insertRecusal, listRecusals } from '../db/repo/recusals.js';
+import {
+  findPeerReviewsByRequestId,
+  findPeerReview,
+  insertPeerReview,
+  updatePeerReviewScore,
+  listPeerReviewsForViewer,
+} from '../db/repo/peer-reviews.js';
+import {
+  findSelfReviewsByRequestId,
+  findSelfReview,
+  insertSelfReview,
+  updateSelfReviewScore,
+  listSelfReviewsForViewer,
+} from '../db/repo/self-reviews.js';
+import { insertRecusal, listRecusals, listRecusalViews } from '../db/repo/recusals.js';
 import { writeAuditLog } from '../audit/log.js';
 import { checkRecusal, checkPeerEligibility } from '../domain/review-eligibility.js';
 import { appError } from '../errors.js';
@@ -319,6 +337,26 @@ export function getReviewBoard({ db, stageId, viewer, rules = null }) {
   const teams = listStageTeamRows(db, stageId);
   const myScores = listReviews(db, { stageId, judgeId: viewer?.userId ?? null })
     .map((r) => ({ teamId: r.team_id, dimension: r.dimension, rawScore: r.raw_score }));
+  // ── 【P10 评委前置】三个「我已经交过哪些」 ──────────────────────────────
+  // ⚠️ **同族口径**：`myScores` 只返回本人 ⇒ 这三个字段也**只返回当前 viewer 自己的**。
+  //    ⛔ **组委会也只看自己的**（不实现「看全部」）——
+  //    「看全部」要额外判定（谁能看别人的互评/自评？评委能看同赛段其他评委的？
+  //    答案必须是「不能」）⇒ 一律不做，避免出现「有的页面看得到、有的看不到」的漂移。
+  //    若将来要放开，必须**同时**放开 `myScores` 并写清口径（否则评审页会出现两套口径）。
+  //
+  // ⚠️ **三者的「我的」含义各不相同**（与各自的写入口对齐）：
+  //   myPeerReviews  互评是「队 → 队」的行为 ⇒ 「我的」= **我参与的那些队**发起的互评
+  //                  （写入口：提交者必须是发起队的在册成员）
+  //   mySelfReviews  自评是**队伍**行为（R-JDG-13 不加分）⇒ 「我的」= **我参与的队**的自评
+  //                  （写入口：只能由本队成员提交）
+  //   myCalibrations 校准是**评委个人**行为（R-JDG-12 对齐宽严尺度）⇒ 「我的」= judge_id = 自己
+  const viewerUserId = viewer?.userId ?? null;
+  const myPeerReviews = listPeerReviewsForViewer(db, { stageId, userId: viewerUserId })
+    .map((r) => ({ fromTeamId: r.fromTeamId, toTeamId: r.toTeamId, score: r.score }));
+  const mySelfReviews = listSelfReviewsForViewer(db, { stageId, userId: viewerUserId })
+    .map((r) => ({ teamId: r.teamId, dimension: r.dimension, rawScore: r.rawScore }));
+  const myCalibrations = listCalibrationsForJudge(db, { stageId, judgeId: viewerUserId })
+    .map((r) => ({ dimension: r.dimension, rawScore: r.rawScore }));
   const progress = getReviewState({
     db,
     stageId,
@@ -338,6 +376,10 @@ export function getReviewBoard({ db, stageId, viewer, rules = null }) {
     judgeDimensions,
     teams,
     myScores,
+    // ⚠️ 【P10 评委前置】三个「我已经交过哪些」——**只含当前 viewer 自己的**（同 myScores 口径）。
+    myPeerReviews,
+    mySelfReviews,
+    myCalibrations,
     // ⚠️ **scope 必须带上**（P8 DP-99）：getReviewState 对两种身份返回的是**两套口径** ——
     //    组委会 = 全赛段（已交 N 格 / 缺了谁的哪一格），评委 = 只看自己（我还差几格）。
     //    前端拿到同一个 {submitted,total,missing} 却不知道是哪套口径 ⇒
@@ -562,4 +604,52 @@ export function declareRecusal({ db, stageId, judgeId, teamId = null, reason, ac
     detail: { judgeId, teamId, reason }, now,
   });
   return row;
+}
+
+/**
+ * 回避台账（**读**）—— P10 评委前置页的「已回避清单」数据源。
+ *
+ * ⚠️ 为什么以前没有这个读口（这正是 P10 补上的缺口）：
+ *   全仓只有 `POST /api/stages/:stageId/recusals`，**没有**配套的 GET ——
+ *   `recusal_records` 只在计算（computeStage）与复核（checkRecusal）里被读。
+ *   ⇒ 前端只能显示「本次会话里我刚提交过的那一条」，
+ *      历史上申报过的、别的评委申报过的（组委会要看的），**全都看不到**。
+ *
+ * ⛔ **可见性在服务层（= API 层）裁决**（全局约束「可见性在 API 层过滤，
+ *    前端隐藏 = 数据已泄露」）：
+ *   · **本人**（普通登录用户）⇒ 只看**自己**的回避记录；
+ *   · **组委会**（`stage:compute`，与 POST /recusals 的 isCommittee 口径一致）
+ *     ⇒ 看**全部**（含别的评委的记录）。
+ *   ⛔ 「看全部」**只给组委会** —— 回避原因是利益冲突（供应方 / 投资方 / 前雇主），
+ *      让所有评委互相看见对方的回避理由，等于把「谁跟哪支队有关系」广播出去。
+ *
+ * ⚠️ **记录只增不改**（R-JDG-09 留档）：撤销是**再写一条** `action='reinstated'`，
+ *    所以台账里同一支队的回避会有**两行**（原申报 + 撤销）——
+ *    这是「留档 + 可复算」的语义，**不是**重复行。
+ *    每行都带自己的 `status`（recused / reinstated），前端按需取最后一条。
+ *
+ * ⚠️ 三态状态码：赛段不存在 → 404；赛段存在但没有记录 → **200 + `{ items: [] }`**（不是 404）。
+ */
+export function getRecusalLedger({ db, stageId, viewer }) {
+  assertStageExists(db, stageId);
+  const isAdmin = viewer?.isAdmin === true;
+  // ⛔ 非组委会一律收窄到「本人」—— 判定在**这里**（服务层），不在前端。
+  const judgeId = isAdmin ? null : (viewer?.userId ?? null);
+  const rows = listRecusalViews(db, { stageId, judgeId });
+  return {
+    items: rows.map((r) => ({
+      id: r.id,
+      stageId: r.stageId,
+      judgeId: r.judgeId,
+      judgeName: r.judgeName,
+      teamId: r.teamId,
+      teamName: r.teamName,
+      reason: r.reason,
+      source: r.source,
+      auditBy: r.auditBy,
+      createdAt: r.createdAt,
+      // ⚠️ `status` = 记录自身的动作（recused 生效 / reinstated 撤销）
+      status: r.status,
+    })),
+  };
 }
