@@ -14,7 +14,7 @@ import assert from 'node:assert/strict';
 import {
   loadingState, emptyState, errorState, noticeState, badge,
   statCard, statRow, kvList, rankBadge, barRow,
-  pageHead, panel, tabs, tableWrap, emptyRow, tone,
+  pageHead, panel, tabs, tableWrap, emptyRow, tone, friendlyError,
 } from '../web/ui.js';
 
 import {
@@ -371,4 +371,52 @@ test('总览页：未登录也要有内容（首屏不能白屏）', async () =>
   const html = dom.app.children?.[0]?.innerHTML ?? '';
   assert.ok(html.includes('未登录'), `首屏必须显示未登录状态，实际：${html}`);
   assert.ok(html.includes('赛事'), '首屏要有内容');
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 四、错误消息友好化（P7 浏览器实测：网络层失败把英文 TypeError 甩给用户）
+// ══════════════════════════════════════════════════════════════════
+
+test('错误友好化：浏览器网络层失败（Failed to fetch）⇒ 换成人话', () => {
+  assert.equal(friendlyError(new TypeError('Failed to fetch')), '网络连接失败，请检查网络后重试');
+  assert.equal(friendlyError(new TypeError('Load failed')), '网络连接失败，请检查网络后重试');
+  assert.equal(friendlyError('Failed to fetch'), '网络连接失败，请检查网络后重试');
+});
+
+test('错误友好化：业务错误原样透出（不洗成通用话术）', () => {
+  assert.equal(friendlyError(new Error('未登录')), '未登录');
+  assert.equal(friendlyError(new Error('战队不存在')), '战队不存在');
+});
+
+test('错误友好化：没有消息时用兜底文案（不许出现 undefined / null）', () => {
+  assert.equal(friendlyError(undefined), '加载失败，请重试');
+  assert.equal(friendlyError(new Error('')), '加载失败，请重试');
+  assert.equal(friendlyError(new Error('undefined')), '加载失败，请重试');
+});
+
+test('错误态：错误消息过一遍友好化（唯一出口 ⇒ 11 个视图都受益）', () => {
+  const html = errorState({ message: new TypeError('Failed to fetch') });
+  assert.ok(html.includes('网络连接失败，请检查网络后重试'));
+  assert.ok(!html.includes('Failed to fetch'), '不能把英文技术错误透给用户');
+  assert.ok(html.includes('data-action="retry"'), '错误态必须有重试按钮');
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 五、总览页的请求口径（端到端：看真实发出了哪些请求）
+// ══════════════════════════════════════════════════════════════════
+
+test('总览页：未登录不请求需要登录态的 /api/teams', async () => {
+  const dom = await bootApp('#/', { user: null }, 'home-no-teams');
+  assert.ok(
+    !dom.calls.some((c) => c.includes('/api/teams')),
+    `未登录不该请求 /api/teams，实际：${JSON.stringify(dom.calls)}`,
+  );
+});
+
+test('总览页：已登录才请求 /api/teams（反向对照：上一条不是恒绿）', async () => {
+  const dom = await bootApp('#/', { user: { id: 'u_a', name: '甲', roles: ['member'] } }, 'home-teams');
+  assert.ok(
+    dom.calls.some((c) => c.includes('/api/teams')),
+    `已登录必须请求 /api/teams，实际：${JSON.stringify(dom.calls)}`,
+  );
 });

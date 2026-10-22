@@ -206,3 +206,87 @@ test('演示适配器的任务清单：可领取 / 可提交完成 / 可释放�
   assert.equal(done.status, 'done', '提交完成要落状态');
   assert.ok(done.completedAt, '要记完成时间');
 });
+
+// ══════════════════════════════════════════════════════════════════
+// 演示运行时的**可恢复性**（P7 浏览器实测踩到的真事故）
+// ══════════════════════════════════════════════════════════════════
+//
+// ⚠️ 事故还原：
+//   演示站重新发布时，nginx 会在那一瞬间短暂拿不到静态文件 ⇒ 首次 fetch 失败。
+//   原实现把**被 reject 的 promise** 存进模块级 runtimePromise ⇒
+//   之后**每一次**调用都抛同一个错 ⇒ 整个演示站永久瘫痪；
+//   而且错误态里那个「重试」按钮点了也永远不会好（重试的是同一份坏 promise）。
+//   ⇒ 失败必须**不缓存**，下一次调用重新加载。
+
+/**
+ * 假的 fetch：把演示站要的资源（种子 + 13 份规则）从本地磁盘读出来。
+ * @param {boolean} failFirst  第一次调用是否抛网络错误
+ */
+function makeDemoFetch(failFirst) {
+  const rulesDir = join(here, '..', 'rules');
+  const seedFile = join(webDir, 'seed', 'demo-data.json');
+  let failed = false;
+  return async (url) => {
+    const u = String(url);
+    if (failFirst && !failed) {
+      failed = true;
+      throw new TypeError('Failed to fetch');   // 浏览器网络层失败的原文
+    }
+    const file = u.split('/').pop();
+    const path = u.includes('/rules/') ? join(rulesDir, file) : seedFile;
+    const body = readFileSync(path, 'utf8');
+    return { ok: true, status: 200, json: async () => JSON.parse(body) };
+  };
+}
+
+test('演示运行时：一次加载失败不能把 promise 永久缓存住（否则「重试」永远无效）', async () => {
+  // ⚠️ 用带 query 的 import 拿一个**全新的模块实例**（Node ESM 按 URL 缓存），
+  //    避免别的用例已经把成功的运行时缓存进模块级变量。
+  const mod = await import(`../web/api.demo.js?rt=${Date.now()}`);
+  const original = globalThis.fetch;
+  try {
+    globalThis.fetch = makeDemoFetch(true);
+    // 第一次：应当失败，但错误必须是**中文人话**（不能把英文 TypeError 甩给用户）
+    await assert.rejects(
+      () => mod.getDemoRuntime(),
+      (err) => {
+        assert.ok(
+          !/Failed to fetch/.test(err.message),
+          `不能把英文技术错误透给用户：${err.message}`,
+        );
+        assert.ok(/无法连接服务器/.test(err.message), `错误要说明发生了什么：${err.message}`);
+        return true;
+      },
+    );
+    // 第二次：网络恢复后必须**能成功**（这正是「失败不缓存」的可观测证据）
+    globalThis.fetch = makeDemoFetch(false);
+    const runtime = await mod.getDemoRuntime();
+    assert.ok(runtime, '网络恢复后必须能拿到运行时');
+    assert.equal(typeof runtime.get, 'function');
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test('演示运行时：并发调用共享同一次加载（不该打 N 次请求）', async () => {
+  const mod = await import(`../web/api.demo.js?rt=rt-${Date.now()}`);
+  const original = globalThis.fetch;
+  try {
+    let count = 0;
+    globalThis.fetch = async (url) => {
+      count += 1;
+      return makeDemoFetch(false)(url);
+    };
+    await mod.getDemoRuntime();
+    const oneCall = count;            // 单次加载的资源数（1 份种子 + 13 份规则 = 14）
+    assert.ok(oneCall >= 2, '资源数不该只有 1 个（否则说明规则没加载）');
+
+    count = 0;
+    const [a, b] = await Promise.all([mod.getDemoRuntime(), mod.getDemoRuntime()]);
+    assert.equal(a, b, '并发调用必须拿到同一个运行时');
+    assert.equal(count, 0, '已缓存的运行时不该再发请求');
+    assert.ok(oneCall <= 20, `资源数异常：${oneCall}`);
+  } finally {
+    globalThis.fetch = original;
+  }
+});

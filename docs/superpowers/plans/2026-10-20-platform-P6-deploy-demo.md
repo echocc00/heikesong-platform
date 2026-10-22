@@ -6159,17 +6159,39 @@ export function createDemoApi({ storage = defaultStorage(), seed = null, rules =
 
 // ── 浏览器入口 ─────────────────────────────────────────────────
 
-export async function loadDemoSeed(url = SEED_URL) {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`演示种子数据加载失败：${url}（HTTP ${res.status}）`);
+/**
+ * 抓一个 JSON 资源，失败时给出**中文 + 可操作**的报错。
+ * ⚠️ 为什么要包一层：浏览器在网络层失败时抛的是英文 TypeError（"Failed to fetch"），
+ *    原样透出去既看不懂也不知道该干什么（这是 P7 浏览器实测抓到的真实报错）。
+ * @param {string} url      资源地址
+ * @param {string} what     资源的人类名（用于报错文案）
+ */
+async function fetchJson(url, what) {
+  let res;
+  try {
+    res = await fetch(url);
+  } catch (cause) {
+    throw new Error(`${what}加载失败：无法连接服务器（${url}），请检查网络后刷新重试`);
+  }
+  if (!res.ok) throw new Error(`${what}加载失败：${url}（HTTP ${res.status}）`);
   return res.json();
+}
+
+export async function loadDemoSeed(url = SEED_URL) {
+  return fetchJson(url, '演示种子数据');
 }
 
 export async function loadDemoRules(base = RULES_BASE) {
   const loaded = {};
   const missing = [];
   for (const [key, file] of Object.entries(DEMO_RULE_FILES)) {
-    const res = await fetch(base + file);
+    const url = base + file;
+    let res;
+    try {
+      res = await fetch(url);
+    } catch (cause) {
+      throw new Error(`演示规则配置加载失败：无法连接服务器（${url}），请检查网络后刷新重试`);
+    }
     if (!res.ok) {
       missing.push(`${file}（HTTP ${res.status}）`);
       continue;
@@ -6199,12 +6221,25 @@ export async function loadDemoRules(base = RULES_BASE) {
 
 let runtimePromise = null;
 
+/**
+ * 取演示运行时（种子 + 规则）。
+ *
+ * ⚠️⚠️ **失败绝不能被缓存**（P7 浏览器实测踩到的真事故）：
+ *   演示站重新发布时，nginx 会在那一瞬间短暂拿不到静态文件 ⇒ 首次 fetch 失败。
+ *   如果这里把**被 reject 的 promise** 存进 runtimePromise，
+ *   之后**每一次**调用都抛同一个错 ⇒ 整个演示站永久瘫痪，
+ *   而且错误态里那个「重试」按钮点了也永远不会好（重试的是同一份坏 promise）。
+ *   ⇒ 失败时**清掉缓存**，让下一次调用重新加载。
+ */
 export function getDemoRuntime() {
   if (!runtimePromise) {
     runtimePromise = (async () => {
       const [seed, rules] = await Promise.all([loadDemoSeed(), loadDemoRules()]);
       return createDemoApi({ seed, rules });
-    })();
+    })().catch((err) => {
+      runtimePromise = null;   // ⚠️ 失败不缓存 ⇒ 下次调用重新加载（可恢复）
+      throw err;
+    });
   }
   return runtimePromise;
 }

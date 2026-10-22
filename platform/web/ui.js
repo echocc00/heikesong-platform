@@ -62,17 +62,48 @@ export function emptyState({ title = '暂无数据', hint = '', action = null } 
  * 错误态：消息 + 重试按钮。
  * ⚠️ 重试按钮是**必须有**的：生产级错误态不能是死路一条。
  *   按钮挂 `data-action="retry"`，由视图侧绑定具体重跑逻辑。
+ *
+ * ⚠️ 消息在**这里**统一过一道 friendlyError：
+ *   11 个视图各写各的错误态时，最常见的事故就是把浏览器的英文 TypeError
+ *   （"Failed to fetch"）原样甩给用户。放在这个**唯一出口**归一，
+ *   比要求 11 个视图各自记得调用友好化更可靠（也少改 11 个文件）。
  */
 export function errorState({ message = '加载失败', retry = true, hint = '' } = {}) {
+  const text = friendlyError(message, '加载失败');
   const retryHtml = retry
     ? '<button type="button" class="btn btn--ghost btn--sm" data-action="retry">重试</button>'
     : '';
   return `<div class="state state--error" role="alert">
     <div class="state__icon" aria-hidden="true">⚠</div>
-    <p class="state__title">${escapeHtml(message)}</p>
+    <p class="state__title">${escapeHtml(text)}</p>
     ${hint ? `<p class="state__hint">${escapeHtml(hint)}</p>` : ''}
     ${retryHtml}
   </div>`;
+}
+
+/**
+ * 把技术错误翻译成**人话**（生产级错误态的第一要求）。
+ *
+ * ⚠️ 为什么需要这一层：
+ *   网络层失败时浏览器抛的是英文 TypeError（"Failed to fetch" / "Load failed"），
+ *   直接透给用户 = 把开发细节甩到脸上，而且用户**不知道下一步该干什么**。
+ *   ⇒ 这里只做一件事：**认出网络层失败**，换成一句带下一步的中文。
+ *
+ * ⚠️ 边界：只改写**网络层**失败；业务错误（后端 AppError 的中文 message）原样透出，
+ *   避免把「未登录」「战队不存在」这类**有业务含义**的信息洗成通用话术。
+ *
+ * @param {unknown} err        捕获到的异常
+ * @param {string}  fallback   连 message 都没有时的兜底文案
+ * @returns {string}           可直接交给 errorState({ message }) 的纯文本
+ */
+export function friendlyError(err, fallback = '加载失败，请重试') {
+  const raw = typeof err === 'string' ? err : (err?.message ?? '');
+  const msg = String(raw ?? '').trim();
+  if (/failed to fetch|networkerror|load failed|network request failed|网络错误/i.test(msg)) {
+    return '网络连接失败，请检查网络后重试';
+  }
+  if (!msg || msg === 'undefined' || msg === 'null') return fallback;
+  return msg;
 }
 
 // ── 提示条 ─────────────────────────────────────────────────────────────

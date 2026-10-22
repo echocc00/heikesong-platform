@@ -102,6 +102,9 @@
 - **顶栏先渲染**，内容后渲染 ⇒ 视图渲染失败时页面不至于白屏，且 catch 分支写入的内容不会被顶栏覆盖（写入顺序 = 视觉顺序）。
 - `#app` 的**首个子节点必须仍是视图本身**（`test/workflow-e2e.test.js` 按 `children[0].innerHTML` 断言）。
 - 总览页 `/` 重做：页头 + 指标行 + 分区入口卡 + 滚动总榜前五；**问候语同步渲染**（不依赖任何请求），数据异步补。
+  - ⛔ **P7.1 起，总览页从本文件抽到 `web/views/home.js`**（P7 owns，新建）：12 个视图里原先只有首页住在 `app.js`；
+    且首页的「指标形状 / 榜单字段口径 / 入口死链」三条判据必须**可断言** ⇒ 抽成纯函数 `homeKpiCards` / `homeBoardHtml` / `homeEntryCards`，
+    本文件只留 `route('/', (c) => renderHome(c))`（详见 §8.5）。
 - 主题切换：`localStorage` 持久化（存取全部包 try —— 隐私模式下会抛）。
 - 新增路由 `/tasks`（工作流索引页）⇒ 任务清单页**第一次有了可达路径**（此前 `/tasks/:workflowId` 无处可点）。
 
@@ -158,6 +161,40 @@
 | 新增用例 | `platform/test/web-ui.test.js`（外壳三件套 + 导航分区 + 守卫红线 + 端到端反向对照） |
 | 变异检验 | 对本阶段新判据做变异，**存活变异必须修或显式标注等价** |
 | 公网 | 平台 8444 与演示站 8445 均 200；演示站任务清单页**不再 404** |
+| 浏览器实测 | 演示站首页**无错误态**、KPI 标签与数值**对得上**、榜单行有**名次与积分**、入口卡**无死链**（见 §8.5） |
+
+---
+
+## 8.5 浏览器实测收尾（P7.1：真实浏览器里抓到的 5 个真 bug）
+
+⚠️ **为什么要有这一节**：§8 的验收标准全是「测试绿 + 机器闸绿」，而 §8.5 的 5 个 bug **全部通过了这些闸**——
+它们是在**真实浏览器**里点出来的（截图可见：首页榜单行显示「. 拾光队」+「分」）。
+⇒ 结论：**机器闸覆盖不到的口径错误，只有真机能抓**。
+
+| # | 现象 | 根因 | 修法 |
+|---|---|---|---|
+| B1 | 未登录时首页「参赛队伍」显示的是**榜单数**，「在榜队伍」是空的 | `jobs` 数组按登录态**改变长度** ⇒ `const [teamCount, boardCount] = await Promise.all(jobs)` **解构错位** | 标签跟着值一起出现/消失；缺失值用 `null` 占位（不是少一个元素）。另：`GET /api/teams` 返回的是**我参与的战队** ⇒ 标签改「我的队伍」 |
+| B2 | 榜单每行渲染成「. 拾光队」+「分」（名次与积分**两个空值**） | 滚动总榜的行字段是 `points`、且**没有 `rank` 也没有 `total`**（`getRollingLeaderboard` 与演示适配器**形状一致**）⇒ 前端用了不存在的字段 | 名次按返回顺序（已按积分降序）自己编号；积分取 `points` |
+| B3 | 榜单错误态的「重试」按钮**点了没反应** | `errorState` 渲染了按钮，但调用方**没绑定 click** ⇒ 死路一条（违反 DP-80） | 抽出 `loadBoard()`，把重试绑上去 |
+| B4 | 首页「报名入口」按钮点了是「页面不存在」 | 链接写的是 `#/register`，路由表里只有 `/apply` | 改 `#/apply`；并新增**死链闸**（拿路由表逐一比对所有 href） |
+| B5 | 网络层失败把英文 `Failed to fetch` 甩给用户；更糟：**一次失败后整个演示站永久瘫痪** | ① 错误消息直接透传浏览器 TypeError；② `getDemoRuntime()` 把**被 reject 的 promise** 存进模块级变量 ⇒ 之后每次调用都抛同一个错 ⇒ 「重试」重试的是同一份坏 promise，**永远救不回来** | ① `friendlyError()` 统一友好化，放在 `errorState` 这个**唯一出口**；② 失败时**清掉缓存**，下一次调用重新加载 |
+
+### 8.5.1 首页为什么从 `web/app.js` 抽成 `web/views/home.js`
+
+B1 / B2 / B4 三条都藏在 `app.js` 的异步闭包里 ⇒ 只能靠人点页面发现。
+⇒ 把「数据 → 卡片/行」的映射抽成**纯函数**（`homeKpiCards` / `homeBoardHtml` / `homeEntryCards`），
+   `app.js` 只负责挂路由 ⇒ `platform/test/web-home.test.js` 能对**结果本身**断言。
+
+⚠️ 顺带修掉一个结构性不一致：12 个视图里**只有首页**住在 `app.js`，其余 11 个都在 `web/views/`。
+
+### 8.5.2 浏览器首轮观察到的「Failed to fetch」
+
+首轮浏览器验证时首页报「Failed to fetch」。复查结论：
+- reload 后 **48 个请求全部成功**（含 1 份种子 + 13 份规则）⇒ 该次失败是**演示站重新发布那一瞬间**的瞬时故障
+  （nginx 短暂拿不到静态文件），**不是**代码里的稳定缺陷；
+- 但它暴露了 B5 的**放大器**：一次瞬时故障 ⇒ 演示站永久瘫痪且无法自救。
+
+⇒ 处置：**不把瞬时故障当 bug 修**，但把「失败被缓存 ⇒ 永久瘫痪」这个放大器修掉（DP-93）。
 
 ---
 
@@ -232,17 +269,48 @@ export function emptyState({ title = '暂无数据', hint = '', action = null } 
  * 错误态：消息 + 重试按钮。
  * ⚠️ 重试按钮是**必须有**的：生产级错误态不能是死路一条。
  *   按钮挂 `data-action="retry"`，由视图侧绑定具体重跑逻辑。
+ *
+ * ⚠️ 消息在**这里**统一过一道 friendlyError：
+ *   11 个视图各写各的错误态时，最常见的事故就是把浏览器的英文 TypeError
+ *   （"Failed to fetch"）原样甩给用户。放在这个**唯一出口**归一，
+ *   比要求 11 个视图各自记得调用友好化更可靠（也少改 11 个文件）。
  */
 export function errorState({ message = '加载失败', retry = true, hint = '' } = {}) {
+  const text = friendlyError(message, '加载失败');
   const retryHtml = retry
     ? '<button type="button" class="btn btn--ghost btn--sm" data-action="retry">重试</button>'
     : '';
   return `<div class="state state--error" role="alert">
     <div class="state__icon" aria-hidden="true">⚠</div>
-    <p class="state__title">${escapeHtml(message)}</p>
+    <p class="state__title">${escapeHtml(text)}</p>
     ${hint ? `<p class="state__hint">${escapeHtml(hint)}</p>` : ''}
     ${retryHtml}
   </div>`;
+}
+
+/**
+ * 把技术错误翻译成**人话**（生产级错误态的第一要求）。
+ *
+ * ⚠️ 为什么需要这一层：
+ *   网络层失败时浏览器抛的是英文 TypeError（"Failed to fetch" / "Load failed"），
+ *   直接透给用户 = 把开发细节甩到脸上，而且用户**不知道下一步该干什么**。
+ *   ⇒ 这里只做一件事：**认出网络层失败**，换成一句带下一步的中文。
+ *
+ * ⚠️ 边界：只改写**网络层**失败；业务错误（后端 AppError 的中文 message）原样透出，
+ *   避免把「未登录」「战队不存在」这类**有业务含义**的信息洗成通用话术。
+ *
+ * @param {unknown} err        捕获到的异常
+ * @param {string}  fallback   连 message 都没有时的兜底文案
+ * @returns {string}           可直接交给 errorState({ message }) 的纯文本
+ */
+export function friendlyError(err, fallback = '加载失败，请重试') {
+  const raw = typeof err === 'string' ? err : (err?.message ?? '');
+  const msg = String(raw ?? '').trim();
+  if (/failed to fetch|networkerror|load failed|network request failed|网络错误/i.test(msg)) {
+    return '网络连接失败，请检查网络后重试';
+  }
+  if (!msg || msg === 'undefined' || msg === 'null') return fallback;
+  return msg;
 }
 
 // ── 提示条 ─────────────────────────────────────────────────────────────
@@ -714,7 +782,7 @@ import assert from 'node:assert/strict';
 import {
   loadingState, emptyState, errorState, noticeState, badge,
   statCard, statRow, kvList, rankBadge, barRow,
-  pageHead, panel, tabs, tableWrap, emptyRow, tone,
+  pageHead, panel, tabs, tableWrap, emptyRow, tone, friendlyError,
 } from '../web/ui.js';
 
 import {
@@ -1072,6 +1140,54 @@ test('总览页：未登录也要有内容（首屏不能白屏）', async () =>
   assert.ok(html.includes('未登录'), `首屏必须显示未登录状态，实际：${html}`);
   assert.ok(html.includes('赛事'), '首屏要有内容');
 });
+
+// ══════════════════════════════════════════════════════════════════
+// 四、错误消息友好化（P7 浏览器实测：网络层失败把英文 TypeError 甩给用户）
+// ══════════════════════════════════════════════════════════════════
+
+test('错误友好化：浏览器网络层失败（Failed to fetch）⇒ 换成人话', () => {
+  assert.equal(friendlyError(new TypeError('Failed to fetch')), '网络连接失败，请检查网络后重试');
+  assert.equal(friendlyError(new TypeError('Load failed')), '网络连接失败，请检查网络后重试');
+  assert.equal(friendlyError('Failed to fetch'), '网络连接失败，请检查网络后重试');
+});
+
+test('错误友好化：业务错误原样透出（不洗成通用话术）', () => {
+  assert.equal(friendlyError(new Error('未登录')), '未登录');
+  assert.equal(friendlyError(new Error('战队不存在')), '战队不存在');
+});
+
+test('错误友好化：没有消息时用兜底文案（不许出现 undefined / null）', () => {
+  assert.equal(friendlyError(undefined), '加载失败，请重试');
+  assert.equal(friendlyError(new Error('')), '加载失败，请重试');
+  assert.equal(friendlyError(new Error('undefined')), '加载失败，请重试');
+});
+
+test('错误态：错误消息过一遍友好化（唯一出口 ⇒ 11 个视图都受益）', () => {
+  const html = errorState({ message: new TypeError('Failed to fetch') });
+  assert.ok(html.includes('网络连接失败，请检查网络后重试'));
+  assert.ok(!html.includes('Failed to fetch'), '不能把英文技术错误透给用户');
+  assert.ok(html.includes('data-action="retry"'), '错误态必须有重试按钮');
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 五、总览页的请求口径（端到端：看真实发出了哪些请求）
+// ══════════════════════════════════════════════════════════════════
+
+test('总览页：未登录不请求需要登录态的 /api/teams', async () => {
+  const dom = await bootApp('#/', { user: null }, 'home-no-teams');
+  assert.ok(
+    !dom.calls.some((c) => c.includes('/api/teams')),
+    `未登录不该请求 /api/teams，实际：${JSON.stringify(dom.calls)}`,
+  );
+});
+
+test('总览页：已登录才请求 /api/teams（反向对照：上一条不是恒绿）', async () => {
+  const dom = await bootApp('#/', { user: { id: 'u_a', name: '甲', roles: ['member'] } }, 'home-teams');
+  assert.ok(
+    dom.calls.some((c) => c.includes('/api/teams')),
+    `已登录必须请求 /api/teams，实际：${JSON.stringify(dom.calls)}`,
+  );
+});
 ```
 
 ### `platform/test/demo-api-parity.test.js`
@@ -1287,9 +1403,608 @@ test('演示适配器的任务清单：可领取 / 可提交完成 / 可释放�
   assert.equal(done.status, 'done', '提交完成要落状态');
   assert.ok(done.completedAt, '要记完成时间');
 });
+
+// ══════════════════════════════════════════════════════════════════
+// 演示运行时的**可恢复性**（P7 浏览器实测踩到的真事故）
+// ══════════════════════════════════════════════════════════════════
+//
+// ⚠️ 事故还原：
+//   演示站重新发布时，nginx 会在那一瞬间短暂拿不到静态文件 ⇒ 首次 fetch 失败。
+//   原实现把**被 reject 的 promise** 存进模块级 runtimePromise ⇒
+//   之后**每一次**调用都抛同一个错 ⇒ 整个演示站永久瘫痪；
+//   而且错误态里那个「重试」按钮点了也永远不会好（重试的是同一份坏 promise）。
+//   ⇒ 失败必须**不缓存**，下一次调用重新加载。
+
+/**
+ * 假的 fetch：把演示站要的资源（种子 + 13 份规则）从本地磁盘读出来。
+ * @param {boolean} failFirst  第一次调用是否抛网络错误
+ */
+function makeDemoFetch(failFirst) {
+  const rulesDir = join(here, '..', 'rules');
+  const seedFile = join(webDir, 'seed', 'demo-data.json');
+  let failed = false;
+  return async (url) => {
+    const u = String(url);
+    if (failFirst && !failed) {
+      failed = true;
+      throw new TypeError('Failed to fetch');   // 浏览器网络层失败的原文
+    }
+    const file = u.split('/').pop();
+    const path = u.includes('/rules/') ? join(rulesDir, file) : seedFile;
+    const body = readFileSync(path, 'utf8');
+    return { ok: true, status: 200, json: async () => JSON.parse(body) };
+  };
+}
+
+test('演示运行时：一次加载失败不能把 promise 永久缓存住（否则「重试」永远无效）', async () => {
+  // ⚠️ 用带 query 的 import 拿一个**全新的模块实例**（Node ESM 按 URL 缓存），
+  //    避免别的用例已经把成功的运行时缓存进模块级变量。
+  const mod = await import(`../web/api.demo.js?rt=${Date.now()}`);
+  const original = globalThis.fetch;
+  try {
+    globalThis.fetch = makeDemoFetch(true);
+    // 第一次：应当失败，但错误必须是**中文人话**（不能把英文 TypeError 甩给用户）
+    await assert.rejects(
+      () => mod.getDemoRuntime(),
+      (err) => {
+        assert.ok(
+          !/Failed to fetch/.test(err.message),
+          `不能把英文技术错误透给用户：${err.message}`,
+        );
+        assert.ok(/无法连接服务器/.test(err.message), `错误要说明发生了什么：${err.message}`);
+        return true;
+      },
+    );
+    // 第二次：网络恢复后必须**能成功**（这正是「失败不缓存」的可观测证据）
+    globalThis.fetch = makeDemoFetch(false);
+    const runtime = await mod.getDemoRuntime();
+    assert.ok(runtime, '网络恢复后必须能拿到运行时');
+    assert.equal(typeof runtime.get, 'function');
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test('演示运行时：并发调用共享同一次加载（不该打 N 次请求）', async () => {
+  const mod = await import(`../web/api.demo.js?rt=rt-${Date.now()}`);
+  const original = globalThis.fetch;
+  try {
+    let count = 0;
+    globalThis.fetch = async (url) => {
+      count += 1;
+      return makeDemoFetch(false)(url);
+    };
+    await mod.getDemoRuntime();
+    const oneCall = count;            // 单次加载的资源数（1 份种子 + 13 份规则 = 14）
+    assert.ok(oneCall >= 2, '资源数不该只有 1 个（否则说明规则没加载）');
+
+    count = 0;
+    const [a, b] = await Promise.all([mod.getDemoRuntime(), mod.getDemoRuntime()]);
+    assert.equal(a, b, '并发调用必须拿到同一个运行时');
+    assert.equal(count, 0, '已缓存的运行时不该再发请求');
+    assert.ok(oneCall <= 20, `资源数异常：${oneCall}`);
+  } finally {
+    globalThis.fetch = original;
+  }
+});
 ```
 
 ---
+
+### `platform/web/views/home.js`
+
+`platform/web/views/home.js`：
+
+```javascript
+// web/views/home.js — 总览页（赛事总览）
+// 溯源需求：P7「现有页面打磨到生产级」
+//
+// ⚠️ **为什么首页要单独成文件**（而不是继续待在 web/app.js 里）：
+//   P7 打磨前，首页的三个关键判断全埋在 app.js 的异步闭包里：
+//     ①「未登录时两个指标会不会错位」②「榜单行的名次和积分取哪个字段」
+//     ③「入口卡里的链接是不是死链」
+//   这三条**全是可复算的判据**，但藏起来就只能靠人点页面发现
+//   （P7 实测就真的漏掉了两处：指标错位 + 一个指向不存在路由的「报名入口」按钮）。
+//   ⇒ 把「数据 → 卡片/行」的映射抽成**纯函数**导出，
+//      app.js 只负责挂路由 ⇒ platform/test/web-home.test.js 能对**结果本身**断言。
+//
+// ⛔ 纯逻辑与 IO 分离：本文件的三个导出（homeKpiCards / homeBoardHtml / homeEntryCards）
+//    都是纯函数（无 IO、无 DOM），可直接被 node:test 断言。
+import { emptyState, errorState, friendlyError, loadingState, pageHead, statRow } from '../ui.js';
+import { escapeHtml } from '../escape.js';
+
+/**
+ * 首页指标卡：**形状固定**的序列。
+ *
+ * ⚠️ 这里踩过的坑（P7 实测）：
+ *   原来的写法是「未登录就不往数组里 push」，然后
+ *   `const [teamCount, boardCount] = await Promise.all(jobs)` ——
+ *   数组长度一变，**解构位置就变了**：
+ *   未登录时 teamCount 拿到的是**榜单数**、boardCount 变成 undefined，
+ *   而两张卡的标签还写着「参赛队伍 / 在榜队伍」⇒ 数字与标签**对不上**。
+ *   ⇒ ① 标签按登录态决定**是否出现**；② 缺失值用 null 占位而不是少一个元素。
+ *
+ * @param {object}  input
+ * @param {object|null} input.user        当前登录用户（null = 访客）
+ * @param {boolean} input.isAdmin         是否组委会身份
+ * @param {number|null} input.teamCount   「GET /api/teams」= **我参与的战队**的条数
+ * @param {number|null} input.boardCount  滚动总榜的条数
+ * @returns {Array<{label:string,value:string|number,tone:string}>}
+ */
+export function homeKpiCards({ user = null, isAdmin = false, teamCount = null, boardCount = null } = {}) {
+  const cards = [];
+  // ⚠️ 标签必须写「我的队伍」：`GET /api/teams` 返回的是**我参与的战队**（不是全场队伍），
+  //    写「参赛队伍」= 口径撒谎。
+  if (user) cards.push({ label: '我的队伍', value: teamCount === null ? '—' : teamCount, tone: 'brand' });
+  cards.push({ label: '在榜队伍', value: boardCount === null ? '—' : boardCount, tone: 'success' });
+  cards.push({ label: '我的身份', value: user ? (isAdmin ? '组委会' : '参赛者') : '访客' });
+  return cards;
+}
+
+/**
+ * 首页「滚动总榜 · 前五」的行。
+ *
+ * ⚠️ 字段口径（P7 实测出的真 bug）：
+ *   滚动总榜的行字段是 `points`（全赛段累计积分），而且**没有 `rank`、没有 `total`** ——
+ *   src/services/leaderboard.js 的 getRollingLeaderboard 与演示适配器形状**一致**。
+ *   原实现写的是 `r.rank` 和 `r.total` ⇒ 首页每一行都渲染成「. 队名」+「分」（两个空值），
+ *   正式平台和演示站**同时**中招。
+ *   ⇒ 名次按返回顺序（后端已按积分降序）自己编号；积分取 points。
+ *
+ * @param {Array<object>} rows  滚动总榜行
+ * @returns {string}             HTML 片段
+ */
+export function homeBoardHtml(rows) {
+  const list = (rows ?? []).slice(0, 5);
+  if (!list.length) {
+    return emptyState({ title: '榜单还没有数据', hint: '等组委会完成首个赛段的计算与发榜。' });
+  }
+  return `<ul class="list-divided">${list.map((r, i) => `<li class="row row--between">
+      <span>${i + 1}. ${escapeHtml(r.teamName || r.teamId)}</span>
+      <span class="num">${escapeHtml(r.points ?? r.total ?? '—')} 分</span>
+    </li>`).join('')}</ul>`;
+}
+
+/**
+ * 首页入口卡：按身份分区，只显示当前身份用得上的入口。
+ *
+ * ⚠️ **每个 href 必须是真实存在的路由**（P7 实测出的真 bug）：
+ *   「开始参赛」里的「报名入口」原来写的是 `#/register`，
+ *   而路由表里根本没有 `/register`（报名页是 `/apply`）⇒ 点了就是「页面不存在」。
+ *   ⇒ platform/test/web-home.test.js 有一条**死链闸**：拿路由表逐一比对这里的 href。
+ *
+ * @param {object} input
+ * @param {object|null} input.user
+ * @param {boolean} input.isAdmin
+ * @returns {Array<{title:string,desc:string,links:Array<{href:string,label:string}>}>}
+ */
+export function homeEntryCards({ user = null, isAdmin = false } = {}) {
+  const entries = [];
+  if (user) {
+    entries.push({ title: '我的赛事', desc: '报名、战队与任务领取', links: [
+      { href: '#/apply', label: '去报名' },
+      { href: '#/team', label: '我的战队' },
+      { href: '#/tasks', label: '任务清单' },
+    ] });
+  } else {
+    entries.push({ title: '开始参赛', desc: '先登录，再报名组队', links: [
+      { href: '#/login', label: '登录' },
+      { href: '#/apply', label: '报名入口' },
+    ] });
+  }
+  entries.push({ title: '赛事公开信息', desc: '榜单与段位，无需登录', links: [
+    { href: '#/leaderboard', label: '看榜单' },
+    { href: '#/tier', label: '段位榜' },
+  ] });
+  if (isAdmin) {
+    entries.push({ title: '组委会工作台', desc: '筛选、复核与发榜留痕', links: [
+      { href: '#/admin/registration', label: '报名筛选台' },
+      { href: '#/flags', label: '复核队列' },
+    ] });
+  }
+  return entries;
+}
+
+/** 入口卡 HTML。 */
+export function homeEntryCardsHtml(entries) {
+  return (entries ?? []).map((e) => `
+      <article class="card home__entry">
+        <h3>${escapeHtml(e.title)}</h3>
+        <p class="muted small">${escapeHtml(e.desc)}</p>
+        <div class="btn-group">
+          ${e.links.map((l) => `<a class="btn btn--ghost btn--sm" href="${escapeHtml(l.href)}">${escapeHtml(l.label)}</a>`).join('')}
+        </div>
+      </article>`).join('');
+}
+
+/**
+ * 总览页视图。
+ *
+ * ⚠️ **同步渲染问候语，异步补数据**：
+ *   首屏必须**立刻**有内容（骨架屏也行），否则弱网下是白屏；
+ *   同时问候语不依赖任何请求 ⇒ 不会因为接口慢而看不到「你是谁」。
+ *
+ * @param {object} ctx  应用上下文（{ api, navigate, setState, getState }）
+ * @returns {HTMLElement}
+ */
+export function renderHome(ctx) {
+  const wrap = document.createElement('div');
+  wrap.className = 'home';
+  const { user } = ctx.getState();
+  const isAdmin = user?.isSuperadmin === true || (user?.roles ?? []).includes('admin');
+
+  wrap.innerHTML = `
+    ${pageHead({
+      title: '华东区 AI 商业黑客松',
+      sub: '赛事总览：报名、战队、赛段、榜单都在这里。',
+    })}
+    <section class="panel">
+      <div class="panel__body">
+        <p class="home__hello">${user
+          ? `已登录：<strong>${escapeHtml(user.name || '')}</strong>`
+          : '<span class="muted">未登录</span> —— <a href="#/login">登录</a>后可报名、组队、领任务'}</p>
+        <div class="home__kpi" id="home-kpi">${loadingState({ rows: 1, label: '正在汇总赛事数据…' })}</div>
+      </div>
+    </section>
+    <section class="grid grid--3" id="home-entries"></section>
+    <section class="panel" id="home-board-panel">
+      <div class="panel__head"><h2 class="panel__title">滚动总榜 · 前五</h2>
+        <p class="panel__desc">按全赛段累计积分排名</p></div>
+      <div class="panel__body" id="home-board"></div>
+    </section>`;
+
+  const entryBox = wrap.querySelector('#home-entries');
+  if (entryBox) entryBox.innerHTML = homeEntryCardsHtml(homeEntryCards({ user, isAdmin }));
+
+  const kpiBox = wrap.querySelector('#home-kpi');
+  const boardBox = wrap.querySelector('#home-board');
+
+  /**
+   * 加载滚动总榜并画进面板；失败时给出**能点的重试**。
+   * @returns {Promise<object|null>} 成功返回原始数据，失败返回 null
+   */
+  const loadBoard = async () => {
+    if (!boardBox) return null;
+    try {
+      const data = await ctx.api.get('/api/leaderboard/rolling');
+      boardBox.innerHTML = homeBoardHtml(data.rows ?? []);
+      return data;
+    } catch (e) {
+      boardBox.innerHTML = errorState({
+        message: friendlyError(e),
+        hint: '榜单读不到不影响其它功能，可以重试。',
+      });
+      // ⚠️ 重试按钮必须**真的能点**：不绑定就是死路一条（打磨前 11 个页面的真实状态）。
+      boardBox.querySelector('[data-action="retry"]')?.addEventListener('click', () => {
+        void loadBoard();
+      });
+      return null;
+    }
+  };
+
+  // 异步补 KPI + 榜单（失败不阻塞首屏）
+  // ⚠️ 滚动总榜**只请求一次**：KPI 的「在榜队伍」与下面的「前五」是同一份数据，
+  //    请求两次既浪费，又可能两次拿到不同结果（KPI 与榜单对不上）。
+  (async () => {
+    // ⚠️ 两个数的**形状必须固定**：未登录时 `/api/teams` 不该发（它要登录态），
+    //    但若用「少 push 一个元素」来表达「没有这个数」，
+    //    `const [teamCount, boardCount] = await Promise.all(...)` 就会**错位**。
+    //    ⇒ 未登录时用 Promise.resolve(null) 占位，标签由 homeKpiCards 按登录态决定。
+    const teamCountP = user
+      ? ctx.api.get('/api/teams').then((r) => (r.items ?? []).length).catch(() => null)
+      : Promise.resolve(null);
+    const rollingP = loadBoard();
+
+    const [teamCount, rolling] = await Promise.all([teamCountP, rollingP]);
+    const boardCount = rolling ? (rolling.rows ?? []).length : null;
+    if (kpiBox) kpiBox.innerHTML = statRow(homeKpiCards({ user, isAdmin, teamCount, boardCount }));
+  })().catch(() => { /* 静默：首屏问候语已经在了 */ });
+
+  return wrap;
+}
+```
+
+### `platform/test/web-home.test.js`
+
+`platform/test/web-home.test.js`：
+
+```javascript
+// platform/test/web-home.test.js —— 总览页（赛事总览）的行为闸
+//
+// 规则溯源：
+//   - 「页面打磨到生产级（视觉 / 交互 / 信息密度）」→ P7
+//   - 「错误态必须带真的能点的重试」→ P7 DP-80
+//   - 「可见性在 API 层过滤」→ 全局约束（前端只判登录态，不按角色拦路）
+//
+// ⚠️ 本文件为什么存在（P7 浏览器实测逼出来的）：
+//   首页打磨后的第一版在**真实浏览器**里暴露了三个肉眼容易漏、但用户一定看得见的缺陷：
+//     ① 未登录时两个指标**错位**（「参赛队伍」显示的其实是榜单数）；
+//     ② 榜单每一行渲染成「. 队名」+「分」（名次与积分两个空值）；
+//     ③ 「报名入口」按钮指向 `#/register`——**路由表里根本没有这个路由**。
+//   这三条如果只靠人点页面发现，下一轮改版大概率复发 ⇒ 全部变成**可复算的机器闸**。
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import {
+  homeKpiCards, homeBoardHtml, homeEntryCards, homeEntryCardsHtml, renderHome,
+} from '../web/views/home.js';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const webDir = join(here, '..', 'web');
+const APP_JS = readFileSync(join(webDir, 'app.js'), 'utf8');
+const NAV_JS = readFileSync(join(webDir, 'nav.js'), 'utf8');
+const HOME_JS = readFileSync(join(webDir, 'views', 'home.js'), 'utf8');
+
+/** 路由表：从 app.js 的 route('...') 调用点**扫出来**（手写清单会漏）。 */
+const ROUTES = [...APP_JS.matchAll(/route\(\s*'([^']+)'/g)].map((m) => m[1]);
+
+/** 路由模式匹配（支持 :param 段）。 */
+function routeMatches(pattern, path) {
+  const pp = pattern.split('/').filter(Boolean);
+  const xp = path.split('/').filter(Boolean);
+  if (pp.length !== xp.length) return false;
+  return pp.every((seg, i) => seg.startsWith(':') || seg === xp[i]);
+}
+
+/** 某个 hash 链接（#/xxx）有没有对应的路由。 */
+function hasRoute(hashPath) {
+  const clean = hashPath.replace(/^#/, '').replace(/\?.*$/, '');
+  return ROUTES.some((r) => routeMatches(r, clean));
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 一、指标卡：形状固定 + 标签与值不得错位
+// ══════════════════════════════════════════════════════════════════
+
+test('首页指标卡：未登录只有 2 张卡（不显示「我的队伍」）', () => {
+  const cards = homeKpiCards({ user: null, teamCount: null, boardCount: 5 });
+  assert.equal(cards.length, 2, '未登录不该出现「我的队伍」卡');
+  assert.deepEqual(cards.map((c) => c.label), ['在榜队伍', '我的身份']);
+  assert.equal(cards[0].value, 5);
+  assert.equal(cards[1].value, '访客');
+});
+
+test('首页指标卡：登录后 3 张卡，且「在榜队伍」的值**不是**队伍数', () => {
+  const cards = homeKpiCards({ user: { name: '张三' }, teamCount: 2, boardCount: 7 });
+  assert.equal(cards.length, 3);
+  assert.deepEqual(cards.map((c) => c.label), ['我的队伍', '在榜队伍', '我的身份']);
+  assert.equal(cards[0].value, 2, '「我的队伍」= /api/teams 的条数');
+  assert.equal(cards[1].value, 7, '「在榜队伍」= 滚动总榜的条数');
+  assert.equal(cards[2].value, '参赛者');
+});
+
+test('首页指标卡：组委会身份显示「组委会」而不是「参赛者」', () => {
+  const cards = homeKpiCards({ user: { roles: ['admin'] }, isAdmin: true, boardCount: 3 });
+  assert.equal(cards.at(-1).value, '组委会');
+});
+
+test('首页指标卡：取不到数时用「—」占位（不是 undefined）', () => {
+  const cards = homeKpiCards({ user: { name: '张三' }, teamCount: null, boardCount: null });
+  assert.equal(cards[0].value, '—');
+  assert.equal(cards[1].value, '—');
+  assert.ok(!cards.some((c) => c.value === undefined), '不许出现 undefined');
+});
+
+test('首页指标卡：标签不得写成「参赛队伍」（/api/teams 返回的是**我的**战队）', () => {
+  const cards = homeKpiCards({ user: { name: '张三' }, teamCount: 1, boardCount: 1 });
+  assert.ok(!cards.some((c) => c.label === '参赛队伍'), '口径撒谎：/api/teams 是我的战队');
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 二、滚动总榜：字段口径
+// ══════════════════════════════════════════════════════════════════
+
+test('首页榜单：行没有 rank / total 字段时，名次按序编号、积分取 points', () => {
+  // ⚠️ 这就是滚动总榜的真实形状（getRollingLeaderboard 与演示适配器一致）
+  const rows = [
+    { teamId: 't_alpha', teamName: '拾光队', points: 88, stages: 2, bestRank: 1, tier: 'A' },
+    { teamId: 't_beta', teamName: '回声队', points: 61, stages: 2, bestRank: 3, tier: 'B' },
+  ];
+  const html = homeBoardHtml(rows);
+  assert.ok(html.includes('>1. 拾光队<'), '第一名必须渲染成「1. 拾光队」');
+  assert.ok(html.includes('2. 回声队'));
+  assert.ok(html.includes('88 分'), '积分取 points');
+  assert.ok(html.includes('61 分'));
+  assert.ok(!/(^|[^0-9])\. 拾光队/.test(html), '不能渲染成「. 队名」（名次字段不存在时的经典症状）');
+  assert.ok(!/>\s*分</.test(html), '不能渲染成空积分');
+});
+
+test('首页榜单：积分口径钉死 —— points 优先（total 不能盖掉它）', () => {
+  // ⚠️ 变异检验实测：只断言「行里有 points 时显示 points」**杀不掉**
+  //    「points / total 两个字段顺序颠倒」的变异体（滚动总榜的行根本没有 total
+  //    ⇒ 两种写法结果一样 ⇒ 判据太弱，不是等价变异体）。
+  //    ⇒ 这里显式给一行**同时有** points 与 total 的数据，把优先级钉死。
+  const html = homeBoardHtml([{ teamId: 't_x', teamName: '双字段队', points: 88, total: 999 }]);
+  assert.ok(html.includes('88 分'), 'points 是滚动总榜的积分口径 ⇒ 必须优先');
+  assert.ok(!html.includes('999 分'), 'total 不能盖掉 points');
+});
+
+test('首页榜单：行没有 points 字段时才退回 total', () => {
+  const html = homeBoardHtml([{ teamId: 't_y', teamName: '老口径队', total: 42 }]);
+  assert.ok(html.includes('42 分'), '兼容老口径');
+});
+
+test('首页榜单：最多只显示前五', () => {
+  const rows = Array.from({ length: 9 }, (_, i) => ({ teamId: `t${i}`, teamName: `队${i}`, points: 100 - i }));
+  const html = homeBoardHtml(rows);
+  assert.equal((html.match(/<li/g) || []).length, 5);
+});
+
+test('首页榜单：空数据给空态（说清什么时候会有）', () => {
+  const html = homeBoardHtml([]);
+  assert.ok(html.includes('榜单还没有数据'));
+  assert.ok(html.includes('发榜'), '空态必须说清什么时候会有数据');
+});
+
+test('首页榜单：队名里的 HTML 必须转义（服务端数据是外部输入）', () => {
+  const html = homeBoardHtml([{ teamId: 'x', teamName: '<img src=x onerror=alert(1)>', points: 1 }]);
+  assert.ok(!/<img/i.test(html), '不得出现真实 img 标签');
+  assert.ok(html.includes('&lt;img'));
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 三、死链闸：入口卡与导航里的每个 href 都必须对应真实路由
+// ══════════════════════════════════════════════════════════════════
+
+test('死链闸：首页入口卡的每个 href 都对应真实路由', () => {
+  const cases = [
+    { user: null, isAdmin: false },
+    { user: { name: '张三' }, isAdmin: false },
+    { user: { roles: ['admin'] }, isAdmin: true },
+  ];
+  for (const c of cases) {
+    const entries = homeEntryCards(c);
+    for (const e of entries) {
+      for (const l of e.links) {
+        assert.ok(
+          hasRoute(l.href),
+          `死链：${e.title} → ${l.label} 指向 ${l.href}，但路由表里没有（现有路由：${ROUTES.join(', ')}）`,
+        );
+      }
+    }
+  }
+});
+
+test('死链闸：主导航的每个 path 都对应真实路由', () => {
+  const paths = [...NAV_JS.matchAll(/path:\s*'([^']+)'/g)].map((m) => m[1]);
+  assert.ok(paths.length >= 6, '导航里应该有 6 条以上的路径（漏扫说明正则失效）');
+  for (const p of paths) {
+    assert.ok(hasRoute(p), `死链：导航项 ${p} 没有对应路由`);
+  }
+});
+
+test('死链闸：路由表必须含首页与报名页（防扫描正则失效导致闸变空转）', () => {
+  assert.ok(ROUTES.includes('/'), '必须有首页路由');
+  assert.ok(ROUTES.includes('/apply'), '必须有报名页路由');
+  assert.ok(ROUTES.length >= 10, `路由表只扫到 ${ROUTES.length} 条，正则可能失效`);
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 四、结构闸：首页必须走独立视图，且不能自己造路由表
+// ══════════════════════════════════════════════════════════════════
+
+test('结构闸：首页逻辑在 views/home.js 里，app.js 只负责挂路由', () => {
+  assert.ok(
+    /import \{ renderHome \} from '\.\/views\/home\.js'/.test(APP_JS),
+    'app.js 必须从 views/home.js 引入首页视图',
+  );
+  assert.ok(
+    /route\('\/',\s*\(\w+\)\s*=>\s*renderHome\(\w+\)\)/.test(APP_JS),
+    '首页路由必须把上下文透传给视图（否则 ctx.api 为 undefined，页面直接崩）',
+  );
+  assert.ok(!/function renderHome/.test(APP_JS), 'app.js 不该再自带一份 renderHome（两份实现 = 迟早走偏）');
+});
+
+test('结构闸：首页不得引用滚动总榜里**不存在**的 rank 字段', () => {
+  // ⚠️ 只扫**代码**：注释里会写「原实现写的是 r.rank」来解释坑，
+  //    连注释一起扫会把「说明问题的文字」当成「问题本身」。
+  const code = HOME_JS
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/.*$/gm, '');
+  assert.ok(!/\br\.rank\b/.test(code), '滚动总榜没有 rank 字段（名次要按序自己编号）');
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 六、请求口径（视图层隔离断言）
+// ══════════════════════════════════════════════════════════════════
+
+/**
+ * 最小 DOM 桩：够 renderHome 跑起来。
+ * ⚠️ 为什么在**视图层**断言请求次数，而不是在 app.js 层：
+ *   app.js 层每次 import 都会往**同一个** router 模块里追加一份路由，
+ *   多个测试实例会互相触发渲染 ⇒ 请求次数被放大，断言必然 flaky。
+ *   视图层直接喂 ctx ⇒ 一次 boot、一次请求序列，完全确定。
+ */
+function stubDom() {
+  const mk = (tag = 'div') => ({
+    tagName: tag, className: '', innerHTML: '', textContent: '', value: '', id: '',
+    children: [],
+    appendChild(c) { this.children.push(c); return c; },
+    replaceChildren(...kids) { this.children = kids; },
+    addEventListener() {},
+    querySelector() { return mk(); },
+    querySelectorAll() { return []; },
+  });
+  globalThis.window = { location: { search: '', hash: '#/' }, addEventListener() {} };
+  globalThis.document = { createElement: (t) => mk(t), getElementById: () => mk('div') };
+}
+
+async function bootHome(user, apiImpl) {
+  stubDom();
+  const calls = [];
+  const ctx = {
+    api: {
+      get: async (p) => { calls.push(p); return apiImpl ? apiImpl(p) : { rows: [] }; },
+    },
+    getState: () => ({ user }),
+  };
+  renderHome(ctx);
+  await new Promise((r) => setTimeout(r, 10));
+  return calls;
+}
+
+test('总览页：滚动总榜只请求一次（KPI 与前五榜共用同一份数据）', async () => {
+  const calls = await bootHome(null);
+  const rolling = calls.filter((c) => c.includes('/api/leaderboard/rolling'));
+  assert.equal(rolling.length, 1, `滚动总榜应只请求 1 次，实际 ${rolling.length} 次：${JSON.stringify(calls)}`);
+});
+
+test('总览页：未登录不请求需要登录态的 /api/teams', async () => {
+  const calls = await bootHome(null);
+  assert.ok(!calls.some((c) => c.includes('/api/teams')), `未登录不该请求 /api/teams：${JSON.stringify(calls)}`);
+});
+
+test('总览页：已登录才请求 /api/teams（反向对照：上一条不是恒绿）', async () => {
+  const calls = await bootHome({ id: 'u_a', name: '甲', roles: ['member'] });
+  assert.ok(calls.some((c) => c.includes('/api/teams')), `已登录必须请求 /api/teams：${JSON.stringify(calls)}`);
+});
+
+test('总览页：榜单接口失败时给出**带重试**的错误态（不许是死路）', async () => {
+  stubDom();
+  const calls = [];
+  const ctx = {
+    api: {
+      get: async (p) => {
+        calls.push(p);
+        if (p.includes('/api/leaderboard/rolling')) throw new TypeError('Failed to fetch');
+        return { items: [] };
+      },
+    },
+    getState: () => ({ user: null }),
+  };
+  renderHome(ctx);
+  await new Promise((r) => setTimeout(r, 10));
+  // ⚠️ DOM 桩的 querySelector 返回游离元素 ⇒ 只能断言「错误态片段被生成过」，
+  //    这里用源码闸补上「重试按钮真的被绑定」这一半（见下一条）。
+  assert.ok(calls.some((c) => c.includes('/api/leaderboard/rolling')), '榜单接口必须被请求');
+});
+
+test('结构闸：榜单错误态必须绑定重试按钮（点了要能重跑）', () => {
+  const code = HOME_JS
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/.*$/gm, '');
+  assert.ok(/data-action="retry"/.test(code), '首页必须给错误态挂重试按钮');
+  assert.ok(
+    /addEventListener\('click'/.test(code),
+    '重试按钮必须真的绑定 click（只渲染按钮不绑定 = 死路一条）',
+  );
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 五、入口卡 HTML
+// ══════════════════════════════════════════════════════════════════
+
+test('入口卡 HTML：标题与链接都要渲染出来', () => {
+  const html = homeEntryCardsHtml(homeEntryCards({ user: null }));
+  assert.ok(html.includes('开始参赛'));
+  assert.ok(html.includes('赛事公开信息'));
+  assert.ok(html.includes('href="#/apply"'));
+  assert.ok(!html.includes('href="#/register"'), '报名入口必须指向 /apply');
+});
+```
 
 ## 10. 本轮决策记录（DP）
 
@@ -1307,3 +2022,8 @@ test('演示适配器的任务清单：可领取 / 可提交完成 / 可释放�
 | DP-86 | 🧪 **审计器必须打印失配明细** | C-RW 的判据是贪心子序列匹配 ⇒ 改掉靠前的一行会让后面全部失配 ⇒ 看起来像整文件被重写。⇒ 工具直接打印**第一处失配行**（沿用「D 类必须打印明细」的纪律）⇒ 判据不变，诊断信息自足。 |
 | DP-87 | 🧪 **class 清单要做差集核对** | 视图里写出来的 class 必须在样式表里**有对应规则**，否则「拼错 / 没定义」只表现为「样式没生效」，**完全看不出来**。⇒ 把视图用到的 class 全量抽出求差集（本轮查出 **15 个缺失**）。 |
 | DP-88 | 🔗 **新增端点必须能补上「可发现性」** | 赛段选择器与任务清单入口需要「列表端点」；仓储层本来就有 `listStages` / `listWorkflowsByEdition`，只是**没端点** ⇒ 页面在生产上走不通。⇒ 补两个**只读**端点。 |
+| DP-89 | ⛔ **可选数量的标签必须跟着值一起出现/消失** | 首页 KPI 原来用「未登录就不往数组里 push」来表达「没有这个数」，于是 `Promise.all` 的**解构位置随登录态漂移** ⇒ 未登录时「参赛队伍」显示的是榜单数。⇒ ① 标签按登录态决定**是否出现**；② 缺失值用 `null` **占位**而不是少一个元素；③ 解构前先固定形状。 |
+| DP-90 | ⛔ **前端只用后端真实存在的字段** | 首页用了 `r.rank` / `r.total`，而滚动总榜的真实形状是 `points` + **没有 rank**（`getRollingLeaderboard` 与演示适配器**一致**）⇒ 每行渲染成「. 队名」+「分」。⇒ 改字段前先**对齐口径**；名次按返回顺序自己编号（后端已按积分降序）。 |
+| DP-91 | ⛔ **「重试」按钮必须真的绑定 click** | DP-80 只保证了**渲染**出按钮，调用方漏绑 ⇒ 点了没反应，**比没有按钮更糟**（用户以为是自己没点到）。⇒ 抽出可重入的 `loadBoard()`，把 click 绑上去；并加**结构闸**断言 `addEventListener('click'` 存在。 |
+| DP-92 | 🔗 **每个链接都要有死链闸** | `#/register` 在路由表里**根本不存在**（报名页是 `/apply`）⇒ 点了就是「页面不存在」，而这**没有任何测试会报**。⇒ 新增**死链闸**：从 `app.js` 扫出路由表，与首页入口卡 + 主导航的每个 href **逐一比对**（不匹配即红）。 |
+| DP-93 | 🛡 **失败不能被缓存；错误消息必须友好化** | ① `getDemoRuntime()` 缓存了**被 reject 的 promise** ⇒ 一次瞬时网络故障就让演示站**永久瘫痪**，且「重试」重试的是同一份坏 promise。⇒ 失败时**清掉缓存**，让下一次调用重新加载。② 浏览器网络层失败抛的是英文 `TypeError` ⇒ 统一用 `friendlyError()` 翻译成中文，且放在 `errorState()` 这个**唯一出口**（11 个视图一次受益）。 |
