@@ -15,8 +15,19 @@
 #   两种走法：
 #     · 版本够新（≥ 1.25.1）⇒ 原样拷贝（保留 `http2 on;`）
 #     · 版本偏旧         ⇒ 降级：删掉独立的 `http2 on;` 行，
-#                          并把 `listen ... 443 ssl;` 改成 `listen ... 443 ssl http2;`
+#                          并把 `listen ... <端口> ssl;` 改成 `listen ... <端口> ssl http2;`
 #                          （旧语法在**所有** nginx 版本上都合法 ⇒ 降级永远安全）
+#
+# ⚠️ 端口为什么不能写死成 443：
+#    ① deploy/nginx-tls-port.conf 用的是**占位符** `__TLS_PORT__`（端口由
+#      install.sh 的 NGINX_TLS_PORT 注入，常见值 8444 / 9443 等自定义口）。
+#    ② ⚠️ **顺序陷阱**：install.sh 是**先跑本脚本、后替换占位符** ——
+#      本脚本看到的永远是 `listen __TLS_PORT__ ssl;` 这种**占位符形态**，
+#      不是替换后的真实端口。
+#    ⇒ 若这里只匹配 443，占位符形态匹配不上 ⇒ 降级时 `http2 on;` 被删掉、
+#      `http2` 又没补回 listen 行 ⇒ **HTTP/2 被静默丢弃**（功能不坏，但
+#      与模板声明的形态不符，且没人会发现）。
+#    ⇒ 故此处匹配「任意数字端口」或占位符 `__TLS_PORT__`。
 #
 # 环境变量：
 #   NGINX_VERSION  覆盖探测到的版本（形如 1.24.0）。默认用 `nginx -v` 探测；
@@ -124,7 +135,7 @@ else
       line = $0
       # 把 `listen [::]:443 ssl;` / `listen 443 ssl;` 改成 `... ssl http2;`
       # ⚠️ IPv6 那一支是 `[::]:443` —— `]` 后面还有一个 `:`，正则必须带上它
-      if (line ~ /^[[:space:]]*listen[[:space:]]+(\[[^]]*\]:[[:space:]]*)?443[[:space:]]+ssl;[[:space:]]*$/) {
+      if (line ~ /^[[:space:]]*listen[[:space:]]+(\[[^]]*\]:[[:space:]]*)?([0-9]+|__TLS_PORT__)[[:space:]]+ssl;[[:space:]]*$/) {
         sub(/;[[:space:]]*$/, " http2;", line)
         changed = 1
       }

@@ -37,6 +37,7 @@
 #                                令路形态用 deploy/nginx-plain-http.conf
 #                                （纯 HTTP + 自定义端口，**无 TLS**）
 #   NGINX_HTTP_PORT 纯 HTTP 监听端口   默认 8081（只对 plain-http 模板有意义）
+#   NGINX_TLS_PORT HTTPS 监听端口      默认 443（只对 tls-port 模板有意义）
 #   COOKIE_SECURE  登录 Cookie 的 Secure 属性  默认空 = 跟随 NODE_ENV
 #                                纯 HTTP 形态必须显式给 false（否则浏览器拒收 Cookie → 登录失效）
 #   SYSTEMD_UNIT_DIR systemd 单元目录  默认 /etc/systemd/system
@@ -65,6 +66,9 @@ NGINX_LINK="${NGINX_LINK:-/etc/nginx/sites-enabled/heikesong.conf}"
 # 时改用 deploy/nginx-plain-http.conf —— 纯 HTTP + 自定义端口，不碰 443。
 NGINX_TEMPLATE="${NGINX_TEMPLATE:-$ROOT/deploy/nginx.conf}"
 NGINX_HTTP_PORT="${NGINX_HTTP_PORT:-8081}"
+# TLS 监听端口：只对 deploy/nginx-tls-port.conf 有意义（正式模板的 443 是写死的）。
+# 默认 443 ⇒ 不给这个变量时，行为与「没加这个开关」完全一样。
+NGINX_TLS_PORT="${NGINX_TLS_PORT:-443}"
 # 登录 Cookie 的 Secure 属性：默认空 = 跟随 NODE_ENV（=production）。
 # 纯 HTTP 对外面必须显式给 false —— 但**不要**用 NODE_ENV=development 去绕，
 # 那会连带改掉其它生产行为。
@@ -184,14 +188,27 @@ validate_cookie_secure() {
   esac
 }
 
+# ⛔ 端口必须是合法端口号（1–65535）。
+#    抽成公共函数：现在有两个端口开关（明文 HTTP 口 / TLS 口），
+#    校验逻辑必须**完全一致** —— 复制两份必然漂移（改一处忘一处）。
+check_port() {
+  local name="$1" value="$2"
+  case "$value" in
+    ''|*[!0-9]*) die "$name 必须是 1-65535 的整数，实际：$value" ;;
+  esac
+  if [ "$value" -lt 1 ] || [ "$value" -gt 65535 ]; then
+    die "$name 必须在 1-65535 之间，实际：$value"
+  fi
+}
+
 # ⛔ NGINX_HTTP_PORT 必须是合法端口号（1–65535）。
 validate_http_port() {
-  case "$NGINX_HTTP_PORT" in
-    ''|*[!0-9]*) die "NGINX_HTTP_PORT 必须是 1-65535 的整数，实际：$NGINX_HTTP_PORT" ;;
-  esac
-  if [ "$NGINX_HTTP_PORT" -lt 1 ] || [ "$NGINX_HTTP_PORT" -gt 65535 ]; then
-    die "NGINX_HTTP_PORT 必须在 1-65535 之间，实际：$NGINX_HTTP_PORT"
-  fi
+  check_port "NGINX_HTTP_PORT" "$NGINX_HTTP_PORT"
+}
+
+# ⛔ NGINX_TLS_PORT 必须是合法端口号（1–65535）。
+validate_tls_port() {
+  check_port "NGINX_TLS_PORT" "$NGINX_TLS_PORT"
 }
 
 install_node() {
@@ -386,6 +403,7 @@ write_nginx_site() {
       -e "s|__KEY_PATH__|$(sed_escape "$key")|g" \
       -e "s|__APP_DIR__|$(sed_escape "$APP_DIR")|g" \
       -e "s|__HTTP_PORT__|$(sed_escape "$NGINX_HTTP_PORT")|g" \
+      -e "s|__TLS_PORT__|$(sed_escape "$NGINX_TLS_PORT")|g" \
       "$rendered" > "$NGINX_SITE"
   rm -f "$rendered"
   ln -sfn "$NGINX_SITE" "$NGINX_LINK"
@@ -440,6 +458,7 @@ main() {
   validate_session_ttls
   validate_cookie_secure
   validate_http_port
+  validate_tls_port
   if ! node_version_ok; then
     install_node
   fi

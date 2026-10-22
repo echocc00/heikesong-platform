@@ -777,8 +777,8 @@ heikesong-platform 启动于 http://127.0.0.1:8080（规则版本 2026-10-20）
 | U-4 | ~~`nginx-http2-compat.sh` 的版本探测在真机上总是失败~~ **已修** | 原 `detect_version()` 的 sed 匹配不到 nginx 的真实输出格式 `nginx version: nginx/1.24.0`（版本号前带 `nginx/` 前缀）⇒ 真机总是走保守降级。**后果安全**（降级语法在所有版本都合法），但「≥ 1.25.1 保留 `http2 on;`」只有显式 `NGINX_VERSION` 才走得到。**已由父代理修复轮修掉**（2026-10-21）：解析式改为同时吃下带前缀/不带前缀两种形态，并补了走**真实自动探测路径**的回归用例（假 `nginx` 放 `PATH` 上）—— 见 §8.1 |
 | U-5 | **演示版构建 / 发布流程未实跑** | `scripts/build-demo.js` / `scripts/serve-demo.js` 是 **P6 Task 6** 的产物，**本 Task 时点尚未落地**。§8.5 写的是**目标流程**（接口以 P6 计划 Task 6 为准） |
 | U-6 | **多机 / Postgres 方案** | 超出本阶段范围。§0.2 与 §4 只把**边界**说清楚（多机必须换 Postgres，没有第三条路） |
-| U-7 | **计划代码块原样保留，未作改动** | 计划 Task 7 的 `docs/deployment.md` 代码块在本文件里**逐字连续**保留（§0–§7），补写内容全部落在 §8–§16。计划文档本身只**追加**了「Task 7 实施台账」一章 |
-| U-8 | **systemd 侧未在真机验证** | 本手册写作环境是 macOS（无 systemd）。§8.3 的「确认生效」三条命令里，②（`systemctl show -p EnvironmentFiles`）与 ③（读 `/proc/<pid>/environ`）**未在真机跑过** —— 但 ③ 读的是内核暴露的进程环境，语义不依赖 systemd 版本。⚠️ 刻意**不用** `systemctl show -p Environment`：那条**看不到** `EnvironmentFile=` 的内容（systemd issue #14723），会让人误判「环境文件没生效」。<br>⚠️ **2026-10-21 补充**：单元文件本身已在**真机 systemd 252** 上过 `systemd-analyze verify`（零告警，见 §16 E20）；仍未验证的是「**服务真跑起来之后**那三条确认命令」（那需要真的把服务装上并启动）<br>✅ **2026-10-21 晚补充**：让路形态部署后服务**真的跑起来了**（`systemctl is-active heikesong` ⇒ `active`，`Main PID` 为 `node /opt/heikesong/platform/src/server.js`），见 §16 E25；「确认生效」三条命令仍可自行跑 |
+| U-7 | **计划代码块原样保留，未作改动** | 计划 Task 7 的 `docs/deployment.md` 代码块在本文件里**逐字连续**保留（§0–§7），补写内容全部落在 §8–§18。计划文档本身只**追加**了「Task 7 实施台账」一章 |
+| U-8 | **systemd 侧未在真机验证** | 本手册写作环境是 macOS（无 systemd）。§8.3 的「确认生效」三条命令里，②（`systemctl show -p EnvironmentFiles`）与 ③（读 `/proc/<pid>/environ`）**未在真机跑过** —— 但 ③ 读的是内核暴露的进程环境，语义不依赖 systemd 版本。⚠️ 刻意**不用** `systemctl show -p Environment`：那条**看不到** `EnvironmentFile=` 的内容（systemd issue #14723），会让人误判「环境文件没生效」。<br>⚠️ **2026-10-21 补充**：单元文件本身已在**真机 systemd 252** 上过 `systemd-analyze verify`（零告警，见 §18 E20）；仍未验证的是「**服务真跑起来之后**那三条确认命令」（那需要真的把服务装上并启动）<br>✅ **2026-10-21 晚补充**：让路形态部署后服务**真的跑起来了**（`systemctl is-active heikesong` ⇒ `active`，`Main PID` 为 `node /opt/heikesong/platform/src/server.js`），见 §18 E25；「确认生效」三条命令仍可自行跑 |
 | U-9 | **平台在公网打不开**（真机部署后实测） | 主机侧**零防火墙规则**（iptables INPUT 0 条 / nftables 空 / firewalld 未装），`8081` 确实在监听 `0.0.0.0` ⇒ **过滤在云侧**（安全组 / 端口映射只放行了 22 / 80 / 443 / 7000 / 8888）。让路形态部署在 8081 ⇒ 机内全通（E26/E27），公网不通（E29）。<br>⇒ **不是应用问题**：在云控制台加一条 **TCP 8081** 的入方向规则即可（代码与主机配置零改动）；在此之前可用 `ssh -L 8081:127.0.0.1:8081` 本机隧道访问 |
 
 ---
@@ -900,7 +900,143 @@ curl -s -X POST http://127.0.0.1:8081/api/auth/logout-all -H 'Cookie: hk_session
 
 ---
 
-## 16. 实跑证据台账（2026-10-21）
+## 17. HTTPS 升级：TLS + 自定义端口（80/443 被占，但手上有证书）
+
+> 适用场景：与 §14 同一前提（80 / 443 被既有业务占用），**但手上有一张可用证书** ——
+> 域名证书，或者 Let's Encrypt 的 **IP 短周期证书**（`/etc/letsencrypt/live/<IP>/`）。
+> 与 §14 的差别只有一个：**加密**。真机 8.133.200.235 实跑形态。
+
+### 17.1 三个模板怎么选
+
+| 场景 | 模板 | 对外形态 |
+|---|---|---|
+| 有域名、443 空闲（正式形态） | `deploy/nginx.conf` | `https://<域名>/`（80 301 → 443） |
+| 80/443 被占，**无**证书 | `deploy/nginx-plain-http.conf` | `http://<IP>:<端口>/`（**明文**） |
+| 80/443 被占，**有**证书 | `deploy/nginx-tls-port.conf` | `https://<IP>:<端口>/` |
+| 已上 TLS，想**关掉明文入口** | `deploy/nginx-https-redirect.conf` | `http://<IP>:<端口>/` ⇒ 301 到 TLS 端口 |
+
+### 17.2 开关
+
+| 开关 | 默认 | 作用 |
+|---|---|---|
+| `NGINX_TEMPLATE` | `deploy/nginx.conf` | 指向 `deploy/nginx-tls-port.conf`（或跳转模板） |
+| `NGINX_TLS_PORT` | `443` | TLS 监听端口（模板里的 `__TLS_PORT__` 占位符） |
+| `NGINX_HTTP_PORT` | `8081` | 明文监听端口（模板里的 `__HTTP_PORT__` 占位符） |
+| `COOKIE_SECURE` | 不设 = 跟随 `NODE_ENV` | 走 https 后应显式给 `true`；**明文入口还在时只能给 `false`** |
+
+### 17.3 两个必须知道的坑（模板注释里也写了）
+
+**① ⛔ TLS 模板**没有** 80 端口的 server 块，两个原因缺一不可：**
+
+- 80 常被既有业务以 `default_server` 占用。再加一个 `server_name` 更精确的块，
+  **IP 直访时命中的是精确 `server_name`**（nginx 先精确后通配）⇒ 等于我们上线、
+  别人的控制台被我们抢走入口。
+- 证书续期靠 ACME HTTP-01 校验，而校验目录（certbot webroot）**恰好**挂在 80 的
+  `default_server` 上 ⇒ 我们抢走 80 就等于**掐断自己的续期链路**
+  （短周期证书一旦续不上，过期当天服务直接不可用）。
+
+**② ⛔ upstream 名字必须与别的站点文件不同**（本模板用 `heikesong_app_tls`，
+另两个模板用 `heikesong_app`）：nginx 的 upstream 名是**全局**的 —— 同名会让
+`nginx -t` 报 `duplicate upstream`，且**整个 nginx 起不来**（连带把别人的业务一起带崩）。
+
+### 17.4 两阶段切换（顺序不能反）
+
+> ⚠️ 为什么不能一把梭：`COOKIE_SECURE=true` 会让**明文入口的登录直接失效** ——
+> 浏览器拒收带 `Secure` 标记的 Cookie（明文 HTTP 下收不了）。所以必须**先让 https 验证通过**，
+> 再切 Cookie。
+
+**Stage 1：先只加 TLS 入口，不动 Cookie。** 用**另一个站点文件**落 TLS 站点，
+明文站点原样保留 ⇒ 这一步**不影响现有访问**：
+
+```bash
+sudo SERVER_NAME=8.133.200.235 \
+     NGINX_TEMPLATE="$(pwd)/platform/deploy/nginx-tls-port.conf" \
+     NGINX_TLS_PORT=8444 \
+     NGINX_SITE=/etc/nginx/sites-available/heikesong-tls.conf \
+     NGINX_LINK=/etc/nginx/sites-enabled/heikesong-tls.conf \
+     COOKIE_SECURE=false \
+     ADMIN_PASSWORD=… \
+     ./platform/deploy/install.sh
+```
+
+验证（**在本机**就能验，证书链用系统信任库校验，不要加 `-k`）：
+
+```bash
+curl --resolve 8.133.200.235:8444:127.0.0.1 https://8.133.200.235:8444/api/health
+```
+
+> `--resolve` 是为了绕开「云上映射无 hairpin ⇒ 机内 curl 公网 IP 不通」；
+> 用 `--resolve` 指定回环地址后，**TLS 握手仍按 IP 走**（证书 SAN = IP），
+> 所以它验的是**真证书链**，不是绕过校验。
+
+**Stage 2：确认 https 能用之后**，再切 Cookie 并关掉明文入口：
+
+```bash
+# ① 切 COOKIE_SECURE=true（同一套 install.sh 重跑即可）
+sudo SERVER_NAME=8.133.200.235 \
+     NGINX_TEMPLATE="$(pwd)/platform/deploy/nginx-tls-port.conf" \
+     NGINX_TLS_PORT=8444 \
+     NGINX_SITE=/etc/nginx/sites-available/heikesong-tls.conf \
+     NGINX_LINK=/etc/nginx/sites-enabled/heikesong-tls.conf \
+     COOKIE_SECURE=true \
+     ADMIN_PASSWORD=… \
+     ./platform/deploy/install.sh
+
+# ② 明文入口改成 301 跳转（**替换**掉原来的明文站点文件）
+sudo SERVER_NAME=8.133.200.235 \
+     NGINX_TEMPLATE="$(pwd)/platform/deploy/nginx-https-redirect.conf" \
+     NGINX_HTTP_PORT=8081 \
+     NGINX_TLS_PORT=8444 \
+     NGINX_SITE=/etc/nginx/sites-available/heikesong.conf \
+     NGINX_LINK=/etc/nginx/sites-enabled/heikesong.conf \
+     COOKIE_SECURE=true \
+     ADMIN_PASSWORD=… \
+     ./platform/deploy/install.sh
+```
+
+> ② 也可以**直接删掉**明文入口（`rm` 站点文件 + 软链 + `nginx -t && systemctl reload nginx`）——
+> 最干净，但**旧链接直接断**。用跳转模板则是「旧链接仍落到正确地址，且没有业务流量再走明文」。
+
+### 17.5 明文入口的三个选项
+
+| 选项 | 做法 | 结果 |
+|---|---|---|
+| **留着**（不推荐） | 什么都不动 | 明文入口仍可访问；`COOKIE_SECURE=true` 后**登录会失败**（浏览器拒收 Secure Cookie）⇒ 半残状态 |
+| **301 跳转**（推荐） | `deploy/nginx-https-redirect.conf` | 旧链接自动落到 https；无业务流量走明文 |
+| **删掉** | `rm` 站点文件 + 软链 + reload | 最干净；旧链接断 |
+
+### 17.6 证书续期（**短周期证书必看**）
+
+Let's Encrypt 的 **IP 短周期证书**只有 **6 天**有效期 ⇒ 续期链路断了就是**当天服务不可用**。
+
+- 续期由 certbot 的 timer 驱动（如 `certbot-renew.timer`，一天两次）；
+- 续期成功后必须 `systemctl reload nginx`，否则 nginx 还在用旧证书；
+- certbot 的 deploy hook（`/etc/letsencrypt/renewal-hooks/deploy/`）通常已经做了 reload ——
+  **部署前先确认这个 hook 在不在**：
+
+```bash
+ls -l /etc/letsencrypt/renewal-hooks/deploy/
+systemctl list-timers | grep -i cert
+```
+
+⚠️ 本模板**不碰 80**，所以 ACME 的 webroot 校验仍由既有 `default_server` 提供 ⇒ 续期链路不受影响。
+
+### 17.7 回滚
+
+```bash
+# 只回滚 TLS 入口（保留明文入口原样）
+rm -f /etc/nginx/sites-enabled/heikesong-tls.conf /etc/nginx/sites-available/heikesong-tls.conf
+nginx -t && systemctl reload nginx
+
+# 只回滚 Cookie 开关（改回明文可用）
+sed -i 's/^COOKIE_SECURE=.*/COOKIE_SECURE=false/' /etc/heikesong/platform.env
+systemctl restart heikesong
+```
+
+> 回滚只删**本次新增**的东西；`default`（headscale）、`headscale-tls`、xray、frps、
+> HydroOJ、mongod 一律不碰。
+
+## 18. 实跑证据台账（2026-10-21 起）
 
 > 全部在**临时目录**（`mktemp -d`）里做，不碰工作树的库文件。
 > 环境：macOS（darwin 27.0.0 arm64）、Node **v22.23.2**、**本机没装 nginx**（正好用来验证降级路径与探测失败路径）。
