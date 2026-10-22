@@ -176,7 +176,11 @@ export function barRow({ label = '', value = 0, max = null, note = '', tone: t =
   const v = Number(value) || 0;
   const m = max === null || max === undefined || Number(max) <= 0 ? Math.max(v, 1) : Number(max);
   const pct = Math.max(0, Math.min(100, Math.round((v / m) * 100)));
-  const noteHtml = note ? `<span class="bar__note">${escapeHtml(note)}</span>` : '';
+  // ⚠️ 备注前必须加**分隔符**（P8 实测发现的真问题）：
+  //    值与备注是**相邻**的两个 span，中间只有一个 4px 的视觉间距 ——
+  //    于是「1」（1 支队伍）+「25%」（占比）在**文本提取 / 读屏**里拼成「125%」，
+  //    一个**假数字**。⇒ 统一加「·」分隔，文本与视觉都读得对。
+  const noteHtml = note ? `<span class="bar__note">· ${escapeHtml(note)}</span>` : '';
   return `<div class="bar">
     <span class="bar__label">${escapeHtml(label)}</span>
     <span class="bar__track"><span class="bar__fill bar__fill--${tone(t)}" style="width:${pct}%"></span></span>

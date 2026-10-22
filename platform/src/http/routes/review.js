@@ -25,6 +25,7 @@ import { AppError } from '../../errors.js';
 import {
   submitReviews,
   getReviewState,
+  getReviewBoard,
   submitCalibration,
   submitPeerReviews,
   submitSelfReviews,
@@ -209,6 +210,28 @@ export function registerReviewRoutes(router) {
         viewer: { userId: ctx.user.id, isAdmin: isCommittee(ctx) },
         dimensions: stateDimensions,
       }),
+    });
+  });
+
+  // ⛔ P8：评审工作台（只读，一次拿齐「名册 + 维度 + 我的分 + 进度」）
+  //    前端要拼评分表单，但名册/维度/我的分原先分散在仓储层、规则文件与 stage_reviews 里，
+  //    **一个对外读口都没有** ⇒ 前端要么猜口径、要么拼三个请求。
+  router.add('GET', '/api/stages/:stageId/review-board', async (ctx) => {
+    requireUser(ctx);
+    // ⚠️ 权限闸门与 `GET /api/stages/:stageId/review-state` **完全同口径**：
+    //    组委会 / 有 score:read（赛段级或全局）/ 本赛段评委 ⇒ 否则 403。
+    //    ⚠️ 不按角色判（全局约束：可见性与授权在 API 层裁决），只认能力点与评委身份。
+    if (!isCommittee(ctx)
+      && !ctx.can('score:read', { scopeType: 'stage', scopeId: ctx.params.stageId })
+      && !ctx.can('score:read', { scopeType: 'global' })
+      && !getStageJudge(ctx.db, ctx.params.stageId, ctx.user.id)) {
+      throw new AppError(403, 'FORBIDDEN', '没有查看评审工作台的权限');
+    }
+    return getReviewBoard({
+      db: ctx.db,
+      stageId: ctx.params.stageId,
+      viewer: { userId: ctx.user.id, isAdmin: isCommittee(ctx) },
+      rules: ctx.rules,
     });
   });
 

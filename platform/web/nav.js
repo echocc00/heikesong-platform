@@ -40,8 +40,9 @@ export const GUEST = { label: '访客', group: 'guest' };
  *   - `roles: [...]` ⇒ 需要命中其中任一角色；
  *   - `exact: true` ⇒ 只有路径完全相等才算「当前页」（否则 '/tasks' 会把 '/tasks/x' 也点亮）。
  *
- * ⛔ 「评审台」分区**故意留空**：评审打分页属于下一轮（补端点），
- *   现在放一个空分区等于放一个死入口 —— 等页面真的存在时再加这一条数据。
+ * ⛔ 「评审台」分区在 **P8 之前**故意留空：评审打分页当时不存在，
+ *   放一个空分区等于放一个死入口 —— 等页面真的存在时再加这一条数据。
+ *   ⇒ P8 起补上「评审席」分区（评审打分）与组委会分区里的「赛段发榜」。
  */
 export const NAV_SECTIONS = [
   {
@@ -64,6 +65,17 @@ export const NAV_SECTIONS = [
     ],
   },
   {
+    // ⚠️ **不按角色限定**：评委席位是**赛段级**指派的（stage_judges 表），
+    //   前端手里没有「你是不是本赛段评委」这个信息 ⇒ 硬按角色限定会**误伤**。
+    //   能不能进评审页由 API 裁决（403 → 错误态说清缺什么权限），沿用 DP-77。
+    id: 'reviewer',
+    label: '评审席',
+    auth: true,
+    items: [
+      { path: '/review', label: '评审打分' },
+    ],
+  },
+  {
     id: 'committee',
     label: '组委会',
     auth: true,
@@ -71,6 +83,7 @@ export const NAV_SECTIONS = [
     items: [
       { path: '/admin/registration', label: '报名筛选台' },
       { path: '/flags', label: '复核队列' },
+      { path: '/publish', label: '赛段发榜' },
     ],
   },
 ];
@@ -98,6 +111,9 @@ export const PROTECTED_ROUTES = [
   { pattern: /^\/admin(\/|$)/, auth: true },
   { pattern: /^\/flags\/?$/, auth: true },
   { pattern: /^\/audit(\/|$)/, auth: true },
+  // P8：评审打分与赛段发榜都需要登录
+  { pattern: /^\/review(\/|$)/, auth: true },
+  { pattern: /^\/publish(\/|$)/, auth: true },
 ];
 
 /** 取用户身上的角色键数组（宽容处理各种形状）。 */

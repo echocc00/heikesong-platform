@@ -217,7 +217,7 @@ export function renderAdminRegistration(ctx) {
         label: `${l.key}（${l.label}）`,
         value: count,
         max: total || 1,
-        note: `${Math.round((count / (total || 1)) * 100)}%`,
+        note: `占 ${Math.round((count / (total || 1)) * 100)}%`,
         tone: 'brand',
       });
     }).join('');

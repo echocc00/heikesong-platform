@@ -5229,6 +5229,79 @@ export function expandSubmissions(state) {
   return out;
 }
 
+/**
+ * 评审工作台（演示版）。
+ *
+ * ⚠️ **形状必须与真实后端 `GET /api/stages/:stageId/review-board` 逐字段一致**
+ *    （src/services/review.js 的 getReviewBoard）——
+ *    同一份前端在演示站与正式站必须表现一致，否则「演示」就失去意义。
+ *
+ * ⚠️ 演示站只有一个赛段（stage_final）⇒ 维度取 `rules.scoring.final`。
+ *    ⚠️ 演示管理员是**组委会**身份 ⇒ progress.scope = 'stage'（全赛段口径）。
+ */
+export function demoReviewBoard({ state, rules, stageId = 'stage_final' }) {
+  const stageName = stageId === state.lastStageId ? '决赛赛段' : `赛段 ${stageId}`;
+  const config = rules?.scoring?.final ?? rules?.scoring?.initial ?? {};
+  const dimensions = (config.dimensions ?? []).map((d) => ({
+    key: d.key, name: d.name, weight: d.weight, seat: d.seat,
+  }));
+  const judgeDimensions = dimensions.filter((d) => d.seat === 'judge');
+  const pkgById = new Map((state.taskPackages ?? []).map((p) => [p.id, p]));
+  const teams = (state.teams ?? []).map((t) => {
+    const pkg = pkgById.get(t.packageId) ?? {};
+    return {
+      id: t.id,
+      name: t.name,
+      taskPackageId: t.packageId ?? null,
+      taskPackageTitle: pkg.title ?? null,
+      isFreeBrief: pkg.isFreeBrief === true,
+    };
+  });
+  const meId = state.me?.id ?? null;
+  const mine = (meId && state.reviews?.[meId]) || {};
+  const myScores = [];
+  for (const [teamId, byDim] of Object.entries(mine)) {
+    for (const [dimension, rawScore] of Object.entries(byDim ?? {})) {
+      myScores.push({ teamId, dimension, rawScore: Number(rawScore) });
+    }
+  }
+  const subs = expandSubmissions(state);
+  const dimKeys = judgeDimensions.map((d) => d.key);
+  const total = teams.length * dimKeys.length;
+  const submitted = subs.filter((x) => dimKeys.includes(x.dimension)).length;
+  const dimensionProgress = {};
+  for (const d of dimKeys) {
+    dimensionProgress[d] = {
+      submitted: subs.filter((x) => x.dimension === d).length,
+      total: teams.length,
+    };
+  }
+  const missing = [];
+  for (const j of (state.judges ?? [])) {
+    for (const t of teams) {
+      for (const d of dimKeys) {
+        const hit = subs.some((x) => x.judgeId === j.id && x.teamId === t.id && x.dimension === d);
+        if (!hit) missing.push({ judgeId: j.id, teamId: t.id, dimension: d });
+      }
+    }
+  }
+  return {
+    stage: {
+      id: stageId,
+      key: stageId,
+      name: stageName,
+      kind: 'final',
+      status: 'computed',
+      scoringConfigKey: 'final',
+    },
+    dimensions,
+    judgeDimensions,
+    teams,
+    myScores,
+    progress: { scope: 'stage', submitted, total, missing, dimensionProgress },
+  };
+}
+
 /** 队伍名册：R1（分赛道）与 R4（自由命题）需要知道任务包归属 */
 export function demoTeamsRoster(state) {
   const pkgById = new Map((state.taskPackages ?? []).map((p) => [p.id, p]));
@@ -6078,29 +6151,42 @@ export function createDemoApi({ storage = defaultStorage(), seed = null, rules =
     m = clean.match(/^\/api\/teams\/([^/]+)\/tier$/);
     if (method === 'GET' && m) return demoTier({ state: s, rules: r, teamId: m[1] });
     // 打分
+    // ⚠️ **形状必须与真实后端一致**（P8 修正）：真实后端从**会话**取评委
+    //    （src/http/routes/review.js：`judgeId: ctx.user.id`），**不看 body 里的 judgeId**。
+    //    原来演示适配器从 `it.judgeId` 取 ⇒ 前端按真实契约发（body 里没有 judgeId）时，
+    //    演示站会把分记到一个**空 judgeId** 下 ⇒ 「提交成功但进度不涨」。
     m = clean.match(/^\/api\/stages\/([^/]+)\/reviews$/);
     if (method === 'POST' && m) {
+      if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
+      const judgeId = s.me.id;
+      // ⚠️ **打分的人必须在这个赛段的评委池里**，否则引擎不认他的分
+      //    （src/domain/scoring.js：votingIds = 池内评委 ⇒ 池外的分被丢弃）。
+      //    真实系统里评委由 stage_judges 指派；演示站只有一个账号 ⇒ **打分时自动入池**，
+      //    否则演示站会出现「提交成功但榜单纹丝不动」的假象。
+      if (!(s.judges ?? []).some((j) => j.id === judgeId)) {
+        s.judges = [...(s.judges ?? []), { id: judgeId, name: s.me.name ?? '演示评审', seat: 'expert' }];
+      }
       const items = Array.isArray(body?.items) ? body.items : [];
+      if (!s.reviews[judgeId]) s.reviews[judgeId] = {};
       for (const it of items) {
-        const judgeId = it.judgeId;
-        if (!s.reviews[judgeId]) s.reviews[judgeId] = {};
         if (!s.reviews[judgeId][it.teamId]) s.reviews[judgeId][it.teamId] = {};
         s.reviews[judgeId][it.teamId][it.dimension] = Number(it.rawScore);
       }
       persist();
-      return { submitted: items.length, stageId: m[1] };
+      return { stageId: m[1], judgeId, submitted: items.length, items: [] };
     }
+    // ⚠️ **评审工作台（P8）**：形状必须与真实后端 `GET /api/stages/:stageId/review-board`
+    //    **逐字段一致**（否则同一份前端在演示站与正式站表现不同 ⇒ 演示就失去意义）。
+    m = clean.match(/^\/api\/stages\/([^/]+)\/review-board$/);
+    if (method === 'GET' && m) return demoReviewBoard({ state: s, rules: r, stageId: m[1] });
     m = clean.match(/^\/api\/stages\/([^/]+)\/review-state$/);
     if (method === 'GET' && m) {
-      const subs = expandSubmissions(s);
-      const byJudge = new Map();
-      for (const sub of subs) byJudge.set(sub.judgeId, (byJudge.get(sub.judgeId) ?? 0) + 1);
-      return {
-        stageId: m[1],
-        submitted: subs.length,
-        dimensionProgress: Object.fromEntries(byJudge),
-        judges: (s.judges ?? []).map((j) => ({ judgeId: j.id, submitted: byJudge.get(j.id) ?? 0 })),
-      };
+      // ⚠️ **P8 修正**：原来返回的 `dimensionProgress` 是「按评委分组」的**数字**，
+      //    而真实后端是「按维度分组」的 `{submitted, total}`，并且还有 `total` / `missing`。
+      //    ⇒ 演示站的进度条与真实站**根本不是一回事**（P7 的 parity 闸没覆盖到这条端点）。
+      const board = demoReviewBoard({ state: s, rules: r, stageId: m[1] });
+      const { submitted, total, missing, dimensionProgress } = board.progress;
+      return { stageId: m[1], submitted, total, missing, dimensionProgress };
     }
     // 计算
     m = clean.match(/^\/api\/stages\/([^/]+)\/compute$/);
@@ -8366,6 +8452,10 @@ import { createPublicToken } from '../src/services/public-api.js';
 import { publishLeaderboard } from '../src/services/leaderboard.js';
 import { createDemoApi } from '../web/api.demo.js';
 import { call, callJson } from '../test-helpers/http-call.js';
+import { isolateTempDir } from '../test-helpers/tmp.js';
+
+// ⚠️ 隔离本进程临时目录：进程退出时整体回收（防临时目录泄漏，详见 test-helpers/tmp.js）
+isolateTempDir();
 
 const here = dirname(fileURLToPath(import.meta.url));
 const platformDir = join(here, '..');
@@ -8462,28 +8552,48 @@ test('演示线全链路：报名 → 组队 → 打分 → 计算 → 发榜 �
   const rsBefore = await api.get('/api/stages/stage_final/review-state');
 
   // 3a. 给**新建的验收队**打一条（全新的一格：评委 × 队 × 维度）
+  // ⚠️ **body 里没有 judgeId**（P8 修正）：真实后端从**会话**取评委
+  //    （src/http/routes/review.js：`judgeId: ctx.user.id`）⇒ 演示适配器原先
+  //    从 body 里读 judgeId = 与真实后端**形状不一致**（演示站会记到空评委名下）。
   const reviewNew = await api.post('/api/stages/stage_final/reviews', {
-    items: [{ judgeId: 'j_mid1', teamId: team.id, dimension: 'completeness', rawScore: 80 }],
+    items: [{ teamId: team.id, dimension: 'completeness', rawScore: 80 }],
   });
   assert.equal(reviewNew.submitted, 1);
   assert.equal(reviewNew.stageId, 'stage_final');
+  assert.ok(reviewNew.judgeId, '必须回显评委（来自会话）');
 
   // 判别性A6：这一条真的进了「已提交」统计
   const rsAfter = await api.get('/api/stages/stage_final/review-state');
   assert.equal(rsAfter.submitted, rsBefore.submitted + 1, '提交的分数必须计入 review-state');
+  // ⚠️ 进度按**维度**分组（与真实后端一致）：{ 维度键: {submitted, total} }
   assert.equal(
-    rsAfter.dimensionProgress.j_mid1, rsBefore.dimensionProgress.j_mid1 + 1,
-    '该评委的已提交数必须 +1',
+    rsAfter.dimensionProgress.completeness.submitted,
+    rsBefore.dimensionProgress.completeness.submitted + 1,
+    '该维度的已提交数必须 +1',
   );
 
-  // 3b. 给**已有的格子**改分（覆盖，不是累加）
+  // 3b. 给**刚才那一格**改分（覆盖，不是累加）
+  // ⚠️ 必须是**同一个评委**（同一个会话）改**同一个**格子 ⇒ 才测得到「覆盖」；
+  //    换一支队就不是覆盖，而是新增一格（那由 3c 单独测）。
   const reviewOverwrite = await api.post('/api/stages/stage_final/reviews', {
-    items: [{ judgeId: 'j_mid1', teamId: 't_gamma', dimension: 'completeness', rawScore: 88 }],
+    items: [{ teamId: team.id, dimension: 'completeness', rawScore: 88 }],
   });
   assert.equal(reviewOverwrite.submitted, 1);
   const rsAgain = await api.get('/api/stages/stage_final/review-state');
   assert.equal(rsAgain.submitted, rsAfter.submitted, '同一评委同一队同一维度重复打分必须覆盖，不能累加');
-  assert.equal(rsAgain.dimensionProgress.j_mid1, rsAfter.dimensionProgress.j_mid1, '覆盖不增加已提交数');
+  assert.equal(
+    rsAgain.dimensionProgress.completeness.submitted,
+    rsAfter.dimensionProgress.completeness.submitted,
+    '覆盖不增加已提交数',
+  );
+
+  // 3c. 给**已有的种子评委**那支队补一格（下一个判别性 A7 依赖这个差异）
+  const reviewGamma = await api.post('/api/stages/stage_final/reviews', {
+    items: [{ teamId: 't_gamma', dimension: 'completeness', rawScore: 90 }],
+  });
+  assert.equal(reviewGamma.submitted, 1);
+  const rsThird = await api.get('/api/stages/stage_final/review-state');
+  assert.equal(rsThird.submitted, rsAgain.submitted + 1, '换一支队 = 新增一格（不是覆盖）');
 
   // ── 4. 计算 ────────────────────────────────────────────────────
   const computed = await api.post('/api/stages/stage_final/compute', {});
@@ -8500,7 +8610,8 @@ test('演示线全链路：报名 → 组队 → 打分 → 计算 → 发榜 �
       memberIds: ['mba_captain', 'demo_member_1'],
     });
     await fresh.post('/api/stages/stage_final/reviews', {
-      items: [{ judgeId: 'j_mid1', teamId: 'team_demo_1', dimension: 'completeness', rawScore: 80 }],
+      // ⚠️ 同上：body 里**不带 judgeId**（评委来自会话）
+      items: [{ teamId: 'team_demo_1', dimension: 'completeness', rawScore: 80 }],
     });
     return fresh.post('/api/stages/stage_final/compute', {});
   })();

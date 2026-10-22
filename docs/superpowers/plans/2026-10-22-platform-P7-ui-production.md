@@ -383,7 +383,11 @@ export function barRow({ label = '', value = 0, max = null, note = '', tone: t =
   const v = Number(value) || 0;
   const m = max === null || max === undefined || Number(max) <= 0 ? Math.max(v, 1) : Number(max);
   const pct = Math.max(0, Math.min(100, Math.round((v / m) * 100)));
-  const noteHtml = note ? `<span class="bar__note">${escapeHtml(note)}</span>` : '';
+  // ⚠️ 备注前必须加**分隔符**（P8 实测发现的真问题）：
+  //    值与备注是**相邻**的两个 span，中间只有一个 4px 的视觉间距 ——
+  //    于是「1」（1 支队伍）+「25%」（占比）在**文本提取 / 读屏**里拼成「125%」，
+  //    一个**假数字**。⇒ 统一加「·」分隔，文本与视觉都读得对。
+  const noteHtml = note ? `<span class="bar__note">· ${escapeHtml(note)}</span>` : '';
   return `<div class="bar">
     <span class="bar__label">${escapeHtml(label)}</span>
     <span class="bar__track"><span class="bar__fill bar__fill--${tone(t)}" style="width:${pct}%"></span></span>
@@ -500,8 +504,9 @@ export const GUEST = { label: '访客', group: 'guest' };
  *   - `roles: [...]` ⇒ 需要命中其中任一角色；
  *   - `exact: true` ⇒ 只有路径完全相等才算「当前页」（否则 '/tasks' 会把 '/tasks/x' 也点亮）。
  *
- * ⛔ 「评审台」分区**故意留空**：评审打分页属于下一轮（补端点），
- *   现在放一个空分区等于放一个死入口 —— 等页面真的存在时再加这一条数据。
+ * ⛔ 「评审台」分区在 **P8 之前**故意留空：评审打分页当时不存在，
+ *   放一个空分区等于放一个死入口 —— 等页面真的存在时再加这一条数据。
+ *   ⇒ P8 起补上「评审席」分区（评审打分）与组委会分区里的「赛段发榜」。
  */
 export const NAV_SECTIONS = [
   {
@@ -524,6 +529,17 @@ export const NAV_SECTIONS = [
     ],
   },
   {
+    // ⚠️ **不按角色限定**：评委席位是**赛段级**指派的（stage_judges 表），
+    //   前端手里没有「你是不是本赛段评委」这个信息 ⇒ 硬按角色限定会**误伤**。
+    //   能不能进评审页由 API 裁决（403 → 错误态说清缺什么权限），沿用 DP-77。
+    id: 'reviewer',
+    label: '评审席',
+    auth: true,
+    items: [
+      { path: '/review', label: '评审打分' },
+    ],
+  },
+  {
     id: 'committee',
     label: '组委会',
     auth: true,
@@ -531,6 +547,7 @@ export const NAV_SECTIONS = [
     items: [
       { path: '/admin/registration', label: '报名筛选台' },
       { path: '/flags', label: '复核队列' },
+      { path: '/publish', label: '赛段发榜' },
     ],
   },
 ];
@@ -558,6 +575,9 @@ export const PROTECTED_ROUTES = [
   { pattern: /^\/admin(\/|$)/, auth: true },
   { pattern: /^\/flags\/?$/, auth: true },
   { pattern: /^\/audit(\/|$)/, auth: true },
+  // P8：评审打分与赛段发榜都需要登录
+  { pattern: /^\/review(\/|$)/, auth: true },
+  { pattern: /^\/publish(\/|$)/, auth: true },
 ];
 
 /** 取用户身上的角色键数组（宽容处理各种形状）。 */
@@ -1264,6 +1284,15 @@ const VIEW_ENDPOINTS = [
   { method: 'GET', path: '/api/audit/flags' },
   { method: 'GET', path: '/api/audit/computations/cmp_demo_1' },
   { method: 'GET', path: '/api/audit/computations/cmp_demo_1/diff' },
+  // P8：评审打分页与赛段发榜页用到的三个端点
+  { method: 'GET', path: '/api/stages/stage_final/review-board' },
+  { method: 'GET', path: '/api/stages/stage_final/review-state' },
+  {
+    method: 'POST',
+    path: '/api/stages/stage_final/reviews',
+    // ⚠️ **body 里没有 judgeId** —— 真实后端从**会话**取评委（P8 修正演示适配器时发现的形状不一致）
+    body: { items: [{ teamId: 't_alpha', dimension: 'innovation', rawScore: 90 }] },
+  },
 ];
 
 test('演示适配器必须实现前端用到的**每一个**端点（缺一个 ⇒ 演示站那页就是 404）', async () => {
@@ -1486,6 +1515,59 @@ test('演示运行时：并发调用共享同一次加载（不该打 N 次请�
   } finally {
     globalThis.fetch = original;
   }
+});
+
+// ══════════════════════════════════════════════════════════════════
+// P8：评审工作台的**形状**必须与真实后端逐字段一致
+// ══════════════════════════════════════════════════════════════════
+
+test('演示适配器的评审工作台：形状与真实后端 getReviewBoard 一致', async () => {
+  const { api } = await bootDemo();
+  const b = await api.get('/api/stages/stage_final/review-board');
+  assert.ok(b.stage?.id, '必须有赛段摘要');
+  assert.ok(typeof b.stage.name === 'string');
+  assert.ok(typeof b.stage.scoringConfigKey === 'string');
+  assert.ok(Array.isArray(b.dimensions) && b.dimensions.length > 0, '必须有维度表');
+  assert.ok(b.dimensions.every((d) => typeof d.key === 'string' && typeof d.name === 'string'));
+  assert.ok(b.dimensions.every((d) => typeof d.weight === 'number'), '维度必须带权重');
+  assert.ok(Array.isArray(b.judgeDimensions), '必须有评委席维度');
+  assert.ok(b.judgeDimensions.every((d) => d.seat === 'judge'), '评委席维度不能混进企业席');
+  assert.ok(Array.isArray(b.teams) && b.teams.length > 0, '必须有赛段名册');
+  assert.ok(b.teams.every((t) => typeof t.id === 'string' && typeof t.name === 'string'), '名册必须带队名');
+  assert.ok(Array.isArray(b.myScores), '必须有 myScores 数组');
+  assert.ok(typeof b.progress.total === 'number', '进度必须有 total');
+  assert.ok(Array.isArray(b.progress.missing), '进度必须有 missing');
+  assert.ok(b.progress.scope === 'mine' || b.progress.scope === 'stage', '进度必须标明口径（mine / stage）');
+  assert.ok(b.progress.dimensionProgress && typeof b.progress.dimensionProgress === 'object');
+});
+
+test('演示适配器的评审进度：dimensionProgress 按**维度**分组（不是按评委）', async () => {
+  const { api } = await bootDemo();
+  const st = await api.get('/api/stages/stage_final/review-state');
+  assert.equal(typeof st.total, 'number', '必须有 total（真实后端有，演示原来没有）');
+  assert.ok(Array.isArray(st.missing), '必须有 missing');
+  for (const [dim, v] of Object.entries(st.dimensionProgress ?? {})) {
+    assert.ok(
+      typeof v === 'object' && typeof v.submitted === 'number' && typeof v.total === 'number',
+      `维度 ${dim} 的进度必须是 {submitted, total}（真实后端的形状），实际：${JSON.stringify(v)}`,
+    );
+  }
+});
+
+test('演示适配器：打分走**会话**里的评委（body 里没有 judgeId 也能记上）', async () => {
+  const { api } = await bootDemo();
+  const before = await api.get('/api/stages/stage_final/review-board');
+  const res = await api.post('/api/stages/stage_final/reviews', {
+    items: [{ teamId: 't_alpha', dimension: 'innovation', rawScore: 90 }],
+  });
+  assert.equal(res.submitted, 1);
+  assert.ok(res.judgeId, '必须回显评委（来自会话）');
+  const after = await api.get('/api/stages/stage_final/review-board');
+  assert.ok(
+    after.myScores.some((s) => s.dimension === 'innovation' && s.rawScore === 90),
+    '打的那一分必须出现在 myScores 里（否则前端「提交成功但进度不涨」）',
+  );
+  assert.ok(after.progress.submitted > before.progress.submitted, '进度必须涨');
 });
 ```
 

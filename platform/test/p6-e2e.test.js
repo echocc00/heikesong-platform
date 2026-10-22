@@ -142,28 +142,48 @@ test('演示线全链路：报名 → 组队 → 打分 → 计算 → 发榜 �
   const rsBefore = await api.get('/api/stages/stage_final/review-state');
 
   // 3a. 给**新建的验收队**打一条（全新的一格：评委 × 队 × 维度）
+  // ⚠️ **body 里没有 judgeId**（P8 修正）：真实后端从**会话**取评委
+  //    （src/http/routes/review.js：`judgeId: ctx.user.id`）⇒ 演示适配器原先
+  //    从 body 里读 judgeId = 与真实后端**形状不一致**（演示站会记到空评委名下）。
   const reviewNew = await api.post('/api/stages/stage_final/reviews', {
-    items: [{ judgeId: 'j_mid1', teamId: team.id, dimension: 'completeness', rawScore: 80 }],
+    items: [{ teamId: team.id, dimension: 'completeness', rawScore: 80 }],
   });
   assert.equal(reviewNew.submitted, 1);
   assert.equal(reviewNew.stageId, 'stage_final');
+  assert.ok(reviewNew.judgeId, '必须回显评委（来自会话）');
 
   // 判别性A6：这一条真的进了「已提交」统计
   const rsAfter = await api.get('/api/stages/stage_final/review-state');
   assert.equal(rsAfter.submitted, rsBefore.submitted + 1, '提交的分数必须计入 review-state');
+  // ⚠️ 进度按**维度**分组（与真实后端一致）：{ 维度键: {submitted, total} }
   assert.equal(
-    rsAfter.dimensionProgress.j_mid1, rsBefore.dimensionProgress.j_mid1 + 1,
-    '该评委的已提交数必须 +1',
+    rsAfter.dimensionProgress.completeness.submitted,
+    rsBefore.dimensionProgress.completeness.submitted + 1,
+    '该维度的已提交数必须 +1',
   );
 
-  // 3b. 给**已有的格子**改分（覆盖，不是累加）
+  // 3b. 给**刚才那一格**改分（覆盖，不是累加）
+  // ⚠️ 必须是**同一个评委**（同一个会话）改**同一个**格子 ⇒ 才测得到「覆盖」；
+  //    换一支队就不是覆盖，而是新增一格（那由 3c 单独测）。
   const reviewOverwrite = await api.post('/api/stages/stage_final/reviews', {
-    items: [{ judgeId: 'j_mid1', teamId: 't_gamma', dimension: 'completeness', rawScore: 88 }],
+    items: [{ teamId: team.id, dimension: 'completeness', rawScore: 88 }],
   });
   assert.equal(reviewOverwrite.submitted, 1);
   const rsAgain = await api.get('/api/stages/stage_final/review-state');
   assert.equal(rsAgain.submitted, rsAfter.submitted, '同一评委同一队同一维度重复打分必须覆盖，不能累加');
-  assert.equal(rsAgain.dimensionProgress.j_mid1, rsAfter.dimensionProgress.j_mid1, '覆盖不增加已提交数');
+  assert.equal(
+    rsAgain.dimensionProgress.completeness.submitted,
+    rsAfter.dimensionProgress.completeness.submitted,
+    '覆盖不增加已提交数',
+  );
+
+  // 3c. 给**已有的种子评委**那支队补一格（下一个判别性 A7 依赖这个差异）
+  const reviewGamma = await api.post('/api/stages/stage_final/reviews', {
+    items: [{ teamId: 't_gamma', dimension: 'completeness', rawScore: 90 }],
+  });
+  assert.equal(reviewGamma.submitted, 1);
+  const rsThird = await api.get('/api/stages/stage_final/review-state');
+  assert.equal(rsThird.submitted, rsAgain.submitted + 1, '换一支队 = 新增一格（不是覆盖）');
 
   // ── 4. 计算 ────────────────────────────────────────────────────
   const computed = await api.post('/api/stages/stage_final/compute', {});
@@ -180,7 +200,8 @@ test('演示线全链路：报名 → 组队 → 打分 → 计算 → 发榜 �
       memberIds: ['mba_captain', 'demo_member_1'],
     });
     await fresh.post('/api/stages/stage_final/reviews', {
-      items: [{ judgeId: 'j_mid1', teamId: 'team_demo_1', dimension: 'completeness', rawScore: 80 }],
+      // ⚠️ 同上：body 里**不带 judgeId**（评委来自会话）
+      items: [{ teamId: 'team_demo_1', dimension: 'completeness', rawScore: 80 }],
     });
     return fresh.post('/api/stages/stage_final/compute', {});
   })();

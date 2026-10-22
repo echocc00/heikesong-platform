@@ -27,7 +27,7 @@
   --fg: #e6e9ef;
   --fg-strong: #f7f9fc;
   --fg-muted: #98a2b3;
-  --fg-subtle: #6b7688;
+  --fg-subtle: #808b9b;
 
   --border: #232a38;
   --border-strong: #313a4d;
@@ -35,16 +35,23 @@
   --brand: #4c8dff;
   --brand-strong: #75a6ff;
   --brand-soft: rgba(76, 141, 255, 0.14);
-  --on-brand: #ffffff;
+  /* ⚠️ --on-brand 是**压在 --brand 实底上的文字色**，不是「品牌色文字」。
+   *    实底上的文字必须满足 4.5:1（WCAG AA 普通文本）——
+   *    白字压 #4c8dff 只有 3.20:1（不合格），
+   *    而深色底字 #0b0e14 压 #4c8dff 是 6.04:1（合格）。
+   *    ⇒ 实底按钮/徽标用深色字，--brand 本身继续做「文字与描边色」
+   *      （#4c8dff 压 --bg 是 6.04:1，作为文字色合格）。 */
+  --on-brand: #0b0e14;
 
   --success: #35c88a;
   --success-soft: rgba(53, 200, 138, 0.14);
   --warn: #f0b429;
   --warn-soft: rgba(240, 180, 41, 0.14);
-  --danger: #f2555a;
-  --danger-soft: rgba(242, 85, 90, 0.14);
+  --danger: #f56e72;
+  --danger-soft: rgba(245, 110, 114, 0.14);
   --info: #38bdf8;
   --info-soft: rgba(56, 189, 248, 0.14);
+  --on-danger: #0b0e14;
 
   /* 间距（4px 基数） */
   --sp-1: 4px;  --sp-2: 8px;   --sp-3: 12px; --sp-4: 16px;
@@ -88,7 +95,7 @@
   --fg: #1c2430;
   --fg-strong: #0d1218;
   --fg-muted: #5b6675;
-  --fg-subtle: #7d8796;
+  --fg-subtle: #636d7b;
 
   --border: #dfe4ec;
   --border-strong: #c4ccd9;
@@ -98,14 +105,15 @@
   --brand-soft: rgba(37, 99, 235, 0.10);
   --on-brand: #ffffff;
 
-  --success: #0f9d58;
-  --success-soft: rgba(15, 157, 88, 0.12);
-  --warn: #b7791f;
-  --warn-soft: rgba(183, 121, 31, 0.14);
-  --danger: #d93036;
-  --danger-soft: rgba(217, 48, 54, 0.12);
-  --info: #0284c7;
-  --info-soft: rgba(2, 132, 199, 0.12);
+  --success: #0a6d3c;
+  --success-soft: rgba(10, 109, 60, 0.12);
+  --warn: #7f5314;
+  --warn-soft: rgba(127, 83, 20, 0.14);
+  --danger: #bb2228;
+  --danger-soft: rgba(187, 34, 40, 0.12);
+  --info: #02689d;
+  --info-soft: rgba(2, 104, 157, 0.12);
+  --on-danger: #ffffff;
 
   --sh-1: 0 1px 2px rgba(16, 24, 40, 0.06);
   --sh-2: 0 4px 14px rgba(16, 24, 40, 0.08);
@@ -124,7 +132,7 @@
     --fg: #1c2430;
     --fg-strong: #0d1218;
     --fg-muted: #5b6675;
-    --fg-subtle: #7d8796;
+    --fg-subtle: #636d7b;
 
     --border: #dfe4ec;
     --border-strong: #c4ccd9;
@@ -134,14 +142,15 @@
     --brand-soft: rgba(37, 99, 235, 0.10);
     --on-brand: #ffffff;
 
-    --success: #0f9d58;
-    --success-soft: rgba(15, 157, 88, 0.12);
-    --warn: #b7791f;
-    --warn-soft: rgba(183, 121, 31, 0.14);
-    --danger: #d93036;
-    --danger-soft: rgba(217, 48, 54, 0.12);
-    --info: #0284c7;
-    --info-soft: rgba(2, 132, 199, 0.12);
+    --success: #0a6d3c;
+    --success-soft: rgba(10, 109, 60, 0.12);
+    --warn: #7f5314;
+    --warn-soft: rgba(127, 83, 20, 0.14);
+    --danger: #bb2228;
+    --danger-soft: rgba(187, 34, 40, 0.12);
+    --info: #02689d;
+    --info-soft: rgba(2, 104, 157, 0.12);
+    --on-danger: #ffffff;
 
     --sh-1: 0 1px 2px rgba(16, 24, 40, 0.06);
     --sh-2: 0 4px 14px rgba(16, 24, 40, 0.08);
@@ -347,12 +356,16 @@ pre {
 .btn:disabled { opacity: .45; cursor: not-allowed; filter: none; }
 .btn--primary { background: var(--brand); color: var(--on-brand); }
 .btn--ghost { background: transparent; border-color: var(--border-strong); color: var(--fg); }
-.btn--danger { background: var(--danger); color: #fff; }
+.btn--danger { background: var(--danger); color: var(--on-danger); }
 .btn--sm { padding: var(--sp-1) var(--sp-3); font-size: var(--fs-sm); }
 .btn--block { width: 100%; }
 .btn.is-static { cursor: default; color: var(--fg-muted); }
 .btn.is-static:hover { filter: none; }
 .btn-group { display: inline-flex; gap: var(--sp-2); flex-wrap: wrap; }
+
+/* ⚠️ **图标尺寸**：SVG 图标必须显式给尺寸，否则在 flex 容器里会被拉伸变形。
+ *    图标默认垂直居中（inline-block 的 baseline 对齐会让它偏下 1-2px）。 */
+.icon { flex: 0 0 auto; vertical-align: middle; }
 
 /* ─────────────────────────────────────────────────────────────────────────
  * ⑦ 徽章 / 状态
@@ -497,7 +510,9 @@ pre {
 
 .bar { display: grid; grid-template-columns: minmax(96px, 26%) 1fr auto; gap: var(--sp-3); align-items: center; margin-bottom: var(--sp-2); }
 .bar__label { font-size: var(--fs-sm); color: var(--fg-muted); }
-.bar__track { height: 8px; border-radius: var(--r-full); background: var(--surface-sunken); overflow: hidden; }
+/* 内联 SVG 图标（web/icons.js）：跟着所在文字的颜色走，别变成一个异色方块。
+   ⚠️ P8 的 class 差集核对查出来的**唯一**一个缺口（P6 遗留）。 */
+.icon { flex: none; fill: currentColor; vertical-align: -0.15em; }.bar__track { height: 8px; border-radius: var(--r-full); background: var(--surface-sunken); overflow: hidden; }
 .bar__fill { display: block; height: 100%; border-radius: var(--r-full); background: var(--brand); }
 .bar__fill--success { background: var(--success); }
 .bar__fill--warn { background: var(--warn); }
@@ -605,6 +620,12 @@ label > input, label > select, label > textarea { margin-top: var(--sp-1); }
 
 /* 视图根：给「分段的语义色」留出呼吸位 */
 .apply, .team, .tasks, .flags-queue, .audit-trace, .admin-registration, .task-index, .home { display: block; }
+
+/* P8：评审打分页与赛段发榜页 */
+.review-view, .publish-view { display: block; }
+/* 表单反馈区（提交成功/失败后就地显示）：空的时候不占位 */
+.form-feedback:not(:empty) { margin-top: var(--sp-3); }
+.review-view .panel + .panel { margin-top: var(--sp-4); }
 
 .team-card { border: 1px solid var(--border); border-radius: var(--r-lg); padding: var(--sp-4); background: var(--surface); }
 .biz-card { margin: 0; }

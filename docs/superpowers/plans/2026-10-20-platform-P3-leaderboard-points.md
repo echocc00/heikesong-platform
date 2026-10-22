@@ -5173,7 +5173,9 @@ function businessRowsHtml(rows, meta) {
         label: '里程碑达成',
         value: r?.achievedCount ?? done.length,
         max: total,
-        note: `/ ${total}`,
+        // ⚠️ 备注改成「共 N」（不是「/ N」）：条形图的值与备注是相邻的两段文本，
+        //    「/ N」拼上去会变成「3/ 5」这种怪读法；「共 5」更清楚。
+        note: `共 ${total}`,
         tone: 'success',
       })}
       <ul class="milestones">${items || '<li class="muted">暂无数据</li>'}</ul>

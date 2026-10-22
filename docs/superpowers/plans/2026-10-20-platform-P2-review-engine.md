@@ -4120,6 +4120,61 @@ export function listStages(db, { editionId } = {}) {
 }
 
 /**
+ * 赛段**摘要**列表（P7 新增，给前端做赛段选择器 / 赛事时间线）。
+ *
+ * ⚠️ 为什么另起一个函数而不是直接复用 listStages()：
+ *    listStages 返回 `SELECT *`（含 freeze_at / scoring_config_key 等内部字段），
+ *    那是对内形状；对外只暴露「哪一段、叫什么、什么时候、什么状态」这四项。
+ *    ⛔ 仍然**不做任何可见性过滤** —— 赛段时间线是公开赛事信息，
+ *    真正需要按人过滤的是评分与名单（那些走 /api/leaderboard 等端点）。
+ */
+export function listStageSummaries(db, { editionId } = {}) {
+  const sql = `SELECT id, "key" AS key, name, kind, status, starts_at AS startsAt, ends_at AS endsAt
+                 FROM stages ${editionId ? 'WHERE edition_id = ?' : ''}
+                ORDER BY starts_at, id`;
+  return editionId ? db.prepare(sql).all(editionId) : db.prepare(sql).all();
+}
+
+/**
+ * 赛段**名册**（带队名与任务包标题）—— P8 新增，给前端「评审打分页」用。
+ *
+ * ⚠️ 为什么不能直接用 `listStageTeams`：
+ *    `listStageTeams` 只返回 `{ teamId, packageEnterpriseId, isFreeBrief }` ——
+ *    **没有队名**。前端要渲染「队伍名 + 任务包」，没有队名就没法显示。
+ *    ⇒ 这里 JOIN 出队名与任务包标题。
+ *
+ * ⚠️ 名册口径与 listStageTeams **保持一致**（同一张表、同一 edition 口径、同样过滤软删除）：
+ *    两个函数口径一旦分叉，评审页看到的队伍就会和计算时算的队伍**不是同一批** ——
+ *    那是最难查的一类 bug（榜单里凭空少一支队）。
+ *
+ * ⚠️ **排序兜底键用 SQLite 隐式 `rowid`**（全局约束）：
+ *    `t.id` 是 `crypto.randomUUID()` ⇒ **随机 UUID** ⇒ 排序随机 ⇒ 列表顺序每次刷新都可能变。
+ *    `created_at` 相等时由 `rowid`（插入顺序）兜底 ⇒ 顺序确定。
+ */
+export function listStageTeamRows(db, stageId) {
+  return db
+    .prepare(
+      `SELECT t.id AS team_id, t.name AS team_name, t.task_package_id,
+              tp.title AS package_title, tp.enterprise_id AS package_enterprise_id,
+              COALESCE(tp.is_free_brief, 0) AS is_free_brief
+       FROM teams t
+       LEFT JOIN task_packages tp ON tp.id = t.task_package_id
+       WHERE t.edition_id = (SELECT edition_id FROM stages WHERE id = ?)
+         AND t.deleted_at IS NULL
+       ORDER BY t.created_at, t.rowid`,
+    )
+    .all(stageId)
+    .map((r) => ({
+      id: r.team_id,
+      name: r.team_name,
+      taskPackageId: r.task_package_id ?? null,
+      taskPackageTitle: r.package_title ?? null,
+      enterpriseId: r.package_enterprise_id ?? null,
+      isFreeBrief: !!r.is_free_brief,
+    }));
+}
+
+/**
  * 默认利益冲突声明正文（评委被分配到赛段时即签署）。
  * 评委可另行声明存在冲突 → `has_conflict = 1` → 逐案回避（R-JDG-09 / R-JDG-18）。
  */
@@ -4599,7 +4654,7 @@ import {
   insertCalibration,
   applyScoreStatDelta,
 } from '../db/repo/reviews.js';
-import { listStageJudges, getStageJudge, getStage, listStageTeams } from '../db/repo/stages.js';
+import { listStageJudges, getStageJudge, getStage, listStageTeams, listStageTeamRows } from '../db/repo/stages.js';
 import { claimRequestKey } from '../db/repo/request-keys.js';
 import { insertEnterpriseConfirmation, listEnterpriseConfirmations } from '../db/repo/enterprise-confirmations.js';
 import { findPeerReviewsByRequestId, findPeerReview, insertPeerReview, updatePeerReviewScore } from '../db/repo/peer-reviews.js';
@@ -4840,6 +4895,66 @@ export function getReviewState({ db, stageId, viewer, dimensions = null }) {
   const submitted = isAdmin ? all.length : all.filter((r) => r.judge_id === viewer?.userId).length;
   const total = isAdmin ? judges.length * teams.length * dimList.length : teams.length * dimList.length;
   return { submitted, total, missing, dimensionProgress };
+}
+
+/**
+ * 评审工作台（**只读**）：一次拿齐前端拼评分表单要的三样东西。
+ *
+ * ⚠️ 为什么需要这个函数（P8）：
+ *   前端要显示「本赛段有哪些队伍 + 有哪些可打分维度 + 我已经给了多少分」，
+ *   而这三样东西原先**分散在三个地方，且都没有对外读口**：
+ *     名册   → listStageTeams（仓储层，且**只有 teamId、没有队名**）
+ *     维度   → rules.scoring[stage.scoring_config_key].dimensions（规则文件）
+ *     我的分 → stage_reviews（**没有任何读端点**）
+ *   ⇒ 前端要么拼三个请求（慢），更要命的是**三个口径会各自漂移**
+ *      （名册口径与维度口径不在一处 ⇒ 前端拼出来的表可能自相矛盾）。
+ *
+ * ⛔ **只返回本人的分**（`myScores`）：改分要回填本人已给的分；
+ *    别人的分不该出现在评审页上（全局可见性由 filterVisibleScores 管，本页不需要那份全局数组）。
+ */
+export function getReviewBoard({ db, stageId, viewer, rules = null }) {
+  const stage = getStage(db, stageId);
+  if (!stage) throw fail(404, 'STAGE_NOT_FOUND', '赛段不存在');
+  const config = rules?.scoring?.[stage.scoring_config_key];
+  if (!config) {
+    throw fail(500, 'SCORING_CONFIG_MISSING', `赛段 ${stageId} 指向的权重表 ${stage.scoring_config_key} 不存在`);
+  }
+  const dimensions = (config.dimensions ?? []).map((d) => ({
+    key: d.key,
+    name: d.name,
+    weight: d.weight,
+    seat: d.seat,
+  }));
+  // 评委只能给**评委席**维度打分（与 POST /reviews 的维度白名单同一口径）
+  const judgeDimensions = dimensions.filter((d) => d.seat === 'judge');
+  const teams = listStageTeamRows(db, stageId);
+  const myScores = listReviews(db, { stageId, judgeId: viewer?.userId ?? null })
+    .map((r) => ({ teamId: r.team_id, dimension: r.dimension, rawScore: r.raw_score }));
+  const progress = getReviewState({
+    db,
+    stageId,
+    viewer: { userId: viewer?.userId ?? null, isAdmin: viewer?.isAdmin === true },
+    dimensions: judgeDimensions.map((d) => d.key),
+  });
+  return {
+    stage: {
+      id: stage.id,
+      key: stage.key,
+      name: stage.name,
+      kind: stage.kind,
+      status: stage.status,
+      scoringConfigKey: stage.scoring_config_key,
+    },
+    dimensions,
+    judgeDimensions,
+    teams,
+    myScores,
+    // ⚠️ **scope 必须带上**（P8 DP-99）：getReviewState 对两种身份返回的是**两套口径** ——
+    //    组委会 = 全赛段（已交 N 格 / 缺了谁的哪一格），评委 = 只看自己（我还差几格）。
+    //    前端拿到同一个 {submitted,total,missing} 却不知道是哪套口径 ⇒
+    //    标签必然有一半是错的（这正是 P7 的 B1「数字与标签对不上」的同款事故）。
+    progress: { ...progress, scope: viewer?.isAdmin === true ? 'stage' : 'mine' },
+  };
 }
 
 /** 校准打分（R-JDG-12）：写 calibrations，【不计入评分】 */
@@ -8102,6 +8217,7 @@ import { AppError } from '../../errors.js';
 import {
   submitReviews,
   getReviewState,
+  getReviewBoard,
   submitCalibration,
   submitPeerReviews,
   submitSelfReviews,
@@ -8286,6 +8402,28 @@ export function registerReviewRoutes(router) {
         viewer: { userId: ctx.user.id, isAdmin: isCommittee(ctx) },
         dimensions: stateDimensions,
       }),
+    });
+  });
+
+  // ⛔ P8：评审工作台（只读，一次拿齐「名册 + 维度 + 我的分 + 进度」）
+  //    前端要拼评分表单，但名册/维度/我的分原先分散在仓储层、规则文件与 stage_reviews 里，
+  //    **一个对外读口都没有** ⇒ 前端要么猜口径、要么拼三个请求。
+  router.add('GET', '/api/stages/:stageId/review-board', async (ctx) => {
+    requireUser(ctx);
+    // ⚠️ 权限闸门与 `GET /api/stages/:stageId/review-state` **完全同口径**：
+    //    组委会 / 有 score:read（赛段级或全局）/ 本赛段评委 ⇒ 否则 403。
+    //    ⚠️ 不按角色判（全局约束：可见性与授权在 API 层裁决），只认能力点与评委身份。
+    if (!isCommittee(ctx)
+      && !ctx.can('score:read', { scopeType: 'stage', scopeId: ctx.params.stageId })
+      && !ctx.can('score:read', { scopeType: 'global' })
+      && !getStageJudge(ctx.db, ctx.params.stageId, ctx.user.id)) {
+      throw new AppError(403, 'FORBIDDEN', '没有查看评审工作台的权限');
+    }
+    return getReviewBoard({
+      db: ctx.db,
+      stageId: ctx.params.stageId,
+      viewer: { userId: ctx.user.id, isAdmin: isCommittee(ctx) },
+      rules: ctx.rules,
     });
   });
 

@@ -33,7 +33,7 @@ import {
   insertCalibration,
   applyScoreStatDelta,
 } from '../db/repo/reviews.js';
-import { listStageJudges, getStageJudge, getStage, listStageTeams } from '../db/repo/stages.js';
+import { listStageJudges, getStageJudge, getStage, listStageTeams, listStageTeamRows } from '../db/repo/stages.js';
 import { claimRequestKey } from '../db/repo/request-keys.js';
 import { insertEnterpriseConfirmation, listEnterpriseConfirmations } from '../db/repo/enterprise-confirmations.js';
 import { findPeerReviewsByRequestId, findPeerReview, insertPeerReview, updatePeerReviewScore } from '../db/repo/peer-reviews.js';
@@ -274,6 +274,66 @@ export function getReviewState({ db, stageId, viewer, dimensions = null }) {
   const submitted = isAdmin ? all.length : all.filter((r) => r.judge_id === viewer?.userId).length;
   const total = isAdmin ? judges.length * teams.length * dimList.length : teams.length * dimList.length;
   return { submitted, total, missing, dimensionProgress };
+}
+
+/**
+ * 评审工作台（**只读**）：一次拿齐前端拼评分表单要的三样东西。
+ *
+ * ⚠️ 为什么需要这个函数（P8）：
+ *   前端要显示「本赛段有哪些队伍 + 有哪些可打分维度 + 我已经给了多少分」，
+ *   而这三样东西原先**分散在三个地方，且都没有对外读口**：
+ *     名册   → listStageTeams（仓储层，且**只有 teamId、没有队名**）
+ *     维度   → rules.scoring[stage.scoring_config_key].dimensions（规则文件）
+ *     我的分 → stage_reviews（**没有任何读端点**）
+ *   ⇒ 前端要么拼三个请求（慢），更要命的是**三个口径会各自漂移**
+ *      （名册口径与维度口径不在一处 ⇒ 前端拼出来的表可能自相矛盾）。
+ *
+ * ⛔ **只返回本人的分**（`myScores`）：改分要回填本人已给的分；
+ *    别人的分不该出现在评审页上（全局可见性由 filterVisibleScores 管，本页不需要那份全局数组）。
+ */
+export function getReviewBoard({ db, stageId, viewer, rules = null }) {
+  const stage = getStage(db, stageId);
+  if (!stage) throw fail(404, 'STAGE_NOT_FOUND', '赛段不存在');
+  const config = rules?.scoring?.[stage.scoring_config_key];
+  if (!config) {
+    throw fail(500, 'SCORING_CONFIG_MISSING', `赛段 ${stageId} 指向的权重表 ${stage.scoring_config_key} 不存在`);
+  }
+  const dimensions = (config.dimensions ?? []).map((d) => ({
+    key: d.key,
+    name: d.name,
+    weight: d.weight,
+    seat: d.seat,
+  }));
+  // 评委只能给**评委席**维度打分（与 POST /reviews 的维度白名单同一口径）
+  const judgeDimensions = dimensions.filter((d) => d.seat === 'judge');
+  const teams = listStageTeamRows(db, stageId);
+  const myScores = listReviews(db, { stageId, judgeId: viewer?.userId ?? null })
+    .map((r) => ({ teamId: r.team_id, dimension: r.dimension, rawScore: r.raw_score }));
+  const progress = getReviewState({
+    db,
+    stageId,
+    viewer: { userId: viewer?.userId ?? null, isAdmin: viewer?.isAdmin === true },
+    dimensions: judgeDimensions.map((d) => d.key),
+  });
+  return {
+    stage: {
+      id: stage.id,
+      key: stage.key,
+      name: stage.name,
+      kind: stage.kind,
+      status: stage.status,
+      scoringConfigKey: stage.scoring_config_key,
+    },
+    dimensions,
+    judgeDimensions,
+    teams,
+    myScores,
+    // ⚠️ **scope 必须带上**（P8 DP-99）：getReviewState 对两种身份返回的是**两套口径** ——
+    //    组委会 = 全赛段（已交 N 格 / 缺了谁的哪一格），评委 = 只看自己（我还差几格）。
+    //    前端拿到同一个 {submitted,total,missing} 却不知道是哪套口径 ⇒
+    //    标签必然有一半是错的（这正是 P7 的 B1「数字与标签对不上」的同款事故）。
+    progress: { ...progress, scope: viewer?.isAdmin === true ? 'stage' : 'mine' },
+  };
 }
 
 /** 校准打分（R-JDG-12）：写 calibrations，【不计入评分】 */

@@ -45,6 +45,45 @@ export function listStageSummaries(db, { editionId } = {}) {
 }
 
 /**
+ * 赛段**名册**（带队名与任务包标题）—— P8 新增，给前端「评审打分页」用。
+ *
+ * ⚠️ 为什么不能直接用 `listStageTeams`：
+ *    `listStageTeams` 只返回 `{ teamId, packageEnterpriseId, isFreeBrief }` ——
+ *    **没有队名**。前端要渲染「队伍名 + 任务包」，没有队名就没法显示。
+ *    ⇒ 这里 JOIN 出队名与任务包标题。
+ *
+ * ⚠️ 名册口径与 listStageTeams **保持一致**（同一张表、同一 edition 口径、同样过滤软删除）：
+ *    两个函数口径一旦分叉，评审页看到的队伍就会和计算时算的队伍**不是同一批** ——
+ *    那是最难查的一类 bug（榜单里凭空少一支队）。
+ *
+ * ⚠️ **排序兜底键用 SQLite 隐式 `rowid`**（全局约束）：
+ *    `t.id` 是 `crypto.randomUUID()` ⇒ **随机 UUID** ⇒ 排序随机 ⇒ 列表顺序每次刷新都可能变。
+ *    `created_at` 相等时由 `rowid`（插入顺序）兜底 ⇒ 顺序确定。
+ */
+export function listStageTeamRows(db, stageId) {
+  return db
+    .prepare(
+      `SELECT t.id AS team_id, t.name AS team_name, t.task_package_id,
+              tp.title AS package_title, tp.enterprise_id AS package_enterprise_id,
+              COALESCE(tp.is_free_brief, 0) AS is_free_brief
+       FROM teams t
+       LEFT JOIN task_packages tp ON tp.id = t.task_package_id
+       WHERE t.edition_id = (SELECT edition_id FROM stages WHERE id = ?)
+         AND t.deleted_at IS NULL
+       ORDER BY t.created_at, t.rowid`,
+    )
+    .all(stageId)
+    .map((r) => ({
+      id: r.team_id,
+      name: r.team_name,
+      taskPackageId: r.task_package_id ?? null,
+      taskPackageTitle: r.package_title ?? null,
+      enterpriseId: r.package_enterprise_id ?? null,
+      isFreeBrief: !!r.is_free_brief,
+    }));
+}
+
+/**
  * 默认利益冲突声明正文（评委被分配到赛段时即签署）。
  * 评委可另行声明存在冲突 → `has_conflict = 1` → 逐案回避（R-JDG-09 / R-JDG-18）。
  */

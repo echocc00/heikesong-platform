@@ -8137,6 +8137,8 @@ import { renderFlags } from './views/flags.js';
 import { renderTasks } from './views/tasks.js';
 import { renderTaskIndex } from './views/task-index.js';
 import { renderHome } from './views/home.js';
+import { renderReview } from './views/review.js';
+import { renderPublish } from './views/publish.js';
 import { escapeHtml } from './escape.js';
 
 // 演示版：?demo=1 时用 localStorage 适配器；正式版走真实 API。
@@ -8175,6 +8177,13 @@ route('/flags', (c) => renderFlags(c));
 route('/tasks/:workflowId', (c) => renderTasks(c));
 // P7：工作流索引页（任务清单的入口 —— 此前 /tasks/:workflowId 没有可达路径）
 route('/tasks', (c) => renderTaskIndex(c));
+// P8：评审打分页 + 赛段计算发榜页（赛事能跑起来的最小闭环）
+// ⚠️ 两条都注册「带赛段」与「不带赛段」两个入口：
+//    不带赛段 ⇒ 页面内给赛段选择器（导航入口 `#/review` / `#/publish` 落到那里）。
+route('/review', (c) => renderReview(c));
+route('/review/:stageId', (c) => renderReview(c));
+route('/publish', (c) => renderPublish(c));
+route('/publish/:stageId', (c) => renderPublish(c));
 
 const ctx = { api, navigate, setState, getState };
 
@@ -8817,7 +8826,9 @@ pre {
 
 .bar { display: grid; grid-template-columns: minmax(96px, 26%) 1fr auto; gap: var(--sp-3); align-items: center; margin-bottom: var(--sp-2); }
 .bar__label { font-size: var(--fs-sm); color: var(--fg-muted); }
-.bar__track { height: 8px; border-radius: var(--r-full); background: var(--surface-sunken); overflow: hidden; }
+/* 内联 SVG 图标（web/icons.js）：跟着所在文字的颜色走，别变成一个异色方块。
+   ⚠️ P8 的 class 差集核对查出来的**唯一**一个缺口（P6 遗留）。 */
+.icon { flex: none; fill: currentColor; vertical-align: -0.15em; }.bar__track { height: 8px; border-radius: var(--r-full); background: var(--surface-sunken); overflow: hidden; }
 .bar__fill { display: block; height: 100%; border-radius: var(--r-full); background: var(--brand); }
 .bar__fill--success { background: var(--success); }
 .bar__fill--warn { background: var(--warn); }
@@ -8925,6 +8936,12 @@ label > input, label > select, label > textarea { margin-top: var(--sp-1); }
 
 /* 视图根：给「分段的语义色」留出呼吸位 */
 .apply, .team, .tasks, .flags-queue, .audit-trace, .admin-registration, .task-index, .home { display: block; }
+
+/* P8：评审打分页与赛段发榜页 */
+.review-view, .publish-view { display: block; }
+/* 表单反馈区（提交成功/失败后就地显示）：空的时候不占位 */
+.form-feedback:not(:empty) { margin-top: var(--sp-3); }
+.review-view .panel + .panel { margin-top: var(--sp-4); }
 
 .team-card { border: 1px solid var(--border); border-radius: var(--r-lg); padding: var(--sp-4); background: var(--surface); }
 .biz-card { margin: 0; }

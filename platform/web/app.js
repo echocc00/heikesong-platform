@@ -23,6 +23,8 @@ import { renderFlags } from './views/flags.js';
 import { renderTasks } from './views/tasks.js';
 import { renderTaskIndex } from './views/task-index.js';
 import { renderHome } from './views/home.js';
+import { renderReview } from './views/review.js';
+import { renderPublish } from './views/publish.js';
 import { escapeHtml } from './escape.js';
 
 // 演示版：?demo=1 时用 localStorage 适配器；正式版走真实 API。
@@ -61,6 +63,13 @@ route('/flags', (c) => renderFlags(c));
 route('/tasks/:workflowId', (c) => renderTasks(c));
 // P7：工作流索引页（任务清单的入口 —— 此前 /tasks/:workflowId 没有可达路径）
 route('/tasks', (c) => renderTaskIndex(c));
+// P8：评审打分页 + 赛段计算发榜页（赛事能跑起来的最小闭环）
+// ⚠️ 两条都注册「带赛段」与「不带赛段」两个入口：
+//    不带赛段 ⇒ 页面内给赛段选择器（导航入口 `#/review` / `#/publish` 落到那里）。
+route('/review', (c) => renderReview(c));
+route('/review/:stageId', (c) => renderReview(c));
+route('/publish', (c) => renderPublish(c));
+route('/publish/:stageId', (c) => renderPublish(c));
 
 const ctx = { api, navigate, setState, getState };
 
