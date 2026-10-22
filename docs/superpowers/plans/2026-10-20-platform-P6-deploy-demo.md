@@ -2723,6 +2723,70 @@ write_systemd_unit() {
   systemctl enable "$SERVICE_NAME"
 }
 
+# ── nginx reload 的「生效校验」 ────────────────────────────────────────
+# 踩过的坑（真实事故）：机器上残留着**另一个** nginx 实例（一个遗留的测试进程），
+# 它把 /run/nginx.pid 覆盖了 ⇒ `systemctl reload nginx` 把 SIGHUP 发给了
+# **那个测试进程**，真正的 master 从没收到信号 ⇒ **线上仍在跑旧配置**，
+# 而脚本一路绿灯、退出码 0 ⇒「部署成功」的假象比部署失败更危险
+# （运维看到成功就不会再去查，直到线上行为跟预期不符才发现）。
+#
+# 判据：nginx 收到 SIGHUP **一定会起新 worker**（配置一个字没改也一样会换 ——
+# 实测：reload 前 worker {488927,488928} → reload 后 {488927,488955,488956}）。
+# ⇒ reload 后 master 的 worker 集合**没变** ⇒ 信号没送到真正的 master ⇒ 失败。
+NGINX_PID_FILE="${NGINX_PID_FILE:-/run/nginx.pid}"
+
+nginx_master_pid() {
+  local pidfile="$1" pid
+  [ -f "$pidfile" ] || return 1
+  pid="$(head -n 1 "$pidfile" 2>/dev/null | tr -d '[:space:]')"
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  # 进程是否还活着：Linux 查 /proc，别的系统用 kill -0（POSIX，跨平台）
+  if [ ! -d "/proc/$pid" ]; then
+    kill -0 "$pid" 2>/dev/null || return 1
+  fi
+  printf '%s' "$pid"
+}
+
+nginx_worker_pids() {
+  local master="$1"
+  [ -n "$master" ] || return 0
+  ps -o pid= --ppid "$master" 2>/dev/null | tr -d ' ' | sort -u | tr '\n' ' '
+}
+
+assert_nginx_reload_took_effect() {
+  local master_before="$1" workers_before="$2"
+  local master_after workers_after saw_workers=0 i
+
+  # 之前就没在跑（首次部署），或读不到 worker 集合（发行版的 ps 不支持 --ppid）
+  # ⇒ 无法比对 ⇒ **放行并告警**（宁可少一道校验，也不误伤别的平台）
+  if [ -z "$master_before" ] || [ -z "$workers_before" ]; then
+    log "跳过 nginx reload 生效校验（读不到 master/worker 集合）"
+    return 0
+  fi
+
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 0.3
+    master_after="$(nginx_master_pid "$NGINX_PID_FILE" || true)"
+    workers_after="$(nginx_worker_pids "$master_after")"
+    # 情形 A：master 换了（走了 restart 分支）⇒ 新配置一定被重新读入
+    if [ -n "$master_after" ] && [ "$master_after" != "$master_before" ]; then
+      return 0
+    fi
+    # 情形 B：master 没换，但 worker 换代了 ⇒ SIGHUP 送到了真正的 master
+    if [ -n "$workers_after" ] && [ "$workers_after" != "$workers_before" ]; then
+      return 0
+    fi
+    [ -n "$workers_after" ] && saw_workers=1
+  done
+
+  if [ "$saw_workers" -eq 0 ]; then
+    log "跳过 nginx reload 生效校验（始终读不到 worker 集合，工具不可用）"
+    return 0
+  fi
+
+  die "nginx reload **没有生效**：master(${master_before}) 的 worker 集合始终没变 ⇒ SIGHUP 很可能发给了**另一个** nginx 实例（典型原因：${NGINX_PID_FILE} 被别的进程覆盖、机器上残留了第二个 nginx master）⇒ **线上仍在跑旧配置，本次部署不算成功**"
+}
+
 write_nginx_site() {
   if [ -z "$SERVER_NAME" ]; then
     log "跳过 nginx：未设置 SERVER_NAME（正式对外域名）"
@@ -2793,12 +2857,21 @@ write_nginx_site() {
   fi
   if [ -n "$backup" ]; then rm -f "$backup"; fi
 
+  # ⚠️ 记下 reload **之前**的 master 与 worker —— 用来验证 reload 真的生效了
+  #    （信号发错进程时，脚本会一路绿灯但线上还是旧配置）。
+  local master_before workers_before
+  master_before="$(nginx_master_pid "$NGINX_PID_FILE" || true)"
+  workers_before="$(nginx_worker_pids "$master_before")"
+
   if systemctl reload nginx 2>/dev/null; then
     log "nginx 已 reload"
   else
     systemctl restart nginx
     log "nginx 已重启"
   fi
+
+  # ⛔ reload 没生效 ⇒ **直接失败**，不许报成功（否则运维不会再去查）。
+  assert_nginx_reload_took_effect "$master_before" "$workers_before"
 }
 
 start_service() {
@@ -10687,3 +10760,44 @@ TLS 作为可选增强、不 force。
 ⇒ 只能由你给出**现用 token 值**，我写进 `/root/frp/frps.toml`（`auth.token = "..."`）并重启 frps；
 带 token 的客户端**零改动**即可恢复，不带 token 的会被拒掉（这正是安全方向）。
 ⚠️ 备选：授权生成新 token ⇒ 所有客户端都要改配置，现在能连的那批会断。
+
+---
+
+## 第 8 轮补充：登录报障修复 + 「reload 生效校验」护栏（DP-32 ~ DP-38）
+
+> 触发：用户在**旧的明文地址**上用**正确**口令登录，提示「手机号和密码错误」；
+> 同一组凭据在 https 地址下登录成功。
+> **根因不在应用**：是**我上一轮引入的重定向状态码用错**（301），
+> 外加**我自己留下的临时 nginx 进程**造成的「reload 没生效却报成功」。
+
+### A. 报障根因（DP-32 ~ DP-34）
+
+| 编号 | 项 | 结论 |
+|---|---|---|
+| DP-32 | **重定向状态码用错（301）** | 浏览器对 301/302/303 会**把 POST 降级成 GET 并丢掉请求体**；我们的明文入口后面跟着 `POST /api/auth/login` ⇒ 请求体被吃掉 ⇒ 服务端收到空 body ⇒ 判为「手机号或密码不正确」⇒ **401 `INVALID_CREDENTIALS`**。⇒ **真凶是状态码，不是凭据**（错误信息指向「口令错」，排障方向会被完全带偏）。<br>⇒ 正解：**308**（307 的永久版，永久迁移该用永久码）—— 保留方法与请求体，POST 原样送达。 |
+| DP-33 | **我自己留下的临时 nginx 进程** | 为验证 `return 308` 语法，在真机上起过一个 `nginx -c /tmp/t308.conf`（监听 19999），**没杀掉**。它把 `/run/nginx.pid` 覆盖了 ⇒ `systemctl reload nginx` 的 SIGHUP **发给了它** ⇒ 真 master 从没收到 ⇒ **磁盘上已是 308、线上仍在跑 301**，而 `install.sh` 退出码 **0**。<br>⚠️ 清理时又踩一层：systemd 已把它误认成 MainPID ⇒ kill 它时 systemd 对**整个 cgroup** 发 SIGTERM ⇒ 真 nginx 一并倒下（80/18443/8081/8444 短暂不可用）⇒ `systemctl reset-failed nginx` + `start` 恢复。 |
+| DP-34 | **静默成功比失败更危险** | 「部署成功」的假象会让运维**不再去查**，直到线上行为与预期不符才发现。⇒ 必须让脚本在「变更没真正落地」时**直接失败**。 |
+
+### B. 护栏与判别性（DP-35 ~ DP-36）
+
+| 编号 | 项 | 设计 |
+|---|---|---|
+| DP-35 | `install.sh` 的 **reload 生效校验**（`assert_nginx_reload_took_effect`） | 判据：nginx 收到 SIGHUP **一定会起新 worker**（配置一个字没改也一样会换 —— 实测 `{488927,488928}` → `{488927,488955,488956}`）⇒ reload 后 worker 集合**没变** ⇒ 信号没送到真 master ⇒ **直接失败并说清原因**，不许报成功。<br>⚠️ 读不到 pid 文件 / worker 集合时 ⇒ **放行并告警**（首次部署、BusyBox 的 `ps` 不支持 `--ppid` ⇒ 不能误伤别的平台）。<br>⚠️ 进程存活判定：`/proc/<pid>` 优先，别的系统用 `kill -0`（POSIX 跨平台）。 |
+| DP-36 | 判别性用例（`platform/test/deploy-tls-port.test.js` ⇒ **24 条**） | ① 「301/302/303 丢请求体、307/308 保留」这条**规则本身**写成可执行断言（附对照组：规则写反了也会红）⇒ 任何人把 308 改回 301，测试立刻红；② reload 生效校验三条：没生效必须失败并说人话 / 生效必须成功 / 读不到 pid 文件必须放行。<br>**变异检验：18 个变异体 / 18 KILLED**（新增 M16 退回 301、M17 去掉校验调用、M18 校验永远放行）。 |
+
+### C. 契约与文档同步（DP-37）
+
+| 文档 | 动作 |
+|---|---|
+| 部署手册 | §17 新增 **17.5「重定向会吃掉 POST 请求体」**、**17.6「reload 没生效却报成功」** 两个小节（各含真凶/判据/修法）；台账新增 **E41–E47** |
+| `deploy/nginx-https-redirect.conf` | 状态码 301 → **308**，并在模板注释里写明「为什么不能改回 301」 |
+| 设计文档 §8 / 需求落地表 | **未改动**（不新增端点、不新增编号需求） |
+| 计划块 | `deploy/install.sh`（护栏）已用 `plan-block-sync.mjs` **逐字同步回本计划**，`--verify` 复验逐字一致 ⇒ **C-RW 归零** |
+
+### D. 运维纪律（DP-38）
+
+**不要在生产机上留测试进程。** 本次事故的起点就是一次「验证 `return 308` 语法」的临时 nginx。
+它同时造成了两件事：① 抢走 pid 文件 ⇒ reload 静默失效；② 被 systemd 误认成 MainPID ⇒ 清理时把真 nginx 一起带走。
+
+⇒ 临时进程要么用完立刻 kill（并确认 `systemctl show <unit> -p MainPID` 仍指向真 master），
+要么**别在生产机上起**。

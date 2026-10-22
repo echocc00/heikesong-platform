@@ -359,6 +359,70 @@ write_systemd_unit() {
   systemctl enable "$SERVICE_NAME"
 }
 
+# ── nginx reload 的「生效校验」 ────────────────────────────────────────
+# 踩过的坑（真实事故）：机器上残留着**另一个** nginx 实例（一个遗留的测试进程），
+# 它把 /run/nginx.pid 覆盖了 ⇒ `systemctl reload nginx` 把 SIGHUP 发给了
+# **那个测试进程**，真正的 master 从没收到信号 ⇒ **线上仍在跑旧配置**，
+# 而脚本一路绿灯、退出码 0 ⇒「部署成功」的假象比部署失败更危险
+# （运维看到成功就不会再去查，直到线上行为跟预期不符才发现）。
+#
+# 判据：nginx 收到 SIGHUP **一定会起新 worker**（配置一个字没改也一样会换 ——
+# 实测：reload 前 worker {488927,488928} → reload 后 {488927,488955,488956}）。
+# ⇒ reload 后 master 的 worker 集合**没变** ⇒ 信号没送到真正的 master ⇒ 失败。
+NGINX_PID_FILE="${NGINX_PID_FILE:-/run/nginx.pid}"
+
+nginx_master_pid() {
+  local pidfile="$1" pid
+  [ -f "$pidfile" ] || return 1
+  pid="$(head -n 1 "$pidfile" 2>/dev/null | tr -d '[:space:]')"
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  # 进程是否还活着：Linux 查 /proc，别的系统用 kill -0（POSIX，跨平台）
+  if [ ! -d "/proc/$pid" ]; then
+    kill -0 "$pid" 2>/dev/null || return 1
+  fi
+  printf '%s' "$pid"
+}
+
+nginx_worker_pids() {
+  local master="$1"
+  [ -n "$master" ] || return 0
+  ps -o pid= --ppid "$master" 2>/dev/null | tr -d ' ' | sort -u | tr '\n' ' '
+}
+
+assert_nginx_reload_took_effect() {
+  local master_before="$1" workers_before="$2"
+  local master_after workers_after saw_workers=0 i
+
+  # 之前就没在跑（首次部署），或读不到 worker 集合（发行版的 ps 不支持 --ppid）
+  # ⇒ 无法比对 ⇒ **放行并告警**（宁可少一道校验，也不误伤别的平台）
+  if [ -z "$master_before" ] || [ -z "$workers_before" ]; then
+    log "跳过 nginx reload 生效校验（读不到 master/worker 集合）"
+    return 0
+  fi
+
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 0.3
+    master_after="$(nginx_master_pid "$NGINX_PID_FILE" || true)"
+    workers_after="$(nginx_worker_pids "$master_after")"
+    # 情形 A：master 换了（走了 restart 分支）⇒ 新配置一定被重新读入
+    if [ -n "$master_after" ] && [ "$master_after" != "$master_before" ]; then
+      return 0
+    fi
+    # 情形 B：master 没换，但 worker 换代了 ⇒ SIGHUP 送到了真正的 master
+    if [ -n "$workers_after" ] && [ "$workers_after" != "$workers_before" ]; then
+      return 0
+    fi
+    [ -n "$workers_after" ] && saw_workers=1
+  done
+
+  if [ "$saw_workers" -eq 0 ]; then
+    log "跳过 nginx reload 生效校验（始终读不到 worker 集合，工具不可用）"
+    return 0
+  fi
+
+  die "nginx reload **没有生效**：master(${master_before}) 的 worker 集合始终没变 ⇒ SIGHUP 很可能发给了**另一个** nginx 实例（典型原因：${NGINX_PID_FILE} 被别的进程覆盖、机器上残留了第二个 nginx master）⇒ **线上仍在跑旧配置，本次部署不算成功**"
+}
+
 write_nginx_site() {
   if [ -z "$SERVER_NAME" ]; then
     log "跳过 nginx：未设置 SERVER_NAME（正式对外域名）"
@@ -429,12 +493,21 @@ write_nginx_site() {
   fi
   if [ -n "$backup" ]; then rm -f "$backup"; fi
 
+  # ⚠️ 记下 reload **之前**的 master 与 worker —— 用来验证 reload 真的生效了
+  #    （信号发错进程时，脚本会一路绿灯但线上还是旧配置）。
+  local master_before workers_before
+  master_before="$(nginx_master_pid "$NGINX_PID_FILE" || true)"
+  workers_before="$(nginx_worker_pids "$master_before")"
+
   if systemctl reload nginx 2>/dev/null; then
     log "nginx 已 reload"
   else
     systemctl restart nginx
     log "nginx 已重启"
   fi
+
+  # ⛔ reload 没生效 ⇒ **直接失败**，不许报成功（否则运维不会再去查）。
+  assert_nginx_reload_took_effect "$master_before" "$workers_before"
 }
 
 start_service() {

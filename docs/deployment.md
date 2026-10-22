@@ -984,7 +984,7 @@ sudo SERVER_NAME=8.133.200.235 \
      ADMIN_PASSWORD=… \
      ./platform/deploy/install.sh
 
-# ② 明文入口改成 301 跳转（**替换**掉原来的明文站点文件）
+# ② 明文入口改成 308 跳转（**替换**掉原来的明文站点文件；⛔ 必须是 308 不是 301，见 §17.5）
 sudo SERVER_NAME=8.133.200.235 \
      NGINX_TEMPLATE="$(pwd)/platform/deploy/nginx-https-redirect.conf" \
      NGINX_HTTP_PORT=8081 \
@@ -999,15 +999,64 @@ sudo SERVER_NAME=8.133.200.235 \
 > ② 也可以**直接删掉**明文入口（`rm` 站点文件 + 软链 + `nginx -t && systemctl reload nginx`）——
 > 最干净，但**旧链接直接断**。用跳转模板则是「旧链接仍落到正确地址，且没有业务流量再走明文」。
 
-### 17.5 明文入口的三个选项
+### 17.5 ⛔ 踩过的坑：重定向会吃掉 POST 请求体（301 ⇒ 登录报「手机号或密码不正确」）
+
+**症状**：用户在**旧的明文地址**上登录，提示「手机号和密码错误」；但同一组凭据在 https 地址下**登录成功**。
+
+**真凶**：重定向状态码用错了。浏览器对重定向的处理分两类：
+
+| 状态码 | 浏览器行为 |
+|---|---|
+| 301 / 302 / 303 | **把 POST 降级成 GET，并丢掉请求体** |
+| 307 / 308 | **保留方法与请求体**，原样重发 |
+
+我们的明文入口后面跟着**登录接口**（`POST /api/auth/login`）。用 301 时：
+
+```
+POST /api/auth/login  →  301  →  浏览器改成 GET、body 为空  →  服务端收到空 body
+                       →  判定为「手机号或密码不正确」  →  401 INVALID_CREDENTIALS
+```
+
+⇒ **口令是对的，是重定向把请求体吃掉了**。而错误信息指向「口令错」，排障方向会被完全带偏。
+
+⇒ **正解：用 308**（307 的永久版，永久迁移到 https 就该用永久码）—— 保留方法与请求体，
+POST 原样送达。`deploy/nginx-https-redirect.conf` 固定用 308，并在模板注释里写明了这个原因。
+
+**判别性钉子**：`platform/test/deploy-tls-port.test.js` 里有一条用例把
+「301/302/303 丢请求体、307/308 保留」这条规则写成了**可执行断言**
+（并附一条对照组，断言这条规则本身写反了也会红）⇒ 任何人把 308 改回 301，测试立刻红。
+
+### 17.6 ⛔ 踩过的坑：reload 没生效，脚本却报成功
+
+**症状**：`install.sh` 退出码 **0**、日志一路绿灯，但**线上跑的还是旧配置**。
+
+**真凶**：机器上残留着**另一个** nginx 实例（一个遗留的测试进程），它把 `/run/nginx.pid` 覆盖了 ⇒
+`systemctl reload nginx` 把 SIGHUP 发给了**那个测试进程**，真正的 master 从没收到信号。
+
+⇒ 这比部署失败更危险：运维看到「成功」就不会再查，直到线上行为与预期不符才发现。
+
+**已加的护栏**（`deploy/install.sh` 的 `assert_nginx_reload_took_effect`）：
+
+- reload 前后记录 nginx master 及其 **worker 集合**；
+- 判据：nginx 收到 SIGHUP **一定会起新 worker**（配置一个字没改也一样会换 ——
+  实测：reload 前 `{488927,488928}` → reload 后 `{488927,488955,488956}`）；
+- worker 集合**没变** ⇒ 信号没送到真正的 master ⇒ **直接失败并说清原因**（不许报成功）；
+- 读不到 pid 文件 / worker 集合时 ⇒ **放行并告警**（首次部署、BusyBox 的 `ps` 不支持 `--ppid` 等情况不能误伤）。
+
+⚠️ 顺带一条运维纪律：**不要在生产机上留测试进程**。本次事故的起点就是一次用来验证
+`return 308` 语法的临时 nginx（`nginx -c /tmp/xxx.conf`）没被杀掉 ——
+它抢走了 pid 文件，还让 systemd 把它误认成 MainPID，kill 它时 systemd 对整个 cgroup 发了 SIGTERM，
+把真 nginx 一起带走了（本次已修复，nginx 已重新拉起并自检通过）。
+
+### 17.7 明文入口的三个选项
 
 | 选项 | 做法 | 结果 |
 |---|---|---|
 | **留着**（不推荐） | 什么都不动 | 明文入口仍可访问；`COOKIE_SECURE=true` 后**登录会失败**（浏览器拒收 Secure Cookie）⇒ 半残状态 |
-| **301 跳转**（推荐） | `deploy/nginx-https-redirect.conf` | 旧链接自动落到 https；无业务流量走明文 |
+| **308 跳转**（推荐） | `deploy/nginx-https-redirect.conf` | 旧链接自动落到 https；无业务流量走明文。⛔ **必须 308**（见 §17.5 的坑） |
 | **删掉** | `rm` 站点文件 + 软链 + reload | 最干净；旧链接断 |
 
-### 17.6 证书续期（**短周期证书必看**）
+### 17.8 证书续期（**短周期证书必看**）
 
 Let's Encrypt 的 **IP 短周期证书**只有 **6 天**有效期 ⇒ 续期链路断了就是**当天服务不可用**。
 
@@ -1023,7 +1072,7 @@ systemctl list-timers | grep -i cert
 
 ⚠️ 本模板**不碰 80**，所以 ACME 的 webroot 校验仍由既有 `default_server` 提供 ⇒ 续期链路不受影响。
 
-### 17.7 回滚
+### 17.9 回滚
 
 ```bash
 # 只回滚 TLS 入口（保留明文入口原样）
@@ -1084,6 +1133,13 @@ systemctl restart heikesong
 | E37 | **公网 https 实测** | `8444` **公网直接可达**（**未改安全组** —— 此前那轮只探过一组固定端口清单，8444 不在其中）；首页 200 / `styles.css` 200（1192B）/ `app.js` 200（5784B，`text/javascript`）/ 健康检查 200 / 公开榜单 200；登录 ⇒ **HTTP/2 200** |
 | E38 | **真机 Stage 2**（明文入口 301 + `COOKIE_SECURE=true`） | `install.sh` 退出码 **0**；`http://…:8081/api/health` ⇒ **301** → `https://8.133.200.235:8444/api/health`；https 登录 ⇒ `Set-Cookie: …; HttpOnly; SameSite=Lax; Path=/; Max-Age=604799; **Secure**`；带该 Cookie 访问 `/api/me` ⇒ 200、`/api/registrations` ⇒ 200；SSE `/api/stages/ed_1/events` ⇒ 首段 `event: connected` ✅（经 https 未被缓冲） |
 | E39 | **证书续期链路演练**（`certbot renew --dry-run`，6 天短周期证书的关键前置） | `Congratulations, all simulated renewals succeeded: /etc/letsencrypt/live/8.133.200.235/fullchain.pem (success)` ⇒ **ACME webroot 校验链路未被本次部署掐断**（TLS 模板不碰 80 就是为了这个） |
+| E41 | **用户报障复现**：旧地址 `http://8.133.200.235:8081/` 上用正确口令登录 | ① 直接 POST 旧地址 ⇒ **301**（`Location: https://8.133.200.235:8444/api/auth/login`）；② **跟随跳转** ⇒ **401 `INVALID_CREDENTIALS`「手机号或密码不正确」**；③ 同一凭据直接走 https ⇒ **200** ⇒ **口令是对的，问题在重定向** |
+| E42 | 根因定位 | 浏览器对 301/302/303 会**把 POST 降级成 GET 并丢掉请求体** ⇒ 登录接口收到空 body ⇒ 报「手机号或密码不正确」。**真凶是状态码用错，不是凭据错** |
+| E43 | 修复一：跳转状态码 301 → **308** | 308（307 的永久版）**保留方法与请求体** ⇒ POST 原样送达。真机复测：旧地址 POST ⇒ **308** ⇒ 跟随 ⇒ **HTTP/2 200** + 完整用户对象 + `Set-Cookie …; Secure`；旧地址 GET 首页 ⇒ 跟随 ⇒ **200** |
+| E44 | 根因定位（第二个坑）：**reload 没生效却报成功** | 真机 `ps` 显示**两个 nginx master**：`445717`（真 master，10-14 启动，持 8081 监听套接字）与 `488602`（**我用来验证 `return 308` 语法的临时 `nginx -c /tmp/t308.conf`**，未杀掉）。它把 `/run/nginx.pid` 覆盖了 ⇒ `systemctl reload nginx` 的 SIGHUP **发给了那个临时进程** ⇒ 真 master 从没收到 ⇒ 磁盘上是 308、线上仍在跑 301，而 `install.sh` **退出码 0** |
+| E45 | 清理与恢复 | kill 临时进程时，systemd 把它误认成 MainPID ⇒ 对**整个 cgroup** 发 SIGTERM ⇒ 真 nginx 一并倒下（80/18443/8081/8444 全部短暂不可用）。`systemctl reset-failed nginx` + `systemctl start nginx` ⇒ `active`、MainPID 与 pid 文件一致、`nginx -t` 通过；headscale 控制台（80）**200**、https 8444 **200**、明文口 **308** |
+| E46 | 修复二：`install.sh` 加 **reload 生效校验**（`assert_nginx_reload_took_effect`） | 判据：nginx 收到 SIGHUP **一定会起新 worker**（实测配置未变时 worker 仍从 `{488927,488928}` 换到 `{488927,488955,488956}`）⇒ reload 后 worker 集合没变 ⇒ **直接失败并说清原因**，不许报成功；读不到 pid 文件/worker 集合时**放行并告警**（不误伤首次部署与 BusyBox `ps`） |
+| E47 | 判别性用例 | `platform/test/deploy-tls-port.test.js` 增至 **24 条**（新增：308 保留 POST body 的可执行断言 + 规则写反的对照组 + reload 生效校验的三条）；变异检验 **18 个变异体**（新增 M16 退回 301 / M17 去掉校验调用 / M18 校验永远放行） |
 | E40 | 真机最终体检 | `nginx`/`xray`/`headscale`/`frps`/`mongod`/`heikesong` **全部 active**；headscale 控制台（80）仍 **200**；ACME 校验路径仍由 `default_server` 提供（探测 404 = webroot 命中）；环境文件 `COOKIE_SECURE=true`；监听端口：80 / 443(xray) / 7000(frps) / 8081(跳转) / **8444(TLS)** / 8888(HydroOJ)，应用仍只绑 `127.0.0.1:8080` |
 
 ---

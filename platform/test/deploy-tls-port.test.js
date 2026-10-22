@@ -46,6 +46,20 @@ function runInstall(body, env = {}) {
     // systemctl 桩：reload / restart 都成功（否则写站点那步会以非 0 退出）
     writeFileSync(join(binDir, 'systemctl'), '#!/bin/sh\nexit 0\n');
     chmodSync(join(binDir, 'systemctl'), 0o755);
+    // ps 桩（只在校验「reload 有没有真生效」那两条用例里需要）：
+    //   HKS_PS_MODE=constant ⇒ 每次都打印同一组 worker（模拟「reload 没生效」）
+    //   HKS_PS_MODE=changing ⇒ 第一次一组、之后换一组（模拟「reload 真生效了」）
+    if (env.HKS_PS_MODE) {
+      const counter = join(tmp, 'ps-counter');
+      writeFileSync(
+        join(binDir, 'ps'),
+        `#!/bin/sh\nn=$(cat "${counter}" 2>/dev/null || echo 0)\nn=$((n+1))\necho "$n" > "${counter}"\n`
+        + (env.HKS_PS_MODE === 'changing'
+          ? 'if [ "$n" -le 1 ]; then echo "111 222"; else echo "111 333"; fi\n'
+          : 'echo "111 222"\n'),
+      );
+      chmodSync(join(binDir, 'ps'), 0o755);
+    }
 
     const script = [
       'set -uo pipefail',
@@ -56,6 +70,11 @@ function runInstall(body, env = {}) {
       `export APP_DIR="${tmp}/app"`,
       `export DATA_DIR="${tmp}/data"`,
       `export ENV_FILE="${tmp}/platform.env"`,
+      // ⚠️ 必须**隔离** NGINX_PID_FILE：否则这台机器上真的跑着 nginx 时，
+      //    沙箱会读到**真机器**的 pid 文件 → 触发 reload 生效校验 → 用例结果依赖宿主机状态。
+      `export NGINX_PID_FILE="${tmp}/nginx.pid"`,
+      // 需要校验 reload 生效时，让 pid 文件指向**活着的**进程（沙箱 bash 自己）
+      ...(env.HKS_PS_MODE ? [`printf '%s' "$$" > "\${NGINX_PID_FILE}"`] : []),
       'mkdir -p "$(dirname "$NGINX_SITE")" "$(dirname "$NGINX_LINK")"',
       `source "${tmp}/install.sh"`,
       // source 之后 SCRIPT_DIR/ROOT 是按 $0 算的（source 时 $0 是 bash）⇒ 必须改回来
@@ -228,26 +247,26 @@ test('模板占位符与 install.sh 的替换一一对应（不许漏替换）',
   }
 });
 
-// ── 明文入口的 301 跳转模板 ────────────────────────────────────────────
+// ── 明文入口的 308 跳转模板 ────────────────────────────────────────────
 
 test('跳转模板存在：deploy/nginx-https-redirect.conf', () => {
   assert.ok(existsSync(join(deployDir, 'nginx-https-redirect.conf')), '跳转模板必须存在');
 });
 
-test('跳转模板：只做 301 跳转、目标**显式带 TLS 端口**，且⛔不代理业务（无 upstream）', () => {
+test('跳转模板：只做 308 跳转、目标**显式带 TLS 端口**，且⛔不代理业务（无 upstream）', () => {
   const conf = effective(read('nginx-https-redirect.conf'));
-  assert.match(conf, /return 301 https:\/\/\$host:__TLS_PORT__\$request_uri;/, '跳转目标必须带 TLS 端口（$host 不含端口，不带就跳到 443 去）');
+  assert.match(conf, /return 308 https:\/\/\$host:__TLS_PORT__\$request_uri;/, '跳转目标必须带 TLS 端口（$host 不含端口，不带就跳到 443 去）');
   assert.match(conf, /listen __HTTP_PORT__;/, '明文口用 __HTTP_PORT__ 占位');
   assert.deepEqual(upstreamNames(read('nginx-https-redirect.conf')), [], '⛔ 跳转模板不得定义 upstream（不代理业务）');
   assert.ok(!/\bssl\b/.test(conf), '跳转模板本身是明文口，不该出现 ssl');
 });
 
-test('沙箱实跑：跳转模板渲染 = 明文口 + 301 到 TLS 端口 + 占位符零残留', () => {
+test('沙箱实跑：跳转模板渲染 = 明文口 + 308 到 TLS 端口 + 占位符零残留', () => {
   const r = runInstall('write_nginx_site', { HKS_TEMPLATE: join(deployDir, 'nginx-https-redirect.conf') });
   assert.equal(r.code, 0, `渲染应成功，实际输出：\n${r.out}`);
   const site = effective(r.siteText || '');
   assert.match(site, /listen 8081;/, `必须监听 8081，实际：\n${site}`);
-  assert.match(site, /return 301 https:\/\/\$host:8444\$request_uri;/, '⛔ 跳转目标必须带上 TLS 端口 8444');
+  assert.match(site, /return 308 https:\/\/\$host:8444\$request_uri;/, '⛔ 跳转目标必须带上 TLS 端口 8444');
   assert.ok(!/__[A-Z_]+__/.test(site), `占位符必须零残留，实际：\n${site}`);
 });
 
@@ -273,5 +292,62 @@ test('沙箱实跑：明文口与 TLS 口都可用自定义端口（不写死 80
   assert.equal(r.code, 0, `渲染应成功，实际输出：\n${r.out}`);
   const site = effective(r.siteText || '');
   assert.match(site, /listen 8083;/, '明文口应被替换成 8083');
-  assert.match(site, /return 301 https:\/\/\$host:9443\$request_uri;/, '跳转目标的 TLS 端口应被替换成 9443');
+  assert.match(site, /return 308 https:\/\/\$host:9443\$request_uri;/, '跳转目标的 TLS 端口应被替换成 9443');
+});
+
+// ── nginx reload 的「生效校验」护栏 ───────────────────────────────────
+
+test('⛔ reload 没生效（worker 集合不变）⇒ install.sh 必须失败并说清原因，不许报成功', () => {
+  const r = runInstall('write_nginx_site', { HKS_PS_MODE: 'constant' });
+  assert.notEqual(r.code, 0, '⛔ reload 没生效却退出 0 = 静默失败（线上跑旧配置，运维以为部署成功）');
+  assert.match(r.out, /没有生效/, '报错要说清是「reload 没生效」');
+  assert.match(r.out, /旧配置/, '报错要点明「线上仍在跑旧配置」');
+});
+
+test('reload 生效（worker 换代）⇒ install.sh 必须正常成功', () => {
+  const r = runInstall('write_nginx_site', { HKS_PS_MODE: 'changing' });
+  assert.equal(r.code, 0, `reload 生效时必须成功，实际输出：\n${r.out}`);
+  assert.ok(!/没有生效/.test(r.out), '不该报「没有生效」');
+});
+
+test('读不到 pid 文件时校验必须**放行**（不能误伤首次部署 / 非 Linux 平台）', () => {
+  // 不设 HKS_PS_MODE ⇒ 沙箱不建 pid 文件 ⇒ master 读不到 ⇒ 校验应跳过并成功
+  const r = runInstall('write_nginx_site');
+  assert.equal(r.code, 0, `应当跳过校验并成功，实际输出：\n${r.out}`);
+  assert.match(r.out, /跳过 nginx reload 生效校验/, '应当明确告知「跳过校验」');
+});
+
+// ── 浏览器重定向语义：POST 的方法与请求体会不会被吃掉 ──────────────────
+
+/**
+ * 浏览器（与 curl）处理重定向的规则：
+ *   301 / 302 / 303 ⇒ **把 POST 降级成 GET，并丢掉请求体**；
+ *   307 / 308       ⇒ **保留方法与请求体**，原样重发。
+ * 写成函数而不是写死 308，是为了让「这条规则」本身成为可执行断言 ——
+ * 只断言「字符串里有 308」的话，把 308 改成 302 也能骗过「匹配 /return 3\d\d/」这类弱断言。
+ */
+function redirectPreservesPostBody(status) {
+  return status === 307 || status === 308;
+}
+
+test('⛔ 明文入口的重定向必须保留 POST 方法与请求体（否则登录会被误报成「手机号或密码不正确」）', () => {
+  const r = runInstall('write_nginx_site', { HKS_TEMPLATE: join(deployDir, 'nginx-https-redirect.conf') });
+  assert.equal(r.code, 0, `渲染应成功，实际输出：\n${r.out}`);
+  const site = effective(r.siteText || '');
+  const m = site.match(/return (\d{3}) https:\/\/\$host:(\d+)\$request_uri;/);
+  assert.ok(m, `渲染结果里应有 "return <状态码> https://$host:<端口>$request_uri;"，实际：\n${site}`);
+  const status = Number(m[1]);
+  assert.ok(
+    redirectPreservesPostBody(status),
+    `⛔ 状态码 ${status} 会让浏览器把 POST 降级成 GET 并丢掉请求体 ⇒ 登录接口收到空 body ⇒ `
+    + `返回 401「手机号或密码不正确」⇒ **用户会以为口令错了，真相是重定向把请求体吃了** ⇒ 必须用 307/308`,
+  );
+});
+
+test('⛔ 回归钉子：301 确实会丢 POST 请求体（这条用例本身要能判别「规则写反了」）', () => {
+  // 对照组：把规则反过来用，断言必须失败 —— 证明上面的判定函数不是「永远为真」
+  assert.equal(redirectPreservesPostBody(301), false, '301 不得被判定为保留请求体');
+  assert.equal(redirectPreservesPostBody(303), false, '303 不得被判定为保留请求体');
+  assert.equal(redirectPreservesPostBody(307), true, '307 必须保留请求体');
+  assert.equal(redirectPreservesPostBody(308), true, '308 必须保留请求体');
 });
