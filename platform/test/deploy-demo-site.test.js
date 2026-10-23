@@ -50,6 +50,19 @@ function runDemo(body, env = {}) {
     // curl 桩：打印状态码（HKS_CURL_CODE 可指定，用来测「站点不可取」）
     writeFileSync(join(binDir, 'curl'), `#!/bin/sh\necho "${env.HKS_CURL_CODE || '200'}"\n`);
     chmodSync(join(binDir, 'curl'), 0o755);
+    // ⚠️ 必须给 `rm` 打个桩（deploy-assets.test.js 里早有先例，此处补齐）：
+    //    某些开发环境把 `rm` shim 成「可恢复删除」（走 osascript + Finder）⇒
+    //    ① 每次删除要好几秒；
+    //    ② 目标落在系统临时区时，**访达会弹管理员授权框**，osascript 被模态框
+    //       阻塞住不返回 ⇒ 命令挂死、整轮测试被拖成分钟级；
+    //    ③ 每轮测试都新建一个同名临时目录 ⇒ 弹窗一轮一个地反复出现，
+    //       删文件也删不掉（下一轮又造一个新的同名文件）。
+    //    这里让桩直接调**真正的** /bin/rm：被测的是**逻辑**（回滚删没删对东西），
+    //    不是「删除是否可恢复」。
+    const realRm = ['/bin/rm', '/usr/bin/rm'].find((p) => existsSync(p)) || 'rm';
+    const rmStub = join(binDir, 'rm');
+    writeFileSync(rmStub, `#!/bin/sh\nexec ${realRm} "$@"\n`);
+    chmodSync(rmStub, 0o755);
 
     // 假证书（脚本会检查它们存在）
     const cert = join(tmp, 'fullchain.pem');
