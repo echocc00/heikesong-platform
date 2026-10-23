@@ -21,7 +21,7 @@ node --test               # 跑测试
 | `platform/src/` | 服务端实现：领域层（`domain/`）、HTTP 路由（`http/routes/`）、数据访问（`db/`）、审计反作弊（`audit/`）、鉴权（`auth/`） |
 | `platform/rules/` | 赛制规则配置（评分、积分、段位、行为分、合规、赛程、池化等 JSON），改配置即生效，不改代码 |
 | `platform/db/migrations/` | 数据库迁移 |
-| `platform/test/` | 测试套件（1277 例） |
+| `platform/test/` | 测试套件（1963 例） |
 | `platform/web/` | 前端：SPA + 演示站构建产物（`dist/`，构建产物不入库） |
 | `platform/deploy/` | 部署资产：nginx、systemd、docker-compose、一键安装脚本 |
 | `docs/` | 需求溯源、规则冲突登记、组委会确认清单、部署运维手册、设计与实施计划 |
@@ -40,6 +40,16 @@ node --test               # 跑测试
 | `node scripts/build-demo.js` | 构建公开演示站（产物 → `platform/web/dist/`） |
 | `node scripts/serve-demo.js` | 本地预览演示站 |
 | `node scripts/audit-scan.js` | 禁用词 / 证据链扫描闸 |
+
+### 机器闸（改动前先跑，有红就停下）
+
+| 命令 | 作用 |
+| --- | --- |
+| `node scripts/audit-scan.js` | 禁用词 / 证据链扫描 |
+| `node scripts/temp-leak-scan.js` | 临时目录泄漏（测试必须走 `test-helpers/tmp.js` 的回收机制） |
+| `node scripts/bash-var-scan.js` | bash 变量名吞非 ASCII |
+| `node docs/tools/dead-service-scan.mjs` | 服务层导出函数 ⇒ 生产必有调用方（有死函数退出码 1） |
+| `node docs/tools/plan-block-audit.mjs platform` | 计划块漂移审计（`C-RW` 必须为 0） |
 
 ## 架构要点
 
