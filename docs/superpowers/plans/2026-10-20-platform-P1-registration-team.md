@@ -4188,6 +4188,8 @@ import {
   createTaskPackage, getTaskPackage, listTaskPackagesByEdition, updateTaskPackage,
 } from '../db/repo/taskPackages.js';
 import { getEdition } from '../db/repo/editions.js';
+import { getUserById } from '../db/repo/users.js';
+import { listUserRoles } from '../db/repo/roles.js';
 import { writeAuditLog } from '../audit/log.js';
 import { can } from '../auth/permissions.js';
 
@@ -4262,6 +4264,35 @@ export function submitTaskPackage({ db, userId, payload, now = new Date().toISOS
     throw new AppError(400, 'FREE_BRIEF_NO_ENTERPRISE', '自由命题任务卡不得挂企业主体');
   }
 
+  // ⚛️ F31（Medium，2026-10-23 审计）：任务卡的 enterprise_id 原来**照抄请求体** ——
+  //   ⇒ 任何人都能把任务卡挂到**别人**的企业名下（冒用企业主体；该字段会进公开榜与签级链路）。
+  //   ⇒ 企业主体**由提交人自己决定**，请求体里的 enterpriseId 只在**与提交人身份一致**时采纳：
+  //     ① 企业席本人提交      ⇒ 挂自己（enterprise_id = 自己的 user id）；
+  //     ② 企业管理员提交      ⇒ 目标企业的 org 必须与自己的 org 相同，否则不挂；
+  //     ③ 组委会提交          ⇒ 受信任，按请求体挂（赛制需要代挂）；
+  //     ④ 其它角色            ⇒ 不挂企业主体。
+  //   ⇒ id 与 name 必须一致：id 被改写时，name 一并改成该企业自己的名字
+  //     （否则会出现「id 指向 A、名字写着 B」的错挂）。
+  const actor = getUserById(db, userId);
+  const actorRoles = listUserRoles(db, userId);
+  const requestedEnterpriseId = enterpriseId ?? null;
+  let effectiveEnterpriseId = null;
+  if (actorRoles.includes('enterprise')) {
+    effectiveEnterpriseId = userId;
+  } else if (actorRoles.includes('enterprise_admin')) {
+    const target = requestedEnterpriseId ? getUserById(db, requestedEnterpriseId) : null;
+    if (target && target.org && actor && target.org === actor.org) {
+      effectiveEnterpriseId = requestedEnterpriseId;
+    }
+  } else if (actorRoles.includes('admin')) {
+    effectiveEnterpriseId = requestedEnterpriseId;
+  }
+  let effectiveEnterpriseName = enterpriseName ?? null;
+  if (effectiveEnterpriseId !== requestedEnterpriseId) {
+    const eff = effectiveEnterpriseId ? getUserById(db, effectiveEnterpriseId) : null;
+    effectiveEnterpriseName = eff ? (eff.name ?? null) : null;
+  }
+
   // R-ENT-11：IP 与成果归属 —— 同意记录随任务卡一起留存
   const meta = {
     consent: { ...(consent ?? {}), acceptedAt: now },
@@ -4269,7 +4300,8 @@ export function submitTaskPackage({ db, userId, payload, now = new Date().toISOS
   };
 
   const row = createTaskPackage(db, {
-    editionId, enterpriseId, enterpriseName, title, painPoint,
+    editionId, enterpriseId: effectiveEnterpriseId, enterpriseName: effectiveEnterpriseName,
+    title, painPoint,
     expectedDelivery, acceptanceCriteria, isFreeBrief, submittedBy: userId, meta, now,
   });
   return presentTaskPackage(row);
@@ -4313,6 +4345,28 @@ export function assessSolvability({ db, taskPackageId, answers, actorId, now = n
     vetoes: result.vetoes,
     explain: result.explain,
     computedGrade: result.computedGrade,
+    // ⚛️ F16（Critical）：**档位定义必须一并投影出来**。
+    //    原来这里只投影维度 explain（不含 minScore/maxScore）⇒ 前端的「服务端投影」
+    //    只能反推出**档位键**、没有分数区间 ⇒ `gradeTiers()` 判「档位未就绪」
+    //    ⇒ **一旦有任意一张卡被评估过，签级控件就整片消失**（自锁：评估更多卡也修不好）。
+    //    为什么必须服务端带：生产部署**不挂** /rules/（只有 DEMO_MODE=1 才挂）
+    //    ⇒ 规则投影那条路在生产是断的 ⇒ 服务端不带完整档位定义，前端就没有可用规格。
+    //    （前端侧还有一道兜底：投影不出完整档位就返回 null，降级到规则投影 —— 见
+    //      web/views/admin-task-packages.js 的 solvabilitySpecFromPackages。）
+    grades: config.grades.map((g) => ({
+      key: g.key,
+      minScore: Number(g.minScore),
+      maxScore: Number(g.maxScore),
+      commitment: String(g.commitment ?? ''),
+      agreement: String(g.agreement ?? ''),
+    })),
+    // 否决项的**完整定义**（key/label/auto）—— 与 `vetoes`（本次命中的那几项）不是一回事：
+    // 前端要靠 `auto` 区分「由维度取值自动命中」与「委员会自报」。
+    vetoesSpec: config.vetoes.map((v) => ({
+      key: v.key,
+      label: String(v.label ?? v.key),
+      auto: Boolean(v.auto),
+    })),
     assessedBy: actorId,
     assessedAt: now,
   };
@@ -5226,7 +5280,8 @@ import {
   insertTeamMember, listActiveMembers, listMemberHistory, markMemberLeft,
   countActiveMembers, findActiveMembershipByUser, lastLeaveAt,
 } from '../db/repo/teamMembers.js';
-import { can } from '../auth/permissions.js';
+import { insertMilestones } from '../db/repo/tiers.js';
+import { can, canScoped, isCommitteeActor } from '../auth/permissions.js';
 
 /**
  * 组队硬校验。错误串格式：[错误码] 说明，服务层按码分流。
@@ -5373,16 +5428,25 @@ export function createTeam({
     now,
   });
   insertTeamMember(db, { teamId: team.id, userId, role: 'captain', now });
+  // R-STG-03 / R-PTS-10：里程碑清单在【组队时】固定 —— 同时落成 P3 的 milestones 表行。
+  //   （P3 的段位引擎与 B 榜只读这张表；清单本身仍来自 teams.milestones_json，两处同源。）
+  insertMilestones(db, { teamId: team.id, items: milestones.items, now });
   return teamView(db, team.id, rules);
 }
 
 export function getTeam({ db, id, viewer, rules }) {
   const row = findTeamRow(db, id);
   if (!row) return null;
-  // 可见性：战队成员 / 组长 / 有 team:read 授权的人
+  // 可见性：战队成员 / 组长 / 组委会 / 有**该队作用域**授权的人
   const isMember = listActiveMembers(db, id).some((m) => m.user_id === viewer?.id);
   const isCaptain = row.captain_id === viewer?.id;
-  const hasRight = viewer && can(viewer, 'team:read', { scopeType: 'team', scopeId: id }, db);
+  // ⚛️ F41（Low，2026-10-23 审计）：原来用 can(viewer, 'team:read', {scopeType:'team', scopeId:id}) ——
+  //    但 `team:read` 由 **captain / member / observer 三个角色全局持有**
+  //    （role_capabilities 没有 scope 列 ⇒ 角色授权是全局的）⇒ **任意登录用户**
+  //    都能读任意队伍的名单与成员变动历史 ⇒ 传进来的 scope 形同虚设。
+  //    ⇒ 改为「组委会（身份）+ 该队作用域的资源级授权」。
+  const hasRight = viewer && (isCommitteeActor(db, viewer)
+    || canScoped(viewer, 'team:read', { scopeType: 'team', scopeId: id }, db));
   if (!isMember && !isCaptain && !hasRight) return null;
   return teamView(db, id, rules);
 }
@@ -5441,7 +5505,13 @@ export function replaceMember({
   if (config.memberChange.requireCaptainOrAdmin) {
     const actor = getUserById(db, actorId);
     const isCaptain = team.captain_id === actorId;
-    const isAdmin = actor && can(actor, 'team:manage', { scopeType: 'team', scopeId: teamId }, db);
+    // ⚛️ F14（High，2026-10-23 审计）：原来这里是
+    //   can(actor, 'team:manage', { scopeType:'team', scopeId: teamId })
+    //   —— 但 `team:manage` 由 **captain 角色也持有**（全局授权）⇒
+    //   **任何一支队伍的队长**都通过了「组委会」这一支 ⇒ 跨队越权（可汰换他队成员）。
+    //   ⇒ 「组委会」改判**身份**（admin 角色），作用域化授权走 canScoped()。
+    const isAdmin = actor && (isCommitteeActor(db, actor)
+      || canScoped(actor, 'team:manage', { scopeType: 'team', scopeId: teamId }, db));
     if (!isCaptain && !isAdmin) {
       throw new AppError(403, 'FORBIDDEN', '只有队长或组委会可以汰换成员');
     }
@@ -5485,7 +5555,11 @@ export function updateTeam({ db, teamId, patch, actorId, now = new Date().toISOS
 
   const actor = getUserById(db, actorId);
   const isCaptain = team.captain_id === actorId;
-  const isAdmin = actor && can(actor, 'team:manage', { scopeType: 'team', scopeId: teamId }, db);
+  // ⚛️ F29（High，2026-10-23 审计）：与 F14 同一个病根 ——
+  //   `team:manage` 由 captain 角色**全局**持有 ⇒ 带 scope 的 can() 挡不住「别队的队长」
+  //   ⇒ 任意队长可改名并改挂**他队**的任务包。
+  const isAdmin = actor && (isCommitteeActor(db, actor)
+    || canScoped(actor, 'team:manage', { scopeType: 'team', scopeId: teamId }, db));
   if (!isCaptain && !isAdmin) {
     throw new AppError(403, 'FORBIDDEN', '只有队长或组委会可以修改战队');
   }

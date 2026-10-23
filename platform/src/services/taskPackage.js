@@ -7,6 +7,8 @@ import {
   createTaskPackage, getTaskPackage, listTaskPackagesByEdition, updateTaskPackage,
 } from '../db/repo/taskPackages.js';
 import { getEdition } from '../db/repo/editions.js';
+import { getUserById } from '../db/repo/users.js';
+import { listUserRoles } from '../db/repo/roles.js';
 import { writeAuditLog } from '../audit/log.js';
 import { can } from '../auth/permissions.js';
 
@@ -81,6 +83,35 @@ export function submitTaskPackage({ db, userId, payload, now = new Date().toISOS
     throw new AppError(400, 'FREE_BRIEF_NO_ENTERPRISE', '自由命题任务卡不得挂企业主体');
   }
 
+  // ⚛️ F31（Medium，2026-10-23 审计）：任务卡的 enterprise_id 原来**照抄请求体** ——
+  //   ⇒ 任何人都能把任务卡挂到**别人**的企业名下（冒用企业主体；该字段会进公开榜与签级链路）。
+  //   ⇒ 企业主体**由提交人自己决定**，请求体里的 enterpriseId 只在**与提交人身份一致**时采纳：
+  //     ① 企业席本人提交      ⇒ 挂自己（enterprise_id = 自己的 user id）；
+  //     ② 企业管理员提交      ⇒ 目标企业的 org 必须与自己的 org 相同，否则不挂；
+  //     ③ 组委会提交          ⇒ 受信任，按请求体挂（赛制需要代挂）；
+  //     ④ 其它角色            ⇒ 不挂企业主体。
+  //   ⇒ id 与 name 必须一致：id 被改写时，name 一并改成该企业自己的名字
+  //     （否则会出现「id 指向 A、名字写着 B」的错挂）。
+  const actor = getUserById(db, userId);
+  const actorRoles = listUserRoles(db, userId);
+  const requestedEnterpriseId = enterpriseId ?? null;
+  let effectiveEnterpriseId = null;
+  if (actorRoles.includes('enterprise')) {
+    effectiveEnterpriseId = userId;
+  } else if (actorRoles.includes('enterprise_admin')) {
+    const target = requestedEnterpriseId ? getUserById(db, requestedEnterpriseId) : null;
+    if (target && target.org && actor && target.org === actor.org) {
+      effectiveEnterpriseId = requestedEnterpriseId;
+    }
+  } else if (actorRoles.includes('admin')) {
+    effectiveEnterpriseId = requestedEnterpriseId;
+  }
+  let effectiveEnterpriseName = enterpriseName ?? null;
+  if (effectiveEnterpriseId !== requestedEnterpriseId) {
+    const eff = effectiveEnterpriseId ? getUserById(db, effectiveEnterpriseId) : null;
+    effectiveEnterpriseName = eff ? (eff.name ?? null) : null;
+  }
+
   // R-ENT-11：IP 与成果归属 —— 同意记录随任务卡一起留存
   const meta = {
     consent: { ...(consent ?? {}), acceptedAt: now },
@@ -88,7 +119,8 @@ export function submitTaskPackage({ db, userId, payload, now = new Date().toISOS
   };
 
   const row = createTaskPackage(db, {
-    editionId, enterpriseId, enterpriseName, title, painPoint,
+    editionId, enterpriseId: effectiveEnterpriseId, enterpriseName: effectiveEnterpriseName,
+    title, painPoint,
     expectedDelivery, acceptanceCriteria, isFreeBrief, submittedBy: userId, meta, now,
   });
   return presentTaskPackage(row);
@@ -132,6 +164,28 @@ export function assessSolvability({ db, taskPackageId, answers, actorId, now = n
     vetoes: result.vetoes,
     explain: result.explain,
     computedGrade: result.computedGrade,
+    // ⚛️ F16（Critical）：**档位定义必须一并投影出来**。
+    //    原来这里只投影维度 explain（不含 minScore/maxScore）⇒ 前端的「服务端投影」
+    //    只能反推出**档位键**、没有分数区间 ⇒ `gradeTiers()` 判「档位未就绪」
+    //    ⇒ **一旦有任意一张卡被评估过，签级控件就整片消失**（自锁：评估更多卡也修不好）。
+    //    为什么必须服务端带：生产部署**不挂** /rules/（只有 DEMO_MODE=1 才挂）
+    //    ⇒ 规则投影那条路在生产是断的 ⇒ 服务端不带完整档位定义，前端就没有可用规格。
+    //    （前端侧还有一道兜底：投影不出完整档位就返回 null，降级到规则投影 —— 见
+    //      web/views/admin-task-packages.js 的 solvabilitySpecFromPackages。）
+    grades: config.grades.map((g) => ({
+      key: g.key,
+      minScore: Number(g.minScore),
+      maxScore: Number(g.maxScore),
+      commitment: String(g.commitment ?? ''),
+      agreement: String(g.agreement ?? ''),
+    })),
+    // 否决项的**完整定义**（key/label/auto）—— 与 `vetoes`（本次命中的那几项）不是一回事：
+    // 前端要靠 `auto` 区分「由维度取值自动命中」与「委员会自报」。
+    vetoesSpec: config.vetoes.map((v) => ({
+      key: v.key,
+      label: String(v.label ?? v.key),
+      auto: Boolean(v.auto),
+    })),
     assessedBy: actorId,
     assessedAt: now,
   };

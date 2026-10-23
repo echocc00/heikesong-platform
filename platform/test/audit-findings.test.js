@@ -592,20 +592,43 @@ test('F16 签级表单：评估过一次任务卡后仍必须能签级', async (
     ?? solvabilitySpecFromRules(rules);
   assert.equal(gradeTiers(before).complete, true, '前提：评估前签级档位应就绪');
 
-  // 评估后：那一张卡带上了 meta.solvability.explain ⇒ packages 投影胜出（?? 短路）
+  // 评估后：那一张卡带上了 meta.solvability.explain **与服务端投影的完整档位定义**
+  //   （服务端修复后会把 grades 一并投影进 meta.solvability —— 见 services/taskPackage.js）
+  const serverGrades = rules.grades.map((g) => ({
+    key: g.key,
+    minScore: g.minScore,
+    maxScore: g.maxScore,
+    commitment: g.commitment ?? '',
+    agreement: g.agreement ?? '',
+  }));
   const after = solvabilitySpecFromPackages([{
     id: 'p1', status: 'assessed', grade: 'B',
     meta: { solvability: { explain: [
       { dimension: 'capability', label: '能力维度', weight: 0.35, max: 5 },
-    ] } },
+    ], grades: serverGrades } },
   }]) ?? solvabilitySpecFromRules(rules);
   const tiers = gradeTiers(after);
-  // 修复前：packages 投影的 grades 只有 key、没有 minScore ⇒ gradeTiers 判定「档位未就绪」
+  // 修复前：前端**不读** meta.solvability.grades ⇒ 投影出的 grades 只有 key、没有 minScore
+  //        ⇒ gradeTiers 判定「档位未就绪」⇒ 签级控件整片消失（自锁）
   assert.equal(
     tiers.complete, true,
     '评估过一次任务卡后签级档位就绪状态丢失（packages 投影缺 minScore/maxScore）',
   );
   assert.ok(tiers.approve.length > 0, '签级下拉框没有可选项');
+
+  // ⚛️ 另一半的病根也必须钉住：**视图的取规格路径要规则优先**。
+  //    只修投影、不修优先级的话：生产环境不挂 /rules/（只有 DEMO_MODE=1）⇒ 规则投影取不到，
+  //    而**旧数据**（修复前评估过的卡）没有 grades ⇒ 包投影残缺 ⇒ 照样「档位未就绪」。
+  //    视图里那两个解析器曾**相反**（resolveSolvabilitySpec 规则优先 / load() 包投影优先）。
+  const viewSrc = readFileSync(join(webDir, 'views', 'admin-task-packages.js'), 'utf8');
+  assert.ok(
+    viewSrc.includes('resolveSolvabilitySpec({ packages, rules:'),
+    '视图必须走 resolveSolvabilitySpec（规则投影优先）—— 包投影优先会让签级自锁',
+  );
+  assert.ok(
+    !/solvabilitySpecFromPackages\(packages\)\s*\?\?/.test(viewSrc),
+    '视图里不得再出现「包投影 ?? 规则投影」这种把残缺规格放在前面的写法',
+  );
 });
 
 // ══════════════════════════════════════════════════════════════════

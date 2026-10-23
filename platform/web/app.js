@@ -263,13 +263,18 @@ async function render() {
   }
   const banner = demoBanner();
 
-  const found = match(path);
-  if (!found) {
-    app.innerHTML = '<div class="card">页面不存在</div>';
-    if (banner) app.prepend?.(banner);
-    return;
-  }
+  // ⚠️ 路由匹配必须**在 try 块之内**（F18）：`match()` 内部要解码 hash 里的参数，
+  //    畸形百分号编码会抛 URIError —— 若在 try 之外，异常一路冒到 hashchange 回调
+  //    ⇒ **整页白屏**（连错误卡片都渲染不出来）。
+  //    （路由层本身已把畸形编码当作「该路由不匹配」处理，这里是纵深防御：
+  //      将来任何新的匹配期异常，也不该再让整页崩掉。）
   try {
+    const found = match(path);
+    if (!found) {
+      app.innerHTML = '<div class="card">页面不存在</div>';
+      if (banner) app.prepend?.(banner);
+      return;
+    }
     // ⚠️ 路由参数与 query 必须透传给视图：P3 的视图要靠 params.stageId / params.teamId
     //    决定请求哪个赛段 / 哪支队伍，靠 query.scope / query.editionId 决定口径与届期。
     //    P0 原来只传 ctx —— 视图拿不到参数（前端 router.match 会把 '?query' 剥掉再匹配）。

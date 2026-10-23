@@ -1390,8 +1390,25 @@ export function solvabilitySpecFromRules(rules) {
 export function solvabilitySpecFromPackages(packages) {
   const list = Array.isArray(packages) ? packages : [];
   for (const pkg of list) {
-    const explain = pkg?.meta?.solvability?.explain;
+    const solvability = pkg?.meta?.solvability;
+    const explain = solvability?.explain;
     if (!Array.isArray(explain) || !explain.length) continue;
+    // ⚛️ F16（Critical）：档位定义（minScore/maxScore）**不完整就不算规格**。
+    //    原来这里只从卡片反推**档位键**（`grades: observedGrades(list).map(k => ({key:k}))`）
+    //    ⇒ `gradeTiers()` 因「没有一条带 minScore」判「档位未就绪」
+    //    ⇒ **只要有任意一张卡被评估过，签级控件就整片消失**（自锁：再评估也修不好）。
+    //    投影不出完整档位 ⇒ **返回 null**，让调用方降级（`??` 走规则投影）
+    //    —— 半份规格比没有规格更坏：它会让页面显示「档位未就绪」而看不出真因。
+    //    服务端现在也会把完整档位定义带进 meta.solvability（见 services/taskPackage.js）。
+    const grades = (Array.isArray(solvability.grades) ? solvability.grades : [])
+      .filter((g) => g && typeof g.key === 'string')
+      .map((g) => ({
+        key: g.key,
+        minScore: Number(g.minScore),
+        maxScore: Number(g.maxScore),
+        commitment: String(g.commitment ?? ''),
+        agreement: String(g.agreement ?? ''),
+      }));
     return {
       source: 'api',
       dimensions: explain
@@ -1402,23 +1419,20 @@ export function solvabilitySpecFromPackages(packages) {
           weight: Number(d.weight) || 0,
           max: Number(d.max) || 0,
         })),
-      // 档位与否决项：从**已观察到的**取值反推（只有键，没有分数区间 / 说明）
-      grades: observedGrades(list).map((key) => ({ key })),
-      vetoes: observedVetoes(list).map((key) => ({ key })),
+      // ⚛️ F16（Critical）：档位定义（minScore/maxScore）**必须完整**，否则这份规格是残的。
+      //    残规格会让 `gradeTiers()` 判「档位未就绪」⇒ 签级控件整片消失（自锁）。
+      //    服务端现在把完整档位定义投影进 meta.solvability（见 services/taskPackage.js）
+      //    ⇒ 这里优先读它；读不到（**旧数据**：本项修复之前评估过的卡）才退回
+      //    「从已观察到的取值反推」（只有键，没有分数区间）。
+      grades: grades.length ? grades : observedGrades(list).map((key) => ({ key })),
+      // 否决项：优先用服务端带来的**完整定义**（含 label / auto）；
+      // 没有就退回「从已命中的反推」（只有键）。
+      vetoes: (Array.isArray(solvability.vetoesSpec) && solvability.vetoesSpec.length
+        ? solvability.vetoesSpec
+        : observedVetoes(list)).map((v) => (typeof v === 'string' ? { key: v } : v)),
     };
   }
   return null;
-}
-
-/**
- * 定规格（纯函数）：规则投影更完整（六维 + 档位区间 + 否决项说明）⇒ 有它就用它；
- * 没有就退回服务端投影（维度齐、档位只有键）。
- *
- * @param {{ packages?: object[], rules?: object|null }} input
- * @returns {object|null}
- */
-export function resolveSolvabilitySpec({ packages = [], rules = null } = {}) {
-  return solvabilitySpecFromRules(rules) ?? solvabilitySpecFromPackages(packages);
 }
 
 /** 规格里出现过的档位键（从卡片的已签 / 已算档位反推）。 */
@@ -1431,6 +1445,17 @@ function observedGrades(packages) {
     }
   }
   return [...keys].sort();
+}
+
+/**
+ * 定规格（纯函数）：规则投影更完整（六维 + 档位区间 + 否决项说明）⇒ 有它就用它；
+ * 没有就退回服务端投影（维度齐、档位只有键）。
+ *
+ * @param {{ packages?: object[], rules?: object|null }} input
+ * @returns {object|null}
+ */
+export function resolveSolvabilitySpec({ packages = [], rules = null } = {}) {
+  return solvabilitySpecFromRules(rules) ?? solvabilitySpecFromPackages(packages);
 }
 
 /** 规格里出现过的否决项键（从卡片已命中的否决项反推）。 */
@@ -1866,10 +1891,17 @@ export function renderAdminTaskPackages(ctx) {
       const res = await api.get(`/api/task-packages${query}`);
       packages = res?.items ?? res?.rows ?? [];
       mix = res?.mix ?? null;
-      // 规格：先用服务端投影（不用额外请求），取不到再取规则文件。
+      // ⚛️ F16（Critical）：规格**规则投影优先**。
+      //    原来这里是「服务端投影优先」⇒ 一旦有任意一张卡被评估过，
+      //    **残缺**的包投影（只有档位键、没有分数区间）就盖掉了完整规则
+      //    ⇒ `gradeTiers()` 判「档位未就绪」⇒ **签级控件整片消失**
+      //    （自锁：评估更多卡也修不好，只有改代码才能恢复）。
+      //    两个投影的优先级由 `resolveSolvabilitySpec()` 统一定义（规则投影更完整 ⇒ 有它就用它），
+      //    本文件另有一处同名解析器，两者曾**相反** ⇒ 现在只有这一个入口。
+      //    生产环境不挂 /rules/（只有 DEMO_MODE=1）⇒ 那时靠服务端投影 ——
+      //    服务端现在也把完整档位定义带进 meta.solvability（见 services/taskPackage.js）。
       const fetched = await fetchSolvabilityRules(api);
-      spec = solvabilitySpecFromPackages(packages)
-        ?? (fetched ? solvabilitySpecFromRules(fetched.rules) : null);
+      spec = resolveSolvabilitySpec({ packages, rules: fetched?.rules ?? null });
     } catch (e) {
       body.innerHTML = errorState({
         message: '任务卡加载失败',

@@ -76,6 +76,19 @@ export function createWorkflowTask({ db, workflowId, title, detail, ownerTeamId,
     if (actor.is_superadmin !== 1 && !hasActiveMembership(db, ownerTeamId, actorId)) {
       throw appError(403, 'FORBIDDEN', '只能给自己所在的队建任务');
     }
+  } else {
+    // ⚛️ F32（Medium，2026-10-23 审计）：原来「不传 ownerTeamId」就**完全跳过归属校验**
+    //   ⇒ 任何队的成员都能往**别队**的工作流里注入任务（任务归属被凭空改写）。
+    //   ⇒ 不传时也要校验：必须是该工作流（任务包）的承接队之一（或超管）。
+    const ownerTeams = listTeamRows(db, {
+      editionId: workflow.edition_id,
+      taskPackageId: workflow.task_package_id,
+    });
+    const allowed = actor.is_superadmin === 1
+      || ownerTeams.some((t) => hasActiveMembership(db, t.id, actorId));
+    if (!allowed) {
+      throw appError(403, 'FORBIDDEN', '只能给自己所在的队建任务');
+    }
   }
   return wfRepo.insertWorkflowTask(db, {
     id: randomUUID(),
@@ -133,6 +146,28 @@ export function claimTask({ db, taskId, userId, teamId, now }) {
   if (task.status === 'done') throw appError(409, 'TASK_ALREADY_DONE', '任务已完成，不能再领取');
 
   const team = resolveTeam(db, userId, teamId);
+  // ⛔ F15（High，2026-10-23 审计）：**任务归属校验**。
+  //    原来只校验「你是不是某支队的成员」（resolveTeam），**从不校验这个任务是谁的**
+  //    ⇒ 任何队的队长都能 `claimTask` 抢走**别队**的任务并完成它
+  //    （R-OPS-14「禁止岗位制」被绕过：任务池的归属语义没了）。
+  //    判据：
+  //      ① 任务有 owner_team_id ⇒ 只能由**那一支**队领取；
+  //      ② 任务没有 owner_team_id ⇒ 它属于该工作流（任务包）的承接队，
+  //         只有那些队能领。
+  const ownerTeamId = task.owner_team_id ?? null;
+  if (ownerTeamId) {
+    if (ownerTeamId !== team.id) {
+      throw appError(403, 'NOT_TASK_OWNER', '不能领取别队的任务');
+    }
+  } else {
+    const wf = wfRepo.getWorkflow(db, task.workflow_id);
+    const ownerTeams = wf
+      ? listTeamRows(db, { editionId: wf.edition_id, taskPackageId: wf.task_package_id })
+      : [];
+    if (ownerTeams.length && !ownerTeams.some((t) => t.id === team.id)) {
+      throw appError(403, 'NOT_TASK_OWNER', '不能领取别队的任务');
+    }
+  }
   if (claimRepo.getActiveClaim(db, taskId)) {
     throw appError(409, 'TASK_ALREADY_CLAIMED', '任务已被他人领取');
   }

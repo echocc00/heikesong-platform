@@ -20,8 +20,10 @@ import { getTeamTierRow } from '../db/repo/tiers.js';
 import { getRegistration as findRegistrationRow, updateRegistrationRow } from '../db/repo/registrations.js';
 import { insertRegistrationEvent } from '../db/repo/registrationEvents.js';
 import { getUserById } from '../db/repo/users.js';
+import { hasActiveMembership } from '../db/repo/teamMembers.js';
+import { getTeam } from '../db/repo/teams.js';
 import { writeAuditLog } from '../audit/log.js';
-import { can } from '../auth/permissions.js';
+import { can, isCommitteeActor } from '../auth/permissions.js';
 import { badRequest, conflict, forbidden, notFound } from '../errors.js';
 
 export const REVIEW_STATES = ['SUBMITTED', 'PENDING_REVIEW', 'CONFIRMED', 'FINALIZED', 'REJECTED', 'FLAGGED'];
@@ -195,6 +197,23 @@ export function fileAppeal({
   }
 
   const { stageId, teamId } = parseAppealSubject(subjectId);
+  // ⚛️ F34（Medium，2026-10-23 审计）：原来**没有归属校验** ——
+  //   ⇒ 任何持有 appeal:write 的人都能对**别人队伍**的赛段结果提申诉。
+  //   ⇒ 申诉人必须是该队成员（或组委会 / 超管）。
+  //   ⛔ **归属校验必须排在状态校验之前**：否则对一条「不存在的条目」提申诉会先撞上
+  //      409（状态不对），把「越权」掩盖成「状态错误」⇒ 排障时看错方向。
+  if (teamId) {
+    const actor = getUserById(db, filedBy);
+    const team = getTeam(db, teamId);
+    // 归属 = 该队**队长**或**在册成员**（队长身份来自 teams.captain_id，
+    // 与 team_members 是否有行无关 —— 报名刚通过、还没落成员行时队长就该能申诉）
+    const isCaptain = Boolean(team) && team.captain_id === filedBy;
+    const isMember = Boolean(filedBy) && hasActiveMembership(db, teamId, filedBy);
+    const isCommittee = actor && isCommitteeActor(db, actor);
+    if (!isCaptain && !isMember && !isCommittee) {
+      throw forbidden('只能对自己队伍的赛段结果提申诉');
+    }
+  }
   const state = stageId ? getSubjectState({ db, subjectType: 'stage_result', subjectId: stageId }) : null;
   if (state !== 'FINALIZED') {
     throw conflict(`只有已 FINALIZED 的条目可以申诉（当前状态：${state ?? '未进入复核'}）`);

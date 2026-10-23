@@ -20,7 +20,7 @@ import {
   countActiveMembers, findActiveMembershipByUser, lastLeaveAt,
 } from '../db/repo/teamMembers.js';
 import { insertMilestones } from '../db/repo/tiers.js';
-import { can } from '../auth/permissions.js';
+import { can, canScoped, isCommitteeActor } from '../auth/permissions.js';
 
 /**
  * 组队硬校验。错误串格式：[错误码] 说明，服务层按码分流。
@@ -176,10 +176,16 @@ export function createTeam({
 export function getTeam({ db, id, viewer, rules }) {
   const row = findTeamRow(db, id);
   if (!row) return null;
-  // 可见性：战队成员 / 组长 / 有 team:read 授权的人
+  // 可见性：战队成员 / 组长 / 组委会 / 有**该队作用域**授权的人
   const isMember = listActiveMembers(db, id).some((m) => m.user_id === viewer?.id);
   const isCaptain = row.captain_id === viewer?.id;
-  const hasRight = viewer && can(viewer, 'team:read', { scopeType: 'team', scopeId: id }, db);
+  // ⚛️ F41（Low，2026-10-23 审计）：原来用 can(viewer, 'team:read', {scopeType:'team', scopeId:id}) ——
+  //    但 `team:read` 由 **captain / member / observer 三个角色全局持有**
+  //    （role_capabilities 没有 scope 列 ⇒ 角色授权是全局的）⇒ **任意登录用户**
+  //    都能读任意队伍的名单与成员变动历史 ⇒ 传进来的 scope 形同虚设。
+  //    ⇒ 改为「组委会（身份）+ 该队作用域的资源级授权」。
+  const hasRight = viewer && (isCommitteeActor(db, viewer)
+    || canScoped(viewer, 'team:read', { scopeType: 'team', scopeId: id }, db));
   if (!isMember && !isCaptain && !hasRight) return null;
   return teamView(db, id, rules);
 }
@@ -238,7 +244,13 @@ export function replaceMember({
   if (config.memberChange.requireCaptainOrAdmin) {
     const actor = getUserById(db, actorId);
     const isCaptain = team.captain_id === actorId;
-    const isAdmin = actor && can(actor, 'team:manage', { scopeType: 'team', scopeId: teamId }, db);
+    // ⚛️ F14（High，2026-10-23 审计）：原来这里是
+    //   can(actor, 'team:manage', { scopeType:'team', scopeId: teamId })
+    //   —— 但 `team:manage` 由 **captain 角色也持有**（全局授权）⇒
+    //   **任何一支队伍的队长**都通过了「组委会」这一支 ⇒ 跨队越权（可汰换他队成员）。
+    //   ⇒ 「组委会」改判**身份**（admin 角色），作用域化授权走 canScoped()。
+    const isAdmin = actor && (isCommitteeActor(db, actor)
+      || canScoped(actor, 'team:manage', { scopeType: 'team', scopeId: teamId }, db));
     if (!isCaptain && !isAdmin) {
       throw new AppError(403, 'FORBIDDEN', '只有队长或组委会可以汰换成员');
     }
@@ -282,7 +294,11 @@ export function updateTeam({ db, teamId, patch, actorId, now = new Date().toISOS
 
   const actor = getUserById(db, actorId);
   const isCaptain = team.captain_id === actorId;
-  const isAdmin = actor && can(actor, 'team:manage', { scopeType: 'team', scopeId: teamId }, db);
+  // ⚛️ F29（High，2026-10-23 审计）：与 F14 同一个病根 ——
+  //   `team:manage` 由 captain 角色**全局**持有 ⇒ 带 scope 的 can() 挡不住「别队的队长」
+  //   ⇒ 任意队长可改名并改挂**他队**的任务包。
+  const isAdmin = actor && (isCommitteeActor(db, actor)
+    || canScoped(actor, 'team:manage', { scopeType: 'team', scopeId: teamId }, db));
   if (!isCaptain && !isAdmin) {
     throw new AppError(403, 'FORBIDDEN', '只有队长或组委会可以修改战队');
   }

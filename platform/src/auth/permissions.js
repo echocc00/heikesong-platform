@@ -16,7 +16,33 @@ import {
   capabilityExists,
 } from '../db/repo/assignments.js';
 import { userExists } from '../db/repo/users.js';
+import { listUserRoles } from '../db/repo/roles.js';
 import { appError } from '../errors.js';
+
+/**
+ * 「组委会」判定：admin 角色（或超管）。
+ *
+ * ⛔ **为什么不能写成 `can(user, 'team:manage', { scopeType: 'team', scopeId })`**：
+ *    `role_capabilities` **没有 scope 列** ⇒ 角色授予的能力点一律是**全局**的
+ *    （INTERFACES.md:22 明文：「超管 / role_capability 授权一律不做行级过滤」）。
+ *    而 `captain` 角色**也**持有 `team:manage` ⇒ 任何队长都能通过「带 scope 的 can()」
+ *    ⇒ 「任意队长可汰换他队成员 / 改挂他队任务包」这类**跨队越权**
+ *    （2026-10-23 审计 F14 / F29 / F30 / F40 / F42）。
+ *    ⇒ 组委会是**身份**（admin 角色），不是「作用域化的能力」⇒ 单独判定。
+ *    ⛔ 这**不违反**「判定只有 can() 一个入口」：那条约束管的是**能力点**判定；
+ *       身份事实（本队队长 `teams.captain_id`、本组成员 `team_members`、
+ *       本企业 `task_packages.enterprise_id`）本来就是各调用点自己判的。
+ *
+ * @param {object} db
+ * @param {object|null} user 用户行或 toPublicUser 形状
+ * @returns {boolean}
+ */
+export function isCommitteeActor(db, user) {
+  if (!user || !db) return false;
+  if (user.is_superadmin === 1 || user.isSuperadmin === true) return true;
+  if (!user.id) return false;
+  return listUserRoles(db, user.id).includes('admin');
+}
 
 export function grantAssignment(
   db,
@@ -102,6 +128,39 @@ export function can(user, capability, ctx = null, db = null) {
   if (roleGrants(db, user.id, capability)) return true;
 
   // 资源级授权
+  return assignmentGrants(db, user, capability, ctx);
+}
+
+/**
+ * 资源级授权判定（assignments）—— `can()` 的**作用域化那一半**。
+ *
+ * ⛔ **为什么要有它**（2026-10-23 审计 F14 / F29 / F41）：
+ *    `can()` 里「角色能力命中即 return true」，而**角色授权是全局的**
+ *    （role_capabilities 没有 scope 列 —— INTERFACES.md:22 明文：
+ *      「超管 / role_capability 授权一律不做行级过滤」）。
+ *    ⇒ 「带 scope 的 can()」**表达不了**「我对**这一支**队伍有权限」：
+ *      只要用户持有该能力点的任意角色（captain / member / observer …），
+ *      `can(user, 'team:read', {scopeType:'team', scopeId: 别人的队})` 也是 true
+ *      ⇒ **任意登录用户可读任意队伍名单**（F41）、**任意队长可汰换他队成员**（F14）。
+ *    ⇒ 需要「作用域受限」时，调用方用 `canScoped()`（只看 assignments）
+ *      或 `isCommitteeActor()`（组委会身份），**不要**直接用带 scope 的 can()。
+ *
+ * @param {object|null} user
+ * @param {string} capability
+ * @param {{scopeType?: string, scopeId?: any}|null} ctx
+ * @param {object} db
+ * @returns {boolean}
+ */
+export function canScoped(user, capability, ctx = null, db = null) {
+  if (!user) return false;
+  if (user.active !== undefined && !user.active) return false;
+  if (user.is_superadmin === 1 || user.isSuperadmin === true) return true;
+  if (!db || !user.id) return false;
+  return assignmentGrants(db, user, capability, ctx);
+}
+
+/** assignments 表的授权判定（can() 与 canScoped() 共用，保证两者结论一致）。 */
+function assignmentGrants(db, user, capability, ctx) {
   const rows = listAssignments(db, { userId: user.id, capability });
   for (const row of rows) {
     if (row.scope_type === 'global') return true;
