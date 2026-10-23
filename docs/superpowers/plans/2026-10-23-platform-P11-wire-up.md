@@ -9585,7 +9585,7 @@ export function stageCreateFormHtml({ draft = {}, configs = [] } = {}) {
       <label class="field__label" for="stage-new-key">赛段代号</label>
       <input class="input" id="stage-new-key" type="text" autocomplete="off"
         placeholder="如 initial / final" value="${escapeHtml(draft.key ?? '')}" data-stage="new-key" />
-      <p class="field__hint">代号建后**不可改**（它进 URL 与日志）：只能用字母、数字、连字符与下划线，同一届期内不能重复。</p>
+      <p class="field__hint">代号建后不可改（它进 URL 与日志）：只能用字母、数字、连字符与下划线，同一届期内不能重复。</p>
     </div>
     <div class="field field--required">
       <label class="field__label" for="stage-new-name">赛段名称</label>
@@ -9600,7 +9600,7 @@ export function stageCreateFormHtml({ draft = {}, configs = [] } = {}) {
     <div class="field">
       <label class="field__label" for="stage-new-config">权重表</label>
       <select class="select" id="stage-new-config" data-stage="new-config">${optionsHtml(configItems, draft.scoringConfigKey ?? 'initial')}</select>
-      <p class="field__hint">权重表来自 rules/scoring-*.json（改文件、重启即生效）—— 这里只选择**用哪一张**。</p>
+      <p class="field__hint">权重表来自 rules/scoring-*.json（改文件、重启即生效）—— 这里只选择用哪一张。</p>
     </div>
     <div class="field">
       <label class="field__label" for="stage-new-starts">开始时间</label>
@@ -9654,8 +9654,8 @@ export function stageConfigHtml({ stage = null, draft = {}, configs = [] } = {})
       tone: 'warn',
       title: '这两项没有随赛段列表返回',
       items: [
-        '赛段列表端点只返回摘要（代号 / 名称 / 类型 / 时间窗 / 状态），**不含**冻结时间与权重表键 ⇒ 页面无法回填它们的当前值。',
-        '没有改动的字段**不会被提交**（服务端的改配置语义是「不传 = 不改」）⇒ 保存一次不会误清空已有的冻结时间，也不会把权重表换成默认值。',
+        '赛段列表端点只返回摘要（代号 / 名称 / 类型 / 时间窗 / 状态），不含冻结时间与权重表键 ⇒ 页面无法回填它们的当前值。',
+        '没有改动的字段不会被提交（服务端的改配置语义是「不传 = 不改」）⇒ 保存一次不会误清空已有的冻结时间，也不会把权重表换成默认值。',
       ],
     })}
     <div class="field">
@@ -9721,7 +9721,7 @@ export function weightTableHtml({ configs = [], scoringConfigKey = '', degraded 
       items: [
         '权重表来自 rules/scoring-*.json（改一份 JSON、重启即生效），此刻拿不到规则文件，权重表暂时显示不出来。',
         forbidden
-          ? '读取权重表**没有权限**（权重表端点是届期作用域的读口，需要该届期的组委会能力）。'
+          ? '读取权重表没有权限（权重表端点是届期作用域的读口，需要该届期的组委会能力）。'
           : '其余面板（赛段配置 / 评委席 / 名册）不受影响，可以照常操作。',
       ],
     });
@@ -9817,7 +9817,7 @@ export function weightTableHtml({ configs = [], scoringConfigKey = '', degraded 
     ${sectionTitle('席构成约束')}
     ${kvList(poolRows)}
     <p class="muted small">以上约束由服务端校验（企业席 ≥30%、专家席 ≤50%）；页面不复制这套判定。</p>
-    <p class="muted small">权重表**只读**：要改权重，改 rules/scoring-*.json 这一份 JSON，重启即生效。</p>`;
+    <p class="muted small">权重表只读：要改权重，改 rules/scoring-*.json 这一份 JSON，重启即生效。</p>`;
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -9883,7 +9883,7 @@ export function judgeSeatHtml({ judges = [], candidates = [], draft = {}, pendin
       <div class="field">
         <label class="field__label" for="stage-judge-seat">席位</label>
         <select class="select" id="stage-judge-seat" data-stage="judge-seat">${optionsHtml(seatItems, draft.seat ?? 'judge')}</select>
-        <p class="field__hint">观察席**无投票权**；企业席 ≥30%、专家席 ≤50% 由服务端校验（页面不复制这套判定）。</p>
+        <p class="field__hint">观察席无投票权；企业席 ≥30%、专家席 ≤50% 由服务端校验（页面不复制这套判定）。</p>
       </div>
       <div class="row">
         <button type="button" class="btn btn--primary" data-action="judge-assign-submit">派评委</button>
@@ -9907,7 +9907,7 @@ export function removeJudgeConfirmHtml({ userId = '', name = '', stageName = '' 
   const where = stageName ? `赛段「${stageName}」` : '本赛段';
   return `<div class="notice notice--warn" data-stage-confirm="judge">
     <p class="notice__title">确认撤回该评委？</p>
-    <p class="notice__text">撤回 ${escapeHtml(who)} 在${escapeHtml(where)}的席位后：他的席位立即失效，其在本赛段签署的**利益冲突声明一并解除**（声明记录作为历史事实保留，不会删除）；该评委不再计入本赛段的评委池与席构成校验，已提交的历史评分不受影响。</p>
+    <p class="notice__text">撤回 ${escapeHtml(who)} 在${escapeHtml(where)}的席位后：他的席位立即失效，其在本赛段签署的<strong>利益冲突声明一并解除</strong>（声明记录作为历史事实保留，不会删除）；该评委不再计入本赛段的评委池与席构成校验，已提交的历史评分不受影响。</p>
     <div class="btn-group">
       <button type="button" class="btn btn--primary" data-action="judge-remove-confirm" data-user-id="${escapeHtml(userId)}">确认撤回</button>
       <button type="button" class="btn btn--ghost" data-action="judge-remove-cancel">取消</button>
@@ -10005,7 +10005,7 @@ export function removeTeamConfirmHtml({ teamId = '', name = '', stageName = '' }
   const where = stageName ? `赛段「${stageName}」` : '本赛段';
   return `<div class="notice notice--warn" data-stage-confirm="team">
     <p class="notice__title">确认把该队伍退名册？</p>
-    <p class="notice__text">把 ${escapeHtml(who)} 从${escapeHtml(where)}的名册里退出后：该队在本赛段的**评分与确认全部失效**（已交的评分不再计入本赛段的计算与名次），名次与榜单也会随之变化。这一步是逆向操作，请确认。</p>
+    <p class="notice__text">把 ${escapeHtml(who)} 从${escapeHtml(where)}的名册里退出后：该队在本赛段的<strong>评分与确认全部失效</strong>（已交的评分不再计入本赛段的计算与名次），名次与榜单也会随之变化。这一步是逆向操作，请确认。</p>
     <div class="btn-group">
       <button type="button" class="btn btn--primary" data-action="roster-remove-confirm" data-team-id="${escapeHtml(teamId)}">确认退名册</button>
       <button type="button" class="btn btn--ghost" data-action="roster-remove-cancel">取消</button>
@@ -10396,7 +10396,7 @@ export async function renderStageConfig(ctx) {
       state.stageId = created?.id ? String(created.id) : state.stageId;
       ok('赛段已创建', [
         created ? `赛段「${created.name}（${created.key}）」已建好。` : '赛段已建好。',
-        '新赛段是**草稿**状态：开闸是另一个动作。',
+        '新赛段是草稿状态：开闸是另一个动作。',
       ]);
       await reload();
     } catch (e) {
@@ -11301,5 +11301,114 @@ test('契约：不许自造 CSS 类名（只用仓库里已有的类）', () => 
   }
   const missing = [...used].filter((cls) => !new RegExp(`\\.${cls.replace(/[-]/g, '\\-')}[^\\w-]`).test(css));
   assert.deepEqual(missing, [], `这些 class 在 styles.css 里不存在：${missing.join(', ')}`);
+});
+
+test('⛔ 契约：用户可见文案里**不许**出现 markdown 星号（`**`）', () => {
+  // ⛔ 为什么钉这条（浏览器实测抓到的真缺陷）：
+  //   本仓前端**不渲染 markdown** —— `noticeState` 会 escapeHtml，`field__hint` 是纯文本。
+  //   ⇒ 文案里写 `观察席**无投票权**`，用户在页面上看到的就是**字面的星号**。
+  //   （浏览器实跑 E158 时在「席位」下方看到「观察席**无投票权**」才暴露出来。）
+  //
+  // ⚠️ 注释里用 `**` 做强调是**正常**的（仓库惯例）⇒ 只查非注释行。
+  const offenders = [];
+  VIEW_SRC.split('\n').forEach((line, i) => {
+    const s = line.trim();
+    if (s.startsWith('//') || s.startsWith('*') || s.startsWith('/*')) return;
+    if (line.includes('**')) offenders.push(`${i + 1}: ${s.slice(0, 120)}`);
+  });
+  assert.deepEqual(offenders, [], `这些行的用户可见文案里带了 markdown 星号：\n${offenders.join('\n')}`);
+});
+```
+
+### `platform/test/view-markdown-leak.test.js`
+
+全站视图的 markdown 漏出闸（E158 浏览器实测抓到的真缺陷）：本仓前端**不渲染 markdown**（noticeState 会 escapeHtml、field__hint 是纯文本）⇒ 文案里写 `**不可改**` 用户看到的就是字面星号。闸扫全站 `web/views/*.js` 的非注释行，并收窄判据以免误伤乘法运算符与文件名通配符。
+
+```javascript
+// platform/test/view-markdown-leak.test.js —— 全站视图：用户可见文案里**不许**漏出 markdown 标记
+//
+// ⛔ **这个闸为什么存在**（浏览器实测抓到的真缺陷 · E158）：
+//   本仓前端**不渲染 markdown** ——
+//     · `noticeState` 走 `escapeHtml`（web/ui.js:128-135）⇒ 提示条里是纯文本；
+//     · `field__hint` / `muted small` 是纯文本标签；
+//     · `pageHead` / `panel` 的说明文字同理。
+//   ⇒ 文案里写 `观察席**无投票权**`，用户在页面上看到的就是**字面的两个星号**。
+//
+//   实际怎么发现的：E158 在公网演示站浏览器实跑「赛段配置」页时，
+//   在「席位」下方看到「观察席**无投票权**」—— 一眼看出来的排版脏点。
+//   同一次扫描还抓到 publish.js 的二次确认文案「会按**当前评分**清空旧名次…」（P8 起的旧账）。
+//
+// ⚠️ 注释里用 `**` 做强调是**仓库惯例**（溯源注释大量使用）⇒ 只查**非注释行**。
+// ⚠️ JS 的幂运算符 `**` 是**代码**，不是文案 ⇒ 排除（`1 - (1 - t) ** 3` 这类）。
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync, readdirSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const viewsDir = join(here, '..', 'web', 'views');
+
+/**
+ * 去掉注释后的行（只用于**扫描**，不参与运行）。
+ * @param {string} src
+ * @returns {string[]}
+ */
+function codeLines(src) {
+  const out = [];
+  let inBlock = false;
+  for (const line of src.split('\n')) {
+    const s = line.trim();
+    if (inBlock) {
+      if (s.includes('*/')) inBlock = false;
+      continue;
+    }
+    if (s.startsWith('/*')) {
+      inBlock = !s.includes('*/');
+      continue;
+    }
+    if (s.startsWith('//') || s.startsWith('*')) continue;
+    out.push(line);
+  }
+  return out;
+}
+
+test('⛔ 全站视图：用户可见文案里不许漏出 markdown 星号（`**`）', () => {
+  const offenders = [];
+  for (const file of readdirSync(viewsDir).filter((f) => f.endsWith('.js'))) {
+    const src = readFileSync(join(viewsDir, file), 'utf8');
+    codeLines(src).forEach((line, i) => {
+      if (!line.includes('**')) return;
+      // ⛔ 排除 JS 幂运算符：`a ** b`（等号 / 运算符语境），它不是文案。
+      if (/\S\s\*\*\s\S/.test(line) && !/['"`]/.test(line)) return;
+      offenders.push(`${file}: ${line.trim().slice(0, 130)}`);
+    });
+  }
+  assert.deepEqual(offenders, [], `这些行的文案里带了 markdown 星号（前端不渲染 markdown ⇒ 用户看到的是字面星号）：\n${offenders.join('\n')}`);
+});
+
+test('⛔ 全站视图：中文文案里不许出现**落单**的星号（多半是 markdown 写了一半）', () => {
+  // ⛔ 收窄判据（否则误伤一堆）：
+  //   · `Math.round(x * 100)` —— 乘法运算符；
+  //   · `rules/scoring-*.json` —— 文件名通配符。
+  //   ⇒ 只判「星号**紧邻中文**」的情况：那才是 markdown 强调漏出。
+  const offenders = [];
+  for (const file of readdirSync(viewsDir).filter((f) => f.endsWith('.js'))) {
+    const src = readFileSync(join(viewsDir, file), 'utf8');
+    codeLines(src).forEach((line) => {
+      const s = line.trim();
+      if (!/[一-龥]/.test(s)) return;
+      for (let i = 0; i < s.length; i += 1) {
+        if (s[i] !== '*') continue;
+        const prev = s[i - 1] ?? '';
+        const next = s[i + 1] ?? '';
+        if (/[一-龥]/.test(prev) || /[一-龥]/.test(next)) {
+          offenders.push(`${file}: ${s.slice(0, 130)}`);
+          break;
+        }
+      }
+    });
+  }
+  assert.deepEqual(offenders, [], `这些行的中文文案里有落单星号（多半是 markdown 强调写了一半）：\n${offenders.join('\n')}`);
 });
 ```
