@@ -14,6 +14,8 @@ import { randomUUID } from 'node:crypto';
 import { appError } from '../errors.js';
 import { validateTaskEvidence } from '../domain/task-evidence.js';
 import { getUserById } from '../db/repo/users.js';
+import { getEdition } from '../db/repo/editions.js';
+import { getTaskPackage } from '../db/repo/taskPackages.js';
 import * as wfRepo from '../db/repo/workflows.js';
 import * as claimRepo from '../db/repo/task-claims.js';
 import { hasActiveMembership, listMemberTeams } from '../db/repo/teamMembers.js';
@@ -49,6 +51,16 @@ export function createWorkflow({ db, editionId, taskPackageId, name, actorId, no
   }
   const title = typeof name === 'string' ? name.trim() : '';
   if (!title) throw appError(400, 'NAME_REQUIRED', '工作流名称必填');
+  // ⚠️ **先查存在性**（F2）：原来直接 INSERT，editionId / taskPackageId 不存在时
+  //    让数据库抛 `FOREIGN KEY constraint failed` ⇒ HTTP 层收到的是**外键原文**
+  //    （违反「三态状态码」契约：4xx 业务错 / 5xx 内部错），且客户端只看到 500。
+  //    ⇒ 业务层先判存在性 ⇒ 404（资源不存在），而不是让约束错误冒到 HTTP 层。
+  if (!getEdition(db, editionId)) {
+    throw appError(404, 'EDITION_NOT_FOUND', '届期不存在');
+  }
+  if (!getTaskPackage(db, taskPackageId)) {
+    throw appError(404, 'TASK_PACKAGE_NOT_FOUND', '任务包不存在');
+  }
   const teams = listTeamRows(db, { editionId, taskPackageId });
   const allowed = actor.is_superadmin === 1 || teams.some((t) => hasActiveMembership(db, t.id, actorId));
   if (!allowed) {

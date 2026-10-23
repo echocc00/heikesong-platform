@@ -331,6 +331,11 @@ export function registerReviewRoutes(router) {
   });
 
   router.add('POST', '/api/stages/:stageId/enterprise-confirmations', async (ctx) => {
+    // ⚠️ **鉴权必须最先做**（F1）：原来第一行就取 `ctx.user.id`
+    //    ⇒ 未登录时 `ctx.user` 是 null ⇒ TypeError ⇒ **500**（而不是 401）
+    //    ⇒ 客户端分不清「没登录」与「服务端坏了」。
+    //    口径与同文件其它写端点一致（见 withdraw 端点）。
+    if (!ctx.user) throw new AppError(401, 'UNAUTHENTICATED', '未登录');
     const stageId = ctx.params.stageId;
     const actorId = ctx.user.id;
     const committee = isCommittee(ctx);

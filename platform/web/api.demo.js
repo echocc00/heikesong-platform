@@ -1398,15 +1398,22 @@ export function demoPools({ state, rules, kind }) {
 export function demoTeamFormation({ team, state, rules }) {
   const errors = [];
   const cfg = rules.teamFormation ?? {};
-  const size = (team.memberIds ?? []).length;
-  const min = cfg.teamSize?.min ?? 2;
+  // ⚠️ **人数下限不在建队时强制**（F17，与真实后端同口径）：
+  //    真实后端 `src/services/team.js` 的 `createTeam` **不检查人数** ——
+  //    队长自动成为首个成员（`team_members` 里出现 `{role:'captain'}`），
+  //    人数下限在**后续加入**时才生效。真实后端注释原文：
+  //    「强制 min 会让这个包**永远建不出第一支队**（死锁）」。
+  //    原来演示版按人数下限拒 ⇒ 前端（`web/views/team.js` 不发 `memberIds`）建队 **100% 失败**。
+  const size = Math.max((team.memberIds ?? []).length, 1);   // 队长本人算一个（真实后端口径）
   const max = cfg.teamSize?.max ?? 5;
-  if (size < min) errors.push(`组队人数 ${size} 少于下限 ${min}`);
   if (size > max) errors.push(`组队人数 ${size} 超过上限 ${max}`);
   if (cfg.captainMustBeMba) {
     const captain = (state.users ?? []).find((u) => u.id === team.captainId);
-    if (!captain) errors.push('组长不存在');
-    else if (captain.mbaStatus !== 'mba') errors.push('组长必须是一堂 MBA 在籍（硬性门槛）');
+    // ⚠️ **演示登录用户不在 users 表里**（演示站只有 demo_admin 一个账号）⇒
+    //    组长就是登录用户时**无法核验** MBA 身份 ⇒ **不据此拒收**。
+    //    真实后端口径：组长 = 创建者 = 登录用户 ⇒ 必然存在，其 MBA 身份在**报名**环节就校验过。
+    //    （原来这里报「组长不存在」⇒ 演示站建队按钮**必然**失败。）
+    if (captain && captain.mbaStatus !== 'mba') errors.push('组长必须是一堂 MBA 在籍（硬性门槛）');
   }
   const pkg = (state.taskPackages ?? []).find((p) => p.id === team.packageId);
   if (!pkg) errors.push('必须认领一个任务包（报名即认领）');

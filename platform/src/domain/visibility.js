@@ -15,18 +15,29 @@ const PEER_SOURCE_KEYS = ['peerSource', 'fromTeamId', 'fromUserId', 'peerFrom', 
 // 企业名字段：段位公示时不公示（S10 §8）
 const ENTERPRISE_NAME_KEYS = ['enterpriseName', 'enterprise_name', 'enterpriseId', 'enterprise_id'];
 // 告警内部明细字段：只给有 audit:read 的人看（DP-107）
-const WARNING_INTERNAL_KEYS = ['detail', 'teamId', 'teamIds', 'dimension'];
+// ⚠️ **修复前是黑名单**（`['detail','teamId','teamIds','dimension']`）⇒ **新增字段默认外泄**：
+//    `compute.js` 塞进告警的 `errors`（评委池错误，**含原始 judgeId**）与 `stats`
+//    不在名单里 ⇒ **匿名访客能看到评委的真实 id**（F11）。
+//    ⇒ 改成**白名单**（fail-closed）：没有 audit:read 时**只发这三个键**，
+//    新增任何内部字段都**不会**自动外泄（黑名单的老毛病正是在这里）。
+//    - `code`：机器判据 / 审计定位要靠它（**故意保留**，见 warning-wording.test.js）
+//    - `message`：人话正文
+//    - `stageName` / `stageId` / `stageKey`：告警来自**哪个赛段**（前端要渲染赛段名；
+//      滚动总榜要标明来源赛段）—— 赛段本身是公开信息（榜单本来就按赛段分段公示）
+//    - `source`：告警来源（计算 / 破同分）—— 用来区分是哪一环出的问题
+const WARNING_PUBLIC_KEYS = ['code', 'message', 'stageName', 'stageId', 'stageKey', 'source'];
 
 /**
  * 告警可见性裁剪（纯函数，⛔ 必须在 API 层裁决 —— 「前端隐藏 = 数据已经发到浏览器」）。
  *
  * 口径：
  *   - 有 `audit:read` 能力点 ⇒ 完整告警（含 `detail` 内部明细与内部标识）。
- *   - 没有（匿名访客 / 普通参与者）⇒ 只保留**人话部分**：
- *       `detail`（内部明细：评委 id + 原因码、队伍 id、原始片段）
- *       `teamId` / `teamIds` / `dimension`（内部标识：队伍 id、英文维度键）
- *     这三类字段前端**根本不渲染** ⇒ 不发出去。
- *   - `code` **保留**（机器判据 / 审计要靠它定位），`message` 保留（人话正文）。
+ *   - 没有（匿名访客 / 普通参与者）⇒ **只发白名单里的三个键**
+ *     （`code` 机器判据 / `message` 人话正文 / `stageName` 赛段名），
+ *     其余**一律不发**（`detail` 内部明细、`teamId`/`teamIds`/`dimension` 内部标识、
+ *     `errors`/`stats` 评委池内部数据 …）。
+ *     ⇒ **白名单而不是黑名单**（F11）：黑名单的默认值是「外泄」，
+ *       任何**新加**的内部字段（`errors` / `stats` 就是这么漏出去的）都会自动外泄。
  *
  * ⚠️ 告警**一条都不许少**：裁剪的是字段，不是告警本身
  *    （S-5 / C-05「降级必须显式展示，不静默」—— 降级不许藏）。
@@ -37,7 +48,14 @@ const WARNING_INTERNAL_KEYS = ['detail', 'teamId', 'teamIds', 'dimension'];
 export function applyWarningVisibility(warnings, { canAudit = false } = {}) {
   const list = Array.isArray(warnings) ? warnings : [];
   if (canAudit === true) return list;
-  return list.map((w) => omit(w ?? {}, WARNING_INTERNAL_KEYS));
+  return list.map((w) => {
+    const src = w ?? {};
+    const out = {};
+    for (const k of WARNING_PUBLIC_KEYS) {
+      if (src[k] !== undefined) out[k] = src[k];
+    }
+    return out;
+  });
 }
 
 /**

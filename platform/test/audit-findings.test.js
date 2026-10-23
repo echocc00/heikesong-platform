@@ -713,6 +713,99 @@ test('F17 演示站建队必须与真实后端同口径（前端不发 memberIds
   );
 });
 
+// ═══ F11（运行时）：匿名访客的榜单响应里不得出现评委 id ═══
+// ⚠️ 上面那条用例只测**裁剪函数**本身；它抓不住「告警明细里真的带了评委 id」。
+//    ⇒ 这里走完整路径：真算一次赛段（评委池只有 1 人 ⇒ 池不合规 ⇒ 告警明细带 judgeId）
+//      → 公开榜单（匿名访客）⇒ 响应里不得出现那个 id。
+test('F11 运行时：匿名访客的榜单响应里不得泄漏评委 id（走真实计算 + 榜单路径）', async () => {
+  const { db, close } = freshDb();
+  try {
+    const { rules } = loadRules(rulesDir);
+    const now = '2026-10-23T10:00:00.000Z';
+    db.exec(`INSERT INTO editions (id,name,city,starts_at,ends_at,created_at) VALUES ('ed1','E','北京','2026-01-01','2026-12-31','${now}')`);
+    db.exec(`INSERT INTO stages (id,edition_id,"key",name,kind,status,starts_at,ends_at,scoring_config_key) VALUES ('st1','ed1','s1','S1','initial','open','2026-01-01','2026-02-01','initial')`);
+    const judge = createUser(db, { name: '评委甲', phone: '13900000081', password: 'pw' });
+    const captain = createUser(db, { name: '一队队长', phone: '13900000082', password: 'pw' });
+    db.exec(`INSERT INTO teams (id,edition_id,name,captain_id,created_at) VALUES ('tm1','ed1','一队','${captain.id}','${now}')`);
+    assignStageJudge(db, { stageId: 'st1', userId: judge.id, seat: 'judge', now });
+    db.exec(
+      `INSERT INTO stage_reviews (id,stage_id,judge_id,team_id,dimension,raw_score,submitted_at,request_id,calibrated)
+       VALUES ('r1','st1','${judge.id}','tm1','track_fit',80,'${now}','req_1',0)`,
+    );
+
+    const { insertSnapshot } = await import('../src/db/repo/computations.js');
+    // ⚠️ 泄漏的真实载体是**计算快照里的告警明细**（榜单把快照的 warnings 直接带给访客）。
+    //    ⇒ 这里写一份**带评委 id 明细**的快照（等价于「历史上算出来的那一份」），
+    //      再看公开榜单会不会把它原样端出去。
+    const leakId = 'u_judge_leak_0001';
+    insertSnapshot(db, {
+      kind: 'stage_score', editionId: 'ed1', stageId: 'st1', teamId: null,
+      ruleVersion: '2026-10-23',
+      input: {}, trace: {},
+      output: {
+        // ⚠️ **形状照抄生产代码**（compute.js:212-217）：`message` 只列错误 **code**，
+        //    带原始 judgeId 的是 `errors[].message` ⇒ 泄漏就发生在 `errors` 这个字段上。
+        warnings: [{
+          code: 'judge_pool_invalid',
+          message: '评委池不合规（1 项）：duplicate_judge',
+          errors: [{ code: 'duplicate_judge', message: `评委名单里有 1 个重复的 judgeId：${leakId}` }],
+          stats: { total: 3, voting: 3, enterprise: 1, expert: 2, observer: 0, perDimension: { all: 3 } },
+        }],
+      },
+      revision: 1, now,
+    });
+
+    // 公开榜单（匿名访客 = viewer 为 null）
+    const { getLeaderboard } = await import('../src/services/leaderboard.js');
+    const lb = getLeaderboard({ db, stageId: 'st1', scope: 'rank', viewer: null, rules });
+    const dumped = JSON.stringify(lb);
+    assert.ok(
+      !dumped.includes(leakId),
+      `匿名访客的榜单里泄漏了评委 id：${dumped.slice(0, 400)}`,
+    );
+    // 告警**一条都不许少**（裁的是字段，不是告警）
+    assert.ok(
+      (lb.warnings ?? []).some((w) => w.code === 'judge_pool_invalid'),
+      '告警本身必须保留（降级必须显式展示，不静默）',
+    );
+    // 正对照：有 audit:read 的人**必须**拿到完整明细（否则就成了「把告警藏起来」）
+    const admin = createUser(db, { name: '组委会', phone: '13900000083', password: 'pw' });
+    setSuperadmin(db, admin.id);
+    insertCapability(db, 'audit:read', '读审计日志');
+    grantAssignment(db, {
+      userId: admin.id, capability: 'audit:read', scopeType: 'global', scopeId: null, grantedBy: admin.id,
+    });
+    const lbAudit = getLeaderboard({ db, stageId: 'st1', scope: 'rank', viewer: admin, rules });
+    assert.ok(
+      JSON.stringify(lbAudit).includes(leakId),
+      '有 audit:read 的人必须拿到完整告警明细（裁剪只针对公开视角，不许把告警藏起来）',
+    );
+  } finally { close(); }
+});
+
+// ═══ F17（运行时）：演示站用前端真实的 body 建队必须成功 ═══
+// ⚠️ 上面那条用例只测 `demoTeamFormation` 这个纯函数；它抓不住「演示站的前端
+//    真的按这个 body 建队失败」。⇒ 这里走**演示站的 HTTP 适配器**：登录 → 按前端
+//    真实发的 body 建队 ⇒ 必须成功。
+test('F17 运行时：演示站按前端真实的 body 建队必须成功（不是 100% 失败）', async () => {
+  const { readFileSync: rf } = await import('node:fs');
+  const seed = JSON.parse(rf(join(platformDir, 'web', 'seed', 'demo-data.json'), 'utf8'));
+  const { rules } = loadRules(rulesDir);
+  const { createDemoApi } = await import('../web/api.demo.js');
+  const m = new Map();
+  const storage = {
+    getItem: (k) => (m.has(k) ? m.get(k) : null),
+    setItem: (k, v) => m.set(k, String(v)),
+    removeItem: (k) => m.delete(k),
+  };
+  const api = createDemoApi({ storage, seed, rules });
+  await api.post('/api/auth/login', { name: '演示管理员' });
+  // ⚠️ 前端 web/views/team.js 真实发的 body：**不带 memberIds**
+  const team = await api.post('/api/teams', { editionId: 'ed_demo', name: '演示新队', taskPackageId: 'tp_retail' });
+  assert.ok(team?.id, `演示站建队必须成功，实际返回：${JSON.stringify(team)}`);
+  assert.equal(team.name, '演示新队');
+});
+
 // ══════════════════════════════════════════════════════════════════
 // F18：前端路由的畸形百分号编码会抛 URIError ⇒ 整页白屏（后端同类问题已修）
 // ══════════════════════════════════════════════════════════════════

@@ -117,14 +117,19 @@ test('演示线全链路：报名 → 组队 → 打分 → 计算 → 发榜 �
   assert.deepEqual(team.memberIds, ['mba_captain', 'demo_member_1']);
   assert.equal(team.packageId ?? team.taskPackageId, 'tp_manu');
 
-  // 判别性A3：1 人组队必须被拒（人数下限是真在跑的）
-  await assert.rejects(
-    () => api.post('/api/teams', {
-      name: '单人队', taskPackageId: 'tp_manu', captainId: 'mba_captain', memberIds: ['mba_captain'],
-    }),
-    (err) => err.status === 400 && err.code === 'TEAM_FORMATION_INVALID',
-    '1 人组队必须被拒（team-formation.json 的 teamSize.min = 2）',
-  );
+  // 判别性A3（E172 / F17 修正后的口径）：**1 人组队可以建出来**。
+  //   ⚠️ 原来这里断言「1 人组队必须被拒」—— 那是**演示站自己的**口径，与真实后端相反：
+  //   真实后端 `src/services/team.js` 的 `createTeam` **不检查人数**，队长自动成为首个成员，
+  //   人数下限是「战队**成立**条件」（`addMember` 里人数达标才把 status 置 active），
+  //   真实后端注释原文：「强制 min 会让这个包**永远建不出第一支队**（死锁）」。
+  //   ⇒ 演示站按人数下限拒 ⇒ 前端（不发 memberIds）建队按钮 **100% 失败** ⇒ 演示与生产漂移。
+  //   判别性：① 必须建得出来（有人把下限改回创建闸 ⇒ 这条直接红）；
+  //            ② 状态必须是 forming（人数没达标 ⇒ 战队**未成立**，下限这条规则没被丢掉）。
+  const solo = await api.post('/api/teams', {
+    name: '单人队', taskPackageId: 'tp_manu', captainId: 'mba_captain', memberIds: ['mba_captain'],
+  });
+  assert.ok(solo.id, '1 人组队必须能建出来（真实后端口径：队长自动成为首个成员）');
+  assert.equal(solo.status, 'forming', '人数未达下限 ⇒ 战队仍是 forming（人数下限是成立条件，不是创建闸）');
   // 判别性A4：组长必须是一堂 MBA 在籍（硬门槛）
   await assert.rejects(
     () => api.post('/api/teams', {
@@ -135,8 +140,16 @@ test('演示线全链路：报名 → 组队 → 打分 → 计算 → 发榜 �
     '组长不是 MBA 在籍必须被拒（captainMustBeMba）',
   );
   // 判别性A5：被拒的组队**没有**混进名册
+  //   ⚠️ 计数随 F17 的口径调整：现在是 **+2**（验收队 2 人已成立 + 单人队 1 人处于 forming，
+  //   两者都是真实后端会建出来的战队）；被拒的「非 MBA 队」**不计入**。
+  //   判别性：① 计数精确 ⇒ 有人把「非 MBA 队」放进来这条直接红；
+  //          ② 按名字点名 ⇒ 只靠计数也躲不过。
   const teamsAfter = api._state().teams;
-  assert.equal(teamsAfter.length, seed.teams.length + 1, '只有成立的验收队进了名册（失败的两次没进）');
+  assert.equal(teamsAfter.length, seed.teams.length + 2, '只有建得出来的两支队进了名册（被拒的那次没进）');
+  assert.ok(
+    !teamsAfter.some((t) => t.name === '非 MBA 队'),
+    '被拒的组队（组长非 MBA 在籍）不得混进名册',
+  );
 
   // ── 3. 打分 ────────────────────────────────────────────────────
   const rsBefore = await api.get('/api/stages/stage_final/review-state');
@@ -188,7 +201,7 @@ test('演示线全链路：报名 → 组队 → 打分 → 计算 → 发榜 �
   // ── 4. 计算 ────────────────────────────────────────────────────
   const computed = await api.post('/api/stages/stage_final/compute', {});
   assert.ok(computed.computationId);
-  assert.equal(computed.teams.length, seed.teams.length + 1, '名册里的每支队都要进计算（含刚建的验收队）');
+  assert.equal(computed.teams.length, seed.teams.length + 2, '名册里的每支队都要进计算（含刚建的验收队与单人队）');
   assert.ok(computed.trace && computed.trace.normalization, '计算必须留下归一化 trace');
 
   // 判别性A7：原始分真的进了引擎 —— 同一份种子，只改 t_gamma 的一个原始分，总分必须变
@@ -219,7 +232,7 @@ test('演示线全链路：报名 → 组队 → 打分 → 计算 → 发榜 �
 
   // ── 5. 发榜 ────────────────────────────────────────────────────
   const lb = await api.get('/api/leaderboard/stage_final?scope=rank');
-  assert.equal(lb.rows.length, seed.teams.length + 1, '榜单覆盖名册里的每支队');
+  assert.equal(lb.rows.length, seed.teams.length + 2, '榜单覆盖名册里的每支队');
   assert.equal(lb.rows[0].rank, 1, '第一名是 rank 1');
   const totals = lb.rows.map((r) => r.total);
   assert.deepEqual(totals, [...totals].sort((a, b) => b - a), '榜单按总分从高到低排');
@@ -275,7 +288,7 @@ test('演示线全链路：报名 → 组队 → 打分 → 计算 → 发榜 �
   assert.ok(resources.rows.length > 0, '资源池不能是空的');
 
   // 判别性A12：三池的行数与名册/种子对得上（不是随便塞几行）
-  assert.equal(projects.rows.length, seed.teams.length + 1, '项目池每支队一行');
+  assert.equal(projects.rows.length, seed.teams.length + 2, '项目池每支队一行');
   assert.equal(talents.rows.length, seed.users.length, '人才池覆盖每一个队员');
   assert.equal(resources.rows.length, seed.taskPackages.length, '资源池覆盖每一张任务包');
 
