@@ -5,10 +5,10 @@
   "completionThreshold": 60,
   "maxWeightShare": 0.10,
   "events": [
-    { "key": "weekly_progress",   "label": "每周提交一次进度",   "points": 2,  "requiresRunnableOrBlocker": true },
-    { "key": "workshop_output",   "label": "参加 workshop 并提交课后产出", "points": 3, "requiresOutput": true },
-    { "key": "milestone_on_time", "label": "按时交付里程碑",     "points": 5 },
-    { "key": "enterprise_meeting","label": "完成一次企业对接会", "points": 5,  "requiresEnterpriseConfirm": true },
+    { "key": "weekly_progress",   "label": "每周提交一次进度",   "points": 2,  "once": true, "cadence": { "windowDays": 7, "maxCount": 1 }, "requiresRunnableOrBlocker": true },
+    { "key": "workshop_output",   "label": "参加 workshop 并提交课后产出", "points": 3,  "once": true, "requiresOutput": true },
+    { "key": "milestone_on_time", "label": "按时交付里程碑",     "points": 5,  "once": true },
+    { "key": "enterprise_meeting","label": "完成一次企业对接会", "points": 5,  "once": true, "requiresEnterpriseConfirm": true },
     { "key": "first_demo",        "label": "首次提交 Demo",      "points": 10, "once": true }
   ],
   "sortUse": "tiebreak_only"

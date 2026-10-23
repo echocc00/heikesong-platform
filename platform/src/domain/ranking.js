@@ -32,6 +32,23 @@ const fieldOf = (key) => KEY_FIELD[key] || key;
  */
 const NUMERIC_KEYS = new Set(['total', 'tiebreak_extra', 'peer', 'enterprise_raw', 'behavior']);
 
+/**
+ * 数值型破同分键的**比较容差**（F35）。
+ *
+ * ⚠️ 为什么不能按 `String(value)` 分桶（原来的写法）：
+ *    `70` 与 `70.00000000000001`（差 1 ULP ≈ 1.42e-14）**数学上完全相等**，
+ *    但字符串不同 ⇒ 被判成**两个组** ⇒ 两队拿到**不同名次 + 不同赛段积分（10 vs 8）**，
+ *    而且同分却**没记成同分**（tiedWith 为空）⇒ 破同分链在最该并列的地方拆开了并列。
+ *    审计实测的可达性：当前 `scoreStage` 对两队用**同一个表达式**算 total ⇒ 位级相同，
+ *    端到端尚未触发；**但只要两队的 total 来自不同代码路径**（一队的企业席分来自 R4 替换、
+ *    另一队来自 seatScore，或某赛段由旧规则版本写过）⇒ DB 里的 REAL 就存下不同的位 ⇒ 触发。
+ *    ⇒ 这是**潜伏缺陷**，必须按「数学相等即同分」修。
+ *
+ * ⛔ 容差取 **1e-9**：分数量级 0–100 ⇒ 1e-9 比任何**真实**分差（最小 0.01）小 7 个数量级，
+ *    只用来吸收浮点表示误差（1 ULP ≈ 1.4e-14 @ 70），不会把真的不同分判成同分。
+ */
+const NUMERIC_EPSILON = 1e-9;
+
 function readValue(candidate, key, data) {
   const bucket = (data?.byTeam || {})[candidate.teamId];
   if (bucket) {
@@ -55,6 +72,55 @@ function compareValues(a, b, direction, key) {
     return (na - nb) * dir;
   }
   return cmpStr(a, b) * dir;
+}
+
+/**
+ * 按破同分键把一个并列组分成若干「桶」（同桶 = 同分）。
+ *
+ * ⛔ **数值键不许用 `String(value)` 分桶**（F35）—— 见 NUMERIC_EPSILON 的注释。
+ *    数值键改成：**按数值排序后，相邻差 ≤ 容差的归同一个桶**（连续游程）。
+ *    为什么用「排序 + 相邻游程」而不是「量化取整」：量化（`round(n/eps)*eps`）
+ *    在大数上会因 `n/eps` 超出 2^53 丢精度 ⇒ 反而把**相等**的值分到不同桶；
+ *    游程比较只看**相邻差**，与量级无关。
+ *
+ * 非数值键（如 `team_id`）保持字符串分桶 —— 队伍编号是**标识符**，
+ * '0123' 与 '123' 是两支队，不能按数值合并。
+ *
+ * @returns {Array<Array>} 每个元素是一个桶（队伍数组）
+ */
+function bucketByKey(group, item, data) {
+  const key = item.key;
+  const values = group.map((c) => readValue(c, key, data));
+
+  const stringBuckets = () => {
+    const buckets = new Map();
+    group.forEach((c, i) => {
+      const k = String(values[i]);
+      if (!buckets.has(k)) buckets.set(k, []);
+      buckets.get(k).push(c);
+    });
+    return [...buckets.values()];
+  };
+
+  if (!NUMERIC_KEYS.has(key)) return stringBuckets();
+
+  const nums = values.map((v) => toNumber(v));
+  // ⛔ 有**非数值**（脏数据 / 口径不符）⇒ 不猜：退回字符串分桶（与历史行为一致）。
+  if (nums.some((n) => n === null)) return stringBuckets();
+
+  const rows = group.map((c, i) => ({ c, v: nums[i] }));
+  rows.sort((a, b) => a.v - b.v);
+  const parts = [];
+  let cur = [rows[0]];
+  for (let i = 1; i < rows.length; i += 1) {
+    if (rows[i].v - cur[cur.length - 1].v > NUMERIC_EPSILON) {
+      parts.push(cur.map((r) => r.c));
+      cur = [];
+    }
+    cur.push(rows[i]);
+  }
+  parts.push(cur.map((r) => r.c));
+  return parts;
 }
 
 /** 破同分链不变量校验（C-03 链 + R-PTS-08）。返回错误数组，空 = 通过。 */
@@ -124,13 +190,7 @@ export function applyTiebreakChain({ candidates, chain, data }) {
         usedBy.push(...group.map((c) => c.teamId));
         continue;
       }
-      const buckets = new Map();
-      for (const c of group) {
-        const k = String(readValue(c, item.key, data));
-        if (!buckets.has(k)) buckets.set(k, []);
-        buckets.get(k).push(c);
-      }
-      const parts = [...buckets.values()];
+      const parts = bucketByKey(group, item, data);
       if (parts.length > 1) {
         parts.sort((a, b) => compareValues(
           readValue(a[0], item.key, data), readValue(b[0], item.key, data), item.direction, item.key,

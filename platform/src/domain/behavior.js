@@ -54,6 +54,34 @@ function checkEvidence(def, ev, requirements) {
 }
 
 /**
+ * 次数约束（F38）：一个行为事件**最多能计几次分**。
+ *
+ * ⚠️ **修复前的病根**：5 个事件里只有 `first_demo` 有 `once` ⇒ 其余 4 个**无上限**
+ *    ⇒ 提交 40 次 `weekly_progress` = 80 分 ⇒ **超过完赛线 60**
+ *    ⇒ 「完赛认定」可在一分钟 API 调用内达成 ⇒ 而行为分是破同分链的**倒数第二个键**
+ *    ⇒ 刷行为分 ⇒ 决定同分队伍的排名 ⇒ 决定 10/8/5 的赛段积分 ⇒ **决定钱**。
+ *
+ * ⛔ **口径**（写在规则文件里，代码只执行它）：
+ *   · `once: true` **且无 cadence** ⇒ **终身一次**（reason: `once_limit`）
+ *   · `once: true` **且有 cadence** ⇒ 每个滚动窗口内最多 `maxCount` 次
+ *     （reason: `cadence_limit`）—— 「每周提交一次进度」真的按**周**算，
+ *     而不是「一次性事件」也不是「无限次」。
+ *
+ * ⚠️ 为什么用**滚动窗口**而不是「自然周」：自然周要定时区（跨时区队伍会差一天），
+ *    而滚动窗口只依赖事件自身的时间戳 ⇒ **可复算**（R-AUD-01）。
+ *
+ * @returns {{max:number, windowMs:number|null}|null} null = 无次数约束
+ */
+function countLimitOf(def) {
+  if (!def?.once) return null;
+  const cadence = def.cadence ?? null;
+  if (!cadence) return { max: 1, windowMs: null };
+  const maxCount = Number.isInteger(cadence.maxCount) && cadence.maxCount > 0 ? cadence.maxCount : 1;
+  const windowDays = Number.isFinite(cadence.windowDays) && cadence.windowDays > 0 ? cadence.windowDays : null;
+  return { max: maxCount, windowMs: windowDays === null ? null : windowDays * 86_400_000 };
+}
+
+/**
  * 计算行为分。
  * events: [{ id, type, evidence, created_at }]
  *   ⚠️ 分值【不】取自事件本身，一律以 rules/behavior-points.json 为准（防篡改）。
@@ -74,7 +102,8 @@ export function behaviorScore({ events, behaviorConfig }) {
     return String(a?.id ?? '') < String(b?.id ?? '') ? -1 : (String(a?.id ?? '') > String(b?.id ?? '') ? 1 : 0);
   });
 
-  const seenOnce = new Set();
+  /** 已计分事件的时间戳（按 key）—— 用于次数约束（F38） */
+  const countedAt = new Map();
   const items = [];
   let total = 0;
   for (const ev of sorted) {
@@ -82,22 +111,42 @@ export function behaviorScore({ events, behaviorConfig }) {
     const def = byKey.get(type);
     if (!def) {
       // 未知类型（如"签到"）→ 0 分并明确记录，不静默（R-PTS-10 反作弊第 1 条）
-      items.push({ type, points: 0, label: String(type), counted: false, reason: 'unknown_event_type' });
+      items.push({ id: ev?.id ?? null, type, points: 0, label: String(type), counted: false, reason: 'unknown_event_type' });
       continue;
     }
-    if (def.once && seenOnce.has(def.key)) {
-      items.push({ type: def.key, points: 0, label: def.label, counted: false, reason: 'once_limit' });
-      continue;
+    const limit = countLimitOf(def);
+    if (limit) {
+      const atMs = Date.parse(ev?.created_at ?? '');
+      const times = countedAt.get(def.key) ?? [];
+      // ⛔ 时间戳坏掉 ⇒ **不猜**：按「无法归入任何窗口」处理 ⇒ 不计分（宁可漏一分也不可无限刷）
+      if (!Number.isFinite(atMs)) {
+        items.push({ id: ev?.id ?? null, type: def.key, points: 0, label: def.label, counted: false, reason: 'cadence_unknown_time' });
+        continue;
+      }
+      const inWindow = limit.windowMs === null
+        ? times.length
+        : times.filter((t) => atMs - t < limit.windowMs).length;
+      if (inWindow >= limit.max) {
+        items.push({
+          id: ev?.id ?? null, type: def.key, points: 0, label: def.label, counted: false,
+          reason: limit.windowMs === null ? 'once_limit' : 'cadence_limit',
+        });
+        continue;
+      }
     }
     const check = checkEvidence(def, ev, requirements);
     if (!check.ok) {
-      items.push({ type: def.key, points: 0, label: def.label, counted: false, reason: check.reason });
+      items.push({ id: ev?.id ?? null, type: def.key, points: 0, label: def.label, counted: false, reason: check.reason });
       continue;
     }
-    seenOnce.add(def.key);
+    if (limit) {
+      const times = countedAt.get(def.key) ?? [];
+      times.push(Date.parse(ev.created_at));
+      countedAt.set(def.key, times);
+    }
     const pts = Number(def.points) || 0;
     total += pts;
-    items.push({ type: def.key, points: pts, label: def.label, counted: true, reason: null });
+    items.push({ id: ev?.id ?? null, type: def.key, points: pts, label: def.label, counted: true, reason: null });
   }
   return {
     total,

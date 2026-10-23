@@ -126,6 +126,9 @@ export function checkRateLimit({
     const key = subjectOf(profile.lock);
     const lock = acquireLock(db, {
       subjectKey: key, rule: `lock:${rule}`, now, lockSeconds: profile.lock.seconds,
+      // ⚠️ durable（F19）：锁也是「消耗配额」的一部分 ⇒ 业务失败也得留下这把锁，
+      //    否则「5 秒提交锁」形同虚设（失败一次就能立刻再提交）。
+      durable: true,
     });
     if (!lock.acquired) {
       layers.push({ layer: 'lock', allowed: false, retryAfterSeconds: lock.retryAfterSeconds });
@@ -138,22 +141,25 @@ export function checkRateLimit({
   }
 
   // ── 消耗配额（落库）────────────────────────────────────
+  // ⚠️ durable（F19）：计数写在**业务事务**里 ⇒ 业务一抛错就被一起回滚
+  //    ⇒ 「加个 requestId 就能绕过限频」⇒ 唯一的限频端点形同虚设。
+  //    ⇒ durable = true：写入立即执行 + 登记回滚日志 ⇒ 回滚后重放 ⇒ 计数存活。
   if (profile.sliding) {
     const key = subjectOf(profile.sliding);
     incrementBucket(db, {
-      subjectKey: key, rule: `sliding:${rule}`, bucket: bucketKey('s', nowMs, 1000), now,
+      subjectKey: key, rule: `sliding:${rule}`, bucket: bucketKey('s', nowMs, 1000), now, durable: true,
     });
   }
   if (profile.perMinute) {
     const key = subjectOf(profile.perMinute);
     incrementBucket(db, {
-      subjectKey: key, rule: `minute:${rule}`, bucket: bucketKey('m', nowMs, 60_000), now,
+      subjectKey: key, rule: `minute:${rule}`, bucket: bucketKey('m', nowMs, 60_000), now, durable: true,
     });
   }
   if (profile.perHour) {
     const key = subjectOf(profile.perHour);
     incrementBucket(db, {
-      subjectKey: key, rule: `hour:${rule}`, bucket: bucketKey('h', nowMs, 3_600_000), now,
+      subjectKey: key, rule: `hour:${rule}`, bucket: bucketKey('h', nowMs, 3_600_000), now, durable: true,
     });
   }
 

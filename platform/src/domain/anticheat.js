@@ -72,40 +72,66 @@ export function detectIdenticalPeerPattern({ peerReviews = [], minOverlap = 3 })
 /**
  * 短时间窗口内突发提交。
  * 借鉴 hack-the-back app/services/judging.py 的思路（MIT），只读思路独立实现。
+ *
+ * ⚠️ **单位是「提交动作」，不是「评分格子」**（F10）：
+ *    `stage_reviews` 的粒度是**队伍 × 维度** ⇒ 一次正常的表单提交（1 评委 × 2 队 × 5 维度）
+ *    会写 **10 行**。若把**行**当「提交事件」喂进来，阈值 5 必然被撞穿 ⇒
+ *    **一次完全正常的评审就被判成「刷分」** ⇒ 防刷分链路因全是误报而失去意义。
+ *    ⇒ 事件必须带**动作标识**（`actionId` / `requestId`，即一次提交的 request_id）：
+ *      · 同一个动作标识的多行 ⇒ **只算一次**；
+ *      · **没有动作标识**的事件 ⇒ **无法归并成动作** ⇒ **不计入**（宁可漏报也不误报）。
+ *        ⚠️ 这不是「宽容」，而是「不猜」：把行当动作正是 F10 的病根。
+ *        `unidentified` 会回报给调用方，由它显式告警（不静默）。
+ *
+ * ⛔ `findingKey` 是**稳定标识**（不含时间戳）：原先 detail 里嵌了 `windowStart`/`windowEnd`，
+ *    而复核队列的去重按 `canonicalJson(detail)` 比较 ⇒ 同一问题在不同时间算出来**不是同一个问题**
+ *    ⇒ **每次重算都新增一条 flagged_reviews 行** ⇒ 复核队列被同一个问题刷屏。
+ *    ⇒ 稳定标识 = `kind|主体|窗口序号`（窗口序号 = 窗口起点按窗口长度取整）。
  */
 export function detectBurstSubmission({ events = [], windowSeconds = 60, threshold = 5 }) {
   const bySubject = new Map();
+  let unidentified = 0;
   for (const e of events) {
     const subject = e.subjectId ?? e.judgeId ?? 'default';
     const at = Date.parse(e.at);
     if (!Number.isFinite(at)) continue;
-    if (!bySubject.has(subject)) bySubject.set(subject, []);
-    bySubject.get(subject).push(at);
+    const actionId = e.actionId ?? e.requestId ?? null;
+    if (!actionId) { unidentified += 1; continue; }
+    if (!bySubject.has(subject)) bySubject.set(subject, new Map());
+    const actions = bySubject.get(subject);
+    // 同一动作只留**最早**的时刻（重试不产生新动作，但可能带来更晚的落库时间）
+    const prev = actions.get(actionId);
+    if (prev === undefined || at < prev) actions.set(actionId, at);
   }
 
   const flags = [];
   let maxCount = 0;
-  for (const [subject, times] of bySubject) {
-    times.sort((x, y) => x - y);
+  const windowMs = windowSeconds * 1000;
+  for (const [subject, actions] of bySubject) {
+    const times = [...actions.values()].sort((x, y) => x - y);
     let start = 0;
     for (let end = 0; end < times.length; end += 1) {
-      while (times[end] - times[start] > windowSeconds * 1000) start += 1;
+      while (times[end] - times[start] > windowMs) start += 1;
       const count = end - start + 1;
       if (count > maxCount) maxCount = count;
       if (count > threshold) {
+        const windowStart = times[start];
+        const windowEnd = times[end];
         flags.push({
           kind: 'burst_submit',
           subjectId: subject,
           count,
-          windowStart: new Date(times[start]).toISOString(),
-          windowEnd: new Date(times[end]).toISOString(),
+          windowStart: new Date(windowStart).toISOString(),
+          windowEnd: new Date(windowEnd).toISOString(),
+          // 稳定标识：窗口序号按**窗口长度**取整 ⇒ 同一批数据重算得到同一个键
+          findingKey: `burst_submit|${subject}|${Math.floor(windowStart / windowMs)}`,
           action: 'alert_only',
         });
         break; // 同一主体只报一次（报最早的那次爆发）
       }
     }
   }
-  return { flags, maxCount };
+  return { flags, maxCount, unidentified };
 }
 
 /**

@@ -13,7 +13,7 @@ import { AppError } from '../errors.js';
 import { can } from '../auth/permissions.js';
 import { getUserById } from '../db/repo/users.js';
 import { getTeam } from '../db/repo/leaderboard.js';
-import { insertBehaviorEvent } from '../db/repo/points.js';
+import { insertBehaviorEvent, listBehaviorEventsByTeams } from '../db/repo/points.js';
 import { behaviorScore } from '../domain/behavior.js';
 
 /**
@@ -37,12 +37,26 @@ export function submitBehaviorEvent({ db, teamId, actorId, body, now = new Date(
     ...(rules.behavior || {}),
     evidenceRequirements: rules.criteria?.behaviorEvidence || undefined,
   };
+  // ⚠️ **次数约束必须连同历史一起算**（F38）：只看候选事件当然「没超限」，
+  //    而真实的刷分手法正是「同一条事件反复提交」⇒ 必须把**本队已有事件**一起喂进去。
+  const prior = listBehaviorEventsByTeams(db, [teamId]).map((e) => ({
+    id: e.id, type: e.type, evidence: e.evidence, created_at: e.created_at,
+  }));
   const probe = behaviorScore({
-    events: [{ id: 'probe', type, evidence: body?.evidence, created_at: now }],
+    events: [...prior, { id: 'probe', type, evidence: body?.evidence, created_at: now }],
     behaviorConfig,
   });
-  const item = probe.items[0];
+  const item = probe.items.find((i) => i.id === 'probe');
   if (!item || !item.counted) {
+    // ⛔ **次数/频次超限**与**证据不合规**是两回事，必须分开报：
+    //    证据不合规 = 400（重写证据再来）；次数超限 = 409（这个周期已经计过分了）。
+    if (item?.reason === 'once_limit' || item?.reason === 'cadence_limit') {
+      throw new AppError(
+        409, 'BEHAVIOR_CADENCE_LIMIT',
+        `该行为事件在本计分周期内已提交过（${def.label}），不能重复计分`,
+        { type, reason: item.reason, once: Boolean(def.once), cadence: def.cadence ?? null },
+      );
+    }
     throw new AppError(400, 'EVIDENCE_REJECTED', `证据不合规，不予计分：${item?.reason ?? 'unknown'}`);
   }
 

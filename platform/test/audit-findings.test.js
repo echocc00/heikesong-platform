@@ -369,6 +369,22 @@ test('F10 正常评审（1 评委 2 队 5 维度）不得触发 burst_submit 误
   );
 });
 
+// ═══ F8b：517 必须归类为「可重试」（而不是 500 级内部错误）═══
+test('F8b SQLite 并发冲突（517/5/6）必须归类为可重试，其它错误不得误判', async () => {
+  const { isRetryableDbError } = await import('../src/db/tx.js');
+  assert.equal(
+    isRetryableDbError({ errcode: 517, code: 'ERR_SQLITE_ERROR', message: 'database is locked' }),
+    true, '517（SQLITE_BUSY_SNAPSHOT）必须可重试',
+  );
+  assert.equal(isRetryableDbError({ errcode: 5 }), true, '5（SQLITE_BUSY）必须可重试');
+  assert.equal(isRetryableDbError({ errcode: 6 }), true, '6（SQLITE_LOCKED）必须可重试');
+  assert.equal(
+    isRetryableDbError({ errcode: 19, message: 'UNIQUE constraint failed' }),
+    false, '唯一约束冲突不是并发冲突 ⇒ 不得误判成可重试（否则真错误会被当成「稍后再说」）',
+  );
+  assert.equal(isRetryableDbError(new Error('普通错误')), false);
+});
+
 // ══════════════════════════════════════════════════════════════════
 // F11：告警裁剪漏了 errors/stats ⇒ 评委 ID 泄漏给匿名访客
 // ══════════════════════════════════════════════════════════════════
@@ -1092,6 +1108,78 @@ test('F36 发榜后对赛段结果提交申诉必须被受理（FINALIZED 的生
       reason: '名次有异议',
     });
     assert.ok(appeal?.id, `发榜后申诉必须被受理，实际返回：${JSON.stringify(appeal)}`);
+  } finally { close(); }
+});
+
+// ═══ F10（运行时）：生产路径必须按「提交动作」归并评分行 ═══
+// ⚠️ 上面那条用例只测了**检测器**的输入契约；它抓不住「调用方仍然按行喂」。
+//    ⇒ 这里走**完整生产路径**：真算一次赛段（computeStage → runDetection → flagged_reviews）。
+//       ① 一次正常评审（1 评委 × 2 队 × 5 维度 = 10 行，同一个 request_id）⇒ **不得**有 burst 告警；
+//       ② 6 次**真的**的提交（6 个 request_id）⇒ **必须**有 burst 告警（不能把检测改成永远不报）。
+test('F10 生产路径必须按「提交动作」归并评分行（一次提交写 10 行 ≠ 10 次提交）', async () => {
+  const { db, close } = freshDb();
+  try {
+    const { rules } = loadRules(rulesDir);
+    const now = '2026-10-23T10:00:00.000Z';
+    db.exec(`INSERT INTO editions (id,name,city,starts_at,ends_at,created_at) VALUES ('ed1','E','北京','2026-01-01','2026-12-31','${now}')`);
+    db.exec(`INSERT INTO stages (id,edition_id,"key",name,kind,status,starts_at,ends_at,scoring_config_key) VALUES ('st1','ed1','s1','S1','initial','open','2026-01-01','2026-02-01','initial')`);
+    const judge = createUser(db, { name: '评委甲', phone: '13900000071', password: 'pw' });
+    const captain1 = createUser(db, { name: '一队队长', phone: '13900000072', password: 'pw' });
+    const captain2 = createUser(db, { name: '二队队长', phone: '13900000073', password: 'pw' });
+    db.exec(`INSERT INTO teams (id,edition_id,name,captain_id,created_at) VALUES ('tm1','ed1','一队','${captain1.id}','${now}')`);
+    db.exec(`INSERT INTO teams (id,edition_id,name,captain_id,created_at) VALUES ('tm2','ed1','二队','${captain2.id}','${now}')`);
+    assignStageJudge(db, { stageId: 'st1', userId: judge.id, seat: 'judge', now });
+
+    const dims = ['track_fit', 'innovation', 'feasibility', 'completeness', 'collaboration'];
+    const insertReview = (id, team, dim, requestId, at) => db.exec(
+      `INSERT INTO stage_reviews (id,stage_id,judge_id,team_id,dimension,raw_score,submitted_at,request_id,calibrated)
+       VALUES ('${id}','st1','${judge.id}','${team}','${dim}',80,'${at}','${requestId}',0)`,
+    );
+
+    // ① 一次正常评审：10 行，同一个 request_id
+    for (const team of ['tm1', 'tm2']) {
+      for (const dim of dims) insertReview(`r_${team}_${dim}`, team, dim, 'req_1', now);
+    }
+    const { computeStage } = await import('../src/services/compute.js');
+    computeStage({ db, stageId: 'st1', actorId: judge.id, now, rules });
+
+    const burst = db.prepare("SELECT id, detail_json FROM flagged_reviews WHERE kind = 'burst_submit'").all();
+    assert.equal(
+      burst.length, 0,
+      `一次正常评审（10 行、同一个 request_id）被误判为刷分：${JSON.stringify(burst).slice(0, 300)}`,
+    );
+
+    // ② 6 次真的提交（6 个 request_id）⇒ 必须报得出（不能把检测改成永远不报）
+    //    ⚠️ `stage_reviews` 对 (stage_id, judge_id, team_id, dimension) 有唯一约束
+    //    ⇒ 同一个评委不能对同一队同一维度重复插 ⇒ 改用**第二位评委**的 6 个格子。
+    const judge2 = createUser(db, { name: '评委乙', phone: '13900000074', password: 'pw' });
+    assignStageJudge(db, { stageId: 'st1', userId: judge2.id, seat: 'judge', now });
+    const combos = [['tm1', 'track_fit'], ['tm1', 'innovation'], ['tm1', 'feasibility'],
+      ['tm2', 'track_fit'], ['tm2', 'innovation'], ['tm2', 'feasibility']];
+    combos.forEach(([team, dim], i) => {
+      const at = new Date(Date.parse(now) + i * 1000).toISOString();
+      db.exec(
+        `INSERT INTO stage_reviews (id,stage_id,judge_id,team_id,dimension,raw_score,submitted_at,request_id,calibrated)
+         VALUES ('r3_${i}','st1','${judge2.id}','${team}','${dim}',80,'${at}','req_${i}',0)`,
+      );
+    });
+    computeStage({ db, stageId: 'st1', actorId: judge.id, now: '2026-10-23T10:00:10.000Z', rules });
+    const burst2 = db.prepare("SELECT id, detail_json FROM flagged_reviews WHERE kind = 'burst_submit'").all();
+    assert.equal(burst2.length, 1, '6 次提交必须仍然触发 burst_submit（检测器不能被改成永远不报）');
+    const detail = JSON.parse(burst2[0].detail_json);
+    assert.equal(detail.subjectId, judge2.id);
+    assert.ok(detail.findingKey, '告警必须带稳定标识（不含时间戳）⇒ 重算不再刷屏');
+
+    // ③ 没有 request_id 的行 ⇒ 无法归并成「提交动作」⇒ 不参与检测，且必须**显式告警**（不静默）
+    const judge3 = createUser(db, { name: '评委丙', phone: '13900000075', password: 'pw' });
+    assignStageJudge(db, { stageId: 'st1', userId: judge3.id, seat: 'judge', now });
+    db.exec(
+      `INSERT INTO stage_reviews (id,stage_id,judge_id,team_id,dimension,raw_score,submitted_at,request_id,calibrated)
+       VALUES ('r4_0','st1','${judge3.id}','tm1','completeness',80,'${now}',NULL,0)`,
+    );
+    const out3 = computeStage({ db, stageId: 'st1', actorId: judge.id, now: '2026-10-23T10:00:20.000Z', rules });
+    const blind = (out3.warnings ?? []).find((w) => w.code === 'anticheat_burst_blind_spot');
+    assert.ok(blind, '没有 request_id 的评分行必须显式告警（这条检测对它是盲区，不许静默）');
   } finally { close(); }
 });
 

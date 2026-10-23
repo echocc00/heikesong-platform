@@ -7,6 +7,7 @@ import { dirname, join } from 'node:path';
 import { realpathSync } from 'node:fs';
 import { openDatabase } from './db/sqlite.js';
 import { applyMigrations } from './db/migrate.js';
+import { isRetryableDbError } from './db/tx.js';
 import { loadRules, validateRules } from './config.js';
 import { createRouter } from './http/router.js';
 import { json, error, text } from './http/respond.js';
@@ -505,6 +506,13 @@ export function createApp({ db, rules, webDir }) {
           // ⛔ 预审修正（I7-3）：内部错误原文不外泄 ——
           //    SQLite 错误带表名列名，Node 错误带内部实现细节。只进日志。
           console.error('[server]', err);
+          // ⚠️ **SQLite 的并发冲突是可重试的**（F8）：517（SQLITE_BUSY_SNAPSHOT）
+          //    与 5/6（BUSY / LOCKED）都是「另一个连接正占着写锁」⇒ 稍后重试即可
+          //    ⇒ 回 **503 + Retry-After**，而不是让用户看到一个「服务内部错误」的 500。
+          if (isRetryableDbError(err)) {
+            json(res, 503, { error: { code: 'DB_BUSY', message: '数据库正忙，请稍后重试' } }, { 'Retry-After': '1' });
+            return;
+          }
           json(res, 500, { error: { code: 'INTERNAL', message: '服务内部错误' } });
           return;
         }

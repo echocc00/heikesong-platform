@@ -2052,10 +2052,10 @@ Expected: FAIL —— `Cannot find module '../src/config.js'`
   "completionThreshold": 60,
   "maxWeightShare": 0.10,
   "events": [
-    { "key": "weekly_progress",   "label": "每周提交一次进度",   "points": 2,  "requiresRunnableOrBlocker": true },
-    { "key": "workshop_output",   "label": "参加 workshop 并提交课后产出", "points": 3, "requiresOutput": true },
-    { "key": "milestone_on_time", "label": "按时交付里程碑",     "points": 5 },
-    { "key": "enterprise_meeting","label": "完成一次企业对接会", "points": 5,  "requiresEnterpriseConfirm": true },
+    { "key": "weekly_progress",   "label": "每周提交一次进度",   "points": 2,  "once": true, "cadence": { "windowDays": 7, "maxCount": 1 }, "requiresRunnableOrBlocker": true },
+    { "key": "workshop_output",   "label": "参加 workshop 并提交课后产出", "points": 3,  "once": true, "requiresOutput": true },
+    { "key": "milestone_on_time", "label": "按时交付里程碑",     "points": 5,  "once": true },
+    { "key": "enterprise_meeting","label": "完成一次企业对接会", "points": 5,  "once": true, "requiresEnterpriseConfirm": true },
     { "key": "first_demo",        "label": "首次提交 Demo",      "points": 10, "once": true }
   ],
   "sortUse": "tiebreak_only"
@@ -2587,6 +2587,22 @@ export function validateRules(rules, expectedCount = null) {
         if (typeof e.points !== 'number' || e.points <= 0) {
           push(`behavior.events 事件 ${e.key} 的 points 必须为正数`);
         }
+        // ⚠️ **每个行为事件都必须有次数约束**（F38）：修复前 5 个事件里只有 1 个有 `once`
+        //    ⇒ 其余 4 个**无上限** ⇒ 提交 40 次 `weekly_progress` = 80 分 > 完赛线 60
+        //    ⇒ 「完赛认定」一分钟内可达 ⇒ 而行为分是破同分链的倒数第二个键
+        //    ⇒ 刷行为分 = 决定同分队伍排名 = 决定 10/8/5 赛段积分 = 决定钱。
+        //    ⇒ 这是「配置在说谎」的同款病根：`once` 写在规则里却没人执行 ⇒ 必须 fail-fast。
+        if (!e.once) {
+          push(`behavior.events 事件 ${e.key} 必须有 once 次数约束（否则可无限提交刷分）`);
+        }
+        if (e.cadence !== undefined) {
+          const c = e.cadence;
+          if (!c || typeof c !== 'object'
+            || !Number.isFinite(c.windowDays) || c.windowDays <= 0
+            || !Number.isInteger(c.maxCount) || c.maxCount <= 0) {
+            push(`behavior.events 事件 ${e.key} 的 cadence 必须是 { windowDays>0, maxCount>=1 }`);
+          }
+        }
       }
     }
   }
@@ -2816,6 +2832,11 @@ export function validateRules(rules, expectedCount = null) {
         if (!l) continue;
         if (layer === 'lock' && !(Number.isInteger(l.seconds) && l.seconds > 0)) {
           errors.push(`audit.rateLimit.${name}.lock.seconds 必须是正整数`);
+        }
+        // ⚠️ lock.mode 必须显式合法：cooldown（冷却锁）/ mutex（互斥锁）。
+        //    漏配 ⇒ 服务层按默认走，配置与行为对不上 ⇒ 「配置在说谎」的老毛病。
+        if (layer === 'lock' && !['cooldown', 'mutex'].includes(l.mode)) {
+          errors.push(`audit.rateLimit.${name}.lock.mode 必须是 cooldown 或 mutex（当前：${JSON.stringify(l.mode)}）`);
         }
         if (layer !== 'lock' && !(Number.isInteger(l.max) && l.max > 0)) {
           errors.push(`audit.rateLimit.${name}.${layer}.max 必须是正整数`);
@@ -7179,6 +7200,7 @@ import { dirname, join } from 'node:path';
 import { realpathSync } from 'node:fs';
 import { openDatabase } from './db/sqlite.js';
 import { applyMigrations } from './db/migrate.js';
+import { isRetryableDbError } from './db/tx.js';
 import { loadRules, validateRules } from './config.js';
 import { createRouter } from './http/router.js';
 import { json, error, text } from './http/respond.js';
@@ -7677,6 +7699,13 @@ export function createApp({ db, rules, webDir }) {
           // ⛔ 预审修正（I7-3）：内部错误原文不外泄 ——
           //    SQLite 错误带表名列名，Node 错误带内部实现细节。只进日志。
           console.error('[server]', err);
+          // ⚠️ **SQLite 的并发冲突是可重试的**（F8）：517（SQLITE_BUSY_SNAPSHOT）
+          //    与 5/6（BUSY / LOCKED）都是「另一个连接正占着写锁」⇒ 稍后重试即可
+          //    ⇒ 回 **503 + Retry-After**，而不是让用户看到一个「服务内部错误」的 500。
+          if (isRetryableDbError(err)) {
+            json(res, 503, { error: { code: 'DB_BUSY', message: '数据库正忙，请稍后重试' } }, { 'Retry-After': '1' });
+            return;
+          }
           json(res, 500, { error: { code: 'INTERNAL', message: '服务内部错误' } });
           return;
         }

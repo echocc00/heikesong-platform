@@ -12,7 +12,7 @@
 //    检测器等于完全不能用（kind / action 是每个 flag 都带的两个固定键）。
 export const FLAG_DETAIL_FIELDS = {
   self_vs_judge: ['kind', 'teamId', 'dimension', 'judgeScore', 'selfScore', 'delta', 'action'],
-  burst_submit: ['kind', 'subjectId', 'count', 'windowStart', 'windowEnd', 'action'],
+  burst_submit: ['kind', 'subjectId', 'count', 'windowStart', 'windowEnd', 'findingKey', 'action'],
   identical_peer_pattern: ['kind', 'voterA', 'voterB', 'overlap', 'targets', 'matchRatio', 'action'],
   low_variance: ['kind', 'judgeId', 'dimension', 'stdev', 'n', 'mean', 'direction', 'action'],
   multi_account: ['kind', 'keyField', 'keyValue', 'userIds', 'count', 'action'],

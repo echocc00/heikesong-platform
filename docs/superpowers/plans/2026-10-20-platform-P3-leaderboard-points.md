@@ -1118,6 +1118,23 @@ const fieldOf = (key) => KEY_FIELD[key] || key;
  */
 const NUMERIC_KEYS = new Set(['total', 'tiebreak_extra', 'peer', 'enterprise_raw', 'behavior']);
 
+/**
+ * 数值型破同分键的**比较容差**（F35）。
+ *
+ * ⚠️ 为什么不能按 `String(value)` 分桶（原来的写法）：
+ *    `70` 与 `70.00000000000001`（差 1 ULP ≈ 1.42e-14）**数学上完全相等**，
+ *    但字符串不同 ⇒ 被判成**两个组** ⇒ 两队拿到**不同名次 + 不同赛段积分（10 vs 8）**，
+ *    而且同分却**没记成同分**（tiedWith 为空）⇒ 破同分链在最该并列的地方拆开了并列。
+ *    审计实测的可达性：当前 `scoreStage` 对两队用**同一个表达式**算 total ⇒ 位级相同，
+ *    端到端尚未触发；**但只要两队的 total 来自不同代码路径**（一队的企业席分来自 R4 替换、
+ *    另一队来自 seatScore，或某赛段由旧规则版本写过）⇒ DB 里的 REAL 就存下不同的位 ⇒ 触发。
+ *    ⇒ 这是**潜伏缺陷**，必须按「数学相等即同分」修。
+ *
+ * ⛔ 容差取 **1e-9**：分数量级 0–100 ⇒ 1e-9 比任何**真实**分差（最小 0.01）小 7 个数量级，
+ *    只用来吸收浮点表示误差（1 ULP ≈ 1.4e-14 @ 70），不会把真的不同分判成同分。
+ */
+const NUMERIC_EPSILON = 1e-9;
+
 function readValue(candidate, key, data) {
   const bucket = (data?.byTeam || {})[candidate.teamId];
   if (bucket) {
@@ -1141,6 +1158,55 @@ function compareValues(a, b, direction, key) {
     return (na - nb) * dir;
   }
   return cmpStr(a, b) * dir;
+}
+
+/**
+ * 按破同分键把一个并列组分成若干「桶」（同桶 = 同分）。
+ *
+ * ⛔ **数值键不许用 `String(value)` 分桶**（F35）—— 见 NUMERIC_EPSILON 的注释。
+ *    数值键改成：**按数值排序后，相邻差 ≤ 容差的归同一个桶**（连续游程）。
+ *    为什么用「排序 + 相邻游程」而不是「量化取整」：量化（`round(n/eps)*eps`）
+ *    在大数上会因 `n/eps` 超出 2^53 丢精度 ⇒ 反而把**相等**的值分到不同桶；
+ *    游程比较只看**相邻差**，与量级无关。
+ *
+ * 非数值键（如 `team_id`）保持字符串分桶 —— 队伍编号是**标识符**，
+ * '0123' 与 '123' 是两支队，不能按数值合并。
+ *
+ * @returns {Array<Array>} 每个元素是一个桶（队伍数组）
+ */
+function bucketByKey(group, item, data) {
+  const key = item.key;
+  const values = group.map((c) => readValue(c, key, data));
+
+  const stringBuckets = () => {
+    const buckets = new Map();
+    group.forEach((c, i) => {
+      const k = String(values[i]);
+      if (!buckets.has(k)) buckets.set(k, []);
+      buckets.get(k).push(c);
+    });
+    return [...buckets.values()];
+  };
+
+  if (!NUMERIC_KEYS.has(key)) return stringBuckets();
+
+  const nums = values.map((v) => toNumber(v));
+  // ⛔ 有**非数值**（脏数据 / 口径不符）⇒ 不猜：退回字符串分桶（与历史行为一致）。
+  if (nums.some((n) => n === null)) return stringBuckets();
+
+  const rows = group.map((c, i) => ({ c, v: nums[i] }));
+  rows.sort((a, b) => a.v - b.v);
+  const parts = [];
+  let cur = [rows[0]];
+  for (let i = 1; i < rows.length; i += 1) {
+    if (rows[i].v - cur[cur.length - 1].v > NUMERIC_EPSILON) {
+      parts.push(cur.map((r) => r.c));
+      cur = [];
+    }
+    cur.push(rows[i]);
+  }
+  parts.push(cur.map((r) => r.c));
+  return parts;
 }
 
 /** 破同分链不变量校验（C-03 链 + R-PTS-08）。返回错误数组，空 = 通过。 */
@@ -1210,13 +1276,7 @@ export function applyTiebreakChain({ candidates, chain, data }) {
         usedBy.push(...group.map((c) => c.teamId));
         continue;
       }
-      const buckets = new Map();
-      for (const c of group) {
-        const k = String(readValue(c, item.key, data));
-        if (!buckets.has(k)) buckets.set(k, []);
-        buckets.get(k).push(c);
-      }
-      const parts = [...buckets.values()];
+      const parts = bucketByKey(group, item, data);
       if (parts.length > 1) {
         parts.sort((a, b) => compareValues(
           readValue(a[0], item.key, data), readValue(b[0], item.key, data), item.direction, item.key,
@@ -2587,7 +2647,12 @@ test('★ 事件按创建时间升序处理；同一时刻按 id 兜底（顺序
     behaviorConfig: B,
   });
   assert.deepEqual(same.items.map((i) => i.type), ['weekly_progress', 'weekly_progress']);
-  assert.equal(same.total, 4);
+  // ⚠️ `weekly_progress` 现在带**周期约束**（7 天 1 次，F38）⇒ 同一时刻的两条只计第一条。
+  //    夹具跟着新契约走，但**判别性变强了**：现在能直接断言「哪一条被计分」⇒
+  //    钉住的正是「同一时刻按 id 码位序」这条口径（e_a < e_b ⇒ e_a 先判 ⇒ e_a 计分）。
+  assert.equal(same.total, 2, '同一时刻的两条 weekly_progress 只计第一条（周期约束）');
+  assert.equal(same.items.find((i) => i.counted).id, 'e_a', '同一时刻按 id 码位序 ⇒ e_a 先判 ⇒ e_a 计分');
+  assert.equal(same.items.find((i) => !i.counted).reason, 'cadence_limit');
 });
 
 test('★ 排序口径：先按创建时间，同一时刻再按 id 码位序（两条都要钉住）', () => {
@@ -2676,6 +2741,34 @@ function checkEvidence(def, ev, requirements) {
 }
 
 /**
+ * 次数约束（F38）：一个行为事件**最多能计几次分**。
+ *
+ * ⚠️ **修复前的病根**：5 个事件里只有 `first_demo` 有 `once` ⇒ 其余 4 个**无上限**
+ *    ⇒ 提交 40 次 `weekly_progress` = 80 分 ⇒ **超过完赛线 60**
+ *    ⇒ 「完赛认定」可在一分钟 API 调用内达成 ⇒ 而行为分是破同分链的**倒数第二个键**
+ *    ⇒ 刷行为分 ⇒ 决定同分队伍的排名 ⇒ 决定 10/8/5 的赛段积分 ⇒ **决定钱**。
+ *
+ * ⛔ **口径**（写在规则文件里，代码只执行它）：
+ *   · `once: true` **且无 cadence** ⇒ **终身一次**（reason: `once_limit`）
+ *   · `once: true` **且有 cadence** ⇒ 每个滚动窗口内最多 `maxCount` 次
+ *     （reason: `cadence_limit`）—— 「每周提交一次进度」真的按**周**算，
+ *     而不是「一次性事件」也不是「无限次」。
+ *
+ * ⚠️ 为什么用**滚动窗口**而不是「自然周」：自然周要定时区（跨时区队伍会差一天），
+ *    而滚动窗口只依赖事件自身的时间戳 ⇒ **可复算**（R-AUD-01）。
+ *
+ * @returns {{max:number, windowMs:number|null}|null} null = 无次数约束
+ */
+function countLimitOf(def) {
+  if (!def?.once) return null;
+  const cadence = def.cadence ?? null;
+  if (!cadence) return { max: 1, windowMs: null };
+  const maxCount = Number.isInteger(cadence.maxCount) && cadence.maxCount > 0 ? cadence.maxCount : 1;
+  const windowDays = Number.isFinite(cadence.windowDays) && cadence.windowDays > 0 ? cadence.windowDays : null;
+  return { max: maxCount, windowMs: windowDays === null ? null : windowDays * 86_400_000 };
+}
+
+/**
  * 计算行为分。
  * events: [{ id, type, evidence, created_at }]
  *   ⚠️ 分值【不】取自事件本身，一律以 rules/behavior-points.json 为准（防篡改）。
@@ -2696,7 +2789,8 @@ export function behaviorScore({ events, behaviorConfig }) {
     return String(a?.id ?? '') < String(b?.id ?? '') ? -1 : (String(a?.id ?? '') > String(b?.id ?? '') ? 1 : 0);
   });
 
-  const seenOnce = new Set();
+  /** 已计分事件的时间戳（按 key）—— 用于次数约束（F38） */
+  const countedAt = new Map();
   const items = [];
   let total = 0;
   for (const ev of sorted) {
@@ -2704,22 +2798,42 @@ export function behaviorScore({ events, behaviorConfig }) {
     const def = byKey.get(type);
     if (!def) {
       // 未知类型（如"签到"）→ 0 分并明确记录，不静默（R-PTS-10 反作弊第 1 条）
-      items.push({ type, points: 0, label: String(type), counted: false, reason: 'unknown_event_type' });
+      items.push({ id: ev?.id ?? null, type, points: 0, label: String(type), counted: false, reason: 'unknown_event_type' });
       continue;
     }
-    if (def.once && seenOnce.has(def.key)) {
-      items.push({ type: def.key, points: 0, label: def.label, counted: false, reason: 'once_limit' });
-      continue;
+    const limit = countLimitOf(def);
+    if (limit) {
+      const atMs = Date.parse(ev?.created_at ?? '');
+      const times = countedAt.get(def.key) ?? [];
+      // ⛔ 时间戳坏掉 ⇒ **不猜**：按「无法归入任何窗口」处理 ⇒ 不计分（宁可漏一分也不可无限刷）
+      if (!Number.isFinite(atMs)) {
+        items.push({ id: ev?.id ?? null, type: def.key, points: 0, label: def.label, counted: false, reason: 'cadence_unknown_time' });
+        continue;
+      }
+      const inWindow = limit.windowMs === null
+        ? times.length
+        : times.filter((t) => atMs - t < limit.windowMs).length;
+      if (inWindow >= limit.max) {
+        items.push({
+          id: ev?.id ?? null, type: def.key, points: 0, label: def.label, counted: false,
+          reason: limit.windowMs === null ? 'once_limit' : 'cadence_limit',
+        });
+        continue;
+      }
     }
     const check = checkEvidence(def, ev, requirements);
     if (!check.ok) {
-      items.push({ type: def.key, points: 0, label: def.label, counted: false, reason: check.reason });
+      items.push({ id: ev?.id ?? null, type: def.key, points: 0, label: def.label, counted: false, reason: check.reason });
       continue;
     }
-    seenOnce.add(def.key);
+    if (limit) {
+      const times = countedAt.get(def.key) ?? [];
+      times.push(Date.parse(ev.created_at));
+      countedAt.set(def.key, times);
+    }
     const pts = Number(def.points) || 0;
     total += pts;
-    items.push({ type: def.key, points: pts, label: def.label, counted: true, reason: null });
+    items.push({ id: ev?.id ?? null, type: def.key, points: pts, label: def.label, counted: true, reason: null });
   }
   return {
     total,
@@ -6626,7 +6740,7 @@ import { AppError } from '../errors.js';
 import { can } from '../auth/permissions.js';
 import { getUserById } from '../db/repo/users.js';
 import { getTeam } from '../db/repo/leaderboard.js';
-import { insertBehaviorEvent } from '../db/repo/points.js';
+import { insertBehaviorEvent, listBehaviorEventsByTeams } from '../db/repo/points.js';
 import { behaviorScore } from '../domain/behavior.js';
 
 /**
@@ -6650,12 +6764,26 @@ export function submitBehaviorEvent({ db, teamId, actorId, body, now = new Date(
     ...(rules.behavior || {}),
     evidenceRequirements: rules.criteria?.behaviorEvidence || undefined,
   };
+  // ⚠️ **次数约束必须连同历史一起算**（F38）：只看候选事件当然「没超限」，
+  //    而真实的刷分手法正是「同一条事件反复提交」⇒ 必须把**本队已有事件**一起喂进去。
+  const prior = listBehaviorEventsByTeams(db, [teamId]).map((e) => ({
+    id: e.id, type: e.type, evidence: e.evidence, created_at: e.created_at,
+  }));
   const probe = behaviorScore({
-    events: [{ id: 'probe', type, evidence: body?.evidence, created_at: now }],
+    events: [...prior, { id: 'probe', type, evidence: body?.evidence, created_at: now }],
     behaviorConfig,
   });
-  const item = probe.items[0];
+  const item = probe.items.find((i) => i.id === 'probe');
   if (!item || !item.counted) {
+    // ⛔ **次数/频次超限**与**证据不合规**是两回事，必须分开报：
+    //    证据不合规 = 400（重写证据再来）；次数超限 = 409（这个周期已经计过分了）。
+    if (item?.reason === 'once_limit' || item?.reason === 'cadence_limit') {
+      throw new AppError(
+        409, 'BEHAVIOR_CADENCE_LIMIT',
+        `该行为事件在本计分周期内已提交过（${def.label}），不能重复计分`,
+        { type, reason: item.reason, once: Boolean(def.once), cadence: def.cadence ?? null },
+      );
+    }
     throw new AppError(400, 'EVIDENCE_REJECTED', `证据不合规，不予计分：${item?.reason ?? 'unknown'}`);
   }
 

@@ -106,6 +106,38 @@ function mapSelfReviews(rows) {
 }
 
 /**
+ * 把 `stage_reviews` 的**行**归并成「提交动作」（F10）。
+ *
+ * ⚠️ 为什么必须归并：`stage_reviews` 的粒度是**队伍 × 维度** ⇒ 一次正常的表单提交
+ *    （1 评委 × 2 队 × 5 维度）写 **10 行**，10 行的 `submitted_at` 还常常相同。
+ *    而「刷分突发检测」的阈值是 5 ⇒ 拿**行**当提交事件，一次正常评审就必然被判成刷分。
+ *    ⇒ 一次提交动作 = 一个 `request_id`（`stage_reviews.request_id` 列就是为此存在的）。
+ *
+ * ⛔ **没有 `request_id` 的行不参与检测**：它无法与别的行区分（不能猜）⇒ 宁可漏报也不误报。
+ *    这类行会被单独计数，由调用方**显式告警**（不静默）。
+ *
+ * @returns {{ events: Array<{subjectId, actionId, at}>, unattributed: number }}
+ */
+function submissionActions(reviews) {
+  const actions = new Map();
+  let unattributed = 0;
+  for (const r of reviews) {
+    const requestId = r.request_id ?? null;
+    if (!requestId) { unattributed += 1; continue; }
+    const actionId = `${r.judge_id}|${requestId}`;
+    const at = r.submitted_at;
+    const prev = actions.get(actionId);
+    if (!prev) {
+      actions.set(actionId, { subjectId: r.judge_id, actionId, at });
+    } else if (Date.parse(at) < Date.parse(prev.at)) {
+      // 同一动作的最早时刻（重试不产生新动作，但落库时间可能更晚）
+      actions.set(actionId, { subjectId: r.judge_id, actionId, at });
+    }
+  }
+  return { events: [...actions.values()], unattributed };
+}
+
+/**
  * 计算一个赛段的分数并落快照。
  * @param {object} input
  * @param {string} input.rules 规则集合（rules.scoring.initial / rules.scoring.final）
@@ -261,13 +293,27 @@ export function computeStage({ db, stageId, actorId, now, rules }) {
   //    ⇒ 挂在「算完之后」这个时机：数据齐了才检测得出来。
   //    ⛔ 检测 ≠ 处罚：只建 flag（status='open'），不改分、不封号、不自动裁决（裁决是人的动作）。
   //    ⛔ 检测失败**不许**让计算失败（计算本身已经落库成功）⇒ 降级成一条显式告警，不静默。
+  const actions = submissionActions(allReviews);
+  if (actions.unattributed > 0) {
+    // ⚠️ 显式告警，不静默：这些行没有 request_id ⇒ 无法归并成「提交动作」
+    //    ⇒ 它们**不参与**「刷分突发检测」（宁可漏报也不误报）⇒ 这条检测对它们是**盲区**。
+    out.warnings.push({
+      code: 'anticheat_burst_blind_spot',
+      message: `有 ${actions.unattributed} 条评分记录没有 request_id，无法归并成提交动作，未参与「刷分突发检测」`,
+      records: actions.unattributed,
+    });
+  }
   try {
     const detection = runDetection({
       db,
       stageId,
       peerReviews: peerReviews.map((p) => ({ judgeId: p.fromTeamId, teamId: p.toTeamId, score: p.score })),
       // 提交事件（用于「刷分」突发检测）：评委在某时刻提交了一条打分
-      events: allReviews.map((r) => ({ subjectId: r.judge_id, at: r.submitted_at })),
+      // ⚠️ **单位是「提交动作」**（F10）：`stage_reviews` 的粒度是「队伍 × 维度」，
+      //    一次正常的表单提交（1 评委 × 2 队 × 5 维度）写 **10 行** ⇒ 拿**行**当提交事件，
+      //    阈值 5 必然被撞穿 ⇒ **一次正常评审就被判成刷分**。
+      //    ⇒ 按 `request_id`（一次提交一个 id）聚成「一次提交动作」再喂进去。
+      events: actions.events,
       scoreStats: listScoreStats(db),
       users: listUsersForDetection(db),
       // ⚠️ 名次相关的检测（detectTiedMutualPeerRate）需要**最终名次**，

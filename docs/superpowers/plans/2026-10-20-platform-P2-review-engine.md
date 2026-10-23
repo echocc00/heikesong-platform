@@ -6449,7 +6449,12 @@ git commit -m "feat(P2): 加时陈述轮次与一票破同分（数据库唯一�
 //   - 「自评测不加分」→ S7 §4.3（R-JDG-13）
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { scoreStage } from '../src/domain/scoring.js';
+import { loadRules } from '../src/config.js';
+
+const rulesDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'rules');
 
 // 初赛权重表（S7 §2.1；w_E = 10%，依据冲突裁决 C-01）
 const CONFIG = {
@@ -6531,6 +6536,38 @@ test('⭐ 行为分变化不影响总分（S10 §8：分轨必须是算法层面
   });
   assert.deepEqual(b.teams, a.teams, '传入行为分不得改变任何队伍的总分');
   assert.deepEqual(b.warnings, a.warnings);
+});
+
+test('⭐ 行为分占比上限必须真的被执行（行为分对总分的贡献占比恒为 0 ≤ maxWeightShare）', () => {
+  // ⚠️ **为什么占比上限是「机器闸」而不是「运行时截断」**（E171 / F38）：
+  //    S10 §3.3「行为分占比 ≤10%」与 S10 §3.2「达标线 60」在数学上**互相打架**
+  //    （一次性行为事件满分 25 分，已超过 100 分制总分的 10%）⇒
+  //    若按「把行为分截断到 10%」实现，真实数据上「行为分高者排前」这条既有契约会**整体失效**
+  //    ⇒ 因此本平台把「占比上限」落地成它**真正**保证的那件事：
+  //    **行为分从不进入总分** ⇒ 它对总分的贡献占比恒为 **0** ≤ maxWeightShare。
+  //    ⛔ 修复前：`maxWeightShare` 只在行为分计算结果里被**回显**，任何代码路径都没执行它
+  //    ⇒ 下面这条断言就是它的**执行点**：一旦有人把行为分加进总分 ⇒ 立刻红。
+  const { rules } = loadRules(rulesDir);
+  const share = Number(rules.behavior?.maxWeightShare);
+  assert.ok(
+    Number.isFinite(share) && share > 0 && share <= 1,
+    `behavior.maxWeightShare 必须是 (0,1]：${rules.behavior?.maxWeightShare}`,
+  );
+  const a = scoreStage({ config: CONFIG, judges: JUDGES, submissions: SUBMISSIONS, enterpriseConfirmations: CONFIRMATIONS, teams: TEAMS });
+  const b = scoreStage({
+    config: CONFIG, judges: JUDGES, submissions: SUBMISSIONS, enterpriseConfirmations: CONFIRMATIONS, teams: TEAMS,
+    behaviorScore: 999, behaviorPoints: 999, behavior: { total: 999 },
+  });
+  const byId = new Map(b.teams.map((t) => [t.teamId, t]));
+  let contribution = 0;
+  let total = 0;
+  for (const t of a.teams) {
+    contribution += Math.abs(Number(t.total ?? 0) - Number(byId.get(t.teamId)?.total ?? 0));
+    total += Number(t.total ?? 0);
+  }
+  assert.equal(contribution, 0, '行为分对总分的贡献必须恒为 0（S10 §8：分轨必须是算法层面的，不是纪律层面的）');
+  const ratio = total === 0 ? 0 : contribution / total;
+  assert.ok(ratio <= share, `行为分占比 ${ratio} 超过上限 ${share}`);
 });
 
 test('trace 具备 normalization / steps / weights / perTeam 四段', () => {
@@ -8629,6 +8666,38 @@ function mapSelfReviews(rows) {
 }
 
 /**
+ * 把 `stage_reviews` 的**行**归并成「提交动作」（F10）。
+ *
+ * ⚠️ 为什么必须归并：`stage_reviews` 的粒度是**队伍 × 维度** ⇒ 一次正常的表单提交
+ *    （1 评委 × 2 队 × 5 维度）写 **10 行**，10 行的 `submitted_at` 还常常相同。
+ *    而「刷分突发检测」的阈值是 5 ⇒ 拿**行**当提交事件，一次正常评审就必然被判成刷分。
+ *    ⇒ 一次提交动作 = 一个 `request_id`（`stage_reviews.request_id` 列就是为此存在的）。
+ *
+ * ⛔ **没有 `request_id` 的行不参与检测**：它无法与别的行区分（不能猜）⇒ 宁可漏报也不误报。
+ *    这类行会被单独计数，由调用方**显式告警**（不静默）。
+ *
+ * @returns {{ events: Array<{subjectId, actionId, at}>, unattributed: number }}
+ */
+function submissionActions(reviews) {
+  const actions = new Map();
+  let unattributed = 0;
+  for (const r of reviews) {
+    const requestId = r.request_id ?? null;
+    if (!requestId) { unattributed += 1; continue; }
+    const actionId = `${r.judge_id}|${requestId}`;
+    const at = r.submitted_at;
+    const prev = actions.get(actionId);
+    if (!prev) {
+      actions.set(actionId, { subjectId: r.judge_id, actionId, at });
+    } else if (Date.parse(at) < Date.parse(prev.at)) {
+      // 同一动作的最早时刻（重试不产生新动作，但落库时间可能更晚）
+      actions.set(actionId, { subjectId: r.judge_id, actionId, at });
+    }
+  }
+  return { events: [...actions.values()], unattributed };
+}
+
+/**
  * 计算一个赛段的分数并落快照。
  * @param {object} input
  * @param {string} input.rules 规则集合（rules.scoring.initial / rules.scoring.final）
@@ -8784,13 +8853,27 @@ export function computeStage({ db, stageId, actorId, now, rules }) {
   //    ⇒ 挂在「算完之后」这个时机：数据齐了才检测得出来。
   //    ⛔ 检测 ≠ 处罚：只建 flag（status='open'），不改分、不封号、不自动裁决（裁决是人的动作）。
   //    ⛔ 检测失败**不许**让计算失败（计算本身已经落库成功）⇒ 降级成一条显式告警，不静默。
+  const actions = submissionActions(allReviews);
+  if (actions.unattributed > 0) {
+    // ⚠️ 显式告警，不静默：这些行没有 request_id ⇒ 无法归并成「提交动作」
+    //    ⇒ 它们**不参与**「刷分突发检测」（宁可漏报也不误报）⇒ 这条检测对它们是**盲区**。
+    out.warnings.push({
+      code: 'anticheat_burst_blind_spot',
+      message: `有 ${actions.unattributed} 条评分记录没有 request_id，无法归并成提交动作，未参与「刷分突发检测」`,
+      records: actions.unattributed,
+    });
+  }
   try {
     const detection = runDetection({
       db,
       stageId,
       peerReviews: peerReviews.map((p) => ({ judgeId: p.fromTeamId, teamId: p.toTeamId, score: p.score })),
       // 提交事件（用于「刷分」突发检测）：评委在某时刻提交了一条打分
-      events: allReviews.map((r) => ({ subjectId: r.judge_id, at: r.submitted_at })),
+      // ⚠️ **单位是「提交动作」**（F10）：`stage_reviews` 的粒度是「队伍 × 维度」，
+      //    一次正常的表单提交（1 评委 × 2 队 × 5 维度）写 **10 行** ⇒ 拿**行**当提交事件，
+      //    阈值 5 必然被撞穿 ⇒ **一次正常评审就被判成刷分**。
+      //    ⇒ 按 `request_id`（一次提交一个 id）聚成「一次提交动作」再喂进去。
+      events: actions.events,
       scoreStats: listScoreStats(db),
       users: listUsersForDetection(db),
       // ⚠️ 名次相关的检测（detectTiedMutualPeerRate）需要**最终名次**，

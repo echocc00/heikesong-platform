@@ -122,17 +122,19 @@ test('互评：重叠数**刚好等于** minOverlap 也要报（阈值的另一�
 });
 
 test('突发提交：窗口内提交数超阈值才报', () => {
+  // ⚠️ 每个事件必须带 **actionId**（= 一次提交动作的标识）：检测器的单位是「提交动作」
+  //    而不是「评分格子」（F10）⇒ 没有 actionId 的事件**不计入**（宁可漏报也不误报）。
   const events = [
-    { subjectId: 'j1', at: '2026-10-20T00:00:00.000Z' },
-    { subjectId: 'j1', at: '2026-10-20T00:00:05.000Z' },
-    { subjectId: 'j1', at: '2026-10-20T00:00:10.000Z' },
-    { subjectId: 'j2', at: '2026-10-20T00:00:01.000Z' },
+    { subjectId: 'j1', actionId: 'r1', at: '2026-10-20T00:00:00.000Z' },
+    { subjectId: 'j1', actionId: 'r2', at: '2026-10-20T00:00:05.000Z' },
+    { subjectId: 'j1', actionId: 'r3', at: '2026-10-20T00:00:10.000Z' },
+    { subjectId: 'j2', actionId: 'r4', at: '2026-10-20T00:00:01.000Z' },
   ];
   const r = detectBurstSubmission({ events, windowSeconds: 60, threshold: 3 });
   assert.equal(r.flags.length, 0, '刚好等于阈值不报');
   assert.equal(r.maxCount, 3, 'maxCount 要如实反映窗口内最大提交数');
 
-  const events2 = [...events, { subjectId: 'j1', at: '2026-10-20T00:00:15.000Z' }];
+  const events2 = [...events, { subjectId: 'j1', actionId: 'r5', at: '2026-10-20T00:00:15.000Z' }];
   const r2 = detectBurstSubmission({ events: events2, windowSeconds: 60, threshold: 3 });
   assert.equal(r2.flags.length, 1);
   assert.equal(r2.flags[0].kind, 'burst_submit');
@@ -141,11 +143,36 @@ test('突发提交：窗口内提交数超阈值才报', () => {
   assert.equal(r2.flags[0].action, 'alert_only');
 });
 
+test('突发提交：同一个动作标识的多行只算一次（F10 的核心口径）', () => {
+  // 判别性数据：一次提交动作写 10 行（队伍 × 维度）⇒ 若按**行**计数，必然撞穿阈值 5 ⇒ 误报。
+  // 修复前（按行计数）：flags.length = 1（count 6 > 5）
+  // 修复后（按动作计数）：10 行同属 1 个动作 ⇒ 只算 1 次 ⇒ 不报。
+  const events = Array.from({ length: 10 }, (_, i) => ({
+    subjectId: 'u_judge_A', actionId: 'req_1', at: `2026-10-23T10:00:0${i}.000Z`,
+  }));
+  const r = detectBurstSubmission({ events, windowSeconds: 60, threshold: 5 });
+  assert.equal(r.flags.length, 0, '一次提交写 10 行不得被判为突发提交');
+  assert.equal(r.maxCount, 1, '同一个动作标识只算一次');
+  assert.equal(r.unidentified, 0);
+});
+
+test('突发提交：没有动作标识的事件不计入（不猜），并如实回报盲区条数', () => {
+  // 判别性数据：10 条**没有 actionId** 的事件（旧的「按行喂」口径就是这种）
+  //   ⇒ 修复后一条都不计（无法归并成动作）⇒ 不报 + 回报 unidentified = 10
+  const events = Array.from({ length: 10 }, (_, i) => ({
+    subjectId: 'u_judge_A', at: `2026-10-23T10:00:0${i}.000Z`,
+  }));
+  const r = detectBurstSubmission({ events, windowSeconds: 60, threshold: 5 });
+  assert.equal(r.flags.length, 0, '无法归并成动作的事件不得被当成提交动作');
+  assert.equal(r.maxCount, 0);
+  assert.equal(r.unidentified, 10, '盲区条数必须如实回报（不静默）');
+});
+
 test('突发提交：窗口外的提交不计入', () => {
   const events = [
-    { subjectId: 'j1', at: '2026-10-20T00:00:00.000Z' },
-    { subjectId: 'j1', at: '2026-10-20T00:10:00.000Z' },
-    { subjectId: 'j1', at: '2026-10-20T00:20:00.000Z' },
+    { subjectId: 'j1', actionId: 'r1', at: '2026-10-20T00:00:00.000Z' },
+    { subjectId: 'j1', actionId: 'r2', at: '2026-10-20T00:10:00.000Z' },
+    { subjectId: 'j1', actionId: 'r3', at: '2026-10-20T00:20:00.000Z' },
   ];
   const r = detectBurstSubmission({ events, windowSeconds: 60, threshold: 3 });
   assert.equal(r.flags.length, 0);
@@ -155,7 +182,7 @@ test('突发提交：同一主体只报一次（连续爆发不重复报）', ()
   // 判别性数据：窗口内 6 次提交、阈值 3 —— 循环里每多一个 end 都会再次越过阈值。
   //   「同一主体只报一次」的 break 在不在，结果差 3 倍（1 条 vs 3 条）。
   const events = Array.from({ length: 6 }, (_, i) => ({
-    subjectId: 'j1', at: `2026-10-20T00:00:0${i}.000Z`,
+    subjectId: 'j1', actionId: `r${i}`, at: `2026-10-20T00:00:0${i}.000Z`,
   }));
   const r = detectBurstSubmission({ events, windowSeconds: 60, threshold: 3 });
   assert.equal(r.flags.length, 1, '同一主体只报最早的那次爆发');
@@ -166,19 +193,35 @@ test('突发提交：窗口边界 —— 相隔正好 windowSeconds 算同一窗
   // 判别性数据：窗口是「开区间右闭」—— 差值**正好**等于窗口长度仍算同一窗口，
   // 差 1 毫秒才算出窗。只测「差 10 分钟」测不出 `>` 写成 `>=`。
   const inside = [
-    { subjectId: 'j1', at: '2026-10-20T00:00:00.000Z' },
-    { subjectId: 'j1', at: '2026-10-20T00:01:00.000Z' },
+    { subjectId: 'j1', actionId: 'r1', at: '2026-10-20T00:00:00.000Z' },
+    { subjectId: 'j1', actionId: 'r2', at: '2026-10-20T00:01:00.000Z' },
   ];
   const r = detectBurstSubmission({ events: inside, windowSeconds: 60, threshold: 1 });
   assert.equal(r.flags.length, 1, '正好相隔 60 秒仍算同一窗口');
   assert.equal(r.flags[0].count, 2);
 
   const outside = [
-    { subjectId: 'j1', at: '2026-10-20T00:00:00.000Z' },
-    { subjectId: 'j1', at: '2026-10-20T00:01:00.001Z' },
+    { subjectId: 'j1', actionId: 'r1', at: '2026-10-20T00:00:00.000Z' },
+    { subjectId: 'j1', actionId: 'r2', at: '2026-10-20T00:01:00.001Z' },
   ];
   const r2 = detectBurstSubmission({ events: outside, windowSeconds: 60, threshold: 1 });
   assert.equal(r2.flags.length, 0, '超出窗口 1 毫秒就不算同一窗口');
+});
+
+test('突发提交：findingKey 是稳定标识（不含时间戳 ⇒ 重算不会刷屏）', () => {
+  // 判别性数据：同一批事件算两次，findingKey 必须**逐字相同**；
+  //   而 windowStart 之类的**原始字段**不进键 ⇒ 键里不得出现 ISO 时间戳。
+  const events = Array.from({ length: 8 }, (_, i) => ({
+    subjectId: 'j1', actionId: `r${i}`, at: `2026-10-20T00:00:0${i}.000Z`,
+  }));
+  const a = detectBurstSubmission({ events, windowSeconds: 60, threshold: 3 });
+  const b = detectBurstSubmission({ events: events.map((e) => ({ ...e })), windowSeconds: 60, threshold: 3 });
+  assert.equal(a.flags.length, 1);
+  assert.equal(a.flags[0].findingKey, b.flags[0].findingKey, '同一批数据重算必须得到同一个 findingKey');
+  assert.ok(
+    !/20\d\d-\d\d-\d\dT/.test(a.flags[0].findingKey),
+    `findingKey 里不得含时间戳：${a.flags[0].findingKey}`,
+  );
 });
 
 test('评委打分方差异常小/大都告警，但标死 action=alert_only（只告警不处罚）', () => {
@@ -465,7 +508,7 @@ test('同一个问题：明细键顺序不同也算重复（不重建 flag）', 
     '2026-10-20T00:00:00.000Z',
   );
   const events = Array.from({ length: 6 }, (_, i) => ({
-    subjectId: 'j1', at: `2026-10-20T00:00:0${i}.000Z`,
+    subjectId: 'j1', actionId: `r${i}`, at: `2026-10-20T00:00:0${i}.000Z`,
   }));
   const r = runDetection({
     db, stageId: 'st1', peerReviews: [], events, scoreStats: [], users: [], rules: RULES,
@@ -483,7 +526,7 @@ test('五个检测器的产出全部 action=alert_only，且全部通过字段�
     { judgeId: 'j1', teamId: 't1', score: 90 }, { judgeId: 'j1', teamId: 't2', score: 80 },
     { judgeId: 'j2', teamId: 't1', score: 60 }, { judgeId: 'j2', teamId: 't2', score: 50 },
   ];
-  const events = Array.from({ length: 6 }, (_, i) => ({ subjectId: 'j1', at: `2026-10-20T00:00:0${i}.000Z` }));
+  const events = Array.from({ length: 6 }, (_, i) => ({ subjectId: 'j1', actionId: `r${i}`, at: `2026-10-20T00:00:0${i}.000Z` }));
   const scoreStats = [{ judgeId: 'j1', dimension: 'innovation', n: 10, mean: 80, sum_sq: 64000 }];
   const users = [{ id: 'u1', phone: '13800000001' }, { id: 'u2', phone: '13800000001' }];
   const results = [{ teamId: 't1', rank: 1 }, { teamId: 't2', rank: 1 }];
@@ -509,7 +552,14 @@ test('裁决 flag 会写审计日志，且证据按发行方去重后落库', ()
     db,
     stageId: 'st1',
     peerReviews: [],
-    events: [{ subjectId: 'j1', at: '2026-10-20T00:00:00.000Z' }, { subjectId: 'j1', at: '2026-10-20T00:00:01.000Z' }, { subjectId: 'j1', at: '2026-10-20T00:00:02.000Z' }, { subjectId: 'j1', at: '2026-10-20T00:00:03.000Z' }, { subjectId: 'j1', at: '2026-10-20T00:00:04.000Z' }, { subjectId: 'j1', at: '2026-10-20T00:00:05.000Z' }],
+    events: [
+      { subjectId: 'j1', actionId: 'r0', at: '2026-10-20T00:00:00.000Z' },
+      { subjectId: 'j1', actionId: 'r1', at: '2026-10-20T00:00:01.000Z' },
+      { subjectId: 'j1', actionId: 'r2', at: '2026-10-20T00:00:02.000Z' },
+      { subjectId: 'j1', actionId: 'r3', at: '2026-10-20T00:00:03.000Z' },
+      { subjectId: 'j1', actionId: 'r4', at: '2026-10-20T00:00:04.000Z' },
+      { subjectId: 'j1', actionId: 'r5', at: '2026-10-20T00:00:05.000Z' },
+    ],
     scoreStats: [],
     users: [],
     rules: RULES,

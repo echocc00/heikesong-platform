@@ -251,7 +251,12 @@ test('★ 事件按创建时间升序处理；同一时刻按 id 兜底（顺序
     behaviorConfig: B,
   });
   assert.deepEqual(same.items.map((i) => i.type), ['weekly_progress', 'weekly_progress']);
-  assert.equal(same.total, 4);
+  // ⚠️ `weekly_progress` 现在带**周期约束**（7 天 1 次，F38）⇒ 同一时刻的两条只计第一条。
+  //    夹具跟着新契约走，但**判别性变强了**：现在能直接断言「哪一条被计分」⇒
+  //    钉住的正是「同一时刻按 id 码位序」这条口径（e_a < e_b ⇒ e_a 先判 ⇒ e_a 计分）。
+  assert.equal(same.total, 2, '同一时刻的两条 weekly_progress 只计第一条（周期约束）');
+  assert.equal(same.items.find((i) => i.counted).id, 'e_a', '同一时刻按 id 码位序 ⇒ e_a 先判 ⇒ e_a 计分');
+  assert.equal(same.items.find((i) => !i.counted).reason, 'cadence_limit');
 });
 
 test('★ 排序口径：先按创建时间，同一时刻再按 id 码位序（两条都要钉住）', () => {

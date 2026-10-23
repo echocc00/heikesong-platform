@@ -727,23 +727,108 @@ export function rateLimited(message, detail) {
 ```javascript
 // src/db/tx.js — 事务助手
 // 依据：设计文档 §11「数据库写入失败 → 事务回滚，无部分写入」
-// 用 SAVEPOINT 而不是 BEGIN/COMMIT：SAVEPOINT 可嵌套，调用方自己开了事务时不会炸。
+//
+// ⚠️ **外层用 BEGIN IMMEDIATE，不是 deferred SAVEPOINT**（F8）：
+//    deferred 事务是「先读快照、后升级为写」⇒ 期间别的连接一提交，
+//    升级写锁就撞 `SQLITE_BUSY_SNAPSHOT`（errcode **517**），
+//    而 **busy_timeout 不覆盖这个错误码** ⇒ 0ms 硬失败 ⇒ 用户只看到 500。
+//    （本仓 `src/services/review.js` 与 `src/services/compute.js` 早就用 BEGIN IMMEDIATE
+//      并写明了理由：「立即取写锁，避免「抢键」与「写数据」之间被另一个连接插进来」——
+//      而 `withTransaction` 一直没跟上，**它才是 `withIdempotency` 与 `src/services/pools.js`
+//      的事务入口**。）
+//    ⇒ 规则：**连接上没有事务** ⇒ BEGIN IMMEDIATE（立即取写锁）；
+//      **已经有事务** ⇒ SAVEPOINT（可嵌套，不与外层打架）。
+//
+// ⚠️ **回滚日志：有些写入不能被业务失败带走**（F19）
+//    限频计数写在业务事务里 ⇒ 业务一抛错，`ROLLBACK TO` 把它**一起回滚**了
+//    ⇒ 「只要在 body 里加一个 requestId，限频就完全失效」
+//      （加 requestId 走幂等事务 ⇒ 计数在事务内 ⇒ 回滚 ⇒ 计数归零）
+//    ⇒ 全站唯一有限频的端点（申诉）形同虚设。
+//    ⇒ `durableWrite(db, fn)`：写入**立即执行**（并发可见、判定原子），
+//      同时登记进**回滚日志**；事务回滚后**重放**一次 ⇒ 计数存活。
+//      事务提交 ⇒ 日志作废（**不重复计数**）。
 import { randomUUID } from 'node:crypto';
 
+/**
+ * 每个连接一份事务状态（深度 + 回滚日志）。
+ * ⚠️ 用 WeakMap 挂连接，不往 db 对象上挂自定义属性（那是别人的对象）。
+ */
+const STATES = new WeakMap();
+
+function stateOf(db) {
+  let s = STATES.get(db);
+  if (!s) { s = { depth: 0, journal: [] }; STATES.set(db, s); }
+  return s;
+}
+
+/** 连接上当前是否真的在事务里（含 SAVEPOINT 与 BEGIN IMMEDIATE 两种）。 */
+export function inTransaction(db) {
+  return db.isTransaction === true;
+}
+
+/**
+ * 登记一个「**事务回滚后必须仍然生效**」的写入。
+ *
+ * ⚠️ 为什么写入要**立即执行**而不是「回滚后再写」：
+ *    立即执行 ⇒ 并发请求能**立刻**看到这条计数/这把锁（判定原子）；
+ *    回滚后再写 ⇒ 在事务期间这把锁**对别人不可见** ⇒ 两个并发请求能同时拿到锁。
+ *
+ * @param {object} db
+ * @param {Function} fn 幂等的写入动作（重放时必须得到同样的效果）
+ */
+export function durableWrite(db, fn) {
+  fn();                                   // 立即执行（在当前事务里 ⇒ 并发可见）
+  const s = stateOf(db);
+  if (s.depth > 0) s.journal.push(fn);   // 在事务里 ⇒ 回滚后要重放
+  // 不在事务里 ⇒ 无需重放（写完即提交）
+}
+
+/** 回滚后重放登记过的写入（失败不掩盖原始错误）。 */
+function replayJournal(db, s, mark) {
+  const entries = s.journal.slice(mark);
+  s.journal.length = mark;
+  for (const entry of entries) {
+    try { entry(); } catch { /* 重放失败不掩盖原始错误 */ }
+  }
+}
+
+/**
+ * SQLite 的 **517（SQLITE_BUSY_SNAPSHOT）** = 快照冲突 ⇒ **可重试**，
+ * ⛔ 不是 500 级的「服务内部错误」（用户重试一次就好了）。
+ * 其它 SQLite 错误码（5 = BUSY、6 = LOCKED）同样可重试。
+ */
+export function isRetryableDbError(err) {
+  const code = err?.errcode;
+  if (code === 517 || code === 5 || code === 6) return true;
+  return /SQLITE_BUSY|database is locked/i.test(String(err?.message ?? ''));
+}
+
 export function withTransaction(db, fn) {
+  const s = stateOf(db);
+  const outermost = !inTransaction(db);
   const name = `sp_${randomUUID().replace(/-/g, '')}`;
-  db.exec(`SAVEPOINT ${name}`);
+  const mark = s.journal.length;
+
+  if (outermost) db.exec('BEGIN IMMEDIATE');
+  else db.exec(`SAVEPOINT ${name}`);
+  s.depth += 1;
+
   try {
     const result = fn();
-    db.exec(`RELEASE ${name}`);
+    if (outermost) db.exec('COMMIT');
+    else db.exec(`RELEASE ${name}`);
+    s.depth -= 1;
+    if (s.depth === 0) s.journal.length = mark;   // 提交 ⇒ 回滚日志作废（不重复计数）
     return result;
   } catch (err) {
     try {
-      db.exec(`ROLLBACK TO ${name}`);
-      db.exec(`RELEASE ${name}`);
+      if (outermost) db.exec('ROLLBACK');
+      else { db.exec(`ROLLBACK TO ${name}`); db.exec(`RELEASE ${name}`); }
     } catch {
       // 回滚本身失败：保留原始错误，不掩盖真正的失败原因
     }
+    s.depth -= 1;
+    if (s.depth === 0) replayJournal(db, s, mark);   // 回滚 ⇒ 把「必须存活」的写入重放一次
     throw err;
   }
 }
@@ -1002,7 +1087,13 @@ export function insertIdempotency(db, {
 // 依据：设计文档 §11.1「三层限频：滑动窗口计数 + 提交锁 + 每分钟配额；再加评委级配额」
 //   借鉴 CTFd api/v1/challenges.py 的三层限频思路（Apache-2.0），只读思路独立实现。
 //   ⛔ 计数必须落库：只在内存计数 = 进程重启即失效 = 等于没有限频。
+//
+// ⚠️ `durable` 开关（F19）：限频计数写在**业务事务**里 ⇒ 业务一抛错就被
+//    `ROLLBACK` 一起带走 ⇒ 「加个 requestId 就能绕过限频」⇒ 全站唯一有限频的端点形同虚设。
+//    ⇒ durable = true 时走 `durableWrite`：写入立即执行（并发可见）+ 登记回滚日志
+//      ⇒ 事务回滚后**重放**一次 ⇒ 计数存活。
 import { randomUUID } from 'node:crypto';
+import { durableWrite } from '../tx.js';
 
 export function countBucket(db, { subjectKey, rule, bucket }) {
   const row = db.prepare(
@@ -1011,13 +1102,15 @@ export function countBucket(db, { subjectKey, rule, bucket }) {
   return row?.count ?? 0;
 }
 
-export function incrementBucket(db, { subjectKey, rule, bucket, now = new Date().toISOString() }) {
-  db.prepare(
+export function incrementBucket(db, { subjectKey, rule, bucket, now = new Date().toISOString(), durable = false }) {
+  const write = () => db.prepare(
     `INSERT INTO rate_limit_events (id, subject_key, rule, bucket, count, window_start, updated_at)
      VALUES (?, ?, ?, ?, 1, ?, ?)
      ON CONFLICT(subject_key, rule, bucket)
      DO UPDATE SET count = count + 1, updated_at = excluded.updated_at`,
   ).run(randomUUID(), subjectKey, rule, bucket, now, now);
+  if (durable) durableWrite(db, write);
+  else write();
 }
 
 export function slidingWindowCount(db, { subjectKey, rule, now, windowSeconds }) {
@@ -1040,17 +1133,20 @@ export function slidingWindowEvents(db, { subjectKey, rule, now, windowSeconds }
 
 // 提交锁：靠 (subject_key, rule, bucket) 的唯一约束 + CAS 改 window_start 实现。
 // 锁过期后允许重新获取（window_start + lockSeconds <= now）。
-export function acquireLock(db, { subjectKey, rule, now = new Date().toISOString(), lockSeconds = 5 }) {
+// ⚠️ `durable`（F19）：锁也是「消耗配额」的一部分 ⇒ 业务失败也得留下这把锁
+//    ⇒ 否则「5 秒提交锁」形同虚设（失败一次就能立刻再提交）。
+export function acquireLock(db, { subjectKey, rule, now = new Date().toISOString(), lockSeconds = 5, durable = false }) {
   const nowMs = Date.parse(now);
   const row = db.prepare(
     'SELECT id, window_start FROM rate_limit_events WHERE subject_key = ? AND rule = ? AND bucket = ?',
   ).get(subjectKey, rule, 'lock');
 
   if (!row) {
-    db.prepare(
+    const write = () => db.prepare(
       `INSERT INTO rate_limit_events (id, subject_key, rule, bucket, count, window_start, updated_at)
        VALUES (?, ?, ?, 'lock', 1, ?, ?)`,
     ).run(randomUUID(), subjectKey, rule, now, now);
+    if (durable) durableWrite(db, write); else write();
     return { acquired: true, retryAfterSeconds: 0 };
   }
 
@@ -1060,11 +1156,35 @@ export function acquireLock(db, { subjectKey, rule, now = new Date().toISOString
   }
 
   // CAS：只有把 window_start 从旧值改成新值成功的那一方拿到锁
-  const upd = db.prepare(
-    'UPDATE rate_limit_events SET window_start = ?, updated_at = ?, count = count + 1 WHERE id = ? AND window_start = ?',
-  ).run(now, now, row.id, row.window_start);
-  if (upd.changes === 1) return { acquired: true, retryAfterSeconds: 0 };
+  let changes = 0;
+  const write = () => {
+    changes = db.prepare(
+      'UPDATE rate_limit_events SET window_start = ?, updated_at = ?, count = count + 1 WHERE id = ? AND window_start = ?',
+    ).run(now, now, row.id, row.window_start).changes;
+  };
+  if (durable) durableWrite(db, write); else write();
+  if (changes === 1) return { acquired: true, retryAfterSeconds: 0 };
   return { acquired: false, retryAfterSeconds: Math.max(1, lockSeconds) };
+}
+
+/**
+ * 释放提交锁（**互斥语义**）：把锁行删掉 ⇒ 下一次可以立刻重新获取。
+ *
+ * 为什么要它：`acquireLock` 原本是**冷却锁**（拿到后 5 秒内谁都拿不到）。
+ * 冷却锁对「申诉」是对的（5 秒内重复申诉 = 刷申诉），
+ * 但对「评分提交」是错的 —— 评委改分是**先后两次**提交，
+ * 冷却锁会把「改分」挡成 429 ⇒ 平台最核心的「改分必须留痕」契约直接失效。
+ *
+ * ⇒ 评分路径改成**互斥**：锁只在请求处理期间存在，
+ *   挡的是「**同时**在跑」的两笔提交，挡不住「先后两次」。
+ *   请求结束（无论成功还是失败）即释放 ⇒ 失败也不把评委锁死 5 秒。
+ *   `lock.seconds` 退化为**崩溃兜底 TTL**：进程被 kill 时锁不会永远留着。
+ */
+export function releaseLock(db, { subjectKey, rule }) {
+  const r = db.prepare(
+    'DELETE FROM rate_limit_events WHERE subject_key = ? AND rule = ? AND bucket = ?',
+  ).run(subjectKey, rule, 'lock');
+  return r.changes;
 }
 ```
 
@@ -2834,6 +2954,9 @@ export function checkRateLimit({
     const key = subjectOf(profile.lock);
     const lock = acquireLock(db, {
       subjectKey: key, rule: `lock:${rule}`, now, lockSeconds: profile.lock.seconds,
+      // ⚠️ durable（F19）：锁也是「消耗配额」的一部分 ⇒ 业务失败也得留下这把锁，
+      //    否则「5 秒提交锁」形同虚设（失败一次就能立刻再提交）。
+      durable: true,
     });
     if (!lock.acquired) {
       layers.push({ layer: 'lock', allowed: false, retryAfterSeconds: lock.retryAfterSeconds });
@@ -2846,22 +2969,25 @@ export function checkRateLimit({
   }
 
   // ── 消耗配额（落库）────────────────────────────────────
+  // ⚠️ durable（F19）：计数写在**业务事务**里 ⇒ 业务一抛错就被一起回滚
+  //    ⇒ 「加个 requestId 就能绕过限频」⇒ 唯一的限频端点形同虚设。
+  //    ⇒ durable = true：写入立即执行 + 登记回滚日志 ⇒ 回滚后重放 ⇒ 计数存活。
   if (profile.sliding) {
     const key = subjectOf(profile.sliding);
     incrementBucket(db, {
-      subjectKey: key, rule: `sliding:${rule}`, bucket: bucketKey('s', nowMs, 1000), now,
+      subjectKey: key, rule: `sliding:${rule}`, bucket: bucketKey('s', nowMs, 1000), now, durable: true,
     });
   }
   if (profile.perMinute) {
     const key = subjectOf(profile.perMinute);
     incrementBucket(db, {
-      subjectKey: key, rule: `minute:${rule}`, bucket: bucketKey('m', nowMs, 60_000), now,
+      subjectKey: key, rule: `minute:${rule}`, bucket: bucketKey('m', nowMs, 60_000), now, durable: true,
     });
   }
   if (profile.perHour) {
     const key = subjectOf(profile.perHour);
     incrementBucket(db, {
-      subjectKey: key, rule: `hour:${rule}`, bucket: bucketKey('h', nowMs, 3_600_000), now,
+      subjectKey: key, rule: `hour:${rule}`, bucket: bucketKey('h', nowMs, 3_600_000), now, durable: true,
     });
   }
 
@@ -3130,6 +3256,10 @@ import { normalizeEvidence } from '../src/domain/evidence.js';
 import { assertKnownFields } from '../src/domain/field-dictionary.js';
 import { runDetection, resolveFlag, listFlags, buildReverseAuditTasks, assertFlagDetail } from '../src/services/anticheat.js';
 import { queryAuditLog } from '../src/db/repo/audit-log.js';
+import { isolateTempDir } from '../test-helpers/tmp.js';
+
+// ⚠️ 隔离本进程临时目录：进程退出时整体回收（防临时目录泄漏，详见 test-helpers/tmp.js）
+isolateTempDir();
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrationsDir = join(here, '..', 'db', 'migrations');
@@ -3234,17 +3364,19 @@ test('互评：重叠数**刚好等于** minOverlap 也要报（阈值的另一�
 });
 
 test('突发提交：窗口内提交数超阈值才报', () => {
+  // ⚠️ 每个事件必须带 **actionId**（= 一次提交动作的标识）：检测器的单位是「提交动作」
+  //    而不是「评分格子」（F10）⇒ 没有 actionId 的事件**不计入**（宁可漏报也不误报）。
   const events = [
-    { subjectId: 'j1', at: '2026-10-20T00:00:00.000Z' },
-    { subjectId: 'j1', at: '2026-10-20T00:00:05.000Z' },
-    { subjectId: 'j1', at: '2026-10-20T00:00:10.000Z' },
-    { subjectId: 'j2', at: '2026-10-20T00:00:01.000Z' },
+    { subjectId: 'j1', actionId: 'r1', at: '2026-10-20T00:00:00.000Z' },
+    { subjectId: 'j1', actionId: 'r2', at: '2026-10-20T00:00:05.000Z' },
+    { subjectId: 'j1', actionId: 'r3', at: '2026-10-20T00:00:10.000Z' },
+    { subjectId: 'j2', actionId: 'r4', at: '2026-10-20T00:00:01.000Z' },
   ];
   const r = detectBurstSubmission({ events, windowSeconds: 60, threshold: 3 });
   assert.equal(r.flags.length, 0, '刚好等于阈值不报');
   assert.equal(r.maxCount, 3, 'maxCount 要如实反映窗口内最大提交数');
 
-  const events2 = [...events, { subjectId: 'j1', at: '2026-10-20T00:00:15.000Z' }];
+  const events2 = [...events, { subjectId: 'j1', actionId: 'r5', at: '2026-10-20T00:00:15.000Z' }];
   const r2 = detectBurstSubmission({ events: events2, windowSeconds: 60, threshold: 3 });
   assert.equal(r2.flags.length, 1);
   assert.equal(r2.flags[0].kind, 'burst_submit');
@@ -3253,11 +3385,36 @@ test('突发提交：窗口内提交数超阈值才报', () => {
   assert.equal(r2.flags[0].action, 'alert_only');
 });
 
+test('突发提交：同一个动作标识的多行只算一次（F10 的核心口径）', () => {
+  // 判别性数据：一次提交动作写 10 行（队伍 × 维度）⇒ 若按**行**计数，必然撞穿阈值 5 ⇒ 误报。
+  // 修复前（按行计数）：flags.length = 1（count 6 > 5）
+  // 修复后（按动作计数）：10 行同属 1 个动作 ⇒ 只算 1 次 ⇒ 不报。
+  const events = Array.from({ length: 10 }, (_, i) => ({
+    subjectId: 'u_judge_A', actionId: 'req_1', at: `2026-10-23T10:00:0${i}.000Z`,
+  }));
+  const r = detectBurstSubmission({ events, windowSeconds: 60, threshold: 5 });
+  assert.equal(r.flags.length, 0, '一次提交写 10 行不得被判为突发提交');
+  assert.equal(r.maxCount, 1, '同一个动作标识只算一次');
+  assert.equal(r.unidentified, 0);
+});
+
+test('突发提交：没有动作标识的事件不计入（不猜），并如实回报盲区条数', () => {
+  // 判别性数据：10 条**没有 actionId** 的事件（旧的「按行喂」口径就是这种）
+  //   ⇒ 修复后一条都不计（无法归并成动作）⇒ 不报 + 回报 unidentified = 10
+  const events = Array.from({ length: 10 }, (_, i) => ({
+    subjectId: 'u_judge_A', at: `2026-10-23T10:00:0${i}.000Z`,
+  }));
+  const r = detectBurstSubmission({ events, windowSeconds: 60, threshold: 5 });
+  assert.equal(r.flags.length, 0, '无法归并成动作的事件不得被当成提交动作');
+  assert.equal(r.maxCount, 0);
+  assert.equal(r.unidentified, 10, '盲区条数必须如实回报（不静默）');
+});
+
 test('突发提交：窗口外的提交不计入', () => {
   const events = [
-    { subjectId: 'j1', at: '2026-10-20T00:00:00.000Z' },
-    { subjectId: 'j1', at: '2026-10-20T00:10:00.000Z' },
-    { subjectId: 'j1', at: '2026-10-20T00:20:00.000Z' },
+    { subjectId: 'j1', actionId: 'r1', at: '2026-10-20T00:00:00.000Z' },
+    { subjectId: 'j1', actionId: 'r2', at: '2026-10-20T00:10:00.000Z' },
+    { subjectId: 'j1', actionId: 'r3', at: '2026-10-20T00:20:00.000Z' },
   ];
   const r = detectBurstSubmission({ events, windowSeconds: 60, threshold: 3 });
   assert.equal(r.flags.length, 0);
@@ -3267,7 +3424,7 @@ test('突发提交：同一主体只报一次（连续爆发不重复报）', ()
   // 判别性数据：窗口内 6 次提交、阈值 3 —— 循环里每多一个 end 都会再次越过阈值。
   //   「同一主体只报一次」的 break 在不在，结果差 3 倍（1 条 vs 3 条）。
   const events = Array.from({ length: 6 }, (_, i) => ({
-    subjectId: 'j1', at: `2026-10-20T00:00:0${i}.000Z`,
+    subjectId: 'j1', actionId: `r${i}`, at: `2026-10-20T00:00:0${i}.000Z`,
   }));
   const r = detectBurstSubmission({ events, windowSeconds: 60, threshold: 3 });
   assert.equal(r.flags.length, 1, '同一主体只报最早的那次爆发');
@@ -3278,19 +3435,35 @@ test('突发提交：窗口边界 —— 相隔正好 windowSeconds 算同一窗
   // 判别性数据：窗口是「开区间右闭」—— 差值**正好**等于窗口长度仍算同一窗口，
   // 差 1 毫秒才算出窗。只测「差 10 分钟」测不出 `>` 写成 `>=`。
   const inside = [
-    { subjectId: 'j1', at: '2026-10-20T00:00:00.000Z' },
-    { subjectId: 'j1', at: '2026-10-20T00:01:00.000Z' },
+    { subjectId: 'j1', actionId: 'r1', at: '2026-10-20T00:00:00.000Z' },
+    { subjectId: 'j1', actionId: 'r2', at: '2026-10-20T00:01:00.000Z' },
   ];
   const r = detectBurstSubmission({ events: inside, windowSeconds: 60, threshold: 1 });
   assert.equal(r.flags.length, 1, '正好相隔 60 秒仍算同一窗口');
   assert.equal(r.flags[0].count, 2);
 
   const outside = [
-    { subjectId: 'j1', at: '2026-10-20T00:00:00.000Z' },
-    { subjectId: 'j1', at: '2026-10-20T00:01:00.001Z' },
+    { subjectId: 'j1', actionId: 'r1', at: '2026-10-20T00:00:00.000Z' },
+    { subjectId: 'j1', actionId: 'r2', at: '2026-10-20T00:01:00.001Z' },
   ];
   const r2 = detectBurstSubmission({ events: outside, windowSeconds: 60, threshold: 1 });
   assert.equal(r2.flags.length, 0, '超出窗口 1 毫秒就不算同一窗口');
+});
+
+test('突发提交：findingKey 是稳定标识（不含时间戳 ⇒ 重算不会刷屏）', () => {
+  // 判别性数据：同一批事件算两次，findingKey 必须**逐字相同**；
+  //   而 windowStart 之类的**原始字段**不进键 ⇒ 键里不得出现 ISO 时间戳。
+  const events = Array.from({ length: 8 }, (_, i) => ({
+    subjectId: 'j1', actionId: `r${i}`, at: `2026-10-20T00:00:0${i}.000Z`,
+  }));
+  const a = detectBurstSubmission({ events, windowSeconds: 60, threshold: 3 });
+  const b = detectBurstSubmission({ events: events.map((e) => ({ ...e })), windowSeconds: 60, threshold: 3 });
+  assert.equal(a.flags.length, 1);
+  assert.equal(a.flags[0].findingKey, b.flags[0].findingKey, '同一批数据重算必须得到同一个 findingKey');
+  assert.ok(
+    !/20\d\d-\d\d-\d\dT/.test(a.flags[0].findingKey),
+    `findingKey 里不得含时间戳：${a.flags[0].findingKey}`,
+  );
 });
 
 test('评委打分方差异常小/大都告警，但标死 action=alert_only（只告警不处罚）', () => {
@@ -3577,7 +3750,7 @@ test('同一个问题：明细键顺序不同也算重复（不重建 flag）', 
     '2026-10-20T00:00:00.000Z',
   );
   const events = Array.from({ length: 6 }, (_, i) => ({
-    subjectId: 'j1', at: `2026-10-20T00:00:0${i}.000Z`,
+    subjectId: 'j1', actionId: `r${i}`, at: `2026-10-20T00:00:0${i}.000Z`,
   }));
   const r = runDetection({
     db, stageId: 'st1', peerReviews: [], events, scoreStats: [], users: [], rules: RULES,
@@ -3595,7 +3768,7 @@ test('五个检测器的产出全部 action=alert_only，且全部通过字段�
     { judgeId: 'j1', teamId: 't1', score: 90 }, { judgeId: 'j1', teamId: 't2', score: 80 },
     { judgeId: 'j2', teamId: 't1', score: 60 }, { judgeId: 'j2', teamId: 't2', score: 50 },
   ];
-  const events = Array.from({ length: 6 }, (_, i) => ({ subjectId: 'j1', at: `2026-10-20T00:00:0${i}.000Z` }));
+  const events = Array.from({ length: 6 }, (_, i) => ({ subjectId: 'j1', actionId: `r${i}`, at: `2026-10-20T00:00:0${i}.000Z` }));
   const scoreStats = [{ judgeId: 'j1', dimension: 'innovation', n: 10, mean: 80, sum_sq: 64000 }];
   const users = [{ id: 'u1', phone: '13800000001' }, { id: 'u2', phone: '13800000001' }];
   const results = [{ teamId: 't1', rank: 1 }, { teamId: 't2', rank: 1 }];
@@ -3621,7 +3794,14 @@ test('裁决 flag 会写审计日志，且证据按发行方去重后落库', ()
     db,
     stageId: 'st1',
     peerReviews: [],
-    events: [{ subjectId: 'j1', at: '2026-10-20T00:00:00.000Z' }, { subjectId: 'j1', at: '2026-10-20T00:00:01.000Z' }, { subjectId: 'j1', at: '2026-10-20T00:00:02.000Z' }, { subjectId: 'j1', at: '2026-10-20T00:00:03.000Z' }, { subjectId: 'j1', at: '2026-10-20T00:00:04.000Z' }, { subjectId: 'j1', at: '2026-10-20T00:00:05.000Z' }],
+    events: [
+      { subjectId: 'j1', actionId: 'r0', at: '2026-10-20T00:00:00.000Z' },
+      { subjectId: 'j1', actionId: 'r1', at: '2026-10-20T00:00:01.000Z' },
+      { subjectId: 'j1', actionId: 'r2', at: '2026-10-20T00:00:02.000Z' },
+      { subjectId: 'j1', actionId: 'r3', at: '2026-10-20T00:00:03.000Z' },
+      { subjectId: 'j1', actionId: 'r4', at: '2026-10-20T00:00:04.000Z' },
+      { subjectId: 'j1', actionId: 'r5', at: '2026-10-20T00:00:05.000Z' },
+    ],
     scoreStats: [],
     users: [],
     rules: RULES,
@@ -3846,7 +4026,7 @@ Expected: FAIL —— `Cannot find module '../src/domain/anticheat.js'`
 //    检测器等于完全不能用（kind / action 是每个 flag 都带的两个固定键）。
 export const FLAG_DETAIL_FIELDS = {
   self_vs_judge: ['kind', 'teamId', 'dimension', 'judgeScore', 'selfScore', 'delta', 'action'],
-  burst_submit: ['kind', 'subjectId', 'count', 'windowStart', 'windowEnd', 'action'],
+  burst_submit: ['kind', 'subjectId', 'count', 'windowStart', 'windowEnd', 'findingKey', 'action'],
   identical_peer_pattern: ['kind', 'voterA', 'voterB', 'overlap', 'targets', 'matchRatio', 'action'],
   low_variance: ['kind', 'judgeId', 'dimension', 'stdev', 'n', 'mean', 'direction', 'action'],
   multi_account: ['kind', 'keyField', 'keyValue', 'userIds', 'count', 'action'],
@@ -4023,40 +4203,66 @@ export function detectIdenticalPeerPattern({ peerReviews = [], minOverlap = 3 })
 /**
  * 短时间窗口内突发提交。
  * 借鉴 hack-the-back app/services/judging.py 的思路（MIT），只读思路独立实现。
+ *
+ * ⚠️ **单位是「提交动作」，不是「评分格子」**（F10）：
+ *    `stage_reviews` 的粒度是**队伍 × 维度** ⇒ 一次正常的表单提交（1 评委 × 2 队 × 5 维度）
+ *    会写 **10 行**。若把**行**当「提交事件」喂进来，阈值 5 必然被撞穿 ⇒
+ *    **一次完全正常的评审就被判成「刷分」** ⇒ 防刷分链路因全是误报而失去意义。
+ *    ⇒ 事件必须带**动作标识**（`actionId` / `requestId`，即一次提交的 request_id）：
+ *      · 同一个动作标识的多行 ⇒ **只算一次**；
+ *      · **没有动作标识**的事件 ⇒ **无法归并成动作** ⇒ **不计入**（宁可漏报也不误报）。
+ *        ⚠️ 这不是「宽容」，而是「不猜」：把行当动作正是 F10 的病根。
+ *        `unidentified` 会回报给调用方，由它显式告警（不静默）。
+ *
+ * ⛔ `findingKey` 是**稳定标识**（不含时间戳）：原先 detail 里嵌了 `windowStart`/`windowEnd`，
+ *    而复核队列的去重按 `canonicalJson(detail)` 比较 ⇒ 同一问题在不同时间算出来**不是同一个问题**
+ *    ⇒ **每次重算都新增一条 flagged_reviews 行** ⇒ 复核队列被同一个问题刷屏。
+ *    ⇒ 稳定标识 = `kind|主体|窗口序号`（窗口序号 = 窗口起点按窗口长度取整）。
  */
 export function detectBurstSubmission({ events = [], windowSeconds = 60, threshold = 5 }) {
   const bySubject = new Map();
+  let unidentified = 0;
   for (const e of events) {
     const subject = e.subjectId ?? e.judgeId ?? 'default';
     const at = Date.parse(e.at);
     if (!Number.isFinite(at)) continue;
-    if (!bySubject.has(subject)) bySubject.set(subject, []);
-    bySubject.get(subject).push(at);
+    const actionId = e.actionId ?? e.requestId ?? null;
+    if (!actionId) { unidentified += 1; continue; }
+    if (!bySubject.has(subject)) bySubject.set(subject, new Map());
+    const actions = bySubject.get(subject);
+    // 同一动作只留**最早**的时刻（重试不产生新动作，但可能带来更晚的落库时间）
+    const prev = actions.get(actionId);
+    if (prev === undefined || at < prev) actions.set(actionId, at);
   }
 
   const flags = [];
   let maxCount = 0;
-  for (const [subject, times] of bySubject) {
-    times.sort((x, y) => x - y);
+  const windowMs = windowSeconds * 1000;
+  for (const [subject, actions] of bySubject) {
+    const times = [...actions.values()].sort((x, y) => x - y);
     let start = 0;
     for (let end = 0; end < times.length; end += 1) {
-      while (times[end] - times[start] > windowSeconds * 1000) start += 1;
+      while (times[end] - times[start] > windowMs) start += 1;
       const count = end - start + 1;
       if (count > maxCount) maxCount = count;
       if (count > threshold) {
+        const windowStart = times[start];
+        const windowEnd = times[end];
         flags.push({
           kind: 'burst_submit',
           subjectId: subject,
           count,
-          windowStart: new Date(times[start]).toISOString(),
-          windowEnd: new Date(times[end]).toISOString(),
+          windowStart: new Date(windowStart).toISOString(),
+          windowEnd: new Date(windowEnd).toISOString(),
+          // 稳定标识：窗口序号按**窗口长度**取整 ⇒ 同一批数据重算得到同一个键
+          findingKey: `burst_submit|${subject}|${Math.floor(windowStart / windowMs)}`,
           action: 'alert_only',
         });
         break; // 同一主体只报一次（报最早的那次爆发）
       }
     }
   }
-  return { flags, maxCount };
+  return { flags, maxCount, unidentified };
 }
 
 /**
@@ -4258,7 +4464,26 @@ function canonicalJson(value) {
  *    在粗键下 team_id / judge_id 都是 NULL → 第二个被当成「重复」丢掉；
  *    同一位评委的**两个维度**方差异常同理（judge_id 相同、dimension 不同）。
  *    丢掉的不是重复项，是**真问题** —— 防作弊检测漏报。改成按明细内容判定。
+ *
+ * ⚠️ **稳定标识优先**（F10）：`burst_submit` 的明细里嵌了 `windowStart` / `windowEnd`
+ *    两个**时间戳** ⇒ 同一问题在不同时间算出来**不是同一个问题**
+ *    ⇒ **每次重算都新增一条 flagged_reviews 行** ⇒ 复核队列被同一个问题刷屏。
+ *    ⇒ 检测器给出不含时间戳的 `findingKey`（kind|主体|窗口序号）⇒ 按它去重。
+ *    没有 `findingKey` 的旧行退回「明细内容」比较（不丢历史）。
  */
+const VOLATILE_DETAIL_KEYS = ['windowStart', 'windowEnd', 'findingKey'];
+
+/** 去掉「每次重算都会变」的字段（时间戳 / 稳定标识本身）后的明细内容 */
+function stripVolatile(detail) {
+  if (!detail || typeof detail !== 'object' || Array.isArray(detail)) return detail;
+  const out = {};
+  for (const k of Object.keys(detail).sort()) {
+    if (VOLATILE_DETAIL_KEYS.includes(k)) continue;
+    out[k] = detail[k];
+  }
+  return out;
+}
+
 function isSameFinding(row, flag, stageId) {
   if ((row.stage_id ?? null) !== (stageId ?? null)) return false;
   let detail = null;
@@ -4267,7 +4492,14 @@ function isSameFinding(row, flag, stageId) {
   } catch {
     return false;   // 明细坏掉 → 不当成同一个问题（宁可多建一条让人看，也不漏）
   }
-  return canonicalJson(detail) === canonicalJson(flag);
+  const a = stripVolatile(detail);
+  const b = stripVolatile(flag);
+  // 两边都有稳定标识 ⇒ 按标识比（能分开「同一主体的两次不同爆发」）
+  if (detail?.findingKey && flag?.findingKey) {
+    return detail.findingKey === flag.findingKey;
+  }
+  // 一边没有稳定标识（历史行）⇒ 退回「去掉易变字段后的明细内容」比较
+  return canonicalJson(a) === canonicalJson(b);
 }
 
 /**

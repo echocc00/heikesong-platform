@@ -36,7 +36,26 @@ function canonicalJson(value) {
  *    在粗键下 team_id / judge_id 都是 NULL → 第二个被当成「重复」丢掉；
  *    同一位评委的**两个维度**方差异常同理（judge_id 相同、dimension 不同）。
  *    丢掉的不是重复项，是**真问题** —— 防作弊检测漏报。改成按明细内容判定。
+ *
+ * ⚠️ **稳定标识优先**（F10）：`burst_submit` 的明细里嵌了 `windowStart` / `windowEnd`
+ *    两个**时间戳** ⇒ 同一问题在不同时间算出来**不是同一个问题**
+ *    ⇒ **每次重算都新增一条 flagged_reviews 行** ⇒ 复核队列被同一个问题刷屏。
+ *    ⇒ 检测器给出不含时间戳的 `findingKey`（kind|主体|窗口序号）⇒ 按它去重。
+ *    没有 `findingKey` 的旧行退回「明细内容」比较（不丢历史）。
  */
+const VOLATILE_DETAIL_KEYS = ['windowStart', 'windowEnd', 'findingKey'];
+
+/** 去掉「每次重算都会变」的字段（时间戳 / 稳定标识本身）后的明细内容 */
+function stripVolatile(detail) {
+  if (!detail || typeof detail !== 'object' || Array.isArray(detail)) return detail;
+  const out = {};
+  for (const k of Object.keys(detail).sort()) {
+    if (VOLATILE_DETAIL_KEYS.includes(k)) continue;
+    out[k] = detail[k];
+  }
+  return out;
+}
+
 function isSameFinding(row, flag, stageId) {
   if ((row.stage_id ?? null) !== (stageId ?? null)) return false;
   let detail = null;
@@ -45,7 +64,14 @@ function isSameFinding(row, flag, stageId) {
   } catch {
     return false;   // 明细坏掉 → 不当成同一个问题（宁可多建一条让人看，也不漏）
   }
-  return canonicalJson(detail) === canonicalJson(flag);
+  const a = stripVolatile(detail);
+  const b = stripVolatile(flag);
+  // 两边都有稳定标识 ⇒ 按标识比（能分开「同一主体的两次不同爆发」）
+  if (detail?.findingKey && flag?.findingKey) {
+    return detail.findingKey === flag.findingKey;
+  }
+  // 一边没有稳定标识（历史行）⇒ 退回「去掉易变字段后的明细内容」比较
+  return canonicalJson(a) === canonicalJson(b);
 }
 
 /**

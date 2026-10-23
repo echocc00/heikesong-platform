@@ -414,6 +414,22 @@ export function validateRules(rules, expectedCount = null) {
         if (typeof e.points !== 'number' || e.points <= 0) {
           push(`behavior.events 事件 ${e.key} 的 points 必须为正数`);
         }
+        // ⚠️ **每个行为事件都必须有次数约束**（F38）：修复前 5 个事件里只有 1 个有 `once`
+        //    ⇒ 其余 4 个**无上限** ⇒ 提交 40 次 `weekly_progress` = 80 分 > 完赛线 60
+        //    ⇒ 「完赛认定」一分钟内可达 ⇒ 而行为分是破同分链的倒数第二个键
+        //    ⇒ 刷行为分 = 决定同分队伍排名 = 决定 10/8/5 赛段积分 = 决定钱。
+        //    ⇒ 这是「配置在说谎」的同款病根：`once` 写在规则里却没人执行 ⇒ 必须 fail-fast。
+        if (!e.once) {
+          push(`behavior.events 事件 ${e.key} 必须有 once 次数约束（否则可无限提交刷分）`);
+        }
+        if (e.cadence !== undefined) {
+          const c = e.cadence;
+          if (!c || typeof c !== 'object'
+            || !Number.isFinite(c.windowDays) || c.windowDays <= 0
+            || !Number.isInteger(c.maxCount) || c.maxCount <= 0) {
+            push(`behavior.events 事件 ${e.key} 的 cadence 必须是 { windowDays>0, maxCount>=1 }`);
+          }
+        }
       }
     }
   }
