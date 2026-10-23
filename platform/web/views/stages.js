@@ -269,7 +269,7 @@ export function stageCreateFormHtml({ draft = {}, configs = [] } = {}) {
       <label class="field__label" for="stage-new-key">赛段代号</label>
       <input class="input" id="stage-new-key" type="text" autocomplete="off"
         placeholder="如 initial / final" value="${escapeHtml(draft.key ?? '')}" data-stage="new-key" />
-      <p class="field__hint">代号建后**不可改**（它进 URL 与日志）：只能用字母、数字、连字符与下划线，同一届期内不能重复。</p>
+      <p class="field__hint">代号建后不可改（它进 URL 与日志）：只能用字母、数字、连字符与下划线，同一届期内不能重复。</p>
     </div>
     <div class="field field--required">
       <label class="field__label" for="stage-new-name">赛段名称</label>
@@ -284,7 +284,7 @@ export function stageCreateFormHtml({ draft = {}, configs = [] } = {}) {
     <div class="field">
       <label class="field__label" for="stage-new-config">权重表</label>
       <select class="select" id="stage-new-config" data-stage="new-config">${optionsHtml(configItems, draft.scoringConfigKey ?? 'initial')}</select>
-      <p class="field__hint">权重表来自 rules/scoring-*.json（改文件、重启即生效）—— 这里只选择**用哪一张**。</p>
+      <p class="field__hint">权重表来自 rules/scoring-*.json（改文件、重启即生效）—— 这里只选择用哪一张。</p>
     </div>
     <div class="field">
       <label class="field__label" for="stage-new-starts">开始时间</label>
@@ -338,8 +338,8 @@ export function stageConfigHtml({ stage = null, draft = {}, configs = [] } = {})
       tone: 'warn',
       title: '这两项没有随赛段列表返回',
       items: [
-        '赛段列表端点只返回摘要（代号 / 名称 / 类型 / 时间窗 / 状态），**不含**冻结时间与权重表键 ⇒ 页面无法回填它们的当前值。',
-        '没有改动的字段**不会被提交**（服务端的改配置语义是「不传 = 不改」）⇒ 保存一次不会误清空已有的冻结时间，也不会把权重表换成默认值。',
+        '赛段列表端点只返回摘要（代号 / 名称 / 类型 / 时间窗 / 状态），不含冻结时间与权重表键 ⇒ 页面无法回填它们的当前值。',
+        '没有改动的字段不会被提交（服务端的改配置语义是「不传 = 不改」）⇒ 保存一次不会误清空已有的冻结时间，也不会把权重表换成默认值。',
       ],
     })}
     <div class="field">
@@ -405,7 +405,7 @@ export function weightTableHtml({ configs = [], scoringConfigKey = '', degraded 
       items: [
         '权重表来自 rules/scoring-*.json（改一份 JSON、重启即生效），此刻拿不到规则文件，权重表暂时显示不出来。',
         forbidden
-          ? '读取权重表**没有权限**（权重表端点是届期作用域的读口，需要该届期的组委会能力）。'
+          ? '读取权重表没有权限（权重表端点是届期作用域的读口，需要该届期的组委会能力）。'
           : '其余面板（赛段配置 / 评委席 / 名册）不受影响，可以照常操作。',
       ],
     });
@@ -501,7 +501,7 @@ export function weightTableHtml({ configs = [], scoringConfigKey = '', degraded 
     ${sectionTitle('席构成约束')}
     ${kvList(poolRows)}
     <p class="muted small">以上约束由服务端校验（企业席 ≥30%、专家席 ≤50%）；页面不复制这套判定。</p>
-    <p class="muted small">权重表**只读**：要改权重，改 rules/scoring-*.json 这一份 JSON，重启即生效。</p>`;
+    <p class="muted small">权重表只读：要改权重，改 rules/scoring-*.json 这一份 JSON，重启即生效。</p>`;
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -567,7 +567,7 @@ export function judgeSeatHtml({ judges = [], candidates = [], draft = {}, pendin
       <div class="field">
         <label class="field__label" for="stage-judge-seat">席位</label>
         <select class="select" id="stage-judge-seat" data-stage="judge-seat">${optionsHtml(seatItems, draft.seat ?? 'judge')}</select>
-        <p class="field__hint">观察席**无投票权**；企业席 ≥30%、专家席 ≤50% 由服务端校验（页面不复制这套判定）。</p>
+        <p class="field__hint">观察席无投票权；企业席 ≥30%、专家席 ≤50% 由服务端校验（页面不复制这套判定）。</p>
       </div>
       <div class="row">
         <button type="button" class="btn btn--primary" data-action="judge-assign-submit">派评委</button>
@@ -591,7 +591,7 @@ export function removeJudgeConfirmHtml({ userId = '', name = '', stageName = '' 
   const where = stageName ? `赛段「${stageName}」` : '本赛段';
   return `<div class="notice notice--warn" data-stage-confirm="judge">
     <p class="notice__title">确认撤回该评委？</p>
-    <p class="notice__text">撤回 ${escapeHtml(who)} 在${escapeHtml(where)}的席位后：他的席位立即失效，其在本赛段签署的**利益冲突声明一并解除**（声明记录作为历史事实保留，不会删除）；该评委不再计入本赛段的评委池与席构成校验，已提交的历史评分不受影响。</p>
+    <p class="notice__text">撤回 ${escapeHtml(who)} 在${escapeHtml(where)}的席位后：他的席位立即失效，其在本赛段签署的<strong>利益冲突声明一并解除</strong>（声明记录作为历史事实保留，不会删除）；该评委不再计入本赛段的评委池与席构成校验，已提交的历史评分不受影响。</p>
     <div class="btn-group">
       <button type="button" class="btn btn--primary" data-action="judge-remove-confirm" data-user-id="${escapeHtml(userId)}">确认撤回</button>
       <button type="button" class="btn btn--ghost" data-action="judge-remove-cancel">取消</button>
@@ -689,7 +689,7 @@ export function removeTeamConfirmHtml({ teamId = '', name = '', stageName = '' }
   const where = stageName ? `赛段「${stageName}」` : '本赛段';
   return `<div class="notice notice--warn" data-stage-confirm="team">
     <p class="notice__title">确认把该队伍退名册？</p>
-    <p class="notice__text">把 ${escapeHtml(who)} 从${escapeHtml(where)}的名册里退出后：该队在本赛段的**评分与确认全部失效**（已交的评分不再计入本赛段的计算与名次），名次与榜单也会随之变化。这一步是逆向操作，请确认。</p>
+    <p class="notice__text">把 ${escapeHtml(who)} 从${escapeHtml(where)}的名册里退出后：该队在本赛段的<strong>评分与确认全部失效</strong>（已交的评分不再计入本赛段的计算与名次），名次与榜单也会随之变化。这一步是逆向操作，请确认。</p>
     <div class="btn-group">
       <button type="button" class="btn btn--primary" data-action="roster-remove-confirm" data-team-id="${escapeHtml(teamId)}">确认退名册</button>
       <button type="button" class="btn btn--ghost" data-action="roster-remove-cancel">取消</button>
@@ -1080,7 +1080,7 @@ export async function renderStageConfig(ctx) {
       state.stageId = created?.id ? String(created.id) : state.stageId;
       ok('赛段已创建', [
         created ? `赛段「${created.name}（${created.key}）」已建好。` : '赛段已建好。',
-        '新赛段是**草稿**状态：开闸是另一个动作。',
+        '新赛段是草稿状态：开闸是另一个动作。',
       ]);
       await reload();
     } catch (e) {

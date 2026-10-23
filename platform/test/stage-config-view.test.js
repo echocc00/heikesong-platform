@@ -611,3 +611,19 @@ test('契约：不许自造 CSS 类名（只用仓库里已有的类）', () => 
   const missing = [...used].filter((cls) => !new RegExp(`\\.${cls.replace(/[-]/g, '\\-')}[^\\w-]`).test(css));
   assert.deepEqual(missing, [], `这些 class 在 styles.css 里不存在：${missing.join(', ')}`);
 });
+
+test('⛔ 契约：用户可见文案里**不许**出现 markdown 星号（`**`）', () => {
+  // ⛔ 为什么钉这条（浏览器实测抓到的真缺陷）：
+  //   本仓前端**不渲染 markdown** —— `noticeState` 会 escapeHtml，`field__hint` 是纯文本。
+  //   ⇒ 文案里写 `观察席**无投票权**`，用户在页面上看到的就是**字面的星号**。
+  //   （浏览器实跑 E158 时在「席位」下方看到「观察席**无投票权**」才暴露出来。）
+  //
+  // ⚠️ 注释里用 `**` 做强调是**正常**的（仓库惯例）⇒ 只查非注释行。
+  const offenders = [];
+  VIEW_SRC.split('\n').forEach((line, i) => {
+    const s = line.trim();
+    if (s.startsWith('//') || s.startsWith('*') || s.startsWith('/*')) return;
+    if (line.includes('**')) offenders.push(`${i + 1}: ${s.slice(0, 120)}`);
+  });
+  assert.deepEqual(offenders, [], `这些行的用户可见文案里带了 markdown 星号：\n${offenders.join('\n')}`);
+});

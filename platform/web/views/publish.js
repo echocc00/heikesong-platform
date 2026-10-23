@@ -230,7 +230,7 @@ export function publishConfirmHtml(stageName, teamCount, kind = 'compute') {
   const title = isPublish ? '确认发布榜单？' : '确认执行发榜？';
   const text = isPublish
     ? `赛段「${escapeHtml(stageName)}」将正式发布：写榜单快照、重算段位记录、发放名次积分（影响奖金），并留下带操作者与时间戳的发榜审计。${escapeHtml(teamCount)} 支队伍进入公示。`
-    : `赛段「${escapeHtml(stageName)}」会按**当前评分**清空旧名次并重算落榜（${escapeHtml(teamCount)} 支队伍参与排名）。这一步影响奖金与公示，且会覆盖上一次的名次、总分与积分。`;
+    : `赛段「${escapeHtml(stageName)}」会按<strong>当前评分</strong>清空旧名次并重算落榜（${escapeHtml(teamCount)} 支队伍参与排名）。这一步影响奖金与公示，且会覆盖上一次的名次、总分与积分。`;
   const confirmAction = isPublish ? 'publish-leaderboard-confirm' : 'publish-confirm';
   const requestAction = isPublish ? 'publish-leaderboard-request' : 'publish-request';
   return `
