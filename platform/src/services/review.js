@@ -64,6 +64,7 @@ import {
   listSelfReviewsForViewer,
 } from '../db/repo/self-reviews.js';
 import { insertRecusal, listRecusals, listRecusalViews } from '../db/repo/recusals.js';
+import { getUserById } from '../db/repo/users.js';
 import { writeAuditLog } from '../audit/log.js';
 import { checkRecusal, checkPeerEligibility } from '../domain/review-eligibility.js';
 import { appError } from '../errors.js';
@@ -445,6 +446,19 @@ export function submitEnterpriseConfirmation({ db, stageId, teamId, enterpriseId
     throw fail(400, 'SIGNATURE_CONTENT_REQUIRED', '企业签字必须填写内容（解决了我方哪个具体环节 / 预计落地时间 / 我方投入角色）');
   }
   assertScoreInRange(rawScore, '企业确认分');
+  // ⚠️ **F9（Medium，2026-10-23 审计 §3.4「写端点错误语义不一致」）**：
+  //    `enterprise_confirmations.enterprise_id` 与 `signatory_user_id` 都是
+  //    `REFERENCES users(id)` 的外键 —— 原来**直接 INSERT**，让外键约束去兜底 ⇒
+  //    引用一个不存在的出题企业时，数据库抛 `FOREIGN KEY constraint failed`
+  //    ⇒ HTTP 层只能回 **500**（外键错误没有映射到 4xx），
+  //    客户端分不清「你填错了企业 id」和「服务端坏了」。
+  //    ⇒ 与 `services/workflow.js` 的 `createWorkflow`（先查 edition / taskPackage ⇒ 404）、
+  //      `services/taskPackage.js` 的 `submitTaskPackage`（先查届期 ⇒ 404）**逐字同源**：
+  //      业务层先判外键目标的存在性 ⇒ 404（资源不存在），而不是让约束错误冒到 HTTP 层。
+  //    ⚠️ 错误码沿用全仓既有命名 `USER_NOT_FOUND`（与 `services/stage.js` 派评委时同款）。
+  if (!getUserById(db, enterpriseId)) {
+    throw fail(404, 'USER_NOT_FOUND', '用户不存在', { userId: enterpriseId });
+  }
   assertTeamInStage(db, stageId, teamId);
   // ⛔ P11 · E148②：同格重签原来直接撞唯一索引 `idx_enterprise_confirmations_cell`
   //    → SQLite 抛 UNIQUE constraint → **HTTP 500「服务内部错误」**（违反设计文档 §7.3 的三态口径）。

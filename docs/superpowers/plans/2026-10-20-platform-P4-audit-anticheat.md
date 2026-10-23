@@ -1059,13 +1059,14 @@ export function findIdempotency(db, { key, scope }) {
 }
 
 export function insertIdempotency(db, {
-  key, scope, requestId = null, response = null, now = new Date().toISOString(),
+  key, scope, requestId = null, response = null, requestDigest = null,
+  now = new Date().toISOString(),
 }) {
   try {
     db.prepare(
-      `INSERT INTO idempotency_keys (key, scope, request_id, response_json, created_at)
-       VALUES (?, ?, ?, ?, ?)`,
-    ).run(key, scope, requestId, response === null ? null : JSON.stringify(response), now);
+      `INSERT INTO idempotency_keys (key, scope, request_id, response_json, request_digest, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(key, scope, requestId, response === null ? null : JSON.stringify(response), requestDigest, now);
     return true;
   } catch (err) {
     // ⚠️ 只认「唯一约束」这一种失败 —— 其他错误必须继续往上抛。
@@ -3053,17 +3054,48 @@ export function assertRateLimit(args) {
 //    对 JSON 安全的载荷两者完全一致；对 `undefined` / `Date` / `Map` 这类值会不同
 //    （`undefined` 落库成 NULL、重放拿到 `null`）。HTTP 层本来就只吐 JSON，
 //    所以对外无感；调用方若直接读对象字段，请只用 JSON 安全的返回值。
+import { createHash } from 'node:crypto';
 import { withTransaction } from '../db/tx.js';
+import { canonicalJson } from '../domain/canonical-json.js';
 import { findIdempotency, insertIdempotency } from '../db/repo/idempotency.js';
-import { badRequest } from '../errors.js';
+import { appError, badRequest } from '../errors.js';
 
-export function withIdempotency({ db, key, scope, requestId = null, now = new Date().toISOString() }, fn) {
+/**
+ * 请求体摘要（指纹）—— 幂等键必须**绑定操作**，不能只绑定调用方。
+ *
+ * ⚠️ **为什么需要它**（2026-10-23 审计 F25）：
+ *    幂等键的 scope 是**调用方**（`appeal:${user.id}`），原来**没有任何请求体指纹**
+ *    ⇒ 同一个 requestId 换了内容再提交 ⇒ 命中同一条记录 ⇒ **返回第一次的响应**，
+ *    第二次申诉**从未提交**，而客户端被告知「成功」⇒ **静默重放**。
+ *    ⇒ 摘要不同 ⇒ 不是同一笔操作 ⇒ 报 409（口径与 P2 的 `assertSameRequestContent` 一致：
+ *      `src/services/review.js` 的 REQUEST_ID_REUSED）。
+ *
+ * ⚠️ **为什么用 canonicalJson 而不是 JSON.stringify**：
+ *    JSON.stringify 的键顺序取决于**构造顺序** ⇒ 等价内容、不同键序会算出不同摘要
+ *    ⇒ 客户端重试时被误判成「换了内容」⇒ 用**键名排序**的稳定序列化（与反作弊去重同口径）。
+ */
+function requestDigest(payload) {
+  return createHash('sha256').update(canonicalJson(payload ?? null)).digest('hex');
+}
+
+export function withIdempotency({
+  db, key, scope, requestId = null, payload = null, now = new Date().toISOString(),
+}, fn) {
   if (!key) throw badRequest('幂等执行必须给 key（request_id）');
   if (!scope) throw badRequest('幂等执行必须给 scope（操作域）');
+  const digest = requestDigest(payload);
 
   return withTransaction(db, () => {
     const existing = findIdempotency(db, { key, scope });
     if (existing) {
+      // ⚠️ **F25：同一 requestId 换了内容 ⇒ 不是同一笔操作 ⇒ 409（不许静默重放）**
+      //    ⚠️ 旧记录没有摘要（NULL）⇒ 不比对（不把历史记录误判成冲突）。
+      if (existing.request_digest && existing.request_digest !== digest) {
+        throw appError(
+          409, 'REQUEST_ID_REUSED',
+          '同一个 requestId 被用于了不同的内容（幂等键已绑定首次提交）',
+        );
+      }
       // ⛔ 重复请求：直接返回首次的响应，不重新执行业务函数
       return {
         replayed: true,
@@ -3073,10 +3105,19 @@ export function withIdempotency({ db, key, scope, requestId = null, now = new Da
     }
 
     const result = fn();
-    const inserted = insertIdempotency(db, { key, scope, requestId, response: result, now });
+    const inserted = insertIdempotency(db, {
+      key, scope, requestId, response: result, requestDigest: digest, now,
+    });
     if (!inserted) {
       // 并发下别人先写进去了：以库里的首次响应为准
       const again = findIdempotency(db, { key, scope });
+      // ⚠️ 并发路径同样要判「内容是不是同一份」——否则并发也能静默重放
+      if (again?.request_digest && again.request_digest !== digest) {
+        throw appError(
+          409, 'REQUEST_ID_REUSED',
+          '同一个 requestId 被用于了不同的内容（幂等键已绑定首次提交）',
+        );
+      }
       return {
         replayed: true,
         result: again?.response_json ? JSON.parse(again.response_json) : null,
@@ -4441,20 +4482,11 @@ import { createFlag, listFlagRows, resolveFlagRow } from '../db/repo/flags.js';
 import { writeAuditLog } from '../audit/log.js';
 import { can } from '../auth/permissions.js';
 import { badRequest, notFound } from '../errors.js';
+import { canonicalJson } from '../domain/canonical-json.js';
 
-/**
- * 稳定序列化（键名排序）——用来比较两份 flag 明细是不是「同一个问题」。
- * 不排序的话，键顺序不同但内容相同的明细会被判成两个问题。
- */
-function canonicalJson(value) {
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
-  if (value && typeof value === 'object') {
-    const parts = Object.keys(value).sort()
-      .map((k) => `${JSON.stringify(k)}:${canonicalJson(value[k])}`);
-    return `{${parts.join(',')}}`;
-  }
-  return JSON.stringify(value) ?? 'null';
-}
+// ⚠️ 稳定序列化（键名排序）已抽到 `src/domain/canonical-json.js`
+//    （2026-10-23 审计 F25：幂等摘要要用**同一口径** ⇒ 复制一份就是「同一口径写两份 ⇒ 必然漂移」）。
+//    语义与原实现**逐字一致**，行为未变。
 
 /**
  * 「同一个问题」的判定：同 kind + 同赛段 + **同明细内容**。
@@ -4526,6 +4558,32 @@ function scanFlags(db, filter, match) {
  */
 export function assertFlagDetail(flag) {
   return [...assertKnownFields(flag.kind, flag), ...assertMutuallyExclusive(flag)];
+}
+
+/**
+ * `peer_reviews` 的仓储行（snake_case）→ 检测器的入参形状（**队 → 队**）。
+ *
+ * ⚠️ **互评数据在本仓的真实存储位置**（2026-10-23 审计 F47 的取证结论，不要凭印象）：
+ *   · 互评**只**存在 `peer_reviews` 表（db/migrations/003_review.sql:132）：
+ *     stage_id / from_team_id / to_team_id / score / request_id / created_at；
+ *   · `stage_reviews`（评委打分表）**没有 seat 列** ⇒「stage_reviews 里 seat='peer' 那一路」
+ *     在本仓**不存在**；本仓的「互评」是**队 → 队**的行为（from_team_id → to_team_id）。
+ *   ⇒ 检测器的「谁投了谁」只能来自 `peer_reviews`。
+ *
+ * ⚠️ **为什么放在服务层而不是仓储层**：仓储层统一返回**原始行**（snake_case），
+ *   而检测器的入参是领域形状 ⇒ 这一层翻译**只在这里发生一次**
+ *   （计算期与发榜期两条链路共用同一份）⇒ 不可能漂移
+ *   （同一口径写两份 ⇒ 必然漂移 —— 本仓的老教训）。
+ *
+ * ⚠️ 字段名用 fromId / toId（**队**），不是 judgeId：`pickVoter` / `pickTarget`
+ *   在 src/domain/anticheat.js 里读的是 `judgeId ?? fromId` 与 `teamId ?? toId`
+ *   ⇒ 两种写法都能命中，这里取语义正确的那个。
+ *
+ * @param {object[]} rows `peer_reviews` 的仓储行
+ * @returns {{fromId: string, toId: string, score: number}[]}
+ */
+export function toDetectionPeerReviews(rows = []) {
+  return rows.map((r) => ({ fromId: r.from_team_id, toId: r.to_team_id, score: r.score }));
 }
 
 /**
@@ -5487,6 +5545,7 @@ import { getUserById } from '../db/repo/users.js';
 import { hasActiveMembership } from '../db/repo/teamMembers.js';
 import { getTeam } from '../db/repo/teams.js';
 import { writeAuditLog } from '../audit/log.js';
+import { withTransaction } from '../db/tx.js';
 import { can, isCommitteeActor } from '../auth/permissions.js';
 import { badRequest, conflict, forbidden, notFound } from '../errors.js';
 
@@ -5552,59 +5611,68 @@ export function filterVisibleScores({ db, stageId, viewer = null, scores = [] })
 export function fileAppeal({
   db, subjectType = 'team_result', subjectId, filedBy = null, reason, now = new Date().toISOString(), rules,
 }) {
-  if (!subjectId) throw badRequest('申诉必须给 subjectId');
-  if (!reason || !String(reason).trim()) throw badRequest('申诉必须写理由（空理由 = 无法复核）');
+  // ⚠️ **F26（Medium，2026-10-23 审计）：本函数的写路径原先**全程无事务**** ——
+  //   `withTransaction` / `SAVEPOINT` / `BEGIN` 一个都没有，却有十几处写调用 ⇒
+  //   `UPDATE appeals` 抛错时，**状态迁移已经提交**、而申诉行还写着旧状态
+  //   ⇒ 主体实际已是「已复核」（分数被隐藏）却**没有任何裁决记录**。
+  //   ⚠️ 关键：**审计日志就是状态源**（`findLatestTransition` 从 audit_log 读当前状态） ⇒
+  //   状态迁移与申诉行更新**必须同生共死**。
+  //   （配合 F8：外层无事务时 `withTransaction` 走 `BEGIN IMMEDIATE`，嵌套时走 SAVEPOINT ⇒ 可安全嵌套。）
+  return withTransaction(db, () => {
+    if (!subjectId) throw badRequest('申诉必须给 subjectId');
+    if (!reason || !String(reason).trim()) throw badRequest('申诉必须写理由（空理由 = 无法复核）');
 
-  // ── 报名类申诉（DP-106）：独立的校验口径，见 fileRegistrationAppeal ──────
-  if (subjectType === 'registration') {
-    return fileRegistrationAppeal({ db, subjectId, filedBy, reason, now, rules });
-  }
-
-  const { stageId, teamId } = parseAppealSubject(subjectId);
-  // ⚛️ F34（Medium，2026-10-23 审计）：原来**没有归属校验** ——
-  //   ⇒ 任何持有 appeal:write 的人都能对**别人队伍**的赛段结果提申诉。
-  //   ⇒ 申诉人必须是该队成员（或组委会 / 超管）。
-  //   ⛔ **归属校验必须排在状态校验之前**：否则对一条「不存在的条目」提申诉会先撞上
-  //      409（状态不对），把「越权」掩盖成「状态错误」⇒ 排障时看错方向。
-  if (teamId) {
-    const actor = getUserById(db, filedBy);
-    const team = getTeam(db, teamId);
-    // 归属 = 该队**队长**或**在册成员**（队长身份来自 teams.captain_id，
-    // 与 team_members 是否有行无关 —— 报名刚通过、还没落成员行时队长就该能申诉）
-    const isCaptain = Boolean(team) && team.captain_id === filedBy;
-    const isMember = Boolean(filedBy) && hasActiveMembership(db, teamId, filedBy);
-    const isCommittee = actor && isCommitteeActor(db, actor);
-    if (!isCaptain && !isMember && !isCommittee) {
-      throw forbidden('只能对自己队伍的赛段结果提申诉');
+    // ── 报名类申诉（DP-106）：独立的校验口径，见 fileRegistrationAppeal ──────
+    if (subjectType === 'registration') {
+      return fileRegistrationAppeal({ db, subjectId, filedBy, reason, now, rules });
     }
-  }
-  const state = stageId ? getSubjectState({ db, subjectType: 'stage_result', subjectId: stageId }) : null;
-  if (state !== 'FINALIZED') {
-    throw conflict(`只有已 FINALIZED 的条目可以申诉（当前状态：${state ?? '未进入复核'}）`);
-  }
 
-  const allowedTiers = rules?.audit?.reviewState?.appealAllowedTiers ?? [];
-  const tier = teamId ? getTeamTierRow(db, teamId) : null;
-  if (!tier) {
-    throw conflict(`无法判定档位（队伍 ${teamId}）——档位未知时不得受理申诉`);
-  }
-  if (!allowedTiers.includes(tier)) {
-    throw forbidden(`档位 ${tier} 不在可申诉的低可见档（${allowedTiers.join(' / ')}）范围内`);
-  }
+    const { stageId, teamId } = parseAppealSubject(subjectId);
+    // ⚛️ F34（Medium，2026-10-23 审计）：原来**没有归属校验** ——
+    //   ⇒ 任何持有 appeal:write 的人都能对**别人队伍**的赛段结果提申诉。
+    //   ⇒ 申诉人必须是该队成员（或组委会 / 超管）。
+    //   ⛔ **归属校验必须排在状态校验之前**：否则对一条「不存在的条目」提申诉会先撞上
+    //      409（状态不对），把「越权」掩盖成「状态错误」⇒ 排障时看错方向。
+    if (teamId) {
+      const actor = getUserById(db, filedBy);
+      const team = getTeam(db, teamId);
+      // 归属 = 该队**队长**或**在册成员**（队长身份来自 teams.captain_id，
+      // 与 team_members 是否有行无关 —— 报名刚通过、还没落成员行时队长就该能申诉）
+      const isCaptain = Boolean(team) && team.captain_id === filedBy;
+      const isMember = Boolean(filedBy) && hasActiveMembership(db, teamId, filedBy);
+      const isCommittee = actor && isCommitteeActor(db, actor);
+      if (!isCaptain && !isMember && !isCommittee) {
+        throw forbidden('只能对自己队伍的赛段结果提申诉');
+      }
+    }
+    const state = stageId ? getSubjectState({ db, subjectType: 'stage_result', subjectId: stageId }) : null;
+    if (state !== 'FINALIZED') {
+      throw conflict(`只有已 FINALIZED 的条目可以申诉（当前状态：${state ?? '未进入复核'}）`);
+    }
 
-  const id = insertAppeal(db, {
-    subjectType, subjectId, filedBy, reason, status: 'submitted', now,
-  });
-  writeAuditLog(db, {
-    actorId: filedBy,
-    action: 'appeal.filed',
-    entity: 'appeal',
-    entityId: id,
-    detail: { subjectType, subjectId, reason, stageId, teamId, tier },
-    now,
-  });
-  return getAppeal(db, id);
-}
+    const allowedTiers = rules?.audit?.reviewState?.appealAllowedTiers ?? [];
+    const tier = teamId ? getTeamTierRow(db, teamId) : null;
+    if (!tier) {
+      throw conflict(`无法判定档位（队伍 ${teamId}）——档位未知时不得受理申诉`);
+    }
+    if (!allowedTiers.includes(tier)) {
+      throw forbidden(`档位 ${tier} 不在可申诉的低可见档（${allowedTiers.join(' / ')}）范围内`);
+    }
+
+    const id = insertAppeal(db, {
+      subjectType, subjectId, filedBy, reason, status: 'submitted', now,
+    });
+    writeAuditLog(db, {
+      actorId: filedBy,
+      action: 'appeal.filed',
+      entity: 'appeal',
+      entityId: id,
+      detail: { subjectType, subjectId, reason, stageId, teamId, tier },
+      now,
+    });
+    return getAppeal(db, id);
+
+  });}
 
 /**
  * 报名类申诉（DP-106）：选手对**自己的报名分级结果**不服，交给组委会复核。
@@ -5691,85 +5759,94 @@ function fileRegistrationAppeal({ db, subjectId, filedBy, reason, now, rules }) 
 export function decideAppeal({
   db, appealId, decision, decidedBy = null, note, now = new Date().toISOString(), rules,
 }) {
-  if (!['accepted', 'rejected'].includes(decision)) {
-    throw badRequest(`裁决只能是 accepted 或 rejected，收到：${decision}`);
-  }
-  if (!note || !String(note).trim()) throw badRequest('裁决必须写说明（无说明的裁决无法复盘）');
+  // ⚠️ **F26（Medium，2026-10-23 审计）：本函数的写路径原先**全程无事务**** ——
+  //   `withTransaction` / `SAVEPOINT` / `BEGIN` 一个都没有，却有十几处写调用 ⇒
+  //   `UPDATE appeals` 抛错时，**状态迁移已经提交**、而申诉行还写着旧状态
+  //   ⇒ 主体实际已是「已复核」（分数被隐藏）却**没有任何裁决记录**。
+  //   ⚠️ 关键：**审计日志就是状态源**（`findLatestTransition` 从 audit_log 读当前状态） ⇒
+  //   状态迁移与申诉行更新**必须同生共死**。
+  //   （配合 F8：外层无事务时 `withTransaction` 走 `BEGIN IMMEDIATE`，嵌套时走 SAVEPOINT ⇒ 可安全嵌套。）
+  return withTransaction(db, () => {
+    if (!['accepted', 'rejected'].includes(decision)) {
+      throw badRequest(`裁决只能是 accepted 或 rejected，收到：${decision}`);
+    }
+    if (!note || !String(note).trim()) throw badRequest('裁决必须写说明（无说明的裁决无法复盘）');
 
-  const appeal = getAppeal(db, appealId);
-  if (!appeal) throw notFound(`申诉不存在: ${appealId}`);
-  if (appeal.status !== 'submitted' && appeal.status !== 'reviewing') {
-    throw conflict(`申诉 ${appealId} 已裁决（当前状态 ${appeal.status}）`);
-  }
+    const appeal = getAppeal(db, appealId);
+    if (!appeal) throw notFound(`申诉不存在: ${appealId}`);
+    if (appeal.status !== 'submitted' && appeal.status !== 'reviewing') {
+      throw conflict(`申诉 ${appealId} 已裁决（当前状态 ${appeal.status}）`);
+    }
 
-  const transitions = [];
-  // ⚠️ DP-106：**先看 subject_type** —— 报名类与赛段结果类的裁决口径完全不同。
-  //   'registration'（报名类）：成立 ⇒ 撤销**分级裁定**，让它回到待复核（不重算赛段）。
-  //   其它（赛段结果类）：成立 ⇒ 撤销终稿（FINALIZED → REJECTED → PENDING_REVIEW）+ 重算。**原逻辑一字未改**。
-  const isRegistrationAppeal = appeal.subject_type === 'registration';
-  // 只有赛段结果类成立才要求重算（重算走 revision + 1，旧 revision 保留）。
-  const recomputeRequired = decision === 'accepted' && !isRegistrationAppeal;
-  if (decision === 'accepted') {
-    if (isRegistrationAppeal) {
-      // ── 报名类：撤销分级裁定 → 回到待复核 ──────────────────────────────
-      // ⚠️ 为什么**不**触发赛段重算：报名分级与赛段分数是两套独立的量
-      //    （设计文档 §9「报名分级」 vs §11.2「赛段复核」）。
-      //    撤销一条分级裁定要重算的是**这条报名的分级**，由委员会重新复核落 level_final；
-      //    赛段分数一个字都不受影响 ⇒ recomputeRequired 必须为 false、transitions 为空。
-      const reg = findRegistrationRow(db, appeal.subject_id);
-      if (!reg) throw notFound(`报名记录不存在: ${appeal.subject_id}`);
-      const fromStatus = reg.status;
-      // ⚠️ 改报名行**必须走仓储层**（全局约束：SQL 只在 src/db/repo/）。
-      //    updateRegistrationRow 的可更新列白名单里含 level_final ⇒ 传 null 即清空裁定等级。
-      //    （decided_by / decided_at / decision_note **保留**：那是上一次裁定的来源，
-      //      撤销与否决都留在 registration_events 与审计日志里，不靠覆盖字段抹历史。）
-      updateRegistrationRow(db, appeal.subject_id, {
-        level_final: null,
-        status: 'submitted',
-      });
-      // 事件轨迹（追加式，历史不覆盖）：from_status = 申诉前的状态，to_status = 回到待复核。
-      insertRegistrationEvent(db, {
-        registrationId: appeal.subject_id,
-        fromStatus,
-        toStatus: 'submitted',
-        actorId: decidedBy,
-        reason: note,
-        now,
-      });
-    } else {
-      const { stageId } = parseAppealSubject(appeal.subject_id);
-      if (stageId) {
-        transitions.push(transition({
-          db, subjectType: 'stage_result', subjectId: stageId,
-          from: 'FINALIZED', to: 'REJECTED', actorId: decidedBy,
-          reason: `申诉成立：${note}`, idempotencyKey: `appeal:${appealId}:revoke`, now,
-        }));
-        transitions.push(transition({
-          db, subjectType: 'stage_result', subjectId: stageId,
-          from: 'REJECTED', to: 'PENDING_REVIEW', actorId: decidedBy,
-          reason: `申诉重新复核：${note}`, idempotencyKey: `appeal:${appealId}:reopen`, now,
-        }));
+    const transitions = [];
+    // ⚠️ DP-106：**先看 subject_type** —— 报名类与赛段结果类的裁决口径完全不同。
+    //   'registration'（报名类）：成立 ⇒ 撤销**分级裁定**，让它回到待复核（不重算赛段）。
+    //   其它（赛段结果类）：成立 ⇒ 撤销终稿（FINALIZED → REJECTED → PENDING_REVIEW）+ 重算。**原逻辑一字未改**。
+    const isRegistrationAppeal = appeal.subject_type === 'registration';
+    // 只有赛段结果类成立才要求重算（重算走 revision + 1，旧 revision 保留）。
+    const recomputeRequired = decision === 'accepted' && !isRegistrationAppeal;
+    if (decision === 'accepted') {
+      if (isRegistrationAppeal) {
+        // ── 报名类：撤销分级裁定 → 回到待复核 ──────────────────────────────
+        // ⚠️ 为什么**不**触发赛段重算：报名分级与赛段分数是两套独立的量
+        //    （设计文档 §9「报名分级」 vs §11.2「赛段复核」）。
+        //    撤销一条分级裁定要重算的是**这条报名的分级**，由委员会重新复核落 level_final；
+        //    赛段分数一个字都不受影响 ⇒ recomputeRequired 必须为 false、transitions 为空。
+        const reg = findRegistrationRow(db, appeal.subject_id);
+        if (!reg) throw notFound(`报名记录不存在: ${appeal.subject_id}`);
+        const fromStatus = reg.status;
+        // ⚠️ 改报名行**必须走仓储层**（全局约束：SQL 只在 src/db/repo/）。
+        //    updateRegistrationRow 的可更新列白名单里含 level_final ⇒ 传 null 即清空裁定等级。
+        //    （decided_by / decided_at / decision_note **保留**：那是上一次裁定的来源，
+        //      撤销与否决都留在 registration_events 与审计日志里，不靠覆盖字段抹历史。）
+        updateRegistrationRow(db, appeal.subject_id, {
+          level_final: null,
+          status: 'submitted',
+        });
+        // 事件轨迹（追加式，历史不覆盖）：from_status = 申诉前的状态，to_status = 回到待复核。
+        insertRegistrationEvent(db, {
+          registrationId: appeal.subject_id,
+          fromStatus,
+          toStatus: 'submitted',
+          actorId: decidedBy,
+          reason: note,
+          now,
+        });
+      } else {
+        const { stageId } = parseAppealSubject(appeal.subject_id);
+        if (stageId) {
+          transitions.push(transition({
+            db, subjectType: 'stage_result', subjectId: stageId,
+            from: 'FINALIZED', to: 'REJECTED', actorId: decidedBy,
+            reason: `申诉成立：${note}`, idempotencyKey: `appeal:${appealId}:revoke`, now,
+          }));
+          transitions.push(transition({
+            db, subjectType: 'stage_result', subjectId: stageId,
+            from: 'REJECTED', to: 'PENDING_REVIEW', actorId: decidedBy,
+            reason: `申诉重新复核：${note}`, idempotencyKey: `appeal:${appealId}:reopen`, now,
+          }));
+        }
       }
     }
-  }
 
-  updateAppeal(db, { id: appealId, status: decision, decidedBy, decidedAt: now, decisionNote: note });
-  writeAuditLog(db, {
-    actorId: decidedBy,
-    action: 'appeal.decided',
-    entity: 'appeal',
-    entityId: appealId,
-    detail: { decision, note, subjectType: appeal.subject_type, subjectId: appeal.subject_id, recomputeRequired },
-    now,
-  });
+    updateAppeal(db, { id: appealId, status: decision, decidedBy, decidedAt: now, decisionNote: note });
+    writeAuditLog(db, {
+      actorId: decidedBy,
+      action: 'appeal.decided',
+      entity: 'appeal',
+      entityId: appealId,
+      detail: { decision, note, subjectType: appeal.subject_type, subjectId: appeal.subject_id, recomputeRequired },
+      now,
+    });
 
-  return {
-    appeal: getAppeal(db, appealId),
-    transitions,
-    // 申诉成立必须重算；重算走 revision + 1，旧 revision 保留（不覆盖历史）
-    recomputeRequired,
-  };
-}
+    return {
+      appeal: getAppeal(db, appealId),
+      transitions,
+      // 申诉成立必须重算；重算走 revision + 1，旧 revision 保留（不覆盖历史）
+      recomputeRequired,
+    };
+
+  });}
 
 /**
  * 申诉列表。列表不满足 → 200 + 空集。
@@ -5925,6 +6002,10 @@ import { scoreStage } from '../src/domain/scoring.js';
 import { applyScoreVisibility } from '../src/http/routes/review.js';
 import { rateLimited } from '../src/errors.js';
 import { callJson } from '../test-helpers/http-call.js';
+import { isolateTempDir } from '../test-helpers/tmp.js';
+
+// ⚠️ 隔离本进程临时目录：进程退出时整体回收（防临时目录泄漏，详见 test-helpers/tmp.js）
+isolateTempDir();
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrationsDir = join(here, '..', 'db', 'migrations');
@@ -6053,7 +6134,12 @@ test('GET /api/audit/computations/:id 未登录返回 401，单条不存在返�
   rmSync(dataDir, { recursive: true, force: true });
 });
 
-test('GET /api/audit/computations/:id/diff 返回 diff 与 warnings（能被看见）', async () => {
+// ⚠️ F20（缺陷报告 2026-10-23 §3.5）：复算**会写库**（写一条 `computation.recompute`
+//    审计日志）⇒ 它是**有副作用的动作** ⇒ 端点从 GET 改成 **POST**
+//    （GET 跨站可达 ⇒ `<img src>` 就能以受害者身份污染审计日志）。
+//    ⇒ 下面三条用例的调用方**按契约变更**同步改成 POST（不是「改测试迁就实现」：
+//    契约本身就变了，F20 的验收口径就是「复算只能由 POST 触发」）。
+test('POST /api/audit/computations/:id/diff 返回 diff 与 warnings（能被看见）', async () => {
   const { db, close, dataDir, app, rules } = setup();
   const refs = seedRefs(db);
   const token = createSession(db, refs.admin.id).token;
@@ -6067,7 +6153,7 @@ test('GET /api/audit/computations/:id/diff 返回 diff 与 warnings（能被看�
     db, kind: 'stage_score', stageId: refs.stage.id, ruleVersion: input.ruleVersion,
     input, output, trace: {},
   });
-  const res = await callJson(app, 'GET', `/api/audit/computations/${id}/diff`, { token });
+  const res = await callJson(app, 'POST', `/api/audit/computations/${id}/diff`, { token });
   assert.equal(res.status, 200);
   assert.ok(Array.isArray(res.json.diff));
   assert.ok(Array.isArray(res.json.warnings));
@@ -6078,7 +6164,7 @@ test('GET /api/audit/computations/:id/diff 返回 diff 与 warnings（能被看�
   rmSync(dataDir, { recursive: true, force: true });
 });
 
-test('GET /api/audit/computations/:id/diff 精确定位到被改的那一处（path 可定位）', async () => {
+test('POST /api/audit/computations/:id/diff 精确定位到被改的那一处（path 可定位）', async () => {
   const { db, close, dataDir, app, rules } = setup();
   const refs = seedRefs(db);
   const token = createSession(db, refs.admin.id).token;
@@ -6089,7 +6175,7 @@ test('GET /api/audit/computations/:id/diff 精确定位到被改的那一处（p
     db, kind: 'stage_score', stageId: refs.stage.id, ruleVersion: input.ruleVersion,
     input, output, trace: {},
   });
-  const res = await callJson(app, 'GET', `/api/audit/computations/${id}/diff`, { token });
+  const res = await callJson(app, 'POST', `/api/audit/computations/${id}/diff`, { token });
   assert.equal(res.status, 200);
   assert.equal(res.json.diff.length, 1, `只改一个数就只该有一条差异（实际 ${JSON.stringify(res.json.diff)}）`);
   assert.equal(res.json.diff[0].path, 'teams[t1].total');
@@ -6454,7 +6540,7 @@ test('单条无权访问返回 404（不泄露记录是否存在）：无 audit:
   rmSync(dataDir, { recursive: true, force: true });
 });
 
-test('GET /api/audit/computations/:id/diff 无权复算返回 403', async () => {
+test('POST /api/audit/computations/:id/diff 无权复算返回 403', async () => {
   const { db, close, dataDir, app, rules } = setup();
   const refs = seedRefs(db);
   const judgeToken = createSession(db, refs.judge.id).token;
@@ -6463,7 +6549,7 @@ test('GET /api/audit/computations/:id/diff 无权复算返回 403', async () => 
     db, kind: 'stage_score', stageId: refs.stage.id, ruleVersion: input.ruleVersion,
     input, output: engineOutput(input), trace: {},
   });
-  const res = await callJson(app, 'GET', `/api/audit/computations/${id}/diff`, { token: judgeToken });
+  const res = await callJson(app, 'POST', `/api/audit/computations/${id}/diff`, { token: judgeToken });
   assert.equal(res.status, 403);
   assert.equal(res.json.error.code, 'FORBIDDEN');
   close();
@@ -6718,7 +6804,7 @@ function installDom() {
 
 const tick = () => new Promise((r) => setTimeout(r, 5));
 
-test('前端 trace 抽屉：三件套 + 降级告警置顶 + 复算 diff 必须被看见', async () => {
+test('前端 trace 抽屉：三件套 + 降级告警置顶 + 复算 diff 必须被看见（且复算走 POST）', async () => {
   installDom();
   const { renderAudit } = await import('../web/views/audit.js');
   const calls = [];
@@ -6726,14 +6812,7 @@ test('前端 trace 抽屉：三件套 + 降级告警置顶 + 复算 diff 必须�
     params: { computationId: 'cmp-1' },
     api: {
       get: async (p) => {
-        calls.push(p);
-        if (p.endsWith('/diff')) {
-          return {
-            identical: false,
-            diff: [{ path: 'teams[t1].total', before: 61, after: 60 }],
-            warnings: [{ code: 'strict_replay_failed', message: '快照被改过' }],
-          };
-        }
+        calls.push(['GET', p]);
         return {
           ruleVersion: 'scoring.final@2026-10-20', revision: 2, createdAt: '2026-10-20T00:00:00.000Z',
           input: { submissions: [{ judgeId: 'j1' }] },
@@ -6741,11 +6820,24 @@ test('前端 trace 抽屉：三件套 + 降级告警置顶 + 复算 diff 必须�
           trace: { normalization: { innovation: { normalized: false, fallbackReason: 'judge_sample_too_small' } } },
         };
       },
+      // ⚠️ 复算必须走 **POST**（F20：复算会写审计日志 ⇒ 有副作用 ⇒ 不是 GET；
+      //    GET 跨站可达 ⇒ 会被 `<img src>` 触发写库）。
+      post: async (p) => {
+        calls.push(['POST', p]);
+        return {
+          identical: false,
+          diff: [{ path: 'teams[t1].total', before: 61, after: 60 }],
+          warnings: [{ code: 'strict_replay_failed', message: '快照被改过' }],
+        };
+      },
     },
   };
   const wrap = renderAudit(ctx);
   await tick();
-  assert.ok(calls.includes('/api/audit/computations/cmp-1'), '必须按路由参数拉快照');
+  assert.ok(
+    calls.some(([m, p]) => m === 'GET' && p === '/api/audit/computations/cmp-1'),
+    '必须按路由参数拉快照',
+  );
   const body = wrap.children[1];
   const warnBox = body.children[0];
   assert.ok(warnBox.innerHTML.includes('降级告警'), '降级告警必须置顶');
@@ -6758,7 +6850,14 @@ test('前端 trace 抽屉：三件套 + 降级告警置顶 + 复算 diff 必须�
   const btn = actions.children[0];
   assert.equal(btn.textContent, '用同一输入复算并比对');
   await btn.handlers.click[0]();
-  assert.ok(calls.includes('/api/audit/computations/cmp-1/diff'), '复算 diff 必须真的去拉');
+  assert.ok(
+    calls.some(([m, p]) => m === 'POST' && p === '/api/audit/computations/cmp-1/diff'),
+    '复算 diff 必须真的去拉，且**必须用 POST**（复算有副作用 ⇒ 不是 GET）',
+  );
+  assert.ok(
+    !calls.some(([m, p]) => m === 'GET' && p.endsWith('/diff')),
+    '复算**不得**再走 GET（GET 跨站可达 ⇒ 可被 <img> 触发写库）',
+  );
   const diffBox = actions.children[1];
   assert.ok(diffBox.innerHTML.includes('identical = false'), 'diff 必须被看见（不能只写一条日志）');
   assert.ok(diffBox.innerHTML.includes('teams[t1].total'), 'diff 必须给出可定位的 path');
@@ -6826,12 +6925,19 @@ test('前端：/audit/:computationId 与 /flags 路由都把参数透传给视�
   const calls = [];
   globalThis.fetch = async (url) => {
     calls.push(String(url));
-    return {
-      ok: true, status: 200,
-      text: async () => JSON.stringify({
+    // ⚠️ P7：/api/me 现在必须返回**已登录**用户 ——
+    //    前端新增了路由守卫（未登录访问受保护页 → 引导登录，不发请求），
+    //    否则这个用例测到的会是「被守卫挡掉」，而不是「参数透传」这个本意。
+    //    ⇒ 这里补一个组委会身份，用例的主体（参数透传）保持不变。
+    const body = String(url) === '/api/me'
+      ? { user: { id: 'u_admin', name: '组委会', roles: ['admin'] } }
+      : {
         user: null, rows: [], total: 0,
         ruleVersion: 'v1', revision: 1, createdAt: 'c', output: { teams: [] }, trace: {},
-      }),
+      };
+    return {
+      ok: true, status: 200,
+      text: async () => JSON.stringify(body),
     };
   };
   await import('../web/app.js?v=t6-app');
@@ -6875,7 +6981,7 @@ Expected: FAIL —— 实测**不是 404**，而是 `ERR_MODULE_NOT_FOUND`（规
 // src/http/routes/audit.js — P4 的 7 个接口
 // 依据：INTERFACES.md §5「API（P4）」——路径与语义逐字对齐。
 //   GET  /api/audit/computations/:id          计算快照（三件套）
-//   GET  /api/audit/computations/:id/diff     复算 diff
+//   POST /api/audit/computations/:id/diff     复算 diff（**有副作用** ⇒ POST）
 //   GET  /api/audit/log                       审计日志
 //   GET  /api/audit/flags                     复核队列
 //   POST /api/audit/flags/:id/resolve         裁决复核项
@@ -6961,7 +7067,18 @@ export function registerAuditRoutes(router, { db, rules }) {
     return getComputation({ db, id: params.id, viewer: user });
   });
 
-  router.add('GET', '/api/audit/computations/:id/diff', async ({ user, params }) => {
+  // ⚠️ F20（缺陷报告 2026-10-23 §3.5「F20 · Medium · GET .../diff 会写库」）：
+  //    复算**会写库** —— `recomputeAndDiff` 在返回 diff 之外还写一条
+  //    `computation.recompute` 审计日志 ⇒ 它是**有副作用的动作** ⇒ 必须是 **POST**。
+  //    原先注册的是 GET ⇒ `SameSite=Lax` 只挡跨站的 POST/XHR，**顶层 GET 导航照带 Cookie**
+  //    ⇒ 该 GET **跨站可达** ⇒ `<img src=".../diff">` 就能以受害者身份写一条审计记录
+  //    ⇒ 污染审计日志 ⇒ 破坏「审计日志可信」这个前提（缺陷报告原文的实测：
+  //    rows BEFORE 0 → AFTER 1）。
+  //    ⇒ 复算必须要求**显式 POST 意图**（幂等语义下复算本就不该是 GET）。
+  //    ⛔ 不保留 GET 兼容：仓内唯一的调用方是前端「用同一输入复算并比对」按钮，
+  //    已同步改成 POST（web/views/audit.js）；GET 落到 server.js 的
+  //    「无此接口」分支（404），**不得触发复算、不得写库**。
+  router.add('POST', '/api/audit/computations/:id/diff', async ({ user, params }) => {
     requireLogin(user);
     if (!can(user, 'audit:read', null, db)) throw forbidden('无权复算');
     return recomputeAndDiff({ db, id: params.id, actorId: user.id, now: now(), rules });
@@ -7027,6 +7144,11 @@ export function registerAuditRoutes(router, { db, rules }) {
         key: String(body.requestId),
         scope: `appeal:${user.id}`,
         requestId: String(body.requestId),
+        // ⚠️ **F25（2026-10-23 审计）**：幂等键必须**绑定操作内容**，不只绑定调用方。
+        //    原来不传内容 ⇒ 同一个 requestId 换了内容重放 ⇒ 直接返回**首次**的响应
+        //    ⇒ 第二次申诉**从未提交**，而客户端被告知「成功」（静默重放）。
+        //    ⇒ 把请求体交给幂等层算摘要 ⇒ 内容不同 ⇒ 409 REQUEST_ID_REUSED。
+        payload: body,
         now: now(),
       }, submit);
       return out.result;

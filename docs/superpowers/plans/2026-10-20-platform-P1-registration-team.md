@@ -4183,7 +4183,7 @@ export function checkTaskMix(packages, config) {
 // 依据：INTERFACES.md §2「服务层」签名（逐字对齐）+ 顶层文档 §3.1/§3.2
 // 溯源需求：R-ENT-01 / R-ENT-06 / R-ENT-07 / R-ENT-08 / R-ENT-09 / R-ENT-10 / R-ENT-11 / R-ENT-12
 import { AppError } from '../errors.js';
-import { scoreSolvability } from '../domain/solvability.js';
+import { scoreSolvability, buildSolvabilityMeta, buildDiagnosticReport } from '../domain/solvability.js';
 import {
   createTaskPackage, getTaskPackage, listTaskPackagesByEdition, updateTaskPackage,
 } from '../db/repo/taskPackages.js';
@@ -4345,42 +4345,19 @@ export function assessSolvability({ db, taskPackageId, answers, actorId, now = n
 
   const result = scoreSolvability({ answers, config });
   const meta = parseJson(row.meta_json, {}) ?? {};
-  meta.solvability = {
-    // ⚠️ 父代理预审修正（Important）：score / grade 必须一起存。
-    //    原来只存 vetoes/explain/computedGrade → buildDiagnosticReport 里
-    //    `solvability.score ?? null` 恒为 null —— 《问题可解性诊断报告》
-    //    （D 级退回时给企业的唯一凭据）里分数永远是空的。
-    //    父代理预审实跑复现：诊断报告 score = null。
-    score: result.score,
-    grade: result.grade,
-    vetoes: result.vetoes,
-    explain: result.explain,
-    computedGrade: result.computedGrade,
-    // ⚛️ F16（Critical）：**档位定义必须一并投影出来**。
-    //    原来这里只投影维度 explain（不含 minScore/maxScore）⇒ 前端的「服务端投影」
-    //    只能反推出**档位键**、没有分数区间 ⇒ `gradeTiers()` 判「档位未就绪」
-    //    ⇒ **一旦有任意一张卡被评估过，签级控件就整片消失**（自锁：评估更多卡也修不好）。
-    //    为什么必须服务端带：生产部署**不挂** /rules/（只有 DEMO_MODE=1 才挂）
-    //    ⇒ 规则投影那条路在生产是断的 ⇒ 服务端不带完整档位定义，前端就没有可用规格。
-    //    （前端侧还有一道兜底：投影不出完整档位就返回 null，降级到规则投影 —— 见
-    //      web/views/admin-task-packages.js 的 solvabilitySpecFromPackages。）
-    grades: config.grades.map((g) => ({
-      key: g.key,
-      minScore: Number(g.minScore),
-      maxScore: Number(g.maxScore),
-      commitment: String(g.commitment ?? ''),
-      agreement: String(g.agreement ?? ''),
-    })),
-    // 否决项的**完整定义**（key/label/auto）—— 与 `vetoes`（本次命中的那几项）不是一回事：
-    // 前端要靠 `auto` 区分「由维度取值自动命中」与「委员会自报」。
-    vetoesSpec: config.vetoes.map((v) => ({
-      key: v.key,
-      label: String(v.label ?? v.key),
-      auto: Boolean(v.auto),
-    })),
-    assessedBy: actorId,
-    assessedAt: now,
-  };
+  // ⚠️ 父代理预审修正（Important）：score / grade 必须一起存。
+  //    原来只存 vetoes/explain/computedGrade → buildDiagnosticReport 里
+  //    `solvability.score ?? null` 恒为 null —— 《问题可解性诊断报告》
+  //    （D 级退回时给企业的唯一凭据）里分数永远是空的。
+  //    父代理预审实跑复现：诊断报告 score = null。
+  // ⚛️ F16（Critical）：**档位定义必须一并投影出来**（否则一旦有任意一张卡被评估过，
+  //    签级控件就整片消失 —— 自锁）。
+  // ⚠️ F22（2026-10-23 审计）：这份投影**下沉到领域层**（domain/solvability.js 的
+  //    buildSolvabilityMeta）⇒ 演示站（web/api.demo.js）**复用同一份** ⇒
+  //    演示站与真实后端的 meta.solvability 形状**不可能漂**。
+  //    演示站原先**没有 meta** ⇒ 前端在演示站走的是另一条路径（规则投影）
+  //    ⇒ F16 在演示站压根不复现 ⇒ 唯一被公开演示的环境看不见这个 bug。
+  meta.solvability = buildSolvabilityMeta({ result, config, actorId, now });
 
   const updated = updateTaskPackage(db, taskPackageId, {
     solvability_score: result.score,
@@ -4454,7 +4431,7 @@ export function approveTaskPackage({
 
   if (finalGrade === 'D') {
     // R-ENT-08：D 级不是静默丢弃 —— 必须出《问题可解性诊断报告》
-    solvability.diagnosticReport = buildDiagnosticReport({ row, solvability, config, now });
+    solvability.diagnosticReport = buildDiagnosticReport({ packageTitle: row.title, solvability, config, now });
   } else if (solvability.diagnosticReport) {
     // ⚠️ 2026-10-21 独立评审修正（Minor M-6：**旧 D 级报告残留**）：
     //    原来只在 finalGrade === 'D' 时写 meta_json。一张被退回过（D 级、带诊断报告）
@@ -4489,32 +4466,10 @@ export function approveTaskPackage({
   return presentTaskPackage(updated);
 }
 
-// 《问题可解性诊断报告》：D 级任务卡的强制产物
-function buildDiagnosticReport({ row, solvability, config, now }) {
-  const explain = solvability.explain ?? [];
-  const weakest = [...explain].sort((a, b) => a.contribution - b.contribution).slice(0, 2);
-  const suggestions = weakest.map(
-    (d) => `「${d.label}」当前 ${d.value}/${d.max}（折算 ${d.contribution} 分），是拉低可解性的主要短板，建议先补齐这一维。`,
-  );
-  const vetoLabels = (solvability.vetoes ?? []).map(
-    (k) => config.vetoes.find((v) => v.key === k)?.label ?? k,
-  );
-  if (vetoLabels.length) {
-    suggestions.push(`命中一票否决项：${vetoLabels.join('、')}。未解除前不进入任务包池。`);
-  }
-  return {
-    title: '问题可解性诊断报告',
-    generatedAt: now,
-    packageTitle: row.title,
-    score: solvability.score ?? null,
-    grade: 'D',
-    vetoes: solvability.vetoes ?? [],
-    vetoLabels,
-    dimensions: explain,
-    suggestions,
-    disposition: '退回出题方并附本诊断报告；补齐短板后可重新提交六维评估。',
-  };
-}
+// ⚠️ F22（2026-10-23 审计）：《问题可解性诊断报告》的构造已**下沉到领域层**
+//    （src/domain/solvability.js 的 buildDiagnosticReport）——
+//    演示站（web/api.demo.js）也必须给出**逐字同形**的报告（D 级退回时给企业的唯一凭据，
+//    R-ENT-08）；原先只有真实后端有 ⇒ 演示站的 D 级退回**整份缺报告** ⇒ 又是一个被掩盖的行为。
 
 export function listTaskPackages({ db, filter = {}, viewer, rules }) {
   // 列表权限不满足 → 空数组（API 层 200 + 空集）

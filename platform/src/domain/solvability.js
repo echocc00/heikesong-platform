@@ -157,3 +157,90 @@ export function checkTaskMix(packages, config) {
 
   return { ok: errors.length === 0, total, free, enterprise, actualFree, actualEnterprise, byGrade, errors };
 }
+
+/**
+ * 评估结论 ⇒ `meta.solvability` 的**投影**（纯函数）。
+ *
+ * ⚠️ 为什么放在**领域层**（F22，2026-10-23 审计 §3.4）：
+ *    真实后端把它写进 `task_packages.meta_json`（src/services/taskPackage.js 的
+ *    assessSolvability），演示站（web/api.demo.js）也必须给出**逐字同形**的投影 ——
+ *    演示站原先**根本没有 meta** ⇒ 前端拿不到档位定义 ⇒
+ *    F16（Critical：「第一次评估后签级表单永久失效」）在演示站上**压根不复现** ⇒
+ *    唯一被公开演示、被评审反复检验的环境，恰恰看不到这个 bug。
+ *    ⇒ 同一份投影由两边**共用**（形状不可能漂）。
+ *
+ * ⚛️ F16（Critical）：**档位定义必须一并投影出来**。
+ *    少了 minScore/maxScore，前端的「服务端投影」只能反推出**档位键**、没有分数区间
+ *    ⇒ `gradeTiers()` 判「档位未就绪」⇒ **一旦有任意一张卡被评估过，签级控件就整片消失**
+ *    （自锁：评估更多卡也修不好）。
+ *    为什么必须服务端带：生产部署**不挂** /rules/（只有 DEMO_MODE=1 才挂）
+ *    ⇒ 规则投影那条路在生产是断的 ⇒ 服务端不带完整档位定义，前端就没有可用规格。
+ *    （前端侧还有一道兜底：投影不出完整档位就返回 null、降级到规则投影 ——
+ *      见 web/views/admin-task-packages.js 的 solvabilitySpecFromPackages。）
+ *
+ * @param {{ result: object, config: object, actorId?: string|null, now?: string|null }} input
+ * @returns {object} meta.solvability
+ */
+export function buildSolvabilityMeta({ result, config, actorId = null, now = null }) {
+  return {
+    score: result.score,
+    grade: result.grade,
+    vetoes: result.vetoes,
+    explain: result.explain,
+    computedGrade: result.computedGrade,
+    // ⚠️ 档位定义（key / 分数区间 / 承诺 / 协议）—— 前端据此渲染签级下拉框。
+    grades: (config?.grades ?? []).map((g) => ({
+      key: g.key,
+      minScore: Number(g.minScore),
+      maxScore: Number(g.maxScore),
+      commitment: String(g.commitment ?? ''),
+      agreement: String(g.agreement ?? ''),
+    })),
+    // 否决项的**完整定义**（key/label/auto）—— 与 `vetoes`（本次命中的那几项）不是一回事：
+    // 前端要靠 `auto` 区分「由维度取值自动命中」与「委员会自报」。
+    // ⚠️ `auto` 在规则里是**对象**（{dimension, equals}）⇒ Boolean() 后为 true
+    //    （真后端与前端规则投影用的是同一个口径，见 admin-task-packages.js）。
+    vetoesSpec: (config?.vetoes ?? []).map((v) => ({
+      key: v.key,
+      label: String(v.label ?? v.key),
+      auto: Boolean(v.auto),
+    })),
+    assessedBy: actorId,
+    assessedAt: now,
+  };
+}
+
+/**
+ * 《问题可解性诊断报告》：D 级任务卡的强制产物（纯函数）。
+ *
+ * ⚠️ 为什么在**领域层**（F22）：真实后端（服务层）与演示站（web/api.demo.js）
+ *    都必须给出**逐字同形**的报告 —— D 级退回时给企业的**唯一凭据**（R-ENT-08）
+ *    在演示站上原本**整份缺失** ⇒ 演示站又掩盖了一个真实行为。
+ *
+ * @param {{ packageTitle: string, solvability: object, config: object, now: string }} input
+ */
+export function buildDiagnosticReport({ packageTitle, solvability, config, now }) {
+  const explain = solvability.explain ?? [];
+  const weakest = [...explain].sort((a, b) => a.contribution - b.contribution).slice(0, 2);
+  const suggestions = weakest.map(
+    (d) => `「${d.label}」当前 ${d.value}/${d.max}（折算 ${d.contribution} 分），是拉低可解性的主要短板，建议先补齐这一维。`,
+  );
+  const vetoLabels = (solvability.vetoes ?? []).map(
+    (k) => config.vetoes.find((v) => v.key === k)?.label ?? k,
+  );
+  if (vetoLabels.length) {
+    suggestions.push(`命中一票否决项：${vetoLabels.join('、')}。未解除前不进入任务包池。`);
+  }
+  return {
+    title: '问题可解性诊断报告',
+    generatedAt: now,
+    packageTitle,
+    score: solvability.score ?? null,
+    grade: 'D',
+    vetoes: solvability.vetoes ?? [],
+    vetoLabels,
+    dimensions: explain,
+    suggestions,
+    disposition: '退回出题方并附本诊断报告；补齐短板后可重新提交六维评估。',
+  };
+}

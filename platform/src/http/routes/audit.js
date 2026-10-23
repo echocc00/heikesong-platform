@@ -1,7 +1,7 @@
 // src/http/routes/audit.js — P4 的 7 个接口
 // 依据：INTERFACES.md §5「API（P4）」——路径与语义逐字对齐。
 //   GET  /api/audit/computations/:id          计算快照（三件套）
-//   GET  /api/audit/computations/:id/diff     复算 diff
+//   POST /api/audit/computations/:id/diff     复算 diff（**有副作用** ⇒ POST）
 //   GET  /api/audit/log                       审计日志
 //   GET  /api/audit/flags                     复核队列
 //   POST /api/audit/flags/:id/resolve         裁决复核项
@@ -87,7 +87,18 @@ export function registerAuditRoutes(router, { db, rules }) {
     return getComputation({ db, id: params.id, viewer: user });
   });
 
-  router.add('GET', '/api/audit/computations/:id/diff', async ({ user, params }) => {
+  // ⚠️ F20（缺陷报告 2026-10-23 §3.5「F20 · Medium · GET .../diff 会写库」）：
+  //    复算**会写库** —— `recomputeAndDiff` 在返回 diff 之外还写一条
+  //    `computation.recompute` 审计日志 ⇒ 它是**有副作用的动作** ⇒ 必须是 **POST**。
+  //    原先注册的是 GET ⇒ `SameSite=Lax` 只挡跨站的 POST/XHR，**顶层 GET 导航照带 Cookie**
+  //    ⇒ 该 GET **跨站可达** ⇒ `<img src=".../diff">` 就能以受害者身份写一条审计记录
+  //    ⇒ 污染审计日志 ⇒ 破坏「审计日志可信」这个前提（缺陷报告原文的实测：
+  //    rows BEFORE 0 → AFTER 1）。
+  //    ⇒ 复算必须要求**显式 POST 意图**（幂等语义下复算本就不该是 GET）。
+  //    ⛔ 不保留 GET 兼容：仓内唯一的调用方是前端「用同一输入复算并比对」按钮，
+  //    已同步改成 POST（web/views/audit.js）；GET 落到 server.js 的
+  //    「无此接口」分支（404），**不得触发复算、不得写库**。
+  router.add('POST', '/api/audit/computations/:id/diff', async ({ user, params }) => {
     requireLogin(user);
     if (!can(user, 'audit:read', null, db)) throw forbidden('无权复算');
     return recomputeAndDiff({ db, id: params.id, actorId: user.id, now: now(), rules });
@@ -153,6 +164,11 @@ export function registerAuditRoutes(router, { db, rules }) {
         key: String(body.requestId),
         scope: `appeal:${user.id}`,
         requestId: String(body.requestId),
+        // ⚠️ **F25（2026-10-23 审计）**：幂等键必须**绑定操作内容**，不只绑定调用方。
+        //    原来不传内容 ⇒ 同一个 requestId 换了内容重放 ⇒ 直接返回**首次**的响应
+        //    ⇒ 第二次申诉**从未提交**，而客户端被告知「成功」（静默重放）。
+        //    ⇒ 把请求体交给幂等层算摘要 ⇒ 内容不同 ⇒ 409 REQUEST_ID_REUSED。
+        payload: body,
         now: now(),
       }, submit);
       return out.result;

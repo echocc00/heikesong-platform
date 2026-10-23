@@ -1,7 +1,12 @@
 // src/http/static.js — 静态文件服务
 // 依据：设计文档 §14.2。生产环境静态资源由 nginx 直出，这里是内网/本地兜底。
+//
+// ⚠️ F28（缺陷报告 2026-10-23 §3.5，:1676-1704）：静态响应原来也**一个安全头都没有**
+//    （只有 Content-Type / Content-Length / ETag / Cache-Control）。
+//    管理后台 SPA 是点击劫持的主要目标 ⇒ 静态响应同样要带安全头（口径见 security-headers.js）。
 import { createReadStream, openSync, fstatSync, closeSync, realpathSync, statSync } from 'node:fs';
 import { resolve, sep, extname } from 'node:path';
+import { responseHeaders } from './security-headers.js';
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -95,12 +100,13 @@ export function serveStatic(webDir, req, res) {
   if (req.headers && req.headers['if-none-match'] === etag) {
     // ⚠️ fd 已经在上面打开了 → 这里必须关掉，否则每次 304 都漏一个 fd
     closeSync(fd);
-    res.writeHead(304, { ETag: etag });
+    res.writeHead(304, { ETag: etag, ...responseHeaders(req) });
     res.end();
     return true;
   }
 
   res.writeHead(200, {
+    ...responseHeaders(req),
     'Content-Type': MIME[ext] || 'application/octet-stream',
     'Content-Length': stat.size,
     ETag: etag,

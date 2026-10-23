@@ -30,6 +30,7 @@ import { getUserById } from '../db/repo/users.js';
 import { hasActiveMembership } from '../db/repo/teamMembers.js';
 import { getTeam } from '../db/repo/teams.js';
 import { writeAuditLog } from '../audit/log.js';
+import { withTransaction } from '../db/tx.js';
 import { can, isCommitteeActor } from '../auth/permissions.js';
 import { badRequest, conflict, forbidden, notFound } from '../errors.js';
 
@@ -95,59 +96,68 @@ export function filterVisibleScores({ db, stageId, viewer = null, scores = [] })
 export function fileAppeal({
   db, subjectType = 'team_result', subjectId, filedBy = null, reason, now = new Date().toISOString(), rules,
 }) {
-  if (!subjectId) throw badRequest('申诉必须给 subjectId');
-  if (!reason || !String(reason).trim()) throw badRequest('申诉必须写理由（空理由 = 无法复核）');
+  // ⚠️ **F26（Medium，2026-10-23 审计）：本函数的写路径原先**全程无事务**** ——
+  //   `withTransaction` / `SAVEPOINT` / `BEGIN` 一个都没有，却有十几处写调用 ⇒
+  //   `UPDATE appeals` 抛错时，**状态迁移已经提交**、而申诉行还写着旧状态
+  //   ⇒ 主体实际已是「已复核」（分数被隐藏）却**没有任何裁决记录**。
+  //   ⚠️ 关键：**审计日志就是状态源**（`findLatestTransition` 从 audit_log 读当前状态） ⇒
+  //   状态迁移与申诉行更新**必须同生共死**。
+  //   （配合 F8：外层无事务时 `withTransaction` 走 `BEGIN IMMEDIATE`，嵌套时走 SAVEPOINT ⇒ 可安全嵌套。）
+  return withTransaction(db, () => {
+    if (!subjectId) throw badRequest('申诉必须给 subjectId');
+    if (!reason || !String(reason).trim()) throw badRequest('申诉必须写理由（空理由 = 无法复核）');
 
-  // ── 报名类申诉（DP-106）：独立的校验口径，见 fileRegistrationAppeal ──────
-  if (subjectType === 'registration') {
-    return fileRegistrationAppeal({ db, subjectId, filedBy, reason, now, rules });
-  }
-
-  const { stageId, teamId } = parseAppealSubject(subjectId);
-  // ⚛️ F34（Medium，2026-10-23 审计）：原来**没有归属校验** ——
-  //   ⇒ 任何持有 appeal:write 的人都能对**别人队伍**的赛段结果提申诉。
-  //   ⇒ 申诉人必须是该队成员（或组委会 / 超管）。
-  //   ⛔ **归属校验必须排在状态校验之前**：否则对一条「不存在的条目」提申诉会先撞上
-  //      409（状态不对），把「越权」掩盖成「状态错误」⇒ 排障时看错方向。
-  if (teamId) {
-    const actor = getUserById(db, filedBy);
-    const team = getTeam(db, teamId);
-    // 归属 = 该队**队长**或**在册成员**（队长身份来自 teams.captain_id，
-    // 与 team_members 是否有行无关 —— 报名刚通过、还没落成员行时队长就该能申诉）
-    const isCaptain = Boolean(team) && team.captain_id === filedBy;
-    const isMember = Boolean(filedBy) && hasActiveMembership(db, teamId, filedBy);
-    const isCommittee = actor && isCommitteeActor(db, actor);
-    if (!isCaptain && !isMember && !isCommittee) {
-      throw forbidden('只能对自己队伍的赛段结果提申诉');
+    // ── 报名类申诉（DP-106）：独立的校验口径，见 fileRegistrationAppeal ──────
+    if (subjectType === 'registration') {
+      return fileRegistrationAppeal({ db, subjectId, filedBy, reason, now, rules });
     }
-  }
-  const state = stageId ? getSubjectState({ db, subjectType: 'stage_result', subjectId: stageId }) : null;
-  if (state !== 'FINALIZED') {
-    throw conflict(`只有已 FINALIZED 的条目可以申诉（当前状态：${state ?? '未进入复核'}）`);
-  }
 
-  const allowedTiers = rules?.audit?.reviewState?.appealAllowedTiers ?? [];
-  const tier = teamId ? getTeamTierRow(db, teamId) : null;
-  if (!tier) {
-    throw conflict(`无法判定档位（队伍 ${teamId}）——档位未知时不得受理申诉`);
-  }
-  if (!allowedTiers.includes(tier)) {
-    throw forbidden(`档位 ${tier} 不在可申诉的低可见档（${allowedTiers.join(' / ')}）范围内`);
-  }
+    const { stageId, teamId } = parseAppealSubject(subjectId);
+    // ⚛️ F34（Medium，2026-10-23 审计）：原来**没有归属校验** ——
+    //   ⇒ 任何持有 appeal:write 的人都能对**别人队伍**的赛段结果提申诉。
+    //   ⇒ 申诉人必须是该队成员（或组委会 / 超管）。
+    //   ⛔ **归属校验必须排在状态校验之前**：否则对一条「不存在的条目」提申诉会先撞上
+    //      409（状态不对），把「越权」掩盖成「状态错误」⇒ 排障时看错方向。
+    if (teamId) {
+      const actor = getUserById(db, filedBy);
+      const team = getTeam(db, teamId);
+      // 归属 = 该队**队长**或**在册成员**（队长身份来自 teams.captain_id，
+      // 与 team_members 是否有行无关 —— 报名刚通过、还没落成员行时队长就该能申诉）
+      const isCaptain = Boolean(team) && team.captain_id === filedBy;
+      const isMember = Boolean(filedBy) && hasActiveMembership(db, teamId, filedBy);
+      const isCommittee = actor && isCommitteeActor(db, actor);
+      if (!isCaptain && !isMember && !isCommittee) {
+        throw forbidden('只能对自己队伍的赛段结果提申诉');
+      }
+    }
+    const state = stageId ? getSubjectState({ db, subjectType: 'stage_result', subjectId: stageId }) : null;
+    if (state !== 'FINALIZED') {
+      throw conflict(`只有已 FINALIZED 的条目可以申诉（当前状态：${state ?? '未进入复核'}）`);
+    }
 
-  const id = insertAppeal(db, {
-    subjectType, subjectId, filedBy, reason, status: 'submitted', now,
-  });
-  writeAuditLog(db, {
-    actorId: filedBy,
-    action: 'appeal.filed',
-    entity: 'appeal',
-    entityId: id,
-    detail: { subjectType, subjectId, reason, stageId, teamId, tier },
-    now,
-  });
-  return getAppeal(db, id);
-}
+    const allowedTiers = rules?.audit?.reviewState?.appealAllowedTiers ?? [];
+    const tier = teamId ? getTeamTierRow(db, teamId) : null;
+    if (!tier) {
+      throw conflict(`无法判定档位（队伍 ${teamId}）——档位未知时不得受理申诉`);
+    }
+    if (!allowedTiers.includes(tier)) {
+      throw forbidden(`档位 ${tier} 不在可申诉的低可见档（${allowedTiers.join(' / ')}）范围内`);
+    }
+
+    const id = insertAppeal(db, {
+      subjectType, subjectId, filedBy, reason, status: 'submitted', now,
+    });
+    writeAuditLog(db, {
+      actorId: filedBy,
+      action: 'appeal.filed',
+      entity: 'appeal',
+      entityId: id,
+      detail: { subjectType, subjectId, reason, stageId, teamId, tier },
+      now,
+    });
+    return getAppeal(db, id);
+
+  });}
 
 /**
  * 报名类申诉（DP-106）：选手对**自己的报名分级结果**不服，交给组委会复核。
@@ -234,85 +244,94 @@ function fileRegistrationAppeal({ db, subjectId, filedBy, reason, now, rules }) 
 export function decideAppeal({
   db, appealId, decision, decidedBy = null, note, now = new Date().toISOString(), rules,
 }) {
-  if (!['accepted', 'rejected'].includes(decision)) {
-    throw badRequest(`裁决只能是 accepted 或 rejected，收到：${decision}`);
-  }
-  if (!note || !String(note).trim()) throw badRequest('裁决必须写说明（无说明的裁决无法复盘）');
+  // ⚠️ **F26（Medium，2026-10-23 审计）：本函数的写路径原先**全程无事务**** ——
+  //   `withTransaction` / `SAVEPOINT` / `BEGIN` 一个都没有，却有十几处写调用 ⇒
+  //   `UPDATE appeals` 抛错时，**状态迁移已经提交**、而申诉行还写着旧状态
+  //   ⇒ 主体实际已是「已复核」（分数被隐藏）却**没有任何裁决记录**。
+  //   ⚠️ 关键：**审计日志就是状态源**（`findLatestTransition` 从 audit_log 读当前状态） ⇒
+  //   状态迁移与申诉行更新**必须同生共死**。
+  //   （配合 F8：外层无事务时 `withTransaction` 走 `BEGIN IMMEDIATE`，嵌套时走 SAVEPOINT ⇒ 可安全嵌套。）
+  return withTransaction(db, () => {
+    if (!['accepted', 'rejected'].includes(decision)) {
+      throw badRequest(`裁决只能是 accepted 或 rejected，收到：${decision}`);
+    }
+    if (!note || !String(note).trim()) throw badRequest('裁决必须写说明（无说明的裁决无法复盘）');
 
-  const appeal = getAppeal(db, appealId);
-  if (!appeal) throw notFound(`申诉不存在: ${appealId}`);
-  if (appeal.status !== 'submitted' && appeal.status !== 'reviewing') {
-    throw conflict(`申诉 ${appealId} 已裁决（当前状态 ${appeal.status}）`);
-  }
+    const appeal = getAppeal(db, appealId);
+    if (!appeal) throw notFound(`申诉不存在: ${appealId}`);
+    if (appeal.status !== 'submitted' && appeal.status !== 'reviewing') {
+      throw conflict(`申诉 ${appealId} 已裁决（当前状态 ${appeal.status}）`);
+    }
 
-  const transitions = [];
-  // ⚠️ DP-106：**先看 subject_type** —— 报名类与赛段结果类的裁决口径完全不同。
-  //   'registration'（报名类）：成立 ⇒ 撤销**分级裁定**，让它回到待复核（不重算赛段）。
-  //   其它（赛段结果类）：成立 ⇒ 撤销终稿（FINALIZED → REJECTED → PENDING_REVIEW）+ 重算。**原逻辑一字未改**。
-  const isRegistrationAppeal = appeal.subject_type === 'registration';
-  // 只有赛段结果类成立才要求重算（重算走 revision + 1，旧 revision 保留）。
-  const recomputeRequired = decision === 'accepted' && !isRegistrationAppeal;
-  if (decision === 'accepted') {
-    if (isRegistrationAppeal) {
-      // ── 报名类：撤销分级裁定 → 回到待复核 ──────────────────────────────
-      // ⚠️ 为什么**不**触发赛段重算：报名分级与赛段分数是两套独立的量
-      //    （设计文档 §9「报名分级」 vs §11.2「赛段复核」）。
-      //    撤销一条分级裁定要重算的是**这条报名的分级**，由委员会重新复核落 level_final；
-      //    赛段分数一个字都不受影响 ⇒ recomputeRequired 必须为 false、transitions 为空。
-      const reg = findRegistrationRow(db, appeal.subject_id);
-      if (!reg) throw notFound(`报名记录不存在: ${appeal.subject_id}`);
-      const fromStatus = reg.status;
-      // ⚠️ 改报名行**必须走仓储层**（全局约束：SQL 只在 src/db/repo/）。
-      //    updateRegistrationRow 的可更新列白名单里含 level_final ⇒ 传 null 即清空裁定等级。
-      //    （decided_by / decided_at / decision_note **保留**：那是上一次裁定的来源，
-      //      撤销与否决都留在 registration_events 与审计日志里，不靠覆盖字段抹历史。）
-      updateRegistrationRow(db, appeal.subject_id, {
-        level_final: null,
-        status: 'submitted',
-      });
-      // 事件轨迹（追加式，历史不覆盖）：from_status = 申诉前的状态，to_status = 回到待复核。
-      insertRegistrationEvent(db, {
-        registrationId: appeal.subject_id,
-        fromStatus,
-        toStatus: 'submitted',
-        actorId: decidedBy,
-        reason: note,
-        now,
-      });
-    } else {
-      const { stageId } = parseAppealSubject(appeal.subject_id);
-      if (stageId) {
-        transitions.push(transition({
-          db, subjectType: 'stage_result', subjectId: stageId,
-          from: 'FINALIZED', to: 'REJECTED', actorId: decidedBy,
-          reason: `申诉成立：${note}`, idempotencyKey: `appeal:${appealId}:revoke`, now,
-        }));
-        transitions.push(transition({
-          db, subjectType: 'stage_result', subjectId: stageId,
-          from: 'REJECTED', to: 'PENDING_REVIEW', actorId: decidedBy,
-          reason: `申诉重新复核：${note}`, idempotencyKey: `appeal:${appealId}:reopen`, now,
-        }));
+    const transitions = [];
+    // ⚠️ DP-106：**先看 subject_type** —— 报名类与赛段结果类的裁决口径完全不同。
+    //   'registration'（报名类）：成立 ⇒ 撤销**分级裁定**，让它回到待复核（不重算赛段）。
+    //   其它（赛段结果类）：成立 ⇒ 撤销终稿（FINALIZED → REJECTED → PENDING_REVIEW）+ 重算。**原逻辑一字未改**。
+    const isRegistrationAppeal = appeal.subject_type === 'registration';
+    // 只有赛段结果类成立才要求重算（重算走 revision + 1，旧 revision 保留）。
+    const recomputeRequired = decision === 'accepted' && !isRegistrationAppeal;
+    if (decision === 'accepted') {
+      if (isRegistrationAppeal) {
+        // ── 报名类：撤销分级裁定 → 回到待复核 ──────────────────────────────
+        // ⚠️ 为什么**不**触发赛段重算：报名分级与赛段分数是两套独立的量
+        //    （设计文档 §9「报名分级」 vs §11.2「赛段复核」）。
+        //    撤销一条分级裁定要重算的是**这条报名的分级**，由委员会重新复核落 level_final；
+        //    赛段分数一个字都不受影响 ⇒ recomputeRequired 必须为 false、transitions 为空。
+        const reg = findRegistrationRow(db, appeal.subject_id);
+        if (!reg) throw notFound(`报名记录不存在: ${appeal.subject_id}`);
+        const fromStatus = reg.status;
+        // ⚠️ 改报名行**必须走仓储层**（全局约束：SQL 只在 src/db/repo/）。
+        //    updateRegistrationRow 的可更新列白名单里含 level_final ⇒ 传 null 即清空裁定等级。
+        //    （decided_by / decided_at / decision_note **保留**：那是上一次裁定的来源，
+        //      撤销与否决都留在 registration_events 与审计日志里，不靠覆盖字段抹历史。）
+        updateRegistrationRow(db, appeal.subject_id, {
+          level_final: null,
+          status: 'submitted',
+        });
+        // 事件轨迹（追加式，历史不覆盖）：from_status = 申诉前的状态，to_status = 回到待复核。
+        insertRegistrationEvent(db, {
+          registrationId: appeal.subject_id,
+          fromStatus,
+          toStatus: 'submitted',
+          actorId: decidedBy,
+          reason: note,
+          now,
+        });
+      } else {
+        const { stageId } = parseAppealSubject(appeal.subject_id);
+        if (stageId) {
+          transitions.push(transition({
+            db, subjectType: 'stage_result', subjectId: stageId,
+            from: 'FINALIZED', to: 'REJECTED', actorId: decidedBy,
+            reason: `申诉成立：${note}`, idempotencyKey: `appeal:${appealId}:revoke`, now,
+          }));
+          transitions.push(transition({
+            db, subjectType: 'stage_result', subjectId: stageId,
+            from: 'REJECTED', to: 'PENDING_REVIEW', actorId: decidedBy,
+            reason: `申诉重新复核：${note}`, idempotencyKey: `appeal:${appealId}:reopen`, now,
+          }));
+        }
       }
     }
-  }
 
-  updateAppeal(db, { id: appealId, status: decision, decidedBy, decidedAt: now, decisionNote: note });
-  writeAuditLog(db, {
-    actorId: decidedBy,
-    action: 'appeal.decided',
-    entity: 'appeal',
-    entityId: appealId,
-    detail: { decision, note, subjectType: appeal.subject_type, subjectId: appeal.subject_id, recomputeRequired },
-    now,
-  });
+    updateAppeal(db, { id: appealId, status: decision, decidedBy, decidedAt: now, decisionNote: note });
+    writeAuditLog(db, {
+      actorId: decidedBy,
+      action: 'appeal.decided',
+      entity: 'appeal',
+      entityId: appealId,
+      detail: { decision, note, subjectType: appeal.subject_type, subjectId: appeal.subject_id, recomputeRequired },
+      now,
+    });
 
-  return {
-    appeal: getAppeal(db, appealId),
-    transitions,
-    // 申诉成立必须重算；重算走 revision + 1，旧 revision 保留（不覆盖历史）
-    recomputeRequired,
-  };
-}
+    return {
+      appeal: getAppeal(db, appealId),
+      transitions,
+      // 申诉成立必须重算；重算走 revision + 1，旧 revision 保留（不覆盖历史）
+      recomputeRequired,
+    };
+
+  });}
 
 /**
  * 申诉列表。列表不满足 → 200 + 空集。

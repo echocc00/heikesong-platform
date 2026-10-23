@@ -168,7 +168,12 @@ test('GET /api/audit/computations/:id 未登录返回 401，单条不存在返�
   rmSync(dataDir, { recursive: true, force: true });
 });
 
-test('GET /api/audit/computations/:id/diff 返回 diff 与 warnings（能被看见）', async () => {
+// ⚠️ F20（缺陷报告 2026-10-23 §3.5）：复算**会写库**（写一条 `computation.recompute`
+//    审计日志）⇒ 它是**有副作用的动作** ⇒ 端点从 GET 改成 **POST**
+//    （GET 跨站可达 ⇒ `<img src>` 就能以受害者身份污染审计日志）。
+//    ⇒ 下面三条用例的调用方**按契约变更**同步改成 POST（不是「改测试迁就实现」：
+//    契约本身就变了，F20 的验收口径就是「复算只能由 POST 触发」）。
+test('POST /api/audit/computations/:id/diff 返回 diff 与 warnings（能被看见）', async () => {
   const { db, close, dataDir, app, rules } = setup();
   const refs = seedRefs(db);
   const token = createSession(db, refs.admin.id).token;
@@ -182,7 +187,7 @@ test('GET /api/audit/computations/:id/diff 返回 diff 与 warnings（能被看�
     db, kind: 'stage_score', stageId: refs.stage.id, ruleVersion: input.ruleVersion,
     input, output, trace: {},
   });
-  const res = await callJson(app, 'GET', `/api/audit/computations/${id}/diff`, { token });
+  const res = await callJson(app, 'POST', `/api/audit/computations/${id}/diff`, { token });
   assert.equal(res.status, 200);
   assert.ok(Array.isArray(res.json.diff));
   assert.ok(Array.isArray(res.json.warnings));
@@ -193,7 +198,7 @@ test('GET /api/audit/computations/:id/diff 返回 diff 与 warnings（能被看�
   rmSync(dataDir, { recursive: true, force: true });
 });
 
-test('GET /api/audit/computations/:id/diff 精确定位到被改的那一处（path 可定位）', async () => {
+test('POST /api/audit/computations/:id/diff 精确定位到被改的那一处（path 可定位）', async () => {
   const { db, close, dataDir, app, rules } = setup();
   const refs = seedRefs(db);
   const token = createSession(db, refs.admin.id).token;
@@ -204,7 +209,7 @@ test('GET /api/audit/computations/:id/diff 精确定位到被改的那一处（p
     db, kind: 'stage_score', stageId: refs.stage.id, ruleVersion: input.ruleVersion,
     input, output, trace: {},
   });
-  const res = await callJson(app, 'GET', `/api/audit/computations/${id}/diff`, { token });
+  const res = await callJson(app, 'POST', `/api/audit/computations/${id}/diff`, { token });
   assert.equal(res.status, 200);
   assert.equal(res.json.diff.length, 1, `只改一个数就只该有一条差异（实际 ${JSON.stringify(res.json.diff)}）`);
   assert.equal(res.json.diff[0].path, 'teams[t1].total');
@@ -569,7 +574,7 @@ test('单条无权访问返回 404（不泄露记录是否存在）：无 audit:
   rmSync(dataDir, { recursive: true, force: true });
 });
 
-test('GET /api/audit/computations/:id/diff 无权复算返回 403', async () => {
+test('POST /api/audit/computations/:id/diff 无权复算返回 403', async () => {
   const { db, close, dataDir, app, rules } = setup();
   const refs = seedRefs(db);
   const judgeToken = createSession(db, refs.judge.id).token;
@@ -578,7 +583,7 @@ test('GET /api/audit/computations/:id/diff 无权复算返回 403', async () => 
     db, kind: 'stage_score', stageId: refs.stage.id, ruleVersion: input.ruleVersion,
     input, output: engineOutput(input), trace: {},
   });
-  const res = await callJson(app, 'GET', `/api/audit/computations/${id}/diff`, { token: judgeToken });
+  const res = await callJson(app, 'POST', `/api/audit/computations/${id}/diff`, { token: judgeToken });
   assert.equal(res.status, 403);
   assert.equal(res.json.error.code, 'FORBIDDEN');
   close();
@@ -833,7 +838,7 @@ function installDom() {
 
 const tick = () => new Promise((r) => setTimeout(r, 5));
 
-test('前端 trace 抽屉：三件套 + 降级告警置顶 + 复算 diff 必须被看见', async () => {
+test('前端 trace 抽屉：三件套 + 降级告警置顶 + 复算 diff 必须被看见（且复算走 POST）', async () => {
   installDom();
   const { renderAudit } = await import('../web/views/audit.js');
   const calls = [];
@@ -841,14 +846,7 @@ test('前端 trace 抽屉：三件套 + 降级告警置顶 + 复算 diff 必须�
     params: { computationId: 'cmp-1' },
     api: {
       get: async (p) => {
-        calls.push(p);
-        if (p.endsWith('/diff')) {
-          return {
-            identical: false,
-            diff: [{ path: 'teams[t1].total', before: 61, after: 60 }],
-            warnings: [{ code: 'strict_replay_failed', message: '快照被改过' }],
-          };
-        }
+        calls.push(['GET', p]);
         return {
           ruleVersion: 'scoring.final@2026-10-20', revision: 2, createdAt: '2026-10-20T00:00:00.000Z',
           input: { submissions: [{ judgeId: 'j1' }] },
@@ -856,11 +854,24 @@ test('前端 trace 抽屉：三件套 + 降级告警置顶 + 复算 diff 必须�
           trace: { normalization: { innovation: { normalized: false, fallbackReason: 'judge_sample_too_small' } } },
         };
       },
+      // ⚠️ 复算必须走 **POST**（F20：复算会写审计日志 ⇒ 有副作用 ⇒ 不是 GET；
+      //    GET 跨站可达 ⇒ 会被 `<img src>` 触发写库）。
+      post: async (p) => {
+        calls.push(['POST', p]);
+        return {
+          identical: false,
+          diff: [{ path: 'teams[t1].total', before: 61, after: 60 }],
+          warnings: [{ code: 'strict_replay_failed', message: '快照被改过' }],
+        };
+      },
     },
   };
   const wrap = renderAudit(ctx);
   await tick();
-  assert.ok(calls.includes('/api/audit/computations/cmp-1'), '必须按路由参数拉快照');
+  assert.ok(
+    calls.some(([m, p]) => m === 'GET' && p === '/api/audit/computations/cmp-1'),
+    '必须按路由参数拉快照',
+  );
   const body = wrap.children[1];
   const warnBox = body.children[0];
   assert.ok(warnBox.innerHTML.includes('降级告警'), '降级告警必须置顶');
@@ -873,7 +884,14 @@ test('前端 trace 抽屉：三件套 + 降级告警置顶 + 复算 diff 必须�
   const btn = actions.children[0];
   assert.equal(btn.textContent, '用同一输入复算并比对');
   await btn.handlers.click[0]();
-  assert.ok(calls.includes('/api/audit/computations/cmp-1/diff'), '复算 diff 必须真的去拉');
+  assert.ok(
+    calls.some(([m, p]) => m === 'POST' && p === '/api/audit/computations/cmp-1/diff'),
+    '复算 diff 必须真的去拉，且**必须用 POST**（复算有副作用 ⇒ 不是 GET）',
+  );
+  assert.ok(
+    !calls.some(([m, p]) => m === 'GET' && p.endsWith('/diff')),
+    '复算**不得**再走 GET（GET 跨站可达 ⇒ 可被 <img> 触发写库）',
+  );
   const diffBox = actions.children[1];
   assert.ok(diffBox.innerHTML.includes('identical = false'), 'diff 必须被看见（不能只写一条日志）');
   assert.ok(diffBox.innerHTML.includes('teams[t1].total'), 'diff 必须给出可定位的 path');

@@ -1543,7 +1543,9 @@ const VIEW_ENDPOINTS = [
   { method: 'GET', path: '/api/teams/t_alpha/performance-card' },
   { method: 'GET', path: '/api/audit/flags' },
   { method: 'GET', path: '/api/audit/computations/cmp_demo_1' },
-  { method: 'GET', path: '/api/audit/computations/cmp_demo_1/diff' },
+  // ⚠️ 复算 diff 是 **POST**（F20：复算有副作用 ⇒ 写审计日志 ⇒ 不能是 GET；
+  //    GET 跨站可达 ⇒ `<img src>` 就能以受害者身份污染审计日志）。
+  { method: 'POST', path: '/api/audit/computations/cmp_demo_1/diff', body: {} },
   // P8：评审打分页与赛段发榜页用到的三个端点
   { method: 'GET', path: '/api/stages/stage_final/review-board' },
   { method: 'GET', path: '/api/stages/stage_final/review-state' },
@@ -1766,9 +1768,19 @@ test('演示适配器的审计三端点：留痕含降级告警与每队 trace�
   assert.ok(trace.trace?.perTeam, '要有每队 trace（原始分 / z 分 / 去极值 / 加权）');
   assert.ok(Array.isArray(trace.trace?.warnings), '要有告警数组（降级状态必须显式展示）');
 
-  const diff = await api.get('/api/audit/computations/cmp_demo_1/diff');
+  const diff = await api.post('/api/audit/computations/cmp_demo_1/diff', {});
   assert.equal(diff.identical, true, '同一输入复算必然一致（演示站跑的是同一套引擎）');
   assert.deepEqual(diff.diff, [], '无差异时 diff 必须是空数组');
+
+  // ⚠️ 对照组：GET 不再是复算入口（演示站必须与正式后端**同口径**：
+  //    复算是 POST，GET 落「端点未实现」分支 ⇒ 404，**不得**返回复算结果）。
+  await assert.rejects(
+    () => api.get('/api/audit/computations/cmp_demo_1/diff'),
+    (e) => {
+      assert.equal(e.code, 'DEMO_ENDPOINT_MISSING', `GET 复算端点必须未实现，实际：${e.code}`);
+      return true;
+    },
+  );
 
   const flags = await api.get('/api/audit/flags');
   assert.ok(Array.isArray(flags.rows), '复核队列必须返回数组');

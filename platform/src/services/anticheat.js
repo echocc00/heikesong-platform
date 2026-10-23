@@ -13,20 +13,11 @@ import { createFlag, listFlagRows, resolveFlagRow } from '../db/repo/flags.js';
 import { writeAuditLog } from '../audit/log.js';
 import { can } from '../auth/permissions.js';
 import { badRequest, notFound } from '../errors.js';
+import { canonicalJson } from '../domain/canonical-json.js';
 
-/**
- * 稳定序列化（键名排序）——用来比较两份 flag 明细是不是「同一个问题」。
- * 不排序的话，键顺序不同但内容相同的明细会被判成两个问题。
- */
-function canonicalJson(value) {
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
-  if (value && typeof value === 'object') {
-    const parts = Object.keys(value).sort()
-      .map((k) => `${JSON.stringify(k)}:${canonicalJson(value[k])}`);
-    return `{${parts.join(',')}}`;
-  }
-  return JSON.stringify(value) ?? 'null';
-}
+// ⚠️ 稳定序列化（键名排序）已抽到 `src/domain/canonical-json.js`
+//    （2026-10-23 审计 F25：幂等摘要要用**同一口径** ⇒ 复制一份就是「同一口径写两份 ⇒ 必然漂移」）。
+//    语义与原实现**逐字一致**，行为未变。
 
 /**
  * 「同一个问题」的判定：同 kind + 同赛段 + **同明细内容**。
@@ -98,6 +89,32 @@ function scanFlags(db, filter, match) {
  */
 export function assertFlagDetail(flag) {
   return [...assertKnownFields(flag.kind, flag), ...assertMutuallyExclusive(flag)];
+}
+
+/**
+ * `peer_reviews` 的仓储行（snake_case）→ 检测器的入参形状（**队 → 队**）。
+ *
+ * ⚠️ **互评数据在本仓的真实存储位置**（2026-10-23 审计 F47 的取证结论，不要凭印象）：
+ *   · 互评**只**存在 `peer_reviews` 表（db/migrations/003_review.sql:132）：
+ *     stage_id / from_team_id / to_team_id / score / request_id / created_at；
+ *   · `stage_reviews`（评委打分表）**没有 seat 列** ⇒「stage_reviews 里 seat='peer' 那一路」
+ *     在本仓**不存在**；本仓的「互评」是**队 → 队**的行为（from_team_id → to_team_id）。
+ *   ⇒ 检测器的「谁投了谁」只能来自 `peer_reviews`。
+ *
+ * ⚠️ **为什么放在服务层而不是仓储层**：仓储层统一返回**原始行**（snake_case），
+ *   而检测器的入参是领域形状 ⇒ 这一层翻译**只在这里发生一次**
+ *   （计算期与发榜期两条链路共用同一份）⇒ 不可能漂移
+ *   （同一口径写两份 ⇒ 必然漂移 —— 本仓的老教训）。
+ *
+ * ⚠️ 字段名用 fromId / toId（**队**），不是 judgeId：`pickVoter` / `pickTarget`
+ *   在 src/domain/anticheat.js 里读的是 `judgeId ?? fromId` 与 `teamId ?? toId`
+ *   ⇒ 两种写法都能命中，这里取语义正确的那个。
+ *
+ * @param {object[]} rows `peer_reviews` 的仓储行
+ * @returns {{fromId: string, toId: string, score: number}[]}
+ */
+export function toDetectionPeerReviews(rows = []) {
+  return rows.map((r) => ({ fromId: r.from_team_id, toId: r.to_team_id, score: r.score }));
 }
 
 /**

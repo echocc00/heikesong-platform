@@ -58,6 +58,37 @@ export function createRouter() {
     return as.length - bs.length; // ④ 前缀 → 短的在前
   }
 
+  /**
+   * 按**方法精确匹配**找一条路由。
+   * 抽成独立函数是为了让「HEAD 回退到 GET」（见 match）能复用同一套匹配逻辑。
+   */
+  function findRoute(method, clean) {
+    // 静态优先于参数：逐段比较（见 compareRoutes）
+    const ordered = [...routes].sort(compareRoutes);
+    for (const route of ordered) {
+      if (route.method !== method) continue;
+      const hit = route.regex.exec(clean);
+      if (!hit) continue;
+      const params = {};
+      let malformed = false;
+      route.names.forEach((name, i) => {
+        if (malformed) return;
+        try {
+          params[name] = decodeURIComponent(hit[i + 1]);
+        } catch {
+          // ⛔ 畸形百分号编码（如 '%E0%A4%A'）会让 decodeURIComponent 抛 URIError。
+          //    绝不能让它抛出到路由匹配之外：server.js 里 router.match 一旦在 try 块外，
+          //    一个畸形 URL 就能让 Node 以未捕获异常退出（退出码 1）→ 整个服务器进程死亡。
+          //    视为非法 URL → 该路由不匹配（match 返回 null），由上层回 400。
+          malformed = true;
+        }
+      });
+      if (malformed) return null;
+      return { handler: route.handler, params, pattern: route.pattern };
+    }
+    return null;
+  }
+
   return {
     add(method, pattern, handler) {
       const { regex, names } = compile(pattern);
@@ -71,33 +102,41 @@ export function createRouter() {
       });
       return this;
     },
+    /**
+     * 匹配一条路由。
+     *
+     * ⚠️ F27（缺陷报告 2026-10-23 §3.5，:1637-1671）：**HEAD 语义等价 GET**
+     *    （RFC 9110 §9.3.2：HEAD 与 GET 共享同一套响应头，只是不带响应体）。
+     *    修复前是**方法精确匹配** ⇒ `HEAD /api/health` → 404，
+     *    朴素存活探针（curl -I / healthcheck）会**误判服务已死**。
+     *    做法：先按原方法精确匹配（显式注册过 HEAD 时以它为准），
+     *    落空且原方法是 HEAD 时才**回退到同名 GET 路由**。
+     *    ⚠️ 只回退到 GET —— 不回退到 POST/PUT/DELETE（否则一个只该写的端点会被探针摸到）。
+     *    响应体的丢弃由 Node 自己完成（HEAD 请求的 ServerResponse._hasBody = false），
+     *    而 Content-Length 仍然照发（探针要靠它判断体量）。
+     */
     match(method, path) {
       const clean = path.split('?')[0];
       const m = method.toUpperCase();
-      // 静态优先于参数：逐段比较（见 compareRoutes）
-      const ordered = [...routes].sort(compareRoutes);
-      for (const route of ordered) {
-        if (route.method !== m) continue;
-        const hit = route.regex.exec(clean);
-        if (!hit) continue;
-        const params = {};
-        let malformed = false;
-        route.names.forEach((name, i) => {
-          if (malformed) return;
-          try {
-            params[name] = decodeURIComponent(hit[i + 1]);
-          } catch {
-            // ⛔ 畸形百分号编码（如 '%E0%A4%A'）会让 decodeURIComponent 抛 URIError。
-            //    绝不能让它抛出到路由匹配之外：server.js 里 router.match 一旦在 try 块外，
-            //    一个畸形 URL 就能让 Node 以未捕获异常退出（退出码 1）→ 整个服务器进程死亡。
-            //    视为非法 URL → 该路由不匹配（match 返回 null），由上层回 400。
-            malformed = true;
-          }
-        });
-        if (malformed) return null;
-        return { handler: route.handler, params, pattern: route.pattern };
-      }
+      const direct = findRoute(m, clean);
+      if (direct) return direct;
+      if (m === 'HEAD') return findRoute('GET', clean);
       return null;
+    },
+    /**
+     * 某个路径上注册了哪些方法（给 OPTIONS 的 Allow 头用）。
+     *
+     * ⚠️ F27 修法 ②：「OPTIONS 至少要回一个明确的 204 + Allow，而不是 404」。
+     *    Allow 必须**如实**反映该路径支持的方法（RFC 9110 §9.3.2）——
+     *    写成「一律 GET, POST」会让客户端以为能读一个只写端点。
+     */
+    allowedMethods(path) {
+      const clean = String(path || '').split('?')[0];
+      const methods = new Set();
+      for (const route of routes) {
+        if (route.regex.test(clean)) methods.add(route.method);
+      }
+      return [...methods].sort();
     },
     list() {
       return routes.map((r) => ({ method: r.method, pattern: r.pattern }));

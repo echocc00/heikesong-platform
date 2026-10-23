@@ -19,6 +19,11 @@
 //   ② **没有心跳帧**：SSE 连接长时间空闲时，中间的 nginx（proxy_read_timeout 默认 60s）
 //      会把连接掐掉 —— 现象是「前端每隔一分钟重连一次」。现在提供 `sendSseComment()`
 //      注释帧（`: ping\n\n`），由 server.js 用 `unref()` 的定时器定期发。
+//
+// ⚠️ F28（缺陷报告 2026-10-23 §3.5，:1676-1704）：SSE 响应也走统一出口 ⇒ 同样带安全头
+//    （口径见 src/http/security-headers.js）。⚠️ SSE_HEADERS 是常量，
+//    与请求相关的部分（HSTS / CORS）在 openSseStream 里按 res.req 现算。
+import { responseHeaders } from './security-headers.js';
 
 export const SSE_HEADERS = {
   'Content-Type': 'text/event-stream; charset=utf-8',
@@ -42,7 +47,7 @@ export function parseSsePath(url) {
 
 /** 写 SSE 响应头并保持连接。 */
 export function openSseStream(res) {
-  res.writeHead(200, SSE_HEADERS);
+  res.writeHead(200, { ...SSE_HEADERS, ...responseHeaders(res.req) });
   if (typeof res.flushHeaders === 'function') res.flushHeaders();
   return true;
 }

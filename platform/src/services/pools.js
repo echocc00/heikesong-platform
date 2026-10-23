@@ -14,6 +14,7 @@ import { derivePoolProjects, derivePoolTalents, derivePoolResources, aggregatePe
 import * as poolRepo from '../db/repo/pools.js';
 import * as srcRepo from '../db/repo/pool-sources.js';
 import { listEditionIdsByUser } from '../db/repo/registrations.js';
+import { getEdition } from '../db/repo/editions.js';
 // ⛔ 事务助手复用 P4 的 withTransaction（src/db/tx.js，SAVEPOINT），**不再自建一份**：
 //    自建 BEGIN IMMEDIATE 的版本在「调用方已经开了事务」时会抛
 //    "cannot start a transaction within a transaction"，而 Task 4 的
@@ -31,6 +32,26 @@ function requireEdition(editionId) {
   return editionId;
 }
 
+/**
+ * 届期必须**真实存在**（F9 · Medium，2026-10-23 审计 §3.4「写端点错误语义不一致」）。
+ *
+ * ⚠️ 原来这里**只判空**、不判存在性 ⇒ `POST /api/pools/sync` 引用一个**不存在的届期**时，
+ *    同步 0 行、回 **200**，像真的一样。
+ *    ⇒ 而其它所有带 `editionId` 的写端点都是 **404 EDITION_NOT_FOUND**
+ *      （services/team.js 的 createTeam / services/taskPackage.js 的 submitTaskPackage /
+ *        services/workflow.js 的 createWorkflow / routes/public-tokens.js 的 resolveEditionId）
+ *      ⇒ 同一个「届期不存在」在两个端点上是两种语义，客户端没法据此判断。
+ *    ⇒ 口径对齐：**资源不存在 ⇒ 404**，三态状态码（设计文档 §7.3）。
+ *
+ * ⚠️ 口径与 `services/workflow.js` 的 `createWorkflow`（先查 edition ⇒ 404）**逐字同源**。
+ * ⚠️ **单独一个函数、不改 `requireEdition` 的签名**：保持既有调用点逐字不变
+ *    （计划块 `docs/superpowers/plans/` 由父会话统一同步；改动既有行会被
+ *    `docs/tools/plan-block-audit.mjs` 判成「真重写」⇒ 平白制造计划漂移）。
+ */
+function requireEditionExists(db, editionId) {
+  if (!getEdition(db, editionId)) throw appError(404, 'EDITION_NOT_FOUND', '届期不存在');
+}
+
 function packageStatuses(rules) {
   const list = rules?.pools?.packageStatusFilter;
   return Array.isArray(list) ? list : [];
@@ -43,6 +64,7 @@ function packageStatuses(rules) {
 export function syncPoolProjects({ db, editionId, now, rules }) {
   const at = nowIso(now);
   requireEdition(editionId);
+  requireEditionExists(db, editionId);
   const source = {
     teams: srcRepo.listEditionTeams(db, editionId),
     packages: srcRepo.listEditionPackages(db, editionId, { statuses: packageStatuses(rules) }),
@@ -88,6 +110,7 @@ export function syncPoolProjects({ db, editionId, now, rules }) {
 export function syncPoolTalents({ db, editionId, now, rules }) {
   const at = nowIso(now);
   requireEdition(editionId);
+  requireEditionExists(db, editionId);
   // ⚠️ 个人积分口径的**唯一规则来源**是 rules.points（personal 组）：
   //    规则曾散在 rules.pools.talentPointKinds 与 rules.points.personal 两处，
   //    两处口径还不一样 ⇒ 现在只认 rules.points（见 src/domain/personal-points.js）。
@@ -196,6 +219,7 @@ export function syncPoolTalents({ db, editionId, now, rules }) {
 export function syncPoolResources({ db, editionId, now, rules }) {
   const at = nowIso(now);
   requireEdition(editionId);
+  requireEditionExists(db, editionId);
   const packages = srcRepo.listEditionPackages(db, editionId, { statuses: packageStatuses(rules) });
   const rows = derivePoolResources({ packages });
 

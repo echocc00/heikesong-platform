@@ -11,6 +11,7 @@ import { isRetryableDbError } from './db/tx.js';
 import { loadRules, validateRules } from './config.js';
 import { createRouter } from './http/router.js';
 import { json, error, text } from './http/respond.js';
+import { responseHeaders, corsPreflightHeaders } from './http/security-headers.js';
 import { registerWorkflowRoutes } from './http/routes/workflow.js';
 import { registerPoolsRoutes } from './http/routes/pools.js';
 import { registerPublicRoutes } from './http/routes/public.js';
@@ -119,6 +120,20 @@ function hasMalformedEncoding(path) {
   } catch {
     return true;
   }
+}
+
+/**
+ * Allow 头的值：该路径上注册的方法 + HEAD（GET 隐含 HEAD）+ OPTIONS。
+ *
+ * ⚠️ F27（缺陷报告 2026-10-23 §3.5，:1637-1671）：OPTIONS 原来 404 ⇒ 跨源预检失败。
+ *    修法 ② 原文：「在 src/server.js 里统一处理 OPTIONS，回 Allow + Access-Control-Allow-Methods」。
+ *    ⚠️ Allow 必须**如实**（RFC 9110 §9.3.2）：只写 GET 的端点不能被列成 POST。
+ */
+function allowHeader(methods) {
+  const set = new Set(methods);
+  if (set.has('GET')) set.add('HEAD');
+  set.add('OPTIONS');
+  return [...set].sort().join(', ');
 }
 
 /**
@@ -452,6 +467,26 @@ export function createApp({ db, rules, webDir }) {
           sendSseEvent(res, 'connected', { stageId: ssePath.stageId, at: new Date().toISOString() });
           return;
         }
+        // ── F27：OPTIONS 统一处理（跨源预检 / 能力探测）────────────
+        // ⚠️ 修法（缺陷报告 §3.5 F27 ②）：OPTIONS 原来一律 404 ⇒ 跨源预检直接失败。
+        //    现在：**该路径上有注册路由** ⇒ 回 204 + Allow（如实列出支持的方法）
+        //    + 预检头（CORS 开启时才有，见 security-headers.js）；
+        //    **没有注册路由** ⇒ 仍然 404（OPTIONS 不是万能 204）。
+        if (req.method === 'OPTIONS') {
+          const methods = router.allowedMethods(url);
+          if (!methods.length) {
+            error(res, 404, 'NOT_FOUND', `无此接口: ${req.method} ${url}`);
+            return;
+          }
+          const allow = allowHeader(methods);
+          res.writeHead(204, {
+            ...responseHeaders(req),
+            Allow: allow,
+            ...corsPreflightHeaders(req, allow),
+          });
+          res.end();
+          return;
+        }
         const match = router.match(req.method, url);
         if (!match) {
           // 畸形 URL 编码 → 400（请求本身非法）；真没这个接口 → 404
@@ -492,7 +527,8 @@ export function createApp({ db, rules, webDir }) {
         if (result && typeof result === 'object' && typeof result.status === 'number') {
           const { status, body: payload } = result;
           if (status === 204) {
-            res.writeHead(204);
+            // ⚠️ F28：204 也是一条响应 ⇒ 同样带安全头（口径见 security-headers.js）。
+            res.writeHead(204, responseHeaders(req));
             res.end();
             return;
           }
@@ -545,7 +581,11 @@ export function createApp({ db, rules, webDir }) {
     // ⛔ 评审修正（Important）：静态分支原来在 try/catch **之外** ——
     //    serveStatic 抛出的任何异常都会逸出 handle → 进程死亡。
     //    现在它在自己的 try 里；异常一律回 404，不影响进程。
-    if (req.method === 'GET') {
+    // ⚠️ F27：HEAD 也走静态分支（HEAD 与 GET 共享同一套响应头，只是不带响应体；
+    //    探针常探 `/` 而不是 `/api/health` ⇒ 静态页也必须能被 HEAD 命中）。
+    //    Node 自己会丢弃 HEAD 的响应体（ServerResponse._hasBody = false），
+    //    而 Content-Length 照发（探针要靠它判断体量）。
+    if (req.method === 'GET' || req.method === 'HEAD') {
       try {
         if (serveStatic(webDir, req, res)) return;
         // 演示模式（DEMO_MODE=1）：领域层与规则配置不在 web/ 下，挂出去。

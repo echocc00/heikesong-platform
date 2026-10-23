@@ -1010,7 +1010,11 @@ export async function renderSignoff(ctx) {
       return;
     }
     if (action === 'signoff-submit') {
-      submitSignoff(btn.dataset.milestone);
+      // ⚠️ **F23（2026-10-23 审计）防双击**：双击「提交签字」会发出**两次**请求
+      //    ⇒ 服务端与数据库虽然会挡下第二条（409 + 唯一索引），但用户会看到一次报错，
+      //    误以为签字失败。⇒ 提交期间先禁用按钮（同 web/views/team.js 的既有写法）。
+      btn.disabled = true;
+      submitSignoff(btn.dataset.milestone).finally(() => { btn.disabled = false; });
       return;
     }
     if (action === 'withdraw') {

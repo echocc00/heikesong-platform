@@ -89,6 +89,21 @@ export function insertSignoff(db, { id, milestoneId, enterpriseId, signatoryUser
     VALUES (?,?,?,?,?,?,?,NULL)`).run(id, milestoneId, enterpriseId, signatoryUserId ?? null, department, content, signedAt);
 }
 
+/**
+ * 某个里程碑上、某个企业**当前有效**（未撤回）的签字。
+ *
+ * ⚠️ **为什么要它**（2026-10-23 审计 F23）：原来同一 (milestone, enterprise)
+ *    可以写出**两条**签字 ⇒ 双击「提交签字」或失败后重试就会发生
+ *    ⇒ 工作台只看得见一条，另一条**不可见但有效**，而 `revokeSignoff` 按单条 id 撤销
+ *    ⇒ 撤了可见的那条，另一条还在 ⇒ 段位统计与工作台**对不上**。
+ *    ⇒ 服务层先查（给出友好错误），数据库唯一索引兜底（并发下也挡得住）。
+ */
+export function getActiveSignoff(db, { milestoneId, enterpriseId }) {
+  return db.prepare(
+    'SELECT * FROM milestone_signoffs WHERE milestone_id = ? AND enterprise_id = ? AND revoked_at IS NULL',
+  ).get(milestoneId, enterpriseId) ?? null;
+}
+
 export function getSignoff(db, signoffId) {
   return db.prepare('SELECT * FROM milestone_signoffs WHERE id = ?').get(signoffId) ?? null;
 }

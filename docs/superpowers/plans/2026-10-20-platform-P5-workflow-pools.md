@@ -175,6 +175,10 @@ import * as poolsRepo from '../src/db/repo/pools.js';
 import * as poolSourcesRepo from '../src/db/repo/pool-sources.js';
 import * as publicTokensRepo from '../src/db/repo/public-tokens.js';
 import { hasActiveMembership, listMemberTeams } from '../src/db/repo/teamMembers.js';
+import { isolateTempDir } from '../test-helpers/tmp.js';
+
+// ⚠️ 隔离本进程临时目录：进程退出时整体回收（防临时目录泄漏，详见 test-helpers/tmp.js）
+isolateTempDir();
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrationsDir = join(here, '..', 'db', 'migrations');
@@ -279,9 +283,11 @@ function seedRepo(db) {
   `);
 }
 
-test('迁移到 006：七张表全部建出', () => {
+test('迁移到 007：七张表全部建出', () => {
   const { db, close, dataDir, result } = setup();
-  assert.equal(result.version, 6, '迁移版本必须是 6（P0=1, P1=2, P2=3, P3=4, P4=5, P5=6）');
+  // ⚠️ **版本 7 是本轮新增的**（2026-10-23 审计 F23 / F25 的约束补强迁移
+  //    `007_p13_defect_fixes.sql`：幂等键加请求体摘要列 + 签字的部分唯一索引）。
+  assert.equal(result.version, 7, '迁移版本必须是 7（P0=1, P1=2, P2=3, P3=4, P4=5, P5=6, P13=7）');
   const names = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((r) => r.name);
   for (const t of ['workflows', 'workflow_tasks', 'task_claims', 'pool_projects', 'pool_talents', 'pool_resources', 'public_tokens']) {
     assert.ok(names.includes(t), `缺表 ${t}`);

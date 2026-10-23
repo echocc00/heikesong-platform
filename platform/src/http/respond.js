@@ -3,9 +3,18 @@
 //   列表查询权限不满足 → 200 + 空集（不暴露"有但不给看"）
 //   单条读取权限不满足 → 404（不泄露记录是否存在）
 //   规则本身被禁用     → 403
+//
+// ⚠️ F28（缺陷报告 2026-10-23 §3.5，:1676-1704）：这里曾是**一个安全头都没有**的出口
+//    （X-Content-Type-Options / Referrer-Policy / X-Frame-Options / HSTS 全部缺席）。
+//    现在统一在这里挂上（安全头的口径见 src/http/security-headers.js）。
+//    ⚠️ 请求对象取自 res.req（Node 的 ServerResponse 一直带着它）——
+//    这样不必改 json()/text() 的签名（既有调用方一律不变），而 HSTS 仍能按「是不是 https」给。
+import { responseHeaders } from './security-headers.js';
+
 export function json(res, status, body, extraHeaders = {}) {
   const payload = JSON.stringify(body ?? null);
   res.writeHead(status, {
+    ...responseHeaders(res.req),
     'Content-Type': 'application/json; charset=utf-8',
     'Content-Length': Buffer.byteLength(payload),
     ...extraHeaders,
@@ -15,6 +24,7 @@ export function json(res, status, body, extraHeaders = {}) {
 
 export function text(res, status, body, contentType = 'text/plain; charset=utf-8') {
   res.writeHead(status, {
+    ...responseHeaders(res.req),
     'Content-Type': contentType,
     'Content-Length': Buffer.byteLength(body),
   });

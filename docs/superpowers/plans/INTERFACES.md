@@ -518,7 +518,7 @@ detectMultiAccount({ users, keyFields })      // 同一手机号/企业注册多
 
 ```
 GET  /api/audit/computations/:id
-GET  /api/audit/computations/:id/diff
+POST /api/audit/computations/:id/diff
 GET  /api/audit/log
 GET  /api/audit/flags
 POST /api/audit/flags/:id/resolve

@@ -4990,6 +4990,41 @@ import { listUserRoles } from '../db/repo/roles.js';
 import { appError } from '../errors.js';
 
 /**
+ * 「这个人是不是超管」——**本文件唯一的超管标志口径**。
+ *
+ * ⚠️ **为什么要有这个函数（2026-10-23 审计 F48）**：
+ *    本仓有两种用户形状，两者的超管标志**键名不同**：
+ *      · 库行形状（snake_case）：`is_superadmin: 0|1`（`users` 表的列，`getUserById` 的产物）
+ *      · 对外形状（camelCase）：`isSuperadmin: boolean`（`toPublicUser()` 的产物）
+ *    此前**各写各的**：`can()` 认两种，而 `tier.js` / `performance-card.js` / `workflow.js` /
+ *    `milestone.js` **只认 `is_superadmin === 1`**，`signoff-board.js` 认两种
+ *    ⇒ 同一个「形状不一致」散落在 5 个文件里（同一口径写多份 ⇒ 必然漂移）。
+ *    ⇒ **产出点**（`toPublicUser()`）现在**同时**带两种键 ⇒ 一处改动，全仓的「形状不一致」
+ *      一次消掉：拿到对外形状的服务层也能认到超管（不再超管静默降级）。
+ *    ⇒ 本文件内也统一走这里（can / canScoped / isCommitteeActor 三处不再各写各的）。
+ *
+ * ⛔ **只认这两种、且严格比较**（`is_superadmin === 1` / `isSuperadmin === true`）：
+ *    放宽成「truthy」会让 `is_superadmin: '0'`（字符串）也被当成超管 —— 失败方向必须是"少给权限"。
+ *
+ * ⚠️ **已知取舍（不是漏洞，写清楚以免下次又被当成 bug 改掉）**：
+ *    本函数**信任传入对象**的超管标志，不查库。理由：
+ *      ① `can()` 是全项目**唯一**权限入口；多认一种形状是为了消除「**超管静默降级**」
+ *         （症状：管理员登进去什么都点不动，极难定位）；失败方向是 fail-closed（少给权限）。
+ *      ② `scopeClause()` 那一侧**只信库**（`su.is_superadmin = 1`）。
+ *      ③ **生产链路上 `ctx.user` 永远是库里的行**（`server.js` 用 `getUserById` 装配 ctx）
+ *         ⇒ 库行形状下两侧**必然一致**（机器闸见 test/audit-findings.test.js 的 F48 用例）。
+ *      ④ 「对象自称超管、但库里没有这一行」⇒ `can()` 放行而 `scopeClause()` 过滤 ——
+ *         这是**已知取舍**，不是现网漏洞（没有可达路径能把这样的对象喂进 `ctx.user`）。
+ *
+ * @param {object|null} user 库行形状或对外形状
+ * @returns {boolean}
+ */
+function isSuperadminUser(user) {
+  if (!user) return false;
+  return user.is_superadmin === 1 || user.isSuperadmin === true;
+}
+
+/**
  * 「组委会」判定：admin 角色（或超管）。
  *
  * ⛔ **为什么不能写成 `can(user, 'team:manage', { scopeType: 'team', scopeId })`**：
@@ -5009,7 +5044,7 @@ import { appError } from '../errors.js';
  */
 export function isCommitteeActor(db, user) {
   if (!user || !db) return false;
-  if (user.is_superadmin === 1 || user.isSuperadmin === true) return true;
+  if (isSuperadminUser(user)) return true;
   if (!user.id) return false;
   return listUserRoles(db, user.id).includes('admin');
 }
@@ -5118,7 +5153,13 @@ export function can(user, capability, ctx = null, db = null) {
   //    调用方传错形状会让**超管静默失去全部权限** —— 症状是"管理员登进去
   //    什么都点不动"，极难定位。多认一种形状，把这类静默降级从根上消除。
   //    （失败方向是 fail-closed：认不出超管只会少给权限，不会多给。）
-  if (user.is_superadmin === 1 || user.isSuperadmin === true) return true;
+  //    ⚠️ 口径统一到 isSuperadminUser()（2026-10-23 审计 F48）：全仓只有**一处**判超管，
+  //    不再各写各的（同一口径写多份 ⇒ 必然漂移）。
+  //    ⚠️ **已知取舍（不是漏洞）**：这一侧信任**传入对象**的超管标志，scopeClause() 那一侧
+  //    只信**数据库**（`su.is_superadmin = 1`）。生产链路上 `ctx.user` 永远是库里的行
+  //    （server.js 用 getUserById 装配 ctx）⇒ 两侧在生产上**必然一致**；
+  //    「对象自称超管但库里不是」是已知取舍（详见 isSuperadminUser 的注释）。
+  if (isSuperadminUser(user)) return true;
   if (!db) return false;
   // ⛔ 评审修正（Minor→Important）：缺 user.id 时**不能**拿去绑定 SQLite 参数 ——
   //    node:sqlite 抛 TypeError → 整个请求变 500。
@@ -5155,7 +5196,8 @@ export function can(user, capability, ctx = null, db = null) {
 export function canScoped(user, capability, ctx = null, db = null) {
   if (!user) return false;
   if (user.active !== undefined && !user.active) return false;
-  if (user.is_superadmin === 1 || user.isSuperadmin === true) return true;
+  // ⚠️ 与 can() **同口径**（isSuperadminUser）——两者必须给出相同结论。
+  if (isSuperadminUser(user)) return true;
   if (!db || !user.id) return false;
   return assignmentGrants(db, user, capability, ctx);
 }
@@ -5257,6 +5299,19 @@ export function scopeClause(userId, capability, { scopeType, scopeId, alias = nu
   // ⚠️ 占位符顺序必须与 params 顺序**逐字对应**：
   //    ①users.id(启用) ②assignments.user_id ③assignments.capability
   //    ④scopeType[⑤scopeId] ⑥超管.user_id ⑦角色.user_id ⑧角色.capability
+  //
+  // ⚠️ **超管这一段只信数据库**（`su.is_superadmin = 1`），而 can() 那一侧
+  //    信任**传入对象**的超管标志（isSuperadminUser，两种形状都认）——
+  //    这是一处**有意为之的取舍**，不是分歧（2026-10-23 审计 F48）：
+  //      · 这一侧生成的是 SQL 片段，**只能查库**（没有「传入对象」可用）；
+  //        而 can() 是 JS 函数，可以直接读传入对象。
+  //      · 生产链路上 `ctx.user` 永远是库里的行（server.js 用 getUserById 装配 ctx）
+  //        ⇒ 两侧在生产上**必然一致**。
+  //      · 「对象自称超管但库里不是」⇒ 两侧结论相反 —— 已知取舍，不是现网漏洞
+  //        （没有可达路径能把这样的对象喂进 ctx.user）；理由与边界见 isSuperadminUser。
+  //      · 机器闸：同一个**真实用户**（库里分别是超管 / 非超管），
+  //        can() 与 scopeClause() 的结论必须永远一致（库行形状 + 对外形状都测）——
+  //        见 test/audit-findings.test.js 的「F48 …」用例。
   const sql = `(
     EXISTS (SELECT 1 FROM users u WHERE u.id = ? AND u.active = 1)
     AND (
@@ -8590,7 +8645,49 @@ export function subscribe(fn) {
 ```javascript
 // web/api.js — 真实 API 客户端
 // ⛔ 演示版用 api.demo.js 替换本模块，视图代码完全复用。
+//
+// ⚠️ **F24（内部审计报告 §3.5「会话中途 401 不清 UI」）**：
+//   会话在**使用途中**过期（服务端 401）时，此前**全站零消费方**读 `err.status`
+//   ⇒ 页面继续显示旧数据、顶栏仍显示「已登录」，用户以为还在操作，实际什么也没写进去，
+//   而且**永远不会**被送回 `#/login`（只能手工敲 `#/logout`）。
+//   ⇒ 这里做**统一收口**：401 ⇒ 清本地会话态 + 回登录页 + 明确告诉用户「会话已过期」。
+import { getState, setState, SESSION_EXPIRED_MESSAGE } from './store.js';
+import { navigate } from './router.js';
+
 const BASE = '';
+
+/**
+ * 会话探测端点（启动时 web/app.js 的 restoreSession 唯一调用它）。
+ * ⚠️ 它的 401 回答的是「**本来就没登录**」（访客的正常答案），
+ *    不是「**用着用的会话死了**」⇒ 不能在这里跳登录页：
+ *    否则访客一进站就被弹走，落地页就废了（P9 M6「落地页未登录 100% 可用」）。
+ *    启动时的探测由 restoreSession 自己兜底（catch 里清 user）。
+ */
+const SESSION_PROBE_PATH = '/api/me';
+
+/**
+ * 401（会话失效）的**统一处置**（F24 修法）。
+ *
+ * 规则溯源：内部审计报告 §3.5 F24
+ *   「会话过期后界面仍显示为已登录……用户永远不会被送回 #/login」
+ *   ⇒ 修法 = api.js 收到 401 时统一清 store + 跳 #/login（带「会话已过期」提示）。
+ *
+ * ⚠️ 三条边界（每条都有用例覆盖，见 platform/test/audit-findings.test.js 的 F24 系列）：
+ *   ① **403 = 权限不足** ⇒ 绝不清会话（清了会把「权限不够」误导成「请重新登录」）——
+ *      本函数**只**被 401 分支调用；
+ *   ② **401 + INVALID_CREDENTIALS = 口令不对**（登录 / 改密）⇒ 不是会话失效；
+ *   ③ **本来就没有本地会话**（访客）⇒ 不清、不跳（否则把访客从公开落地页弹走）。
+ *
+ * @param {string} path 请求路径（用来识别会话探测端点）
+ * @returns {boolean} true = 本次真的清掉了会话（⇒ 错误文案要换成「会话已过期」）
+ */
+function expireSession(path) {
+  if (path === SESSION_PROBE_PATH) return false;   // 会话探测：访客的正常 401，不算失效
+  if (!getState().user) return false;              // 本来就没会话 ⇒ 不动
+  setState({ user: null, sessionExpired: true });
+  navigate('/login');
+  return true;
+}
 
 async function request(method, path, body) {
   const res = await fetch(BASE + path, {
@@ -8600,11 +8697,27 @@ async function request(method, path, body) {
     credentials: 'same-origin',
   });
   const text = await res.text();
-  const data = text ? JSON.parse(text) : null;
+  // ⚠️ 错误响应体**不保证**是 JSON（反向代理可能回一份 HTML 登录页）⇒ 解析失败按「无结构」处理；
+  //    但**状态码**必须照样拿到 —— 401 的统一处置完全依赖它。
+  let data = null;
+  if (text) {
+    try { data = JSON.parse(text); } catch { data = null; }
+  }
   if (!res.ok) {
     const err = new Error(data?.error?.message || `请求失败 ${res.status}`);
     err.status = res.status;
     err.code = data?.error?.code;
+    // ⛔ **401 = 会话失效** ⇒ 统一清本地会话态 + 回登录页（F24）
+    //   ⚠️ 403 = 权限不足 ⇒ **不清会话**（否则把「权限不够」说成「请重新登录」）
+    //   ⚠️ 401 + INVALID_CREDENTIALS = 口令不对（登录 / 改密）⇒ 不是会话失效
+    const expired = res.status === 401
+      && err.code !== 'INVALID_CREDENTIALS'
+      && expireSession(path);
+    if (expired) {
+      // ⚠️ 不能静默吞掉：服务端的「未登录」用户看不懂、也不知道下一步做什么
+      //    ⇒ 换成一句带下一步的话（登录页显示的是同一条，见 web/store.js）。
+      err.message = SESSION_EXPIRED_MESSAGE;
+    }
     throw err;
   }
   return data;

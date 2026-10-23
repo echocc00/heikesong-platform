@@ -91,14 +91,19 @@ test('toPublicUser 对带哈希的行也不漏 password_hash（对外键集合�
   assert.equal(pub.passwordHash, undefined);
   assert.deepEqual(
     Object.keys(pub).sort(),
-    ['active', 'capabilities', 'createdAt', 'id', 'isSuperadmin', 'mbaStatus', 'name', 'org', 'phone', 'roles'],
+    ['active', 'capabilities', 'createdAt', 'id', 'isSuperadmin', 'is_superadmin', 'mbaStatus', 'name', 'org', 'phone', 'roles'],
     '对外形状的键集合必须精确等于约定的字段（多一个也算泄露）'
     + '｜⚠️ P7 新增 roles：前端要按角色分区导航（三端拆分），必须知道「你是谁」。'
     + 'roles 是**角色键列表**（admin/captain/judge/…），不是能力也不是授权记录 —— '
     + '它不构成任何授权依据（可见性始终在 API 层过滤），因此不属于「泄露」。'
     + '｜⚠️ W1-b（DP-105）新增 capabilities：前端要按**能力点**拦分区级路由，'
     + '必须知道这个人持有哪些能力点。它是**能力点键列表**（audit:read/…），'
-    + '同样只是提示、不构成授权依据，因此不属于「泄露」。',
+    + '同样只是提示、不构成授权依据，因此不属于「泄露」。'
+    + '｜⚠️ F48（2026-10-23 审计）新增 is_superadmin：对外形状**同时**带'
+    + '`isSuperadmin`（布尔）与 `is_superadmin`（0|1）——服务层读超管标志的写法'
+    + '历史上不统一（tier/workflow/performance-card/milestone 只认 `is_superadmin === 1`）'
+    + '⇒ 只带驼峰时超管**静默降级**。两个键说的是同一件事（本人是不是超管），'
+    + '不是新信息 ⇒ 不构成泄露。',
   );
   close();
   rmSync(dataDir, { recursive: true, force: true });

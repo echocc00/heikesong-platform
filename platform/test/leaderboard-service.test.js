@@ -368,8 +368,12 @@ test('★ 段位口径：未知部门不算业务签字、撤回的签字不计�
   const { db, close, dataDir } = setup();
   try {
     // ① 未知部门（法务部）的签字：不是业务部门 → 不算 S 段的那 1 个业务签字
+    // ⚠️ **夹具更新**（2026-10-23 审计 F23 之后）：同一个 (milestone, enterprise) 只允许一条
+    //    **未撤回**的签字（数据库部分唯一索引 + 服务端检查）⇒ 这条签字改成**另一个企业**
+    //    （e_2）⇒ 断言意图（未知部门不算业务签字）**完全不变**，
+    //    且不再依赖「同企业可重复签字」这个已被认定为缺陷的行为。
     db.prepare(`INSERT INTO milestone_signoffs (id, milestone_id, enterprise_id, signatory_user_id, department, content, signed_at, revoked_at)
-      VALUES ('sg_3','ms_1','e_1','u_cap','法务部','内容','${NOW}',NULL)`).run();
+      VALUES ('sg_3','ms_1','e_2','u_cap','法务部','内容','${NOW}',NULL)`).run();
     // ② 撤回的签字：对应里程碑不再算「已达成」
     db.prepare(`INSERT INTO milestone_signoffs (id, milestone_id, enterprise_id, signatory_user_id, department, content, signed_at, revoked_at)
       VALUES ('sg_4','ms_3','e_1','u_cap','业务部门','内容','${NOW}','${NOW}')`).run();

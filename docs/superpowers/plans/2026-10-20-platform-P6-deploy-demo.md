@@ -5043,7 +5043,9 @@ Expected: FAIL —— `buildDemoState is not a function`（`web/api.demo.js` 还
 //      /api/teams/:id/tier        → src/services/tier.js getTeamTier
 //      /api/teams/:id/performance-card → src/services/performance-card.js getPerformanceCard
 import { scoreRegistration, classifyLevel, validateRegistrationAnswers } from '../src/domain/registration.js';
-import { scoreSolvability, checkTaskMix } from '../src/domain/solvability.js';
+import {
+  scoreSolvability, checkTaskMix, buildSolvabilityMeta, buildDiagnosticReport,
+} from '../src/domain/solvability.js';
 import { scoreStage } from '../src/domain/scoring.js';
 import { applyEnterpriseRules } from '../src/domain/enterprise-seat.js';
 import { detectSelfEvalDiff } from '../src/domain/self-eval.js';
@@ -5485,6 +5487,15 @@ export function demoRecusalView(r, state) {
 /**
  * 演示站的任务包视图（纯函数）。
  * ⚠️ 形状与 `src/services/taskPackage.js` 的 presentTaskPackage() 一致。
+ *
+ * ⚛️ F22（2026-10-23 审计）：**必须带 meta**。
+ *    真实后端把评估结论写进 `task_packages.meta_json`，presentTaskPackage 原样端出来
+ *    （含 `meta.solvability` 的**档位定义**与**否决项定义**）⇒
+ *    前端的「服务端投影」才有分数区间 ⇒ 签级控件才不会被 F16 的自锁吃掉。
+ *    演示站原先**只有 19 个字段、没有 meta** ⇒ 前端在演示站上走的是**另一条路径**
+ *    （规则投影）⇒ F16 在演示站压根不复现 ⇒ 唯一被公开演示的环境看不见这个 bug。
+ *    ⇒ 这里把演示站内部的 `p.solvability` **投影成 `meta.solvability`**，
+ *      与真实后端**逐字同形**（同一份投影由 domain/solvability.js 生成）。
  */
 export function demoTaskPackageView(p, state) {
   return {
@@ -5507,7 +5518,18 @@ export function demoTaskPackageView(p, state) {
     submittedAt: p?.submittedAt ?? null,
     approvedBy: p?.approvedBy ?? null,
     approvedAt: p?.approvedAt ?? null,
+    meta: demoTaskPackageMeta(p),
   };
+}
+
+/**
+ * 演示站任务卡的 meta（与真实后端 presentTaskPackage 的 meta 同形）。
+ * ⚠️ 真实后端 = `meta_json` 解析结果（没有 ⇒ 空对象）；评估过的卡带 `meta.solvability`。
+ */
+function demoTaskPackageMeta(p) {
+  const meta = { ...(p?.meta ?? {}) };
+  if (p?.solvability) meta.solvability = p.solvability;
+  return meta;
 }
 
 /**
@@ -6722,15 +6744,16 @@ export function createDemoApi({ storage = defaultStorage(), seed = null, rules =
       pkg.commitment = result.commitment ?? '';
       pkg.agreement = result.agreement ?? '';
       pkg.status = 'assessed';
-      pkg.solvability = {
-        score: result.score,
-        grade: result.grade,
-        vetoes: result.vetoes,
-        explain: result.explain,
-        computedGrade: result.computedGrade,
-        assessedBy: s.me.id,
-        assessedAt: new Date().toISOString(),
-      };
+      // ⚛️ F22（2026-10-23 审计）：用**领域层同一份**投影（buildSolvabilityMeta）
+      //    ⇒ 演示站的 meta.solvability 与真实后端**逐字同形**（含档位定义 grades
+      //    与否决项定义 vetoesSpec）⇒ F16（Critical：第一次评估后签级表单永久失效）
+      //    在演示站上**同样可复现、同样被覆盖**。
+      pkg.solvability = buildSolvabilityMeta({
+        result,
+        config: r.solvability,
+        actorId: s.me.id,
+        now: new Date().toISOString(),
+      });
       persist();
       return demoTaskPackageView(pkg, s);
     }
@@ -6778,6 +6801,19 @@ export function createDemoApi({ storage = defaultStorage(), seed = null, rules =
           decidedAt: now,
         },
       };
+      // ⚠️ F22（2026-10-23 审计）：D 级退回必须出《问题可解性诊断报告》（R-ENT-08），
+      //    签非 D 级必须**清掉**旧报告 —— 与真实后端（src/services/taskPackage.js）**同口径**。
+      //    演示站原先**整份没有**报告 ⇒ 公网演示站上「D 级退回给企业的唯一凭据」是缺的。
+      if (finalGrade === 'D') {
+        pkg.solvability.diagnosticReport = buildDiagnosticReport({
+          packageTitle: pkg.title,
+          solvability: pkg.solvability,
+          config: r.solvability,
+          now,
+        });
+      } else if (pkg.solvability.diagnosticReport) {
+        delete pkg.solvability.diagnosticReport;
+      }
       persist();
       return demoTaskPackageView(pkg, s);
     }
@@ -6785,8 +6821,12 @@ export function createDemoApi({ storage = defaultStorage(), seed = null, rules =
     // ⚠️ 此前演示适配器**完全没有** /api/audit/* ⇒ 公网演示站的
     //    「复核队列」与「计算留痕」两页直接 404。
     // ⚠️ 顺序要紧：diff 的路径多一段（`/diff`），必须排在普通路径**之前**。
+    // ⚠️ **复算必须是 POST**（F20，缺陷报告 2026-10-23 §3.5）：复算会写一条
+    //    `computation.recompute` 审计日志 ⇒ 有副作用 ⇒ 不能是 GET
+    //    （GET 跨站可达 ⇒ `<img src>` 就能以受害者身份污染审计日志）。
+    //    演示站与正式后端**同口径**：GET 不再实现（落「端点未实现」分支 ⇒ 404）。
     let difm = clean.match(/^\/api\/audit\/computations\/([^/]+)\/diff$/);
-    if (method === 'GET' && difm) {
+    if (method === 'POST' && difm) {
       const comp = (s.computations ?? {})[difm[1]];
       if (!comp) throw httpError(404, 'NOT_FOUND', '计算快照不存在');
       // ⚠️ 演示站的 diff 口径：**同输入复算 ⇒ 必然一致**（浏览器里跑的是同一套引擎、同一份输入）
@@ -7105,25 +7145,34 @@ export function createDemoApi({ storage = defaultStorage(), seed = null, rules =
       const stage = (s.stages ?? []).find((x) => x.id === m[1]);
       if (!stage) throw httpError(404, 'STAGE_NOT_FOUND', '赛段不存在');
       const wanted = Array.isArray(body?.teamIds) ? body.teamIds : (body?.teamId ? [body.teamId] : []);
-      const registered = [];
-      const skipped = [];
-      for (const tid of wanted) {
+      // ⚛️ F21（2026-10-23 审计）：**registered / skipped 必须是数字**。
+      //    真实后端（src/services/stage.js:411-415 的 registerStageTeamRoster，
+      //    路由 src/http/routes/stages.js:238-243 逐字透传）给的是
+      //      { registered: 数字, skipped: 数字, teamIds: string[] }
+      //    演示站原先给的是**数组** ⇒ 前端（web/views/stages.js:1227-1228）
+      //      `Number(res?.registered ?? 0)` ⇒ Number(["t_alpha"]) = **NaN**
+      //    ⇒ 公网演示站「赛段配置 → 名册」直接显示「新登记 NaN 支队伍。」
+      //    ⇒ 口径以真实后端为准：这里照抄（并按同口径**先去重**）。
+      const ids = [...new Set(wanted.map((x) => String(x)))];
+      const fresh = [];
+      let skipped = 0;
+      for (const tid of ids) {
         if (!(s.teams ?? []).some((t) => t.id === tid)) {
           throw httpError(404, 'TEAM_NOT_FOUND', `战队不存在：${tid}`);
         }
         if ((s.stageTeams ?? []).some((t) => t.stageId === stage.id && t.teamId === tid)) {
-          skipped.push(tid);
+          skipped += 1;
           continue;
         }
-        registered.push(tid);
+        fresh.push(tid);
       }
       s.stageTeams = [
         ...(s.stageTeams ?? []),
-        ...registered.map((tid) => ({ stageId: stage.id, teamId: tid })),
+        ...fresh.map((tid) => ({ stageId: stage.id, teamId: tid })),
       ];
       persist();
       return {
-        registered,
+        registered: fresh.length,
         skipped,
         teamIds: (s.stageTeams ?? []).filter((t) => t.stageId === stage.id).map((t) => t.teamId),
       };

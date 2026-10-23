@@ -8,13 +8,14 @@ export function findIdempotency(db, { key, scope }) {
 }
 
 export function insertIdempotency(db, {
-  key, scope, requestId = null, response = null, now = new Date().toISOString(),
+  key, scope, requestId = null, response = null, requestDigest = null,
+  now = new Date().toISOString(),
 }) {
   try {
     db.prepare(
-      `INSERT INTO idempotency_keys (key, scope, request_id, response_json, created_at)
-       VALUES (?, ?, ?, ?, ?)`,
-    ).run(key, scope, requestId, response === null ? null : JSON.stringify(response), now);
+      `INSERT INTO idempotency_keys (key, scope, request_id, response_json, request_digest, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(key, scope, requestId, response === null ? null : JSON.stringify(response), requestDigest, now);
     return true;
   } catch (err) {
     // ⚠️ 只认「唯一约束」这一种失败 —— 其他错误必须继续往上抛。

@@ -8595,7 +8595,7 @@ import { scoreStage } from '../domain/scoring.js';
 import { checkRecusal } from '../domain/review-eligibility.js';
 import { checkJudgePool } from '../domain/judge-pool.js';
 import { recordComputation } from './audit.js';
-import { runDetection } from './anticheat.js';
+import { runDetection, toDetectionPeerReviews } from './anticheat.js';
 import { appError } from '../errors.js';
 
 function fail(status, code, message) {
@@ -8739,7 +8739,8 @@ export function computeStage({ db, stageId, actorId, now, rules }) {
 
   const teams = listStageTeams(db, stageId);
   const confirmations = mapConfirmations(listEnterpriseConfirmations(db, { stageId }));
-  const peerReviews = mapPeerReviews(listPeerReviews(db, stageId));
+  const peerReviewRows = listPeerReviews(db, stageId);
+  const peerReviews = mapPeerReviews(peerReviewRows);
   const selfReviews = mapSelfReviews(listSelfReviews(db, stageId));
 
   const result = scoreStage({
@@ -8867,7 +8868,8 @@ export function computeStage({ db, stageId, actorId, now, rules }) {
     const detection = runDetection({
       db,
       stageId,
-      peerReviews: peerReviews.map((p) => ({ judgeId: p.fromTeamId, teamId: p.toTeamId, score: p.score })),
+      // 互评：队 → 队（口径见 toDetectionPeerReviews：互评只存在 peer_reviews 表）
+      peerReviews: toDetectionPeerReviews(peerReviewRows),
       // 提交事件（用于「刷分」突发检测）：评委在某时刻提交了一条打分
       // ⚠️ **单位是「提交动作」**（F10）：`stage_reviews` 的粒度是「队伍 × 维度」，
       //    一次正常的表单提交（1 评委 × 2 队 × 5 维度）写 **10 行** ⇒ 拿**行**当提交事件，
@@ -8878,6 +8880,9 @@ export function computeStage({ db, stageId, actorId, now, rules }) {
       users: listUsersForDetection(db),
       // ⚠️ 名次相关的检测（detectTiedMutualPeerRate）需要**最终名次**，
       //    而名次是发榜时（破同分链跑完）才有的 ⇒ 计算阶段给不了，这里传空。
+      //    ⇒ **这条检测不再因此成为死规则**（2026-10-23 审计 F47）：
+      //      发榜后（src/services/leaderboard.js 的 publishLeaderboard）会用
+      //      「已落库的 stage_results.rank」+「peer_reviews 的互投数据」**再跑一次**。
       //    设计 §11.1 的核心要求「两位评委对全部重叠项目给出完全相同的相对顺序」
       //    （detectIdenticalPeerPattern）**不需要名次** ⇒ 已覆盖。
       results: [],
@@ -10420,6 +10425,11 @@ Expected: FAIL —— `Cannot find module '../src/http/sse.js'`
 //   ② **没有心跳帧**：SSE 连接长时间空闲时，中间的 nginx（proxy_read_timeout 默认 60s）
 //      会把连接掐掉 —— 现象是「前端每隔一分钟重连一次」。现在提供 `sendSseComment()`
 //      注释帧（`: ping\n\n`），由 server.js 用 `unref()` 的定时器定期发。
+//
+// ⚠️ F28（缺陷报告 2026-10-23 §3.5，:1676-1704）：SSE 响应也走统一出口 ⇒ 同样带安全头
+//    （口径见 src/http/security-headers.js）。⚠️ SSE_HEADERS 是常量，
+//    与请求相关的部分（HSTS / CORS）在 openSseStream 里按 res.req 现算。
+import { responseHeaders } from './security-headers.js';
 
 export const SSE_HEADERS = {
   'Content-Type': 'text/event-stream; charset=utf-8',
@@ -10443,7 +10453,7 @@ export function parseSsePath(url) {
 
 /** 写 SSE 响应头并保持连接。 */
 export function openSseStream(res) {
-  res.writeHead(200, SSE_HEADERS);
+  res.writeHead(200, { ...SSE_HEADERS, ...responseHeaders(res.req) });
   if (typeof res.flushHeaders === 'function') res.flushHeaders();
   return true;
 }

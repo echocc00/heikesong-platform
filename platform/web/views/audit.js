@@ -207,7 +207,10 @@ export function renderAudit(ctx) {
   async function runDiff() {
     diffBox.innerHTML = loadingState({ rows: 1, label: '正在用同一输入复算…' });
     try {
-      const d = await ctx.api.get(`/api/audit/computations/${encodeURIComponent(computationId)}/diff`);
+      // ⚠️ **必须用 POST**（F20，缺陷报告 2026-10-23 §3.5）：复算会写一条
+      //    `computation.recompute` 审计日志 ⇒ 它是**有副作用的动作** ⇒ 不是 GET。
+      //    （服务端已把该端点改成 POST；这里若还用 GET，跨站顶层导航就能触发写库。）
+      const d = await ctx.api.post(`/api/audit/computations/${encodeURIComponent(computationId)}/diff`);
       diffBox.innerHTML = renderDiff(d);
     } catch (e) {
       diffBox.innerHTML = errorState({

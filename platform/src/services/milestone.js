@@ -47,6 +47,17 @@ export function createSignoff({ db, milestoneId, actorId, body, now = new Date()
   })) {
     throw new AppError(403, 'FORBIDDEN', '只能为自己企业的队伍里程碑签字');
   }
+  // ⚠️ **F23（2026-10-23 审计）：同一里程碑的同一企业只允许一条有效签字** ——
+  //    原来没有重复检查 ⇒ 双击「提交签字」或失败后重试会写出**两条**：
+  //    工作台只看得见一条，另一条**不可见但有效** ⇒ 段位统计与工作台**对不上**，
+  //    而 `revokeSignoff` 按单条 id 撤销 ⇒ 撤了可见的那条，另一条还在。
+  //    ⚠️ 顺序：归属闸（403）**在先** —— 否则「越权」会被掩盖成「重复」（同 F34 的教训）。
+  //    ⚠️ 数据库的部分唯一索引是**最后一道**保证（并发下「先查再插」挡不住），
+  //    这里的服务层检查是为了给**友好错误**（409）而不是把数据库原文漏出去。
+  const active = tierRepo.getActiveSignoff(db, { milestoneId, enterpriseId: actor.id });
+  if (active) {
+    throw new AppError(409, 'SIGNOFF_ALREADY_EXISTS', '该里程碑已由本企业签字，重复提交不生效');
+  }
   const req = rules.milestones?.signoffRequires ?? {};
   const department = String(body?.department ?? '').trim();
   const content = String(body?.content ?? '').trim();

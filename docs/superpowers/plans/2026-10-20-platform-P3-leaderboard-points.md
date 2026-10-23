@@ -3301,6 +3301,10 @@ import { createSession } from '../src/auth/session.js';
 import { getLeaderboard, publishLeaderboard } from '../src/services/leaderboard.js';
 import { computeTeamTier, getTeamTier } from '../src/services/tier.js';
 import { getLatestTierRecord } from '../src/db/repo/tiers.js';
+import { isolateTempDir } from '../test-helpers/tmp.js';
+
+// ⚠️ 隔离本进程临时目录：进程退出时整体回收（防临时目录泄漏，详见 test-helpers/tmp.js）
+isolateTempDir();
 
 const here = dirname(fileURLToPath(import.meta.url));
 const NOW = '2026-10-20T00:00:00.000Z';
@@ -3653,8 +3657,12 @@ test('★ 段位口径：未知部门不算业务签字、撤回的签字不计�
   const { db, close, dataDir } = setup();
   try {
     // ① 未知部门（法务部）的签字：不是业务部门 → 不算 S 段的那 1 个业务签字
+    // ⚠️ **夹具更新**（2026-10-23 审计 F23 之后）：同一个 (milestone, enterprise) 只允许一条
+    //    **未撤回**的签字（数据库部分唯一索引 + 服务端检查）⇒ 这条签字改成**另一个企业**
+    //    （e_2）⇒ 断言意图（未知部门不算业务签字）**完全不变**，
+    //    且不再依赖「同企业可重复签字」这个已被认定为缺陷的行为。
     db.prepare(`INSERT INTO milestone_signoffs (id, milestone_id, enterprise_id, signatory_user_id, department, content, signed_at, revoked_at)
-      VALUES ('sg_3','ms_1','e_1','u_cap','法务部','内容','${NOW}',NULL)`).run();
+      VALUES ('sg_3','ms_1','e_2','u_cap','法务部','内容','${NOW}',NULL)`).run();
     // ② 撤回的签字：对应里程碑不再算「已达成」
     db.prepare(`INSERT INTO milestone_signoffs (id, milestone_id, enterprise_id, signatory_user_id, department, content, signed_at, revoked_at)
       VALUES ('sg_4','ms_3','e_1','u_cap','业务部门','内容','${NOW}','${NOW}')`).run();
@@ -4245,7 +4253,7 @@ import { computeStagePoints, computeMvp, computePersonalPoints } from '../domain
 import { behaviorScore } from '../domain/behavior.js';
 import { applyVisibility } from '../domain/visibility.js';
 import { computeTeamTier } from './tier.js';
-import { buildReverseAuditTasks } from './anticheat.js';
+import { buildReverseAuditTasks, runDetection, toDetectionPeerReviews } from './anticheat.js';
 import { getTiebreakExtraScores } from './tiebreak.js';
 import { cmpStr } from '../domain/util.js';
 import { withTransaction } from '../db/tx.js';
@@ -4255,6 +4263,7 @@ import { withTransaction } from '../db/tx.js';
 //   状态机内核（迁移表 / transition / 终稿推进）已抽到 core 模块 ⇒ 两边共用同一份实现。
 import { finalizeStageResult } from './review-state-core.js';
 import * as repo from '../db/repo/leaderboard.js';
+import { listPeerReviews } from '../db/repo/peer-reviews.js';
 import * as pointsRepo from '../db/repo/points.js';
 import * as tierRepo from '../db/repo/tiers.js';
 
@@ -4575,7 +4584,7 @@ export function publishLeaderboard({ db, editionId, stageId, actorId, now, rules
   //    快照已写、赛段积分已写、档位已写，却**没有审计行、也没有 MVP 积分**，
   //    而 `getPublishState` 还报 `published: true` ⇒ R-AUD-01 依赖的审计轨迹缺失。
   //    （同一份纪律，compute 路径遵守了、publish 路径没有 —— 见 src/services/compute.js。）
-  return withTransaction(db, () => {
+  const published = withTransaction(db, () => {
     // 一次排名结果，发榜全程复用（buildStageRanking 不便宜：破同分/行为分/企业分都要算）
     const built = buildStageRanking({ db, stage, R });
 
@@ -4635,6 +4644,51 @@ export function publishLeaderboard({ db, editionId, stageId, actorId, now, rules
       createdAt, reverseAuditTasks: buildTopReverseAuditTasks({ db, stage, R }),
     };
   });
+
+  // ⚠️ **F47：R-RNK-08「同分队伍互投率过高 ⇒ 组委会复核」原来永远拿不到数据。**
+  //    detectTiedMutualPeerRate 需要两样东西：**最终名次**（同分组）与**互投的队伍对**。
+  //    而全站唯一的生产调用点（src/services/compute.js）在**计算期**传的是 `results: []`
+  //    （名次是发榜时破同分链跑完才有的）⇒ 这条检测**永远不可能触发**
+  //    ⇒ 规则写在纸上，链路是死的。
+  //    ⇒ 现在在**发榜之后**再跑一次：
+  //      ① 名次：读**已落库**的 stage_results.rank（发榜回写，F7）
+  //         —— 同一名次（同分组）才会被算作「同分队伍互投」；
+  //      ② 互评：读 peer_reviews（队 → 队；互评在本仓**只**存在这张表）。
+  //    ⚠️ 检测 ≠ 处罚：只建 flag（status='open'），不改分、不封号、不自动裁决。
+  //    ⚠️ 检测失败**不许**让发榜失败（榜已经发出去了）⇒ 降级成一条显式告警，不静默。
+  //    ⚠️ events / scoreStats / users 传空：这三个检测器的输入口径都在**计算阶段**
+  //    跑过了（见 src/services/compute.js），这里不重复、不改口径；
+  //    互评会重跑（互评可能是在破同分链里才产生的，比计算期更全）。
+  const warnings = [];
+  try {
+    const detection = runDetection({
+      db,
+      stageId: stage.id,
+      results: repo.listStageResults(db, stage.id)
+        .filter((r) => r.rank !== null && r.rank !== undefined)
+        .map((r) => ({ teamId: r.team_id, rank: r.rank })),
+      peerReviews: toDetectionPeerReviews(listPeerReviews(db, stage.id)),
+      events: [],
+      scoreStats: [],
+      users: [],
+      rules: R,
+      now: createdAt,
+    });
+    if (detection?.created?.length) {
+      warnings.push({
+        code: 'anticheat_flags_created',
+        message: `发榜检测出 ${detection.created.length} 条疑似异常，已进人工复核队列（只告警，不改分）`,
+        flags: detection.created.length,
+      });
+    }
+  } catch (err) {
+    warnings.push({
+      code: 'anticheat_detection_failed',
+      message: `发榜后的反作弊检测未能完成：${String(err?.message ?? err)}（检测失败不影响已发出的榜单）`,
+    });
+  }
+
+  return { ...published, warnings };
 }
 
 /**

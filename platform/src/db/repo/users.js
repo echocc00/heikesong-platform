@@ -40,6 +40,17 @@ export function toPublicUser(row, roles = [], capabilities = []) {
     mbaStatus: row.mba_status,
     org: row.org ?? null,
     isSuperadmin: row.is_superadmin === 1,
+    // ⚠️ `is_superadmin`（2026-10-23 审计 F48）：对外形状**同时**带
+    //    `isSuperadmin`（布尔，驼峰）与 `is_superadmin`（0|1，蛇形）。
+    //    原因：服务层读超管标志的写法**历史上不统一** —— `can()` 认两种，
+    //    而 `tier.js` / `performance-card.js` / `workflow.js` / `milestone.js`
+    //    只认 `is_superadmin === 1` ⇒ 对外形状喂进去时**超管静默降级**
+    //    （症状：管理员什么都点不动）。
+    //    ⇒ 这里把两种键**都**带上 ⇒ 拿到对外形状的服务层也能认到超管。
+    //    ⚠️ 这**不是新信息**：两个键说的是同一件事（本人是不是超管），
+    //    `isSuperadmin` 本来就已经对外暴露了 ⇒ 不构成任何泄露。
+    //    ⚠️ 库行形状（`getUserById` 的产物）本来就是蛇形 ⇒ 生产链路上两种形状都在用。
+    is_superadmin: row.is_superadmin === 1 ? 1 : 0,
     active: row.active === 1,
     createdAt: row.created_at,
     roles: Array.isArray(roles) ? roles.filter((r) => typeof r === 'string' && r) : [],
