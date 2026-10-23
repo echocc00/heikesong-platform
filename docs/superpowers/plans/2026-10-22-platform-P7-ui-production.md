@@ -583,6 +583,12 @@ export const NAV_SECTIONS = [
       { path: '/admin/appeals', label: '申诉裁决' },
       { path: '/flags', label: '复核队列' },
       { path: '/publish', label: '赛段发榜' },
+      // ⚠️ P11：加时陈述 / 一票破同分（此前服务层 181 行 + 路由都写好了，**没有任何入口**）
+      { path: '/tiebreak', label: '加时陈述' },
+      // ⚠️ P11：公开访问链接（公开榜单 / 公开日历的令牌，此前**没有任何创建入口**）
+      { path: '/admin/public-links', label: '公开访问链接' },
+      // ⚠️ P11：审计日志（`GET /api/audit/log` 早就挂在后端，前端**从来没调用过**）
+      { path: '/audit/log', label: '审计日志' },
     ],
   },
 ];
@@ -654,6 +660,15 @@ export const ROUTE_CAPABILITIES = {
   '/admin/appeals': 'audit:read',
   '/flags': 'audit:read',
   '/publish': 'stage:compute',
+  // ⚠️ P11：破同分与公开令牌都要求 `stage:compute`（与 API 同口径 ⇒ 前后端一致）
+  '/tiebreak': 'stage:compute',
+  '/admin/public-links': 'stage:compute',
+  // ⚠️ P11：审计日志页要求 `audit:read`（与 `/api/audit/log` 的**全局**能力点同口径）。
+  //    ⛔ 注意 API 的形态：没有 `audit:read` 时它返回的是 **200 + 空集**（不是 403）
+  //    —— 与 `/api/audit/flags`（复核队列）完全同款。
+  //    ⇒ 前端**必须**声明这个能力点，否则没权限的人会看到一张「空空如也的审计表」，
+  //    把「无权」误读成「没记录」（视图侧也据此显示「可能压根没权限」）。
+  '/audit/log': 'audit:read',
 };
 
 /** 路径归一：去掉 query 与结尾斜杠（'/flags/' 与 '/flags' 是同一个页面）。 */
@@ -1525,6 +1540,13 @@ const VIEW_ENDPOINTS = [
     path: '/api/appeals/ap_demo_1/decide',
     body: { decision: 'accepted', note: '演示裁决' },
   },
+  // ── P11：审计日志页 / 发榜 / 破同分 / 公开令牌 ─────────────────────
+  // ⚠️ P11 漏了审计日志页 —— `GET /api/audit/log` 端点虽然实现了，
+  //    但**没有任何写方** ⇒ 演示站上那页永远是空表（页面接上了却什么也看不到）。
+  { method: 'GET', path: '/api/audit/log' },
+  { method: 'GET', path: '/api/stages/stage_final/publish' },
+  { method: 'GET', path: '/api/stages/stage_final/tiebreak/rounds' },
+  { method: 'GET', path: '/api/public/tokens' },
 ];
 
 test('演示适配器必须实现前端用到的**每一个**端点（缺一个 ⇒ 演示站那页就是 404）', async () => {

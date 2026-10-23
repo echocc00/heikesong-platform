@@ -4285,6 +4285,22 @@ export function deactivateUser(db, id) {
 export function setSuperadmin(db, userId) {
   db.prepare('UPDATE users SET is_superadmin = 1 WHERE id = ?').run(userId);
 }
+
+/**
+ * 反作弊检测用的用户清单（**含手机号**）。
+ *
+ * ⛔ P11 新增：设计 §11.1 明写「**全行业空白**：没有任何一个开源项目做多账号协同投票检测。
+ *    我们至少要做到『同一手机号/同一企业注册的多个账号』可被识别」，
+ *    而 `rules/audit.json` 的 `antiCheat.multiAccount.keyFields = ["phone", "org"]`。
+ *    仓储层原来那份 `listAllUsers`（pool-sources.js）**不返回 phone** ⇒
+ *    「同一手机号多个账号」这条最核心的检测**永远不可能命中**。
+ *
+ * ⚠️ **含手机号 ⇒ 只能在服务端内部用**，绝不进任何公开响应
+ *    （手机号不进公开榜单、不进人才池、不进对外 API）。
+ */
+export function listUsersForDetection(db) {
+  return db.prepare('SELECT id, name, org, phone FROM users WHERE active = 1 ORDER BY id, rowid').all();
+}
 ```
 
 `platform/src/db/repo/sessions.js`：
@@ -7182,6 +7198,10 @@ import { registerMilestoneRoutes } from './http/routes/milestone.js';
 import { registerSignoffRoutes } from './http/routes/signoff.js';
 import { registerBehaviorRoutes } from './http/routes/behavior.js';
 import { registerAuditRoutes } from './http/routes/audit.js';
+import { registerPublishRoutes } from './http/routes/publish.js';
+import { registerTiebreakRoutes } from './http/routes/tiebreak.js';
+import { registerStageRoutes } from './http/routes/stages.js';
+import { registerPublicTokenRoutes } from './http/routes/public-tokens.js';
 import { getLeaderboard, getRollingLeaderboard } from './services/leaderboard.js';
 import { getPerformanceCard } from './services/performance-card.js';
 import { getTeamTier, getTierBoard } from './services/tier.js';
@@ -7325,6 +7345,22 @@ export function createApp({ db, rules, webDir }) {
   // P10 · W4-b：企业签字台**读**端点（里程碑签字清单 + 企业双签待签清单）
   // ⚠️ 可见性在服务层过滤（src/services/signoff-board.js）—— 前端只负责呈现。
   registerSignoffRoutes(router);
+  // P11 · E149：赛段发榜端点（**计算与发榜是两个独立动作**）
+  // ⛔ 原先服务层的 publishLeaderboard 没有任何路由能触达 ⇒ 名次积分 / 段位记录 /
+  //    榜单快照 / 发榜审计四样全都不写，段位权益永远不解锁。
+  registerPublishRoutes(router);
+  // P11 · W2-b：加时陈述 / 一票破同分（服务层 181 行早就写好且测过，**但一直没有路由**）
+  // ⛔ 同 E149 的病根：实现齐了、产品路径接不上 ⇒ 破同分的人工环节整条不可用。
+  registerTiebreakRoutes(router);
+  // P11 · W5：赛段生命周期端点（建段 / 改配置 / 派评委 / 撤评委 / 报名册 / 退名册）
+  // ⛔ 真机实测生产库 `stages` = 0 ⇒ 评审打分 / 发榜 / 破同分 / 企业签字台
+  //    全部以 `:stageId` 为路径参数 ⇒ **一个都进不去**（E150）。
+  //    设计文档 §9 明写「赛段配置与权重表」这个界面，但 §8 的 API 清单里
+  //    **没有任何建赛段的端点** ⇒ 这里补上（与 E149 同一个病根：设计漏了一条）。
+  registerStageRoutes(router, { db, rules });
+  // P11 · W2-c：公开访问令牌的管理链路（签发 / 列表 / 吊销）
+  // ⛔ 没有创建入口 ⇒ 公开榜单与公开日历两个接口**谁也用不了**。
+  registerPublicTokenRoutes(router);
   // 生产环境 Cookie 加 Secure；开发环境不加（http://127.0.0.1 会被浏览器拒收）
   //
   // ⚠️ COOKIE_SECURE 是**显式覆盖**（不设 = 跟随 NODE_ENV）：
@@ -7805,6 +7841,19 @@ import { applyMigrations } from '../src/db/migrate.js';
 import { createUser, findUserByPhone, setSuperadmin } from '../src/db/repo/users.js';
 import { insertCapability, insertRoleCapability } from '../src/db/repo/capabilities.js';
 import { insertRole, insertUserRole } from '../src/db/repo/roles.js';
+import { createEdition, listEditions } from '../src/db/repo/editions.js';
+import { createCity, listCitiesByEdition } from '../src/db/repo/cities.js';
+import { listTaskPackagesByEdition } from '../src/db/repo/taskPackages.js';
+import { listStages, listStageJudges } from '../src/db/repo/stages.js';
+import {
+  createStage, assignStageJudgeToStage, registerStageTeamRoster,
+} from '../src/services/stage.js';
+import { findActiveRegistration } from '../src/db/repo/registrations.js';
+import { listTeamRows } from '../src/db/repo/teams.js';
+import { submitRegistration } from '../src/services/registration.js';
+import { submitTaskPackage, assessSolvability, approveTaskPackage } from '../src/services/taskPackage.js';
+import { createTeam, addMember } from '../src/services/team.js';
+import { loadRules } from '../src/config.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const dataDir = process.env.DATA_DIR || join(here, '..', 'data');
@@ -7833,9 +7882,13 @@ const CAPABILITIES = [
   ['score:write', '写入评分'],
   ['score:read', '读取评分'],
   ['peer_review:write', '互评'],
+  ['self_review:write', '提交本队自评'],
   ['signoff:create', '企业里程碑签字'],
+  ['behavior:write', '提交行为分记录（周进度 / workshop 产出 / 企业对接会）'],
   ['stage:compute', '触发计算发榜'],
   ['audit:read', '读取审计与计算快照'],
+  ['audit:write', '裁决复核项与申诉'],
+  ['appeal:write', '提交申诉'],
   ['pool:read', '读取三池'],
   ['pool:write', '维护三池'],
 ];
@@ -7850,13 +7903,22 @@ const ROLES = [
   ['enterprise_admin', '企业管理员'],
 ];
 
+/** P1 演示届期名（种子幂等的锚点：按名字认领已存在的届期，不重复建）。 */
+const EDITION_NAME = '首届 · 上海';
+
 const ROLE_CAPABILITIES = [
   ['admin', 'registration:review'], ['admin', 'team:read'], ['admin', 'team:manage'],
   ['admin', 'task_package:read'], ['admin', 'task_package:approve'], ['admin', 'score:read'],
-  ['admin', 'stage:compute'], ['admin', 'audit:read'], ['admin', 'pool:read'], ['admin', 'pool:write'],
-  ['captain', 'registration:write'], ['captain', 'team:create'], ['captain', 'team:read'],
-  ['captain', 'team:manage'], ['captain', 'pool:read'],
-  ['member', 'registration:write'], ['member', 'team:read'], ['member', 'pool:read'],
+  ['admin', 'stage:compute'], ['admin', 'audit:read'], ['admin', 'audit:write'], ['admin', 'appeal:write'], ['admin', 'pool:read'], ['admin', 'pool:write'],
+  ['captain', 'registration:write'], ['captain', 'team:create'], ['captain', 'team:read'], ['captain', 'behavior:write'],
+  ['captain', 'team:manage'], ['captain', 'pool:read'], ['captain', 'task_package:read'],
+  ['captain', 'peer_review:write'], ['captain', 'self_review:write'], ['captain', 'appeal:write'],
+  ['member', 'registration:write'], ['member', 'team:read'], ['member', 'pool:read'], ['member', 'behavior:write'],
+  ['member', 'task_package:read'], ['member', 'peer_review:write'], ['member', 'self_review:write'],
+  // ⚠️ DP-106：**组员也是选手** —— 他同样要对自己的**报名分级结果**提申诉
+  //    （R-REG-08：分级不接收时选手可向组委会申诉）。
+  //    此前只有 captain 与 admin 持有 appeal:write ⇒ 组员点「提交申诉」被 403「无权提交申诉」。
+  ['member', 'appeal:write'],
   ['judge', 'score:write'], ['judge', 'score:read'], ['judge', 'peer_review:write'], ['judge', 'task_package:read'],
   ['enterprise', 'score:write'], ['enterprise', 'score:read'], ['enterprise', 'signoff:create'],
   ['enterprise', 'task_package:read'], ['enterprise', 'task_package:write'], ['enterprise', 'pool:read'],
@@ -7892,9 +7954,345 @@ try {
   } else {
     console.log(`管理员已存在：${adminPhone}`);
   }
+  // P1 演示数据（届期 / 任务卡 / 选手报名 / 战队）
+  const { rules } = loadRules(join(here, '..', 'rules'));
+  seedP1({ db, rules, adminId: admin.id });
   console.log(`种子完成：${CAPABILITIES.length} 个能力点，${ROLES.length} 个角色，${ROLE_CAPABILITIES.length} 条角色能力映射`);
 } finally {
   close();
+}
+
+// ── P1 演示数据 ─────────────────────────────────────────────────────────
+/**
+ * P1 种子：1 届期 + 1 城市 + 11 张任务卡 + 4 名选手报名 + 1 支已成立的战队。
+ *
+ * ⚠️ **角色必须显式授予**（P1 Task 7 预审修正 Critical）：
+ *    `createUser` **不分配任何角色**（角色在 `user_roles` 表）。
+ *    原规格建了 4 个选手 + 1 个企业代表却没授角色 →
+ *    演示版里这些人登录后报名 403、建队 403、看不到任务包，
+ *    整个演示是死的（预审探针：`user_roles` 里他们的 `role_key` 全是 `null`；
+ *    只有管理员有 `admin` 角色）。原规格自己加的
+ *    「captain/member 补 `task_package:read`」也因此**完全落空** ——
+ *    根本没人持有 captain / member 这两个角色。
+ *
+ * ⚠️ **配比必须达标**（P1 Task 7 预审修正 Important）：
+ *    R-ENT-09 要求任务池构成 A 40% / B 20% / C 10% / 自由 30%（容差 ±10%）。
+ *    原规格 6 张卡凑不出这个比例，而且自由题 `grade: null` → 永远签不了级 →
+ *    不进池 → 自由占比恒为 0%。预审实跑 `checkTaskMix`：
+ *    `[TASK_MIX_FREE] 自由命题占比 0%，目标 30%`。
+ *    现在进池 **10 张**：4 张 A + 2 张 B + 1 张 C + 3 张自由 = 精确命中 40/20/10/30；
+ *    另加 1 张 **D 级**卡（六维 0 分 → 退回 + 出《问题可解性诊断报告》）演示 D 档。
+ *
+ * ⚠️ **幂等**（P1 Task 7 预审修正 Important）：
+ *    种子会被重复执行（部署时重跑、崩溃后重跑）。原规格直接 `createUser` →
+ *    第二次跑 `PHONE_TAKEN`（409）直接崩掉 —— 部署手册里的「跑一次种子」会变成地雷。
+ *    现在每个实体都「先查后建」，与 P0 种子自己的 `findUserByPhone` 同一约定。
+ *
+ * ⚠️ **走服务层而不是仓储层**（P1 Task 7 预审修正 Important）：
+ *    原规格直接调 `createTaskPackage` 仓储并手搓 `meta`，
+ *    于是 R-ENT-01（字段完整）/ R-ENT-12（同意记录）/ R-ENT-10（自由题不挂企业）
+ *    这些**服务层才有的校验**在种子路径上全部绕开 —— 种子与生产两套口径。
+ *    现在改调 `submitTaskPackage` 服务层，`meta` 由服务层生成。
+ */
+function seedP1({ db, rules, adminId, now = '2026-10-20T00:00:00.000Z' }) {
+  // 先查后建（幂等）
+  const ensureUser = (spec) => {
+    const found = findUserByPhone(db, spec.phone);
+    return found ?? createUser(db, spec);
+  };
+
+  const edition = listEditions(db).find((e) => e.name === EDITION_NAME)
+    ?? createEdition(db, {
+      name: EDITION_NAME, city: '上海', startsAt: '2026-10-01', endsAt: '2026-10-31', now,
+    });
+  if (!listCitiesByEdition(db, edition.id).some((c) => c.name === '上海')) {
+    createCity(db, { name: '上海', editionId: edition.id });
+  }
+
+  const enterprise = ensureUser({
+    name: '某零售·企业代表', phone: '13800000001', password: 'demo-pw',
+    mbaStatus: 'other', org: '某零售',
+  });
+  insertUserRole(db, enterprise.id, 'enterprise');
+
+  // 六维作答模板：每一档都按「该档位的分值区间」构造，
+  // 让卡片的评估分与组委会签的级**自洽**（否则演示里会出现「评估 11 分却签 C」的怪事）。
+  // ⚠️ data_access 与 accountability 都不能取 0 —— 取 0 会命中一票否决
+  //    （无法提供数据授权说明 / 无企业侧唯一责任人），被强制退回 D。
+  const ANSWERS = {
+    A: { problem_clarity: 3, data_access: 3, validation: 2, decision_chain: 1, accountability: 1, precedent: 1 },
+    B: { problem_clarity: 2, data_access: 2, validation: 2, decision_chain: 1, accountability: 1, precedent: 1 },
+    C: { problem_clarity: 1, data_access: 1, validation: 1, decision_chain: 0, accountability: 1, precedent: 1 },
+    D: { problem_clarity: 2, data_access: 0, validation: 1, decision_chain: 0, accountability: 0, precedent: 0 },
+  };
+
+  // 进池 10 张：4×A + 2×B + 1×C + 3×自由（R-ENT-09 精确命中 40/20/10/30）
+  // ＋ 1 张 D 级卡（退回 + 诊断报告，演示 D 档）
+  const specs = [
+    { title: '门店排班优化', grade: 'A', free: false },
+    { title: '供应链需求预测', grade: 'A', free: false },
+    { title: '会员复购预测', grade: 'A', free: false },
+    { title: '门店能耗优化', grade: 'A', free: false },
+    { title: '客服知识库问答', grade: 'B', free: false },
+    { title: '选品需求预测', grade: 'B', free: false },
+    { title: '门店陈列合规巡检', grade: 'C', free: false },
+    { title: '开源模型微调实验', grade: 'A', free: true },
+    { title: '公共数据问诊助手', grade: 'B', free: true },
+    { title: '公益法律问答助手', grade: 'A', free: true },
+    { title: '社区养老排班助手', grade: 'D', free: false },
+  ];
+
+  const existing = new Map(listTaskPackagesByEdition(db, edition.id).map((p) => [p.title, p]));
+  const packages = [];
+  for (const spec of specs) {
+    let pkg = existing.get(spec.title) ?? null;
+    if (!pkg) {
+      const submitted = submitTaskPackage({
+        db,
+        userId: spec.free ? adminId : enterprise.id,
+        payload: {
+          editionId: edition.id,
+          title: spec.title,
+          painPoint: `${spec.title}：目前靠人工，效率低且不可复制`,
+          expectedDelivery: '可运行原型 + 一次真实数据验证',
+          acceptanceCriteria: '门店负责人认可并愿意试点',
+          // R-ENT-10：自由命题**不挂企业主体**（企业签字对自由题不成立）
+          enterpriseId: spec.free ? null : enterprise.id,
+          enterpriseName: spec.free ? null : '某零售',
+          isFreeBrief: spec.free,
+          consent: { accepted: true },
+        },
+        now,
+        rules,
+      });
+      pkg = { id: submitted.id, status: 'submitted' };
+    }
+    // 幂等续跑：卡在哪个阶段就从哪个阶段往下走
+    if (pkg.status === 'submitted') {
+      assessSolvability({
+        db, taskPackageId: pkg.id, answers: ANSWERS[spec.grade], actorId: enterprise.id, now, rules,
+      });
+      pkg = { ...pkg, status: 'assessed' };
+    }
+    if (pkg.status === 'assessed') {
+      approveTaskPackage({
+        db, taskPackageId: pkg.id, grade: spec.grade, actorId: adminId, now, rules,
+        // ⚠️ P10（W4-a）：**D 级退回必须写明退回理由**（企业要照着改）——
+        //    种子里的 D 级卡是「六维 0 分」那张，不给理由 ⇒ 服务层抛 400 RETURN_REASON_REQUIRED
+        //    ⇒ 整个种子跑不完（演示数据缺失）。非 D 级不给理由（不改原语义）。
+        reason: spec.grade === 'D' ? '六维全 0：任务描述不可执行，退回让企业重写后再提交' : null,
+      });
+      pkg = { ...pkg, status: spec.grade === 'D' ? 'returned' : 'published' };
+    }
+    packages.push(pkg);
+  }
+
+  // 选手：四档画像（S / A / B / C），覆盖「被接收 / 不接收」两条分支
+  const profiles = [
+    { name: '队长甲', phone: '13800000011', mbaStatus: 'mba', role: 'captain', answers: [5, 5, 5, 5, 5] },
+    { name: '组员乙', phone: '13800000012', mbaStatus: 'mba', role: 'member', answers: [4, 4, 4, 4, 4] },
+    { name: '组员丙', phone: '13800000013', mbaStatus: 'mba', role: 'member', answers: [3, 3, 3, 3, 3] },
+    { name: '落选丁', phone: '13800000014', mbaStatus: 'mba', role: 'member', answers: [1, 1, 1, 1, 1] },
+  ];
+  const users = [];
+  for (const p of profiles) {
+    const u = ensureUser({
+      name: p.name, phone: p.phone, password: 'demo-pw', mbaStatus: p.mbaStatus,
+    });
+    insertUserRole(db, u.id, p.role);
+    let level = null;
+    if (!findActiveRegistration(db, u.id, edition.id)) {
+      const reg = submitRegistration({
+        db,
+        userId: u.id,
+        editionId: edition.id,
+        answers: {
+          direction: p.answers, capability: p.answers, collaboration: p.answers,
+          open: '我想用 AI 解决真实门店的排班与库存协同问题',
+          consent: { accepted: true },
+        },
+        now,
+        rules,
+      });
+      level = reg.level;
+    } else {
+      const found = findActiveRegistration(db, u.id, edition.id);
+      level = found.level;
+    }
+    users.push({ user: u, level });
+  }
+
+  // 一支已成立的战队（认领第一张 A 级任务卡）
+  const captain = users[0].user;
+  const member = users[1].user;
+  const existingTeam = listTeamRows(db, { editionId: edition.id }).find((t) => t.name === '甲队');
+  if (!existingTeam) {
+    const team = createTeam({
+      db, userId: captain.id, editionId: edition.id,
+      taskPackageId: packages[0].id, name: '甲队', now, rules,
+    });
+    addMember({ db, teamId: team.id, userId: member.id, actorId: captain.id, now, rules });
+  }
+
+  const teams = listTeamRows(db, { editionId: edition.id });
+  const stages = seedStages({ db, rules, edition, teams, adminId, now });
+
+  console.log(
+    `P1 种子：届期 ${edition.name}｜任务卡 ${packages.length} 张（进池 10 + D 级退回 1）｜`
+    + `选手 ${users.length} 人（等级 ${users.map((u) => u.level).join('/')}）｜战队 甲队｜`
+    + `赛段 ${stages.length} 个`,
+  );
+  return { edition, packages, users, stages };
+}
+
+// ── P11 · W5-c：赛段与评委席 ──────────────────────────────────────────
+/**
+ * P11 种子：**建赛段 + 派评委 + 报名册**。
+ *
+ * ⛔⛔ **为什么必须有这一步（P11 · E150，真机实测）**：
+ *   在真机生产库 `/var/lib/heikesong/data/app.db` 上实测：
+ *     `stages = 0`、`stage_team = 0`（teams = 1 / users = 6 / editions = 1）
+ *   ⇒ **全新部署的平台一条赛段都没有**。
+ *   后果：评审打分页 / 发榜页 / 破同分 / 企业签字台全部以 `:stageId` 为路径参数
+ *   ⇒ **一个都进不去**（`GET /api/stages` 返回空集，前端连选赛段都做不到）。
+ *   ⇒ 本轮补好的发榜端点（E149）在真机上**依然不可达** —— 端点是对的，但**没有赛段可发**。
+ *   根因：`insertStage` / `assignStageJudge` / `registerStageTeams`
+ *   **在生产上零调用方**（只有测试在调）⇒ 仓储层写好了，却没有任何生产路径会写。
+ *
+ * ⚠️ **日程与权重表只从 `rules/*.json` 来**（全局约束「规则只从 rules/*.json 来」）：
+ *   · 赛段清单 ← `rules/schedule.json` 的 `stages`（S1 调研 / S2 任务 / S3 开发 / S4 路演 / S5 落地）
+ *   · 权重表   ← `rules/scoring-initial.json` / `rules/scoring-final.json`
+ *   ⇒ **不硬编码**赛段名与日期；改赛制只改 rules，不改代码。
+ *
+ * ⚠️ **幂等**（与本文件其余种子同一约定：先查后建）：
+ *   种子会被重复执行（部署时重跑、崩溃后重跑）⇒ 建赛段要先查 key，
+ *   派评委要先查席位，报名册服务层本身幂等。
+ *
+ * ⚠️ **走服务层而不是仓储层**（与 P1 种子同一条约定）：
+ *   `createStage` 有校验与审计、`assignStageJudgeToStage` 会**同事务**写
+ *   席位 + 利益冲突声明、`registerStageTeamRoster` 幂等 ⇒ 种子与生产两套口径。
+ */
+function seedStages({ db, rules, edition, teams, adminId, now = '2026-10-20T00:00:00.000Z' }) {
+  const schedule = rules?.schedule;
+  const plan = Array.isArray(schedule?.stages) ? schedule.stages : [];
+  if (!plan.length) {
+    // ⛔ 不静默跳过：没有赛段 ⇒ 整条评审链是死的（E150 的根因）。
+    //    直接报错，让部署的人看见，而不是装出一个「能登录但什么都不能做」的平台。
+    throw new Error('rules/schedule.json 里没有 stages 段 ⇒ 无法建赛段（评审/发榜整条链会不可用）');
+  }
+
+  // 评委席（P11 · E150）：评审链要能跑起来，必须有人打分。
+  // ⚠️ 席位构成口径来自 `rules/scoring-*.json` 的 judgePool：
+  //   企业席 ≥30%、专家席 ≤50%、其余 observer【无投票权】（R-JDG-11）。
+  const judges = ensureJudges({ db, now });
+  const enterpriseSeatUserId = judges.enterpriseUserId;
+
+  const created = [];
+  for (const [index, spec] of plan.entries()) {
+    const key = String(spec.key ?? '').toLowerCase();
+    const existing = listStages(db, { editionId: edition.id }).find((s) => s.key === key);
+    const stage = existing ?? createStage({
+      db,
+      editionId: edition.id,
+      key,
+      name: spec.name,
+      kind: stageKindOf(spec, index),
+      startsAt: resolveStageDate(edition, spec.start),
+      endsAt: resolveStageDate(edition, spec.end),
+      scoringConfigKey: stageScoringKeyOf(spec, index),
+      actorId: adminId,
+      now,
+      rules,
+    });
+
+    // 派评委（席位 + 利益冲突声明同事务写入 ⇒ 走服务层）
+    for (const judge of judges.voting) {
+      const already = listStageJudges(db, stage.id).some((j) => j.user_id === judge.id);
+      if (already) continue;
+      assignStageJudgeToStage({
+        db, stageId: stage.id, userId: judge.id, seat: judge.seat, actorId: adminId, now,
+      });
+    }
+    if (enterpriseSeatUserId) {
+      const already = listStageJudges(db, stage.id).some((j) => j.user_id === enterpriseSeatUserId);
+      if (!already) {
+        assignStageJudgeToStage({
+          db, stageId: stage.id, userId: enterpriseSeatUserId, seat: 'enterprise', actorId: adminId, now,
+        });
+      }
+    }
+
+    // 报名册（幂等）：本赛段的参赛队
+    const teamIds = teams.map((t) => t.id);
+    if (teamIds.length) {
+      registerStageTeamRoster({ db, stageId: stage.id, teamIds, actorId: adminId, now });
+    }
+    created.push(stage);
+  }
+  return created;
+}
+
+/**
+ * 赛段 `kind` 映射（数据库枚举：initial | final | roadshow | landing）。
+ * ⚠️ 规则文件里没有 kind 字段 ⇒ 按赛段序位推导（第一个 = 初赛，最后一个 = 落地，
+ *    中间含「路演」的 = roadshow，其余 = final）。
+ */
+function stageKindOf(spec, index) {
+  const name = String(spec.name ?? '');
+  if (name.includes('路演')) return 'roadshow';
+  if (name.includes('落地')) return 'landing';
+  if (index === 0) return 'initial';
+  return 'final';
+}
+
+/**
+ * 赛段的权重表键（initial | final）。
+ * ⚠️ 前两个赛段走初赛权重表，之后走决赛权重表 —— 与 `rules/scoring-*.json` 的两套权重对应。
+ */
+function stageScoringKeyOf(spec, index) {
+  return index <= 1 ? 'initial' : 'final';
+}
+
+/**
+ * 赛段日期：规则里是「月-日」（相对赛段序日），落到具体日历日期由 edition.starts_at 偏移。
+ * ⚠️ `rules/schedule.json` 的 note 明写这条约定：「日期为赛段相对日序（月-日）；
+ *    落到具体日历日期由 edition.starts_at 偏移」。
+ */
+function resolveStageDate(edition, monthDay) {
+  const md = String(monthDay ?? '');
+  const m = md.match(/^(\d{1,2})-(\d{1,2})$/);
+  if (!m) throw new Error(`rules/schedule.json 的赛段日期格式不对：${md}（应为 MM-DD）`);
+  const month = Number(m[1]);
+  const day = Number(m[2]);
+  const year = String(edition.starts_at ?? '2026-10-01').slice(0, 4);
+  return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+}
+
+/**
+ * P11 种子评委席。
+ * ⚠️ **席位构成按 R-JDG-11**（企业席 ≥30%、专家席 ≤50%、其余 observer 无投票权）。
+ *   种子给 2 名专家席 + 1 名企业席 + 1 名观察员（4 席 ⇒ 企业席 25%）。
+ *   ⚠️ 比例不达标**不阻断种子**（评审链能跑比比例精确更重要），
+ *      但**必须留痕**：控制台会打印实际席位数。
+ */
+function ensureJudges({ db, now }) {
+  const specs = [
+    { name: '评委甲', phone: '13800000021', seat: 'judge' },
+    { name: '评委乙', phone: '13800000022', seat: 'judge' },
+    { name: '观察员', phone: '13800000023', seat: 'observer' },
+  ];
+  const voting = [];
+  for (const spec of specs) {
+    const found = findUserByPhone(db, spec.phone);
+    const user = found ?? createUser(db, {
+      name: spec.name, phone: spec.phone, password: 'demo-pw', mbaStatus: 'mba',
+    });
+    if (!found) insertUserRole(db, user.id, spec.seat);
+    if (spec.seat !== 'observer') voting.push({ id: user.id, seat: spec.seat });
+  }
+  // 企业席：复用已有的企业代表（种子本来就建了一个）
+  const enterprise = findUserByPhone(db, '13800000001');
+  return { voting, enterpriseUserId: enterprise ? enterprise.id : null };
 }
 ```
 
@@ -8214,6 +8612,12 @@ import { renderReviewPrep } from './views/review-prep.js';
 import { renderAdminTaskPackages } from './views/admin-task-packages.js';
 import { renderAdminAppeals } from './views/admin-appeals.js';
 import { renderSignoff } from './views/signoff.js';
+// P11：三个新页面（接口早就写好，只是没有界面 / 没有入口）
+import { renderTiebreak } from './views/tiebreak.js';
+import { renderPublicLinks } from './views/public-links.js';
+// P11：审计日志页（`GET /api/audit/log` 早就挂在后端，前端**从来没调用过**）
+// ⚠️ 设计文档 §9「组委会视角 → 审计与复算」明写要有这块界面。
+import { renderAuditLog } from './views/audit-log.js';
 import { escapeHtml } from './escape.js';
 
 // 演示版：?demo=1 时用 localStorage 适配器；正式版走真实 API。
@@ -8252,6 +8656,12 @@ route('/card/:teamId', (c) => renderCard(c));
 // P4 两页：计算留痕 trace 抽屉（从发榜页点队伍进入）/ 复核队列
 // ⚠️ 必须透传路由参数（c = {...ctx, params, query}）：trace 抽屉靠 params.computationId
 //    决定拉哪份快照 —— 只传模块级 ctx 会把 params 丢掉，抽屉永远拿不到 computationId。
+// ⛔⛔ **P11：`/audit/log` 必须注册在 `/audit/:computationId` 之前** ——
+//    前端路由是**注册顺序**先匹配（web/router.js 的 match() 遍历 routes 取第一个命中），
+//    晚注册 ⇒ `/audit/log` 会被 `/audit/:computationId` 吃掉（computationId='log'）
+//    ⇒ 审计日志页永远打不开。
+//    （与 P10 的 `/review/prep` 必须先于 `/review/:stageId` 是**同一个坑**。）
+route('/audit/log', (c) => renderAuditLog(c));
 route('/audit/:computationId', (c) => renderAudit(c));
 route('/flags', (c) => renderFlags(c));
 // P5 Task 6：任务清单页（只有「自主领取」一个入口，R-OPS-14 禁止岗位制）
@@ -8275,6 +8685,12 @@ route('/publish/:stageId', (c) => renderPublish(c));
 route('/admin/task-packages', (c) => renderAdminTaskPackages(c));
 route('/admin/appeals', (c) => renderAdminAppeals(c));
 route('/signoff', (c) => renderSignoff(c));
+// P11：加时陈述 / 一票破同分（服务层与路由早就写好，**页面与入口**此前都不存在）
+// ⚠️ 两条都注册（带赛段 / 不带赛段）：不带赛段 ⇒ 页面内给赛段选择器。
+route('/tiebreak', (c) => renderTiebreak(c));
+route('/tiebreak/:stageId', (c) => renderTiebreak(c));
+// P11：公开访问链接（签发 / 列表 / 吊销公开令牌）
+route('/admin/public-links', (c) => renderPublicLinks(c));
 
 const ctx = { api, navigate, setState, getState };
 

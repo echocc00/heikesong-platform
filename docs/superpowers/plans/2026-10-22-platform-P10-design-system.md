@@ -395,6 +395,8 @@ export function enterpriseConfirmRows(raw) {
       hasCrossJudge,
       missing,
       dimension: first?.dimension ?? null,
+      // ⛔ P11 · E141：逆向路径（撤回 / 改签）要按**确认 id**操作 ⇒ 这里把 id 带出来。
+      confirmationId: first?.id ? String(first.id) : null,
       rawScore: typeof first?.rawScore === 'number' ? first.rawScore : null,
       signedAt: first?.signedAt ?? null,
       content: first?.content ?? null,
@@ -672,15 +674,38 @@ function missingHtml(row) {
 
 /** 企业双签清单表格（纯 HTML）。 */
 function confirmTableHtml(rows) {
+  // ⛔ P11 · E141：企业确认落库后必须**能改、能撤** ——
+  //    此前只有正向流程 ⇒ 签错了改不了、缺的那一半签**永远补不上**（企业席恒 0 分且产品内修不了）。
+  const actions = (row) => {
+    if (!row.signed || !row.confirmationId) return '<span class="muted small">—</span>';
+    const cid = escapeHtml(row.confirmationId);
+    const label = row.hasCrossJudge ? '改签' : '补签并改签';
+    return `<div class="row">
+        <button type="button" class="btn btn--ghost btn--sm" data-action="confirm-resign"
+          data-confirmation="${cid}" data-team="${escapeHtml(row.teamId)}">${label}</button>
+        <button type="button" class="btn btn--danger btn--sm" data-action="confirm-withdraw"
+          data-confirmation="${cid}" data-team="${escapeHtml(row.teamId)}">撤回</button>
+        <div class="signoff__confirm" data-confirm="confirm-withdraw" data-confirmation="${cid}" hidden>
+          <p class="signoff__confirm-text">撤回后这条企业确认失效（证据留痕），该队企业席计分归零，需重新计算并重新发榜。确认撤回？</p>
+          <div class="row">
+            <button type="button" class="btn btn--danger btn--sm" data-action="confirm-withdraw-confirm"
+              data-confirmation="${cid}">确认撤回</button>
+            <button type="button" class="btn btn--ghost btn--sm" data-action="confirm-withdraw-cancel"
+              data-confirmation="${cid}">取消</button>
+          </div>
+        </div>
+      </div>`;
+  };
   const body = rows.map((row) => `<tr>
       <td>${escapeHtml(row.teamName || row.teamId)}</td>
       <td>${escapeHtml(row.taskPackageTitle ?? '—')}</td>
       <td>${row.signed ? badge(row.hasCrossJudge ? '已确认（双签齐全）' : '已确认（缺双签）', row.hasCrossJudge ? 'success' : 'danger') : badge('待确认', 'warn')}</td>
       <td>${missingHtml(row)}</td>
+      <td>${actions(row)}</td>
     </tr>`).join('');
   return tableWrap(
-    `<thead><tr><th>队伍</th><th>任务包</th><th>状态</th><th>还缺</th></tr></thead>
-     <tbody>${body || emptyRow(4, '这个赛段没有你能确认的队伍')}</tbody>`,
+    `<thead><tr><th>队伍</th><th>任务包</th><th>状态</th><th>还缺</th><th>操作</th></tr></thead>
+     <tbody>${body || emptyRow(5, '这个赛段没有你能确认的队伍')}</tbody>`,
     { caption: '企业确认待签清单' },
   );
 }
@@ -1084,6 +1109,77 @@ export async function renderSignoff(ctx) {
     }
   };
 
+  /**
+   * 撤回一条企业确认（P11 · E141）。
+   * ⚠️ 撤回是软删：证据留痕（deleted_at + 审计日志），但该队企业席计分归零。
+   */
+  const submitConfirmWithdraw = async (confirmationId) => {
+    const slot = feedback('confirm');
+    const stage = encodeURIComponent(state.stageId);
+    try {
+      await ctx.api.post(`/api/stages/${stage}/enterprise-confirmations/${encodeURIComponent(confirmationId)}/withdraw`, {});
+      if (slot) {
+        slot.innerHTML = noticeState({
+          tone: 'success',
+          title: '已撤回企业确认',
+          items: ['该条确认已失效（证据留痕）。请重新计算并重新发榜 —— 名次与段位会跟着变。'],
+        });
+      }
+      await loadBoard();
+    } catch (e) {
+      if (slot) {
+        slot.innerHTML = errorState({
+          message: e?.message ?? '撤回失败',
+          hint: '只有签字的出题企业（或组委会）可以撤回。',
+        });
+      }
+    }
+  };
+
+  /**
+   * 改签一条企业确认（P11 · E141 + E148①）。
+   * ⚠️ 表单里现在的分数 / 内容就是改签后的值；
+   *    **缺的那一半跨领域签字**在改签时一并**后补**（R2 双签的后补路径）。
+   */
+  const submitConfirmResign = async (confirmationId, teamId) => {
+    const slot = feedback('confirm');
+    const rows = enterpriseConfirmRows(state.board);
+    const row = rows.find((r) => r.teamId === teamId) ?? null;
+    const stage = encodeURIComponent(state.stageId);
+    const payload = {};
+    const scoreText = value('[data-confirm="rawScore"]');
+    const score = Number(scoreText);
+    if (scoreText !== '' && Number.isFinite(score)) payload.rawScore = score;
+    const content = value('[data-confirm="content"]');
+    if (content) payload.content = content;
+    // ⛔ 只有**缺**双签时才补 crossJudgeId（已有签字的不覆盖别人的签名）
+    if (row && !row.hasCrossJudge) {
+      const judge = value('[data-confirm="crossJudge"]');
+      if (judge) payload.crossJudgeId = judge;
+    }
+    try {
+      await ctx.api.post(
+        `/api/stages/${stage}/enterprise-confirmations/${encodeURIComponent(confirmationId)}/resign`,
+        payload,
+      );
+      if (slot) {
+        slot.innerHTML = noticeState({
+          tone: 'success',
+          title: '已改签',
+          items: ['改签已生效（原记录留痕）。请重新计算并重新发榜 —— 名次与段位会跟着变。'],
+        });
+      }
+      await loadBoard();
+    } catch (e) {
+      if (slot) {
+        slot.innerHTML = errorState({
+          message: e?.message ?? '改签失败',
+          hint: '内容与分数只能由签字的出题企业（或组委会）改；跨领域评委只能给自己补签。',
+        });
+      }
+    }
+  };
+
   // 首屏：两个区块各自加载，互不牵连（一个失败不拖垮另一个）。
   await loadStages();
   await loadWorklist();
@@ -1118,6 +1214,26 @@ export async function renderSignoff(ctx) {
     }
     if (action === 'confirm-submit') {
       submitEnterpriseConfirm();
+      return;
+    }
+    // ⛔ P11 · E141：撤回（破坏性 ⇒ 二次确认）
+    if (action === 'confirm-withdraw') {
+      const box = wrap.querySelector(`[data-confirm="confirm-withdraw"][data-confirmation="${btn.dataset.confirmation}"]`);
+      if (box) box.hidden = false;
+      return;
+    }
+    if (action === 'confirm-withdraw-cancel') {
+      const box = wrap.querySelector(`[data-confirm="confirm-withdraw"][data-confirmation="${btn.dataset.confirmation}"]`);
+      if (box) box.hidden = true;
+      return;
+    }
+    if (action === 'confirm-withdraw-confirm') {
+      submitConfirmWithdraw(btn.dataset.confirmation);
+      return;
+    }
+    // ⛔ P11 · E141 + E148①：改签（更正内容 / 分数；缺的那一半签字就在这里**后补**）
+    if (action === 'confirm-resign') {
+      submitConfirmResign(btn.dataset.confirmation, btn.dataset.team);
       return;
     }
   });

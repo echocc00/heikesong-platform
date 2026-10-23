@@ -4443,6 +4443,9 @@ test('追加·段位榜：C 段及以上公示，D 段只给本人进度卡（�
 
 test('追加·滚动总榜：scope=rolling，按积分排序', async () => {
   const api = createDemoApi({ storage: makeStorage(), seed, rules });
+  // ⚠️ P11：演示站的 compute 与正式站**同口径** —— 都要先登录
+  //    （正式站 src/http/routes/review.js 的 compute 走 requireStageCapability ⇒ requireUser）。
+  await api.post('/api/auth/login', { name: '演示管理员' });
   await api.post('/api/stages/stage_final/compute', {});
   const rolling = await api.get('/api/leaderboard/rolling');
   assert.equal(rolling.scope, 'rolling', '滚动总榜的 scope 必须是 rolling');
@@ -4750,6 +4753,10 @@ test('规则配置同源：浏览器侧的 12 份配置与正式系统 loadRules
 test('浏览器入口路径可跑通：fetch 取种子与规则 → 计算 → 拿到结果', async () => {
   installFetchStub([webDir, platformDir]);
   const runtime = await getDemoRuntime();
+  // ⚠️ P11：演示站的 compute 与正式站**同口径** —— 都要先登录
+  //    （正式站 src/http/routes/review.js 的 compute 走 requireStageCapability ⇒ requireUser）。
+  //    ⇒ 演示适配器此前允许「匿名计算」，那是与正式站**不一致**的地方，本轮对齐。
+  await runtime.post('/api/auth/login', { name: '演示管理员' });
   const health = await runtime.get('/api/health');
   assert.equal(health.ok, true);
   assert.equal(health.demo, true);
@@ -4781,6 +4788,10 @@ test('演示版与正式引擎逐字一致：同一输入 → 同一 teams / war
 test('浏览器入口算出的结果 ≡ 正式引擎算出的结果（浮点容差 1e-9 相对）', async () => {
   installFetchStub([webDir, platformDir]);
   const runtime = await getDemoRuntime();
+  // ⚠️ P11：演示站的 compute 与正式站**同口径** —— 都要先登录
+  //    （正式站 src/http/routes/review.js 的 compute 走 requireStageCapability ⇒ requireUser）。
+  //    ⇒ 演示适配器此前允许「匿名计算」，那是与正式站**不一致**的地方，本轮对齐。
+  await runtime.post('/api/auth/login', { name: '演示管理员' });
   const browser = await runtime.post('/api/stages/stage_final/compute', {});
 
   const direct = directEngine(buildDemoState(seed));
@@ -4798,6 +4809,10 @@ test('浏览器入口算出的结果 ≡ 正式引擎算出的结果（浮点容
 test('破同分链、名次积分、自评差异、段位在浏览器入口与正式系统之间也一致', async () => {
   installFetchStub([webDir, platformDir]);
   const runtime = await getDemoRuntime();
+  // ⚠️ P11：演示站的 compute 与正式站**同口径** —— 都要先登录
+  //    （正式站 src/http/routes/review.js 的 compute 走 requireStageCapability ⇒ requireUser）。
+  //    ⇒ 演示适配器此前允许「匿名计算」，那是与正式站**不一致**的地方，本轮对齐。
+  await runtime.post('/api/auth/login', { name: '演示管理员' });
   const browser = await runtime.post('/api/stages/stage_final/compute', {});
   const state = buildDemoState(seed);
 
@@ -4981,6 +4996,10 @@ import { computeTier, classifyDepartment, isDataOrPrototypeMilestone } from '../
 import { behaviorScore } from '../src/domain/behavior.js';
 import { applyVisibility } from '../src/domain/visibility.js';
 import { buildEventInfo } from '../src/domain/event-info.js';
+// ⛔ P11：TOP 名单回访清单的实现**下沉到领域层**了（原来住在服务层）——
+//    服务层会拖进 node:sqlite ⇒ 浏览器端用不了 ⇒ 演示站只能另写一份 ⇒ 形状必然漂。
+//    现在演示站与正式站 import **同一个函数**。
+import { buildReverseAuditTasks } from '../src/domain/anticheat.js';
 
 export const STORAGE_KEY = 'hks_demo_store_v1';
 export const SEED_URL = './seed/demo-data.json';
@@ -5103,8 +5122,47 @@ export function buildDemoState(seed) {
     computations: deepCopy(seed?.computations) ?? {},
     results: deepCopy(seed?.results) ?? {},
     lastStageId: deepCopy(seed?.lastStageId) ?? null,
+    // ⚠️ P11 新增容器（正式站对应的是表）：
+    //   published     —— leaderboard_snapshots（发榜快照）
+    //   tiebreakRounds / tiebreakVotes —— 加时陈述轮次与投票
+    //   publicTokens  —— public_tokens（公开访问令牌）
+    //   auditLog      —— audit_log（审计日志）
+    published: deepCopy(seed?.published) ?? {},
+    tiebreakRounds: deepCopy(seed?.tiebreakRounds) ?? [],
+    tiebreakVotes: deepCopy(seed?.tiebreakVotes) ?? [],
+    publicTokens: deepCopy(seed?.publicTokens) ?? [],
+    auditLog: deepCopy(seed?.auditLog) ?? [],
     me: null,
   };
+}
+
+/**
+ * 演示站写审计日志（纯函数，就地追加到 state.auditLog）。
+ *
+ * ⚠️ **为什么要加这个**：
+ *    演示站的 `GET /api/audit/log` 端点早就实现了，但**没有任何写方**
+ *    ⇒ 审计日志页在公网演示站上永远是「没有匹配的审计记录」的空表
+ *    ⇒ 页面「接上了」却「什么也看不到」（与 E145「只做展示、点不动」同族的问题）。
+ *    ⇒ 现在演示站的「重新计算」「发布榜单」「加时陈述」「公开令牌」等动作都留痕。
+ *
+ * ⚠️ 形状与正式站 `src/services/audit.js` 的 listAuditLog **逐字一致**：
+ *    { id, actorId, action, entity, entityId, detail, detailParseError, createdAt }
+ */
+export function demoWriteAuditLog(state, { actorId = null, action, entity = null, entityId = null, detail = null, now = null } = {}) {
+  if (!action) throw new Error('写审计日志必须给 action（没有 action 的日志无法检索）');
+  if (!Array.isArray(state.auditLog)) state.auditLog = [];
+  const row = {
+    id: `al_demo_${state.auditLog.length + 1}`,
+    actorId,
+    action,
+    entity,
+    entityId,
+    detail,
+    detailParseError: false,
+    createdAt: now ?? new Date().toISOString(),
+  };
+  state.auditLog.push(row);
+  return row;
 }
 
 /**
@@ -5113,8 +5171,7 @@ export function buildDemoState(seed) {
  *    与演示站降级告警用的是同一批判定 ⇒ 队列与告警**说的是同一件事**。
  *    形状与真实后端 `GET /api/audit/flags` 一致：{ id, kind, status, stageId, teamId, judgeId, detail }。
  */
-export function demoFlags(state) {
-  if (!Array.isArray(state?.flags)) state.flags = [];
+export function demoFlags(state) {  if (!Array.isArray(state?.flags)) state.flags = [];
   if (state.flags.length) return state.flags;
   const comps = Object.values(state?.computations ?? {});
   for (const c of comps) {
@@ -6031,6 +6088,122 @@ export function demoEnterpriseConfirmationBoard({ state, rules, stageId = 'stage
   };
 }
 
+// ══════════════════════════════════════════════════════════════════
+// P11：发榜 / 破同分 / 公开令牌 / 行为分 / 审计日志
+// ⚠️ **形状必须与正式后端逐字一致**（否则同一份前端在演示站与正式站表现不同 ⇒ 演示失去意义）。
+//    这是 P8 的教训：演示适配器曾把「错误的形状」锁进测试 ⇒ 形状必须**同源**。
+// ══════════════════════════════════════════════════════════════════
+
+/**
+ * 演示站的发榜（纯函数）。
+ * ⛔ 形状对齐正式站 src/services/leaderboard.js 的 publishLeaderboard：
+ *    { editionId, stageId, snapshots, awarded, createdAt, reverseAuditTasks }
+ */
+export function demoPublish({ state, rules, stageId, actorId, now = null }) {
+  const result = state.results?.[stageId];
+  if (!result) {
+    throw httpError(400, 'STAGE_NOT_COMPUTED', '该赛段还没有计算结果 —— 请先执行「重新计算」');
+  }
+  const at = now ?? new Date().toISOString();
+  const ordered = Array.isArray(result.ordered) ? result.ordered : [];
+  const pointsByTeam = new Map((result.points ?? []).map((p) => [p.teamId, p.points]));
+  const awarded = ordered
+    .map((row) => ({ teamId: row.teamId, points: pointsByTeam.get(row.teamId) ?? 0 }))
+    .filter((x) => x.points);
+  const snapshots = {
+    rank: { id: `ls_demo_${stageId}_rank`, scope: 'rank', createdAt: at },
+    business: { id: `ls_demo_${stageId}_business`, scope: 'business', createdAt: at },
+    personal: { id: `ls_demo_${stageId}_personal`, scope: 'personal', createdAt: at },
+  };
+  // ⚠️ TOP 名单回访（R-JDG-16）：与正式站 import **同一个领域层函数** ⇒ 形状不可能漂。
+  const signoffs = demoSignoffRows(state).filter((s) => !s.revokedAt);
+  const reverseAuditTasks = buildReverseAuditTasks({
+    results: ordered.map((r) => ({ teamId: r.teamId, rank: r.rank, total: r.total })),
+    signoffs,
+    topN: 10,
+  });
+  if (!state.published || typeof state.published !== 'object') state.published = {};
+  state.published[stageId] = { snapshots, awarded, createdAt: at, actorId, reverseAuditTasks };
+  return {
+    editionId: state.edition?.id ?? null,
+    stageId,
+    snapshots,
+    awarded,
+    createdAt: at,
+    reverseAuditTasks,
+  };
+}
+
+/**
+ * 演示站的发榜状态（纯函数）。
+ * ⛔ 形状对齐正式站 src/services/leaderboard.js 的 getPublishState。
+ */
+export function demoPublishState({ state, rules, stageId }) {
+  const p = state.published?.[stageId] ?? null;
+  const editionId = state.edition?.id ?? null;
+  if (!p) {
+    return {
+      stageId,
+      editionId,
+      published: false,
+      publishedAt: null,
+      snapshots: [],
+      reverseAuditTasks: [],
+      warnings: [{ code: 'STAGE_NOT_PUBLISHED', message: '该赛段尚未发榜：榜单快照、段位记录与名次积分都还没写' }],
+    };
+  }
+  return {
+    stageId,
+    editionId,
+    published: true,
+    publishedAt: p.createdAt,
+    snapshots: Object.values(p.snapshots ?? {}).map((x) => ({ id: x.id, scope: x.scope, createdAt: x.createdAt })),
+    reverseAuditTasks: p.reverseAuditTasks ?? [],
+    warnings: [],
+  };
+}
+
+/** 破同分轮次 → 对外形状（与正式站 src/http/routes/tiebreak.js 的 presentRound 一致）。 */
+function demoTiebreakRound(row) {
+  let tiedTeamIds = [];
+  try { tiedTeamIds = JSON.parse(row.tied_team_ids_json ?? '[]'); } catch { tiedTeamIds = []; }
+  return {
+    ...row,
+    stageId: row.stage_id,
+    tiedTeamIds,
+    statementDeadline: row.statement_deadline,
+    voteDeadline: row.vote_deadline,
+    createdBy: row.created_by,
+    createdAt: row.created_at,
+  };
+}
+
+/** 投票行 → 对外形状（与正式站的 presentVote 一致）。 */
+function demoTiebreakVote(row) {
+  return {
+    ...row,
+    roundId: row.tiebreak_round_id,
+    voterId: row.voter_id,
+    teamId: row.team_id,
+    votedAt: row.voted_at,
+  };
+}
+
+/** 票数统计（与正式站服务层 tally 同口径：count / sum / mean）。 */
+function demoTiebreakTallies(votes) {
+  const buckets = new Map();
+  for (const v of votes) {
+    if (!buckets.has(v.team_id)) buckets.set(v.team_id, []);
+    buckets.get(v.team_id).push(Number(v.score));
+  }
+  const out = {};
+  for (const [teamId, scores] of buckets) {
+    const sum = scores.reduce((a, b) => a + b, 0);
+    out[teamId] = { count: scores.length, sum, mean: sum / scores.length };
+  }
+  return out;
+}
+
 export function demoPools({ state, rules, kind }) {
   const stageId = state.lastStageId ?? 'stage_final';
   const result = state.results?.[stageId];
@@ -6148,6 +6321,12 @@ export function createDemoApi({ storage = defaultStorage(), seed = null, rules =
     if (!Array.isArray(state.flags)) state.flags = [];
     // ⚠️ 申诉队列容器兜底（老版 localStorage 里没有）
     if (!Array.isArray(state.appeals)) state.appeals = [];
+    // ⚠️ P11 新增容器的兜底（老版 localStorage 里没有）
+    if (!state.published || typeof state.published !== 'object') state.published = {};
+    if (!Array.isArray(state.tiebreakRounds)) state.tiebreakRounds = [];
+    if (!Array.isArray(state.tiebreakVotes)) state.tiebreakVotes = [];
+    if (!Array.isArray(state.publicTokens)) state.publicTokens = [];
+    if (!Array.isArray(state.auditLog)) state.auditLog = [];
     // ⚠️ **localStorage 里的旧 state 不带 results**（旧版演示站访问时留下的）⇒
     //    榜单会是空的（访客明明是第一次看到新版演示站，却看到「暂无数据」）。
     // ⇒ 补齐：**只补缺失的计算结果**，不覆盖访客自己的操作数据（报名/评审等）。
@@ -6790,6 +6969,16 @@ export function createDemoApi({ storage = defaultStorage(), seed = null, rules =
       if (crossJudgeId && !(s.judges ?? []).some((j) => j.id === crossJudgeId)) {
         throw httpError(404, 'JUDGE_NOT_ASSIGNED', '跨领域评委不在本赛段名单内');
       }
+      // ⛔ P11 · E148②：同格重签必须 409（与正式站同码同判）——
+      //    正式站原来直接撞唯一索引 ⇒ HTTP 500「服务内部错误」（违反设计 §7.3 的三态口径）。
+      const sameCell = (s.enterpriseConfirmations ?? []).find((c) => (
+        c.stageId === m[1] && c.teamId === teamId && c.dimension === dimension
+        && c.enterpriseId === enterpriseId && !c.withdrawnAt
+      ));
+      if (sameCell) {
+        throw httpError(409, 'CONFIRMATION_EXISTS',
+          '该队伍在该维度已有企业确认（同一格只能有一条）。要更正请用「改签」，要撤销请用「撤回」。');
+      }
       const now = new Date().toISOString();
       const row = {
         id: `ec_demo_${(s.enterpriseConfirmations ?? []).length + 1}`,
@@ -6803,10 +6992,87 @@ export function createDemoApi({ storage = defaultStorage(), seed = null, rules =
         signedAt: now,
         stageId: m[1],
         packageEnterpriseId: pkg?.enterpriseId ?? null,
+        withdrawnAt: null,
       };
       s.enterpriseConfirmations = [...(s.enterpriseConfirmations ?? []), row];
       persist();
       return row;
+    }
+    // ── P11 · E141：企业确认的**逆向路径**（撤回 / 改签）────────────────
+    // ⛔ 形状与正式站一致（src/services/review.js 的 withdraw / resignEnterpriseConfirmation）。
+    m = clean.match(/^\/api\/stages\/([^/]+)\/enterprise-confirmations\/([^/]+)\/withdraw$/);
+    if (method === 'POST' && m) {
+      if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
+      const row = (s.enterpriseConfirmations ?? []).find((c) => c.id === m[2] && !c.withdrawnAt);
+      if (!row) throw httpError(404, 'CONFIRMATION_NOT_FOUND', '企业确认不存在或已被撤回');
+      if (row.stageId !== m[1]) throw httpError(404, 'CONFIRMATION_NOT_FOUND', '企业确认不存在或已被撤回');
+      row.withdrawnAt = new Date().toISOString();
+      persist();
+      return {
+        id: row.id,
+        withdrawn: true,
+        teamId: row.teamId,
+        stageId: row.stageId,
+        dimension: row.dimension,
+        needsRecompute: true,
+        hint: '撤回已生效：该队的企业席计分已变化，请重新计算并重新发榜。',
+      };
+    }
+    m = clean.match(/^\/api\/stages\/([^/]+)\/enterprise-confirmations\/([^/]+)\/resign$/);
+    if (method === 'POST' && m) {
+      if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
+      const row = (s.enterpriseConfirmations ?? []).find((c) => c.id === m[2] && !c.withdrawnAt);
+      if (!row) throw httpError(404, 'CONFIRMATION_NOT_FOUND', '企业确认不存在或已被撤回');
+      if (row.stageId !== m[1]) throw httpError(404, 'CONFIRMATION_NOT_FOUND', '企业确认不存在或已被撤回');
+      const hasCross = Object.prototype.hasOwnProperty.call(body ?? {}, 'crossJudgeId');
+      const changes = {};
+      if (body?.rawScore !== null && body?.rawScore !== undefined && Number(body.rawScore) !== row.rawScore) {
+        const rawScore = Number(body.rawScore);
+        if (!Number.isFinite(rawScore) || rawScore < 0 || rawScore > 100) {
+          throw httpError(400, 'SCORE_OUT_OF_RANGE', '企业确认分必须是 0–100 之间的数字');
+        }
+        changes.rawScore = { from: row.rawScore, to: rawScore };
+      }
+      if (body?.content !== null && body?.content !== undefined && body.content !== row.content) {
+        if (!String(body.content).trim()) {
+          throw httpError(400, 'SIGNATURE_CONTENT_REQUIRED', '企业签字必须填写内容（解决了我方哪个具体环节 / 预计落地时间 / 我方投入角色）');
+        }
+        changes.content = { from: row.content, to: body.content };
+      }
+      if (hasCross) {
+        const next = body.crossJudgeId || null;
+        if (next !== row.crossJudgeId) {
+          if (next && next === row.enterpriseId) {
+            throw httpError(400, 'CROSS_JUDGE_SAME_AS_SIGNATORY', '跨领域评委签字人不能与出题企业签字人相同');
+          }
+          if (next && !(s.judges ?? []).some((j) => j.id === next)) {
+            throw httpError(404, 'JUDGE_NOT_ASSIGNED', '跨领域评委不在本赛段名单内');
+          }
+          changes.crossJudgeId = { from: row.crossJudgeId, to: next };
+        }
+      }
+      if (!Object.keys(changes).length) {
+        throw httpError(400, 'NOTHING_TO_CHANGE', '没有要改的内容：改签必须至少变更一项（内容 / 分数 / 跨领域签字人）');
+      }
+      // 改签 = 软删旧行 + 追加新行（同格），与正式站同口径（只增不改）
+      row.withdrawnAt = new Date().toISOString();
+      const fresh = {
+        ...row,
+        id: `ec_demo_${(s.enterpriseConfirmations ?? []).length + 1}`,
+        rawScore: changes.rawScore ? changes.rawScore.to : row.rawScore,
+        content: changes.content ? changes.content.to : row.content,
+        crossJudgeId: changes.crossJudgeId ? changes.crossJudgeId.to : row.crossJudgeId,
+        signedAt: new Date().toISOString(),
+        withdrawnAt: null,
+      };
+      s.enterpriseConfirmations = [...(s.enterpriseConfirmations ?? []), fresh];
+      persist();
+      return {
+        ...fresh,
+        replacedId: row.id,
+        needsRecompute: true,
+        hint: '改签已生效：该队的企业席计分已变化，请重新计算并重新发榜。',
+      };
     }
     // ── P10 · W4-b：里程碑签字 + 撤回（写）──────────────────────────
     // ⚠️ 与正式站同码同判（src/services/milestone.js）：
@@ -7016,8 +7282,19 @@ export function createDemoApi({ storage = defaultStorage(), seed = null, rules =
     // 计算
     m = clean.match(/^\/api\/stages\/([^/]+)\/compute$/);
     if (method === 'POST' && m) {
-      const out = runDemoCompute({ state: s, rules: r, stageId: m[1], now: new Date().toISOString() });
+      if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
+      const now = new Date().toISOString();
+      const out = runDemoCompute({ state: s, rules: r, stageId: m[1], now });
       s.lastStageId = m[1];
+      // ⚠️ P11：计算也要留痕（正式站 computeStage → recordComputation 写审计日志）
+      demoWriteAuditLog(s, {
+        actorId: s.me.id,
+        action: 'stage.compute',
+        entity: 'stage',
+        entityId: m[1],
+        detail: { computationId: out.computationId, teams: out.ordered?.length ?? 0 },
+        now,
+      });
       persist();
       return out;
     }
@@ -7049,6 +7326,234 @@ export function createDemoApi({ storage = defaultStorage(), seed = null, rules =
     if (method === 'GET' && clean === '/api/public/leaderboard') {
       if (!query.token) throw httpError(401, 'UNAUTHENTICATED', '缺少公开访问令牌');
       return demoLeaderboard({ state: s, rules: r, scope: 'rank', viewer: null });
+    }
+    // ── P11：发榜（写 + 读）─────────────────────────────────────────
+    // ⚠️ 形状与正式站一致（src/http/routes/publish.js + services/leaderboard.js）。
+    // ⛔ **计算与发榜是两个动作**：演示站也必须分开，否则演示会掩盖 E149 这类缺口。
+    m = clean.match(/^\/api\/stages\/([^/]+)\/publish$/);
+    if (method === 'GET' && m) return demoPublishState({ state: s, rules: r, stageId: m[1] });
+    if (method === 'POST' && m) {
+      if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
+      const out = demoPublish({ state: s, rules: r, stageId: m[1], actorId: s.me.id });
+      // ⚠️ P11：发榜留痕（正式站 publishLeaderboard → 审计 'leaderboard.publish'）
+      demoWriteAuditLog(s, {
+        actorId: s.me.id,
+        action: 'leaderboard.publish',
+        entity: 'stage',
+        entityId: m[1],
+        detail: {
+          awardedTeams: out.awarded?.length ?? 0,
+          snapshots: Object.keys(out.snapshots ?? {}).length,
+          reverseAuditTasks: out.reverseAuditTasks?.length ?? 0,
+        },
+        now: out.createdAt ?? new Date().toISOString(),
+      });
+      persist();
+      return out;
+    }
+    // ── P11：加时陈述 / 一票破同分（5 个端点）───────────────────────
+    // ⚠️ 形状与正式站 src/http/routes/tiebreak.js 一致。
+    m = clean.match(/^\/api\/stages\/([^/]+)\/tiebreak\/rounds$/);
+    if (method === 'GET' && m) {
+      if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
+      const items = (s.tiebreakRounds ?? []).filter((x) => x.stage_id === m[1]).map(demoTiebreakRound);
+      return { items };
+    }
+    if (method === 'POST' && m) {
+      if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
+      const tiedTeamIds = Array.isArray(body?.tiedTeamIds) ? [...new Set(body.tiedTeamIds)] : [];
+      if (tiedTeamIds.length < 2) {
+        throw httpError(400, 'NO_TIED_TEAMS', '没有同分队伍，无需加时陈述（至少需要两支同分队伍）');
+      }
+      const roster = new Set((s.teams ?? []).map((t) => t.id));
+      const unknown = tiedTeamIds.filter((id) => !roster.has(id));
+      if (unknown.length) {
+        throw httpError(400, 'TIED_TEAM_NOT_IN_STAGE', '同分组里有队伍不属于本赛段或不存在');
+      }
+      if ((s.tiebreakRounds ?? []).some((x) => x.stage_id === m[1] && x.status === 'open')) {
+        throw httpError(409, 'TIEBREAK_ROUND_ALREADY_OPEN', '该赛段已有一轮进行中的加时陈述，请先关闭');
+      }
+      const now = new Date().toISOString();
+      const minutes = Number(body?.statementMinutes ?? 10);
+      const round = {
+        id: `tbr_demo_${(s.tiebreakRounds ?? []).length + 1}`,
+        stage_id: m[1],
+        kind: 'statement',
+        tied_team_ids_json: JSON.stringify(tiedTeamIds),
+        statement_deadline: new Date(Date.parse(now) + minutes * 60000).toISOString(),
+        vote_deadline: null,
+        status: 'open',
+        created_by: s.me.id,
+        created_at: now,
+      };
+      s.tiebreakRounds = [...(s.tiebreakRounds ?? []), round];
+      persist();
+      return { round: demoTiebreakRound(round) };
+    }
+    m = clean.match(/^\/api\/tiebreak\/rounds\/([^/]+)$/);
+    if (method === 'GET' && m) {
+      if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
+      const round = (s.tiebreakRounds ?? []).find((x) => x.id === m[1]);
+      if (!round) throw httpError(404, 'TIEBREAK_ROUND_NOT_FOUND', '加时陈述轮次不存在');
+      const votes = (s.tiebreakVotes ?? []).filter((v) => v.tiebreak_round_id === round.id);
+      // ⛔ 可见性与正式站同口径：演示站只有一个身份（演示组委会）⇒ 看得到全部投票明细。
+      return {
+        round: demoTiebreakRound(round),
+        votes: votes.map(demoTiebreakVote),
+        tallies: demoTiebreakTallies(votes),
+      };
+    }
+    m = clean.match(/^\/api\/tiebreak\/rounds\/([^/]+)\/votes$/);
+    if (method === 'POST' && m) {
+      if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
+      const round = (s.tiebreakRounds ?? []).find((x) => x.id === m[1]);
+      if (!round) throw httpError(404, 'TIEBREAK_ROUND_NOT_FOUND', '加时陈述轮次不存在');
+      if (round.status !== 'open') throw httpError(409, 'TIEBREAK_ROUND_CLOSED', '该轮加时陈述已关闭');
+      const teamId = String(body?.teamId ?? '').trim();
+      if (!teamId) throw httpError(400, 'INVALID_REQUEST', '缺少队伍');
+      const tied = JSON.parse(round.tied_team_ids_json ?? '[]');
+      if (!tied.includes(teamId)) throw httpError(400, 'TEAM_NOT_IN_TIE_GROUP', '该队伍不在同分组中');
+      const score = Number(body?.score);
+      if (!Number.isFinite(score) || score < 0 || score > 100) {
+        throw httpError(400, 'SCORE_OUT_OF_RANGE', '投票分必须是 0–100 之间的数字');
+      }
+      const voterId = s.me.id;
+      const votes = s.tiebreakVotes ?? [];
+      if (votes.some((v) => v.tiebreak_round_id === round.id && v.voter_id === voterId && v.team_id === teamId)) {
+        throw httpError(409, 'DUPLICATE_TIEBREAK_VOTE', '同一人对同一队伍只能投一次');
+      }
+      const vote = {
+        id: `tbv_demo_${votes.length + 1}`,
+        tiebreak_round_id: round.id,
+        voter_id: voterId,
+        team_id: teamId,
+        score,
+        voted_at: new Date().toISOString(),
+      };
+      s.tiebreakVotes = [...votes, vote];
+      persist();
+      return { vote: demoTiebreakVote(vote) };
+    }
+    m = clean.match(/^\/api\/tiebreak\/rounds\/([^/]+)\/close$/);
+    if (method === 'POST' && m) {
+      if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
+      const round = (s.tiebreakRounds ?? []).find((x) => x.id === m[1]);
+      if (!round) throw httpError(404, 'TIEBREAK_ROUND_NOT_FOUND', '加时陈述轮次不存在');
+      if (round.status !== 'closed') round.status = 'closed';
+      const votes = (s.tiebreakVotes ?? []).filter((v) => v.tiebreak_round_id === round.id);
+      persist();
+      return { round: demoTiebreakRound(round), tallies: demoTiebreakTallies(votes) };
+    }
+    // ── P11：公开访问令牌（签发 / 列表 / 吊销）───────────────────────
+    // ⚠️ 形状与正式站 src/http/routes/public-tokens.js 一致。
+    if (method === 'POST' && clean === '/api/public/tokens') {
+      if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
+      const allowed = r?.pools?.publicScopes ?? ['leaderboard', 'calendar', 'all'];
+      const scope = body?.scope ?? 'all';
+      if (!allowed.includes(scope)) {
+        throw httpError(400, 'PUBLIC_SCOPE_INVALID', `scope 必须是 ${allowed.join(' / ')} 之一`);
+      }
+      const ttlDays = Number.isInteger(body?.ttlDays) && body.ttlDays > 0
+        ? body.ttlDays
+        : (r?.pools?.publicTokenTtlDays ?? 30);
+      const now = new Date();
+      const expiresAt = new Date(now.getTime() + ttlDays * 86400000).toISOString();
+      // ⚠️ 演示站用**明文**当标识（正式站存哈希）⇒ 演示站里 tokenHint 就是明文的前 8 位。
+      const token = `demo_${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
+      const row = {
+        id: token,
+        token,
+        tokenHint: token.slice(0, 8),
+        scope,
+        editionId: body?.editionId ?? s.edition?.id ?? null,
+        expiresAt,
+        createdAt: now.toISOString(),
+      };
+      s.publicTokens = [...(s.publicTokens ?? []), row];
+      persist();
+      return { token, scope, editionId: row.editionId, expiresAt };
+    }
+    if (method === 'GET' && clean === '/api/public/tokens') {
+      if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
+      const now = new Date().toISOString();
+      const items = (s.publicTokens ?? []).map((t) => ({
+        id: t.id,
+        scope: t.scope,
+        editionId: t.editionId,
+        expiresAt: t.expiresAt,
+        createdAt: t.createdAt,
+        tokenHint: t.tokenHint,
+        expired: Date.parse(t.expiresAt) <= Date.parse(now),
+      }));
+      return { items };
+    }
+    m = clean.match(/^\/api\/public\/tokens\/([^/]+)$/);
+    if (method === 'DELETE' && m) {
+      if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
+      const before = (s.publicTokens ?? []).length;
+      s.publicTokens = (s.publicTokens ?? []).filter((t) => t.id !== m[1]);
+      if (s.publicTokens.length === before) {
+        throw httpError(404, 'NOT_FOUND', '令牌不存在或已被吊销');
+      }
+      persist();
+      return { ok: true };
+    }
+    // ── P11：行为分事件（提交入口）───────────────────────────────────
+    // ⛔ 此前**前端从不调用**这个写端点 ⇒ 行为分永远是 0（rules/behavior-points.json 的五类事件一条都采不到）。
+    m = clean.match(/^\/api\/teams\/([^/]+)\/behavior-events$/);
+    if (method === 'POST' && m) {
+      if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
+      const team = (s.teams ?? []).find((t) => t.id === m[1]);
+      if (!team) throw httpError(404, 'TEAM_NOT_FOUND', '战队不存在');
+      const type = String(body?.type ?? '').trim();
+      const def = (r?.behavior?.events ?? []).find((d) => d.key === type);
+      if (!def) throw httpError(400, 'UNKNOWN_EVENT_TYPE', `未知的行为事件类型：${type}`);
+      const probe = behaviorScore({
+        events: [{ id: 'probe', type, evidence: body?.evidence, created_at: new Date().toISOString() }],
+        behaviorConfig: { ...(r.behavior || {}), evidenceRequirements: r.criteria?.behaviorEvidence || undefined },
+      });
+      const item = probe.items[0];
+      if (!item || !item.counted) {
+        throw httpError(400, 'EVIDENCE_REJECTED', `证据不合规，不予计分：${item?.reason ?? 'unknown'}`);
+      }
+      const now = new Date().toISOString();
+      const id = `be_demo_${(s.behaviorEvents ?? []).length + 1}`;
+      s.behaviorEvents = [...(s.behaviorEvents ?? []), {
+        id, teamId: team.id, userId: s.me.id, type, points: Number(item.points) || 0,
+        evidence: typeof body?.evidence === 'string' ? body.evidence : JSON.stringify(body?.evidence ?? {}),
+        createdAt: now,
+      }];
+      persist();
+      return { id, teamId: team.id, userId: s.me.id, type, points: item.points, counted: true, createdAt: now };
+    }
+    // ── P11：审计日志（读口）────────────────────────────────────────
+    // ⚠️ 形状与正式站 src/services/audit.js 的 listAuditLog 一致。
+    if (method === 'GET' && clean === '/api/audit/log') {
+      if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
+      const rows = (s.auditLog ?? []).filter((r) => {
+        if (query.action && r.action !== query.action) return false;
+        if (query.entity && r.entity !== query.entity) return false;
+        if (query.entityId && r.entityId !== query.entityId) return false;
+        return true;
+      });
+      const limit = Number.isInteger(Number(query.limit)) && Number(query.limit) > 0 ? Number(query.limit) : 50;
+      const offset = Number.isInteger(Number(query.offset)) && Number(query.offset) >= 0 ? Number(query.offset) : 0;
+      const page = rows.slice(offset, offset + limit);
+      const archiveMonths = r?.audit?.retention?.archiveMonths ?? null;
+      return {
+        rows: page.map((x) => ({
+          id: x.id,
+          actorId: x.actorId ?? null,
+          action: x.action,
+          entity: x.entity ?? null,
+          entityId: x.entityId ?? null,
+          detail: x.detail ?? null,
+          detailParseError: x.detailParseError === true,
+          createdAt: x.createdAt,
+        })),
+        total: rows.length,
+        retention: archiveMonths === null ? null : { archiveMonths, queryableSince: null },
+      };
     }
     // ⚠️ **专属错误码**：业务上的「单条记录不存在」也是 404（设计文档 §7.3 的三态口径），
     //    两者共用 NOT_FOUND ⇒ 「端点没实现」与「这条记录不在」**分不开** ⇒
