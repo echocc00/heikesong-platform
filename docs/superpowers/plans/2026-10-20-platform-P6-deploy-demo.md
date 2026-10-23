@@ -750,15 +750,30 @@ Expected: FAIL —— `Cannot find module '../scripts/backup.js'`
 - [ ] **Step 3: 创建 `src/runtime/pidfile.js`**
 
 ```javascript
-// src/runtime/pidfile.js — 进程 pid 文件
+// src/runtime/pidfile.js — 进程 pid 文件 + 运行时端口文件
 // 用途：让「恢复前必须先停服务」这条约束【可被机器检查】，而不是靠人记得停。
 // 依据：设计文档 §14.2 单写者约束 —— 多个进程同时写同一个 SQLite 文件会导致 SQLITE_BUSY / 数据损坏。
 // 跨平台：process.kill(pid, 0) 在 macOS / Linux / Windows 上都可用。
+//
+// ⚠️ 为什么还要一个**端口文件**（app.port）：
+//    pid 文件回答「进程还活着吗」，端口文件回答「服务在哪儿听着」。
+//    两者缺一不可 —— 只看 pid 文件时，「服务还活着但 pid 文件被删了」与
+//    「服务确实停了（正常退出时 server.js 会删掉 pid 文件）」**看起来一模一样**，
+//    而这两种情况下恢复的后果天差地别：
+//      · 前者 ⇒ 恢复会替换掉正在被写入的库文件 ⇒ 丢数据 / 库损坏；
+//      · 后者 ⇒ 恢复正是该做的事。
+//    ⇒ 恢复闸在 pid 文件缺失或陈旧时，会用端口文件去**主动探测**服务是否还在应答
+//      （见 src/runtime/service-probe.js）—— 这是唯一能分辨这两种情况的证据。
 import { writeFileSync, readFileSync, unlinkSync, existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 export function pidFilePath(dataDir) {
   return join(dataDir, 'app.pid');
+}
+
+/** 端口文件：记录本进程**实际**监听的端口（PORT=0 时是内核分配的端口，不是 0）。 */
+export function portFilePath(dataDir) {
+  return join(dataDir, 'app.port');
 }
 
 export function writePidFile(dataDir, pid = process.pid) {
@@ -768,8 +783,20 @@ export function writePidFile(dataDir, pid = process.pid) {
   return p;
 }
 
+export function writePortFile(dataDir, port) {
+  mkdirSync(dataDir, { recursive: true });
+  const p = portFilePath(dataDir);
+  writeFileSync(p, String(port), 'utf8');
+  return p;
+}
+
 export function removePidFile(dataDir) {
   const p = pidFilePath(dataDir);
+  if (existsSync(p)) unlinkSync(p);
+}
+
+export function removePortFile(dataDir) {
+  const p = portFilePath(dataDir);
   if (existsSync(p)) unlinkSync(p);
 }
 
@@ -778,6 +805,13 @@ export function readPidFile(dataDir) {
   if (!existsSync(p)) return null;
   const pid = Number(readFileSync(p, 'utf8').trim());
   return Number.isInteger(pid) && pid > 0 ? pid : null;
+}
+
+export function readPortFile(dataDir) {
+  const p = portFilePath(dataDir);
+  if (!existsSync(p)) return null;
+  const port = Number(readFileSync(p, 'utf8').trim());
+  return Number.isInteger(port) && port > 0 && port <= 65535 ? port : null;
 }
 
 /**
@@ -1032,6 +1066,7 @@ import { join, basename, dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { readPidFile, pidFilePath, isProcessAlive } from '../src/runtime/pidfile.js';
+import { probeService } from '../src/runtime/service-probe.js';
 import { currentVersion } from '../src/db/migrate.js';
 
 /** 列出备份文件（新 → 旧）：文件名是 UTC 时间戳，字典序倒排即时间倒序。 */
@@ -1050,15 +1085,37 @@ export function checkServiceState({ dataDir = './data', serviceName = 'heikesong
   if (pid && isProcessAlive(pid)) {
     return { running: true, reason: `pid 文件显示进程 ${pid} 仍在运行`, pid };
   }
-  if (pid) {
-    return { running: false, reason: `pid 文件存在但进程 ${pid} 已退出（可能是异常终止的残留）`, pid, stale: true };
-  }
-  // ⚠️ pid 文件在，但内容不是合法 pid（写坏了）→ 证明不了服务已停 → 保守判为「还在跑」。
+  // ⚠️ pid 文件在，但内容**不是合法 pid**（写坏了）→ 证明不了服务已停 → 保守判为「还在跑」。
   //    依据：设计文档 §14.2【决策】恢复前必须先停服务 —— 这条是**安全闸**，
   //    拿不到证据时必须拒绝，而不是当成「服务没在跑」。
   //    运维确认服务确实停了，删掉这个 pid 文件即可继续。
-  if (existsSync(pidFilePath(dataDir))) {
+  // ⚠️ 判据是「**读不出合法 pid**」（`!pid`），**不是**「文件存在」——
+  //    文件存在但内容合法、只是进程已退出 ⇒ 那是**陈旧残留**，走下面的探测分支，
+  //    不能被这条「内容无法解析」误伤（这条曾经把陈旧残留判成「还在跑」，
+  //    被 test/restore.test.js 的既有用例当场抓住）。
+  if (!pid && existsSync(pidFilePath(dataDir))) {
     return { running: true, reason: 'pid 文件存在但内容无法解析，无法确认服务已停止' };
+  }
+  // ⚠️⚠️ pid 文件**不存在**，或它指向的进程**已退出** ⇒「进程已停」这个证据**不成立**
+  //   ⇒ 必须**主动探测服务本身**（E169 / F5b）。
+  //   为什么不能只看 pid 文件：「服务确实停了」（正常退出时 server.js 会删掉 pid 文件）
+  //   与「服务还在跑、只是 pid 文件没了」（被误删 / 被第二个实例覆盖）**看起来一模一样**，
+  //   而恢复的后果天差地别：
+  //     · 前者 ⇒ 恢复正是该做的事；
+  //     · 后者 ⇒ 恢复会把正在被写入的库文件换掉 ⇒ 丢数据 / 库损坏。
+  //   ⇒ 唯一能分辨的证据是「服务还在不在应答」（见 src/runtime/service-probe.js）。
+  const probe = probeService(dataDir);
+  if (probe.alive) {
+    return {
+      running: true,
+      reason: pid
+        ? `pid 文件显示进程 ${pid} 已退出，但 ${probe.reason} ⇒ 服务仍在运行`
+        : `pid 文件缺失，但 ${probe.reason} ⇒ 服务仍在运行（拿不到「服务已停」的证据，保守拒绝恢复）`,
+      ...(pid ? { pid, stale: true } : {}),
+    };
+  }
+  if (pid) {
+    return { running: false, reason: `pid 文件存在但进程 ${pid} 已退出（可能是异常终止的残留）`, pid, stale: true };
   }
   if (process.platform === 'linux' && existsSync('/run/systemd/system')) {
     try {

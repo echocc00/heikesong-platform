@@ -486,6 +486,39 @@ test('F13 启动失败（端口被占）不得留下陈旧 pid 文件', async ()
       checkServiceState({ dataDir }).running, true,
       'A 还活着但恢复闸判成「没在跑」⇒ 恢复会在服务正在写库时进行',
     );
+
+    // ⚠️ 追加场景（E169 变异检验发现的判别性缺口）：
+    //    同一个 DATA_DIR 的实例 B 现在会被**单写者闸**提前拦掉 ⇒ 它根本走不到
+    //    「写 pid 文件 → listen 失败」那段 ⇒ 上面那条断言已经**不再判别**
+    //    （把「写 pid 挪回 listen 之前」这个变异注入进去，本用例如然全绿 ⇒ 变异存活）。
+    //    ⇒ 补一条**不同 DATA_DIR、同一端口**的场景：C 能通过单写者闸（它自己的目录
+    //    里没有 pid 文件）⇒ 于是真的走到 listen ⇒ 绑定失败 ⇒ 它**不得留下 pid 文件**。
+    const dataDir2 = mkdtempSync(join(tmpdir(), 'hks-bind2-'));
+    const { db: db2, close: close2 } = openDatabase({ dataDir: dataDir2 });
+    applyMigrations(db2, migrationsDir);
+    close2();
+    const c = spawn(process.execPath, [join(platformDir, 'src/server.js')], {
+      env: { ...process.env, DATA_DIR: dataDir2, PORT: '19411' }, // 同一个端口 ⇒ 必然绑定失败
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let cOut = '';
+    c.stdout.on('data', d => { cOut += d; });
+    c.stderr.on('data', d => { cOut += d; });
+    await new Promise(r => setTimeout(r, 2500));
+    try {
+      assert.notEqual(c.exitCode, null, `前提：C 应当因端口被占而启动失败（C 输出：${cOut.slice(0, 200)}）`);
+      const pidPath2 = join(dataDir2, 'app.pid');
+      const pidC = existsSync(pidPath2) ? readFileSync(pidPath2, 'utf8').trim() : null;
+      assert.equal(
+        pidC, null,
+        `启动失败后留下了陈旧 pid 文件（${pidC}）—— 指向已死进程 ⇒ 恢复闸会误判「服务没在跑」`,
+      );
+      // 并且失败信息要人话（不是一坨未捕获异常栈）
+      assert.match(cOut, /启动失败|EADDRINUSE|地址已使用/, `启动失败必须给出人话报错（C 输出：${cOut.slice(0, 200)}）`);
+    } finally {
+      c.kill('SIGKILL');
+      rmSync(dataDir2, { recursive: true, force: true });
+    }
   } finally {
     a.kill('SIGTERM');
     await new Promise(r => setTimeout(r, 600));

@@ -43,7 +43,7 @@ import { getLeaderboard, getRollingLeaderboard } from './services/leaderboard.js
 import { getPerformanceCard } from './services/performance-card.js';
 import { getTeamTier, getTierBoard } from './services/tier.js';
 import { listEditions, getEdition } from './db/repo/editions.js';
-import { writePidFile, removePidFile } from './runtime/pidfile.js';
+import { writePidFile, removePidFile, writePortFile, removePortFile, readPidFile, isProcessAlive } from './runtime/pidfile.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -592,20 +592,50 @@ if (isMain) {
   const rulesDir = join(here, '..', 'rules');
 
   const { rules, version } = loadRules(rulesDir);
+
+  // ── 单写者闸（E169 / F5）────────────────────────────────────────
+  // 依据：README 的头号架构承诺「SQLite 只允许单写进程」+ 设计文档 §14.2。
+  // 修复前：pid 文件在 listen **之前**写、而且**从不检查**是否已有实例
+  //        ⇒ 同一个 DATA_DIR 可以同时起两个服务、两个都启动成功
+  //        ⇒ F8 已证明这种双写会直接撞出 SQLITE_BUSY / 517。
+  // ⚠️ 必须在**开库之前**判：库一打开就可能与对方抢写锁了。
+  const livePid = readPidFile(dataDir);
+  if (livePid && livePid !== process.pid && isProcessAlive(livePid)) {
+    console.error(
+      `[server] 拒绝启动：数据目录 ${dataDir} 已被进程 ${livePid} 占用。`
+      + '单写者约束：同一个 SQLite 文件只允许一个写进程（并发写会撞 SQLITE_BUSY / 517）。'
+      + '请先停掉那个进程再启动本实例。',
+    );
+    process.exit(1);
+  }
+  // ⚠️ pid 文件指向**已死**进程 ⇒ 上次崩溃留下的残留 ⇒ 允许接管（并覆盖它）。
+  //    不允许接管 ⇒ 崩一次就再也起不来（运维得手工删 pid 文件才能重启）。
+
   const { db, close } = openDatabase({ dataDir });
-  // ── P6：写 pid 文件 ──────────────────────────────────────────
-  // 用途：让「恢复前必须先停服务」这条约束**可被机器检查**（scripts/restore.js 读它）。
-  // 依据：设计文档 §14.2【决策】恢复前置约束。
-  writePidFile(dataDir);
-  // ────────────────────────────────────────────────────────────
   applyMigrations(db, migrationsDir);
   const app = createApp({ db, rules, webDir });
 
   const server = http.createServer(app.handle);
   // ⛔ 预审修正（m7-1）：显式绑 127.0.0.1（默认是 0.0.0.0，会暴露到局域网/公网），
   //    日志与实际绑定保持一致；云主机部署时再显式改成 '0.0.0.0'。
+  // ⛔ 启动期错误（端口被占 EADDRINUSE 等）必须有**人话**报错 + 明确退出码。
+  //    没有 'error' 处理器时，listen 的错误会变成未捕获异常 ⇒ 日志里是一坨栈、
+  //    退出码也不是 1 ⇒ 运维看不出「到底为什么没起来」。
+  server.on('error', (err) => {
+    console.error(`[server] 启动失败：${err.message}`);
+    process.exit(1);
+  });
   server.listen(port, '127.0.0.1', () => {
-    console.log(`heikesong-platform 启动于 http://127.0.0.1:${port}（规则版本 ${version}）`);
+    // ── P6：写 pid 文件 + 端口文件 ───────────────────────────────
+    // ⚠️ 必须挪到 **listen 成功之后**（E169 / F13）：
+    //    修复前写在 listen 之前 ⇒ 启动失败（端口被占）时也把 pid 文件覆盖成自己的 pid
+    //    ⇒ 留下一个指向**已死进程**的陈旧 pid ⇒ 恢复闸误判「服务没在跑」。
+    // ⚠️ 端口文件记的是**实际**监听端口（PORT=0 时是内核分配的，不是 0）——
+    //    恢复闸靠它去主动探测「服务还在不在」（见 src/runtime/service-probe.js）。
+    const actualPort = server.address()?.port ?? port;
+    writePidFile(dataDir);
+    writePortFile(dataDir, actualPort);
+    console.log(`heikesong-platform 启动于 http://127.0.0.1:${actualPort}（规则版本 ${version}）`);
   });
 
   for (const sig of ['SIGINT', 'SIGTERM']) {
@@ -613,6 +643,7 @@ if (isMain) {
       server.close(() => {
         // ── P6：退出前删 pid 文件（否则留下陈旧 pid）─────────────
         removePidFile(dataDir);
+        removePortFile(dataDir);
         // ────────────────────────────────────────────────────────
         close();
         process.exit(0);
