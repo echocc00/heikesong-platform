@@ -752,6 +752,18 @@ input[type="radio"] {
   /* 表单控件：正文 14px × 1.65 ≈ 23px + 2×p + 2px 边框 ⇒ 44px 需 p ≈ 9.5px ⇒ 取 --sp-3 */
   .input, .select, .textarea { padding-top: var(--sp-3); padding-bottom: var(--sp-3); }
   .textarea { min-height: 96px; }
+  /* ⚠️ P12：勾选框**本身**是 24×24（WCAG 2.5.8 AA 硬线达标），但它所在的
+   *    **那一行**才是真正的可点区（label 包着「勾选框 + 队名」，点队名会勾上）——
+   *    而 label 的 border box 只有 24px 高（`label` 的上下 margin 不算进盒高）⇒
+   *    触屏上**整条可点区只有 24px 高**，低于 44px 平台舒适线。
+   *    ⇒ 垫**行**（不是把勾选框撑到 44px —— 44px 的方块在密集列表里非常难看）：
+   *      给「包着勾选框的 label」加 min-height: 44px，勾选框由 align-items:center 居中。
+   *    ⚠️ 用 `:has()` 挑出「直接包着勾选框的 label」—— 本仓已在用 :has()
+   *       （.radio-group .radio:has(input:checked)）⇒ 口径一致。
+   *    ⇒ 这条是**全站级**的：报名页的同意勾选、复核台的独立信源、任务卡的否决票…
+   *      所有「勾选框 + 文字」的行在触屏上都一并受益。 */
+  label:has(> input[type="checkbox"]),
+  label:has(> input[type="radio"]) { min-height: 44px; }
   /* ⚠️ P12：页脚链接宽度只有 24–36px（两三个汉字）⇒ 触屏上左右也补内边距到 ≥44px 宽。
    *    （高度已由上面的通用规则垫到 44px；这一条补的是**宽度**这一维。） */
   .landing__footer-links a {
