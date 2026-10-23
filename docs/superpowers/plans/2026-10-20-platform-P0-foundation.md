@@ -8618,6 +8618,10 @@ import { renderPublicLinks } from './views/public-links.js';
 // P11：审计日志页（`GET /api/audit/log` 早就挂在后端，前端**从来没调用过**）
 // ⚠️ 设计文档 §9「组委会视角 → 审计与复算」明写要有这块界面。
 import { renderAuditLog } from './views/audit-log.js';
+// E158：赛段配置与权重表页（设计 §9「组委会视角 → 赛段配置与权重表」明写要有）
+// ⚠️ P11 把建段 / 改配置 / 派评委 / 撤评委 / 报名册 / 退名册 6 个**写**端点全做完了，
+//    却**一个界面都没有** ⇒ 端点在产品里零调用方。
+import { renderStageConfig } from './views/stages.js';
 import { escapeHtml } from './escape.js';
 
 // 演示版：?demo=1 时用 localStorage 适配器；正式版走真实 API。
@@ -8691,6 +8695,10 @@ route('/tiebreak', (c) => renderTiebreak(c));
 route('/tiebreak/:stageId', (c) => renderTiebreak(c));
 // P11：公开访问链接（签发 / 列表 / 吊销公开令牌）
 route('/admin/public-links', (c) => renderPublicLinks(c));
+// E158：赛段配置与权重表（设计 §9「赛段配置与权重表」明写要有这块界面）
+// ⚠️ 两条都注册（带赛段 / 不带赛段）：不带赛段 ⇒ 页面内给赛段选择器。
+route('/stages', (c) => renderStageConfig(c));
+route('/stages/:stageId', (c) => renderStageConfig(c));
 
 const ctx = { api, navigate, setState, getState };
 

@@ -589,6 +589,10 @@ export const NAV_SECTIONS = [
       { path: '/admin/public-links', label: '公开访问链接' },
       // ⚠️ P11：审计日志（`GET /api/audit/log` 早就挂在后端，前端**从来没调用过**）
       { path: '/audit/log', label: '审计日志' },
+      // ⚠️ E158：赛段配置与权重表（设计 §9「组委会视角」明写要有这块界面）。
+      //   此前 P11 把建段 / 改配置 / 派评委 / 报名册 6 个**写**端点全做完了，
+      //   却**一个界面都没有** ⇒ 端点零调用方（与 E149/E150 同一族的「写了没接线」）。
+      { path: '/stages', label: '赛段配置' },
     ],
   },
 ];
@@ -669,6 +673,11 @@ export const ROUTE_CAPABILITIES = {
   //    ⇒ 前端**必须**声明这个能力点，否则没权限的人会看到一张「空空如也的审计表」，
   //    把「无权」误读成「没记录」（视图侧也据此显示「可能压根没权限」）。
   '/audit/log': 'audit:read',
+  // ⚠️ E158：赛段配置页要求 `stage:compute`（与 API 同口径 ⇒ 前后端一致）。
+  //    注意 API 侧的口径是「**届期级或赛段级**都放行」（routes/stages.js 的
+  //    requireStageComputeForEdition）⇒ 前端声明的是能力点**名称**，
+  //    真正的裁决在 API 层（前端拿不到「你是赛段级还是届期级授权」）。
+  '/stages': 'stage:compute',
 };
 
 /** 路径归一：去掉 query 与结尾斜杠（'/flags/' 与 '/flags' 是同一个页面）。 */
@@ -1547,6 +1556,19 @@ const VIEW_ENDPOINTS = [
   { method: 'GET', path: '/api/stages/stage_final/publish' },
   { method: 'GET', path: '/api/stages/stage_final/tiebreak/rounds' },
   { method: 'GET', path: '/api/public/tokens' },
+  // ── E158：赛段配置页（设计 §9「赛段配置与权重表」）────────────────
+  // ⚠️ 这组端点是「赛段配置」页的**全部**数据来源：
+  //    届期 / 候选队伍 / 评委候选池 / 权重表 + 赛段读口。
+  //    演示适配器漏一个 ⇒ 公网演示站那页就有一块是 404。
+  { method: 'GET', path: '/api/editions' },
+  { method: 'GET', path: '/api/editions/ed_demo/teams' },
+  { method: 'GET', path: '/api/editions/ed_demo/judge-candidates' },
+  { method: 'GET', path: '/api/editions/ed_demo/scoring-configs' },
+  { method: 'GET', path: '/api/stages/stage_final/judges' },
+  { method: 'GET', path: '/api/stages/stage_final/teams' },
+  { method: 'POST', path: '/api/editions/ed_demo/stages', body: { key: 's_demo', name: '演示赛段', kind: 'initial', scoringConfigKey: 'initial' } },
+  { method: 'POST', path: '/api/stages/stage_final/judges', body: { userId: 'j_lenient', seat: 'judge' } },
+  { method: 'POST', path: '/api/stages/stage_final/teams', body: { teamIds: ['t_alpha'] } },
 ];
 
 test('演示适配器必须实现前端用到的**每一个**端点（缺一个 ⇒ 演示站那页就是 404）', async () => {

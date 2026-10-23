@@ -777,9 +777,10 @@ import {
   registerStageTeamRoster,
   removeStageTeam as removeStageTeamFromRoster,
 } from '../../services/stage.js';
-import { getStage, listStageJudges } from '../../db/repo/stages.js';
+import { getStage, listStageJudges, listStageJudgeCandidates, listStageSummaries } from '../../db/repo/stages.js';
 import { listStageTeamIds } from '../../db/repo/stage-teams.js';
-import { getEdition } from '../../db/repo/editions.js';
+import { getEdition, listEditions } from '../../db/repo/editions.js';
+import { listEditionTeams } from '../../db/repo/pool-sources.js';
 
 /** 未登录 → 401（领域错误一律走 appError，status 在前）。 */
 function requireUser(ctx) {
@@ -803,6 +804,29 @@ function requireStageCompute(ctx, scope) {
 function requireStageComputeForStage(ctx, stage) {
   if (ctx.can('stage:compute', { scopeType: 'edition', scopeId: stage.edition_id })) return;
   if (ctx.can('stage:compute', { scopeType: 'stage', scopeId: stage.id })) return;
+  throw appError(403, 'FORBIDDEN', '缺少能力：stage:compute');
+}
+
+/**
+ * 届期级资源的能力点闸门：**届期级**，或**该届期下任一赛段的赛段级**授权，都放行。
+ *
+ * ⚠️ 为什么要有这一条（E158 接线时抓到的口径裂缝）：
+ *   赛段的**写**端点走 `requireStageComputeForStage` —— 届期级**或**赛段级都放行。
+ *   而届期级的**读**口若只认届期级，就会出现「**能改赛段、却读不到权重表**」的
+ *   前后端不一致（页面拿不到席构成约束 ⇒ 组委会判断不了席够不够合法）。
+ *   ⇒ 口径对齐写端点：只要在这个届期的**任何**赛段上有 stage:compute，就放行。
+ *
+ * @param {object} ctx
+ * @param {object} db   数据库句柄（⛔ 必须显式传：本文件顶层的辅助函数拿不到
+ *                      registerStageRoutes 内部的 dbOf 闭包）
+ * @param {string} editionId
+ */
+function requireStageComputeForEdition(ctx, db, editionId) {
+  if (ctx.can('stage:compute', { scopeType: 'edition', scopeId: editionId })) return;
+  // ⛔ 赛段级授权：把该届期下的赛段逐个问一遍（赛段数量级很小，可接受）。
+  for (const st of listStageSummaries(db, { editionId })) {
+    if (ctx.can('stage:compute', { scopeType: 'stage', scopeId: st.id })) return;
+  }
   throw appError(403, 'FORBIDDEN', '缺少能力：stage:compute');
 }
 
@@ -992,6 +1016,96 @@ export function registerStageRoutes(router, { db = null, rules = null } = {}) {
     if (!stage) throw appError(404, 'STAGE_NOT_FOUND', '赛段不存在');
     requireStageComputeForStage(ctx, stage);
     return { teamIds: listStageTeamIds(dbOf(ctx), ctx.params.stageId) };
+  });
+
+  // ── 读口（⑦）：届期列表 ────────────────────────────────────────────
+  // ⚠️ 为什么公开：届期是**公开赛事信息**（与 `GET /api/stages` 的赛段时间线同口径），
+  //    落地页/首页都要用。前端要它是因为「建赛段」必须指明届期，而届期 id 只有服务端知道。
+  router.add('GET', '/api/editions', async (ctx) => {
+    const rows = listEditions(dbOf(ctx));
+    return {
+      items: rows.map((r) => ({
+        id: r.id,
+        name: r.name,
+        city: r.city ?? null,
+        startsAt: r.starts_at,
+        endsAt: r.ends_at,
+      })),
+    };
+  });
+
+  // ── 读口（⑧）：该届期的全部战队（名册登记的**候选池**）─────────────
+  // ⚠️ 为什么要这个口：`GET /api/teams` 返回的是「**我参与的**战队」（participant 视角），
+  //    组委会看不到全部队伍 ⇒ 名册登记页**没有任何可选队伍**（E158 的直接产物）。
+  //    届期隔离口径：`listEditionTeams` 只取该届期且未软删除的队伍（顶层文档 §3.1 S2）。
+  router.add('GET', '/api/editions/:editionId/teams', async (ctx) => {
+    requireUser(ctx);
+    const editionId = ctx.params.editionId;
+    if (!getEdition(dbOf(ctx), editionId)) throw appError(404, 'EDITION_NOT_FOUND', '届期不存在');
+    requireStageComputeForEdition(ctx, dbOf(ctx), editionId);
+    const items = listEditionTeams(dbOf(ctx), editionId).map((t) => ({
+      id: t.id,
+      name: t.name,
+      tier: t.tier ?? null,
+    }));
+    return { items };
+  });
+
+  // ── 读口（⑨）：评委候选池 ──────────────────────────────────────────
+  // ⚠️ 候选池 = **持有评委类角色的人**，不是「全部用户」
+  //    （理由见 repo/stages.js 的 listStageJudgeCandidates 注释）。
+  router.add('GET', '/api/editions/:editionId/judge-candidates', async (ctx) => {
+    requireUser(ctx);
+    const editionId = ctx.params.editionId;
+    if (!getEdition(dbOf(ctx), editionId)) throw appError(404, 'EDITION_NOT_FOUND', '届期不存在');
+    requireStageComputeForEdition(ctx, dbOf(ctx), editionId);
+    const items = listStageJudgeCandidates(dbOf(ctx)).map((u) => ({
+      id: u.id,
+      name: u.name,
+      org: u.org ?? null,
+    }));
+    return { items };
+  });
+
+  // ── 读口（⑩）：权重表（设计 §9「赛段配置与**权重表**」）─────────────
+  // ⚠️ 投影纪律与 `src/domain/event-info.js` **同款**：逐字段白名单 ——
+  //    只给「维度 + 权重 + 席」与「席构成约束」，**不给**配置里的内部工作语言
+  //    （note / source / conflictRef / 冲突裁决说明）。
+  //    维度权重本身已由 `GET /api/event-info` 公开；这里补的是**组委会视角**的
+  //    judgePool 席构成约束（派几个人、什么席比例 ⇒ 决定席够不够合法）。
+  //
+  // ⚠️ 为什么是**届期作用域**而不是 global：
+  //    写端点（建赛段 / 改配置 / 派评委…）走 `requireStageComputeForStage`，
+  //    它接受 **edition 级或 stage 级**的 `stage:compute`。
+  //    若这个读口用 global 作用域，就会出现「**能改赛段却读不到权重表**」的
+  //    前后端不一致 ⇒ 页面拿不到权重表 ⇒ 组委会无法判断席够不够合法。
+  //    ⇒ 口径对齐写端点：届期级授权即可读。
+  router.add('GET', '/api/editions/:editionId/scoring-configs', async (ctx) => {
+    requireUser(ctx);
+    const editionId = ctx.params.editionId;
+    if (!getEdition(dbOf(ctx), editionId)) throw appError(404, 'EDITION_NOT_FOUND', '届期不存在');
+    requireStageComputeForEdition(ctx, dbOf(ctx), editionId);
+    const scoring = rulesOf(ctx)?.scoring ?? {};
+    const items = Object.entries(scoring).map(([key, cfg]) => ({
+      key,
+      wEnterprise: cfg?.wEnterprise ?? null,
+      normalizationStrategy: cfg?.normalizationStrategy ?? null,
+      minSamplesForJudgeNormalization: cfg?.minSamplesForJudgeNormalization ?? null,
+      dimensions: (Array.isArray(cfg?.dimensions) ? cfg.dimensions : []).map((d) => ({
+        key: d?.key ?? null,
+        name: d?.name ?? null,
+        weight: d?.weight ?? null,
+        seat: d?.seat ?? null,
+      })),
+      judgePool: {
+        minJudgesPerDimension: cfg?.judgePool?.minJudgesPerDimension ?? null,
+        minEnterpriseSeatShare: cfg?.judgePool?.minEnterpriseSeatShare ?? null,
+        maxExpertSeatShare: cfg?.judgePool?.maxExpertSeatShare ?? null,
+        votingSeats: Array.isArray(cfg?.judgePool?.votingSeats) ? cfg.judgePool.votingSeats : [],
+        nonVotingSeats: Array.isArray(cfg?.judgePool?.nonVotingSeats) ? cfg.judgePool.nonVotingSeats : [],
+      },
+    }));
+    return { items };
   });
 }
 ```
@@ -8844,4 +8958,2348 @@ test('变异检验：「只是提到名字」也算调用 ⇒ 整套自测必须
     }
   ]
 }
+```
+
+### `platform/test/stage-config-api.test.js`
+
+「赛段配置」页所需的**组委会读口**闸（E158）：届期列表 / 候选队伍 / 评委候选池 / 权重表 —— 全部走真实 HTTP 路由，含权限（403）与资源不存在（404）的三态断言。
+
+```javascript
+// platform/test/stage-config-api.test.js —— 「赛段配置」页所需的**组委会读口**闸（P11 新建 · E158）
+//
+// ⛔ **这个文件为什么必须存在**（P11 的病根 #1 同一个形态）：
+//   P11 的 E150 把赛段的 6 个**写**端点（建段 / 改配置 / 派评委 / 撤评委 / 报名册 / 退名册）
+//   全做完了，但**前端一个界面都没有** ⇒ 设计文档 §9「赛段配置与权重表」这块界面不存在。
+//   补界面时又撞出**下一层**缺口：页面要能选队伍、选评委、看权重表，
+//   而这三个读口**一个都不存在**：
+//     · `GET /api/teams` 返回的是「**我参与的**战队」（participant 视角）
+//       ⇒ 组委会看到的永远是空数组 ⇒ 名册登记页**没有任何可选队伍**；
+//     · 没有任何端点能列出「可当评委的人」；
+//     · 权重表的**维度**虽已由 `GET /api/event-info` 公开，但组委会要的
+//       **席构成约束**（judgePool）没有对外投影。
+//   ⇒ 本文件用**真实 HTTP 路由**把这些口钉死（含权限与白名单投影）。
+//
+// 规则溯源：
+//   · 「赛段配置与权重表」界面 ⇒ 设计文档 §9（前端 IA，组委会视角）
+//   · 可见性在 API 层过滤 ⇒ 全局约束
+//   · 三态状态码（404 不存在 / 403 没权限 / 200 成功）⇒ 设计文档 §7.3
+//   · 逐字段白名单投影（不泄漏内部工作语言）⇒ src/domain/event-info.js 同款纪律
+//   · 评委候选池 ≠ 全部用户 ⇒ 顶层文档 §3.1 S2「一切按 edition 隔离」
+//     （机器闸 allow.json 已把 listAllUsers 判为「未被消费是语义上正确的结果」）
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { openDatabase } from '../src/db/sqlite.js';
+import { applyMigrations } from '../src/db/migrate.js';
+import { loadRules } from '../src/config.js';
+import { createApp } from '../src/server.js';
+import { registerStageRoutes } from '../src/http/routes/stages.js';
+import { createUser, deactivateUser } from '../src/db/repo/users.js';
+import { createEdition } from '../src/db/repo/editions.js';
+import { createTaskPackage } from '../src/db/repo/taskPackages.js';
+import { insertTeam } from '../src/db/repo/teams.js';
+import { insertTeamMember } from '../src/db/repo/teamMembers.js';
+import { insertCapability } from '../src/db/repo/capabilities.js';
+import { insertRole, insertUserRole } from '../src/db/repo/roles.js';
+import { grantAssignment } from '../src/auth/permissions.js';
+import { createSession } from '../src/auth/session.js';
+import { call } from '../test-helpers/http-call.js';
+import { isolateTempDir } from '../test-helpers/tmp.js';
+
+isolateTempDir();
+
+const here = dirname(fileURLToPath(import.meta.url));
+const migrationsDir = join(here, '..', 'db', 'migrations');
+const rulesDir = join(here, '..', 'rules');
+const webDir = join(here, '..', 'web');
+const NOW = '2026-10-20T12:00:00.000Z';
+
+/**
+ * 组装一个「组委会能配置赛段」的世界。
+ *
+ * ⚠️ 人物是**判别性**的：
+ *   · admin      —— 全局 `stage:compute`（组委会）
+ *   · orgEdition —— **届期级** `stage:compute`（用来钉住「读口与写口口径一致」）
+ *   · outsider   —— 一个能力点都没有
+ *   · judgeUser  —— 角色 `judge`（专家席）      ⇒ 应在候选池里
+ *   · observer   —— 角色 `observer`（观察员）    ⇒ 应在候选池里
+ *   · entUser    —— 角色 `enterprise`（企业席）  ⇒ 应在候选池里
+ *   · captain    —— 角色 `captain`（**参赛者**） ⇒ **不应**在候选池里
+ *   · admin      —— **没有**评委类角色          ⇒ **不应**在候选池里
+ */
+function setup() {
+  const dataDir = mkdtempSync(join(tmpdir(), 'hks-stage-cfg-'));
+  const { db, close } = openDatabase({ dataDir });
+  applyMigrations(db, migrationsDir);
+  const { rules } = loadRules(rulesDir);
+
+  insertCapability(db, 'stage:compute', '触发计算发榜');
+
+  const edition = createEdition(db, {
+    name: '首届 · 上海', city: '上海', startsAt: '2026-10-01', endsAt: '2026-11-30', now: NOW,
+  });
+  const admin = createUser(db, { name: '组委会', phone: '13900007001', password: 'pw' });
+  const orgEdition = createUser(db, { name: '届期组委会', phone: '13900007002', password: 'pw' });
+  const outsider = createUser(db, { name: '无权限者', phone: '13900007003', password: 'pw' });
+  const judgeUser = createUser(db, { name: '评委甲', phone: '13900007004', password: 'pw' });
+  const observer = createUser(db, { name: '观察员乙', phone: '13900007005', password: 'pw' });
+  const entUser = createUser(db, { name: '企业代表丙', phone: '13900007006', password: 'pw' });
+  const captain = createUser(db, { name: '队长丁', phone: '13900007007', password: 'pw' });
+  // ⛔ orgStage 不授任何能力点 ⇒ 只能在测试里给他授「赛段级」权限。
+  const orgStage = createUser(db, { name: '赛段组委会', phone: '13900007010', password: 'pw' });
+  // ⚠️ 停用但**持有 judge 角色**的人 ⇒ 候选池必须把他排除（active = 1 过滤）。
+  const staleUser = createUser(db, { name: '已停用评委', phone: '13900007009', password: 'pw' });
+
+  for (const key of ['judge', 'enterprise', 'observer', 'captain']) insertRole(db, key, key);
+  insertUserRole(db, judgeUser.id, 'judge');
+  insertUserRole(db, observer.id, 'observer');
+  insertUserRole(db, entUser.id, 'enterprise');
+  insertUserRole(db, captain.id, 'captain');
+  insertUserRole(db, staleUser.id, 'judge');
+  deactivateUser(db, staleUser.id);
+  // ⛔ admin **故意不给**评委类角色 ⇒ 他不该出现在候选池里。
+
+  grantAssignment(db, {
+    userId: admin.id, capability: 'stage:compute', scopeType: 'global', scopeId: null, grantedBy: admin.id,
+  });
+  // ⛔ orgEdition 只有**届期级**授权 ⇒ 用来证明「读口与写端点口径一致」。
+  grantAssignment(db, {
+    userId: orgEdition.id, capability: 'stage:compute', scopeType: 'edition', scopeId: edition.id, grantedBy: admin.id,
+  });
+
+  const pkg = createTaskPackage(db, {
+    editionId: edition.id, enterpriseId: entUser.id, enterpriseName: '某某企业',
+    title: '库存周转', painPoint: '门店库存周转慢',
+    expectedDelivery: '可运行的排产原型', acceptanceCriteria: '能给出周转天数下降的测算',
+    submittedBy: admin.id, now: NOW,
+  });
+
+  const teams = [];
+  for (let i = 0; i < 2; i += 1) {
+    // ⚠️ team_members.user_id 是唯一约束 ⇒ 一人只能在一支队 ⇒ 每队一个队长。
+    const t = insertTeam(db, {
+      editionId: edition.id, name: `${i + 1}队`, captainId: captain.id,
+      taskPackageId: pkg.id, tier: i === 0 ? 'B' : 'C', status: 'active', now: NOW,
+    });
+    if (i === 0) {
+      insertTeamMember(db, { teamId: t.id, userId: captain.id, role: 'captain', now: NOW });
+    } else {
+      const captain2 = createUser(db, { name: '队长戊', phone: '13900007008', password: 'pw' });
+      insertUserRole(db, captain2.id, 'captain');
+      insertTeamMember(db, { teamId: t.id, userId: captain2.id, role: 'captain', now: NOW });
+    }
+    teams.push(t);
+  }
+
+  const app = createApp({ db, rules, webDir });
+  const wired = app.router.list().some(
+    (r) => r.method === 'GET' && r.pattern === '/api/editions/:editionId/teams',
+  );
+  if (!wired) registerStageRoutes(app.router, { db, rules });
+
+  return {
+    db, close, app, rules, edition, teams, admin, orgEdition, outsider,
+    judgeUser, observer, entUser, captain, staleUser, orgStage,
+    tokenAdmin: createSession(db, admin.id).token,
+    tokenOrgEdition: createSession(db, orgEdition.id).token,
+    tokenOrgStage: createSession(db, orgStage.id).token,
+    tokenOutsider: createSession(db, outsider.id).token,
+  };
+}
+
+function json(res) {
+  return JSON.parse(res.body);
+}
+
+/** 错误体的 code（三态状态码约定：{ error: { code, message } }）。 */
+function code(res) {
+  return json(res).error?.code ?? json(res).code ?? null;
+}
+
+test('⛔ E158：GET /api/editions —— 公开可读（届期是公开赛事信息，页面要知道往哪届建赛段）', async () => {
+  const ctx = setup();
+  try {
+    const res = await call(ctx.app, 'GET', '/api/editions');
+    assert.equal(res.status, 200, `届期列表应可读：${res.body}`);
+    const items = json(res).items;
+    assert.equal(items.length, 1);
+    assert.equal(items[0].id, ctx.edition.id);
+    assert.equal(items[0].name, '首届 · 上海');
+    assert.equal(items[0].city, '上海');
+    // ⛔ 白名单投影：不得带出内部列
+    assert.equal(items[0].created_at, undefined, '届期不应带出 created_at（白名单投影）');
+  } finally {
+    ctx.close();
+  }
+});
+
+test('⛔ E158：GET /api/editions/:editionId/teams —— 组委会能看到**全部**候选队伍（participant 视角的 GET /api/teams 看不到）', async () => {
+  const ctx = setup();
+  try {
+    const res = await call(ctx.app, 'GET', `/api/editions/${ctx.edition.id}/teams`, { token: ctx.tokenAdmin });
+    assert.equal(res.status, 200, `组委会应能读候选队伍：${res.body}`);
+    const items = json(res).items;
+    assert.equal(items.length, 2, '两支队伍都必须在候选池里');
+    const names = items.map((t) => t.name).sort();
+    assert.deepEqual(names, ['1队', '2队']);
+    // ⛔ 判别性：段位要透出来（页面要显示队伍段位）
+    const tiers = items.map((t) => t.tier).sort();
+    assert.deepEqual(tiers, ['B', 'C']);
+    // ⛔ 白名单投影：不得带出任务包 id 之类内部列
+    assert.equal(items[0].task_package_id, undefined, '不得带出 task_package_id（白名单投影）');
+    assert.equal(items[0].taskPackageId, undefined);
+  } finally {
+    ctx.close();
+  }
+});
+
+test('⛔ E158：评委候选池 = 持评委类角色的人，**不是**全部用户（S2 届期隔离 + allow.json 的既有判定）', async () => {
+  const ctx = setup();
+  try {
+    const res = await call(ctx.app, 'GET', `/api/editions/${ctx.edition.id}/judge-candidates`, { token: ctx.tokenAdmin });
+    assert.equal(res.status, 200, `组委会应能读评委候选池：${res.body}`);
+    const ids = json(res).items.map((u) => u.id);
+
+    assert.ok(ids.includes(ctx.judgeUser.id), 'judge 角色的人必须在候选池里');
+    assert.ok(ids.includes(ctx.observer.id), 'observer 角色的人必须在候选池里（无投票权但可入席）');
+    assert.ok(ids.includes(ctx.entUser.id), 'enterprise 角色的人必须在候选池里（企业席）');
+
+    assert.ok(!ids.includes(ctx.captain.id), '⛔ 参赛队长（captain 角色）不该在评委候选池里');
+    assert.ok(!ids.includes(ctx.admin.id), '⛔ 没有评委类角色的组委会不该出现在候选池里');
+    assert.ok(!ids.includes(ctx.outsider.id), '⛔ 无关用户不该在候选池里');
+    assert.ok(!ids.includes(ctx.staleUser.id), '⛔ 已停用用户（active=0）不该在候选池里');
+
+    // ⛔ 白名单投影
+    const first = json(res).items[0];
+    assert.deepEqual(Object.keys(first).sort(), ['id', 'name', 'org']);
+  } finally {
+    ctx.close();
+  }
+});
+
+test('⛔ E158：GET /api/editions/:editionId/scoring-configs —— 权重表 + 席构成约束，且不泄漏内部工作语言', async () => {
+  const ctx = setup();
+  try {
+    const res = await call(ctx.app, 'GET', `/api/editions/${ctx.edition.id}/scoring-configs`, { token: ctx.tokenAdmin });
+    assert.equal(res.status, 200, `组委会应能读权重表：${res.body}`);
+    const items = json(res).items;
+    const keys = items.map((c) => c.key).sort();
+    assert.deepEqual(keys, ['final', 'initial'], '两张权重表都要给（initial / final）');
+
+    const initial = items.find((c) => c.key === 'initial');
+    assert.equal(initial.dimensions.length, 6, '初赛 6 个维度');
+    const first = initial.dimensions[0];
+    assert.deepEqual(Object.keys(first).sort(), ['key', 'name', 'seat', 'weight']);
+    assert.equal(first.key, 'track_fit');
+    assert.equal(first.name, '赛题契合度');
+    assert.equal(first.weight, 0.10);
+    assert.equal(first.seat, 'judge');
+
+    // ⛔ 席构成约束：企业席 ≥30% / 专家席 ≤50% / observer 无投票权
+    assert.equal(initial.judgePool.minEnterpriseSeatShare, 0.30);
+    assert.equal(initial.judgePool.maxExpertSeatShare, 0.50);
+    assert.equal(initial.judgePool.minJudgesPerDimension, 7);
+    assert.deepEqual(initial.judgePool.nonVotingSeats, ['observer']);
+    assert.ok(initial.judgePool.votingSeats.includes('enterprise'));
+
+    // ⛔ 内部工作语言**不得**外泄（note / source / conflictRef 是内部裁决说明）
+    for (const c of items) {
+      assert.equal(c.note, undefined, `权重表 ${c.key} 不应带出 note（内部工作语言）`);
+      assert.equal(c.source, undefined, `权重表 ${c.key} 不应带出 source（内部出处说明）`);
+      assert.equal(c.conflictRef, undefined, `权重表 ${c.key} 不应带出 conflictRef`);
+      assert.equal(c.trimOutliers, undefined, `权重表 ${c.key} 不应带出内部参数 trimOutliers`);
+    }
+  } finally {
+    ctx.close();
+  }
+});
+
+test('⛔ E158：三态状态码 —— 无权限 403 / 届期不存在 404（不是 200 空集，也不是 500）', async () => {
+  const ctx = setup();
+  try {
+    // ① 无权限 ⇒ 403
+    for (const path of [
+      `/api/editions/${ctx.edition.id}/teams`,
+      `/api/editions/${ctx.edition.id}/judge-candidates`,
+      `/api/editions/${ctx.edition.id}/scoring-configs`,
+    ]) {
+      const res = await call(ctx.app, 'GET', path, { token: ctx.tokenOutsider });
+      assert.equal(res.status, 403, `${path} 无权限应 403：${res.body}`);
+      assert.equal(code(res), 'FORBIDDEN', `${path} 错误码应是 FORBIDDEN`);
+    }
+
+    // ② 未登录 ⇒ 401
+    const anon = await call(ctx.app, 'GET', `/api/editions/${ctx.edition.id}/teams`);
+    assert.equal(anon.status, 401, `未登录应 401：${anon.body}`);
+    assert.equal(code(anon), 'UNAUTHENTICATED');
+
+    // ③ 届期不存在 ⇒ 404
+    for (const path of [
+      '/api/editions/does-not-exist/teams',
+      '/api/editions/does-not-exist/judge-candidates',
+      '/api/editions/does-not-exist/scoring-configs',
+    ]) {
+      const res = await call(ctx.app, 'GET', path, { token: ctx.tokenAdmin });
+      assert.equal(res.status, 404, `${path} 届期不存在应 404：${res.body}`);
+      assert.equal(code(res), 'EDITION_NOT_FOUND');
+    }
+  } finally {
+    ctx.close();
+  }
+});
+
+test('⛔ E158：**届期级**授权也能读这些口（与写端点口径一致 —— 能改赛段就能看配置）', async () => {
+  const ctx = setup();
+  try {
+    for (const path of [
+      `/api/editions/${ctx.edition.id}/teams`,
+      `/api/editions/${ctx.edition.id}/judge-candidates`,
+      `/api/editions/${ctx.edition.id}/scoring-configs`,
+    ]) {
+      const res = await call(ctx.app, 'GET', path, { token: ctx.tokenOrgEdition });
+      assert.equal(res.status, 200, `${path} 届期级授权应可读：${res.body}`);
+    }
+  } finally {
+    ctx.close();
+  }
+});
+
+test('⛔ E158：**赛段级**授权也能读这些口（写端点认赛段级，读口不许比它更严）', async () => {
+  const ctx = setup();
+  try {
+    // ① 先经 HTTP 建一个赛段（拿 stageId）
+    const created = await call(ctx.app, 'POST', `/api/editions/${ctx.edition.id}/stages`, {
+      token: ctx.tokenAdmin,
+      body: {
+        key: 's1', name: '初赛', kind: 'initial',
+        startsAt: '2026-10-01', endsAt: '2026-10-10', scoringConfigKey: 'initial',
+      },
+    });
+    assert.equal(created.status, 200, `建赛段应成功：${created.body}`);
+    const stageId = json(created).stage.id;
+
+    // ② 给 orgStage 授**赛段级** stage:compute（他**没有**届期级授权 ⇒
+    //    读口若只认届期级，他就会「能改赛段、却读不到权重表」）
+    grantAssignment(ctx.db, {
+      userId: ctx.orgStage.id, capability: 'stage:compute',
+      scopeType: 'stage', scopeId: stageId, grantedBy: ctx.admin.id,
+    });
+
+    // ③ 赛段级授权 ⇒ 能改这个赛段（写端点本来就认）
+    const patched = await call(ctx.app, 'PATCH', `/api/stages/${stageId}`, {
+      token: ctx.tokenOrgStage, body: { name: '初赛（改名）' },
+    });
+    assert.equal(patched.status, 200, `赛段级授权应能改赛段：${patched.body}`);
+
+    // ④ ⛔ 但**读口不许比写端点更严** —— 否则就出现「能改赛段、却读不到权重表」
+    for (const path of [
+      `/api/editions/${ctx.edition.id}/teams`,
+      `/api/editions/${ctx.edition.id}/judge-candidates`,
+      `/api/editions/${ctx.edition.id}/scoring-configs`,
+    ]) {
+      const res = await call(ctx.app, 'GET', path, { token: ctx.tokenOrgStage });
+      assert.equal(res.status, 200, `${path} 赛段级授权应可读：${res.body}`);
+    }
+  } finally {
+    ctx.close();
+  }
+});
+```
+
+### `platform/web/views/stages.js`
+
+「赛段配置与权重表」页（E158 · W5-d 补做）：设计 §9 明写要有这块界面，而 P11 把建段 / 改配置 / 派评委 / 撤评委 / 报名册 / 退名册 6 个写端点全做完了却**一个界面都没有** ⇒ 端点零调用方。本页把 6 个写端点 + 4 个读端点全部接上，逆向路径（撤评委 / 退名册）带影响面二次确认。
+
+```javascript
+// web/views/stages.js — 赛段配置与权重表（组委会 · P11 新建）
+//
+// 规则溯源（每条设计依据都指到具体规则 / 设计文档章节）：
+//   - 「组委会视角 → **赛段配置与权重表**」→ 设计文档 §9「前端信息架构」（IA 图第 883 行）
+//     —— 这一块界面在 §9 里明写存在，但 P11 之前**一个界面都没有** ⇒
+//        六个写端点（建段 / 改配置 / 派评委 / 撤评委 / 报名册 / 退名册）在产品里零调用方。
+//   - 六个写端点 + 两个读口的形状 → src/http/routes/stages.js（P11 补齐）
+//     规则与校验全在 src/services/stage.js（路由层只接线，不复制规则）。
+//   - 「赛段从属于届期」→ src/db/repo/stages.js（stages.edition_id 外键）
+//     ⇒ 建段是 `POST /api/editions/:editionId/stages`，页面必须先有届期。
+//   - 「席构成：企业席 ≥30% / 专家席 ≤50%；观察席无投票权」→ S7 §3.4（R-JDG-11）
+//     + rules/scoring-initial.json 的 judgePool
+//     ⛔ **页面不复制这套校验**（服务端会校验）—— 前端照抄一遍必然与服务端漂移。
+//   - 「利益冲突声明随席位同事务写入」→ S7 §3.4（R-JDG-18）
+//     + src/services/stage.js 的 assignStageJudgeToStage。
+//   - 「权重表只读：改一份 JSON、重启即生效」→ 设计文档 S-2
+//     ⇒ 页面**只展示**当前用的是哪一张表 + 席构成约束，不提供改权重的入口。
+//   - 「权重表端点是**届期作用域**」→ `GET /api/editions/:editionId/scoring-configs`
+//     ⛔ 曾经按 global 作用域判能力点，而赛段的写端点（建段 / 改配置 / 派评委）接受
+//        **edition 级或 stage 级**的 stage:compute ⇒ 会出现「能改赛段、却读不到权重表」
+//        的前后端不一致 ⇒ 页面拿不到席构成约束，组委会无法判断席够不够合法。
+//        ⇒ 统一成届期作用域（页面的读口与写口同域）。
+//   - 「三态状态码：404 不存在 / 403 没权限 / 200 成功」→ 设计文档 §7.3
+//   - 「前端不按角色拦路由，授权归 API」→ 全局约束（DP-77）
+//     ⇒ 按钮**始终渲染**；403 时把服务端的中文原因显示出来。
+//   - 「noticeState 的参数叫 items，不叫 text」→ web/ui.js 文件头（本仓已踩过的坑）
+//   - 「HTML 文本插值一律过 escapeHtml（全站唯一转义入口）」→ web/escape.js
+//   - 「加载 / 空 / 错三态用现成组件，不自己造」→ web/ui.js
+//
+// ⚠️ **为什么这个视图不判权限**：能不能配赛段、能不能派评委，一律由 API 裁决
+//   （全局约束「授权的唯一裁决者是 can()，前端只拿到提示」）。
+//   ⇒ 表单按钮**始终渲染**；被 403 时页面显示「没有权限」，而不是空白页或前端自行藏按钮。
+//
+// ⚠️ **权重表的顺序按「声明序」**（rules/scoring-*.json 里的顺序），不按权重降序：
+//   规则文件里同一席的维度是**连着写**的（judge 维度在前、enterprise 维度在后），
+//   按权重重排会把企业维度插进评委维度中间 ⇒ 席分组被拆散，反而看不出「哪张表」。
+//   权重合计单独一行给出（100% ⇒ 页面能一眼看出表是完整的）。
+import { escapeHtml } from '../escape.js';
+import {
+  badge, emptyState, errorState, kvList, loadingState, noticeState, pageHead,
+  panel, sectionTitle, statRow, tableWrap,
+} from '../ui.js';
+
+// ── 枚举（口径与服务层 src/services/stage.js 同一份）──────────────────
+// ⛔ 这些是**下拉框的选项**，不是校验：真正的校验在服务端（rules 与枚举都由服务端说了算）。
+//    前端复制一份枚举只为「不让人手打一个服务端不认的值」，不参与任何判定。
+
+/** 赛段类型（src/services/stage.js: STAGE_KINDS）。 */
+export const STAGE_KINDS = [
+  { value: 'initial', label: '初赛', tone: 'brand' },
+  { value: 'final', label: '决赛', tone: 'success' },
+  { value: 'roadshow', label: '路演', tone: 'info' },
+  { value: 'landing', label: '落地', tone: 'neutral' },
+];
+
+/** 评委席类型（src/services/stage.js: JUDGE_SEATS）。 */
+export const JUDGE_SEATS = [
+  { value: 'judge', label: '评委席', tone: 'brand', voting: true },
+  { value: 'enterprise', label: '企业席', tone: 'info', voting: true },
+  { value: 'observer', label: '观察席 · 无投票权', tone: 'neutral', voting: false },
+];
+
+/** 可用的权重表键（src/services/stage.js: SCORING_CONFIG_KEYS）。 */
+export const SCORING_CONFIG_KEYS = ['initial', 'final'];
+
+// ── 小工具（纯函数）───────────────────────────────────────────────────
+
+/** 时间 → 「2026-10-20 12:00」（不合法就原样显示，别显示 Invalid Date）。 */
+export function fmtStageTime(value) {
+  const text = String(value ?? '').trim();
+  if (!text) return '';
+  const d = new Date(text);
+  if (Number.isNaN(d.getTime())) return text;
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+/**
+ * 时间 → `<input type="datetime-local">` 的值（「2026-10-20T12:00」）。
+ * ⚠️ 服务端 `Date.parse` 接受 ISO 与 YYYY-MM-DD；datetime-local 给的是**本地时间**，
+ *    与展示用的 fmtStageTime（本地时间）同一口径 ⇒ 存进去和显示出来不会差一个时区。
+ */
+export function toLocalInput(value) {
+  const text = String(value ?? '').trim();
+  if (!text) return '';
+  const d = new Date(text);
+  if (Number.isNaN(d.getTime())) return '';
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+/** 权重 → 「20%」（0.2 → 20%）。 */
+export function fmtWeight(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return '—';
+  const pct = Math.round(n * 1000) / 10;
+  return `${pct}%`;
+}
+
+/**
+ * `<input type="datetime-local">` 的值 → ISO 字符串（发给服务端前统一转一道）。
+ * ⚠️ datetime-local 给的是**本地时间**（"2026-10-20T12:00"），直接存进库会和
+ *    其它端点写入的 ISO 串格式不一致 ⇒ 统一转成 ISO（同一个时刻，不改语义）。
+ */
+export function toIso(value) {
+  const text = String(value ?? '').trim();
+  if (!text) return '';
+  const d = new Date(text);
+  if (Number.isNaN(d.getTime())) return text;
+  return d.toISOString();
+}
+
+/** 赛段类型 → { label, tone }（未知值原样透出，不静默吞掉）。 */
+export function stageKindLabel(kind) {
+  const hit = STAGE_KINDS.find((k) => k.value === String(kind ?? ''));
+  return hit ? { label: hit.label, tone: hit.tone } : { label: String(kind ?? '—'), tone: 'neutral' };
+}
+
+/** 赛段状态 → { label, tone }。 */
+export function stageStatusLabel(status) {
+  const raw = String(status ?? '').trim();
+  if (raw === 'draft') return { label: '草稿', tone: 'neutral' };
+  if (raw === 'open' || raw === 'active') return { label: '进行中', tone: 'success' };
+  if (raw === 'closed' || raw === 'finished') return { label: '已结束', tone: 'neutral' };
+  if (raw === 'computed') return { label: '已计算', tone: 'info' };
+  if (raw === 'published') return { label: '已发榜', tone: 'success' };
+  return { label: raw || '—', tone: 'neutral' };
+}
+
+/**
+ * 席位 → { label, tone, voting }。
+ * ⚠️ observer 的标签里**必须**写明「无投票权」（S7 §3.4 / R-JDG-11）：
+ *    组委会派一个观察席进来，是为了「看」而不是「评」—— 标签不写清楚，
+ *    就会有评委以为自己也有票，事后才发现投不了。
+ */
+export function judgeSeatLabel(seat) {
+  const hit = JUDGE_SEATS.find((s) => s.value === String(seat ?? ''));
+  return hit
+    ? { label: hit.label, tone: hit.tone, voting: hit.voting }
+    : { label: String(seat ?? '—'), tone: 'neutral', voting: false };
+}
+
+/**
+ * 三态状态码 → 人话（纯函数）。
+ * ⛔ 403 必须说「没有权限」而不是「请求失败」—— 设计文档 §7.3 的三态就是给用户看的。
+ * @param {number|string} status
+ * @param {string} message 服务端给的中文原因（403 时优先用它，因为它最具体）
+ */
+export function stageErrorText(status, message) {
+  const code = Number(status);
+  const serverMsg = String(message ?? '').trim();
+  if (code === 403) {
+    return serverMsg
+      ? `没有权限：${serverMsg}`
+      : '没有权限：赛段配置需要组委会能力（stage:compute）。';
+  }
+  if (code === 404) {
+    return serverMsg ? `对象不存在：${serverMsg}` : '对象不存在：赛段或届期可能已被删除。';
+  }
+  if (code === 401) return '请先登录后再配置赛段。';
+  return serverMsg || '加载失败，请重试。';
+}
+
+/** 选项列表（纯 HTML）。 */
+function optionsHtml(items, selected) {
+  return (items ?? [])
+    .map((it) => `<option value="${escapeHtml(it.value)}"${String(it.value) === String(selected ?? '') ? ' selected' : ''}>${escapeHtml(it.label)}</option>`)
+    .join('');
+}
+
+/** 取值：数组优先（规则文件里就是数组），也认单个字符串。 */
+function seatList(value) {
+  if (Array.isArray(value)) return value.map((x) => String(x ?? '')).filter(Boolean);
+  if (value === null || value === undefined || value === '') return [];
+  return [String(value)];
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 一、纯函数：届期 / 赛段列表
+// ══════════════════════════════════════════════════════════════════
+
+/**
+ * 「哪一届是当届」（纯函数）。
+ * ⚠️ 判据与 src/http/routes/registration.js 的 pickCurrentEdition 同款：
+ *    **尚未结束**（ends_at >= 今天）的最早一届；都没有就退回最后一届。
+ *    （不能用「最新一届」—— 那会把评委导到还没开赛的届期去。）
+ */
+export function pickCurrentEdition(editions, today = new Date().toISOString().slice(0, 10)) {
+  const list = Array.isArray(editions) ? editions : [];
+  if (!list.length) return null;
+  const day = String(today).slice(0, 10);
+  const started = list.filter((e) => String(e?.endsAt ?? e?.ends_at ?? '') >= day);
+  if (started.length) return started[0];
+  return list[list.length - 1];
+}
+
+/** 届期选择器（纯 HTML）。 */
+export function editionPickerHtml(editions, editionId) {
+  const list = Array.isArray(editions) ? editions : [];
+  if (!list.length) {
+    return '<p class="muted small">还没有届期 —— 届期是赛段的容器，组委会先建届期才能建赛段。</p>';
+  }
+  const items = list.map((e) => ({
+    value: e.id,
+    label: `${e.name ?? e.id}${e.city ? `（${e.city}）` : ''}${e.startsAt ? ` · ${fmtStageTime(e.startsAt)}` : ''}`,
+  }));
+  return `<div class="field">
+      <label class="field__label" for="stage-edition">届期</label>
+      <select class="select" id="stage-edition" data-stage="edition">
+        ${optionsHtml(items, editionId)}
+      </select>
+      <p class="field__hint">赛段从属于届期：建段、改配置、派评委、报名册都在本届期下操作。</p>
+    </div>`;
+}
+
+/** 赛段列表（纯 HTML）：代号 / 名称 / 类型 / 时间窗 / 状态 + 选中的入口。 */
+export function stageListHtml(stages, selectedId) {
+  const list = Array.isArray(stages) ? stages : [];
+  if (!list.length) {
+    return emptyState({
+      title: '本届期还没有赛段',
+      hint: '用下面的「新建赛段」建一条 —— 评审、发榜、破同分、企业签字台全都挂在赛段上，没有赛段这些页面一个都进不去。',
+    });
+  }
+  const rows = list.map((s) => {
+    const kind = stageKindLabel(s.kind);
+    const status = stageStatusLabel(s.status);
+    const on = String(s.id ?? '') === String(selectedId ?? '');
+    const window = `${fmtStageTime(s.startsAt) || '—'} → ${fmtStageTime(s.endsAt) || '—'}`;
+    return `<tr${on ? ' class="is-active"' : ''}>
+      <td>${escapeHtml(s.key ?? '—')}</td>
+      <td>${escapeHtml(s.name ?? '—')}</td>
+      <td>${badge(kind.label, kind.tone)}</td>
+      <td>${escapeHtml(window)}</td>
+      <td>${badge(status.label, status.tone)}</td>
+      <td><button type="button" class="btn btn--ghost btn--sm" data-action="stage-select" data-stage-id="${escapeHtml(s.id ?? '')}"${on ? ' disabled' : ''}>${on ? '当前赛段' : '进入配置'}</button></td>
+    </tr>`;
+  }).join('');
+  return tableWrap(
+    `<thead><tr><th>代号</th><th>名称</th><th>类型</th><th>时间窗</th><th>状态</th><th></th></tr></thead>
+     <tbody>${rows}</tbody>`,
+    { caption: '本届期赛段列表' },
+  );
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 二、纯函数：建段 / 改配置
+// ══════════════════════════════════════════════════════════════════
+
+/** 权重表下拉的选项（规则列表优先，取不到就退回枚举）。 */
+function scoringOptions(configs, selected) {
+  const list = Array.isArray(configs) ? configs : [];
+  const items = list.length
+    ? list.map((c) => ({ value: c.key, label: `${c.key}${c.version ? `（${c.version}）` : ''}` }))
+    : SCORING_CONFIG_KEYS.map((k) => ({ value: k, label: k }));
+  // 选中的键不在列表里也保留它（服务端的规则可能比前端读到的多）
+  const values = items.map((i) => String(i.value));
+  if (selected && !values.includes(String(selected))) {
+    items.push({ value: selected, label: `${selected}（规则里暂未读到）` });
+  }
+  return items;
+}
+
+/** 新建赛段表单（纯 HTML）。 */
+export function stageCreateFormHtml({ draft = {}, configs = [] } = {}) {
+  const kindItems = STAGE_KINDS.map((k) => ({ value: k.value, label: k.label }));
+  const configItems = scoringOptions(configs, draft.scoringConfigKey ?? 'initial');
+  return `<div class="field">
+      <label class="field__label" for="stage-new-key">赛段代号</label>
+      <input class="input" id="stage-new-key" type="text" autocomplete="off"
+        placeholder="如 initial / final" value="${escapeHtml(draft.key ?? '')}" data-stage="new-key" />
+      <p class="field__hint">代号建后**不可改**（它进 URL 与日志）：只能用字母、数字、连字符与下划线，同一届期内不能重复。</p>
+    </div>
+    <div class="field field--required">
+      <label class="field__label" for="stage-new-name">赛段名称</label>
+      <input class="input" id="stage-new-name" type="text" autocomplete="off"
+        placeholder="如 初赛评审" value="${escapeHtml(draft.name ?? '')}" data-stage="new-name" />
+    </div>
+    <div class="field">
+      <label class="field__label" for="stage-new-kind">赛段类型</label>
+      <select class="select" id="stage-new-kind" data-stage="new-kind">${optionsHtml(kindItems, draft.kind ?? 'initial')}</select>
+      <p class="field__hint">类型建后不可改：类型决定赛段在赛程里的位置与要交付的东西。</p>
+    </div>
+    <div class="field">
+      <label class="field__label" for="stage-new-config">权重表</label>
+      <select class="select" id="stage-new-config" data-stage="new-config">${optionsHtml(configItems, draft.scoringConfigKey ?? 'initial')}</select>
+      <p class="field__hint">权重表来自 rules/scoring-*.json（改文件、重启即生效）—— 这里只选择**用哪一张**。</p>
+    </div>
+    <div class="field">
+      <label class="field__label" for="stage-new-starts">开始时间</label>
+      <input class="input" id="stage-new-starts" type="datetime-local" value="${escapeHtml(toLocalInput(draft.startsAt))}" data-stage="new-starts" />
+    </div>
+    <div class="field">
+      <label class="field__label" for="stage-new-ends">结束时间</label>
+      <input class="input" id="stage-new-ends" type="datetime-local" value="${escapeHtml(toLocalInput(draft.endsAt))}" data-stage="new-ends" />
+    </div>
+    <div class="field">
+      <label class="field__label" for="stage-new-freeze">冻结时间</label>
+      <input class="input" id="stage-new-freeze" type="datetime-local" value="${escapeHtml(toLocalInput(draft.freezeAt))}" data-stage="new-freeze" />
+      <p class="field__hint">冻结后不再接受本赛段的评分（可留空）。</p>
+    </div>
+    <div class="row">
+      <button type="button" class="btn btn--primary" data-action="stage-create-submit">创建赛段</button>
+    </div>`;
+}
+
+/**
+ * 赛段配置（改配置）表单（纯 HTML）。
+ * ⚠️ **key 与 kind 建后不可改** ⇒ 置灰（disabled）而不是隐藏 ——
+ *    隐藏会让组委会以为「这里能改」，于是到处找入口。
+ *
+ * ⚠️ **列表端点只给摘要**（id / key / name / kind / status / startsAt / endsAt），
+ *    **不含** freezeAt 与 scoringConfigKey ⇒ 这两项无法回填。
+ *    ⛔ 因此这两项**没被改动就不提交**（服务端的 PATCH 语义是「undefined = 不改」）
+ *       —— 否则一次「只改名字」的保存会把冻结时间清空、把权重表换成默认值。
+ */
+export function stageConfigHtml({ stage = null, draft = {}, configs = [] } = {}) {
+  if (!stage) {
+    return emptyState({
+      title: '先选一个赛段',
+      hint: '在上方列表点「进入配置」，这里会显示该赛段的时间窗、冻结时间与用的权重表。',
+    });
+  }
+  const kind = stageKindLabel(stage.kind);
+  const keyKnown = stage.scoringConfigKeyKnown !== false;
+  const freezeKnown = stage.freezeAtKnown !== false;
+  const currentKey = String(stage.scoringConfigKey ?? stage.scoring_config_key ?? '');
+  // 草稿优先（用户改过）⇒ 回显用户选的那一张；否则回显当前在用的那张。
+  const selectedKey = String(draft.scoringConfigKey || currentKey || '');
+  const configItems = scoringOptions(configs, selectedKey);
+  const status = stageStatusLabel(stage.status);
+  return `<div class="row">
+      ${badge(`代号 ${stage.key ?? '—'}`, 'neutral')}
+      ${badge(kind.label, kind.tone)}
+      ${badge(status.label, status.tone)}
+    </div>
+    ${(keyKnown && freezeKnown) ? '' : noticeState({
+      tone: 'warn',
+      title: '这两项没有随赛段列表返回',
+      items: [
+        '赛段列表端点只返回摘要（代号 / 名称 / 类型 / 时间窗 / 状态），**不含**冻结时间与权重表键 ⇒ 页面无法回填它们的当前值。',
+        '没有改动的字段**不会被提交**（服务端的改配置语义是「不传 = 不改」）⇒ 保存一次不会误清空已有的冻结时间，也不会把权重表换成默认值。',
+      ],
+    })}
+    <div class="field">
+      <label class="field__label" for="stage-cfg-key">赛段代号（建后不可改）</label>
+      <input class="input" id="stage-cfg-key" type="text" value="${escapeHtml(stage.key ?? '')}" disabled />
+      <p class="field__hint">代号进 URL 与日志，建后不改；要换代号请新建赛段。</p>
+    </div>
+    <div class="field field--required">
+      <label class="field__label" for="stage-cfg-name">赛段名称</label>
+      <input class="input" id="stage-cfg-name" type="text" autocomplete="off" value="${escapeHtml(draft.name ?? stage.name ?? '')}" data-stage="cfg-name" />
+    </div>
+    <div class="field">
+      <label class="field__label" for="stage-cfg-kind">赛段类型（建后不可改）</label>
+      <select class="select" id="stage-cfg-kind" disabled>${optionsHtml(STAGE_KINDS.map((k) => ({ value: k.value, label: k.label })), stage.kind)}</select>
+    </div>
+    <div class="field">
+      <label class="field__label" for="stage-cfg-config">权重表</label>
+      <select class="select" id="stage-cfg-config" data-stage="cfg-config">${optionsHtml(configItems, selectedKey)}</select>
+      <p class="field__hint">权重表来自规则文件，页面只读展示（改表要改 rules/scoring-*.json，重启即生效）。已有评分数据时服务端会拒绝换表（历史评分将不可复算）。</p>
+    </div>
+    <div class="field">
+      <label class="field__label" for="stage-cfg-starts">开始时间</label>
+      <input class="input" id="stage-cfg-starts" type="datetime-local" value="${escapeHtml(toLocalInput(draft.startsAt ?? stage.startsAt))}" data-stage="cfg-starts" />
+    </div>
+    <div class="field">
+      <label class="field__label" for="stage-cfg-ends">结束时间</label>
+      <input class="input" id="stage-cfg-ends" type="datetime-local" value="${escapeHtml(toLocalInput(draft.endsAt ?? stage.endsAt))}" data-stage="cfg-ends" />
+    </div>
+    <div class="field">
+      <label class="field__label" for="stage-cfg-freeze">冻结时间</label>
+      <input class="input" id="stage-cfg-freeze" type="datetime-local" value="${escapeHtml(toLocalInput(draft.freezeAt ?? stage.freezeAt))}" data-stage="cfg-freeze" />
+      <p class="field__hint">冻结后不再接受本赛段的评分（可留空）。</p>
+    </div>
+    <div class="row">
+      <button type="button" class="btn btn--primary" data-action="stage-update-submit">保存赛段配置</button>
+    </div>`;
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 三、纯函数：权重表（只读）
+// ══════════════════════════════════════════════════════════════════
+
+/**
+ * 权重表（**只读**）—— 纯函数。
+ *
+ * ⚠️ 三种降级必须分清楚，不能都写成「没数据」：
+ *   ① 规则文件没加载上来（权重表读口拿不到）⇒ 「规则未加载」，**不阻断其余面板**；
+ *   ② 规则加载了但这个键不在里面 ⇒ 「权重表未找到」（多半是服务端规则与前端读到的版本不一致）；
+ *   ③ 找到了 ⇒ 展示维度表 + 席构成约束。
+ *
+ * @param {object} o
+ * @param {Array<object>} o.configs       `GET /api/editions/:editionId/scoring-configs` 的 items
+ * @param {string} o.scoringConfigKey     当前赛段在用的权重表键
+ * @param {boolean} o.degraded            规则是否没加载上来
+ * @param {number|string} o.degradedStatus 降级时的 HTTP 状态码（403 要说「没有权限」）
+ */
+export function weightTableHtml({ configs = [], scoringConfigKey = '', degraded = false, degradedStatus = null } = {}) {
+  if (degraded) {
+    const forbidden = Number(degradedStatus) === 403;
+    return noticeState({
+      tone: 'warn',
+      title: '规则未加载',
+      items: [
+        '权重表来自 rules/scoring-*.json（改一份 JSON、重启即生效），此刻拿不到规则文件，权重表暂时显示不出来。',
+        forbidden
+          ? '读取权重表**没有权限**（权重表端点是届期作用域的读口，需要该届期的组委会能力）。'
+          : '其余面板（赛段配置 / 评委席 / 名册）不受影响，可以照常操作。',
+      ],
+    });
+  }
+  const list = Array.isArray(configs) ? configs : [];
+  if (!list.length) {
+    return emptyState({
+      title: '规则未加载',
+      hint: '权重表来自 rules/scoring-*.json（改一份 JSON、重启即生效）。此刻没有读到任何权重表，其余面板不受影响。',
+    });
+  }
+  const key = String(scoringConfigKey ?? '');
+  const config = list.find((c) => String(c?.key ?? '') === key);
+  if (!config && !key) {
+    // ⚠️ **「不知道当前用的是哪一张」≠「权重表不存在」** ——
+    //   赛段列表端点只返回摘要（没有权重表键）⇒ 页面无从知道当前那一张。
+    //   这时不能报「权重表未找到」（那是误导），而是把规则里可用的都列出来。
+    const available = list.map((c) => `<tr>
+      <td>${escapeHtml(c.key ?? '—')}</td>
+      <td>${escapeHtml(c.version ?? '—')}</td>
+      <td class="td-num num">${escapeHtml(String((Array.isArray(c.dimensions) ? c.dimensions : []).length))}</td>
+    </tr>`).join('');
+    return noticeState({
+      tone: 'info',
+      title: '这个赛段在用哪一张权重表，页面现在还不知道',
+      items: [
+        '赛段列表端点只返回摘要（不含权重表键）⇒ 页面显示不出「当前在用的那一张」。',
+        '下面是规则里可用的权重表；在上面的「赛段配置」里选一张保存，就会写进这个赛段。',
+      ],
+    }) + tableWrap(
+      `<thead><tr><th>权重表</th><th>版本</th><th class="td-num">维度数</th></tr></thead>
+       <tbody>${available}</tbody>`,
+      { caption: '规则里可用的权重表' },
+    );
+  }
+  if (!config) {
+    return noticeState({
+      tone: 'warn',
+      title: '权重表未找到',
+      items: [
+        key
+          ? `这个赛段在用权重表「${key}」，但规则文件里没有找到这一张。`
+          : '这个赛段没有设置权重表键。',
+        '权重表只在规则文件里（rules/scoring-*.json），页面不提供改权重的入口 —— 请检查服务端规则是否与该赛段匹配。',
+      ],
+    });
+  }
+
+  const dims = Array.isArray(config.dimensions) ? config.dimensions : [];
+  const pool = config.judgePool ?? {};
+  const voting = seatList(pool.votingSeats);
+  const nonVoting = seatList(pool.nonVotingSeats);
+  const seatName = (seat) => {
+    const hit = JUDGE_SEATS.find((s) => s.value === String(seat ?? ''));
+    return hit ? hit.label : String(seat ?? '—');
+  };
+  const sum = dims.reduce((acc, d) => acc + (Number(d?.weight) || 0), 0);
+
+  const dimTable = dims.length
+    ? tableWrap(
+      `<thead><tr><th>维度</th><th>键</th><th class="td-num">权重</th><th>计分席</th></tr></thead>
+       <tbody>${dims.map((d) => `<tr>
+         <td>${escapeHtml(d?.name ?? d?.key ?? '—')}</td>
+         <td>${escapeHtml(d?.key ?? '—')}</td>
+         <td class="td-num num">${escapeHtml(fmtWeight(d?.weight))}</td>
+         <td>${escapeHtml(seatName(d?.seat))}</td>
+       </tr>`).join('')}
+       <tr>
+         <td>合计</td>
+         <td>—</td>
+         <td class="td-num num">${escapeHtml(fmtWeight(sum))}</td>
+         <td>—</td>
+       </tr></tbody>`,
+      { caption: `权重表 ${key}（按规则文件的声明序）` },
+    )
+    : emptyState({ title: '这张权重表没有维度', hint: '规则文件里的 dimensions 是空的。' });
+
+  const poolRows = [
+    ['每维度最少评委数', pool.minJudgesPerDimension === undefined ? '—' : String(pool.minJudgesPerDimension)],
+    ['企业席最低占比', pool.minEnterpriseSeatShare === undefined ? '—' : fmtWeight(pool.minEnterpriseSeatShare)],
+    ['专家席最高占比', pool.maxExpertSeatShare === undefined ? '—' : fmtWeight(pool.maxExpertSeatShare)],
+    ['有投票权的席', voting.length ? voting.map(seatName).join('、') : '—'],
+    ['无投票权的席', nonVoting.length ? nonVoting.map(seatName).join('、') : '—'],
+  ];
+
+  return `<div class="row">
+      ${badge(`权重表 ${key}`, 'brand')}
+      ${config.version ? badge(`版本 ${config.version}`, 'neutral') : ''}
+      ${config.source ? badge(String(config.source), 'neutral') : ''}
+    </div>
+    ${config.note ? `<p class="muted small">${escapeHtml(config.note)}</p>` : ''}
+    ${dimTable}
+    ${sectionTitle('席构成约束')}
+    ${kvList(poolRows)}
+    <p class="muted small">以上约束由服务端校验（企业席 ≥30%、专家席 ≤50%）；页面不复制这套判定。</p>
+    <p class="muted small">权重表**只读**：要改权重，改 rules/scoring-*.json 这一份 JSON，重启即生效。</p>`;
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 四、纯函数：评委席
+// ══════════════════════════════════════════════════════════════════
+
+/**
+ * 评委席面板（纯函数）。
+ * @param {object} o
+ * @param {Array<object>} o.judges      `GET /api/stages/:stageId/judges` 的 judges
+ * @param {Array<object>} o.candidates  `GET /api/editions/:editionId/judge-candidates` 的 items
+ * @param {object} o.draft             { userId, seat }
+ * @param {object|null} o.pending       待确认撤下的评委 { userId }
+ */
+export function judgeSeatHtml({ judges = [], candidates = [], draft = {}, pending = null, stageName = '' } = {}) {
+  const list = Array.isArray(judges) ? judges : [];
+  const pool = Array.isArray(candidates) ? candidates : [];
+  const nameOf = (userId) => {
+    const hit = pool.find((c) => String(c?.id ?? '') === String(userId ?? ''));
+    return hit ? { name: hit.name ?? hit.id, org: hit.org ?? '' } : { name: String(userId ?? '—'), org: '' };
+  };
+
+  const table = list.length
+    ? tableWrap(
+      `<thead><tr><th>评委</th><th>席位</th><th>授权范围</th><th>派任时间</th><th>利益冲突声明</th><th></th></tr></thead>
+       <tbody>${list.map((j) => {
+        const who = nameOf(j.userId);
+        const seat = judgeSeatLabel(j.seat);
+        const scope = j.scopeId ? `${j.scopeType ?? 'global'} / ${j.scopeId}` : String(j.scopeType ?? 'global');
+        const declared = j.conflictDeclaredAt
+          ? `已声明 · ${fmtStageTime(j.conflictDeclaredAt)}`
+          : '未声明';
+        const isPending = pending && String(pending.userId ?? '') === String(j.userId ?? '');
+        const actions = isPending
+          ? removeJudgeConfirmHtml({ userId: j.userId, name: who.name, stageName })
+          : `<button type="button" class="btn btn--ghost btn--sm" data-action="judge-remove-request" data-user-id="${escapeHtml(j.userId ?? '')}">撤评委</button>`;
+        return `<tr>
+          <td>${escapeHtml(who.name)}${who.org ? `<span class="muted small"> · ${escapeHtml(who.org)}</span>` : ''}<br><span class="muted small">${escapeHtml(j.userId ?? '')}</span></td>
+          <td>${badge(seat.label, seat.tone)}</td>
+          <td>${escapeHtml(scope)}</td>
+          <td>${escapeHtml(fmtStageTime(j.assignedAt) || '—')}</td>
+          <td>${escapeHtml(declared)}</td>
+          <td>${actions}</td>
+        </tr>`;
+      }).join('')}</tbody>`,
+      { caption: '本赛段评委席' },
+    )
+    : emptyState({
+      title: '本赛段还没有派评委',
+      hint: '派评委要选「人 + 席」：观察席无投票权；企业席与专家席的比例由服务端校验。',
+    });
+
+  const assigned = new Set(list.map((j) => String(j.userId ?? '')));
+  const selectable = pool.filter((c) => !assigned.has(String(c?.id ?? '')));
+  const seatItems = JUDGE_SEATS.map((s) => ({ value: s.value, label: s.label }));
+  const assignForm = selectable.length
+    ? `<div class="field">
+        <label class="field__label" for="stage-judge-user">评委</label>
+        <select class="select" id="stage-judge-user" data-stage="judge-user">
+          ${optionsHtml(selectable.map((c) => ({ value: c.id, label: `${c.name ?? c.id}${c.org ? `（${c.org}）` : ''}` })), draft.userId ?? '')}
+        </select>
+      </div>
+      <div class="field">
+        <label class="field__label" for="stage-judge-seat">席位</label>
+        <select class="select" id="stage-judge-seat" data-stage="judge-seat">${optionsHtml(seatItems, draft.seat ?? 'judge')}</select>
+        <p class="field__hint">观察席**无投票权**；企业席 ≥30%、专家席 ≤50% 由服务端校验（页面不复制这套判定）。</p>
+      </div>
+      <div class="row">
+        <button type="button" class="btn btn--primary" data-action="judge-assign-submit">派评委</button>
+      </div>`
+    : '<p class="muted small">候选池里的评委都已经在本赛段了（没有更多可派的）。</p>';
+
+  return `${table}
+    ${sectionTitle('派评委')}
+    ${assignForm}`;
+}
+
+/**
+ * 撤评委的二次确认块（纯函数 · 逆向路径）。
+ *
+ * ⚠️ **为什么要二次确认**：撤评委会连带**解除**他在本赛段签署的利益冲突声明
+ *   （声明记录作为历史事实保留，不删除，但不再绑定任何席位）。
+ *   ⇒ 文案必须写明影响面，而不是「确定吗？」。
+ */
+export function removeJudgeConfirmHtml({ userId = '', name = '', stageName = '' } = {}) {
+  const who = name || userId;
+  const where = stageName ? `赛段「${stageName}」` : '本赛段';
+  return `<div class="notice notice--warn" data-stage-confirm="judge">
+    <p class="notice__title">确认撤回该评委？</p>
+    <p class="notice__text">撤回 ${escapeHtml(who)} 在${escapeHtml(where)}的席位后：他的席位立即失效，其在本赛段签署的**利益冲突声明一并解除**（声明记录作为历史事实保留，不会删除）；该评委不再计入本赛段的评委池与席构成校验，已提交的历史评分不受影响。</p>
+    <div class="btn-group">
+      <button type="button" class="btn btn--primary" data-action="judge-remove-confirm" data-user-id="${escapeHtml(userId)}">确认撤回</button>
+      <button type="button" class="btn btn--ghost" data-action="judge-remove-cancel">取消</button>
+    </div>
+  </div>`;
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 五、纯函数：名册
+// ══════════════════════════════════════════════════════════════════
+
+/**
+ * 名册面板（纯函数）。
+ * @param {object} o
+ * @param {Array<object>} o.teams        `GET /api/editions/:editionId/teams` 的 items
+ * @param {Array<string>} o.rosterTeamIds `GET /api/stages/:stageId/teams` 的 teamIds
+ * @param {object|null} o.pending       待确认退名的队伍 { teamId }
+ */
+export function rosterHtml({ teams = [], rosterTeamIds = [], pending = null, stageName = '' } = {}) {
+  const list = Array.isArray(teams) ? teams : [];
+  const roster = new Set((Array.isArray(rosterTeamIds) ? rosterTeamIds : []).map((x) => String(x ?? '')));
+  const nameOf = (id) => {
+    const hit = list.find((t) => String(t?.id ?? '') === String(id ?? ''));
+    return hit ? { name: hit.name ?? hit.id, tier: hit.tier ?? '' } : { name: String(id ?? '—'), tier: '' };
+  };
+
+  if (!list.length) {
+    return emptyState({
+      title: '本届期还没有队伍',
+      hint: '名册登记的是「本届期的队伍」—— 没有队伍就没法往赛段里登记。',
+    });
+  }
+
+  const rosterRows = list.filter((t) => roster.has(String(t?.id ?? '')));
+  const rosterBlock = rosterRows.length
+    ? tableWrap(
+      `<thead><tr><th>队伍</th><th>段位</th><th>名册状态</th><th></th></tr></thead>
+       <tbody>${rosterRows.map((t) => {
+        const id = String(t?.id ?? '');
+        const tier = t?.tier ?? '';
+        const isPending = pending && String(pending.teamId ?? '') === id;
+        const actions = isPending
+          ? removeTeamConfirmHtml({ teamId: id, name: t?.name ?? id, stageName })
+          : `<button type="button" class="btn btn--ghost btn--sm" data-action="roster-remove-request" data-team-id="${escapeHtml(id)}">退名册</button>`;
+        return `<tr>
+          <td>${escapeHtml(t?.name ?? id)}<br><span class="muted small">${escapeHtml(id)}</span></td>
+          <td>${escapeHtml(tier || '—')}</td>
+          <td>${badge('在榜', 'success')}</td>
+          <td>${actions}</td>
+        </tr>`;
+      }).join('')}</tbody>`,
+      { caption: '本赛段名册（在榜队伍）' },
+    )
+    : emptyState({
+      title: '本赛段名册还是空的',
+      hint: '在下面勾选队伍登记进来 —— 名册里的队伍才会出现在本赛段的评审、发榜与名次里。',
+    });
+
+  const pendingIds = [...roster].filter((id) => !list.some((t) => String(t?.id ?? '') === id));
+  const pickList = list
+    .filter((t) => !roster.has(String(t?.id ?? '')))
+    .map((t) => `<li class="row">
+        <label class="row">
+          <input type="checkbox" data-stage="roster-pick" data-team-id="${escapeHtml(t?.id ?? '')}" />
+          <span>${escapeHtml(t?.name ?? t?.id ?? '')}${t?.tier ? ` <span class="muted small">${escapeHtml(t.tier)}</span>` : ''}</span>
+        </label>
+      </li>`)
+    .join('');
+  // ⚠️ 「登记所选队伍」按钮**必须**跟着勾选框一起出现 ——
+  //   早先只在「名册非空」时渲染按钮 ⇒ 名册为空时用户勾了队却找不到提交按钮（死路）。
+  const registerList = pickList
+    ? `<ul class="list-divided">${pickList}</ul>
+      <div class="row">
+        <button type="button" class="btn btn--primary" data-action="roster-register-submit">登记所选队伍</button>
+      </div>`
+    : '<p class="muted small">本届期的队伍都已经在名册里了。</p>';
+
+  const orphanNote = pendingIds.length
+    ? `<p class="muted small">名册里还有 ${pendingIds.length} 支队伍不在本届期队伍列表中（可能已转队或被删除）：${pendingIds.map((id) => escapeHtml(nameOf(id).name)).join('、')}</p>`
+    : '';
+
+  return `${sectionTitle('本赛段名册')}
+    ${rosterBlock}
+    ${orphanNote}
+    ${sectionTitle('登记队伍')}
+    ${registerList}`;
+}
+
+/**
+ * 退名册的二次确认块（纯函数 · 逆向路径）。
+ * ⚠️ 退名册后，该队在本赛段的评分与确认**失效** ⇒ 文案必须写明影响面。
+ */
+export function removeTeamConfirmHtml({ teamId = '', name = '', stageName = '' } = {}) {
+  const who = name || teamId;
+  const where = stageName ? `赛段「${stageName}」` : '本赛段';
+  return `<div class="notice notice--warn" data-stage-confirm="team">
+    <p class="notice__title">确认把该队伍退名册？</p>
+    <p class="notice__text">把 ${escapeHtml(who)} 从${escapeHtml(where)}的名册里退出后：该队在本赛段的**评分与确认全部失效**（已交的评分不再计入本赛段的计算与名次），名次与榜单也会随之变化。这一步是逆向操作，请确认。</p>
+    <div class="btn-group">
+      <button type="button" class="btn btn--primary" data-action="roster-remove-confirm" data-team-id="${escapeHtml(teamId)}">确认退名册</button>
+      <button type="button" class="btn btn--ghost" data-action="roster-remove-cancel">取消</button>
+    </div>
+  </div>`;
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 六、整页
+// ══════════════════════════════════════════════════════════════════
+
+/** 顶部指标（纯函数）。 */
+export function stageConfigStats(model = {}) {
+  const stages = Array.isArray(model.stages) ? model.stages : [];
+  const judges = Array.isArray(model.judges) ? model.judges : [];
+  const roster = Array.isArray(model.rosterTeamIds) ? model.rosterTeamIds : [];
+  const stage = model.stage ?? null;
+  return [
+    { label: '本届期赛段', value: stages.length, tone: 'brand' },
+    { label: '本赛段评委席', value: stage ? judges.length : '—', hint: stage ? '观察席无投票权' : '先选一个赛段' },
+    { label: '本赛段名册', value: stage ? roster.length : '—', hint: stage ? '在榜队伍数' : '先选一个赛段' },
+    {
+      label: '在用权重表',
+      value: stage ? (stage.scoringConfigKey ?? stage.scoring_config_key ?? '—') : '—',
+      tone: 'neutral',
+      hint: '只读：改表要改 rules/scoring-*.json',
+    },
+  ];
+}
+
+/**
+ * 整页 HTML（纯函数，可单测）。
+ * @param {object} model {
+ *   loading, error, errorStatus, editions, editionId, stages, stageId, stage,
+ *   judges, candidates, teams, rosterTeamIds, configs, configsDegraded, feedback,
+ *   drafts, pending
+ * }
+ */
+export function stageConfigPageHtml(model = {}) {
+  const head = pageHead({
+    title: '赛段配置与权重表',
+    sub: '组委会：建赛段、改配置、派评委、报名册；权重表来自规则文件，只读展示。',
+  });
+
+  const feedbackHtml = model.feedback
+    ? noticeState({
+      tone: model.feedback.tone ?? 'info',
+      title: model.feedback.title ?? '',
+      items: model.feedback.items ?? [],
+      list: true,
+    })
+    : '';
+
+  if (model.loading) {
+    return head + loadingState({ rows: 4, label: '正在加载赛段配置…' });
+  }
+
+  const editions = Array.isArray(model.editions) ? model.editions : [];
+  const stages = Array.isArray(model.stages) ? model.stages : [];
+  const listPanel = panel({
+    title: '届期与赛段',
+    desc: '赛段从属于届期：建段、改配置、派评委、报名册都在本届期下操作。',
+    body: editionPickerHtml(editions, model.editionId ?? '') + stageListHtml(stages, model.stageId ?? ''),
+  });
+
+  if (model.error) {
+    return head
+      + listPanel
+      + feedbackHtml
+      + errorState({
+        message: stageErrorText(model.errorStatus, model.error),
+        hint: '赛段配置需要组委会能力（stage:compute）；确认已登录并拥有该能力后点「重试」。',
+      });
+  }
+
+  const drafts = model.drafts ?? {};
+  const stage = model.stage ?? null;
+
+  return head
+    + feedbackHtml
+    + statRow(stageConfigStats(model))
+    + listPanel
+    + panel({
+      title: '新建赛段',
+      desc: '代号与类型建后不可改 —— 它们决定赛段在赛程里的位置。',
+      body: stageCreateFormHtml({ draft: drafts.create ?? {}, configs: model.configs ?? [] }),
+    })
+    + panel({
+      title: '赛段配置',
+      desc: '改名称、时间窗、冻结时间与权重表；代号与类型不可改。',
+      body: stageConfigHtml({ stage, draft: drafts.edit ?? {}, configs: model.configs ?? [] }),
+    })
+    + panel({
+      title: '权重表（只读）',
+      desc: '当前赛段用的是哪一张权重表、席构成约束是什么。改表要改 rules/scoring-*.json，重启即生效。',
+      body: weightTableHtml({
+        configs: model.configs ?? [],
+        scoringConfigKey: stage?.scoringConfigKey ?? stage?.scoring_config_key ?? '',
+        degraded: Boolean(model.configsDegraded),
+        degradedStatus: model.configsStatus ?? null,
+      }),
+    })
+    + panel({
+      title: '评委席',
+      desc: '派评委 = 选人 + 选席；撤评委是逆向路径，会连带解除该评委在本赛段签署的利益冲突声明。',
+      body: judgeSeatHtml({
+        judges: model.judges ?? [],
+        candidates: model.candidates ?? [],
+        draft: drafts.assign ?? {},
+        pending: model.pending ?? null,
+        stageName: stage?.name ?? '',
+      }),
+    })
+    + panel({
+      title: '名册',
+      desc: '名册里的队伍才会出现在本赛段的评审与名次里；退名册是逆向路径。',
+      body: rosterHtml({
+        teams: model.teams ?? [],
+        rosterTeamIds: model.rosterTeamIds ?? [],
+        pending: model.pending ?? null,
+        stageName: stage?.name ?? '',
+      }),
+    });
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 七、DOM 接线（renderStageConfig）
+// ══════════════════════════════════════════════════════════════════
+
+/**
+ * 赛段配置页。
+ *
+ * ⚠️ **交互纪律**（照抄 web/views/tiebreak.js / web/views/publish.js）：
+ *   ① 提交一律「本地校验 → 发请求 → 就地反馈」；
+ *   ② 提交成功后**重新拉一次**（不是本地改状态）⇒ 页面显示的永远是服务端口径；
+ *   ③ 重绘时**回填草稿** ⇒ 用户已填的内容不会被冲掉（DP-81）；
+ *   ④ 加载 / 错误 / 空态全部用 web/ui.js 的现成组件（不自己造）；
+ *   ⑤ 所有 DOM 读取都用可选链 —— 最小 DOM 桩上不许抛；
+ *   ⑥ 事件**全部委托**在 wrap 上（局部重绘不丢监听）。
+ */
+export async function renderStageConfig(ctx) {
+  const wrap = document.createElement('div');
+  wrap.className = 'stack';
+
+  const state = {
+    loading: true,
+    error: null,
+    errorStatus: null,
+    editions: [],
+    editionId: '',
+    stages: [],
+    stageId: '',
+    stage: null,
+    judges: [],
+    candidates: [],
+    teams: [],
+    rosterTeamIds: [],
+    configs: [],
+    configsDegraded: false,
+    configsStatus: null,
+    feedback: null,
+    pending: null,
+    // ⚠️ 脏标记：只有用户**动过**的字段才提交（防止「只改名字」顺手清空冻结时间 / 换掉权重表）。
+    dirty: { freezeAt: false, scoringConfigKey: false },
+    // ⚠️ 写端点返回过完整字段按赛段 id 记下来 ——
+    //    列表端点只给摘要（没有 freezeAt / scoringConfigKey）⇒ 不记就会在每次刷新后丢失。
+    known: {},
+    drafts: {
+      create: { key: '', name: '', kind: 'initial', scoringConfigKey: 'initial', startsAt: '', endsAt: '', freezeAt: '' },
+      edit: { name: '', startsAt: '', endsAt: '', freezeAt: '', scoringConfigKey: '' },
+      assign: { userId: '', seat: 'judge' },
+    },
+  };
+
+  /** 重绘整页。 */
+  const render = () => {
+    wrap.innerHTML = stageConfigPageHtml(state);
+  };
+
+  /** 读输入框的值（读不到就当空串 —— 最小 DOM 桩上不许抛）。 */
+  const value = (id) => {
+    const el = wrap.querySelector(`#${id}`);
+    return el && typeof el.value === 'string' ? el.value : '';
+  };
+
+  /** 读复选框里勾中的队伍 id。 */
+  const pickedTeamIds = () => {
+    const boxes = Array.from(wrap.querySelectorAll('[data-stage="roster-pick"]') ?? []);
+    const out = [];
+    for (const box of boxes) {
+      if (!box?.checked) continue;
+      const id = String(box?.dataset?.teamId ?? box?.value ?? '').trim();
+      if (id) out.push(id);
+    }
+    return out;
+  };
+
+  /** 归一化「列表里的一条」与「写端点返回的完整赛段」⇒ 统一的 stage 形状。 */
+  const normalizeStage = (raw) => {
+    if (!raw) return null;
+    // ⚠️ **known 标记**：列表端点只给摘要（没有 freezeAt / scoringConfigKey），
+    //    写端点返回的是完整行 ⇒ 用「字段在不在」区分「没有这个值」与「不知道这个值」。
+    const hasFreeze = raw.freezeAt !== undefined || raw.freeze_at !== undefined;
+    const hasKey = raw.scoringConfigKey !== undefined || raw.scoring_config_key !== undefined;
+    return {
+      id: raw.id,
+      editionId: raw.editionId ?? raw.edition_id ?? state.editionId,
+      key: raw.key,
+      name: raw.name,
+      kind: raw.kind,
+      status: raw.status,
+      startsAt: raw.startsAt ?? raw.starts_at ?? '',
+      endsAt: raw.endsAt ?? raw.ends_at ?? '',
+      freezeAt: raw.freezeAt ?? raw.freeze_at ?? '',
+      scoringConfigKey: raw.scoringConfigKey ?? raw.scoring_config_key ?? '',
+      freezeAtKnown: hasFreeze,
+      scoringConfigKeyKnown: hasKey,
+    };
+  };
+
+  /** 换赛段时重置「编辑」草稿（否则会把上一个赛段的名字带过来）。 */
+  const resetEditDraft = (stage) => {
+    state.drafts.edit = {
+      name: stage?.name ?? '',
+      startsAt: toLocalInput(stage?.startsAt),
+      endsAt: toLocalInput(stage?.endsAt),
+      freezeAt: toLocalInput(stage?.freezeAt),
+      // ⚠️ 权重表键**不知道**时留空 ⇒ 保存时这一项不提交（服务端保留原值）。
+      scoringConfigKey: stage?.scoringConfigKeyKnown === false ? '' : (stage?.scoringConfigKey ?? ''),
+    };
+    // ⚠️ 脏标记重置：没被用户动过的字段一律不提交。
+    state.dirty = { freezeAt: false, scoringConfigKey: false };
+  };
+
+  /** 拉届期列表（公开端点）。 */
+  const loadEditions = async () => {
+    const data = await ctx.api.get('/api/editions');
+    const items = Array.isArray(data) ? data : (data?.items ?? []);
+    state.editions = Array.isArray(items) ? items : [];
+    const wanted = String(ctx?.params?.editionId ?? ctx?.query?.editionId ?? '');
+    const known = state.editions.find((e) => String(e?.id ?? '') === wanted);
+    state.editionId = known ? wanted : (pickCurrentEdition(state.editions)?.id ?? '');
+  };
+
+  /** 拉赛段列表（公开端点）。 */
+  const loadStages = async () => {
+    if (!state.editionId) {
+      state.stages = [];
+      return;
+    }
+    const data = await ctx.api.get(`/api/stages?editionId=${encodeURIComponent(state.editionId)}`);
+    const items = Array.isArray(data) ? data : (data?.items ?? []);
+    state.stages = (Array.isArray(items) ? items : []).map((s) => normalizeStage(s) ?? s);
+    // ⚠️ 把写端点返回过的完整字段补回列表项（列表端点只给摘要）。
+    for (const s of state.stages) {
+      const extra = state.known[String(s?.id ?? '')];
+      if (!extra) continue;
+      if (s.scoringConfigKeyKnown === false && extra.scoringConfigKey) {
+        s.scoringConfigKey = extra.scoringConfigKey;
+        s.scoringConfigKeyKnown = true;
+      }
+      if (s.freezeAtKnown === false) {
+        s.freezeAt = extra.freezeAt ?? '';
+        s.freezeAtKnown = true;
+      }
+    }
+  };
+
+  /**
+   * 拉权重表（**尽力而为**：拿不到只降级这一块，不阻断其余面板）。
+   * ⚠️ 端点是**届期作用域**的：`/api/editions/:editionId/scoring-configs`
+   *    （与建段 / 改配置 / 派评委的写端点同域 ⇒ 不会出现「能改赛段、却读不到权重表」）。
+   */
+  const loadConfigs = async () => {
+    if (!state.editionId) {
+      state.configs = [];
+      state.configsDegraded = false;
+      state.configsStatus = null;
+      return;
+    }
+    try {
+      const data = await ctx.api.get(`/api/editions/${encodeURIComponent(state.editionId)}/scoring-configs`);
+      const items = Array.isArray(data) ? data : (data?.items ?? []);
+      state.configs = Array.isArray(items) ? items : [];
+      state.configsDegraded = false;
+      state.configsStatus = null;
+    } catch (e) {
+      state.configs = [];
+      state.configsDegraded = true;
+      state.configsStatus = e?.status ?? null;
+    }
+  };
+
+  /** 拉某个赛段的详情（评委席 / 名册 / 候选池）。 */
+  const loadStageDetail = async (stageId) => {
+    if (!stageId) {
+      state.judges = [];
+      state.candidates = [];
+      state.teams = [];
+      state.rosterTeamIds = [];
+      state.stage = null;
+      return;
+    }
+    const base = `/api/stages/${encodeURIComponent(stageId)}`;
+    // ⛔ 这几个端点都要组委会能力：403 ⇒ 整页没有意义（页面级错误，显示「没有权限」）。
+    const judgesData = await ctx.api.get(`${base}/judges`);
+    const rosterData = await ctx.api.get(`${base}/teams`);
+    const [teamsData, candidatesData] = await Promise.all([
+      ctx.api.get(`/api/editions/${encodeURIComponent(state.editionId)}/teams`),
+      ctx.api.get(`/api/editions/${encodeURIComponent(state.editionId)}/judge-candidates`),
+    ]);
+    state.judges = Array.isArray(judgesData?.judges) ? judgesData.judges : [];
+    state.rosterTeamIds = Array.isArray(rosterData?.teamIds) ? rosterData.teamIds : [];
+    state.teams = Array.isArray(teamsData?.items) ? teamsData.items : [];
+    state.candidates = Array.isArray(candidatesData?.items) ? candidatesData.items : [];
+  };
+
+  /** 首屏 / 重试：一次把页面需要的数据拉齐。 */
+  const loadAll = async (keepStage = false) => {
+    state.loading = true;
+    state.error = null;
+    state.errorStatus = null;
+    render();
+    try {
+      await loadEditions();
+      await loadStages();
+      await loadConfigs();
+      if (!keepStage) {
+        const wanted = String(ctx?.params?.stageId ?? ctx?.query?.stageId ?? '');
+        const known = state.stages.find((s) => String(s?.id ?? '') === wanted);
+        state.stageId = known ? wanted : (state.stages[0]?.id ? String(state.stages[0].id) : '');
+      }
+      const picked = state.stages.find((s) => String(s?.id ?? '') === String(state.stageId ?? '')) ?? null;
+      state.stage = picked ? normalizeStage(picked) : null;
+      resetEditDraft(state.stage);
+      if (state.stageId) await loadStageDetail(state.stageId);
+    } catch (e) {
+      state.error = e?.message ?? '加载失败';
+      state.errorStatus = e?.status ?? null;
+    } finally {
+      state.loading = false;
+      render();
+    }
+  };
+
+  /** 成功反馈（noticeState 的参数是 items —— 不是 text）。 */
+  const ok = (title, items) => {
+    state.feedback = { tone: 'success', title, items: Array.isArray(items) ? items : [items] };
+  };
+
+  /** 失败反馈（服务端的中文原因原样透出）。 */
+  const fail = (title, e) => {
+    state.feedback = { tone: 'danger', title, items: [e?.message ?? '操作失败'] };
+  };
+
+  /** 写完之后重新拉一次（页面显示的永远是服务端口径）。 */
+  const reload = async (keepStage = true) => {
+    await loadAll(keepStage);
+  };
+
+  // ── 建赛段 ────────────────────────────────────────────────────────
+  const createStage = async () => {
+    const body = {
+      key: value('stage-new-key').trim(),
+      name: value('stage-new-name').trim(),
+      kind: value('stage-new-kind') || 'initial',
+      scoringConfigKey: value('stage-new-config') || 'initial',
+      // ⚠️ datetime-local 给的是本地时间 ⇒ 统一转 ISO 再发（同一个时刻，格式与其它端点一致）。
+      startsAt: toIso(value('stage-new-starts')),
+      endsAt: toIso(value('stage-new-ends')),
+      freezeAt: value('stage-new-freeze') ? toIso(value('stage-new-freeze')) : null,
+    };
+    if (!body.key || !body.name || !body.startsAt || !body.endsAt) {
+      state.feedback = { tone: 'warn', title: '还差一点', items: ['赛段代号、名称、开始时间与结束时间都要填。'] };
+      render();
+      return;
+    }
+    try {
+      const res = await ctx.api.post(`/api/editions/${encodeURIComponent(state.editionId)}/stages`, body);
+      const created = normalizeStage(res?.stage);
+      if (created?.id) {
+        state.known[String(created.id)] = {
+          freezeAt: created.freezeAt ?? '',
+          scoringConfigKey: created.scoringConfigKey ?? '',
+        };
+      }
+      state.drafts.create = { key: '', name: '', kind: 'initial', scoringConfigKey: 'initial', startsAt: '', endsAt: '', freezeAt: '' };
+      state.stageId = created?.id ? String(created.id) : state.stageId;
+      ok('赛段已创建', [
+        created ? `赛段「${created.name}（${created.key}）」已建好。` : '赛段已建好。',
+        '新赛段是**草稿**状态：开闸是另一个动作。',
+      ]);
+      await reload();
+    } catch (e) {
+      fail('创建赛段失败', e);
+      render();
+    }
+  };
+
+  // ── 改赛段配置 ────────────────────────────────────────────────────
+  const updateStage = async () => {
+    if (!state.stageId) {
+      state.feedback = { tone: 'warn', title: '还没选赛段', items: ['先在上方列表点「进入配置」。'] };
+      render();
+      return;
+    }
+    const body = {
+      name: value('stage-cfg-name').trim(),
+      startsAt: toIso(value('stage-cfg-starts')),
+      endsAt: toIso(value('stage-cfg-ends')),
+    };
+    // ⛔ **只提交用户动过的字段**：服务端的 PATCH 语义是「不传 = 不改」
+    //    ⇒ 没动过 freezeAt / scoringConfigKey 就不传它们，
+    //    否则「只改个名字」会把冻结时间清空、把权重表换成下拉框里的第一项。
+    if (state.dirty.freezeAt) body.freezeAt = value('stage-cfg-freeze') ? toIso(value('stage-cfg-freeze')) : null;
+    if (state.dirty.scoringConfigKey && value('stage-cfg-config')) body.scoringConfigKey = value('stage-cfg-config');
+    if (!body.name || !body.startsAt || !body.endsAt) {
+      state.feedback = { tone: 'warn', title: '还差一点', items: ['赛段名称、开始时间与结束时间都要填。'] };
+      render();
+      return;
+    }
+    try {
+      const res = await ctx.api.patch(`/api/stages/${encodeURIComponent(state.stageId)}`, body);
+      const updated = normalizeStage(res?.stage);
+      if (updated) {
+        const idx = state.stages.findIndex((s) => String(s?.id ?? '') === String(updated.id));
+        if (idx >= 0) state.stages[idx] = updated;
+        state.stage = updated;
+        state.known[String(updated.id)] = {
+          freezeAt: updated.freezeAt ?? '',
+          scoringConfigKey: updated.scoringConfigKey ?? '',
+        };
+      }
+      ok('赛段配置已保存', ['名称、时间窗、冻结时间与权重表已更新（已留审计）。']);
+      await reload();
+    } catch (e) {
+      fail('保存赛段配置失败', e);
+      render();
+    }
+  };
+
+  // ── 派评委 ────────────────────────────────────────────────────────
+  const assignJudge = async () => {
+    if (!state.stageId) {
+      state.feedback = { tone: 'warn', title: '还没选赛段', items: ['先在上方列表点「进入配置」。'] };
+      render();
+      return;
+    }
+    const body = {
+      userId: value('stage-judge-user'),
+      seat: value('stage-judge-seat') || 'judge',
+      scopeType: 'global',
+      scopeId: null,
+    };
+    if (!body.userId) {
+      state.feedback = { tone: 'warn', title: '还没选评委', items: ['先在候选池里选一个人。'] };
+      render();
+      return;
+    }
+    try {
+      await ctx.api.post(`/api/stages/${encodeURIComponent(state.stageId)}/judges`, body);
+      state.drafts.assign = { userId: '', seat: body.seat };
+      ok('已派评委', [
+        `席位 ${judgeSeatLabel(body.seat).label} 已派出。`,
+        '席位与利益冲突声明同一次写入（已留审计）。',
+      ]);
+      await reload();
+    } catch (e) {
+      fail('派评委失败', e);
+      render();
+    }
+  };
+
+  // ── 撤评委（逆向路径）────────────────────────────────────────────
+  const removeJudge = async (userId) => {
+    try {
+      await ctx.api.del(`/api/stages/${encodeURIComponent(state.stageId)}/judges/${encodeURIComponent(userId)}`);
+      state.pending = null;
+      ok('已撤回该评委', [
+        '该评委在本赛段的席位已失效，其在本赛段签署的利益冲突声明一并解除（声明记录作为历史事实保留）。',
+      ]);
+      await reload();
+    } catch (e) {
+      fail('撤评委失败', e);
+      render();
+    }
+  };
+
+  // ── 登记名册 ──────────────────────────────────────────────────────
+  const registerTeams = async () => {
+    if (!state.stageId) {
+      state.feedback = { tone: 'warn', title: '还没选赛段', items: ['先在上方列表点「进入配置」。'] };
+      render();
+      return;
+    }
+    const teamIds = pickedTeamIds();
+    if (!teamIds.length) {
+      state.feedback = { tone: 'warn', title: '还没勾队伍', items: ['先勾选要登记到本赛段的队伍。'] };
+      render();
+      return;
+    }
+    try {
+      const res = await ctx.api.post(`/api/stages/${encodeURIComponent(state.stageId)}/teams`, { teamIds });
+      const registered = Number(res?.registered ?? 0);
+      const skipped = Number(res?.skipped ?? 0);
+      ok('名册已更新', [
+        `新登记 ${registered} 支队伍。`,
+        skipped ? `${skipped} 支此前已在名册里（重复登记是幂等的，不会报错）。` : '重复登记是幂等的，不会报错。',
+      ]);
+      await reload();
+    } catch (e) {
+      fail('登记名册失败', e);
+      render();
+    }
+  };
+
+  // ── 退名册（逆向路径）────────────────────────────────────────────
+  const removeTeam = async (teamId) => {
+    try {
+      await ctx.api.del(`/api/stages/${encodeURIComponent(state.stageId)}/teams/${encodeURIComponent(teamId)}`);
+      state.pending = null;
+      ok('已把该队伍退名册', ['该队在本赛段的评分与确认随之失效。']);
+      await reload();
+    } catch (e) {
+      fail('退名册失败', e);
+      render();
+    }
+  };
+
+  await loadAll();
+
+  // ⚠️ **事件绑定在 wrap 上（委托）**：局部重绘不会丢监听。
+  wrap.addEventListener('click', async (ev) => {
+    const btn = ev.target?.closest?.('[data-action]');
+    if (!btn) return;
+    const action = btn.dataset?.action;
+
+    if (action === 'retry') {
+      await loadAll();
+      return;
+    }
+    if (action === 'stage-select') {
+      const id = String(btn.dataset?.stageId ?? '');
+      if (!id || id === String(state.stageId)) return;
+      state.stageId = id;
+      state.pending = null;
+      state.feedback = null;
+      state.loading = true;
+      render();
+      try {
+        const picked = state.stages.find((s) => String(s?.id ?? '') === id) ?? null;
+        state.stage = picked ? normalizeStage(picked) : null;
+        resetEditDraft(state.stage);
+        await loadStageDetail(id);
+      } catch (e) {
+        state.error = e?.message ?? '加载失败';
+        state.errorStatus = e?.status ?? null;
+      } finally {
+        state.loading = false;
+        render();
+      }
+      return;
+    }
+    if (action === 'stage-create-submit') {
+      await createStage();
+      return;
+    }
+    if (action === 'stage-update-submit') {
+      await updateStage();
+      return;
+    }
+    if (action === 'judge-assign-submit') {
+      await assignJudge();
+      return;
+    }
+    if (action === 'judge-remove-request') {
+      state.pending = { type: 'judge', userId: String(btn.dataset?.userId ?? '') };
+      render();
+      return;
+    }
+    if (action === 'judge-remove-cancel') {
+      state.pending = null;
+      render();
+      return;
+    }
+    if (action === 'judge-remove-confirm') {
+      await removeJudge(String(btn.dataset?.userId ?? ''));
+      return;
+    }
+    if (action === 'roster-register-submit') {
+      await registerTeams();
+      return;
+    }
+    if (action === 'roster-remove-request') {
+      state.pending = { type: 'team', teamId: String(btn.dataset?.teamId ?? '') };
+      render();
+      return;
+    }
+    if (action === 'roster-remove-cancel') {
+      state.pending = null;
+      render();
+      return;
+    }
+    if (action === 'roster-remove-confirm') {
+      await removeTeam(String(btn.dataset?.teamId ?? ''));
+      return;
+    }
+  });
+
+  // 草稿回填：记住用户填了什么 ⇒ 重绘时不冲掉（DP-81）。
+  wrap.addEventListener('input', (ev) => {
+    const el = ev.target;
+    if (!el || typeof el.value !== 'string') return;
+    const kind = el.dataset?.stage;
+    if (!kind) return;
+    if (kind === 'new-key') state.drafts.create.key = el.value;
+    if (kind === 'new-name') state.drafts.create.name = el.value;
+    if (kind === 'new-starts') state.drafts.create.startsAt = el.value;
+    if (kind === 'new-ends') state.drafts.create.endsAt = el.value;
+    if (kind === 'new-freeze') state.drafts.create.freezeAt = el.value;
+    if (kind === 'cfg-name') state.drafts.edit.name = el.value;
+    if (kind === 'cfg-starts') state.drafts.edit.startsAt = el.value;
+    if (kind === 'cfg-ends') state.drafts.edit.endsAt = el.value;
+    if (kind === 'cfg-freeze') {
+      state.drafts.edit.freezeAt = el.value;
+      state.dirty.freezeAt = true;
+    }
+  });
+
+  // 换届期 / 改下拉：只改数据，不整页刷新输入框。
+  wrap.addEventListener('change', async (ev) => {
+    const el = ev.target;
+    if (!el || typeof el.value !== 'string') return;
+    const kind = el.dataset?.stage;
+    if (kind === 'edition') {
+      state.editionId = el.value;
+      state.stageId = '';
+      state.stage = null;
+      state.judges = [];
+      state.candidates = [];
+      state.teams = [];
+      state.rosterTeamIds = [];
+      state.pending = null;
+      state.feedback = null;
+      state.loading = true;
+      render();
+      try {
+        await loadStages();
+        // ⚠️ 权重表端点是**届期作用域**的 ⇒ 换届期必须重拉（否则显示的是上一届的表）。
+        await loadConfigs();
+        state.stageId = state.stages[0]?.id ? String(state.stages[0].id) : '';
+        const picked = state.stages.find((s) => String(s?.id ?? '') === String(state.stageId)) ?? null;
+        state.stage = picked ? normalizeStage(picked) : null;
+        resetEditDraft(state.stage);
+        if (state.stageId) await loadStageDetail(state.stageId);
+      } catch (e) {
+        state.error = e?.message ?? '加载失败';
+        state.errorStatus = e?.status ?? null;
+      } finally {
+        state.loading = false;
+        render();
+      }
+      return;
+    }
+    if (kind === 'new-kind') state.drafts.create.kind = el.value;
+    if (kind === 'new-config') state.drafts.create.scoringConfigKey = el.value;
+    if (kind === 'cfg-config') {
+      state.drafts.edit.scoringConfigKey = el.value;
+      state.dirty.scoringConfigKey = true;
+    }
+    if (kind === 'judge-user') state.drafts.assign.userId = el.value;
+    if (kind === 'judge-seat') state.drafts.assign.seat = el.value;
+  });
+
+  return wrap;
+}
+```
+
+### `platform/test/stage-config-view.test.js`
+
+「赛段配置」页的视图层闸（E158）：纯函数渲染断言（权重表席构成约束 / 三种席标签 / observer 无投票权 / 空态 / 403 权限文案 / 逆向确认块 / XSS 转义）+ 端点路径与 `ctx.api.del` 的静态钉。
+
+```javascript
+// test/stage-config-view.test.js — 赛段配置与权重表页（组委会）
+//
+// 依据：设计文档 §9「组委会视角 → **赛段配置与权重表**」（IA 图第 883 行）
+//   + §8「API 设计」+ §7.3「三态状态码」
+//   + src/http/routes/stages.js（建段 / 改配置 / 派评委 / 撤评委 / 报名册 / 退名册）
+//   + rules/scoring-initial.json（权重表与 judgePool 席构成约束）
+//
+// ⚠️ **这组用例为什么必须存在**：
+//   P11 之前，后端六个写端点早就写好，前端却**一个界面都没有**
+//   ⇒ 「写了没接线」：端点在产品里零调用方。
+//   ⇒ 这组用例钉住的是**界面本身的行为**（不是端点通不通）：
+//     ① 权重表看得见、且**按声明序**（不是按权重降序 —— 降序会把企业维度插进评委维度中间）；
+//     ② 三种席位渲染成**不同**的标签，观察席必须写明「无投票权」；
+//     ③ 名册为空 / 没派评委走**空态**而不是报错；
+//     ④ 403 显示「没有权限」而不是空白页；
+//     ⑤ 逆向路径（撤评委 / 退名册）必须**二次确认**且写明影响面；
+//     ⑥ 服务端返回的用户数据**必须转义**。
+//
+// ⚠️ 另外钉住**端点契约**（静态读源文件，与 web-review-publish.test.js 读 app.js 同款）：
+//   权重表端点是届期作用域的 `/api/editions/:editionId/scoring-configs`
+//   （不是 global 的 `/api/scoring-configs` —— 那会造成「能改赛段、却读不到权重表」）。
+//
+// ⛔ 零依赖、零构建、node:test + ESM；只测**纯函数**（HTML 渲染函数），不起 HTTP 服务。
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import {
+  editionPickerHtml,
+  fmtStageTime,
+  fmtWeight,
+  judgeSeatHtml,
+  judgeSeatLabel,
+  pickCurrentEdition,
+  removeJudgeConfirmHtml,
+  removeTeamConfirmHtml,
+  rosterHtml,
+  stageConfigHtml,
+  stageConfigPageHtml,
+  stageCreateFormHtml,
+  stageErrorText,
+  stageKindLabel,
+  stageListHtml,
+  stageStatusLabel,
+  toIso,
+  toLocalInput,
+  weightTableHtml,
+} from '../web/views/stages.js';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const VIEW_SRC = readFileSync(join(here, '..', 'web', 'views', 'stages.js'), 'utf8');
+
+// ─────────────────────────────────────────────────────────────────────────
+// 测试夹具
+//
+// ⚠️ **时间夹具一律不带时区**（'2026-10-20T09:00:00' 而不是 '...Z'）：
+//    Date.parse 会按**本地时间**解读无时区串 ⇒ 断言（"2026-10-20 09:00"）与时区无关，
+//    不会在 CI 的另一台机器上飘。
+// ─────────────────────────────────────────────────────────────────────────
+
+/** 权重表（形状照 rules/scoring-initial.json；维度顺序 = **声明序**）。 */
+const SCORING = {
+  key: 'initial',
+  id: 'scoring-initial',
+  version: '2026-10-20',
+  source: 'S7 §2.1 初赛权重表 + §3.1 评分公式',
+  note: '初赛 wEnterprise=0.10 —— 依据权重表合计正好 100% 反推',
+  judgePool: {
+    minJudgesPerDimension: 7,
+    minEnterpriseSeatShare: 0.30,
+    maxExpertSeatShare: 0.50,
+    votingSeats: ['judge', 'enterprise'],
+    nonVotingSeats: ['observer'],
+  },
+  dimensions: [
+    { key: 'track_fit', name: '赛题契合度', weight: 0.10, seat: 'judge' },
+    { key: 'innovation', name: '创新性', weight: 0.20, seat: 'judge' },
+    { key: 'feasibility', name: '技术可行性', weight: 0.20, seat: 'judge' },
+    { key: 'completeness', name: '完成度', weight: 0.25, seat: 'judge' },
+    { key: 'enterprise', name: '企业确认', weight: 0.10, seat: 'enterprise' },
+    { key: 'collaboration', name: '团队协作', weight: 0.15, seat: 'judge' },
+  ],
+};
+
+/** 第二个权重表（用来证明「页按 key 选表」，而不是永远显示第一张）。 */
+const SCORING_FINAL = {
+  key: 'final',
+  id: 'scoring-final',
+  version: '2026-10-20',
+  source: 'S7 §3.1 决赛权重表',
+  judgePool: { ...SCORING.judgePool },
+  dimensions: [
+    { key: 'innovation', name: '创新性', weight: 0.40, seat: 'judge' },
+    { key: 'enterprise', name: '企业确认', weight: 0.60, seat: 'enterprise' },
+  ],
+};
+
+/** 三个席位的评委（席构成各不相同 ⇒ 断言才有判别性）。 */
+const JUDGES = [
+  {
+    id: 'sj_1', stageId: 'st_1', userId: 'u_judge1', seat: 'judge',
+    scopeType: 'global', scopeId: null,
+    assignedAt: '2026-10-20T09:00:00', conflictDeclaredAt: '2026-10-20T09:05:00', conflictDeclarationId: 'cd_1',
+  },
+  {
+    id: 'sj_2', stageId: 'st_1', userId: 'u_ent1', seat: 'enterprise',
+    scopeType: 'edition', scopeId: 'ed_2026',
+    assignedAt: '2026-10-20T09:10:00', conflictDeclaredAt: null, conflictDeclarationId: null,
+  },
+  {
+    id: 'sj_3', stageId: 'st_1', userId: 'u_obs1', seat: 'observer',
+    scopeType: 'stage', scopeId: 'st_1',
+    assignedAt: '2026-10-20T09:20:00', conflictDeclaredAt: '2026-10-20T09:21:00', conflictDeclarationId: 'cd_3',
+  },
+];
+
+/** 评委候选池（页面用它把 userId 回填成姓名）。 */
+const CANDIDATES = [
+  { id: 'u_judge1', name: '陈砚秋', org: '青瓷研究院' },
+  { id: 'u_ent1', name: '林望舒', org: '青瓷科技' },
+  { id: 'u_obs1', name: '周叙白', org: '创业邦' },
+  { id: 'u_new', name: '吴未名', org: '南山资本' },
+];
+
+/** 本届期队伍。 */
+const TEAMS = [
+  { id: 't_alpha', name: '拾光队', tier: 'A' },
+  { id: 't_beta', name: '溯洄队', tier: 'B' },
+];
+
+/** 赛段（列表端点只给摘要：没有 freezeAt / scoringConfigKey）。 */
+const STAGES = [
+  { id: 'st_1', key: 'initial', name: '初赛评审', kind: 'initial', status: 'draft', startsAt: '2026-10-20T09:00:00', endsAt: '2026-10-28T18:00:00' },
+  { id: 'st_2', key: 'final', name: '决赛评审', kind: 'final', status: 'open', startsAt: '2026-11-20T09:00:00', endsAt: '2026-11-28T18:00:00' },
+];
+
+const EDITIONS = [
+  { id: 'ed_2025', name: '2025 届', city: '杭州', startsAt: '2025-03-01T00:00:00', endsAt: '2025-09-01T00:00:00' },
+  { id: 'ed_2026', name: '2026 届', city: '深圳', startsAt: '2026-03-01T00:00:00', endsAt: '2026-12-01T00:00:00' },
+];
+
+// ══════════════════════════════════════════════════════════════════
+// 一、权重表（只读）
+// ══════════════════════════════════════════════════════════════════
+
+test('权重表：多个维度按**声明序**渲染（不是按权重降序）', () => {
+  const html = weightTableHtml({ configs: [SCORING], scoringConfigKey: 'initial' });
+  const order = ['赛题契合度', '创新性', '技术可行性', '完成度', '企业确认', '团队协作'];
+  const positions = order.map((name) => html.indexOf(name));
+  for (const [i, p] of positions.entries()) {
+    assert.ok(p >= 0, `${order[i]} 必须出现在权重表里`);
+    if (i > 0) {
+      assert.ok(positions[i - 1] < p, `${order[i - 1]} 必须排在 ${order[i]} 前面（声明序）`);
+    }
+  }
+  // ⛔ 声明序 ≠ 权重降序（降序会把「完成度 25%」提到最前、把「赛题契合度 10%」压到倒数第二）
+  assert.ok(html.indexOf('赛题契合度') < html.indexOf('完成度'), '声明序里赛题契合度在完成度之前');
+  assert.ok(html.indexOf('企业确认') > html.indexOf('完成度'), '企业席维度在评委席维度之后（保持席分组）');
+});
+
+test('权重表：权重百分比与合计都渲染出来', () => {
+  const html = weightTableHtml({ configs: [SCORING], scoringConfigKey: 'initial' });
+  assert.ok(html.includes('10%'), '0.10 要显示成 10%');
+  assert.ok(html.includes('25%'), '0.25 要显示成 25%');
+  assert.ok(html.includes('合计'), '要给出权重合计');
+  assert.ok(html.includes('100%'), '这张表合计正好 100%（六维之和）');
+});
+
+test('权重表：席构成约束按规则里的数值展示（企业席 ≥30% / 专家席 ≤50% / 每维最少 7 人）', () => {
+  const html = weightTableHtml({ configs: [SCORING], scoringConfigKey: 'initial' });
+  assert.ok(html.includes('每维度最少评委数'), '要列出约束项');
+  assert.ok(html.includes('30%'), '企业席最低占比 30%');
+  assert.ok(html.includes('50%'), '专家席最高占比 50%');
+  assert.ok(html.includes('有投票权的席'), '要说明哪些席有投票权');
+  assert.ok(html.includes('无投票权的席'), '要说明哪些席没有投票权');
+});
+
+test('权重表：三种席位渲染成**不同**的标签，观察席明确写「无投票权」', () => {
+  assert.equal(judgeSeatLabel('judge').label, '评委席');
+  assert.equal(judgeSeatLabel('enterprise').label, '企业席');
+  assert.equal(judgeSeatLabel('observer').label, '观察席 · 无投票权');
+  // 三个标签必须互不相同 ⇒ 断言不是「同一个模板套三遍」
+  const labels = new Set([judgeSeatLabel('judge').label, judgeSeatLabel('enterprise').label, judgeSeatLabel('observer').label]);
+  assert.equal(labels.size, 3, '三种席位必须渲染成三个不同的标签');
+  assert.equal(judgeSeatLabel('observer').voting, false, '观察席无投票权');
+  assert.equal(judgeSeatLabel('judge').voting, true);
+  assert.equal(judgeSeatLabel('enterprise').voting, true);
+});
+
+test('权重表：读的是当前赛段那一张（key 决定表，不是永远第一张）', () => {
+  const html = weightTableHtml({ configs: [SCORING, SCORING_FINAL], scoringConfigKey: 'final' });
+  assert.ok(html.includes('决赛权重表'), '应显示 final 那一张的来源');
+  assert.ok(html.includes('40%'), 'final 表的创新性权重 40%');
+  assert.ok(!html.includes('技术可行性'), 'initial 表的维度不该出现在 final 表里');
+});
+
+test('权重表：规则没加载 ⇒ 显示「规则未加载」，但**不阻断**其余面板', () => {
+  const page = stageConfigPageHtml({
+    configs: [],
+    configsDegraded: true,
+    stages: STAGES,
+    editionId: 'ed_2026',
+    editions: EDITIONS,
+  });
+  assert.ok(page.includes('规则未加载'), '降级时必须说「规则未加载」');
+  assert.ok(page.includes('notice--warn'), '降级要给出可见告警');
+  // 其余面板照常渲染
+  assert.ok(page.includes('届期与赛段'), '赛段列表面板不能被降级带没');
+  assert.ok(page.includes('评委席'), '评委席面板不能被降级带没');
+  assert.ok(page.includes('名册'), '名册面板不能被降级带没');
+});
+
+test('权重表：规则加载了但这个键不在里面 ⇒ 「权重表未找到」（不是「规则未加载」）', () => {
+  const html = weightTableHtml({ configs: [SCORING], scoringConfigKey: 'final' });
+  assert.ok(html.includes('权重表未找到'), '键缺失要说「权重表未找到」');
+  assert.ok(html.includes('final'), '要点名是哪个键找不到');
+  assert.ok(!html.includes('规则未加载'), '两种降级不能混为一谈');
+});
+
+test('权重表：**不知道当前用哪一张**（列表端点没返回键）≠「权重表未找到」', () => {
+  const html = weightTableHtml({ configs: [SCORING, SCORING_FINAL], scoringConfigKey: '' });
+  assert.ok(html.includes('还不知道'), '要说清是「不知道」而不是「没有」');
+  assert.ok(!html.includes('权重表未找到'), '不能误报「权重表未找到」');
+  assert.ok(html.includes('initial') && html.includes('final'), '要把可用的权重表列出来');
+  assert.ok(html.includes('规则里可用的权重表'), '要有可用权重表清单');
+});
+
+test('权重表：权重表**只读** —— 页面不提供改权重的入口', () => {
+  const html = weightTableHtml({ configs: [SCORING], scoringConfigKey: 'initial' });
+  assert.ok(!html.includes('data-action="weight-update"'), '权重表不能有写入口');
+  assert.ok(html.includes('rules/scoring-*.json'), '要说明改表的方式是改规则文件');
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 二、赛段列表与届期
+// ══════════════════════════════════════════════════════════════════
+
+test('赛段列表：代号 / 名称 / 类型 / 时间窗 / 状态都渲染出来', () => {
+  const html = stageListHtml(STAGES, 'st_1');
+  assert.ok(html.includes('initial'), '代号');
+  assert.ok(html.includes('初赛评审'), '名称');
+  assert.ok(html.includes('初赛'), '类型');
+  assert.ok(html.includes('2026-10-20 09:00'), '时间窗起点');
+  assert.ok(html.includes('2026-10-28 18:00'), '时间窗终点');
+  assert.ok(html.includes('草稿'), '状态');
+  assert.ok(html.includes('决赛评审'), '第二条赛段也要在列表里');
+});
+
+test('赛段列表：可以点选进入配置（委托用的 data-action）', () => {
+  const html = stageListHtml(STAGES, 'st_1');
+  assert.ok(html.includes('data-action="stage-select"'), '要有选择动作');
+  assert.ok(html.includes('data-stage-id="st_2"'), '要带上赛段 id');
+  assert.ok(html.includes('当前赛段'), '选中的那个要标出来');
+});
+
+test('赛段列表：一个赛段都没有 ⇒ 空态（不是报错）', () => {
+  const html = stageListHtml([], '');
+  assert.ok(html.includes('state--empty'), '要走空态');
+  assert.ok(html.includes('本届期还没有赛段'));
+  assert.ok(!html.includes('state--error'), '空 ≠ 错');
+});
+
+test('届期：默认当届（尚未结束的最早一届），不是最早的一届', () => {
+  assert.equal(pickCurrentEdition(EDITIONS, '2026-06-01')?.id, 'ed_2026');
+  // 全都结束了 ⇒ 退回最后一届
+  assert.equal(pickCurrentEdition(EDITIONS, '2027-01-01')?.id, 'ed_2026');
+  assert.equal(pickCurrentEdition([], '2026-06-01'), null);
+});
+
+test('届期选择器：渲染下拉，并回填当前届期', () => {
+  const html = editionPickerHtml(EDITIONS, 'ed_2026');
+  assert.ok(html.includes('id="stage-edition"'), '要有届期选择器');
+  assert.ok(html.includes('data-stage="edition"'), '要能被委托监听');
+  assert.ok(html.includes('2026 届'), '届期名要在选项里');
+  assert.ok(html.includes('深圳'), '城市也要显示');
+  assert.ok(html.includes('value="ed_2026" selected'), '当前届期要选中');
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 三、建段 / 改配置
+// ══════════════════════════════════════════════════════════════════
+
+test('建赛段表单：七项字段齐全 + 提交动作', () => {
+  const html = stageCreateFormHtml({ draft: {}, configs: [SCORING] });
+  for (const id of ['stage-new-key', 'stage-new-name', 'stage-new-kind', 'stage-new-config', 'stage-new-starts', 'stage-new-ends', 'stage-new-freeze']) {
+    assert.ok(html.includes(`id="${id}"`), `建段表单必须有 ${id}`);
+  }
+  assert.ok(html.includes('data-action="stage-create-submit"'), '要有创建按钮');
+  assert.ok(html.includes('初赛') && html.includes('决赛'), '赛段类型下拉要有枚举选项');
+});
+
+test('改赛段配置：**key 与 kind 建后不可改**（置灰，不是隐藏）', () => {
+  const html = stageConfigHtml({
+    stage: { id: 'st_1', key: 'initial', name: '初赛评审', kind: 'initial', status: 'draft', startsAt: '2026-10-20T09:00:00', endsAt: '2026-10-28T18:00:00', freezeAt: '', scoringConfigKey: 'initial' },
+    draft: {},
+    configs: [SCORING],
+  });
+  const keyField = html.slice(html.indexOf('id="stage-cfg-key"'), html.indexOf('id="stage-cfg-name"'));
+  assert.ok(keyField.includes('disabled'), '代号输入框必须 disabled');
+  const kindField = html.slice(html.indexOf('id="stage-cfg-kind"'), html.indexOf('id="stage-cfg-config"'));
+  assert.ok(kindField.includes('disabled'), '类型下拉必须 disabled');
+  // 可改的字段不能被置灰
+  const nameField = html.slice(html.indexOf('id="stage-cfg-name"'), html.indexOf('id="stage-cfg-kind"'));
+  assert.ok(!nameField.includes('disabled'), '名称可以改');
+  assert.ok(html.includes('data-action="stage-update-submit"'), '要有保存按钮');
+});
+
+test('改赛段配置：没选赛段 ⇒ 空态引导', () => {
+  const html = stageConfigHtml({ stage: null, draft: {}, configs: [] });
+  assert.ok(html.includes('state--empty'));
+  assert.ok(html.includes('先选一个赛段'));
+});
+
+test('改赛段配置：列表端点没返回冻结时间 / 权重表键时，页面如实说明（且这两项不被清空）', () => {
+  const html = stageConfigHtml({
+    // 列表端点的摘要形状：没有 freezeAt / scoringConfigKey
+    stage: { id: 'st_1', key: 'initial', name: '初赛评审', kind: 'initial', status: 'draft', startsAt: '2026-10-20T09:00:00', endsAt: '2026-10-28T18:00:00', freezeAt: '', scoringConfigKey: '', freezeAtKnown: false, scoringConfigKeyKnown: false },
+    draft: {},
+    configs: [SCORING],
+  });
+  assert.ok(html.includes('没有随赛段列表返回'), '必须如实说明这两项没有回填');
+  assert.ok(html.includes('不会被提交'), '必须说明没改动就不提交（不会误清空）');
+});
+
+test('类型 / 状态 / 席位的中文标签映射', () => {
+  assert.equal(stageKindLabel('initial').label, '初赛');
+  assert.equal(stageKindLabel('final').label, '决赛');
+  assert.equal(stageKindLabel('roadshow').label, '路演');
+  assert.equal(stageKindLabel('landing').label, '落地');
+  assert.equal(stageKindLabel('nonsense').label, 'nonsense', '未知值原样透出，不静默吞掉');
+  assert.equal(stageStatusLabel('draft').label, '草稿');
+  assert.equal(stageStatusLabel('open').label, '进行中');
+  assert.equal(stageStatusLabel('published').label, '已发榜');
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 四、评委席
+// ══════════════════════════════════════════════════════════════════
+
+test('评委席：姓名从候选池回填，三种席位渲染成不同标签', () => {
+  const html = judgeSeatHtml({ judges: JUDGES, candidates: CANDIDATES, draft: {} });
+  assert.ok(html.includes('陈砚秋'), '姓名要从候选池回填');
+  assert.ok(html.includes('青瓷研究院'), '单位也要显示');
+  assert.ok(html.includes('u_judge1'), 'userId 也要显示（回填不到时用户能自己认）');
+  assert.ok(html.includes('评委席'), 'judge 席');
+  assert.ok(html.includes('企业席'), 'enterprise 席');
+  assert.ok(html.includes('观察席'), 'observer 席');
+  assert.ok(html.includes('无投票权'), 'observer 必须写明无投票权');
+  // 三种席位的徽章文案不同（不是同一个模板套三遍）
+  assert.notEqual(html.indexOf('badge--brand'), html.indexOf('badge--info'), '评委席与企业席的色调要不同');
+});
+
+test('评委席：一个都没派 ⇒ 空态（不是报错）', () => {
+  const html = judgeSeatHtml({ judges: [], candidates: CANDIDATES, draft: {} });
+  assert.ok(html.includes('state--empty'), '要走空态');
+  assert.ok(html.includes('还没有派评委'));
+  assert.ok(!html.includes('state--error'), '空 ≠ 错');
+});
+
+test('评委席：派评委表单（选人 + 选席），已派的人不再出现在候选下拉里', () => {
+  const html = judgeSeatHtml({ judges: JUDGES, candidates: CANDIDATES, draft: {} });
+  assert.ok(html.includes('id="stage-judge-user"'), '要有选人的下拉');
+  assert.ok(html.includes('id="stage-judge-seat"'), '要有选席的下拉');
+  assert.ok(html.includes('data-action="judge-assign-submit"'), '要有派评委按钮');
+  const select = html.slice(html.indexOf('id="stage-judge-user"'), html.indexOf('id="stage-judge-seat"'));
+  assert.ok(!select.includes('value="u_judge1"'), '已派的人不该再出现在候选下拉里');
+  assert.ok(select.includes('value="u_new"'), '没派的人应该在候选下拉里');
+  assert.ok(select.includes('吴未名'), '候选要显示姓名');
+});
+
+test('评委席：席位下拉里观察席写明「无投票权」', () => {
+  const html = judgeSeatHtml({ judges: [], candidates: CANDIDATES, draft: {} });
+  const seatSelect = html.slice(html.indexOf('id="stage-judge-seat"'));
+  assert.ok(seatSelect.includes('无投票权'), '选席时就要看清观察席没有投票权');
+});
+
+test('撤评委（逆向路径）：二次确认块写明席位失效 + 利益冲突声明被解除', () => {
+  const html = removeJudgeConfirmHtml({ userId: 'u_judge1', name: '陈砚秋', stageName: '初赛评审' });
+  assert.ok(html.includes('确认撤回该评委'), '要有二次确认');
+  assert.ok(html.includes('data-action="judge-remove-confirm"'), '要有确认按钮');
+  assert.ok(html.includes('data-action="judge-remove-cancel"'), '要有取消按钮');
+  assert.ok(html.includes('席位'), '要说明席位失效');
+  assert.ok(html.includes('利益冲突声明'), '要说明连带处理利益冲突声明');
+  assert.ok(html.includes('陈砚秋'), '要点名是谁');
+  assert.ok(html.includes('初赛评审'), '确认文案要写明是哪个赛段（影响面）');
+});
+
+test('撤评委：点了「撤评委」才出现确认块（确认块本身不是常驻的）', () => {
+  const before = judgeSeatHtml({ judges: JUDGES, candidates: CANDIDATES, draft: {}, pending: null });
+  assert.ok(!before.includes('data-stage-confirm="judge"'), '没点之前不出现确认块');
+  const after = judgeSeatHtml({ judges: JUDGES, candidates: CANDIDATES, draft: {}, pending: { userId: 'u_judge1' } });
+  assert.ok(after.includes('data-stage-confirm="judge"'), '点了之后出现确认块');
+  assert.ok(after.includes('data-action="judge-remove-confirm"'), '确认按钮可用');
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 五、名册
+// ══════════════════════════════════════════════════════════════════
+
+test('名册：空名册 ⇒ 空态（不是报错），但登记入口仍然在（不能是死路）', () => {
+  const html = rosterHtml({ teams: TEAMS, rosterTeamIds: [] });
+  assert.ok(html.includes('state--empty'), '要走空态');
+  assert.ok(html.includes('本赛段名册还是空的'));
+  assert.ok(!html.includes('state--error'), '空 ≠ 错');
+  // ⛔ 关键：名册为空时也得能登记（勾选框 + 提交按钮）
+  assert.ok(html.includes('data-stage="roster-pick"'), '要有勾选框');
+  assert.ok(html.includes('data-action="roster-register-submit"'), '要有登记按钮');
+  assert.ok(html.includes('拾光队'), '候选队伍要列出来');
+});
+
+test('名册：在榜队伍被标记「在榜」，并显示队名与段位', () => {
+  const html = rosterHtml({ teams: TEAMS, rosterTeamIds: ['t_alpha'] });
+  assert.ok(html.includes('在榜'), '在榜队伍要有标记');
+  assert.ok(html.includes('拾光队'), '队名');
+  assert.ok(html.includes('溯洄队'), '没在榜的队伍也要列出来（可登记）');
+  assert.ok(html.includes('>A<'), '段位要显示');
+  assert.ok(html.includes('data-action="roster-remove-request"'), '在榜队伍要能退名册');
+  // 只有在榜的那支才给退名册按钮
+  const alphaRow = html.slice(html.indexOf('拾光队'), html.indexOf('溯洄队'));
+  assert.ok(alphaRow.includes('退名册'), '在榜队伍有退名册入口');
+  const betaRow = html.slice(html.indexOf('溯洄队'));
+  assert.ok(!betaRow.includes('data-action="roster-remove-request"'), '不在榜的队伍不该有退名册入口');
+});
+
+test('名册：本届期一支队伍都没有 ⇒ 空态', () => {
+  const html = rosterHtml({ teams: [], rosterTeamIds: [] });
+  assert.ok(html.includes('state--empty'));
+  assert.ok(html.includes('本届期还没有队伍'));
+});
+
+test('退名册（逆向路径）：二次确认块写明评分与确认失效', () => {
+  const html = removeTeamConfirmHtml({ teamId: 't_alpha', name: '拾光队', stageName: '初赛评审' });
+  assert.ok(html.includes('确认把该队伍退名册'), '要有二次确认');
+  assert.ok(html.includes('data-action="roster-remove-confirm"'));
+  assert.ok(html.includes('data-action="roster-remove-cancel"'));
+  assert.ok(html.includes('评分与确认'), '要说明评分与确认失效');
+  assert.ok(html.includes('失效'), '要写明影响面');
+  assert.ok(html.includes('拾光队'), '要点名是哪支队伍');
+});
+
+test('退名册：点了「退名册」才出现确认块', () => {
+  const before = rosterHtml({ teams: TEAMS, rosterTeamIds: ['t_alpha'], pending: null });
+  assert.ok(!before.includes('data-stage-confirm="team"'));
+  const after = rosterHtml({ teams: TEAMS, rosterTeamIds: ['t_alpha'], pending: { teamId: 't_alpha' } });
+  assert.ok(after.includes('data-stage-confirm="team"'));
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 六、整页：状态码 / 反馈 / 转义
+// ══════════════════════════════════════════════════════════════════
+
+test('403 ⇒ 页面显示「没有权限」（而不是空白页，也不是通用「请求失败」）', () => {
+  assert.ok(stageErrorText(403, '缺少能力：stage:compute').includes('权限'), '403 文案必须出现「权限」');
+  assert.ok(stageErrorText(403).includes('权限'));
+  assert.ok(!stageErrorText(403, 'x').includes('请求失败'));
+
+  const page = stageConfigPageHtml({
+    error: '缺少能力：stage:compute',
+    errorStatus: 403,
+    stages: STAGES,
+    editions: EDITIONS,
+    editionId: 'ed_2026',
+  });
+  assert.ok(page.includes('权限'), '页面上要出现「权限」');
+  assert.ok(page.includes('state--error'), '错误态');
+  assert.ok(page.includes('届期与赛段'), '出错时也不能是空白页（赛段列表仍要在）');
+});
+
+test('404 ⇒ 页面显示「不存在」', () => {
+  assert.ok(stageErrorText(404, '赛段不存在').includes('不存在'));
+  const page = stageConfigPageHtml({ error: '赛段不存在', errorStatus: 404, stages: [], editions: EDITIONS });
+  assert.ok(page.includes('不存在'));
+});
+
+test('其它状态码 ⇒ 服务端的中文原因原样透出', () => {
+  assert.equal(stageErrorText(400, '开始时间必须早于结束时间'), '开始时间必须早于结束时间');
+  assert.equal(stageErrorText(null, ''), '加载失败，请重试。');
+});
+
+test('加载中 ⇒ 骨架屏（不是白屏）', () => {
+  const page = stageConfigPageHtml({ loading: true });
+  assert.ok(page.includes('state--loading'));
+  assert.ok(page.includes('正在加载'));
+});
+
+test('成功反馈：noticeState 的参数是 **items 数组**（不是 text）', () => {
+  const page = stageConfigPageHtml({
+    stages: STAGES,
+    editions: EDITIONS,
+    editionId: 'ed_2026',
+    feedback: { tone: 'success', title: '赛段已创建', items: ['赛段「初赛评审」已建好。', '新赛段是草稿状态。'] },
+  });
+  assert.ok(page.includes('notice--success'), '反馈条要有色调');
+  assert.ok(page.includes('赛段已创建'), '标题');
+  assert.ok(page.includes('赛段「初赛评审」已建好。'), 'items 的第一条必须渲染出来');
+  assert.ok(page.includes('新赛段是草稿状态。'), 'items 的第二条必须渲染出来');
+});
+
+test('整页：六个面板都在（建段 / 改配置 / 权重表 / 评委席 / 名册 / 赛段列表）', () => {
+  const page = stageConfigPageHtml({
+    stages: STAGES,
+    editions: EDITIONS,
+    editionId: 'ed_2026',
+    stage: { id: 'st_1', key: 'initial', name: '初赛评审', kind: 'initial', status: 'draft', startsAt: '2026-10-20T09:00:00', endsAt: '2026-10-28T18:00:00', freezeAt: '', scoringConfigKey: 'initial' },
+    configs: [SCORING],
+    judges: JUDGES,
+    candidates: CANDIDATES,
+    teams: TEAMS,
+    rosterTeamIds: ['t_alpha'],
+  });
+  for (const title of ['届期与赛段', '新建赛段', '赛段配置', '权重表（只读）', '评委席', '名册']) {
+    assert.ok(page.includes(title), `整页必须「${title}」面板`);
+  }
+  // 六个写端点的动作都在页面上（端点不再零调用方）
+  for (const action of ['stage-create-submit', 'stage-update-submit', 'judge-assign-submit', 'judge-remove-request', 'roster-register-submit', 'roster-remove-request']) {
+    assert.ok(page.includes(`data-action="${action}"`), `页面上必须有「${action}」动作`);
+  }
+});
+
+test('整页：服务端返回的用户数据必须转义（存储型 XSS 面）', () => {
+  const evil = '<img src=x onerror=alert(1)>';
+  const page = stageConfigPageHtml({
+    stages: [{ id: 'st_evil', key: 'x', name: evil, kind: 'initial', status: 'draft', startsAt: '2026-10-20T09:00:00', endsAt: '2026-10-28T18:00:00' }],
+    editions: EDITIONS,
+    editionId: 'ed_2026',
+    judges: [{ id: 'sj_x', stageId: 'st_evil', userId: 'u_x', seat: 'judge', scopeType: 'global', scopeId: null, assignedAt: '2026-10-20T09:00:00' }],
+    candidates: [{ id: 'u_x', name: evil, org: 'x' }],
+    teams: [{ id: 't_evil', name: evil, tier: 'A' }],
+    rosterTeamIds: ['t_evil'],
+  });
+  assert.ok(!page.includes(evil), '原始 HTML 串不许出现在输出里');
+  assert.ok(page.includes('&lt;img src=x onerror=alert(1)&gt;'), '必须转义后再插入');
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 七、时间与权重格式化
+// ══════════════════════════════════════════════════════════════════
+
+test('时间格式化：无时区串按本地时间读，非法值原样透出（不显示 Invalid Date）', () => {
+  assert.equal(fmtStageTime('2026-10-20T09:00:00'), '2026-10-20 09:00');
+  assert.equal(fmtStageTime(''), '');
+  assert.equal(fmtStageTime('不是时间'), '不是时间');
+});
+
+test('datetime-local 回填与提交：toLocalInput ↔ toIso 同一时刻', () => {
+  assert.equal(toLocalInput('2026-10-20T09:00:00'), '2026-10-20T09:00');
+  assert.equal(toLocalInput(''), '');
+  assert.equal(toLocalInput('不是时间'), '');
+  const iso = toIso('2026-10-20T09:00:00');
+  assert.equal(new Date(iso).getTime(), new Date('2026-10-20T09:00:00').getTime(), '转 ISO 不能改时刻');
+  assert.equal(toIso(''), '');
+});
+
+test('权重格式化：0.2 → 20%，非法值 → —', () => {
+  assert.equal(fmtWeight(0.2), '20%');
+  assert.equal(fmtWeight(0.125), '12.5%');
+  assert.equal(fmtWeight('不是数字'), '—');
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 八、端点契约（静态读源文件钉住 —— 与 web-review-publish.test.js 同款）
+// ══════════════════════════════════════════════════════════════════
+
+test('契约：权重表端点是**届期作用域**的 /api/editions/:editionId/scoring-configs', () => {
+  assert.ok(
+    VIEW_SRC.includes('/api/editions/${encodeURIComponent(state.editionId)}/scoring-configs'),
+    '必须读届期作用域的权重表端点',
+  );
+  assert.ok(
+    !VIEW_SRC.includes("get('/api/scoring-configs'") && !VIEW_SRC.includes('get("/api/scoring-configs"'),
+    '不能用 global 作用域的 /api/scoring-configs（会造成「能改赛段、却读不到权重表」）',
+  );
+});
+
+test('契约：视图用到的端点路径与约定一致', () => {
+  for (const p of [
+    "'/api/editions'",
+    '/api/stages?editionId=',
+    '/judges`',
+    '/teams`',
+    '/api/editions/${encodeURIComponent(state.editionId)}/teams',
+    '/api/editions/${encodeURIComponent(state.editionId)}/judge-candidates',
+  ]) {
+    assert.ok(VIEW_SRC.includes(p), `端点路径 ${p} 必须出现在视图里`);
+  }
+});
+
+test('契约：ctx.api 的方法名是 get / post / patch / **del**（不是 delete）', () => {
+  for (const m of ['ctx.api.get(', 'ctx.api.post(', 'ctx.api.patch(', 'ctx.api.del(']) {
+    assert.ok(VIEW_SRC.includes(m), `必须用 ${m}`);
+  }
+  assert.ok(!VIEW_SRC.includes('ctx.api.delete('), '本仓的 API 客户端没有 delete 方法，删除一律是 del');
+  assert.ok(!VIEW_SRC.includes('ctx.api.remove('), '删除端点用的是 del');
+});
+
+test('契约：视图是浏览器可 import 的纯 ESM（不 import 任何 Node 内置模块）', () => {
+  assert.ok(!/from\s+['"]node:/.test(VIEW_SRC), '不许 import node: 内置模块');
+  assert.ok(VIEW_SRC.includes("from '../escape.js'"), '转义必须走全站唯一入口');
+  assert.ok(VIEW_SRC.includes("from '../ui.js'"), '组件必须用 web/ui.js 里现成的');
+});
+
+test('契约：不许自造 CSS 类名（只用仓库里已有的类）', () => {
+  // 视图里出现的 class 名必须都在 web/styles.css 里存在
+  const css = readFileSync(join(here, '..', 'web', 'styles.css'), 'utf8');
+  const used = new Set();
+  for (const m of VIEW_SRC.matchAll(/class="([^"]+)"/g)) {
+    for (const cls of m[1].split(/\s+/)) if (cls) used.add(cls);
+  }
+  const missing = [...used].filter((cls) => !new RegExp(`\\.${cls.replace(/[-]/g, '\\-')}[^\\w-]`).test(css));
+  assert.deepEqual(missing, [], `这些 class 在 styles.css 里不存在：${missing.join(', ')}`);
+});
 ```

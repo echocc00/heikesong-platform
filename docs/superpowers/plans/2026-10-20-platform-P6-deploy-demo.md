@@ -5132,7 +5132,88 @@ export function buildDemoState(seed) {
     tiebreakVotes: deepCopy(seed?.tiebreakVotes) ?? [],
     publicTokens: deepCopy(seed?.publicTokens) ?? [],
     auditLog: deepCopy(seed?.auditLog) ?? [],
+    // ⚠️ E158：赛段配置（正式站对应 stages / stage_judges / stage_team 三张表）。
+    //    此前演示适配器**没有**这三个容器 ⇒ 「赛段配置」页在公网演示站上
+    //    读不到名册、读不到评委席，也建不了赛段。
+    stages: deepCopy(seed?.stages) ?? [],
+    stageJudges: deepCopy(seed?.stageJudges) ?? [],
+    stageTeams: deepCopy(seed?.stageTeams) ?? [],
     me: null,
+  };
+}
+
+/**
+ * 把「从计算结果推导出来的赛段」**实体化**进 `state.stages`（E158）。
+ *
+ * ⚠️ 为什么需要这一步：
+ *    `GET /api/stages` 的演示实现是从**计算结果**推导赛段列表的
+ *    （演示站只有 stage_final 一个赛段）。但「赛段配置」页要**改**它、
+ *    给它**派评委**、给它**登记名册** ⇒ 它必须是一个**可写的实体**，
+ *    否则页面上点它一律 404（赛段不存在）。
+ * ⇒ 幂等：已存在的 id 不重复补；每次 ensure() 调一次。
+ *
+ * @param {object} state
+ * @returns {object} state
+ */
+export function materializeDemoStages(state) {
+  const ids = Object.keys(state?.results ?? {});
+  const have = new Set((state?.stages ?? []).map((x) => x.id));
+  const add = [];
+  for (const id of ids) {
+    if (have.has(id)) continue;
+    have.add(id);
+    add.push({
+      id,
+      key: id,
+      name: id === state.lastStageId ? '决赛赛段' : `赛段 ${id}`,
+      kind: 'final',
+      status: 'computed',
+      startsAt: null,
+      endsAt: null,
+      freezeAt: null,
+      scoringConfigKey: 'final',
+      editionId: state?.edition?.id ?? null,
+      createdAt: new Date().toISOString(),
+    });
+  }
+  if (add.length) state.stages = [...(state.stages ?? []), ...add];
+  return state;
+}
+
+/**
+ * 演示站赛段视图（与正式站 `presentStage` 同形状：camelCase 别名齐全）。
+ * @param {object} stage
+ * @returns {object}
+ */
+export function demoStageView(stage) {
+  if (!stage) return null;
+  return {
+    ...stage,
+    editionId: stage.editionId ?? null,
+    startsAt: stage.startsAt ?? null,
+    endsAt: stage.endsAt ?? null,
+    freezeAt: stage.freezeAt ?? null,
+    scoringConfigKey: stage.scoringConfigKey ?? null,
+  };
+}
+
+/**
+ * 演示站评委席视图（与正式站 `presentJudge` 同形状）。
+ * @param {object} row
+ * @returns {object}
+ */
+export function demoJudgeView(row) {
+  if (!row) return null;
+  return {
+    ...row,
+    stageId: row.stageId ?? null,
+    userId: row.userId ?? null,
+    seat: row.seat ?? null,
+    scopeType: row.scopeType ?? 'global',
+    scopeId: row.scopeId ?? null,
+    assignedAt: row.assignedAt ?? null,
+    conflictDeclaredAt: row.conflictDeclaredAt ?? null,
+    conflictDeclarationId: row.conflictDeclarationId ?? null,
   };
 }
 
@@ -6327,6 +6408,10 @@ export function createDemoApi({ storage = defaultStorage(), seed = null, rules =
     if (!Array.isArray(state.tiebreakVotes)) state.tiebreakVotes = [];
     if (!Array.isArray(state.publicTokens)) state.publicTokens = [];
     if (!Array.isArray(state.auditLog)) state.auditLog = [];
+    // ⚠️ E158：赛段配置容器的兜底（老版 localStorage 里没有）
+    if (!Array.isArray(state.stages)) state.stages = [];
+    if (!Array.isArray(state.stageJudges)) state.stageJudges = [];
+    if (!Array.isArray(state.stageTeams)) state.stageTeams = [];
     // ⚠️ **localStorage 里的旧 state 不带 results**（旧版演示站访问时留下的）⇒
     //    榜单会是空的（访客明明是第一次看到新版演示站，却看到「暂无数据」）。
     // ⇒ 补齐：**只补缺失的计算结果**，不覆盖访客自己的操作数据（报名/评审等）。
@@ -6336,6 +6421,10 @@ export function createDemoApi({ storage = defaultStorage(), seed = null, rules =
       state.computations = { ...(deepCopy(seed?.computations) ?? {}), ...state.computations };
       if (!state.lastStageId) state.lastStageId = deepCopy(seed?.lastStageId) ?? null;
     }
+    // ⚠️ E158：把「从计算结果推导的赛段」实体化 ⇒ 配置页能改它、派评委、登记名册。
+    //    ⛔ 必须放在**结果兜底之后** —— 否则老版 localStorage 首次恢复时，
+    //      results 还没补上，实体化就落空了（要等下一次请求才生效）。
+    materializeDemoStages(state);
     return state;
   };
   const persist = () => storage.setItem(STORAGE_KEY, JSON.stringify(state));
@@ -6344,6 +6433,10 @@ export function createDemoApi({ storage = defaultStorage(), seed = null, rules =
     const { path: clean, query } = parseQuery(path);
     const s = ensure();
     const r = rules;
+    // ⛔ `m` 的声明放在**最前**：本函数里有多个分段用 `m = clean.match(...)`
+    //    匹配路径，而原来的 `let m` 写在中段。⛔ 若把声明放到那里，
+    //    我新增的分段（在之前）就会碰到「访问尚未初始化的词法变量」。
+    let m = null;
     if (!r) throw httpError(500, 'RULES_MISSING', '演示版规则配置未加载');
 
     // 健康检查
@@ -6755,19 +6848,236 @@ export function createDemoApi({ storage = defaultStorage(), seed = null, rules =
     }
     // ── P7：赛段时间线（前端赛段选择器用）─────────────────────
     if (method === 'GET' && clean === '/api/stages') {
-      // ⚠️ 演示站只有一个赛段（stage_final）—— 从**已有计算结果**推导，
-      //    不要写死：真实系统里赛段数由赛事配置决定。
-      const stageIds = Object.keys(s.results ?? {});
-      const items = stageIds.map((id) => ({
-        id,
-        key: id,
-        name: id === s.lastStageId ? '决赛赛段' : `赛段 ${id}`,
-        kind: 'final',
-        status: 'computed',
-        startsAt: null,
-        endsAt: null,
-      }));
-      return { items };
+      // ⚠️ 演示站的赛段**不是写死的**：从计算结果推导的（ensure 里 materializeDemoStages
+      //    已把推导出来的赛段实体化进 state.stages）+ 访客在「赛段配置」页新建的赛段。
+      //    ⇒ 一律从 state.stages 出（形状与正式站 listStageSummaries 一致）。
+      return { items: (s.stages ?? []).map(demoStageView) };
+    }
+    // ── E158：赛段配置（设计 §9「赛段配置与权重表」）──────────────────
+    //
+    // ⚠️ 形状必须与真实后端 `src/http/routes/stages.js` **逐字段一致**：
+    //    GET    /api/editions
+    //    GET    /api/editions/:editionId/teams
+    //    GET    /api/editions/:editionId/judge-candidates
+    //    GET    /api/editions/:editionId/scoring-configs
+    //    POST   /api/editions/:editionId/stages
+    //    PATCH  /api/stages/:stageId
+    //    GET    /api/stages/:stageId/judges
+    //    POST   /api/stages/:stageId/judges
+    //    DELETE /api/stages/:stageId/judges/:userId
+    //    GET    /api/stages/:stageId/teams
+    //    POST   /api/stages/:stageId/teams
+    //    DELETE /api/stages/:stageId/teams/:teamId
+    //
+    // ⚠️ 三态状态码与正式站同口径：不存在 404 / 没权限 403 / 成功 200。
+    //    演示站只有组委会身份 ⇒ 权限闸门恒放行（与其它演示端点同款取舍）。
+    if (method === 'GET' && clean === '/api/editions') {
+      const ed = s.edition ?? {};
+      return {
+        items: [{
+          id: ed.id ?? null,
+          name: ed.name ?? null,
+          city: ed.city ?? null,
+          startsAt: ed.startsAt ?? null,
+          endsAt: ed.endsAt ?? null,
+        }],
+      };
+    }
+    m = clean.match(/^\/api\/editions\/([^/]+)\/(teams|judge-candidates|scoring-configs)$/);
+    if (method === 'GET' && m) {
+      if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
+      const editionId = m[1];
+      const kind = m[2];
+      if (s.edition?.id && editionId !== s.edition.id) {
+        throw httpError(404, 'EDITION_NOT_FOUND', '届期不存在');
+      }
+      if (kind === 'teams') {
+        // ⛔ 白名单投影：只给 id / name / tier（与正式站一致，不带 task_package_id）。
+        return { items: (s.teams ?? []).map((t) => ({ id: t.id, name: t.name, tier: t.tier ?? null })) };
+      }
+      if (kind === 'judge-candidates') {
+        // ⛔ 白名单投影：只给 id / name / org。
+        return { items: (s.judges ?? []).map((j) => ({ id: j.id, name: j.name, org: j.org ?? null })) };
+      }
+      // scoring-configs：逐字段白名单（**不给** note / source / conflictRef —— 内部工作语言）
+      const scoring = r?.scoring ?? {};
+      return {
+        items: Object.entries(scoring).map(([key, cfg]) => ({
+          key,
+          wEnterprise: cfg?.wEnterprise ?? null,
+          normalizationStrategy: cfg?.normalizationStrategy ?? null,
+          minSamplesForJudgeNormalization: cfg?.minSamplesForJudgeNormalization ?? null,
+          dimensions: (Array.isArray(cfg?.dimensions) ? cfg.dimensions : []).map((d) => ({
+            key: d?.key ?? null,
+            name: d?.name ?? null,
+            weight: d?.weight ?? null,
+            seat: d?.seat ?? null,
+          })),
+          judgePool: {
+            minJudgesPerDimension: cfg?.judgePool?.minJudgesPerDimension ?? null,
+            minEnterpriseSeatShare: cfg?.judgePool?.minEnterpriseSeatShare ?? null,
+            maxExpertSeatShare: cfg?.judgePool?.maxExpertSeatShare ?? null,
+            votingSeats: Array.isArray(cfg?.judgePool?.votingSeats) ? cfg.judgePool.votingSeats : [],
+            nonVotingSeats: Array.isArray(cfg?.judgePool?.nonVotingSeats) ? cfg.judgePool.nonVotingSeats : [],
+          },
+        })),
+      };
+    }
+    m = clean.match(/^\/api\/editions\/([^/]+)\/stages$/);
+    if (method === 'POST' && m) {
+      if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
+      const editionId = m[1];
+      const key = String(body?.key ?? '').trim();
+      const name = String(body?.name ?? '').trim();
+      if (!key || !name) throw httpError(400, 'INVALID_STAGE', '赛段的 key 与名称必填');
+      const scoringConfigKey = String(body?.scoringConfigKey ?? 'initial');
+      if (!r?.scoring?.[scoringConfigKey]) {
+        throw httpError(400, 'SCORING_CONFIG_NOT_FOUND', `规则里没有权重表 ${scoringConfigKey}`);
+      }
+      if ((s.stages ?? []).some((x) => x.editionId === editionId && x.key === key)) {
+        throw httpError(409, 'STAGE_KEY_EXISTS', `本届期已经有 key=${key} 的赛段`);
+      }
+      const now = new Date().toISOString();
+      const stage = {
+        id: `stage_demo_${(s.stages ?? []).length + 1}`,
+        editionId,
+        key,
+        name,
+        kind: String(body?.kind ?? 'initial'),
+        status: 'draft',
+        startsAt: body?.startsAt ?? null,
+        endsAt: body?.endsAt ?? null,
+        freezeAt: body?.freezeAt ?? null,
+        scoringConfigKey,
+        createdAt: now,
+      };
+      s.stages = [...(s.stages ?? []), stage];
+      persist();
+      return { stage: demoStageView(stage) };
+    }
+    m = clean.match(/^\/api\/stages\/([^/]+)$/);
+    if (method === 'PATCH' && m) {
+      if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
+      const stage = (s.stages ?? []).find((x) => x.id === m[1]);
+      if (!stage) throw httpError(404, 'STAGE_NOT_FOUND', '赛段不存在');
+      const scoringConfigKey = body?.scoringConfigKey === undefined
+        ? stage.scoringConfigKey
+        : String(body.scoringConfigKey);
+      if (scoringConfigKey && !r?.scoring?.[scoringConfigKey]) {
+        throw httpError(400, 'SCORING_CONFIG_NOT_FOUND', `规则里没有权重表 ${scoringConfigKey}`);
+      }
+      const updated = {
+        ...stage,
+        name: body?.name === undefined ? stage.name : String(body.name),
+        startsAt: body?.startsAt === undefined ? stage.startsAt : body.startsAt,
+        endsAt: body?.endsAt === undefined ? stage.endsAt : body.endsAt,
+        freezeAt: body?.freezeAt === undefined ? stage.freezeAt : body.freezeAt,
+        scoringConfigKey,
+        updatedAt: new Date().toISOString(),
+      };
+      s.stages = (s.stages ?? []).map((x) => (x.id === stage.id ? updated : x));
+      persist();
+      return { stage: demoStageView(updated) };
+    }
+    m = clean.match(/^\/api\/stages\/([^/]+)\/judges$/);
+    if (method === 'GET' && m) {
+      if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
+      const judges = (s.stageJudges ?? []).filter((j) => j.stageId === m[1]).map(demoJudgeView);
+      return { judges };
+    }
+    if (method === 'POST' && m) {
+      if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
+      const stage = (s.stages ?? []).find((x) => x.id === m[1]);
+      if (!stage) throw httpError(404, 'STAGE_NOT_FOUND', '赛段不存在');
+      const userId = String(body?.userId ?? '').trim();
+      const seat = String(body?.seat ?? '').trim();
+      if (!userId || !seat) throw httpError(400, 'INVALID_JUDGE', '必须指定 userId 与 seat');
+      if (!(s.judges ?? []).some((j) => j.id === userId)) {
+        throw httpError(404, 'USER_NOT_FOUND', '该用户不在评委候选池里');
+      }
+      if ((s.stageJudges ?? []).some((j) => j.stageId === stage.id && j.userId === userId)) {
+        throw httpError(409, 'JUDGE_ALREADY_ASSIGNED', '该评委已在本赛段');
+      }
+      const now = new Date().toISOString();
+      const row = {
+        stageId: stage.id,
+        userId,
+        seat,
+        scopeType: body?.scopeType ?? 'global',
+        scopeId: body?.scopeId ?? null,
+        assignedAt: now,
+        conflictDeclaredAt: now,
+        conflictDeclarationId: `cd_demo_${(s.stageJudges ?? []).length + 1}`,
+      };
+      s.stageJudges = [...(s.stageJudges ?? []), row];
+      persist();
+      return {
+        judges: (s.stageJudges ?? []).filter((j) => j.stageId === stage.id).map(demoJudgeView),
+      };
+    }
+    m = clean.match(/^\/api\/stages\/([^/]+)\/judges\/([^/]+)$/);
+    if (method === 'DELETE' && m) {
+      if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
+      const stageId = m[1];
+      const userId = m[2];
+      const hit = (s.stageJudges ?? []).find((j) => j.stageId === stageId && j.userId === userId);
+      if (!hit) throw httpError(404, 'JUDGE_NOT_FOUND', '该评委不在本赛段');
+      s.stageJudges = (s.stageJudges ?? []).filter((j) => !(j.stageId === stageId && j.userId === userId));
+      persist();
+      return {
+        removed: true,
+        seat: hit.seat,
+        judges: (s.stageJudges ?? []).filter((j) => j.stageId === stageId).map(demoJudgeView),
+      };
+    }
+    m = clean.match(/^\/api\/stages\/([^/]+)\/teams$/);
+    if (method === 'GET' && m) {
+      if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
+      const teamIds = (s.stageTeams ?? []).filter((t) => t.stageId === m[1]).map((t) => t.teamId);
+      return { teamIds };
+    }
+    if (method === 'POST' && m) {
+      if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
+      const stage = (s.stages ?? []).find((x) => x.id === m[1]);
+      if (!stage) throw httpError(404, 'STAGE_NOT_FOUND', '赛段不存在');
+      const wanted = Array.isArray(body?.teamIds) ? body.teamIds : (body?.teamId ? [body.teamId] : []);
+      const registered = [];
+      const skipped = [];
+      for (const tid of wanted) {
+        if (!(s.teams ?? []).some((t) => t.id === tid)) {
+          throw httpError(404, 'TEAM_NOT_FOUND', `战队不存在：${tid}`);
+        }
+        if ((s.stageTeams ?? []).some((t) => t.stageId === stage.id && t.teamId === tid)) {
+          skipped.push(tid);
+          continue;
+        }
+        registered.push(tid);
+      }
+      s.stageTeams = [
+        ...(s.stageTeams ?? []),
+        ...registered.map((tid) => ({ stageId: stage.id, teamId: tid })),
+      ];
+      persist();
+      return {
+        registered,
+        skipped,
+        teamIds: (s.stageTeams ?? []).filter((t) => t.stageId === stage.id).map((t) => t.teamId),
+      };
+    }
+    m = clean.match(/^\/api\/stages\/([^/]+)\/teams\/([^/]+)$/);
+    if (method === 'DELETE' && m) {
+      if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
+      const stageId = m[1];
+      const teamId = m[2];
+      if (!(s.stageTeams ?? []).some((t) => t.stageId === stageId && t.teamId === teamId)) {
+        throw httpError(404, 'TEAM_NOT_IN_STAGE', '该队伍不在本赛段名册里');
+      }
+      s.stageTeams = (s.stageTeams ?? []).filter((t) => !(t.stageId === stageId && t.teamId === teamId));
+      persist();
+      return {
+        removed: true,
+        teamIds: (s.stageTeams ?? []).filter((t) => t.stageId === stageId).map((t) => t.teamId),
+      };
     }
     // ── P7：工作流与任务清单（任务清单页的入口 + 领取/完成/释放）──
     if (method === 'GET' && clean === '/api/workflows') {
@@ -6846,7 +7156,7 @@ export function createDemoApi({ storage = defaultStorage(), seed = null, rules =
       persist();
       return { ...team, formation };
     }
-    let m = clean.match(/^\/api\/teams\/([^/]+)$/);
+    m = clean.match(/^\/api\/teams\/([^/]+)$/);
     if (method === 'GET' && m) {
       const team = (s.teams ?? []).find((t) => t.id === m[1]);
       if (!team) throw httpError(404, 'NOT_FOUND', '队伍不存在');
