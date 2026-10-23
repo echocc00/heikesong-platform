@@ -20,6 +20,7 @@ import { createSession, resolveSession, revokeSession } from './auth/session.js'
 import { can } from './auth/permissions.js';
 import { verifyPassword, hashPassword } from './auth/password.js';
 import { changePassword, logoutAllSessions } from './services/auth.js';
+import { assertRateLimit, loginSubjectKey } from './services/rate-limit.js';
 import { getUserById, getCredentialsByPhone, toPublicUser } from './db/repo/users.js';
 import { listUserRoles } from './db/repo/roles.js';
 import { listUserCapabilities } from './db/repo/assignments.js';
@@ -298,6 +299,21 @@ export function createApp({ db, rules, webDir }) {
     const passwordOk = verifyPassword(password, cred ? cred.password_hash : dummyHash());
     const ok = !!cred && cred.active === 1 && passwordOk;
     if (!ok) {
+      // ⚠️ 限频（F4 附带项）：登录端点原来**完全无限频** ——
+      //    实测 30 次错误口令全部 401、零 429 ⇒ 可无限爆破口令。
+      //    ⛔ 只统计**失败**的尝试：正常用户登录成功不消耗配额
+      //    （否则多设备/多标签页反复登录会被自己的配额挡住）。
+      //    配额用尽 ⇒ 429 + Retry-After（server.js 的错误分支统一加头），不再回 401。
+      //    ⚠️ 放在口令校验**之后**：先校验、再计数 —— 只有「真的错了」才消耗配额。
+      const loginSubject = loginSubjectKey(phone);
+      assertRateLimit({
+        db,
+        subjectKey: loginSubject,
+        rule: 'loginAttempt',
+        now: new Date().toISOString(),
+        limits: rules?.audit?.rateLimit,
+        subjects: { default: loginSubject },
+      });
       // ⛔ 终审修正（Important，I-5）：同上，必须走 AppError。
       throw appError(401, 'INVALID_CREDENTIALS', '手机号或密码不正确');
     }

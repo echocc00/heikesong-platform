@@ -23,6 +23,7 @@
 // 用法：node scripts/build-demo.js [--out web/dist]
 import {
   readFileSync, writeFileSync, mkdirSync, rmSync, existsSync, readdirSync, copyFileSync, statSync,
+  realpathSync,
 } from 'node:fs';
 import { join, dirname, relative, resolve, sep, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -468,7 +469,18 @@ export async function buildDemoSite({
   };
 }
 
-const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+// ⚠️ 必须按 realpath 比较（照抄 scripts/audit-scan.js 的同款修法，E166 同款病根）：
+//    ① 经**软链**调用时，import.meta.url 是**软链指向的真实文件**，而 process.argv[1]
+//       是**软链本身** ⇒ 裸字符串比较恒不等 ⇒ 脚本什么都不做、退出码 0
+//       ⇒ CI 看到绿灯，实际构建根本没跑；deploy-demo-site.sh 只查产物**存在**，
+//          于是**上周的旧演示站会被原样发布**。
+//    ② macOS 的 /tmp → /private/tmp、/var → /private/var 都是符号链接，同一个道理。
+//    对一道发布闸来说，「静默通过」是最坏的失败模式。
+function realPathOrSelf(p) {
+  try { return realpathSync(p); } catch { return p; }
+}
+const isMain = process.argv[1]
+  && realPathOrSelf(process.argv[1]) === realPathOrSelf(fileURLToPath(import.meta.url));
 if (isMain) {
   const args = process.argv.slice(2);
   const outIdx = args.indexOf('--out');

@@ -1,6 +1,6 @@
 {
   "id": "behavior",
-  "version": "2026-10-20",
+  "version": "2026-10-23",
   "source": "S10 §3.1 计分明细 + §3.2 达标线 + §3.3 占比上限",
   "completionThreshold": 60,
   "maxWeightShare": 0.10,

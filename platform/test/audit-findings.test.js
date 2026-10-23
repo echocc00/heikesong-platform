@@ -24,8 +24,13 @@ import { applyMigrations } from '../src/db/migrate.js';
 import { loadRules } from '../src/config.js';
 import { createApp } from '../src/server.js';
 import { createUser, setSuperadmin } from '../src/db/repo/users.js';
+import { createEdition } from '../src/db/repo/editions.js';
+import { createTaskPackage } from '../src/db/repo/taskPackages.js';
+import { insertTeam } from '../src/db/repo/teams.js';
+import { insertStage, assignStageJudge } from '../src/db/repo/stages.js';
 import { insertUserRole, insertRole } from '../src/db/repo/roles.js';
 import { insertRoleCapability, insertCapability } from '../src/db/repo/capabilities.js';
+import { grantAssignment } from '../src/auth/permissions.js';
 import { createSession } from '../src/auth/session.js';
 import { isolateTempDir } from '../test-helpers/tmp.js';
 
@@ -65,7 +70,10 @@ async function call(base, method, path, { body, cookie } = {}) {
     method, headers, body: body === undefined ? undefined : JSON.stringify(body),
   });
   const text = await res.text();
-  return { status: res.status, text };
+  // ⚠️ headers 一并返回：限频用例要验 429 的 **Retry-After** 头（不静默丢包）。
+  const out = {};
+  res.headers.forEach((v, k) => { out[k.toLowerCase()] = v; });
+  return { status: res.status, text, headers: out };
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -770,6 +778,127 @@ test('F4 rules/audit.json 里的每个限频 profile 都必须有生产调用方
     missing, [],
     `这些限频 profile 配了却没有任何生产代码引用（配置在说谎）：${missing.join(', ')}`,
   );
+});
+
+// ══════════════════════════════════════════════════════════════════
+// F4（运行时交叉验证）：静态引用只是「配置不再说谎」，
+//   **限频到底有没有真的生效**必须用真实请求证明 ——
+//   修复前实测：评委连打 40 次评分 → 状态直方图 { '200': 40 } ⇒ 一个 429 都没有。
+// ══════════════════════════════════════════════════════════════════
+
+/**
+ * 造一个「能打分」的最小现场：届期 + 出题企业 + 任务包 + 队伍 + 赛段 + 评委。
+ * 返回评委的 session cookie 与打分所需的 stageId / teamId。
+ * ⚠️ 造**两个**评委：正对照要用（限频必须按评委分 subject，不能一刀切全站皆禁）。
+ */
+function seedJudgeStage(db) {
+  const NOW = '2026-10-23T12:00:00.000Z';
+  const edition = createEdition(db, {
+    name: '限频现场 · 上海', city: '上海', startsAt: '2026-10-01', endsAt: '2026-11-30', now: NOW,
+  });
+  const enterprise = createUser(db, { name: '出题企业', phone: '13900008801', password: 'pw' });
+  const judge = createUser(db, { name: '评委甲', phone: '13900008802', password: 'pw' });
+  const judge2 = createUser(db, { name: '评委乙', phone: '13900008804', password: 'pw' });
+  insertCapability(db, 'score:write', '写入评分');
+  for (const u of [judge, judge2]) {
+    grantAssignment(db, {
+      userId: u.id, capability: 'score:write', scopeType: 'global', scopeId: null, grantedBy: enterprise.id,
+    });
+  }
+  const pkg = createTaskPackage(db, {
+    editionId: edition.id, enterpriseId: enterprise.id, enterpriseName: '某某企业',
+    title: '库存周转', painPoint: '门店库存周转慢',
+    expectedDelivery: '可运行的排产原型', acceptanceCriteria: '能给出周转天数下降的测算',
+    submittedBy: enterprise.id, now: NOW,
+  });
+  const team = insertTeam(db, {
+    editionId: edition.id, name: '一队', captainId: judge.id, taskPackageId: pkg.id, status: 'active', now: NOW,
+  });
+  const stage = insertStage(db, {
+    editionId: edition.id, key: 's1', name: '初赛', kind: 'initial',
+    startsAt: '2026-10-01', endsAt: '2026-10-10', scoringConfigKey: 'initial', status: 'open', now: NOW,
+  });
+  assignStageJudge(db, { stageId: stage.id, userId: judge.id, seat: 'judge', now: NOW });
+  assignStageJudge(db, { stageId: stage.id, userId: judge2.id, seat: 'judge', now: NOW });
+  return {
+    stageId: stage.id,
+    teamId: team.id,
+    cookie: `hk_session=${createSession(db, judge.id).token}`,
+    cookie2: `hk_session=${createSession(db, judge2.id).token}`,
+  };
+}
+
+test('F4 评审提交端点必须真的限频（连打必须出现 429，不能全是 200）', async () => {
+  const { rules } = loadRules(rulesDir);
+  const profile = rules.audit.rateLimit.reviewSubmit;
+  const max = profile.sliding.max;
+  await withServer(async ({ base, db }) => {
+    const { stageId, teamId, cookie, cookie2 } = seedJudgeStage(db);
+    const statuses = [];
+    let last = null;
+    for (let i = 0; i < max + 5; i += 1) {
+      const res = await call(base, 'POST', `/api/stages/${stageId}/reviews`, {
+        cookie,
+        body: { items: [{ teamId, dimension: 'innovation', rawScore: 80 }] },
+      });
+      statuses.push(res.status);
+      last = res;
+    }
+    // 修复前：40 次连打全部 200（实测「一个 429 都没有 ⇒ 限频根本没生效」）
+    assert.ok(
+      statuses.includes(429),
+      `连打 ${max + 5} 次必须出现 429（限频没生效）：${statuses.join(',')}`,
+    );
+    assert.equal(
+      statuses[max], 429,
+      `第 ${max + 1} 次必须被限频（滑动窗口 ${max}/${profile.sliding.seconds}s）：${statuses.join(',')}`,
+    );
+    assert.equal(JSON.parse(last.text).error.code, 'RATE_LIMITED');
+    assert.ok(
+      last.headers['retry-after'],
+      '429 必须带 Retry-After 头（限频触发要告诉调用方等多久，不静默丢包）',
+    );
+    // ⛔ 正对照：限频是**按评委**算的（subject = 评委 id）——
+    //    别的评委必须照常提交。若这里也 429，说明限频接成了「全局一刀切」。
+    const other = await call(base, 'POST', `/api/stages/${stageId}/reviews`, {
+      cookie: cookie2,
+      body: { items: [{ teamId, dimension: 'innovation', rawScore: 80 }] },
+    });
+    assert.equal(other.status, 200, `别的评委必须照常提交（限频按评委分 subject）：${other.text}`);
+  });
+});
+
+test('F4 登录端点必须真的限频（连续错误口令必须出现 429）', async () => {
+  const { rules } = loadRules(rulesDir);
+  const max = rules.audit.rateLimit.loginAttempt.sliding.max;
+  await withServer(async ({ base, db }) => {
+    const phone = '13900008803';
+    createUser(db, { name: '爆破目标', phone, password: 'right-password' });
+    // ⛔ 正对照先跑：**成功**的登录不消耗配额
+    //    （否则正常用户多设备/多标签页反复登录会被自己的配额挡住 —— 那是误伤）
+    for (let i = 0; i < max + 3; i += 1) {
+      const ok = await call(base, 'POST', '/api/auth/login', { body: { phone, password: 'right-password' } });
+      assert.equal(ok.status, 200, `第 ${i + 1} 次正确登录必须成功（成功不消耗限频配额）：${ok.text}`);
+    }
+    const statuses = [];
+    let last = null;
+    for (let i = 0; i < max + 5; i += 1) {
+      const res = await call(base, 'POST', '/api/auth/login', { body: { phone, password: 'wrong-password' } });
+      statuses.push(res.status);
+      last = res;
+    }
+    // 修复前：30 次错误口令全部 401、零 429 ⇒ 可无限爆破
+    assert.ok(
+      statuses.includes(429),
+      `连续 ${max + 5} 次错误口令必须出现 429（登录端点完全无限频）：${statuses.join(',')}`,
+    );
+    assert.equal(
+      statuses[max], 429,
+      `第 ${max + 1} 次错误口令必须被限频（滑动窗口 ${max}/60s）：${statuses.join(',')}`,
+    );
+    assert.equal(JSON.parse(last.text).error.code, 'RATE_LIMITED');
+    assert.ok(last.headers['retry-after'], '429 必须带 Retry-After 头');
+  });
 });
 
 // ══════════════════════════════════════════════════════════════════

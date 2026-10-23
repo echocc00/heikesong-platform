@@ -644,6 +644,11 @@ export function validateRules(rules, expectedCount = null) {
         if (layer === 'lock' && !(Number.isInteger(l.seconds) && l.seconds > 0)) {
           errors.push(`audit.rateLimit.${name}.lock.seconds 必须是正整数`);
         }
+        // ⚠️ lock.mode 必须显式合法：cooldown（冷却锁）/ mutex（互斥锁）。
+        //    漏配 ⇒ 服务层按默认走，配置与行为对不上 ⇒ 「配置在说谎」的老毛病。
+        if (layer === 'lock' && !['cooldown', 'mutex'].includes(l.mode)) {
+          errors.push(`audit.rateLimit.${name}.lock.mode 必须是 cooldown 或 mutex（当前：${JSON.stringify(l.mode)}）`);
+        }
         if (layer !== 'lock' && !(Number.isInteger(l.max) && l.max > 0)) {
           errors.push(`audit.rateLimit.${name}.${layer}.max 必须是正整数`);
         }

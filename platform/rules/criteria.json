@@ -1,6 +1,6 @@
 {
   "id": "criteria",
-  "version": "2026-10-20",
+  "version": "2026-10-23",
   "source": "S10 §2.2 段位表附加条件 + R-PTS-03 + R-STG-04 + R-PTS-10 + 任务书 §七（MVP 口径待确认）",
   "tier": {
     "dataOrPrototypeMilestones": ["data_connected", "demo_ready"],

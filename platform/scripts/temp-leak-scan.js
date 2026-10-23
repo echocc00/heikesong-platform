@@ -29,7 +29,7 @@
 //   node scripts/temp-leak-scan.js --json
 //   node scripts/temp-leak-scan.js --run          附带动态差分检查
 //   node scripts/temp-leak-scan.js --run --clean  动态检查并清掉本次新出现的残留
-import { readFileSync, readdirSync, statSync, existsSync, rmSync } from 'node:fs';
+import { readFileSync, readdirSync, statSync, existsSync, rmSync, realpathSync } from 'node:fs';
 import { join, relative, dirname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
@@ -197,6 +197,17 @@ export function main(argv = []) {
   return ok ? 0 : 1;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+// ⚠️ 必须按 realpath 比较（照抄 scripts/audit-scan.js 的同款修法，E166 同款病根）：
+//    ① 原写法 `import.meta.url === \`file://${process.argv[1]}\`` 在路径**含空格**时恒不等
+//       （import.meta.url 里的空格被百分号编码成 %20，而 argv[1] 是原始空格）
+//       ⇒ 闸**静默不跑、退出码 0**（假绿）；
+//    ② 经**软链**调用时同理恒不等（import.meta.url 指向真实文件，argv[1] 是软链本身）。
+//    一道发布闸「静默通过」是最坏的失败模式。
+function realPathOrSelf(p) {
+  try { return realpathSync(p); } catch { return p; }
+}
+const isMain = process.argv[1]
+  && realPathOrSelf(process.argv[1]) === realPathOrSelf(fileURLToPath(import.meta.url));
+if (isMain) {
   process.exit(main(process.argv.slice(2)));
 }

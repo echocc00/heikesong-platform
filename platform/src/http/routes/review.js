@@ -42,6 +42,7 @@ import { reviewEvents } from '../sse.js';
 import { getStage, getStageJudge, listStageTeams } from '../../db/repo/stages.js';
 import { getTeamWithPackage } from '../../db/repo/teams.js';
 import { listActiveMembers } from '../../db/repo/teamMembers.js';
+import { assertRateLimit } from '../../services/rate-limit.js';
 import { loadOptionalModule } from '../optional-module.js';
 import { fileURLToPath } from 'node:url';
 
@@ -161,25 +162,55 @@ export function registerReviewRoutes(router) {
     //    否则评委能对 seat='self' 的维度打分 → 自评栏被评委占掉。
     const items = ctx.body?.items ?? [];
     assertJudgeDimensions(ctx, items);
-    const result = await submitReviews({
+    // ⚠️ 限频（F4）：reviewSubmit / judgeHourly 两个 profile 在 rules/audit.json 里
+    //    配着，却**从来没有生产代码引用** ⇒ 评审提交端点完全无限频（实测连打 40 次全 200）。
+    //    按评委 id 分 subject：评委之间互不影响，评委自己的提交节奏受限。
+    //    ⛔ 触发即 429 + Retry-After，不静默丢包（server.js 的错误分支统一加头）。
+    //
+    // ⚠️⚠️ 提交锁在评分路径上按**互斥**用（请求结束即释放），不是冷却：
+    //    评委「改分」是**先后两次**提交（第一次 80 分、第二次改成 85 分），
+    //    冷却锁会把第二次挡成 429 ⇒「改分必须把旧分写进审计」这条平台核心契约直接失效。
+    //    互斥锁挡的是「**同时**在跑」的两笔提交 —— 那才是要防的灌分。
+    //    失败也释放（finally）⇒ 一次格式错误不会把评委锁死 5 秒。
+    const reviewLimit = assertRateLimit({
       db: ctx.db,
-      stageId: ctx.params.stageId,
-      judgeId: ctx.user.id,
-      items,
-      requestId: ctx.body?.requestId ?? null,
+      subjectKey: `judge:${ctx.user.id}`,
+      rule: 'reviewSubmit',
       now: new Date().toISOString(),
+      limits: ctx.rules?.audit?.rateLimit,
+      subjects: { default: `judge:${ctx.user.id}` },
     });
-    // 评审进度推送：订阅同一赛段的评审端据此刷新进度条。
-    // ⚠️ 发布点在 **HTTP 层**（不是 service 层）：service 不该知道 HTTP 的存在。
-    // ⚠️ **载荷不含 judgeId**（D-37）：事件流里带「谁在什么时候提交了评分」，
-    //    等于把评委行踪广播给该赛段的每个订阅者。事件只作为**信号**，
-    //    客户端收到后重新拉 `review-state` —— 可见性由那一层按观众过滤。
-    reviewEvents.publish(
-      'review.progress',
-      { stageId: ctx.params.stageId, at: new Date().toISOString() },
-      `stage:${ctx.params.stageId}`,
-    );
-    return result;
+    try {
+      assertRateLimit({
+        db: ctx.db,
+        subjectKey: `judge:${ctx.user.id}`,
+        rule: 'judgeHourly',
+        now: new Date().toISOString(),
+        limits: ctx.rules?.audit?.rateLimit,
+        subjects: { default: `judge:${ctx.user.id}` },
+      });
+      const result = await submitReviews({
+        db: ctx.db,
+        stageId: ctx.params.stageId,
+        judgeId: ctx.user.id,
+        items,
+        requestId: ctx.body?.requestId ?? null,
+        now: new Date().toISOString(),
+      });
+      // 评审进度推送：订阅同一赛段的评审端据此刷新进度条。
+      // ⚠️ 发布点在 **HTTP 层**（不是 service 层）：service 不该知道 HTTP 的存在。
+      // ⚠️ **载荷不含 judgeId**（D-37）：事件流里带「谁在什么时候提交了评分」，
+      //    等于把评委行踪广播给该赛段的每个订阅者。事件只作为**信号**，
+      //    客户端收到后重新拉 `review-state` —— 可见性由那一层按观众过滤。
+      reviewEvents.publish(
+        'review.progress',
+        { stageId: ctx.params.stageId, at: new Date().toISOString() },
+        `stage:${ctx.params.stageId}`,
+      );
+      return result;
+    } finally {
+      reviewLimit.release?.();
+    }
   });
 
   router.add('GET', '/api/stages/:stageId/review-state', async (ctx) => {

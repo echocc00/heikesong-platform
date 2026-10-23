@@ -1,6 +1,6 @@
 {
   "id": "registration",
-  "version": "2026-10-20",
+  "version": "2026-10-23",
   "source": "SABC v1 §二 3 维画像筛选 + §六 待补 1 问卷字段设计",
   "scale": { "min": 1, "max": 5, "scoreMax": 100 },
   "dimensions": [

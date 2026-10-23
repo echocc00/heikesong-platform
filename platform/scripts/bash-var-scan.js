@@ -21,7 +21,7 @@
 // ⚠️ 闸的自我要求：扫描器必须能判**已知坏输入**为违规（防「一条都不判违规」的假绿）。
 //   ⇒ 自检里内置一组正反样本，判定不符就退出码 2。
 
-import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { readdirSync, readFileSync, statSync, realpathSync } from 'node:fs';
 import { join, dirname, relative, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -84,7 +84,16 @@ function selfTest() {
 
 // ⚠️ 顶层 CLI 必须在「作为主程序运行时」才执行 —— 否则测试 import 这个模块时
 //    整个闸会跟着跑一遍并 process.exit，测试就 import 不到函数了。
-const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+//
+// ⚠️ 必须按 realpath 比较（照抄 scripts/audit-scan.js 的同款修法，E166 同款病根）：
+//    经**软链**调用时，import.meta.url 指向**真实文件**，process.argv[1] 是**软链本身**
+//    ⇒ 裸字符串比较恒不等 ⇒ 闸**静默不跑、退出码 0**（假绿）。
+//    一道发布闸「静默通过」是最坏的失败模式。
+function realPathOrSelf(p) {
+  try { return realpathSync(p); } catch { return p; }
+}
+const isMain = process.argv[1]
+  && realPathOrSelf(process.argv[1]) === realPathOrSelf(fileURLToPath(import.meta.url));
 
 function runCli(argv) {
 const args = argv.slice(0);

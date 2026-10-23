@@ -66,3 +66,23 @@ export function acquireLock(db, { subjectKey, rule, now = new Date().toISOString
   if (upd.changes === 1) return { acquired: true, retryAfterSeconds: 0 };
   return { acquired: false, retryAfterSeconds: Math.max(1, lockSeconds) };
 }
+
+/**
+ * 释放提交锁（**互斥语义**）：把锁行删掉 ⇒ 下一次可以立刻重新获取。
+ *
+ * 为什么要它：`acquireLock` 原本是**冷却锁**（拿到后 5 秒内谁都拿不到）。
+ * 冷却锁对「申诉」是对的（5 秒内重复申诉 = 刷申诉），
+ * 但对「评分提交」是错的 —— 评委改分是**先后两次**提交，
+ * 冷却锁会把「改分」挡成 429 ⇒ 平台最核心的「改分必须留痕」契约直接失效。
+ *
+ * ⇒ 评分路径改成**互斥**：锁只在请求处理期间存在，
+ *   挡的是「**同时**在跑」的两笔提交，挡不住「先后两次」。
+ *   请求结束（无论成功还是失败）即释放 ⇒ 失败也不把评委锁死 5 秒。
+ *   `lock.seconds` 退化为**崩溃兜底 TTL**：进程被 kill 时锁不会永远留着。
+ */
+export function releaseLock(db, { subjectKey, rule }) {
+  const r = db.prepare(
+    'DELETE FROM rate_limit_events WHERE subject_key = ? AND rule = ? AND bucket = ?',
+  ).run(subjectKey, rule, 'lock');
+  return r.changes;
+}

@@ -4007,10 +4007,10 @@ Expected: FAIL —— `Cannot find module '../src/services/pools.js'`
 
 - [ ] **Step 3: 创建 `rules/pools.json`**
 
-```json
+```javascript
 {
   "id": "pools",
-  "version": "2026-10-20",
+  "version": "2026-10-23",
   "source": "任务书 §九 三池沉淀 + §二 增长飞轮闭环 + S10 §3.3 个人积分终生上榜（R-RNK-10）+ S10 §3.4 反作弊第 3 条",
   "packageStatusFilter": [],
   "talentTotalScope": "lifetime",

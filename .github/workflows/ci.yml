@@ -40,6 +40,104 @@ jobs:
         working-directory: platform
         run: node --disable-warning=ExperimentalWarning scripts/build-demo.js
 
+  # ⛔ F6 修：发布前必须真跑**全部 5 道机器闸**。
+  #    修复前 CI 只调了 plan-block-audit 一道，另外 4 道在仓库里存在且能跑，
+  #    但**根本没被 CI 引用** ⇒ 闸门形同不存在。
+  #    ⛔ 为什么也要跑在**最低支持版本**上：闸脚本一旦在旧 Node 上「静默不跑、退出 0」
+  #    （E166 就是这一类：import.meta.main 在 22.16/22.17 上恒假），
+  #    单档 CI 根本发现不了 —— 必须三档都跑。
+  release-gates:
+    name: 发布闸（Node ${{ matrix.node }}）
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22.16.0', '22.x', '24.x']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      # 先构建演示站：证据链扫描闸还要扫**发布产物** platform/web/dist/（存在才扫）。
+      - name: 构建演示站
+        working-directory: platform
+        run: node --disable-warning=ExperimentalWarning scripts/build-demo.js
+
+      # ⚠️ 每道闸都带两道护栏：
+      #    ① 「退出码非 0 ⇒ 报错」—— 闸真的发现了问题；
+      #    ② 「输出为空 ⇒ 报错」—— 闸**静默不跑**（什么都不做、退出 0）。
+      #       在 CI 眼里，「静默通过」与「通过了」完全一样（假绿），
+      #       而静默放行是发布闸最坏的失败模式。
+      #    ⚠️ GitHub Actions 的默认 shell 是 `bash -eo pipefail`：
+      #    命令替换里若命令非 0 退出，`set -e` 会**当场掐断整个步骤**、
+      #    后面的诊断分支根本走不到 ⇒ 必须先 `set +e` 取退出码再判。
+      - name: 证据链扫描闸
+        run: |
+          set +e
+          OUT="$(node --disable-warning=ExperimentalWarning platform/scripts/audit-scan.js)"
+          CODE=$?
+          set -e
+          echo "$OUT"
+          if [ "$CODE" -ne 0 ]; then
+            echo "::error::证据链扫描闸未通过（退出码 $CODE）"
+            exit 1
+          fi
+          if [ -z "$OUT" ]; then
+            echo "::error::证据链扫描闸没有任何输出 —— 闸静默失效（假绿）"
+            exit 1
+          fi
+
+      - name: 临时目录泄漏闸
+        run: |
+          set +e
+          OUT="$(node --disable-warning=ExperimentalWarning platform/scripts/temp-leak-scan.js)"
+          CODE=$?
+          set -e
+          echo "$OUT"
+          if [ "$CODE" -ne 0 ]; then
+            echo "::error::临时目录泄漏闸未通过（退出码 $CODE）"
+            exit 1
+          fi
+          if [ -z "$OUT" ]; then
+            echo "::error::临时目录泄漏闸没有任何输出 —— 闸静默失效（假绿）"
+            exit 1
+          fi
+
+      - name: shell 变量闸
+        run: |
+          set +e
+          OUT="$(node --disable-warning=ExperimentalWarning platform/scripts/bash-var-scan.js)"
+          CODE=$?
+          set -e
+          echo "$OUT"
+          if [ "$CODE" -ne 0 ]; then
+            echo "::error::shell 变量闸未通过（退出码 $CODE）"
+            exit 1
+          fi
+          if [ -z "$OUT" ]; then
+            echo "::error::shell 变量闸没有任何输出 —— 闸静默失效（假绿）"
+            exit 1
+          fi
+
+      - name: 死服务扫描闸
+        run: |
+          set +e
+          OUT="$(node --disable-warning=ExperimentalWarning docs/tools/dead-service-scan.mjs platform)"
+          CODE=$?
+          set -e
+          echo "$OUT"
+          if [ "$CODE" -ne 0 ]; then
+            echo "::error::死服务扫描闸未通过（退出码 $CODE）"
+            exit 1
+          fi
+          if [ -z "$OUT" ]; then
+            echo "::error::死服务扫描闸没有任何输出 —— 闸静默失效（假绿）"
+            exit 1
+          fi
+
   plan-sync:
     name: 计划块漂移闸
     runs-on: ubuntu-latest
@@ -57,8 +155,17 @@ jobs:
           OUT="$(node docs/tools/plan-block-audit.mjs platform)"
           echo "$OUT"
           # 从汇总行里取 C-RW 计数，非 0 即失败（真漂移 ⇒ 计划块必须同步到当前实现）
-          RW="$(echo "$OUT" | grep -oE 'C-RW\(真重写·需同步\) [0-9]+' | grep -oE '[0-9]+$')"
-          if [ "${RW:-0}" != "0" ]; then
+          # ⛔ 提取为空**必须报错**：原来写的是 ${RW:-0} —— grep 没匹配上时 RW 是空串，
+          #    被当成 0 ⇒ 静默放行（闸门假绿）。
+          #    「提取失败」与「真的没有漂移」必须区分开。
+          # ⚠️ GitHub Actions 的默认 shell 带 `-e -o pipefail`：grep 没匹配上时整条管道非 0，
+          #    会让命令替换当场掐断这一步 ⇒ 必须显式吞掉 grep 的失败退出码。
+          RW="$(echo "$OUT" | grep -oE 'C-RW\(真重写·需同步\) [0-9]+' | grep -oE '[0-9]+$' || true)"
+          if [ -z "$RW" ]; then
+            echo "::error::计划块漂移闸的输出里读不到 C-RW 计数 —— 提取失败必须报错，不得按 0 放行"
+            exit 1
+          fi
+          if [ "$RW" != "0" ]; then
             echo "::error::计划块真漂移 C-RW=$RW —— 计划块必须同步到当前实现"
             exit 1
           fi

@@ -4,9 +4,27 @@
 //   溯源：R-AUD-05 空结果必须显式报错 —— 限频触发必须返回 429 + retryAfterSeconds，⛔ 绝不静默丢包。
 //   ⛔ 计数落 rate_limit_events 表：只在内存计数 = 进程重启即失效 = 等于没有限频。
 import {
-  countBucket, incrementBucket, slidingWindowCount, slidingWindowEvents, acquireLock,
+  countBucket, incrementBucket, slidingWindowCount, slidingWindowEvents, acquireLock, releaseLock,
 } from '../db/repo/rate-limit.js';
 import { appError, rateLimited } from '../errors.js';
+import { createHash } from 'node:crypto';
+
+/**
+ * 登录限频的 subject key = 手机号的哈希。
+ *
+ * ⚠️ 为什么存哈希、不存明文手机号：限频计数落在 `rate_limit_events` 表，
+ *    那张表会进数据库文件、进备份 ⇒ 存明文等于把手机号复制到第二张表里，
+ *    没必要扩大暴露面。
+ * ⚠️ 为什么按**手机号**限频、而不是按 IP：ctx 上**没有可信的客户端 IP**
+ *    （服务可能挂在 nginx 后面，x-forwarded-for 由客户端随便填）。
+ *    按账号限频挡的是「爆破某一个账号的口令」—— 审计实测的就是这个场景
+ *    （30 次错误口令全部 401、零 429）。
+ * ⚠️ 已知缺口：同一 IP 换着账号喷（credential stuffing）挡不住 ——
+ *    那需要可信的客户端 IP，属于部署形态问题，不在本次缺陷修复范围内。
+ */
+export function loginSubjectKey(phone) {
+  return `login:${createHash('sha256').update(String(phone ?? '')).digest('hex').slice(0, 16)}`;
+}
 
 function bucketKey(kind, ms, unit) {
   return `${kind}:${Math.floor(ms / unit)}`;
@@ -95,6 +113,15 @@ export function checkRateLimit({
   }
 
   // ── 取提交锁（防并发灌分）──────────────────────────────
+  // ⚠️ 锁有两种语义，由**配置**决定（rules/audit.json 的 lock.mode）：
+  //    · cooldown（默认）：拿到后 N 秒内谁都拿不到 —— 适合「申诉」这种
+  //      短时间内重复提交本身就是滥用的场景。
+  //    · mutex：锁只在**本次请求处理期间**存在，请求结束即释放 ——
+  //      挡的是「**同时**在跑」的两笔提交，挡不住「先后两次」。
+  //      ⚠️ 评分路径必须用 mutex：评委「改分」是先后两次提交，
+  //        冷却锁会把第二次挡成 429 ⇒「改分必须把旧分写进审计」这条核心契约直接失效。
+  //    `release` 句柄只在 mutex 语义下给出；cooldown 语义下为 null（调用方 `?.()` 即可）。
+  let release = null;
   if (profile.lock) {
     const key = subjectOf(profile.lock);
     const lock = acquireLock(db, {
@@ -102,9 +129,12 @@ export function checkRateLimit({
     });
     if (!lock.acquired) {
       layers.push({ layer: 'lock', allowed: false, retryAfterSeconds: lock.retryAfterSeconds });
-      return { allowed: false, remaining: 0, retryAfterSeconds: lock.retryAfterSeconds, layers };
+      return { allowed: false, remaining: 0, retryAfterSeconds: lock.retryAfterSeconds, layers, release: null };
     }
     layers.push({ layer: 'lock', allowed: true, retryAfterSeconds: 0 });
+    if ((profile.lock.mode ?? 'cooldown') === 'mutex') {
+      release = () => releaseLock(db, { subjectKey: key, rule: `lock:${rule}` });
+    }
   }
 
   // ── 消耗配额（落库）────────────────────────────────────
@@ -131,7 +161,7 @@ export function checkRateLimit({
     ? Math.min(...layers.filter((l) => Number.isInteger(l.max)).map((l) => Math.max(0, l.max - l.count - 1)))
     : 0;
 
-  return { allowed: true, remaining, retryAfterSeconds: 0, layers };
+  return { allowed: true, remaining, retryAfterSeconds: 0, layers, release };
 }
 
 // 滑动窗口的等待时间：等到窗口内最早的若干次记录滑出窗口，才腾得出一个名额。
