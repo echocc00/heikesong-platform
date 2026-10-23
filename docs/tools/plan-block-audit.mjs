@@ -23,7 +23,8 @@
 // 用法： node docs/tools/plan-block-audit.mjs platform
 //   node docs/tools/plan-block-audit.mjs --selftest   （自检：正则与归因是否正确）
 import { readFileSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join, dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 // ── 扩展名白名单 ──────────────────────────────────────────────────────
 // ⛔ **顺序敏感**：`(?:js|html|css|sql|json)` 里 `js` 排在 `json` 前面，
@@ -114,8 +115,16 @@ export function resolveImplPath(platformDir, rel) {
 // ⚠️ 主流程（读计划、比对实现、打印清单）**只在直接运行时执行**。
 //    否则 `import { extractPath } from '...plan-block-audit.mjs'`（回归测试要用）
 //    会在 import 时就去读相对路径下的计划文件 ⇒ cwd 不对就直接抛错。
-//    `import.meta.main`：Node ≥ 20.11 提供的「本文件是否为主入口」标志。
-if (import.meta.main) {
+// ⛔ **`import.meta.main` 不是所有「声明支持」的版本都有**：它**新增于 v24.2.0 / v22.18.0**
+//    （实测：Node 22.16.0 上它是 `undefined`），而本仓 `engines` 写的是 `node >= 22.16.0`
+//    ⇒ 在 22.16 / 22.17 上 `if (import.meta.main)` **恒假** ⇒ 整个审计**静默不跑**、
+//    退出码仍是 0 ⇒ **假绿**（正是这个工具自己要防的那种假绿）。
+//    真实后果：CI 的 Node 22.16.0 档上漂移闸形同虚设；本仓 3 个回归用例因此变红
+//    （`platform/test/plan-block-audit.test.js`：读不到汇总行 ⇒ `match(...)` 返回 null ⇒ TypeError）。
+// ⇒ 兜底用 argv[1] 比对（与同目录 `dead-service-scan.mjs` 同一套写法）⇒ 任何版本都真跑。
+const IS_MAIN = import.meta.main === true
+  || (typeof process.argv[1] === 'string' && resolve(process.argv[1]) === fileURLToPath(import.meta.url));
+if (IS_MAIN) {
 const platformDir = process.argv[2] || 'platform';
 const best = new Map();  // rel → {phase, open, body, lang}
 for (const [pn, p] of PLANS) {

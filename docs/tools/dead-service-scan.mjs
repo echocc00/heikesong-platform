@@ -1359,7 +1359,7 @@ export function main(argv) {
 }
 
 // ⚠️ 主流程只在**直接运行时**执行 ⇒ 回归测试可以 `import { scanPlatform }` 而不触发扫描。
-//    `import.meta.main`（Node ≥ 22.16）；老版本上兜底用 argv[1] 比对，避免静默不跑。
+//    `import.meta.main`（**新增于 v24.2.0 / v22.18.0**；22.16/22.17 上是 undefined）；老版本上兜底用 argv[1] 比对，避免静默不跑。
 const IS_MAIN = import.meta.main === true
   || (typeof process.argv[1] === 'string' && resolve(process.argv[1]) === fileURLToPath(import.meta.url));
 if (IS_MAIN) {
