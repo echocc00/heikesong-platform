@@ -23,6 +23,66 @@ export function getStage(db, id) {
   return db.prepare('SELECT * FROM stages WHERE id = ?').get(id) ?? null;
 }
 
+/**
+ * 改赛段配置（**逆向路径**：改配置）。
+ *
+ * ⚠️ 为什么没有 `updated_at` 列：`stages` 表（003_review.sql）**只有** created 语义上的
+ *    「赛段本身不是行为表」这一口径 —— 详见 insertStage 的注释。
+ *    ⇒「什么时候改的」由 `audit_log` 的 `stage.update` 承担（可复算，见设计文档 §12），
+ *      **不在 stages 表上另开一列**（那会让「表结构 = 事实」这条口径分叉）。
+ *
+ * ⛔ **只改这五项**：name / starts_at / ends_at / freeze_at / scoring_config_key。
+ *    `id` / `edition_id` / `key` / `kind` / `status` **不可改**：
+ *    · key 与 edition 变了 = 这个赛段「变成另一个赛段」⇒ 历史评分全部张冠李戴；
+ *    · kind 变了 = 权重表与席构成的语义变了（同上）；
+ *    · status 的迁移（draft → open → frozen → computed）是**独立的动作**，
+ *      不塞进「改配置」里（那会让「改个名字」顺手把赛段开闸了）。
+ *
+ * @param {*} db
+ * @param {string} id 赛段 id
+ * @param {string|null} [name] 传 undefined = 不改；传 null = 清空（本表这几列都不允许 null，调用方保证）
+ * @returns {object} 改完后的赛段行
+ */
+export function updateStageConfig(db, {
+  id, name, startsAt, endsAt, freezeAt, scoringConfigKey,
+}) {
+  const sets = [];
+  const params = [];
+  // ⚠️ 用 `undefined` 判「有没有传」而不是 `null`：
+  //    freeze_at 允许为 null（未设冻结时间），传 null 是「清空」而不是「不改」。
+  const put = (col, val) => {
+    if (val === undefined) return;
+    sets.push(`${col} = ?`);
+    params.push(val);
+  };
+  put('name', name);
+  put('starts_at', startsAt);
+  put('ends_at', endsAt);
+  put('freeze_at', freezeAt);
+  put('scoring_config_key', scoringConfigKey);
+  if (!sets.length) return getStage(db, id);
+  params.push(id);
+  db.prepare(`UPDATE stages SET ${sets.join(', ')} WHERE id = ?`).run(...params);
+  return getStage(db, id);
+}
+
+/**
+ * 撤掉一个评委席（**逆向路径**：撤评委）。
+ *
+ * ⚠️ **只删 stage_judges 一行，不删 conflict_declarations**：
+ *    利益冲突声明是「事前签署」的历史事实（R-JDG-17：赛后 6 个月可查），
+ *    撤席不等于「这份声明没发生过」⇒ 删掉它就是篡改审计证据。
+ *    （声明表对 stage_judges 没有外键 ⇒ 留着不会孤儿。）
+ *
+ * @returns {number} 实际删除的行数（0 = 本来就没分配）
+ */
+export function removeStageJudgeRow(db, { stageId, userId }) {
+  const res = db
+    .prepare('DELETE FROM stage_judges WHERE stage_id = ? AND user_id = ?')
+    .run(stageId, userId);
+  return Number(res?.changes ?? 0);
+}
+
 export function listStages(db, { editionId } = {}) {
   if (editionId) return db.prepare('SELECT * FROM stages WHERE edition_id = ? ORDER BY starts_at').all(editionId);
   return db.prepare('SELECT * FROM stages ORDER BY starts_at').all();

@@ -126,6 +126,8 @@ test('★ 演示版适配器：段位榜分支必须排在赛段榜分支之前'
   const { rules } = loadRules(join(here, '..', 'rules'));
   const { createDemoApi } = await import('../web/api.demo.js');
   const api = createDemoApi({ storage, seed, rules });
+  // ⚠️ P11：演示站的 compute 与正式站**同口径** —— 都要先登录
+  await api.post('/api/auth/login', { name: '演示管理员' });
   await api.post('/api/stages/stage_final/compute', {});
 
   const tier = await api.get('/api/leaderboard/tier');

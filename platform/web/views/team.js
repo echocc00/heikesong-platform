@@ -11,6 +11,7 @@
 //   ⑥ 组队表单走 .field / .input / .select 体系，**空队名本地拦下**（不发无谓请求）；
 //   ⑦ 建队 / 退出后**就地刷新列表**，不再 location.reload()（整页刷新会冲掉用户输入）。
 import { escapeHtml } from '../escape.js';
+import { iconDot } from '../icons.js';
 import {
   badge, emptyRow, emptyState, errorState, loadingState, noticeState,
   pageHead, panel, statRow, tableWrap,
@@ -158,6 +159,85 @@ export function buildTeamList(teams, viewerId) {
   return `<div class="stack">${buildTeamCards(teams, viewerId).join('')}</div>`;
 }
 
+/**
+ * 段位与权益（纯函数）。
+ * ⛔ P11：设计文档 §9 明写「段位与权益」是选手视角的一块界面，
+ *    而 `GET /api/teams/:id/tier` 这个端点**早就存在**却**前端从不调用** ⇒ 段位权益永远看不见。
+ * @param {object|null} tier GET /api/teams/:id/tier 的返回
+ */
+export function renderTeamTierHtml(tier) {
+  if (!tier) {
+    return emptyState({
+      title: '还没有段位记录',
+      hint: '队伍完成里程碑并经企业确认后，段位会在发榜时出现在这里。',
+    });
+  }
+  const benefits = Array.isArray(tier.benefits) ? tier.benefits : [];
+  const neverUnlocks = Array.isArray(tier.neverUnlocks) ? tier.neverUnlocks : [];
+  const reasons = Array.isArray(tier.reasons) ? tier.reasons : [];
+  const milestones = Array.isArray(tier.progress?.milestones) ? tier.progress.milestones : [];
+  return `
+    <div class="row">
+      ${badge(tier.tier ?? 'D', 'brand')}
+      ${badge(tier.tierName ?? '—', 'info')}
+      ${badge(`已计分里程碑 ${tier.milestoneCount ?? '—'} 项`, 'neutral')}
+    </div>
+    ${benefits.length
+      ? `<h3 class="section-title">已解锁的权益</h3>
+         <ul class="milestones">${benefits.map((b) => `<li class="todo"><span class="mark">${iconDot(14)}</span><span>${escapeHtml(b)}</span></li>`).join('')}</ul>`
+      : `<p class="muted small">当前段位还没有解锁任何权益。</p>`}
+    ${neverUnlocks.length
+      ? noticeState({
+        tone: 'info',
+        title: '不解锁的权益',
+        items: neverUnlocks,
+        list: true,
+      })
+      : ''}
+    ${reasons.length
+      ? noticeState({ tone: 'info', title: '段位原因', items: reasons.map((r) => String(r)), list: true })
+      : ''}
+    ${milestones.length
+      ? `<h3 class="section-title">里程碑</h3>
+         <ul class="milestones">${milestones.map((m) => `<li class="todo"><span class="mark">${iconDot(14)}</span><span>${escapeHtml(m.label ?? m.key)}</span></li>`).join('')}</ul>`
+      : ''}`;
+}
+
+/**
+ * 行为分提交表单（纯函数）。
+ * ⛔ P11：`POST /api/teams/:id/behavior-events` 这个写端点**前端从不调用**
+ *    ⇒ rules/behavior-points.json 的五类事件**一条都采不到** ⇒ 行为分永远是 0
+ *    ⇒ 破同分链的最后一级（行为分）恒为 0 ⇒ 这一级形同虚设。
+ * ⚠️ 事件清单**来自服务端**（GET /api/event-info 的 behaviorEvents）⇒ 前端不硬编码赛制数字。
+ * @param {Array<object>} events 服务端给的行为事件定义
+ */
+export function renderBehaviorFormHtml(events) {
+  const list = Array.isArray(events) ? events : [];
+  if (!list.length) {
+    return emptyState({
+      title: '没有可提交的行为事件',
+      hint: '行为事件清单来自服务端规则（rules/behavior-points.json），没有配置就是没有。',
+    });
+  }
+  const options = list
+    .map((e) => `<option value="${escapeHtml(e.key)}">${escapeHtml(e.label ?? e.key)}（${escapeHtml(e.points ?? '—')} 分）</option>`)
+    .join('');
+  return `
+    <div class="field">
+      <label class="field__label" for="behavior-type">事件类型</label>
+      <select class="select" id="behavior-type" data-behavior="type">${options}</select>
+    </div>
+    <div class="field field--required">
+      <label class="field__label" for="behavior-evidence">证据（可运行链接 / 阻塞点 / 会议纪要）</label>
+      <textarea class="textarea" id="behavior-evidence" rows="3" data-behavior="evidence"></textarea>
+      <p class="field__hint">证据不合规不予计分（服务端用同一套口径校验）。</p>
+    </div>
+    <div class="row">
+      <button type="button" class="btn btn--primary" data-action="behavior-submit">提交行为记录</button>
+    </div>
+    <div class="form-feedback" data-feedback="behavior"></div>`;
+}
+
 export function renderTeam(ctx) {
   const wrap = document.createElement('div');
   wrap.className = 'team';
@@ -236,10 +316,120 @@ export function renderTeam(ctx) {
             </div>
             <div id="team-feedback"></div>`,
         })}
+        ${panel({
+          title: '段位与权益',
+          desc: '设计文档 §9 的「段位与权益」：段位来自里程碑与未撤回的企业签字，发榜时重算。',
+          body: `
+            <div class="field">
+              <label class="field__label" for="tier-team">选择战队</label>
+              <select class="select" id="tier-team" data-tier="team">
+                ${teams.map((t) => `<option value="${escapeHtml(t.id)}">${escapeHtml(t.name ?? t.id)}</option>`).join('')
+                  || '<option value="">（你还没有战队）</option>'}
+              </select>
+            </div>
+            <div id="tier-box">${loadingState({ rows: 1, label: '正在加载段位…' })}</div>`,
+        })}
+        ${panel({
+          title: '行为分记录',
+          desc: '行为分只用于破同分（排序末级，权重上限 10%）。不提交就是 0 分。',
+          body: `
+            <div class="field">
+              <label class="field__label" for="behavior-team">选择战队</label>
+              <select class="select" id="behavior-team" data-behavior="team">
+                ${teams.map((t) => `<option value="${escapeHtml(t.id)}">${escapeHtml(t.name ?? t.id)}</option>`).join('')
+                  || '<option value="">（你还没有战队）</option>'}
+              </select>
+            </div>
+            <div id="behavior-box">${loadingState({ rows: 1, label: '正在加载行为事件清单…' })}</div>`,
+        })}
       </div>`;
 
     bindCreateButton(packages.length > 0);
     bindLeaveButtons();
+    bindTierAndBehavior(teams);
+  }
+
+  /**
+   * 段位与权益 + 行为分提交（P11）。
+   * ⛔ 这两个读口/写口早就存在，但**前端从不调用** ⇒
+   *    · 段位权益永远看不见；· 行为分永远是 0。
+   */
+  function bindTierAndBehavior(teams) {
+    const tierTeam = body.querySelector('#tier-team');
+    const tierBox = body.querySelector('#tier-box');
+    const behaviorTeam = body.querySelector('#behavior-team');
+    const behaviorBox = body.querySelector('#behavior-box');
+    if (!tierBox || !behaviorBox) return;
+
+    const loadTier = async () => {
+      const teamId = tierTeam?.value ?? '';
+      if (!teamId) {
+        tierBox.innerHTML = emptyState({ title: '你还没有战队', hint: '建队之后这里会显示段位与已解锁的权益。' });
+        return;
+      }
+      tierBox.innerHTML = loadingState({ rows: 1, label: '正在加载段位…' });
+      try {
+        const tier = await api.get(`/api/teams/${encodeURIComponent(teamId)}/tier`);
+        tierBox.innerHTML = renderTeamTierHtml(tier);
+      } catch (e) {
+        tierBox.innerHTML = errorState({
+          message: e.message,
+          hint: '段位记录可能在发榜后才生成（D 段队伍对外不可见，这是设计口径）。',
+        });
+      }
+    };
+
+    const loadBehavior = async () => {
+      const teamId = behaviorTeam?.value ?? '';
+      if (!teamId) {
+        behaviorBox.innerHTML = emptyState({ title: '你还没有战队', hint: '建队之后这里可以提交行为记录。' });
+        return;
+      }
+      behaviorBox.innerHTML = loadingState({ rows: 1, label: '正在加载行为事件清单…' });
+      try {
+        const info = await api.get('/api/event-info');
+        behaviorBox.innerHTML = renderBehaviorFormHtml(info?.behaviorEvents ?? []);
+        behaviorBox.dataset.teamId = teamId;
+      } catch (e) {
+        behaviorBox.innerHTML = errorState({ message: e.message, hint: '行为事件清单来自服务端规则，拉不到就点重试。' });
+      }
+    };
+
+    tierTeam?.addEventListener('change', () => { loadTier(); });
+    behaviorTeam?.addEventListener('change', () => { loadBehavior(); });
+    void loadTier();
+    void loadBehavior();
+
+    // 提交行为记录
+    behaviorBox.addEventListener('click', async (ev) => {
+      const btn = ev.target?.closest?.('[data-action="behavior-submit"]');
+      if (!btn) return;
+      const teamId = behaviorTeam?.value ?? '';
+      const type = body.querySelector('[data-behavior="type"]')?.value ?? '';
+      const evidence = body.querySelector('[data-behavior="evidence"]')?.value ?? '';
+      const slot = behaviorBox.querySelector('[data-feedback="behavior"]');
+      if (!teamId || !type) {
+        if (slot) slot.innerHTML = errorState({ message: '还差一点信息', hint: '先选战队与事件类型。' });
+        return;
+      }
+      btn.disabled = true;
+      try {
+        const out = await api.post(`/api/teams/${encodeURIComponent(teamId)}/behavior-events`, { type, evidence });
+        if (slot) {
+          slot.innerHTML = noticeState({
+            tone: 'success',
+            title: '已提交行为记录',
+            items: [`本条计 ${escapeHtml(String(out?.points ?? 0))} 分（行为分只用于破同分，不进主分）。`],
+          });
+        }
+      } catch (e) {
+        if (slot) {
+          slot.innerHTML = errorState({ message: e.message, hint: '证据不合规会被服务端拒（不予计分）。' });
+        }
+      } finally {
+        btn.disabled = false;
+      }
+    });
   }
 
   /** 建队：空队名**本地拦下**（不发请求），成功后就地刷新列表。 */

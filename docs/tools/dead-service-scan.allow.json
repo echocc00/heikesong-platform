@@ -1,0 +1,210 @@
+{
+  "_comment": [
+    "允许清单（有意豁免）—— 每条都必须写清「谁在用 / 为什么这不算产品路径缺口」，否则不许进本清单。",
+    "口径与 docs/tools/dead-service-scan.mjs 一致：生产调用方 = platform/src/** 下的一处调用表达式。",
+    "分类：①种子/运维脚本路径 ②同文件辅助（导出仅为测试便利）③回调/传参值引用 ④仓储层替代读口（能力已由另一条已接线的路径承担）。",
+    "⚠️ W5（赛段接线）批次不在本清单里 —— 那不是「合理豁免」，是集成人正在修的真缺口，由集成人收口。"
+  ],
+  "allow": [
+    {
+      "file": "src/db/repo/capabilities.js",
+      "name": "insertCapability",
+      "reason": "①种子/运维脚本路径：唯一调用方是 scripts/seed.js（platform/scripts/seed.js:7 import、:54 写入），而 scripts/ 按本闸口径**不算产品路径**（死服务扫描 §判定口径：「调用方范围 = platform/src/**，scripts/ 与 web/ 在 src/ 之外」）。能力点表是**部署期一次性铺数据**（运行期只读不新增）—— 设计文档 §7.1【决策】「权限不靠角色枚举，靠能力 + 授权记录」只要求能力点**存在**，§8 的 API 清单里没有「新增能力点」端点 ⇒ 种子写入是该能力的设计内唯一入口。"
+    },
+    {
+      "file": "src/db/repo/capabilities.js",
+      "name": "insertRoleCapability",
+      "reason": "①种子/运维脚本路径：唯一调用方是 scripts/seed.js（platform/scripts/seed.js:7）。角色↔能力映射是部署期铺数据（设计 §7.1 的「能力 + 授权记录」模型里角色只是能力的打包，运行期不增删角色）；设计 §8 无「授角色能力」端点 ⇒ 非产品路径缺口。"
+    },
+    {
+      "file": "src/db/repo/cities.js",
+      "name": "createCity",
+      "reason": "①种子/运维脚本路径：唯一调用方是 scripts/seed.js（platform/scripts/seed.js:10 import、种子流程内建城）。城市是**届期级基础数据**（设计 §5.2 实体关系：edition ── city ── task_package 的「一届多城」结构；顶层文档 §3.1 S2「一切按 edition 隔离：多期多城复制不改表结构」），由运维脚本随届期一并铺好；设计 §8 的 API 清单里**没有**「建城市」端点 ⇒ 种子写入是设计内的唯一入口。"
+    },
+    {
+      "file": "src/db/repo/cities.js",
+      "name": "listCitiesByEdition",
+      "reason": "①种子/运维脚本路径：唯一调用方是 scripts/seed.js（platform/scripts/seed.js:10）⇒ 与 createCity 同族的**种子期读口**（种子脚本要查本届已铺的城市）。设计 §8 无城市读端点 ⇒ 非产品路径缺口。"
+    },
+    {
+      "file": "src/db/repo/editions.js",
+      "name": "createEdition",
+      "reason": "①种子/运维脚本路径：唯一调用方是 scripts/seed.js（platform/scripts/seed.js:9）⇒ 届期划分是**运营期动作**（顶层文档 §3.1 S2：一切按 edition 隔离、多期多城复制），由运维脚本建；设计 §8 无「建届期」端点 ⇒ 非产品路径缺口。"
+    },
+    {
+      "file": "src/db/repo/roles.js",
+      "name": "insertRole",
+      "reason": "①种子/运维脚本路径：唯一调用方是 scripts/seed.js（platform/scripts/seed.js:8）⇒ 角色是部署期铺数据（设计 §7.1：权限模型靠「能力 + 授权记录」，角色是能力的打包，运行期不增删角色）；设计 §8 无「建角色」端点 ⇒ 非产品路径缺口。"
+    },
+    {
+      "file": "src/db/repo/roles.js",
+      "name": "insertUserRole",
+      "reason": "①种子/运维脚本路径：唯一调用方是 scripts/seed.js（platform/scripts/seed.js:8）⇒ 用户↔角色授予是**部署期运维动作**（给初始管理员授权）；设计 §7.1 / §8 都没有「给人授角色」的端点 ⇒ 非产品路径缺口。"
+    },
+    {
+      "file": "src/db/repo/users.js",
+      "name": "createUser",
+      "reason": "①种子/运维脚本路径：唯一调用方是 scripts/seed.js（platform/scripts/seed.js:6）。**本平台没有自助注册**：设计 §8 认证段只有 login / logout / password / logout-all / me，**没有 signup / register 端点**；服务层 submitRegistration 直接收现成 userId（platform/src/services/registration.js:72，不建用户）⇒ 建账号是运维脚本入口，不是产品路径缺口。"
+    },
+    {
+      "file": "src/db/repo/users.js",
+      "name": "findUserByPhone",
+      "reason": "①种子/运维脚本路径 + ②同文件辅助：调用方是 scripts/seed.js（platform/scripts/seed.js:6）与**同文件** createUser（platform/src/db/repo/users.js:57，手机号唯一性守卫）。它**不看 active**（users.js:73 注释：「停用用户的手机号也不能被再次注册」）⇒ 与同文件的 getUserByPhone（users.js:78，带 active 过滤）是两个不同语义。生产注册路径本平台不存在（见 createUser 条）⇒ 非产品路径缺口。"
+    },
+    {
+      "file": "src/db/repo/users.js",
+      "name": "setSuperadmin",
+      "reason": "①种子/运维脚本路径：唯一调用方是 scripts/seed.js（platform/scripts/seed.js:6 import、种子流程里授初始管理员）。超管是**部署期一次性引导**出来的（scripts/seed.js:28 起：无 ADMIN_PASSWORD 明确报错退出、绝不兜底默认口令）；设计 §8 无「授超管」端点 ⇒ 运维路径，不是产品路径缺口。"
+    },
+    {
+      "file": "src/db/repo/reviews.js",
+      "name": "getScoreStat",
+      "reason": "②同文件辅助：导出了但只有**同文件**调用（platform/src/db/repo/reviews.js:102 与 :130，upsertScoreStat / applyScoreStatDelta 内部读）⇒ 它是 score_stats 增量维护的**内部读口**，导出是为测试便利（test 里单独断言 stdev 口径）。对外的统计读口 listScoreStats 已在生产接线 ⇒ 非产品路径缺口。"
+    },
+    {
+      "file": "src/db/repo/reviews.js",
+      "name": "stdevFromStats",
+      "reason": "②同文件辅助：导出了但只有**同文件**调用（platform/src/db/repo/reviews.js:147，applyScoreStatDelta 里把 n/mean/sumSq 还原成标准差）⇒ 纯算术辅助（reviews.js:106-118 的注释说明 stdev 由 sum_sq 现算、不另存列），导出是为测试便利 ⇒ 非产品路径缺口。"
+    },
+    {
+      "file": "src/db/repo/reviews.js",
+      "name": "upsertScoreStat",
+      "reason": "②同文件辅助：导出了但只有**同文件**调用（platform/src/db/repo/reviews.js:146，applyScoreStatDelta 里增量写）⇒ 它是 score_stats 的**内部写口**（reviews.js:95：n / mean / sum_sq 增量维护）；对外入口 applyScoreStatDelta 已在生产接线（服务层评分提交路径）⇒ 非产品路径缺口。"
+    },
+    {
+      "file": "src/services/anticheat.js",
+      "name": "assertFlagDetail",
+      "reason": "②同文件辅助：导出了但只有**同文件**调用（platform/src/services/anticheat.js:109，runDetection 内做字段字典校验）。anticheat.js:68-72 的注释明确写着「**单独抽成导出函数**：这条闸是不在字典里的字段名不进库（R-AUD-06）的唯一执行点，抽出来才能被单独测到」⇒ 它是**被刻意导出以便可测**的内部闸门，不是产品路径缺口。"
+    },
+    {
+      "file": "src/services/auth.js",
+      "name": "checkPasswordPolicy",
+      "reason": "②同文件辅助：导出了但只有**同文件**调用（platform/src/services/auth.js:87，改口令时校验新口令强度）⇒ 口令强度规则的内部实现（设计 §7.5 认证）；对外入口 POST /api/auth/password 已在生产接线 ⇒ 非产品路径缺口。"
+    },
+    {
+      "file": "src/services/compute.js",
+      "name": "listStageTeams",
+      "reason": "②同文件辅助：导出了但只有**同文件**调用（platform/src/services/compute.js:148）。它是仓储层 listStageTeams（platform/src/db/repo/stages.js:210，在本文件 :25 以别名 listStageTeamsRows 导入）的**带兜底包装**（compute.js:50-62：表未建时返回空并由调用方记 warning，其余错误照抛 —— 静默返回空名册会让 R1/R4 判定整段跳过、榜单分数静默出错）⇒ 服务层内部实现细节，导出为测试便利 ⇒ 非产品路径缺口。"
+    },
+    {
+      "file": "src/services/rate-limit.js",
+      "name": "checkRateLimit",
+      "reason": "②同文件辅助：导出了但只有**同文件**调用（platform/src/services/rate-limit.js:159，assertRateLimit 内部）⇒ 限流算法本体（设计 §11.1「防刷分」）；对外入口 assertRateLimit 已在生产接线（如 platform/src/http/routes/audit.js:14/:127）⇒ 非产品路径缺口。"
+    },
+    {
+      "file": "src/services/registration.js",
+      "name": "presentRegistration",
+      "reason": "②同文件辅助：导出了但只有**同文件**调用（platform/src/services/registration.js:139 / 167 / 178 / 225 / 251）⇒ 它是「报名行 → 对外视图」的**单一映射函数**（registration.js:26-42 的注释锁死了「level = 提交那一刻的快照 / grading = 按当前配置重算」两套口径不许分叉）⇒ 服务层内部实现细节，导出为测试便利 ⇒ 非产品路径缺口。"
+    },
+    {
+      "file": "src/services/review-state.js",
+      "name": "getSubjectState",
+      "reason": "②同文件辅助：导出了但只有**同文件**调用（platform/src/services/review-state.js:125 / 161 / 198）⇒ 复核/申诉状态机的「当前状态」读口（review-state.js:68-76：真值来源是 audit_log 里最后一条 review_state.transition）；对外入口 getReviewState（GET /api/stages/:stageId/review-state）已接线 ⇒ 非产品路径缺口。"
+    },
+    {
+      "file": "src/services/review-state.js",
+      "name": "parseAppealSubject",
+      "reason": "②同文件辅助：导出了但只有**同文件**调用（platform/src/services/review-state.js:197 / 357）⇒ 申诉主体串「stageId:teamId」的拆解工具（review-state.js:182 记录了「不能无条件拆」的修正）；对外入口 submitAppeal / decideAppeal 已接线 ⇒ 非产品路径缺口。"
+    },
+    {
+      "file": "src/services/review-state.js",
+      "name": "transition",
+      "reason": "②同文件辅助：导出了但只有**同文件**调用（platform/src/services/review-state.js:359 / 364）⇒ 状态机迁移的**唯一写入方**（review-state.js:76 明写「本服务是 review_state.transition 的唯一写入方」）；对外入口 submitAppeal / decideAppeal 已接线 ⇒ 非产品路径缺口。"
+    },
+    {
+      "file": "src/services/taskPackage.js",
+      "name": "presentTaskPackage",
+      "reason": "③回调/传参值引用：只被当作**回调值**引用（visible.map(presentTaskPackage)，platform/src/services/taskPackage.js:289），按本闸口径（生产调用方 = 调用表达式）不算接线 ⇒ 它是任务卡 → 对外视图的映射函数（taskPackage.js:28）。⚠️ 但它**确实在产品路径上**（listTaskPackages 的返回值逐条过它）⇒ 非缺口，只是口径不认。"
+    },
+    {
+      "file": "src/services/team.js",
+      "name": "checkTeamFormation",
+      "reason": "②同文件辅助：导出了但只有**同文件**调用（platform/src/services/team.js:71，createTeam 内）⇒ 建队合法性校验的内部实现（设计 §10 流 1：「队长 MBA ✅｜人数 ≥2 ✅｜任务包可解性已分级 ✅」）；对外入口 POST /api/teams 已在生产接线 ⇒ 非产品路径缺口。"
+    },
+    {
+      "file": "src/db/repo/users.js",
+      "name": "deactivateUser",
+      "reason": "③回调/传参值引用：只被**测试**直接调用（platform/test/users.test.js:113、platform/test/server.test.js:580/:731）并以解构形式被当值引用（test/server.test.js:578），生产代码零调用方。它是**软删除**用户的仓储写口（users.js:135 注释「禁止硬删」；设计 §11「删除 = 软删除」）。设计 §8 无「停用用户」端点、§9 前端 IA 无用户管理界面（全文 grep 无「用户管理 / 停用 / 封禁」条目）⇒ 属**未开放的运维动作**，不是产品路径接线。"
+    },
+    {
+      "file": "src/services/registration.js",
+      "name": "presentRegistrationEvent",
+      "reason": "③回调/传参值引用：只被当作**回调值**引用（rows.map(presentRegistrationEvent)，platform/src/services/registration.js:168 与 :186），按本闸口径不算接线 ⇒ 它是「报名事件行 → 对外视图」的映射函数（registration.js:147）。⚠️ 但它**确实在产品路径上**（GET 单条与 GET 列表都过它）⇒ 非缺口，只是口径不认。"
+    },
+    {
+      "file": "src/db/repo/computations.js",
+      "name": "listComputationRows",
+      "reason": "④仓储层替代读口（能力已由另一条已接线的路径承担）：P4 计划建的「最近的计算快照，倒序 + 可分页」读口（computations.js:96-98 的注释自己写明与 listSnapshots 语义不同）。它的**产品出口是审计链路**：services/audit.js:37-43 每次 recordComputation 都往 audit_log 写一条 action='computation.record' / entity='computation' / entityId=快照 id ⇒ 组委会可用 GET /api/audit/log?entity=computation 拿到快照 id，再用 GET /api/audit/computations/:id 与 /:id/diff 看留痕与复算 diff（设计 §12「可复算」）。⚠️ P4 计划自己的端点清单里**本来就没有**「计算列表」端点（只有 computations/:id、:id/diff、audit/log、audit/flags、flags/:id/resolve）⇒ 不是漏接，是「同一能力的另一条读口」。"
+    },
+    {
+      "file": "src/db/repo/computations.js",
+      "name": "listSnapshots",
+      "reason": "④仓储层替代读口（能力已由另一条已接线的路径承担）：P2 建的「某赛段的全部快照，按 revision 升序」读口（computations.js:96-98：与 listComputationRows 不是同一件事的第二个名字）。「旧 revision 保留供复盘」（设计 §11.2）在产品上的出口是 GET /api/audit/log（action='computation.record' 逐条留痕）→ GET /api/audit/computations/:id/:diff；设计 §8 的 API 清单里没有「赛段快照列表」端点，P2 计划的端点清单里也没有 ⇒ 非产品路径缺口。"
+    },
+    {
+      "file": "src/db/repo/flags.js",
+      "name": "findOpenFlag",
+      "reason": "④仓储层替代读口（已被**更细的**去重判据取代）：它是「同 kind + 同赛段 + 同队 + 同评委」粗键找未处置 flag 的读口；services/anticheat.js:36-56 的注释明写 P4-T4-D4 修正：「原来用 (kind, stage_id, team_id, judge_id) 这个粗键去重…那个键分不开『同 kind 的不同问题』… **丢掉的不是重复项，是真问题**」⇒ 现在改用 scanFlags + isSameFinding（按明细内容比对，anticheat.js:58-70）逐页扫。findOpenFlag 这个粗键读口已被**刻意废弃**（只剩 test/audit-repo.test.js:229-246 在测它自己）⇒ 非产品路径缺口。"
+    },
+    {
+      "file": "src/db/repo/pool-sources.js",
+      "name": "listAllUsers",
+      "reason": "④仓储层替代读口（P5 计划明列为「派生源读取」额外导出，未被消费）：P5 计划偏差表 I-5 明写仓储层额外导出含「13 个派生源读取函数（pool-sources.js）」。人才池实际用的是**届期隔离**的那一个（services/pools.js:95 listEditionUsers → 只取本届有积分流水的人），listAllUsers（全部在册用户、不分届期）会破坏顶层文档 §3.1 S2「一切按 edition 隔离」⇒ 未被消费是**语义上正确**的结果，不是缺口。"
+    },
+    {
+      "file": "src/db/repo/pool-sources.js",
+      "name": "listEditionLedger",
+      "reason": "④仓储层替代读口（P5 计划明列为「派生源读取」额外导出，未被消费）：人才池积分口径是**终生累计**（R-RNK-10 个人积分跨届期累加，pool-sources.js:95-97 注释），所以服务层逐人走 listUserLedger（services/pools.js:97 与 :177 的自检都按「同一个人所有届次的行」聚合）；listEditionLedger（只取本届流水）语义与之相反，用它会算错 ⇒ 未被消费是语义正确的选择。"
+    },
+    {
+      "file": "src/db/repo/request-keys.js",
+      "name": "findRequestKey",
+      "reason": "④仓储层替代读口（写口已接线，读口未使用）：评审幂等靠**抢键**实现——services/review.js:191/:620/:687 调 claimRequestKey，抢到 = 首次生效、抢不到 = 重复请求直接短路（request-keys.js:4-13 的注释：键表里**不存业务响应**）。findRequestKey（读回一行）是同一张表的另一读口，本仓不需要它来回答「上次成没成」——回答这个问题的是 P4 的 idempotency_keys（services/idempotency.js:1-20 的注释明确这是**两个不同能力**）⇒ 非产品路径缺口。"
+    },
+    {
+      "file": "src/db/repo/reviews.js",
+      "name": "listCalibrations",
+      "reason": "④仓储层替代读口（「看全部」是**明确不做**的决策）：校准分是按评委记的（judge_id），生产读口是 listCalibrationsForJudge（services/review.js:39 import、:364 使用）。P2 计划自己的服务层 import 清单里也只有 listCalibrationsForJudge（2026-10-20-platform-P2-review-engine.md:4798）⇒ listCalibrations 是同文件同族的备用读口。且 services/review.js:346-361 明写「⛔ 组委会也只看自己的（不实现『看全部』）…『看全部』要额外判定…一律不做，避免出现『有的页面看得到、有的看不到』的漂移」⇒ 非产品路径缺口。"
+    },
+    {
+      "file": "src/db/repo/sessions.js",
+      "name": "countActiveSessions",
+      "reason": "④仓储层替代读口（该能力已由已接线的写口承担）：「强制下线」能力的生产入口是 POST /api/auth/logout-all → auth/session.js:111 revokeAllSessions → deleteSessionsByUser（sessions.js:30），已在生产接线。countActiveSessions 只是同一张表的**计数读口**（sessions.js:56）；设计 §8 无「我的设备数」端点、§9 前端 IA 无对应界面 ⇒ 属预留读口，非产品路径缺口。"
+    },
+    {
+      "file": "src/db/repo/sessions.js",
+      "name": "purgeExpiredSessions",
+      "reason": "④仓储层替代读口（过期清理由**惰性删除**承担）：会话过期不靠批量清理——auth/session.js:95-96 在 resolveSession 命中过期行时直接删行（会话表不存在定时任务入口，设计 §14 部署节也没有清理作业）。purgeExpiredSessions（sessions.js:67）是同一语义的**批量版运维工具**，生产没有调用它 ⇒ 非产品路径缺口。"
+    },
+    {
+      "file": "src/db/repo/task-claims.js",
+      "name": "countActiveClaims",
+      "reason": "④仓储层替代读口（同能力的另一个读口已接线）：「这个任务被领了吗」的生产判据是 getActiveClaim（services/workflow.js:103/:136/:162/:180 在用），并发安全由数据库部分唯一索引 ux_task_claims_active 兜底（services/workflow.js:125-126 与 :146-149 的注释明写「前置检查只是友好提示，真正的保证在 ux_task_claims_active」）⇒ countActiveClaims 是同义计数读口，未被消费不是缺口。"
+    },
+    {
+      "file": "src/db/repo/task-claims.js",
+      "name": "listClaimsByUser",
+      "reason": "④仓储层替代读口（P5 计划明列为额外导出，「我的领取」已由已接线的端点给出）：P5 计划偏差表 I-5 明写仓储层额外导出含 listClaimsByUser。产品上「我领了什么」由 GET /api/workflows/:id/tasks 的 isMine 字段给出（services/workflow.js:103-116：逐条任务带 claim + isMine）⇒ 跨工作流汇总的同义读口未被消费，非产品路径缺口。"
+    },
+    {
+      "file": "src/db/repo/users.js",
+      "name": "getUserByPhone",
+      "reason": "④仓储层替代读口（同能力的另一个读口已接线）：登录路径取的是 getCredentialsByPhone（users.js:86，唯一允许取 password_hash 的读口，服务层口令校验在用）；唯一性查重走 findUserByPhone（users.js:74，不看 active）。getUserByPhone（users.js:78，带 active 过滤）是第三种同义读口，生产不需要 ⇒ 非产品路径缺口。"
+    },
+    {
+      "file": "src/db/repo/users.js",
+      "name": "listUsers",
+      "reason": "④仓储层替代读口（生产用它的「读全部用户」需求已由另一个读口承担）：P0 建它是为了给仓储层行形状做断言（P0 计划:3882「for (const row of listUsers(db)) assert.equal(row.password_hash, undefined)」）；生产上「读全部用户」的真实需求是反作弊多账号检测，走的是 listUsersForDetection（services/compute.js:31 import、:272 使用）。而**用户管理本身不是本产品的能力**：设计 §8 无 GET /api/users、§9 前端 IA 无「用户管理」条目（全文 grep 无「用户管理 / 成员管理 / 账号管理」）⇒ listUsers 是预留的管理读口，非产品路径缺口。"
+    },
+    {
+      "file": "src/db/repo/workflows.js",
+      "name": "findWorkflowByPackage",
+      "reason": "④仓储层替代读口（P5 计划明列为额外导出，未被消费）：P5 计划偏差表 I-5 明写仓储层额外导出含 findWorkflowByPackage（workflows.js）。工作流的建口是 POST /api/workflows（含 task_package_id），读口是 GET /api/workflows → listWorkflowSummaries（server.js:274）；「按任务包反查工作流」这条读口产品上没有使用方 ⇒ 非产品路径缺口。"
+    },
+    {
+      "file": "src/db/repo/workflows.js",
+      "name": "listWorkflowsByEdition",
+      "reason": "④仓储层替代读口（同能力的另一个读口已接线）：届期工作流列表的生产出口是 GET /api/workflows → listWorkflowSummaries（server.js:274；P7 计划已把它定成对外形状）；listWorkflowsByEdition 是同族的对内读口（server.js:260 的注释即写明「仓储层本来就有 listStages / listWorkflowsByEdition，只是没有端点」）⇒ 非产品路径缺口。"
+    }
+  ]
+}

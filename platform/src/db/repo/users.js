@@ -148,3 +148,19 @@ export function deactivateUser(db, id) {
 export function setSuperadmin(db, userId) {
   db.prepare('UPDATE users SET is_superadmin = 1 WHERE id = ?').run(userId);
 }
+
+/**
+ * 反作弊检测用的用户清单（**含手机号**）。
+ *
+ * ⛔ P11 新增：设计 §11.1 明写「**全行业空白**：没有任何一个开源项目做多账号协同投票检测。
+ *    我们至少要做到『同一手机号/同一企业注册的多个账号』可被识别」，
+ *    而 `rules/audit.json` 的 `antiCheat.multiAccount.keyFields = ["phone", "org"]`。
+ *    仓储层原来那份 `listAllUsers`（pool-sources.js）**不返回 phone** ⇒
+ *    「同一手机号多个账号」这条最核心的检测**永远不可能命中**。
+ *
+ * ⚠️ **含手机号 ⇒ 只能在服务端内部用**，绝不进任何公开响应
+ *    （手机号不进公开榜单、不进人才池、不进对外 API）。
+ */
+export function listUsersForDetection(db) {
+  return db.prepare('SELECT id, name, org, phone FROM users WHERE active = 1 ORDER BY id, rowid').all();
+}

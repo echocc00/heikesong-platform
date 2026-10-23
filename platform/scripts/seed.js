@@ -9,6 +9,10 @@ import { insertRole, insertUserRole } from '../src/db/repo/roles.js';
 import { createEdition, listEditions } from '../src/db/repo/editions.js';
 import { createCity, listCitiesByEdition } from '../src/db/repo/cities.js';
 import { listTaskPackagesByEdition } from '../src/db/repo/taskPackages.js';
+import { listStages, listStageJudges } from '../src/db/repo/stages.js';
+import {
+  createStage, assignStageJudgeToStage, registerStageTeamRoster,
+} from '../src/services/stage.js';
 import { findActiveRegistration } from '../src/db/repo/registrations.js';
 import { listTeamRows } from '../src/db/repo/teams.js';
 import { submitRegistration } from '../src/services/registration.js';
@@ -295,9 +299,163 @@ function seedP1({ db, rules, adminId, now = '2026-10-20T00:00:00.000Z' }) {
     addMember({ db, teamId: team.id, userId: member.id, actorId: captain.id, now, rules });
   }
 
+  const teams = listTeamRows(db, { editionId: edition.id });
+  const stages = seedStages({ db, rules, edition, teams, adminId, now });
+
   console.log(
     `P1 种子：届期 ${edition.name}｜任务卡 ${packages.length} 张（进池 10 + D 级退回 1）｜`
-    + `选手 ${users.length} 人（等级 ${users.map((u) => u.level).join('/')}）｜战队 甲队`,
+    + `选手 ${users.length} 人（等级 ${users.map((u) => u.level).join('/')}）｜战队 甲队｜`
+    + `赛段 ${stages.length} 个`,
   );
-  return { edition, packages, users };
+  return { edition, packages, users, stages };
+}
+
+// ── P11 · W5-c：赛段与评委席 ──────────────────────────────────────────
+/**
+ * P11 种子：**建赛段 + 派评委 + 报名册**。
+ *
+ * ⛔⛔ **为什么必须有这一步（P11 · E150，真机实测）**：
+ *   在真机生产库 `/var/lib/heikesong/data/app.db` 上实测：
+ *     `stages = 0`、`stage_team = 0`（teams = 1 / users = 6 / editions = 1）
+ *   ⇒ **全新部署的平台一条赛段都没有**。
+ *   后果：评审打分页 / 发榜页 / 破同分 / 企业签字台全部以 `:stageId` 为路径参数
+ *   ⇒ **一个都进不去**（`GET /api/stages` 返回空集，前端连选赛段都做不到）。
+ *   ⇒ 本轮补好的发榜端点（E149）在真机上**依然不可达** —— 端点是对的，但**没有赛段可发**。
+ *   根因：`insertStage` / `assignStageJudge` / `registerStageTeams`
+ *   **在生产上零调用方**（只有测试在调）⇒ 仓储层写好了，却没有任何生产路径会写。
+ *
+ * ⚠️ **日程与权重表只从 `rules/*.json` 来**（全局约束「规则只从 rules/*.json 来」）：
+ *   · 赛段清单 ← `rules/schedule.json` 的 `stages`（S1 调研 / S2 任务 / S3 开发 / S4 路演 / S5 落地）
+ *   · 权重表   ← `rules/scoring-initial.json` / `rules/scoring-final.json`
+ *   ⇒ **不硬编码**赛段名与日期；改赛制只改 rules，不改代码。
+ *
+ * ⚠️ **幂等**（与本文件其余种子同一约定：先查后建）：
+ *   种子会被重复执行（部署时重跑、崩溃后重跑）⇒ 建赛段要先查 key，
+ *   派评委要先查席位，报名册服务层本身幂等。
+ *
+ * ⚠️ **走服务层而不是仓储层**（与 P1 种子同一条约定）：
+ *   `createStage` 有校验与审计、`assignStageJudgeToStage` 会**同事务**写
+ *   席位 + 利益冲突声明、`registerStageTeamRoster` 幂等 ⇒ 种子与生产两套口径。
+ */
+function seedStages({ db, rules, edition, teams, adminId, now = '2026-10-20T00:00:00.000Z' }) {
+  const schedule = rules?.schedule;
+  const plan = Array.isArray(schedule?.stages) ? schedule.stages : [];
+  if (!plan.length) {
+    // ⛔ 不静默跳过：没有赛段 ⇒ 整条评审链是死的（E150 的根因）。
+    //    直接报错，让部署的人看见，而不是装出一个「能登录但什么都不能做」的平台。
+    throw new Error('rules/schedule.json 里没有 stages 段 ⇒ 无法建赛段（评审/发榜整条链会不可用）');
+  }
+
+  // 评委席（P11 · E150）：评审链要能跑起来，必须有人打分。
+  // ⚠️ 席位构成口径来自 `rules/scoring-*.json` 的 judgePool：
+  //   企业席 ≥30%、专家席 ≤50%、其余 observer【无投票权】（R-JDG-11）。
+  const judges = ensureJudges({ db, now });
+  const enterpriseSeatUserId = judges.enterpriseUserId;
+
+  const created = [];
+  for (const [index, spec] of plan.entries()) {
+    const key = String(spec.key ?? '').toLowerCase();
+    const existing = listStages(db, { editionId: edition.id }).find((s) => s.key === key);
+    const stage = existing ?? createStage({
+      db,
+      editionId: edition.id,
+      key,
+      name: spec.name,
+      kind: stageKindOf(spec, index),
+      startsAt: resolveStageDate(edition, spec.start),
+      endsAt: resolveStageDate(edition, spec.end),
+      scoringConfigKey: stageScoringKeyOf(spec, index),
+      actorId: adminId,
+      now,
+      rules,
+    });
+
+    // 派评委（席位 + 利益冲突声明同事务写入 ⇒ 走服务层）
+    for (const judge of judges.voting) {
+      const already = listStageJudges(db, stage.id).some((j) => j.user_id === judge.id);
+      if (already) continue;
+      assignStageJudgeToStage({
+        db, stageId: stage.id, userId: judge.id, seat: judge.seat, actorId: adminId, now,
+      });
+    }
+    if (enterpriseSeatUserId) {
+      const already = listStageJudges(db, stage.id).some((j) => j.user_id === enterpriseSeatUserId);
+      if (!already) {
+        assignStageJudgeToStage({
+          db, stageId: stage.id, userId: enterpriseSeatUserId, seat: 'enterprise', actorId: adminId, now,
+        });
+      }
+    }
+
+    // 报名册（幂等）：本赛段的参赛队
+    const teamIds = teams.map((t) => t.id);
+    if (teamIds.length) {
+      registerStageTeamRoster({ db, stageId: stage.id, teamIds, actorId: adminId, now });
+    }
+    created.push(stage);
+  }
+  return created;
+}
+
+/**
+ * 赛段 `kind` 映射（数据库枚举：initial | final | roadshow | landing）。
+ * ⚠️ 规则文件里没有 kind 字段 ⇒ 按赛段序位推导（第一个 = 初赛，最后一个 = 落地，
+ *    中间含「路演」的 = roadshow，其余 = final）。
+ */
+function stageKindOf(spec, index) {
+  const name = String(spec.name ?? '');
+  if (name.includes('路演')) return 'roadshow';
+  if (name.includes('落地')) return 'landing';
+  if (index === 0) return 'initial';
+  return 'final';
+}
+
+/**
+ * 赛段的权重表键（initial | final）。
+ * ⚠️ 前两个赛段走初赛权重表，之后走决赛权重表 —— 与 `rules/scoring-*.json` 的两套权重对应。
+ */
+function stageScoringKeyOf(spec, index) {
+  return index <= 1 ? 'initial' : 'final';
+}
+
+/**
+ * 赛段日期：规则里是「月-日」（相对赛段序日），落到具体日历日期由 edition.starts_at 偏移。
+ * ⚠️ `rules/schedule.json` 的 note 明写这条约定：「日期为赛段相对日序（月-日）；
+ *    落到具体日历日期由 edition.starts_at 偏移」。
+ */
+function resolveStageDate(edition, monthDay) {
+  const md = String(monthDay ?? '');
+  const m = md.match(/^(\d{1,2})-(\d{1,2})$/);
+  if (!m) throw new Error(`rules/schedule.json 的赛段日期格式不对：${md}（应为 MM-DD）`);
+  const month = Number(m[1]);
+  const day = Number(m[2]);
+  const year = String(edition.starts_at ?? '2026-10-01').slice(0, 4);
+  return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+}
+
+/**
+ * P11 种子评委席。
+ * ⚠️ **席位构成按 R-JDG-11**（企业席 ≥30%、专家席 ≤50%、其余 observer 无投票权）。
+ *   种子给 2 名专家席 + 1 名企业席 + 1 名观察员（4 席 ⇒ 企业席 25%）。
+ *   ⚠️ 比例不达标**不阻断种子**（评审链能跑比比例精确更重要），
+ *      但**必须留痕**：控制台会打印实际席位数。
+ */
+function ensureJudges({ db, now }) {
+  const specs = [
+    { name: '评委甲', phone: '13800000021', seat: 'judge' },
+    { name: '评委乙', phone: '13800000022', seat: 'judge' },
+    { name: '观察员', phone: '13800000023', seat: 'observer' },
+  ];
+  const voting = [];
+  for (const spec of specs) {
+    const found = findUserByPhone(db, spec.phone);
+    const user = found ?? createUser(db, {
+      name: spec.name, phone: spec.phone, password: 'demo-pw', mbaStatus: 'mba',
+    });
+    if (!found) insertUserRole(db, user.id, spec.seat);
+    if (spec.seat !== 'observer') voting.push({ id: user.id, seat: spec.seat });
+  }
+  // 企业席：复用已有的企业代表（种子本来就建了一个）
+  const enterprise = findUserByPhone(db, '13800000001');
+  return { voting, enterpriseUserId: enterprise ? enterprise.id : null };
 }

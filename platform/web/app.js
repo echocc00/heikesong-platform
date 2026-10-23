@@ -33,6 +33,12 @@ import { renderReviewPrep } from './views/review-prep.js';
 import { renderAdminTaskPackages } from './views/admin-task-packages.js';
 import { renderAdminAppeals } from './views/admin-appeals.js';
 import { renderSignoff } from './views/signoff.js';
+// P11：三个新页面（接口早就写好，只是没有界面 / 没有入口）
+import { renderTiebreak } from './views/tiebreak.js';
+import { renderPublicLinks } from './views/public-links.js';
+// P11：审计日志页（`GET /api/audit/log` 早就挂在后端，前端**从来没调用过**）
+// ⚠️ 设计文档 §9「组委会视角 → 审计与复算」明写要有这块界面。
+import { renderAuditLog } from './views/audit-log.js';
 import { escapeHtml } from './escape.js';
 
 // 演示版：?demo=1 时用 localStorage 适配器；正式版走真实 API。
@@ -71,6 +77,12 @@ route('/card/:teamId', (c) => renderCard(c));
 // P4 两页：计算留痕 trace 抽屉（从发榜页点队伍进入）/ 复核队列
 // ⚠️ 必须透传路由参数（c = {...ctx, params, query}）：trace 抽屉靠 params.computationId
 //    决定拉哪份快照 —— 只传模块级 ctx 会把 params 丢掉，抽屉永远拿不到 computationId。
+// ⛔⛔ **P11：`/audit/log` 必须注册在 `/audit/:computationId` 之前** ——
+//    前端路由是**注册顺序**先匹配（web/router.js 的 match() 遍历 routes 取第一个命中），
+//    晚注册 ⇒ `/audit/log` 会被 `/audit/:computationId` 吃掉（computationId='log'）
+//    ⇒ 审计日志页永远打不开。
+//    （与 P10 的 `/review/prep` 必须先于 `/review/:stageId` 是**同一个坑**。）
+route('/audit/log', (c) => renderAuditLog(c));
 route('/audit/:computationId', (c) => renderAudit(c));
 route('/flags', (c) => renderFlags(c));
 // P5 Task 6：任务清单页（只有「自主领取」一个入口，R-OPS-14 禁止岗位制）
@@ -94,6 +106,12 @@ route('/publish/:stageId', (c) => renderPublish(c));
 route('/admin/task-packages', (c) => renderAdminTaskPackages(c));
 route('/admin/appeals', (c) => renderAdminAppeals(c));
 route('/signoff', (c) => renderSignoff(c));
+// P11：加时陈述 / 一票破同分（服务层与路由早就写好，**页面与入口**此前都不存在）
+// ⚠️ 两条都注册（带赛段 / 不带赛段）：不带赛段 ⇒ 页面内给赛段选择器。
+route('/tiebreak', (c) => renderTiebreak(c));
+route('/tiebreak/:stageId', (c) => renderTiebreak(c));
+// P11：公开访问链接（签发 / 列表 / 吊销公开令牌）
+route('/admin/public-links', (c) => renderPublicLinks(c));
 
 const ctx = { api, navigate, setState, getState };
 

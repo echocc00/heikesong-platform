@@ -262,6 +262,9 @@ test('追加·段位榜：C 段及以上公示，D 段只给本人进度卡（�
 
 test('追加·滚动总榜：scope=rolling，按积分排序', async () => {
   const api = createDemoApi({ storage: makeStorage(), seed, rules });
+  // ⚠️ P11：演示站的 compute 与正式站**同口径** —— 都要先登录
+  //    （正式站 src/http/routes/review.js 的 compute 走 requireStageCapability ⇒ requireUser）。
+  await api.post('/api/auth/login', { name: '演示管理员' });
   await api.post('/api/stages/stage_final/compute', {});
   const rolling = await api.get('/api/leaderboard/rolling');
   assert.equal(rolling.scope, 'rolling', '滚动总榜的 scope 必须是 rolling');

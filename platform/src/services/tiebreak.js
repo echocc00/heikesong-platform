@@ -28,7 +28,8 @@ import {
   insertTiebreakVote,
   listTiebreakVotes,
 } from '../db/repo/tiebreak.js';
-import { getStageJudge, listStageTeams } from '../db/repo/stages.js';
+import { getStageJudge } from '../db/repo/stages.js';
+import { resolveStageRoster } from './review.js';
 import { listRecusals } from '../db/repo/recusals.js';
 import { checkRecusal } from '../domain/review-eligibility.js';
 import { writeAuditLog } from '../audit/log.js';
@@ -58,7 +59,9 @@ export function openTiebreakRound({ db, stageId, tiedTeamIds = [], statementMinu
   }
   // ⛔ 同分组的队伍必须真实存在且属于本赛段 —— 否则会开出一个「指向幽灵队伍」的轮次，
   //    投票时在外键上炸（而且错误信息是原始 SQL 原文）。
-  const roster = new Set(listStageTeams(db, stageId).map((t) => t.teamId));
+  // ⚠️ P11 · E156：走 `resolveStageRoster`（赛段级优先、届期级兜底）——
+  //    直接用届期级名册 ⇒ 同届期另一赛段的队伍能被拉进破同分轮次。
+  const roster = new Set(resolveStageRoster(db, stageId));
   const unknown = unique.filter((id) => !roster.has(id));
   if (unknown.length) {
     throw fail(400, 'TIED_TEAM_NOT_IN_STAGE', '同分组里有队伍不属于本赛段或不存在', { unknown });

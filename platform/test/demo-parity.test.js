@@ -138,6 +138,10 @@ test('规则配置同源：浏览器侧的 12 份配置与正式系统 loadRules
 test('浏览器入口路径可跑通：fetch 取种子与规则 → 计算 → 拿到结果', async () => {
   installFetchStub([webDir, platformDir]);
   const runtime = await getDemoRuntime();
+  // ⚠️ P11：演示站的 compute 与正式站**同口径** —— 都要先登录
+  //    （正式站 src/http/routes/review.js 的 compute 走 requireStageCapability ⇒ requireUser）。
+  //    ⇒ 演示适配器此前允许「匿名计算」，那是与正式站**不一致**的地方，本轮对齐。
+  await runtime.post('/api/auth/login', { name: '演示管理员' });
   const health = await runtime.get('/api/health');
   assert.equal(health.ok, true);
   assert.equal(health.demo, true);
@@ -169,6 +173,10 @@ test('演示版与正式引擎逐字一致：同一输入 → 同一 teams / war
 test('浏览器入口算出的结果 ≡ 正式引擎算出的结果（浮点容差 1e-9 相对）', async () => {
   installFetchStub([webDir, platformDir]);
   const runtime = await getDemoRuntime();
+  // ⚠️ P11：演示站的 compute 与正式站**同口径** —— 都要先登录
+  //    （正式站 src/http/routes/review.js 的 compute 走 requireStageCapability ⇒ requireUser）。
+  //    ⇒ 演示适配器此前允许「匿名计算」，那是与正式站**不一致**的地方，本轮对齐。
+  await runtime.post('/api/auth/login', { name: '演示管理员' });
   const browser = await runtime.post('/api/stages/stage_final/compute', {});
 
   const direct = directEngine(buildDemoState(seed));
@@ -186,6 +194,10 @@ test('浏览器入口算出的结果 ≡ 正式引擎算出的结果（浮点容
 test('破同分链、名次积分、自评差异、段位在浏览器入口与正式系统之间也一致', async () => {
   installFetchStub([webDir, platformDir]);
   const runtime = await getDemoRuntime();
+  // ⚠️ P11：演示站的 compute 与正式站**同口径** —— 都要先登录
+  //    （正式站 src/http/routes/review.js 的 compute 走 requireStageCapability ⇒ requireUser）。
+  //    ⇒ 演示适配器此前允许「匿名计算」，那是与正式站**不一致**的地方，本轮对齐。
+  await runtime.post('/api/auth/login', { name: '演示管理员' });
   const browser = await runtime.post('/api/stages/stage_final/compute', {});
   const state = buildDemoState(seed);
 

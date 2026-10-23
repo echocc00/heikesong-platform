@@ -33,6 +33,9 @@ import {
   reinstateRecusal,
   getRecusalLedger,
   submitEnterpriseConfirmation,
+  withdrawEnterpriseConfirmation,
+  resignEnterpriseConfirmation,
+  resolveStageRoster,
 } from '../../services/review.js';
 import { computeStage, getComputation } from '../../services/compute.js';
 import { reviewEvents } from '../sse.js';
@@ -322,7 +325,9 @@ export function registerReviewRoutes(router) {
     }
     // 名册判定**先于**归属判定：名册外的队伍 → 404（三态：单条不满足 → 404），
     // 而不是「归属不符 → 403」（那会泄露「这支队存在但不是你家的」）。
-    const roster = listStageTeams(ctx.db, stageId).map((t) => t.teamId);
+    // ⚠️ P11 · E156：走服务层的 `resolveStageRoster`（赛段级优先、届期级兜底）——
+    //    直接用届期级的 `listStageTeams` ⇒ 同届期另一赛段的队会被写进本赛段（外队进榜）。
+    const roster = resolveStageRoster(ctx.db, stageId);
     if (!roster.includes(teamId)) {
       throw new AppError(404, 'TEAM_NOT_IN_STAGE', `队伍 ${teamId} 不在本赛段名册内`);
     }
@@ -346,6 +351,54 @@ export function registerReviewRoutes(router) {
       crossJudgeId,
       signatoryUserId: enterpriseId,
       content: ctx.body?.content ?? '',
+      now: new Date().toISOString(),
+    });
+  });
+
+  // ⛔ P11 · E141：**企业确认的逆向路径**（撤回 / 改签）。
+  //
+  // ⚠️ 为什么必须有（E141 实测）：企业确认落库后**没有任何改动的途径** ⇒
+  //    ① 签错了改不了；② **缺跨领域评委签字**（R2 双签只签一半）没法补签
+  //    ⇒ 该队企业席按 R2 恒计 0 分并挂 warning，而**产品内修不了**。
+  //
+  // ⚠️ 权限口径与**同一条正向端点**完全一致（出题企业本人或组委会）：
+  //    跨领域评委**不在这条端点上**——他要补签走下面的「改签」端点（只动 cross_judge_id）。
+  router.add('POST', '/api/stages/:stageId/enterprise-confirmations/:id/withdraw', async (ctx) => {
+    if (!ctx.user) throw new AppError(401, 'UNAUTHENTICATED', '未登录');
+    const committee = isCommittee(ctx);
+    if (!isEnterpriseSeat(ctx) && !committee) {
+      throw new AppError(403, 'FORBIDDEN', '只有出题企业（或组委会）可以撤回企业确认');
+    }
+    return withdrawEnterpriseConfirmation({
+      db: ctx.db,
+      id: ctx.params.id,
+      stageId: ctx.params.stageId,
+      actorId: ctx.user.id,
+      isCommittee: committee,
+      now: new Date().toISOString(),
+    });
+  });
+
+  // ⛔ P11 · E141 + E148①：**改签**（更正内容/分数 + **R2 后补**跨领域签字）。
+  router.add('POST', '/api/stages/:stageId/enterprise-confirmations/:id/resign', async (ctx) => {
+    if (!ctx.user) throw new AppError(401, 'UNAUTHENTICATED', '未登录');
+    const committee = isCommittee(ctx);
+    // ⚠️ 评委**也要能进这个端点**（给自己补签 R2 双签的另一半）⇒ 闸门是「企业席 或 组委会 或 本赛段评委」。
+    const isJudge = !!getStageJudge(ctx.db, ctx.params.stageId, ctx.user.id);
+    if (!isEnterpriseSeat(ctx) && !committee && !isJudge) {
+      throw new AppError(403, 'FORBIDDEN', '只有出题企业、组委会或本赛段评委可以改签企业确认');
+    }
+    // ⛔ crossJudgeId 允许**显式传 null**（= 撤销已补的签字）⇒ 用 `!== undefined` 判「有没有传」
+    const hasCross = Object.prototype.hasOwnProperty.call(ctx.body ?? {}, 'crossJudgeId');
+    return resignEnterpriseConfirmation({
+      db: ctx.db,
+      id: ctx.params.id,
+      stageId: ctx.params.stageId,
+      actorId: ctx.user.id,
+      isCommittee: committee,
+      rawScore: ctx.body?.rawScore ?? null,
+      content: ctx.body?.content ?? null,
+      crossJudgeId: hasCross ? (ctx.body.crossJudgeId || null) : undefined,
       now: new Date().toISOString(),
     });
   });

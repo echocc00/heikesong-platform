@@ -18,6 +18,8 @@ import { computeStagePoints, computeMvp, computePersonalPoints } from '../domain
 import { behaviorScore } from '../domain/behavior.js';
 import { applyVisibility } from '../domain/visibility.js';
 import { computeTeamTier } from './tier.js';
+import { buildReverseAuditTasks } from './anticheat.js';
+import { getTiebreakExtraScores } from './tiebreak.js';
 import { cmpStr } from '../domain/util.js';
 import * as repo from '../db/repo/leaderboard.js';
 import * as pointsRepo from '../db/repo/points.js';
@@ -78,7 +80,13 @@ function buildStageRanking({ db, stage, R }) {
   const results = repo.listStageResults(db, stage.id);
   const peerTotals = indexBy(repo.listPeerScoreTotals(db, stage.id), 'team_id', 'peer_score');
   const entTotals = indexBy(repo.listEnterpriseRawTotals(db, stage.id), 'team_id', 'enterprise_raw');
-  const extraTotals = indexBy(repo.listTiebreakVoteTotals(db, stage.id), 'team_id', 'tiebreak_extra');
+  // ⛔ P11：**破同分复议分必须走服务层**（getTiebreakExtraScores），不能用仓储层那份 SQL 聚合。
+  //    仓储层的 `listTiebreakVoteTotals` 是它的**孪生实现**，少了两条口径：
+  //      ① 「只消费**已关闭**的轮次」—— 还在开放投票的轮次，其当前均值会被当成最终复议分消费
+  //         ⇒ **榜单随投票进行而漂移**（services/tiebreak.js 文件头第 ⑥ 条修的就是这件事，SQL 那份没跟上）；
+  //      ② 「同一队多轮取**最新一轮**」。
+  //    ⇒ 一旦投了票但轮次还没关，榜单就会变 —— 这与「破同分必须可复算」直接冲突。
+  const extraTotals = getTiebreakExtraScores({ db, stageId: stage.id, teamIds: results.map((r) => r.team_id) });
   const behaviorTotals = behaviorScoresByTeam(db, results.map((r) => r.team_id), R);
 
   const candidates = results.map((r) => ({
@@ -299,7 +307,12 @@ export function getRollingLeaderboard({ db, editionId, viewer = null, rules = nu
 export function publishLeaderboard({ db, editionId, stageId, actorId, now, rules = null }) {
   const R = rules || getDefaultRules();
   const user = getUserById(db, actorId);
-  if (!can(user, 'stage:compute', { scopeType: 'edition', scopeId: editionId }, db)) {
+  // ⛔ P11 修正：原先只认**届期级**授权 ⇒「赛段级授权」的 `stage:compute` 明明能
+  //    `POST /api/stages/:id/compute`（路由层认赛段级），却发不了榜 ⇒ 前后端口径不一致。
+  //    现在两种都认（全局授权与角色授权在 can() 里本来就放行）。
+  const allowed = can(user, 'stage:compute', { scopeType: 'edition', scopeId: editionId }, db)
+    || can(user, 'stage:compute', { scopeType: 'stage', scopeId: stageId }, db);
+  if (!allowed) {
     throw new AppError(403, 'FORBIDDEN', '无发榜权限');
   }
   const stage = repo.getStage(db, stageId);
@@ -330,26 +343,106 @@ export function publishLeaderboard({ db, editionId, stageId, actorId, now, rules
     id: randomUUID(), actorId, action: 'leaderboard.publish', entity: 'stage', entityId: stageId,
     detailJson: JSON.stringify({ editionId, stageId, snapshots, awarded }), createdAt,
   });
-  return { editionId, stageId, snapshots, awarded, createdAt };
+  return { editionId, stageId, snapshots, awarded, createdAt, reverseAuditTasks: buildTopReverseAuditTasks({ db, stage, R }) };
 }
 
-/** 名次积分写入流水：只增不改 + 幂等（同一赛段同一队伍不重复发） */
+/**
+ * TOP 名单反向抽查任务（R-JDG-16 / S7 §4.1「组委会对 TOP10 作品电话回访」）。
+ *
+ * ⛔ P11：这份清单原先**只有服务层纯函数**（buildReverseAuditTasks），没有任何生产调用方
+ *    ⇒ TOP 名单回访这件事在产品里**根本做不了**。现在发榜时一并产出。
+ * ⚠️ 口径：只给**名次**与**未撤回的里程碑签字**，不代劳、不自动结案（检测 ≠ 处罚）。
+ */
+function buildTopReverseAuditTasks({ db, stage, R, topN = 10 }) {
+  const built = buildStageRanking({ db, stage, R });
+  const results = built.ranking.ordered.map((row) => ({
+    teamId: row.teamId,
+    rank: row.rank,
+    total: row.total,
+  }));
+  const signoffs = [];
+  for (const row of results.slice(0, topN)) {
+    for (const s of tierRepo.listSignoffsByTeam(db, row.teamId)) {
+      // ⛔ 撤回的签字不算「已签字」—— 回访时要能看出「签了又撤」
+      if (s.revoked_at) continue;
+      signoffs.push({ ...s, teamId: row.teamId });
+    }
+  }
+  return buildReverseAuditTasks({ results, signoffs, topN });
+}
+
+/**
+ * 发榜状态（读口）：这个赛段发过榜没有？发了什么？TOP 回访清单是什么？
+ *
+ * ⛔ P11：原先**没有任何读口**能回答「这个赛段发了榜没有」——
+ *    前端只能靠「有没有快照」猜，页面刷新后就不知道自己刚做过什么。
+ */
+export function getPublishState({ db, stageId, rules = null, topN = 10 }) {
+  const R = rules || getDefaultRules();
+  const stage = repo.getStage(db, stageId);
+  if (!stage) throw new AppError(404, 'STAGE_NOT_FOUND', '赛段不存在');
+  const snaps = repo.listSnapshotsByStage(db, stageId);
+  const published = snaps.length > 0;
+  return {
+    stageId,
+    editionId: stage.edition_id,
+    published,
+    publishedAt: published ? snaps[snaps.length - 1].created_at : null,
+    snapshots: snaps.map((s) => ({ id: s.id, scope: s.scope, createdAt: s.created_at })),
+    reverseAuditTasks: published ? buildTopReverseAuditTasks({ db, stage, R, topN }) : [],
+    warnings: published ? [] : [{ code: 'STAGE_NOT_PUBLISHED', message: '该赛段尚未发榜：榜单快照、段位记录与名次积分都还没写' }],
+  };
+}
+
+/**
+ * 名次积分写入流水：**只增不改 + 更正走新记录**（INTERFACES.md §0「追加式」）。
+ *
+ * ⛔ P11 修正：原实现拿「同一赛段同一队伍不重复发」当幂等 ⇒ **重发榜时名次变了也不改分**。
+ *    榜单快照是新的、段位是重算的，唯独个人积分还停在上一轮 ⇒ 奖金依据与榜单对不上，
+ *    而且**没有任何告警**（静默的不一致比报错更危险）。
+ *    现在改成**差额更正**：把「本轮该发多少」与「已发多少」逐人相减，
+ *    差多少就补/扣多少，差额本身作为**新记录**写进流水（原记录一个字都不动 ⇒ 仍满足「只增不改」）。
+ *
+ * ⚠️ 口径边界（写在这里，避免以后被人当成 bug 改掉）：
+ *   · **只纠正当前在册成员**：已离队的成员保留他已挣到的分（与 R-RNK-10「终生上榜」一致）；
+ *   · **中途入队的成员**在下次发榜时补齐他应得的那份（因为他此前没有流水行）；
+ *   · 队内成员之间的份额是**同额**的（该队名次积分），不按贡献分配。
+ */
 function awardStagePoints({ db, editionId, stageId, rules: R, createdAt }) {
   const built = buildStageRanking({ db, stage: repo.getStage(db, stageId), R });
-  const existing = new Set(pointsRepo.listLedgerByStage(db, stageId).map((r) => `${r.team_id}|${r.kind}`));
-  const awarded = [];
+  // 本轮该发多少：队 → 名次积分
+  const desired = new Map();
   for (const row of built.ranking.ordered) {
-    const pts = built.points[row.teamId] ?? 0;
-    if (!pts) continue;
-    if (existing.has(`${row.teamId}|stage_rank`)) continue;    // 幂等
-    for (const m of repo.listTeamMembers(db, row.teamId)) {
-      pointsRepo.insertLedgerEntry(db, {
-        id: randomUUID(), editionId, stageId, teamId: row.teamId, userId: m.user_id,
-        kind: 'stage_rank', points: pts, createdAt,
-      });
-    }
-    awarded.push({ teamId: row.teamId, points: pts });
+    desired.set(row.teamId, built.points[row.teamId] ?? 0);
   }
+  // 已发多少：逐人累加（同一队有多人 ⇒ 每人一份）
+  const already = new Map();
+  for (const r of pointsRepo.listLedgerByStage(db, stageId)) {
+    if (r.kind !== 'stage_rank') continue;
+    const key = `${r.team_id}|${r.user_id}`;
+    already.set(key, (already.get(key) ?? 0) + (Number(r.points) || 0));
+  }
+  // 参与过本赛段名次积分的队伍（含「本轮掉出前三」的队 —— 它们要被扣回差额）
+  const teams = new Set(desired.keys());
+  for (const key of already.keys()) teams.add(String(key).split('|')[0]);
+
+  const awarded = [];
+  const corrections = [];
+  for (const teamId of teams) {
+    const pts = desired.get(teamId) ?? 0;
+    for (const m of repo.listTeamMembers(db, teamId)) {
+      const key = `${teamId}|${m.user_id}`;
+      const delta = pts - (already.get(key) ?? 0);
+      if (!delta) continue;
+      pointsRepo.insertLedgerEntry(db, {
+        id: randomUUID(), editionId, stageId, teamId, userId: m.user_id,
+        kind: 'stage_rank', points: delta, createdAt,
+      });
+      corrections.push({ teamId, userId: m.user_id, points: delta });
+    }
+    if (pts) awarded.push({ teamId, points: pts });
+  }
+  awarded.corrections = corrections;
   return awarded;
 }
 
@@ -404,12 +497,20 @@ function awardMvp({ db, editionId, stageId, rules: R, createdAt }) {
   }
 
   // ② 幂等键 = (届期, 队伍)：同一支队的 MVP 整届只发一次（跨赛段发榜不再重发）
-  const existing = new Set(
-    pointsRepo.listLedgerByEdition(db, editionId)
-      .filter((r) => r.kind === 'mvp')
-      .map((r) => r.team_id),
-  );
-  const awarded = [];
+  //    ⛔ P11 修正：原实现是「这一队发过就整队跳过」⇒ **重发路演赛段时 MVP 赢家变了也不改分**
+  //    （榜单快照是新的，MVP 积分却还是上一轮的）。现在改成**差额更正**，与名次积分同款口径：
+  //    「本轮该发多少」减「已发多少」，差额作为新记录写进流水（原记录不动）。
+  const already = new Map();   // `${teamId}|${userId}` → 已发合计
+  const alreadyTeams = new Set();
+  for (const r of pointsRepo.listLedgerByEdition(db, editionId)) {
+    if (r.kind !== 'mvp') continue;
+    alreadyTeams.add(r.team_id);
+    const key = `${r.team_id}|${r.user_id}`;
+    already.set(key, (already.get(key) ?? 0) + (Number(r.points) || 0));
+  }
+
+  // 先把本轮每个包的 MVP 赢家与分值算出来
+  const desired = new Map();   // teamId → { points, packageId }
   for (const [pkgId, points] of byPackage) {
     // ★ 路演名次积分是【包内第几名】→ 必须先按包过滤，否则外队会挤掉本包真冠军（P3-27）
     const pkgTeamIds = new Set(points.map((p) => p.teamId));
@@ -420,16 +521,30 @@ function awardMvp({ db, editionId, stageId, rules: R, createdAt }) {
     if (!out.mvp) continue;
     const teamId = out.mvp.teamId;
     if (!pkgTeamIds.has(teamId)) continue;      // 防御：获奖队必须属于本任务包
-    if (existing.has(teamId)) continue;    // 幂等（届期级）
     // MVP 积分口径：rules/criteria.mvp.awardPointsSource = 'stage_points_sum'
     const awardPoints = points.filter((p) => p.teamId === teamId).reduce((s, p) => s + (Number(p.points) || 0), 0);
+    desired.set(teamId, { points: awardPoints, packageId: pkgId });
+  }
+
+  // 差额更正：本轮没人拿 MVP 的队（已发过的）要把差额扣回去
+  const teams = new Set([...desired.keys(), ...alreadyTeams]);
+  const awarded = [];
+  const corrections = [];
+  for (const teamId of teams) {
+    const want = desired.get(teamId);
+    const target = want ? want.points : 0;
     for (const m of repo.listTeamMembers(db, teamId)) {
+      const key = `${teamId}|${m.user_id}`;
+      const delta = target - (already.get(key) ?? 0);
+      if (!delta) continue;
       pointsRepo.insertLedgerEntry(db, {
         id: randomUUID(), editionId, stageId, teamId, userId: m.user_id,
-        kind: 'mvp', points: awardPoints, createdAt,
+        kind: 'mvp', points: delta, createdAt,
       });
+      corrections.push({ teamId, userId: m.user_id, points: delta });
     }
-    awarded.push({ teamId, packageId: pkgId, points: awardPoints });
+    if (want) awarded.push({ teamId, packageId: want.packageId, points: want.points });
   }
+  awarded.corrections = corrections;
   return awarded;
 }

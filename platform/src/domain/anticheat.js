@@ -243,3 +243,24 @@ export function detectTiedMutualPeerRate({ peerReviews = [], results = [], thres
   }
   return { flags };
 }
+
+/**
+ * TOP10 反向抽查任务（R-JDG-16，S7 §4.1「组委会对 TOP10 作品电话回访」）。
+ * 只生成任务，不代劳、不自动结案。
+ *
+ * ⛔ P11：从 src/services/anticheat.js **下沉到领域层**（纯函数，浏览器安全）。
+ *    服务层那一份会拖进 node:sqlite ⇒ 演示站用不了 ⇒ 只能另写一份 ⇒ 形状必然漂。
+ *    现在两边 import 同一个函数。
+ */
+export function buildReverseAuditTasks({ results = [], signoffs = [], topN = 10, instruction = '电话回访 TOP 名单，确认签字人理解与签字内容一致' }) {
+  const sorted = [...results].sort((a, b) => Number(a.rank) - Number(b.rank)).slice(0, topN);
+  return sorted.map((r) => ({
+    teamId: r.teamId,
+    rank: Number(r.rank),
+    total: r.total,
+    signoffs: signoffs.filter((s) => s.teamId === r.teamId),
+    instruction,
+    // ⛔ 检测 ≠ 处罚：反向抽查任务同样只告警、不代劳、不自动结案（把边界写进数据本身）
+    action: 'alert_only',
+  }));
+}

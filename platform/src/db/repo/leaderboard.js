@@ -62,11 +62,18 @@ export function listEnterpriseRawTotals(db, stageId) {
 }
 
 /** 加时陈述复议分（破同分链第 2 项，仅决赛） */
-export function listTiebreakVoteTotals(db, stageId) {
-  return db.prepare(`SELECT v.team_id, AVG(v.score) AS tiebreak_extra, COUNT(*) AS n
-    FROM tiebreak_votes v JOIN tiebreak_round r ON r.id = v.tiebreak_round_id
-    WHERE r.stage_id = ? GROUP BY v.team_id`).all(stageId);
-}
+/**
+ * ⛔ P11 · **已删除**：`listTiebreakVoteTotals`（原按 `tiebreak_votes` 直接 AVG 的聚合）。
+ *
+ *    为什么删：它是 `src/services/tiebreak.js::getTiebreakExtraScores` 的**孪生实现**，
+ *    少了两条口径：
+ *      ① 「只消费**已关闭**的轮次」—— 开放中的轮次，其当前均值会被当成最终复议分消费
+ *         ⇒ **榜单随投票进行而漂移**（破同分必须可复算 ⇒ 这条直接违规）；
+ *      ② 「同一队多轮取**最新一轮**」。
+ *    ⇒ 排名路径已统一走服务层（src/services/leaderboard.js 的 buildStageRanking），
+ *      留着一份语义不同又没人调的实现 = 下一个改口径的人会踩坑。
+ *    （机器闸 docs/tools/dead-service-scan.mjs 的存在意义就在这里。）
+ */
 
 /** 最近一次计算快照：降级告警的来源（P2 写，P3 读） */
 export function getLatestComputation(db, stageId) {
@@ -77,6 +84,16 @@ export function getLatestComputation(db, stageId) {
 export function insertSnapshot(db, { id, editionId, stageId, scope, payloadJson, createdAt }) {
   db.prepare('INSERT INTO leaderboard_snapshots (id, edition_id, stage_id, scope, payload_json, created_at) VALUES (?,?,?,?,?,?)')
     .run(id, editionId, stageId ?? null, scope, payloadJson, createdAt);
+}
+
+/**
+ * 某赛段的发榜快照列表（按发榜时间升序）。
+ * ⛔ P11：原先**没有任何读口**能回答「这个赛段发了榜没有」⇒ 前端刷新页面后
+ *    就不知道自己刚做过什么。排序兜底用 SQLite 隐式 `rowid`（不用随机 id 列）。
+ */
+export function listSnapshotsByStage(db, stageId) {
+  return db.prepare('SELECT id, stage_id, scope, created_at FROM leaderboard_snapshots WHERE stage_id = ? ORDER BY created_at ASC, rowid ASC')
+    .all(stageId);
 }
 
 export function insertAuditLog(db, { id = randomUUID(), actorId, action, entity, entityId, detailJson, createdAt }) {

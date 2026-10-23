@@ -40,8 +40,15 @@ import {
   applyScoreStatDelta,
 } from '../db/repo/reviews.js';
 import { listStageJudges, getStageJudge, getStage, listStageTeams, listStageTeamRows } from '../db/repo/stages.js';
+import { hasStageRoster, listStageTeamIds } from '../db/repo/stage-teams.js';
 import { claimRequestKey } from '../db/repo/request-keys.js';
-import { insertEnterpriseConfirmation, listEnterpriseConfirmations } from '../db/repo/enterprise-confirmations.js';
+import {
+  insertEnterpriseConfirmation,
+  listEnterpriseConfirmations,
+  getEnterpriseConfirmationById,
+  findActiveEnterpriseConfirmation,
+  softDeleteEnterpriseConfirmation,
+} from '../db/repo/enterprise-confirmations.js';
 import {
   findPeerReviewsByRequestId,
   findPeerReview,
@@ -122,17 +129,43 @@ function assertStageExists(db, stageId) {
  *   ② 队伍不存在时直接撞外键 → `FOREIGN KEY constraint failed` 漏到 HTTP 层
  *      → **500**（而不是三态状态码要求的 404）。
  * 现在统一按「本赛段名册」判定，不在册 → 404。
- * ⚠️ 名册的粒度目前是**届期级**（stages → edition_id → teams），
- *    赛段级队伍边界需要一张 stage_team 表 —— 登记在 P3（见 P2 计划「已知限制」）。
+ *
+ * ⛔⛔ **P11 · E156：名册粒度改为「赛段级优先、届期级兜底」**
+ *   原来这里用的是**届期级**名册（`listStageTeams` = 同届期的所有队）
+ *   ⇒ **同届期另一赛段的队伍照样能被写进本赛段**（外队进榜）。
+ *   `stage_team` 表（P3 建、P11 · W5 才有写入方）就是为关这个闸门而存在的，
+ *   但它此前**只写不读**（`hasStageRoster` 在生产上零调用方）。
+ *   现在按 P3 计划偏差表 3c 的口径实现：
+ *     · **赛段级名册有数据** ⇒ 以它为准（外队进榜被挡住）；
+ *     · **赛段级名册为空**（赛段刚建、还没报名册）⇒ 回落到届期级
+ *       （否则会把所有评分都拒掉 —— 那是「全死」，比外队进榜更糟）。
  */
 function assertTeamInStage(db, stageId, teamId, label = '队伍') {
   if (!teamId) {
     throw fail(400, 'MISSING_TEAM_ID', `缺少${label}`);
   }
-  const roster = listStageTeams(db, stageId).map((t) => t.teamId);
+  const roster = resolveStageRoster(db, stageId);
   if (!roster.includes(teamId)) {
     throw fail(404, 'TEAM_NOT_IN_STAGE', `${label} ${teamId} 不在本赛段名册内`);
   }
+}
+
+/**
+ * 解析「本赛段名册」（P11 · E156 抽出来的**唯一入口**）。
+ *
+ * ⚠️ **必须走这个函数，不要再直接调 `listStageTeams`** ——
+ *    直接调 = 届期级口径 = 外队进榜的闸门没关上。
+ *    （P3 计划偏差表 3c：名册有数据时优先赛段级、否则回落到届期级。）
+ *
+ * @returns {string[]} 本赛段可写的队伍 id 列表
+ */
+export function resolveStageRoster(db, stageId) {
+  // 赛段级名册有登记 ⇒ 以它为准（**外队进榜在这里被挡住**）
+  if (hasStageRoster(db, stageId)) {
+    return listStageTeamIds(db, stageId);
+  }
+  // 没有登记 ⇒ 回落到届期级（赛段刚建、名册还没录 ⇒ 不能把评分全拒了）
+  return listStageTeams(db, stageId).map((t) => t.teamId);
 }
 
 function assertVotingJudge(db, stageId, judgeId) {
@@ -257,8 +290,8 @@ export function getReviewState({ db, stageId, viewer, dimensions = null }) {
   const cells = listReviewCells(db, stageId);
   const observedTeams = [...new Set(cells.map((c) => c.team_id))].sort();
   const observedDimensions = [...new Set(cells.map((c) => c.dimension))].sort();
-  // 赛段真实名册；名册为空时退回已出现的队伍（赛段还没建队的情况）
-  const roster = listStageTeams(db, stageId).map((t) => t.teamId);
+  // 赛段真实名册（P11 · E156：赛段级优先、届期级兜底）；名册为空时退回已出现的队伍（赛段还没建队的情况）
+  const roster = resolveStageRoster(db, stageId);
   const teams = roster.length ? roster : observedTeams;
   const dimList = Array.isArray(dimensions) && dimensions.length ? [...dimensions].sort() : observedDimensions;
   const judges = listStageJudges(db, stageId).filter((j) => j.seat !== 'observer');
@@ -413,6 +446,15 @@ export function submitEnterpriseConfirmation({ db, stageId, teamId, enterpriseId
   }
   assertScoreInRange(rawScore, '企业确认分');
   assertTeamInStage(db, stageId, teamId);
+  // ⛔ P11 · E148②：同格重签原来直接撞唯一索引 `idx_enterprise_confirmations_cell`
+  //    → SQLite 抛 UNIQUE constraint → **HTTP 500「服务内部错误」**（违反设计文档 §7.3 的三态口径）。
+  //    现在先查同格是否已有**未撤回**的确认 ⇒ 明确报 409，并告诉客户端「要改请走改签」。
+  const existing = findActiveEnterpriseConfirmation(db, { stageId, teamId, dimension, enterpriseId });
+  if (existing) {
+    throw fail(409, 'CONFIRMATION_EXISTS',
+      '该队伍在该维度已有企业确认（同一格只能有一条）。要更正请用「改签」，要撤销请用「撤回」。',
+      { confirmationId: existing.id });
+  }
   const row = insertEnterpriseConfirmation(db, {
     stageId, teamId, enterpriseId, dimension, rawScore, crossJudgeId, signatoryUserId, content, now,
   });
@@ -421,6 +463,155 @@ export function submitEnterpriseConfirmation({ db, stageId, teamId, enterpriseId
     detail: { stageId, dimension, rawScore, hasCrossJudge: !!crossJudgeId }, now,
   });
   return row;
+}
+
+/**
+ * ⛔ P11 · E141：**撤回企业确认**（逆向路径）。
+ *
+ * ⚠️ **为什么必须有它**（E141 实测）：
+ *   企业确认一旦落库就**没有任何改动的途径** ⇒
+ *   ① 签错了（内容写错 / 分数写错）只能永远错下去；
+ *   ② **缺跨领域评委签字**（R2 双签只签了一半）的确认**没法补签** ⇒
+ *      该队的企业席按 R2 计 0 分并挂 warning，而**产品内没有任何办法把它修好**。
+ *   ⇒ 只有正向流程、没有逆向流程，是本项目这一类 bug 的共同病根。
+ *
+ * ⚠️ 撤回是**软删**（deleted_at）：企业确认是计分证据，事后要能查「谁在什么时候签过、后来撤了」。
+ * ⚠️ 撤回**不自动重算**：计分与发榜都是显式动作（设计文档 §869），
+ *    这里只把「需要重算」这件事显式告诉调用方（needsRecompute）。
+ *
+ * @param {object} args
+ * @param {boolean} [args.isCommittee] 组委会可撤任何人的（代录与纠错都需要）
+ */
+export function withdrawEnterpriseConfirmation({ db, id, stageId, actorId, isCommittee = false, now }) {
+  const row = getEnterpriseConfirmationById(db, id);
+  // ⛔ 单条不满足 → 404（不泄露「这条曾经存在过」）
+  if (!row) throw fail(404, 'CONFIRMATION_NOT_FOUND', '企业确认不存在或已被撤回');
+  if (stageId && row.stage_id !== stageId) {
+    throw fail(404, 'CONFIRMATION_NOT_FOUND', '企业确认不存在或已被撤回');
+  }
+  // ⛔ 权限：只有**签字的那家出题企业**本人或组委会能撤。
+  //    跨领域评委**不能**撤（撤了就把人家的签字也一起撤了 —— 那不是他的权限范围）。
+  if (!isCommittee && row.enterprise_id !== actorId) {
+    throw fail(403, 'FORBIDDEN', '只有签字的出题企业（或组委会）可以撤回这条企业确认');
+  }
+  softDeleteEnterpriseConfirmation(db, id, now);
+  writeAuditLog(db, {
+    actorId, action: 'enterprise.confirm.withdraw', entity: 'team', entityId: row.team_id,
+    detail: {
+      stageId: row.stage_id, confirmationId: id, dimension: row.dimension,
+      rawScore: row.raw_score, hasCrossJudge: !!row.cross_judge_id,
+      reason: '企业确认被撤回（软删，证据留痕）',
+    },
+    now,
+  });
+  return {
+    id, withdrawn: true, teamId: row.team_id, stageId: row.stage_id, dimension: row.dimension,
+    needsRecompute: true,
+    hint: '撤回已生效：该队的企业席计分已变化，请重新计算并重新发榜。',
+  };
+}
+
+/**
+ * ⛔ P11 · E141：**改签企业确认**（正向纠错 + R2「后补」路径）。
+ *
+ * ⚠️ **改签 = 软删旧行 + 追加新行**（同格），不是就地覆盖 ——
+ *    企业确认是**计分证据**（INTERFACES.md §0「追加式」：只增不改，更正走新记录）。
+ *    历史留在旧行的 deleted_at 与审计日志里。
+ *
+ * ⛔ **谁可以改什么**（三条硬边界）：
+ *   ① 内容与分数 ⇒ 只有**签字的那家出题企业**本人或组委会（换内容 = 换这家企业的主张）；
+ *   ② **后补跨领域签字** ⇒ 本赛段评委可以给自己补签（crossJudgeId = 自己）；
+ *   ③ **撤销自己的补签** ⇒ 当前 cross_judge_id 本人可以把它清掉（不能动别人的）。
+ *
+ * ⚠️ 这三条同时解决了两个问题：
+ *   · E148①「写端点要不要强制 crossJudgeId」—— **不强制**（R2 是计分口径，不是写入校验），
+ *     改由「后补」路径补齐 ⇒ 不改变 S7 语义；
+ *   · E141「缺双签恒 0 分且产品内修不了」—— 现在能补签了。
+ */
+export function resignEnterpriseConfirmation({
+  db, id, stageId, actorId, isCommittee = false,
+  rawScore = null, content = null, crossJudgeId = undefined, now,
+}) {
+  const row = getEnterpriseConfirmationById(db, id);
+  if (!row) throw fail(404, 'CONFIRMATION_NOT_FOUND', '企业确认不存在或已被撤回');
+  if (stageId && row.stage_id !== stageId) {
+    throw fail(404, 'CONFIRMATION_NOT_FOUND', '企业确认不存在或已被撤回');
+  }
+  const isEnterprise = row.enterprise_id === actorId;
+  const setCross = crossJudgeId !== undefined;
+  const nextCrossJudgeId = setCross ? (crossJudgeId || null) : row.cross_judge_id;
+  const changes = {};
+
+  // ① 内容 / 分数
+  if (rawScore !== null || content !== null) {
+    if (!isCommittee && !isEnterprise) {
+      throw fail(403, 'FORBIDDEN', '只有签字的出题企业（或组委会）可以更正企业确认的内容与分数');
+    }
+    if (rawScore !== null) {
+      assertScoreInRange(rawScore, '企业确认分');
+      if (rawScore !== row.raw_score) changes.rawScore = { from: row.raw_score, to: rawScore };
+    }
+    if (content !== null) {
+      if (!String(content).trim()) {
+        throw fail(400, 'SIGNATURE_CONTENT_REQUIRED', '企业签字必须填写内容（解决了我方哪个具体环节 / 预计落地时间 / 我方投入角色）');
+      }
+      if (content !== row.content) changes.content = { from: row.content, to: content };
+    }
+  }
+
+  // ② 跨领域签字人
+  if (setCross && nextCrossJudgeId !== row.cross_judge_id) {
+    if (!isCommittee) {
+      // 后补：自己给自己补签（本赛段评委）
+      const isBackfill = nextCrossJudgeId === actorId;
+      // 撤自己的补签：当前就是他签的
+      const isSelfRevoke = nextCrossJudgeId === null && row.cross_judge_id === actorId;
+      if (!isBackfill && !isSelfRevoke) {
+        throw fail(403, 'FORBIDDEN', '跨领域评委只能给自己补签，或撤销自己已补的签字');
+      }
+    }
+    if (nextCrossJudgeId) {
+      if (nextCrossJudgeId === row.enterprise_id) {
+        throw fail(400, 'CROSS_JUDGE_SAME_AS_SIGNATORY', '跨领域评委签字人不能与出题企业签字人相同');
+      }
+      if (!getStageJudge(db, row.stage_id, nextCrossJudgeId)) {
+        throw fail(404, 'JUDGE_NOT_ASSIGNED', '跨领域评委不在本赛段名单内');
+      }
+    }
+    changes.crossJudgeId = { from: row.cross_judge_id, to: nextCrossJudgeId };
+  }
+
+  if (!Object.keys(changes).length) {
+    throw fail(400, 'NOTHING_TO_CHANGE', '没有要改的内容：改签必须至少变更一项（内容 / 分数 / 跨领域签字人）');
+  }
+
+  // 软删旧行 + 追加新行（同格）⇒ 唯一索引仍然只允许一条「有效」确认
+  softDeleteEnterpriseConfirmation(db, id, now);
+  const fresh = insertEnterpriseConfirmation(db, {
+    stageId: row.stage_id,
+    teamId: row.team_id,
+    enterpriseId: row.enterprise_id,
+    dimension: row.dimension,
+    rawScore: rawScore !== null ? rawScore : row.raw_score,
+    crossJudgeId: nextCrossJudgeId,
+    signatoryUserId: row.signatory_user_id,
+    content: content !== null ? content : row.content,
+    now,
+  });
+  writeAuditLog(db, {
+    actorId, action: 'enterprise.confirm.resign', entity: 'team', entityId: row.team_id,
+    detail: {
+      stageId: row.stage_id, replacedId: id, confirmationId: fresh.id, dimension: row.dimension,
+      changes,
+    },
+    now,
+  });
+  return {
+    ...fresh,
+    replacedId: id,
+    needsRecompute: true,
+    hint: '改签已生效：该队的企业席计分已变化，请重新计算并重新发榜。',
+  };
 }
 
 /**

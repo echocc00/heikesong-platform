@@ -23,16 +23,19 @@
 //      现在只写「P 席有分」的队伍。
 //   ④ **计算快照可跨赛段读取**（D-26）→ 见 db/repo/computations.js 的 getSnapshotInStage。
 import { getStage, listStageTeams as listStageTeamsRows, listStageJudges } from '../db/repo/stages.js';
-import { listReviews } from '../db/repo/reviews.js';
+import { listReviews, listScoreStats } from '../db/repo/reviews.js';
 import { listEnterpriseConfirmations } from '../db/repo/enterprise-confirmations.js';
 import { listPeerReviews } from '../db/repo/peer-reviews.js';
 import { listSelfReviews } from '../db/repo/self-reviews.js';
 import { listRecusals } from '../db/repo/recusals.js';
-import { insertSnapshot, nextRevision, upsertStageResult, getSnapshotInStage, resetStageResults } from '../db/repo/computations.js';
+import { listUsersForDetection } from '../db/repo/users.js';
+import { upsertStageResult, getSnapshotInStage, resetStageResults } from '../db/repo/computations.js';
 import { writeAuditLog } from '../audit/log.js';
 import { scoreStage } from '../domain/scoring.js';
 import { checkRecusal } from '../domain/review-eligibility.js';
 import { checkJudgePool } from '../domain/judge-pool.js';
+import { recordComputation } from './audit.js';
+import { runDetection } from './anticheat.js';
 import { appError } from '../errors.js';
 
 function fail(status, code, message) {
@@ -200,10 +203,14 @@ export function computeStage({ db, stageId, actorId, now, rules }) {
   // trace 里也留一份：trace 是「计算过程」的完整留痕
   result.trace = { ...(result.trace ?? {}), judgePool: { ok: judgePool.ok, errors: judgePool.errors, stats: judgePool.stats } };
 
-  return inTransaction(db, () => {
-    const revision = nextRevision(db, { stageId, kind: 'stage_score' });
+  const out = inTransaction(db, () => {
     const scoredTeamIds = [];
-    const computationId = insertSnapshot(db, {
+    // ⛔ P11：快照改走**服务层**的 recordComputation（原来这里直接调仓储层 insertSnapshot），
+    //    于是 `computation_snapshots` 有了**两个写者**：compute.js 自己拼参数写一份，
+    //    services/audit.js 的 recordComputation 又写一份（还带一条 `computation.record` 审计）。
+    //    两份实现必然漂 ⇒ 统一到一个写者，服务层那层（校验 + 审计）才是**唯一**入口。
+    const { id: computationId, revision } = recordComputation({
+      db,
       kind: 'stage_score',
       editionId: stage.edition_id,
       stageId,
@@ -211,7 +218,7 @@ export function computeStage({ db, stageId, actorId, now, rules }) {
       input,
       output: { teams: result.teams, warnings: result.warnings },
       trace: result.trace,
-      revision,
+      actorId,
       now,
     });
 
@@ -246,6 +253,46 @@ export function computeStage({ db, stageId, actorId, now, rules }) {
 
     return { computationId, revision, teams: result.teams, warnings: result.warnings, trace: result.trace };
   });
+
+  // ⛔ P11：反作弊检测**必须有一个生产触发点**。
+  //    此前 `runDetection`（设计 §11.1「检测 → 进人工复核队列」）**只有单测在调**，
+  //    路由表里没有任何一条路能触达它 ⇒ 生产上**永远不会建出 flag** ⇒
+  //    「复核队列」页永远是空的 ⇒ 整条防串通/防刷分链是死的。
+  //    ⇒ 挂在「算完之后」这个时机：数据齐了才检测得出来。
+  //    ⛔ 检测 ≠ 处罚：只建 flag（status='open'），不改分、不封号、不自动裁决（裁决是人的动作）。
+  //    ⛔ 检测失败**不许**让计算失败（计算本身已经落库成功）⇒ 降级成一条显式告警，不静默。
+  try {
+    const detection = runDetection({
+      db,
+      stageId,
+      peerReviews: peerReviews.map((p) => ({ judgeId: p.fromTeamId, teamId: p.toTeamId, score: p.score })),
+      // 提交事件（用于「刷分」突发检测）：评委在某时刻提交了一条打分
+      events: allReviews.map((r) => ({ subjectId: r.judge_id, at: r.submitted_at })),
+      scoreStats: listScoreStats(db),
+      users: listUsersForDetection(db),
+      // ⚠️ 名次相关的检测（detectTiedMutualPeerRate）需要**最终名次**，
+      //    而名次是发榜时（破同分链跑完）才有的 ⇒ 计算阶段给不了，这里传空。
+      //    设计 §11.1 的核心要求「两位评委对全部重叠项目给出完全相同的相对顺序」
+      //    （detectIdenticalPeerPattern）**不需要名次** ⇒ 已覆盖。
+      results: [],
+      rules,
+      now,
+    });
+    if (detection?.created?.length) {
+      out.warnings.push({
+        code: 'anticheat_flags_created',
+        message: `本轮检测出 ${detection.created.length} 条疑似异常，已进人工复核队列（只告警，不改分）`,
+        flags: detection.created.length,
+      });
+    }
+  } catch (err) {
+    out.warnings.push({
+      code: 'anticheat_detection_failed',
+      message: `反作弊检测未能完成：${String(err?.message ?? err)}（检测失败不影响已算出的分数）`,
+    });
+  }
+
+  return out;
 }
 
 /** 读取计算快照（三件套）；给了 stageId 时必须属于该赛段（D-26） */

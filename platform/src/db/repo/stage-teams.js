@@ -57,3 +57,19 @@ export function hasStageRoster(db, stageId) {
   const row = db.prepare('SELECT COUNT(*) AS n FROM stage_team WHERE stage_id = ?').get(stageId);
   return Number(row?.n ?? 0) > 0;
 }
+
+/**
+ * 把队伍从赛段名册里退出去（**逆向路径**：退名册）。
+ *
+ * ⚠️ 与 registerStageTeams 相反的方向：**不静默** ——
+ *    重复退同一个队伍会返回 0 行受影响（调用方据此判「本来就不在册」）。
+ *    幂等与否是**服务层**的事（它要先查再决定要不要报错），仓储层只如实报告影响行数。
+ *
+ * @returns {number} 实际删除的行数（0 = 本来就不在名册里）
+ */
+export function removeStageTeam(db, { stageId, teamId }) {
+  const res = db
+    .prepare('DELETE FROM stage_team WHERE stage_id = ? AND team_id = ?')
+    .run(stageId, teamId);
+  return Number(res?.changes ?? 0);
+}

@@ -23,7 +23,7 @@
 // 用法： node docs/tools/plan-block-audit.mjs platform
 //   node docs/tools/plan-block-audit.mjs --selftest   （自检：正则与归因是否正确）
 import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 
 // ── 扩展名白名单 ──────────────────────────────────────────────────────
 // ⛔ **顺序敏感**：`(?:js|html|css|sql|json)` 里 `js` 排在 `json` 前面，
@@ -65,7 +65,46 @@ const PLANS = [
   //    public-api.js / routes/public.js → P5）仍归最早阶段，
   //    改写后必须**逐字同步回 owning 阶段的计划块**（C-RW 必须清零）。
   ['P9', 'docs/superpowers/plans/2026-10-22-platform-P9-ui-redesign.md'],
+  // ⚠️ P8（评审打分页 + 赛段计算发榜页）：新建文件的规格块在这里 ——
+  //    web/views/review.js、web/views/publish.js 等。
+  //    **P8 之前从未进过 PLANS** ⇒ P8 拥有的文件**从来没被审计过**：
+  //    那些文件的计划块漂移**永远查不出来**（审计漏掉阶段 = 漏掉整批漂移）。
+  ['P8', 'docs/superpowers/plans/2026-10-22-platform-P8-review-publish.md'],
+  // ⚠️ P10（设计系统 2.0 + 功能缺口补界面）：新建文件的规格块在这里。
+  //    同样**从未进过 PLANS** ⇒ 同 P8，漂移查不出来。
+  ['P10', 'docs/superpowers/plans/2026-10-22-platform-P10-design-system.md'],
+  // ⚠️ P11（把「写了没接线」的补齐）：新建文件的规格块在这里
+  //    （services/stage.js、http/routes/stages.js、http/routes/publish.js、
+  //      http/routes/tiebreak.js、http/routes/public-tokens.js 等）。
+  //    ⛔ **P11 尤其不能漏**：它就是专门修「实现了、测试也绿了、但产品路径接不上」的阶段
+  //      （P11 计划 §1.1 病根 1：「闸只测服务层，不测产品路径」），
+  //      而审计漏掉它 ⇒ 这个阶段新写的文件**连漂移都没人查**。
+  ['P11', 'docs/superpowers/plans/2026-10-23-platform-P11-wire-up.md'],
 ];
+
+/**
+ * 规格块的实现文件**实际在哪**。
+ *
+ * ⚠️ **P11：不能一律按 `platform/` 解析**（真实教训）：
+ *   仓内有两类被计划块引用的文件 ——
+ *     · `platform/**`（平台实现）⇒ 相对 `platform/`；
+ *     · `docs/tools/**`（**仓级工具**：机器闸脚本本身）⇒ 相对**仓库根**。
+ *   原来一律 `join(platformDir, rel)` ⇒ `docs/tools/x.mjs` 被解析成
+ *   `platform/docs/tools/x.mjs`（不存在）⇒ 误判 **D(无实现)**。
+ *   ⇒ D 分类是「计划里有、实现里没有」，判错就等于**把闸的视野弄瞎**。
+ *   ⇒ 现在：`docs/` 开头的路径按**仓库根**（platformDir 的上一级）解析。
+ *
+ * @param {string} platformDir 平台目录（如 'platform'）
+ * @param {string} rel         计划里引用的路径（相对 platform/ 或仓库根）
+ */
+export function resolveImplPath(platformDir, rel) {
+  const clean = String(rel).replace(/^platform\//, '');
+  if (clean.startsWith('docs/')) {
+    // platformDir 的上一级 = 仓库根（platformDir 通常是 'platform' 或 '<abs>/platform'）
+    return join(dirname(platformDir), clean);
+  }
+  return join(platformDir, clean);
+}
 
 // ⚠️ 主流程（读计划、比对实现、打印清单）**只在直接运行时执行**。
 //    否则 `import { extractPath } from '...plan-block-audit.mjs'`（回归测试要用）
@@ -142,7 +181,7 @@ for (const [pn, p] of PLANS) {
       //    原始整文件块反而「长度不匹配」但它才是有规格意义的那一块。
       let realLines = -1;
       try {
-        realLines = readFileSync(join(platformDir, rel), 'utf8').replace(/\n$/, '').split('\n').length;
+        realLines = readFileSync(resolveImplPath(platformDir, rel), 'utf8').replace(/\n$/, '').split('\n').length;
       } catch { }
       const blines = body.length;
       const isFragment = realLines > 0 && blines / realLines < 0.25;
@@ -158,7 +197,18 @@ const picked = new Map();
 for (const [rel, cands] of best) {
   const solid = cands.filter((c) => !c.isFragment);
   const pool = solid.length ? solid : cands;
-  pool.sort((a, b) => (b.phase.localeCompare(a.phase)) || (b.open - a.open));
+  // ⚠️ **排序键必须认得出两位数阶段号**（实测，Node 22 / ICU 默认 collation）：
+  //    `localeCompare` 默认是**字典序**，不是数值序：
+  //      'P10'.localeCompare('P9')  === -1   ← P10 排在 P9 **前面**
+  //      'P11'.localeCompare('P2')  === -1   ← P11 排在 P2 **前面**
+  //    ⇒ 降序排列会变成 `P9 > P8 > … > P2 > P11 > P10 > P1 > P0`
+  //      —— P10 / P11 被当成**比 P2 还老**的阶段。
+  //    ⇒「取最新阶段那块」会挑到 P2 的旧块，P10 / P11 拥有的文件的漂移
+  //      **永远查不出来**（P11 正是专门修「写了没接线」的阶段，审计漏掉它等于白做）。
+  //    ⇒ 改用 `{ numeric: true }`（数字段按数值比较）：
+  //      P11 > P10 > P9 > P8 > P7 > … > P1 > P0。
+  //      ⚠️ P0–P9 都是一位数 ⇒ 它们之间的相对次序**完全不变** ⇒ 旧结果不受影响。
+  pool.sort((a, b) => (b.phase.localeCompare(a.phase, undefined, { numeric: true })) || (b.open - a.open));
   picked.set(rel, pool[0]);
 }
 best.clear();
@@ -196,7 +246,7 @@ function orderKeepRate(blockLines, implLines) {
 }
 for (const [rel, b] of [...best].sort()) {
   let impl = null;
-  try { impl = readFileSync(join(platformDir, rel), 'utf8').replace(/\n$/, ''); } catch { }
+  try { impl = readFileSync(resolveImplPath(platformDir, rel), 'utf8').replace(/\n$/, ''); } catch { }
   let kind;
   let diag = null;
   if (impl === null) kind = 'D';

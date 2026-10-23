@@ -34,6 +34,10 @@ import { registerMilestoneRoutes } from './http/routes/milestone.js';
 import { registerSignoffRoutes } from './http/routes/signoff.js';
 import { registerBehaviorRoutes } from './http/routes/behavior.js';
 import { registerAuditRoutes } from './http/routes/audit.js';
+import { registerPublishRoutes } from './http/routes/publish.js';
+import { registerTiebreakRoutes } from './http/routes/tiebreak.js';
+import { registerStageRoutes } from './http/routes/stages.js';
+import { registerPublicTokenRoutes } from './http/routes/public-tokens.js';
 import { getLeaderboard, getRollingLeaderboard } from './services/leaderboard.js';
 import { getPerformanceCard } from './services/performance-card.js';
 import { getTeamTier, getTierBoard } from './services/tier.js';
@@ -177,6 +181,22 @@ export function createApp({ db, rules, webDir }) {
   // P10 · W4-b：企业签字台**读**端点（里程碑签字清单 + 企业双签待签清单）
   // ⚠️ 可见性在服务层过滤（src/services/signoff-board.js）—— 前端只负责呈现。
   registerSignoffRoutes(router);
+  // P11 · E149：赛段发榜端点（**计算与发榜是两个独立动作**）
+  // ⛔ 原先服务层的 publishLeaderboard 没有任何路由能触达 ⇒ 名次积分 / 段位记录 /
+  //    榜单快照 / 发榜审计四样全都不写，段位权益永远不解锁。
+  registerPublishRoutes(router);
+  // P11 · W2-b：加时陈述 / 一票破同分（服务层 181 行早就写好且测过，**但一直没有路由**）
+  // ⛔ 同 E149 的病根：实现齐了、产品路径接不上 ⇒ 破同分的人工环节整条不可用。
+  registerTiebreakRoutes(router);
+  // P11 · W5：赛段生命周期端点（建段 / 改配置 / 派评委 / 撤评委 / 报名册 / 退名册）
+  // ⛔ 真机实测生产库 `stages` = 0 ⇒ 评审打分 / 发榜 / 破同分 / 企业签字台
+  //    全部以 `:stageId` 为路径参数 ⇒ **一个都进不去**（E150）。
+  //    设计文档 §9 明写「赛段配置与权重表」这个界面，但 §8 的 API 清单里
+  //    **没有任何建赛段的端点** ⇒ 这里补上（与 E149 同一个病根：设计漏了一条）。
+  registerStageRoutes(router, { db, rules });
+  // P11 · W2-c：公开访问令牌的管理链路（签发 / 列表 / 吊销）
+  // ⛔ 没有创建入口 ⇒ 公开榜单与公开日历两个接口**谁也用不了**。
+  registerPublicTokenRoutes(router);
   // 生产环境 Cookie 加 Secure；开发环境不加（http://127.0.0.1 会被浏览器拒收）
   //
   // ⚠️ COOKIE_SECURE 是**显式覆盖**（不设 = 跟随 NODE_ENV）：

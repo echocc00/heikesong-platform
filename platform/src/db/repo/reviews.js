@@ -110,6 +110,18 @@ export function stdevFromStats(n, mean, sumSq) {
 }
 
 /**
+ * 全部评分统计（反作弊「评委宽严异常」检测用）。
+ *
+ * ⛔ P11 新增：设计 §11.1「评委宽严异常：某评委 stddev 异常小/大 → **告警但不自动处罚**」
+ *    需要「一位评委 × 一个维度」的统计集合，而仓储层原来**只有单条查询**
+ *    （getScoreStat）⇒ 检测器拿不到集合，只能传空数组 ⇒ **这条检测形同虚设**。
+ *    排序兜底用 SQLite 隐式 `rowid`（不用随机 id）。
+ */
+export function listScoreStats(db) {
+  return db.prepare('SELECT judge_id, dimension, n, mean, sum_sq FROM score_stats ORDER BY judge_id, dimension, rowid').all();
+}
+
+/**
  * 增量更新某个 (评委, 维度) 的统计量。
  * @param {number[]} added 新增的原始分
  * @param {number[]} removed 被改分替换掉的旧原始分

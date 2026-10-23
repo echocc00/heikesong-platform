@@ -212,17 +212,11 @@ export function listFlags({ db, filter = {}, viewer = null }) {
 
 /**
  * TOP10 反向抽查任务（R-JDG-16，S7 §4.1「组委会对 TOP10 作品电话回访」）。
- * 只生成任务，不代劳、不自动结案。
+ *
+ * ⛔ P11：实现**下沉到领域层**（src/domain/anticheat.js）——
+ *    它是纯函数，却住在服务层 ⇒ 演示适配器（浏览器端）无法 import
+ *    （服务层会拖进 node:sqlite）⇒ 演示站只能另写一份 ⇒ **形状必然漂**。
+ *    现在演示站与正式站 import **同一个函数** ⇒ 不可能漂（与 buildEventInfo 同款做法）。
+ *    这里保留一个转出，保证既有调用方（src/services/leaderboard.js）一个字都不用改。
  */
-export function buildReverseAuditTasks({ results = [], signoffs = [], topN = 10, instruction = '电话回访 TOP 名单，确认签字人理解与签字内容一致' }) {
-  const sorted = [...results].sort((a, b) => Number(a.rank) - Number(b.rank)).slice(0, topN);
-  return sorted.map((r) => ({
-    teamId: r.teamId,
-    rank: Number(r.rank),
-    total: r.total,
-    signoffs: signoffs.filter((s) => s.teamId === r.teamId),
-    instruction,
-    // ⛔ 检测 ≠ 处罚：反向抽查任务同样只告警、不代劳、不自动结案（把边界写进数据本身）
-    action: 'alert_only',
-  }));
-}
+export { buildReverseAuditTasks } from '../domain/anticheat.js';

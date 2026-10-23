@@ -140,6 +140,13 @@ const VIEW_ENDPOINTS = [
     path: '/api/appeals/ap_demo_1/decide',
     body: { decision: 'accepted', note: '演示裁决' },
   },
+  // ── P11：审计日志页 / 发榜 / 破同分 / 公开令牌 ─────────────────────
+  // ⚠️ P11 漏了审计日志页 —— `GET /api/audit/log` 端点虽然实现了，
+  //    但**没有任何写方** ⇒ 演示站上那页永远是空表（页面接上了却什么也看不到）。
+  { method: 'GET', path: '/api/audit/log' },
+  { method: 'GET', path: '/api/stages/stage_final/publish' },
+  { method: 'GET', path: '/api/stages/stage_final/tiebreak/rounds' },
+  { method: 'GET', path: '/api/public/tokens' },
 ];
 
 test('演示适配器必须实现前端用到的**每一个**端点（缺一个 ⇒ 演示站那页就是 404）', async () => {
