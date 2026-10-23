@@ -131,6 +131,25 @@ export function assertChainInvariants(chain, { behaviorConfig } = {}) {
     errors.push('破同分链必须以确定性兜底项结尾（deterministic: true），否则榜单不可复算（R-AUD-01）');
   }
   if (!chain.some((c) => c.key === 'total')) errors.push('破同分链缺少总分项');
+  // ⚠️ **F43：`tied_only` 的项必须排在 `total` 之后** ——
+  //    `tied_only` 声明的是「这一键**只做破同分**，从不进入主排序」（R-RNK-05：
+  //    互评在评审分里的占比恒为 0% ≤ 20%）。
+  //    ⚠️ **为什么这必须是一条机器闸**：本引擎的排序是**字典序** ⇒ `always` 与
+  //    `tied_only` 在运行时**等价**（后面的键本来就只在前面的键打平时才比较）
+  //    ⇒ 「声明」本身拦不住任何人 ⇒ 只有**链序**能破坏它，而链序是**配置**。
+  //    ⚠️ 没有这条闸时：把 `peer` 挪到 `total` 前面就能让互评变成**主排序键**，
+  //    而**没有任何校验会报错**（实测：审计当时用 peer-first 链跑，输出与 always 完全相同
+  //    —— 因为字典序下「有没有实现这个 scope」根本不改变结果，只有链序才改变）。
+  const totalIdx = chain.findIndex((c) => c.key === 'total');
+  chain.forEach((c, i) => {
+    if ((c.scope || 'always') !== 'tied_only') return;
+    if (i <= totalIdx) {
+      errors.push(
+        `破同分项「${c.key}」是 tied_only（只做破同分），必须排在 total 之后`
+        + '（R-RNK-05：互评从不进入主排序 —— 排在 total 之前就变成主排序键了）',
+      );
+    }
+  });
   const bi = chain.findIndex((c) => c.key === 'behavior');
   if (bi >= 0) {
     if (chain[bi].scope !== 'tied_only') errors.push(`破同分项 'behavior' 的 scope 必须是 tied_only（当前 ${chain[bi].scope}）——R-PTS-08`);
@@ -159,6 +178,17 @@ export function applyTiebreakChain({ candidates, chain, data }) {
   const isFinal = Boolean(data?.isFinal);
   const warnings = [];
   const applied = [];
+  // ⚠️ **F43：`scope` 的语义（这里曾经写错过，必须先说清楚）**
+  //   本引擎的排序是**字典序**（先按第一个键排，键相等的再按第二个键排……）
+  //   ⇒ 在字典序下，`always` 与 `tied_only` **行为等价**：后面的键本来就只在前面的键
+  //   打平时才参与比较。**试图把 `tied_only` 实现成「另一种排序语义」是错的**
+  //   —— 那会把字典序破坏掉（实测：6 条既有破同分用例当场变红）。
+  //   ⇒ `scope` 的**唯一**运行时作用是 `final_only`（「这一轮要不要用这一键」）。
+  //   ⇒ `tied_only` 的作用是**声明意图**：这一键**只做破同分，从不进入主排序**
+  //      （R-RNK-05：互评在评审分里的占比恒为 0% ≤ 20%）。
+  //      这个声明**必须由机器闸兜住** —— 否则改一下 rules/tiebreak.json 的链序，
+  //      互评就能变成主排序键，而没有任何校验会报错。
+  //      ⇒ 见 assertChainInvariants：「`tied_only` 的项必须排在 `total` 之后」。
   let groups = list.length ? [list] : [];
 
   for (const item of chain) {

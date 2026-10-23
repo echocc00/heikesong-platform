@@ -209,6 +209,35 @@ export function validateRules(rules, expectedCount = null) {
     if (cfg.trimmedIterations != null && !(Number.isInteger(cfg.trimmedIterations) && cfg.trimmedIterations >= 1)) {
       push(`scoring.${key} trimmedIterations 必须是 ≥1 的整数`);
     }
+    // ⚠️ **F45（2026-10-23 审计）去极值门槛是**整数阶跃**，必须由配置**显式声明**：
+    //    S7 §3.2 原文「要求该维度有效评委数 ≥ 5，不足则不去极值」⇒ 4 个评委与 5 个评委
+    //    处在**不同的估计量**上（这是规格明写的阶跃，不是缺陷）。
+    //    ⚠️ 为什么要「显式声明」而不是只靠注释：没有声明 ⇒ 没人知道这个阶跃是**刻意**的
+    //    ⇒ 下一个人看到「4 评委 vs 5 评委不一致」会当成 bug 去「修」，把规格改坏。
+    //    ⇒ 声明 + 机器闸：声明的语义与实现不一致时，配置必须**报错**，不许悄悄生效。
+    if (cfg.trimPolicy !== 'threshold') {
+      push(
+        `scoring.${key}.trimPolicy 必须是 "threshold"`
+        + '（S7 §3.2：评委数不足 minJudgesForTrim 时**整档不去极值** —— 整数阶跃是刻意的）',
+      );
+    }
+    if (!Number.isInteger(cfg.minJudgesForTrim) || cfg.minJudgesForTrim < 1) {
+      push(`scoring.${key} minJudgesForTrim 必须是 ≥1 的整数`);
+    }
+    // ⚠️ **F46（2026-10-23 审计）归一化样本数的口径必须由配置**显式声明**：
+    //    `minSamplesForJudgeNormalization` 的「样本数」= **该评委在本赛段评过的队伍数**
+    //    （不是「被评分队伍的样本数」）⇒ 队伍数少于该门槛的赛段里，评委宽严归一化
+    //    会**整段回退**到全局口径（S7 §3.1 + C-05 的既定行为）。
+    //    ⚠️ 同样：没有声明 ⇒ 没人知道这个口径 ⇒ 会被当成 bug「修成别的意思」。
+    if (cfg.minSamplesScope !== 'judge_ratings_count') {
+      push(
+        `scoring.${key}.minSamplesScope 必须是 "judge_ratings_count"`
+        + '（S7 §3.1：样本数 = 该评委在本赛段评过的队伍数）',
+      );
+    }
+    if (!Number.isInteger(cfg.minSamplesForJudgeNormalization) || cfg.minSamplesForJudgeNormalization < 1) {
+      push(`scoring.${key} minSamplesForJudgeNormalization 必须是 ≥1 的整数`);
+    }
     if (cfg.bayesPriorStrength != null && !(Number.isFinite(cfg.bayesPriorStrength) && cfg.bayesPriorStrength >= 0)) {
       push(`scoring.${key} bayesPriorStrength 必须是 ≥0 的有限数`);
     }
@@ -256,6 +285,23 @@ export function validateRules(rules, expectedCount = null) {
     if (chain.some((c) => typeof c.source !== 'string' || !c.source)) {
       push('tiebreak.chain 存在缺少 source 的项（C-03 要求逐项标注来源文档）');
     }
+    // ⚠️ **F43（2026-10-23 审计）：`tied_only` 的项必须排在 `total` 之后** ——
+    //    `tied_only` 声明的是「这一键**只做破同分**，从不进入主排序」（R-RNK-05：
+    //    互评在评审分里的占比恒为 0% ≤ 20%）。
+    //    ⚠️ 本引擎的排序是**字典序** ⇒ `always` 与 `tied_only` 在运行时**等价**
+    //    ⇒ 「声明」拦不住任何人，**只有链序**能破坏它，而链序是配置 ⇒ 必须机器闸。
+    //    ⚠️ **配置层也要拦一道**（不只是领域层的 assertChainInvariants）：
+    //    领域层那道只在**真的算分时**才触发 ⇒ 配置被改坏了却没人跑分，就没人知道。
+    const totalIdx = chain.findIndex((c) => c.key === 'total');
+    chain.forEach((c, i) => {
+      if ((c.scope || 'always') !== 'tied_only') return;
+      if (i <= totalIdx) {
+        push(
+          `tiebreak.chain 的「${c.key}」是 tied_only（只做破同分），必须排在 total 之后`
+          + '（R-RNK-05：互评从不进入主排序 —— 排在 total 之前就变成主排序键了）',
+        );
+      }
+    });
   }
 
   // ── 段位 ─────────────────────────────────────────────────

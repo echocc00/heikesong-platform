@@ -610,7 +610,7 @@ export function removeStageTeam(db, { stageId, teamId }) {
 ```javascript
 {
   "id": "points",
-  "version": "2026-10-23",
+  "version": "2026-10-24",
   "source": "任务书 §七 + S10 §3.3",
   "stagePoints": [10, 8, 5],
   "stagePointsOnlyTopN": 3,
@@ -651,7 +651,7 @@ export function removeStageTeam(db, { stageId, teamId }) {
 ```javascript
 {
   "id": "criteria",
-  "version": "2026-10-23",
+  "version": "2026-10-24",
   "source": "S10 §2.2 段位表附加条件 + R-PTS-03 + R-STG-04 + R-PTS-10 + 任务书 §七（MVP 口径待确认）",
   "tier": {
     "dataOrPrototypeMilestones": ["data_connected", "demo_ready"],

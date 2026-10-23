@@ -1521,3 +1521,144 @@ test('F33 人才池读取必须按届期隔离（不带 editionId 不得返回�
     close();
   }
 });
+
+// ══════════════════════════════════════════════════════════════════
+// 第 8 批（E174）：领域算法 4 条 —— F43 / F44 / F45 / F46
+//   F43 `scope:'tied_only'` 根本没实现（配置在说谎：改链序就能让互评变成主排序键）
+//   F44 少维度的队伍被结构性抬高（**复核后判定为不成立**，见用例注释）
+//   F45 去极值在评委数边界不连续（S7 §3.2 明写的整数阶跃 ⇒ 配置必须显式声明）
+//   F46 归一化回退把整个赛段降级（S7 §3.1 的样本数口径 ⇒ 配置必须显式声明）
+// ══════════════════════════════════════════════════════════════════
+
+// ═══ F43：`tied_only` 作用域必须真的被实现 ═══
+test('F43 破同分链的 tied_only 项必须排在 total 之后（互评不得进主排序）', async () => {
+  const { applyTiebreakChain } = await import('../src/domain/ranking.js');
+
+  // ① `tied_only` 的项排在 `total` **之前** ⇒ **必须拒绝对这条链算分**
+  //    （R-RNK-05：互评只做破同分，从不进入主排序 —— 排在 total 之前就变成主排序键）
+  //    ⚠️ 这条链**只**违反这一条（末项 deterministic、有 total、无 behavior 项）
+  //    ⇒ 报错原因唯一，判别性不会被别的规则污染。
+  //    ⚠️ **为什么需要这条闸（审计当时以为要「实现 tied_only」，那是错的）**：
+  //    本引擎的排序是**字典序** ⇒ `always` 与 `tied_only` 在运行时**等价**
+  //    （后面的键本来就只在前面的键打平时才比较）⇒ 「实现这个 scope」根本改不了输出
+  //    （实测：真去实现它，6 条既有破同分用例当场变红 —— 字典序被破坏）。
+  //    ⇒ 真正能破坏 R-RNK-05 的**只有链序**，而链序是**配置** ⇒ 必须机器闸。
+  const badChain = [
+    { key: 'peer', label: '互评分', direction: 'desc', scope: 'tied_only', source: 'S7 §3.3' },
+    { key: 'total', label: '总分', direction: 'desc', scope: 'always', source: 'S7 §3.1' },
+    { key: 'team_id', label: '队伍编号', direction: 'asc', scope: 'always', deterministic: true, source: 'C-03' },
+  ];
+  assert.throws(
+    () => applyTiebreakChain({
+      candidates: [{ teamId: 'A', total: 90 }, { teamId: 'B', total: 50 }],
+      chain: badChain,
+      data: {},
+    }),
+    /tied_only/,
+    '链首是 tied_only 的链必须被拒（否则改配置就能让互评变成主排序键）',
+  );
+
+  // ② 总分**相同**的两队 ⇒ 并列组里 `tied_only` 的键必须**真的生效**（否则破同分失效）
+  const chain = [
+    { key: 'total', label: '总分', direction: 'desc', scope: 'always', source: 'S7 §3.1' },
+    { key: 'peer', label: '互评分', direction: 'desc', scope: 'tied_only', source: 'S7 §3.3' },
+    { key: 'team_id', label: '队伍编号', direction: 'asc', scope: 'always', deterministic: true, source: 'C-03' },
+  ];
+  const out = applyTiebreakChain({
+    candidates: [
+      { teamId: 'A', total: 90, peer: 10 },
+      { teamId: 'B', total: 90, peer: 99 },
+    ],
+    chain,
+    data: {},
+  });
+  assert.deepEqual(
+    out.ordered.map((c) => c.teamId), ['B', 'A'],
+    '并列组里互评分必须能拆开（tied_only 不是「永不生效」）',
+  );
+
+  // ③ 总分**不同**的两队 ⇒ `tied_only` 的键**不得**把它们拆开（R-RNK-05 的实际效果）
+  const out2 = applyTiebreakChain({
+    candidates: [
+      { teamId: 'A', total: 90, peer: 10 },
+      { teamId: 'B', total: 50, peer: 99 },
+    ],
+    chain,
+    data: {},
+  });
+  assert.deepEqual(
+    out2.ordered.map((c) => c.teamId), ['A', 'B'],
+    '互评只做破同分：总分不同的两队不得被互评分拆开',
+  );
+});
+
+// ═══ F44：少维度的队伍被结构性抬高 —— **复核后判定为不成立**（本用例是「口径钉子」）═══
+test('F44 缺分维度的权重按「记 0（不参与分子分母）」处理，且必须列入 warnings', async () => {
+  // ⚠️ **这条审计结论经复核后判定为不成立**，理由（证据链）：
+  //   ① 设计文档 §11「错误处理与失效防护」表原文：「某维度无人打分 | 该维度权重记 0
+  //      并列入 warnings，**不静默当 0**」⇒ 规格要求的是「**权重**记 0」；
+  //   ② 「权重记 0」的数学含义 = 该维度对分数**无影响**（既不加分也不减分）
+  //      = 分子分母都不含它 = 现有实现（`seatScore` 的分母是**实际参与权重和**）；
+  //   ③ 审计报告用「(0.2×80+0.2×80)/0.9 = 35.56」这个**「分数记 0」**的公式
+  //      去检验「**权重**记 0」的规格 ⇒ 拿 A 去量 B ⇒ 「文案与行为不一致」的结论不成立；
+  //   ④ 代码里的告警文案（`scoring.js`：「该维度权重记 0」）与实现**逐字一致**。
+  //   ⇒ 结论：**不改计分行为**。本用例把口径**钉死**：将来若有人把它改成「缺分记 0」，
+  //   这条用例会红 ⇒ 逼他先改规格。
+  const { seatScore } = await import('../src/domain/trim.js');
+  const out = seatScore({ dimensionScores: { a: 80 }, weights: { a: 0.5, b: 0.5 } });
+  assert.equal(out.weightSum, 0.5, '缺分维度的权重不进分母（= 权重记 0）');
+  assert.equal(out.score, 80, '结果是「已有维度上的相对加权平均」');
+  assert.deepEqual(out.missing, ['b'], '缺分维度必须进 missing（⇒ 会被列成 warning，不静默）');
+
+  // 文案与行为必须**对得上**：文案说「权重记 0」⇒ 权重确实不进分母
+  const src = readFileSync(join(platformDir, 'src', 'domain', 'scoring.js'), 'utf8');
+  assert.match(src, /该维度权重记 0/, '告警文案必须说明「权重记 0」');
+  assert.match(src, /dimension_no_scores/, '缺分维度必须出 warning（不静默当 0）');
+});
+
+// ═══ F45 / F46：规则必须**显式声明**那些「刻意的阶跃与口径」 ═══
+test('F45/F46 去极值阶跃与归一化样本数口径必须由规则显式声明，且有机器闸', async () => {
+  const { loadRules, validateRules } = await import('../src/config.js');
+  const { rules } = loadRules(rulesDir);
+
+  // ① 规则里必须**写明**这两件事（配置自解释：否则下一个人会当 bug 去「修」）
+  for (const key of ['initial', 'final']) {
+    const cfg = rules.scoring[key];
+    assert.equal(
+      cfg.trimPolicy, 'threshold',
+      `scoring.${key}.trimPolicy 必须显式声明「整数阶跃去极值」（S7 §3.2）—— 没有声明 ⇒ 没人知道这个阶跃是刻意的`,
+    );
+    assert.equal(
+      cfg.minSamplesScope, 'judge_ratings_count',
+      `scoring.${key}.minSamplesScope 必须显式声明「样本数 = 该评委在本赛段评过的队伍数」（S7 §3.1）`,
+    );
+  }
+
+  // ② 机器闸：把声明**删掉** ⇒ 必须报错（不许悄悄生效）
+  for (const key of ['initial', 'final']) {
+    const broken = JSON.parse(JSON.stringify(rules));
+    delete broken.scoring[key].trimPolicy;
+    const errs = validateRules(broken, Object.keys(broken).length);
+    assert.ok(
+      errs.some((e) => e.includes(`scoring.${key}.trimPolicy`)),
+      `删掉 scoring.${key}.trimPolicy 必须报错（配置在说谎 ⇒ 机器闸必须拦住）`,
+    );
+
+    const broken2 = JSON.parse(JSON.stringify(rules));
+    delete broken2.scoring[key].minSamplesScope;
+    const errs2 = validateRules(broken2, Object.keys(broken2).length);
+    assert.ok(
+      errs2.some((e) => e.includes(`scoring.${key}.minSamplesScope`)),
+      `删掉 scoring.${key}.minSamplesScope 必须报错`,
+    );
+  }
+
+  // ③ 机器闸：破同分链首改成 tied_only ⇒ 必须报错（R-RNK-05）
+  const brokenChain = JSON.parse(JSON.stringify(rules));
+  brokenChain.tiebreak.chain[0] = { ...brokenChain.tiebreak.chain[0], scope: 'tied_only' };
+  const errs3 = validateRules(brokenChain, Object.keys(brokenChain).length);
+  assert.ok(
+    errs3.some((e) => e.includes('tied_only')),
+    '把破同分链首改成 tied_only 必须报错（否则改配置就能让互评变成主排序键）',
+  );
+});
