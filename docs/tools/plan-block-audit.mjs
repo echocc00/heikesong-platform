@@ -80,6 +80,11 @@ const PLANS = [
   //      （P11 计划 §1.1 病根 1：「闸只测服务层，不测产品路径」），
   //      而审计漏掉它 ⇒ 这个阶段新写的文件**连漂移都没人查**。
   ['P11', 'docs/superpowers/plans/2026-10-23-platform-P11-wire-up.md'],
+  // ⚠️ P12（UI 改造：把「四页长得一样」变成「四种工作台」）：新建文件的规格块在这里
+  //    （platform/test/ui-committee-contract.test.js —— 委员会操作台的 UI 契约闸）。
+  //    ⛔ **不能漏**：P12 改的是 styles.css / ui.js / 四个视图（P0 / P7 / P11 owns），
+  //      同步回 owning 阶段后，P12 自己拥有的新文件也必须被审计到。
+  ['P12', 'docs/superpowers/plans/2026-10-23-platform-P12-ui-retrofit.md'],
 ];
 
 /**

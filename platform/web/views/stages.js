@@ -38,7 +38,7 @@
 import { escapeHtml } from '../escape.js';
 import {
   badge, emptyState, errorState, kvList, loadingState, noticeState, pageHead,
-  panel, sectionTitle, statRow, tableWrap,
+  panel, sectionTitle, statRow, tableWrap, workbench, workbenchItem,
 } from '../ui.js';
 
 // ── 枚举（口径与服务层 src/services/stage.js 同一份）──────────────────
@@ -213,7 +213,20 @@ export function editionPickerHtml(editions, editionId) {
     </div>`;
 }
 
-/** 赛段列表（纯 HTML）：代号 / 名称 / 类型 / 时间窗 / 状态 + 选中的入口。 */
+/**
+ * 赛段列表（纯 HTML）：左轨里的**赛段选择器**。
+ *
+ * ⚠️ **P12：从表格改成列表**（不是为了好看，是因为表格放不下）：
+ *    改版前这里是一张 6 列表格（代号/名称/类型/时间窗/状态/操作），
+ *    而整个页面是「一列面板一字排开」⇒ 表格和 5 张操作面板**同权重**，
+ *    访客在一屏里既找不到「我现在操作的是哪个赛段」，也读不完一张宽表。
+ *    ⇒ 改成左轨的**条目列表**（代号 / 名称 / 类型·状态·时间窗一行），
+ *      当前赛段用 `is-active` 着色（tinted）标出。
+ *    ⚠️ **类型与状态用纯文字而不是 badge**：左轨是导航面，
+ *      再往里塞彩色徽章会把「每屏强调色 ≤ 3」顶破（实测赛段配置页曾出现 4 档）。
+ * @param {Array}  stages      赛段列表
+ * @param {string} selectedId  当前选中的赛段 id
+ */
 export function stageListHtml(stages, selectedId) {
   const list = Array.isArray(stages) ? stages : [];
   if (!list.length) {
@@ -222,25 +235,24 @@ export function stageListHtml(stages, selectedId) {
       hint: '用下面的「新建赛段」建一条 —— 评审、发榜、破同分、企业签字台全都挂在赛段上，没有赛段这些页面一个都进不去。',
     });
   }
-  const rows = list.map((s) => {
+  const items = list.map((s) => {
     const kind = stageKindLabel(s.kind);
     const status = stageStatusLabel(s.status);
     const on = String(s.id ?? '') === String(selectedId ?? '');
     const window = `${fmtStageTime(s.startsAt) || '—'} → ${fmtStageTime(s.endsAt) || '—'}`;
-    return `<tr${on ? ' class="is-active"' : ''}>
-      <td>${escapeHtml(s.key ?? '—')}</td>
-      <td>${escapeHtml(s.name ?? '—')}</td>
-      <td>${badge(kind.label, kind.tone)}</td>
-      <td>${escapeHtml(window)}</td>
-      <td>${badge(status.label, status.tone)}</td>
-      <td><button type="button" class="btn btn--ghost btn--sm" data-action="stage-select" data-stage-id="${escapeHtml(s.id ?? '')}"${on ? ' disabled' : ''}>${on ? '当前赛段' : '进入配置'}</button></td>
-    </tr>`;
+    // ⚠️ 条目的形状由 web/ui.js 的 workbenchItem() 统一产出
+    //    （条件 class 不许在视图里用模板表达式拼 —— 见 ui.js 的说明）。
+    return `<li>${workbenchItem({
+      key: s.key ?? '—',
+      name: s.name ?? '—',
+      meta: `${kind.label} · ${status.label} · ${window}`,
+      active: on,
+      action: 'stage-select',
+      dataKey: 'stage-id',
+      dataValue: s.id ?? '',
+    })}</li>`;
   }).join('');
-  return tableWrap(
-    `<thead><tr><th>代号</th><th>名称</th><th>类型</th><th>时间窗</th><th>状态</th><th></th></tr></thead>
-     <tbody>${rows}</tbody>`,
-    { caption: '本届期赛段列表' },
-  );
+  return `<ul class="workbench__list">${items}</ul>`;
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -728,6 +740,17 @@ export function stageConfigStats(model = {}) {
  *   drafts, pending
  * }
  */
+/**
+ * 赛段配置页（纯 HTML）。
+ *
+ * ⚠️ **P12：页面形状 = 操作台（左轨选对象 + 右画布做操作）**。
+ *    改版前是「head + 指标行 + 6 张同款面板」的一字排开（实测顶层结构：
+ *    div.stack > header + div.stat-row + section.panel × 6）⇒
+ *    六个面板同权重同材质，访客既分不出主次，也找不到「我现在操作的是哪个赛段」。
+ *    ⇒ 左轨 = 届期 + 赛段选择器（导航器 ⇒ 材质下沉）；
+ *      右画布 = 指标 + 五个操作面板（工作面 ⇒ 材质浮起）。
+ *    样式见 web/styles.css ⑫ 段；结构由 web/ui.js 的 workbench() 统一产出。
+ */
 export function stageConfigPageHtml(model = {}) {
   const head = pageHead({
     title: '赛段配置与权重表',
@@ -743,76 +766,84 @@ export function stageConfigPageHtml(model = {}) {
     })
     : '';
 
-  if (model.loading) {
-    return head + loadingState({ rows: 4, label: '正在加载赛段配置…' });
-  }
-
   const editions = Array.isArray(model.editions) ? model.editions : [];
   const stages = Array.isArray(model.stages) ? model.stages : [];
-  const listPanel = panel({
+  const railPanel = panel({
     title: '届期与赛段',
     desc: '赛段从属于届期：建段、改配置、派评委、报名册都在本届期下操作。',
     body: editionPickerHtml(editions, model.editionId ?? '') + stageListHtml(stages, model.stageId ?? ''),
   });
 
+  if (model.loading) {
+    // ⚠️ 加载中**不要**先渲染赛段列表（那时 stages 还是空数组 ⇒ 会闪一句
+    //    「本届期还没有赛段」，那是**假消息**）⇒ 轨里只放加载态。
+    return head + workbench({
+      rail: panel({ title: '届期与赛段', body: loadingState({ rows: 2, label: '正在加载届期与赛段…' }) }),
+      canvas: loadingState({ rows: 4, label: '正在加载赛段配置…' }),
+    });
+  }
+
   if (model.error) {
-    return head
-      + listPanel
-      + feedbackHtml
-      + errorState({
+    return head + workbench({
+      rail: railPanel,
+      canvas: feedbackHtml + errorState({
         message: stageErrorText(model.errorStatus, model.error),
         hint: '赛段配置需要组委会能力（stage:compute）；确认已登录并拥有该能力后点「重试」。',
-      });
+      }),
+    });
   }
 
   const drafts = model.drafts ?? {};
   const stage = model.stage ?? null;
 
-  return head
-    + feedbackHtml
-    + statRow(stageConfigStats(model))
-    + listPanel
-    + panel({
-      title: '新建赛段',
-      desc: '代号与类型建后不可改 —— 它们决定赛段在赛程里的位置。',
-      body: stageCreateFormHtml({ draft: drafts.create ?? {}, configs: model.configs ?? [] }),
-    })
-    + panel({
-      title: '赛段配置',
-      desc: '改名称、时间窗、冻结时间与权重表；代号与类型不可改。',
-      body: stageConfigHtml({ stage, draft: drafts.edit ?? {}, configs: model.configs ?? [] }),
-    })
-    + panel({
-      title: '权重表（只读）',
-      desc: '当前赛段用的是哪一张权重表、席构成约束是什么。改表要改 rules/scoring-*.json，重启即生效。',
-      body: weightTableHtml({
-        configs: model.configs ?? [],
-        scoringConfigKey: stage?.scoringConfigKey ?? stage?.scoring_config_key ?? '',
-        degraded: Boolean(model.configsDegraded),
-        degradedStatus: model.configsStatus ?? null,
+  return head + workbench({
+    rail: railPanel,
+    canvas: [
+      feedbackHtml,
+      statRow(stageConfigStats(model)),
+      panel({
+        title: '新建赛段',
+        desc: '代号与类型建后不可改 —— 它们决定赛段在赛程里的位置。',
+        body: stageCreateFormHtml({ draft: drafts.create ?? {}, configs: model.configs ?? [] }),
       }),
-    })
-    + panel({
-      title: '评委席',
-      desc: '派评委 = 选人 + 选席；撤评委是逆向路径，会连带解除该评委在本赛段签署的利益冲突声明。',
-      body: judgeSeatHtml({
-        judges: model.judges ?? [],
-        candidates: model.candidates ?? [],
-        draft: drafts.assign ?? {},
-        pending: model.pending ?? null,
-        stageName: stage?.name ?? '',
+      panel({
+        title: '赛段配置',
+        desc: '改名称、时间窗、冻结时间与权重表；代号与类型不可改。',
+        body: stageConfigHtml({ stage, draft: drafts.edit ?? {}, configs: model.configs ?? [] }),
       }),
-    })
-    + panel({
-      title: '名册',
-      desc: '名册里的队伍才会出现在本赛段的评审与名次里；退名册是逆向路径。',
-      body: rosterHtml({
-        teams: model.teams ?? [],
-        rosterTeamIds: model.rosterTeamIds ?? [],
-        pending: model.pending ?? null,
-        stageName: stage?.name ?? '',
+      panel({
+        title: '权重表（只读）',
+        desc: '当前赛段用的是哪一张权重表、席构成约束是什么。改表要改 rules/scoring-*.json，重启即生效。',
+        body: weightTableHtml({
+          configs: model.configs ?? [],
+          scoringConfigKey: stage?.scoringConfigKey ?? stage?.scoring_config_key ?? '',
+          degraded: Boolean(model.configsDegraded),
+          degradedStatus: model.configsStatus ?? null,
+        }),
       }),
-    });
+      panel({
+        title: '评委席',
+        desc: '派评委 = 选人 + 选席；撤评委是逆向路径，会连带解除该评委在本赛段签署的利益冲突声明。',
+        body: judgeSeatHtml({
+          judges: model.judges ?? [],
+          candidates: model.candidates ?? [],
+          draft: drafts.assign ?? {},
+          pending: model.pending ?? null,
+          stageName: stage?.name ?? '',
+        }),
+      }),
+      panel({
+        title: '名册',
+        desc: '名册里的队伍才会出现在本赛段的评审与名次里；退名册是逆向路径。',
+        body: rosterHtml({
+          teams: model.teams ?? [],
+          rosterTeamIds: model.rosterTeamIds ?? [],
+          pending: model.pending ?? null,
+          stageName: stage?.name ?? '',
+        }),
+      }),
+    ].join(''),
+  });
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -832,7 +863,7 @@ export function stageConfigPageHtml(model = {}) {
  */
 export async function renderStageConfig(ctx) {
   const wrap = document.createElement('div');
-  wrap.className = 'stack';
+  wrap.className = 'stack stagecfg-view';
 
   const state = {
     loading: true,

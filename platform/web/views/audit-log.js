@@ -30,7 +30,7 @@
 import { escapeHtml } from '../escape.js';
 import {
   badge, emptyState, errorState, loadingState, noticeState, pageHead, panel,
-  sectionTitle, statRow, tableWrap,
+  sectionTitle, statRow, tableWrap, workbench,
 } from '../ui.js';
 
 /** 默认每页条数（服务端 queryAuditLog 的默认 limit 也是 100，这里取更保守的 50）。 */
@@ -340,30 +340,35 @@ function actionOf(ev) {
  */
 export async function renderAuditLog(ctx) {
   const wrap = document.createElement('div');
-  wrap.className = 'stack';
+  wrap.className = 'stack auditlog-view';
 
-  const head = document.createElement('div');
-  head.innerHTML = `
-    ${pageHead({
+  // ⚠️ **P12：页面形状 = 操作台（左轨过滤 + 右画布看审计流）**。
+  //    改版前是「head + 过滤面板 + 事件表」一字排开 ⇒ 五个过滤输入框
+  //    与审计流水同权重，**读审计的人第一眼看到的是表单而不是记录**。
+  //    ⇒ 左轨 = 过滤条（控件条 ⇒ 材质平，描边用虚线表示「这是一条控件」）；
+  //      右画布 = 指标 + 状态 + 流水 + 翻页。
+  //    骨架统一由 web/ui.js 的 workbench() 产出（四个委员会页同一份结构）。
+  wrap.innerHTML = [
+    pageHead({
       title: '审计日志',
       sub: '审计与复算：谁、在什么时候、对什么做了什么。记录不可编辑 —— 审计轨迹是复盘的唯一凭据。',
-    })}
-    <div id="al-stats"></div>
-    <p class="muted small" id="al-msg">正在加载审计日志…</p>
-    <div id="al-state"></div>`;
-  wrap.appendChild(head);
+    }),
+    workbench({
+      rail: '<div id="al-filters"></div>',
+      canvas: [
+        '<div id="al-stats"></div>',
+        '<p class="muted small" id="al-msg">正在加载审计日志…</p>',
+        '<div id="al-state"></div>',
+        '<div id="al-body"></div>',
+      ].join(''),
+    }),
+  ].join('');
 
-  const filters = document.createElement('div');
-  filters.id = 'al-filters';
-  wrap.appendChild(filters);
-
-  const body = document.createElement('div');
-  body.id = 'al-body';
-  wrap.appendChild(body);
-
-  const msg = head.querySelector('#al-msg');
-  const statsBox = head.querySelector('#al-stats');
-  const stateBox = head.querySelector('#al-state');
+  const filters = wrap.querySelector('#al-filters');
+  const statsBox = wrap.querySelector('#al-stats');
+  const msg = wrap.querySelector('#al-msg');
+  const stateBox = wrap.querySelector('#al-state');
+  const body = wrap.querySelector('#al-body');
 
   // ⚠️ 初始过滤条件从 ctx.query 取（深链可分享）；本视图自己持有后续改动
   //    （不写全局 store：全局 store 会被别的视图读到）。

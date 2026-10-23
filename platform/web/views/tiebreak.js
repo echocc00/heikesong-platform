@@ -23,7 +23,7 @@
 import { escapeHtml } from '../escape.js';
 import {
   badge, emptyState, emptyRow, errorState, loadingState, noticeState, pageHead,
-  panel, rankBadge, sectionTitle, statRow, tableWrap,
+  panel, rankBadge, sectionTitle, statRow, tableWrap, workbench,
 } from '../ui.js';
 
 /** 投票分范围：0–100 百分制（与服务层 SCORE_OUT_OF_RANGE 同一口径）。 */
@@ -285,6 +285,16 @@ function actionsPanelHtml({ round, roster, minutes }) {
  * 整页 HTML（纯函数，可单测）。
  * @param {object} model { loading, error, stageId, stages, round, votes, tallies, teamNames, roster, minutes, feedback, teamDraft, scoreDraft }
  */
+/**
+ * 加时陈述页（纯 HTML）。
+ *
+ * ⚠️ **P12：页面形状 = 操作台（左轨选赛段 + 右画布做操作）**。
+ *    改版前是「head + 赛段面板 + 5 张同款面板」一字排开 ⇒ 改版前实测
+ *    6/10 个面共用同一签名（card-kit 同质化），且「我现在复议的是哪个赛段」
+ *    只有一个孤零零的下拉框，没有位置感。
+ *    ⇒ 左轨 = 赛段（上下文选择器 ⇒ 材质与画布平等，描边）；
+ *      右画布 = 轮次 / 投票 / 统计 / 明细 / 操作。
+ */
 export function tiebreakPageHtml(model = {}) {
   const head = pageHead({
     title: '加时陈述 · 一票破同分',
@@ -292,25 +302,31 @@ export function tiebreakPageHtml(model = {}) {
   });
   const stages = Array.isArray(model.stages) ? model.stages : [];
   const stagePanel = panel({
-    title: '赛段',
+    title: '选择赛段',
     desc: '加时陈述按赛段开轮 —— 同一赛段同时只能有一轮进行中的加时陈述。',
     body: stagePickerHtml(stages, model.stageId ?? ''),
   });
 
   if (model.loading) {
-    return `${head}${stagePanel}${loadingState({ rows: 4, label: '正在加载加时陈述…' })}`;
+    return head + workbench({ rail: stagePanel, canvas: loadingState({ rows: 4, label: '正在加载加时陈述…' }) });
   }
   if (model.error) {
-    return `${head}${stagePanel}${errorState({
-      message: model.error,
-      hint: '点「重试」重新拉一次加时陈述数据。',
-    })}`;
+    return head + workbench({
+      rail: stagePanel,
+      canvas: errorState({
+        message: model.error,
+        hint: '点「重试」重新拉一次加时陈述数据。',
+      }),
+    });
   }
   if (!model.stageId) {
-    return `${head}${stagePanel}${emptyState({
-      title: '先选一个赛段',
-      hint: '加时陈述挂在赛段上：同一赛段同时只能有一轮进行中的加时陈述。',
-    })}`;
+    return head + workbench({
+      rail: stagePanel,
+      canvas: emptyState({
+        title: '先选一个赛段',
+        hint: '加时陈述挂在赛段上：同一赛段同时只能有一轮进行中的加时陈述。',
+      }),
+    });
   }
 
   const teamNames = model.teamNames ?? {};
@@ -327,14 +343,17 @@ export function tiebreakPageHtml(model = {}) {
     })
     : '';
 
-  return `${head}
-    ${stagePanel}
-    ${feedbackHtml}
-    ${panel({ title: '当前轮次', desc: '陈述截止后由评委席复议投票。', body: roundPanelHtml(model.round, tiedTeams, pendingTeams, voteRows.length) })}
-    ${panel({ title: '投一票', desc: '一人一队一票；观察员无投票权，已回避的评委不能投。', body: voteFormHtml(model.round, tiedTeams, { teamId: model.teamDraft ?? '', score: model.scoreDraft ?? '' }) })}
-    ${panel({ title: '复议分统计', desc: '票数 / 总分 / 均值（均值高者领先）。', body: tallyTableHtml(tallyRows) })}
-    ${panel({ title: '投票明细', desc: '谁投了多少分。', body: voteTableHtml(voteRows, tallyRows) })}
-    ${panel({ title: '轮次操作', desc: '开轮次与关轮次由组委会执行（stage:compute）。', body: actionsPanelHtml({ round: model.round, roster: model.roster ?? [], minutes: model.minutes ?? DEFAULT_MINUTES }) })}`;
+  return head + workbench({
+    rail: stagePanel,
+    canvas: [
+      feedbackHtml,
+      panel({ title: '当前轮次', desc: '陈述截止后由评委席复议投票。', body: roundPanelHtml(model.round, tiedTeams, pendingTeams, voteRows.length) }),
+      panel({ title: '投一票', desc: '一人一队一票；观察员无投票权，已回避的评委不能投。', body: voteFormHtml(model.round, tiedTeams, { teamId: model.teamDraft ?? '', score: model.scoreDraft ?? '' }) }),
+      panel({ title: '复议分统计', desc: '票数 / 总分 / 均值（均值高者领先）。', body: tallyTableHtml(tallyRows) }),
+      panel({ title: '投票明细', desc: '谁投了多少分。', body: voteTableHtml(voteRows, tallyRows) }),
+      panel({ title: '轮次操作', desc: '开轮次与关轮次由组委会执行（stage:compute）。', body: actionsPanelHtml({ round: model.round, roster: model.roster ?? [], minutes: model.minutes ?? DEFAULT_MINUTES }) }),
+    ].join(''),
+  });
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -354,7 +373,7 @@ export function tiebreakPageHtml(model = {}) {
 export async function renderTiebreak(ctx) {
   const wrap = document.createElement('div');
   // ⚠️ 只用**既有** class（不造新的 CSS 类、不写 <style>）：stack = 通用纵向堆叠。
-  wrap.className = 'stack';
+  wrap.className = 'stack tiebreak-view';
 
   const state = {
     stageId: String(ctx?.params?.stageId ?? ctx?.query?.stageId ?? ''),

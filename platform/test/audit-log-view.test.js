@@ -284,7 +284,8 @@ test('DOM：页面调的是 GET /api/audit/log，流水表与指标都渲染出�
   assert.equal(api.calls.length, 1, '首次挂载必须请求一次');
   assert.ok(api.calls[0].startsWith('/api/audit/log'), `端点不对：${api.calls[0]}`);
 
-  const head = wrap.children[0];
+  // ⚠️ P12：页面改成「左轨过滤 + 右画布看流水」的操作台 ⇒ 指标行在画布里，
+  //    不再是 wrap 的第一个子节点（旧写法 wrap.children[0] 已经取不到它）。
   const body = wrap.querySelector('#al-body');
   assert.ok(body.innerHTML.includes('<table'), '要有审计流水表');
   assert.ok(body.innerHTML.includes('computation.record'), '动作列要出现');
@@ -292,7 +293,7 @@ test('DOM：页面调的是 GET /api/audit/log，流水表与指标都渲染出�
   assert.ok(body.innerHTML.includes('u_admin'), '操作者列要出现');
   assert.ok(body.innerHTML.includes('2026-10-22T00:00:00.000Z'), '时间列要出现');
 
-  const stats = head.querySelector('#al-stats').innerHTML;
+  const stats = wrap.querySelector('#al-stats').innerHTML;
   assert.ok(stats.includes('总条数'), '指标行要有总条数');
   assert.ok(stats.includes('当前页条数'), '指标行要有当前页条数');
   assert.ok(stats.includes('可查起始日'), '指标行要有可查起始日');
@@ -432,8 +433,8 @@ test('DOM：错误态给可点的重试按钮，点它真的重跑一次', async
   };
   const wrap = await renderAuditLog({ api });
 
-  const head = wrap.children[0];
-  const state = head.querySelector('#al-state');
+  // ⚠️ P12：操作台改造后状态区在右画布里，不再是 wrap 的第一个子节点。
+  const state = wrap.querySelector('#al-state');
   assert.ok(state.innerHTML.includes('data-action="retry"'), '错误态必须有可点的重试按钮');
   assert.ok(state.innerHTML.includes('后端炸了'), '错误消息要透出来');
 

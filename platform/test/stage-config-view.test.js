@@ -252,7 +252,10 @@ test('赛段列表：可以点选进入配置（委托用的 data-action）', ()
   const html = stageListHtml(STAGES, 'st_1');
   assert.ok(html.includes('data-action="stage-select"'), '要有选择动作');
   assert.ok(html.includes('data-stage-id="st_2"'), '要带上赛段 id');
-  assert.ok(html.includes('当前赛段'), '选中的那个要标出来');
+  // ⚠️ P12：选中的那个改成「左轨条目 + is-active + aria-current」，
+  //    旧的「当前赛段」按钮文字没有了 ⇒ 断言改看这两个标记。
+  assert.ok(html.includes('is-active'), '选中的那个要标出来');
+  assert.ok(html.includes('aria-current="true"'), '选中的那个要告诉读屏器「你在这儿」');
 });
 
 test('赛段列表：一个赛段都没有 ⇒ 空态（不是报错）', () => {

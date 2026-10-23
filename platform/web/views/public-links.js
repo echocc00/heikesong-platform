@@ -26,7 +26,7 @@
 import { escapeHtml } from '../escape.js';
 import {
   badge, emptyState, errorState, loadingState, noticeState, pageHead, panel,
-  statRow, tableWrap, sectionTitle,
+  statRow, tableWrap, sectionTitle, workbench,
 } from '../ui.js';
 
 /**
@@ -248,29 +248,38 @@ export function issuedTokenHtml(issued = {}) {
  */
 export async function renderPublicLinks(ctx) {
   const wrap = document.createElement('div');
-  wrap.className = 'stack';
+  wrap.className = 'stack publinks-view';
   const api = ctx.api;
   let items = [];
   // ⛔ 明文只活在这一次的挂载期里（**不进 ctx.setState**：全局 store 会被别的视图读到）。
   let issued = null;
   const editionFilter = ctx.query?.editionId ? String(ctx.query.editionId) : '';
 
+  // ⚠️ **P12：页面形状 = 操作台（左轨签发 + 右画布看结果）**。
+  //    改版前是「head + 指标 + 两张面板」一字排开 ⇒ 签发表单与令牌列表同权重，
+  //    而它们其实是**一对**关系：左轨是动作，右画布是动作的结果。
+  //    ⛔ 三个挂载点（data-stats / data-issued / data-list）**必须保留** ——
+  //    局部重绘靠它们定位（DP-81：不许整页刷新、不许冲掉已填内容）。
   wrap.innerHTML = [
     pageHead({
       title: '公开访问链接',
       sub: '公开榜单与赛程日历接口都必须带 token；在这里签发、查看与吊销。',
     }),
-    `<div data-stats>${statRow(tokenStats(items))}</div>`,
-    '<div data-issued></div>',
-    panel({
-      title: '签发新令牌',
-      desc: '明文只在签发时显示一次；库里只存哈希，丢了只能重发一枚。',
-      body: issueFormHtml(),
-    }),
-    panel({
-      title: '已签发的令牌',
-      desc: '短标识只是哈希的前几位，用来分辨是哪一枚 —— 它不是可用的令牌。',
-      body: '<div data-list></div>',
+    workbench({
+      rail: panel({
+        title: '签发新令牌',
+        desc: '明文只在签发时显示一次；库里只存哈希，丢了只能重发一枚。',
+        body: issueFormHtml(),
+      }),
+      canvas: [
+        '<div data-issued></div>',
+        `<div data-stats>${statRow(tokenStats(items))}</div>`,
+        panel({
+          title: '已签发的令牌',
+          desc: '短标识只是哈希的前几位，用来分辨是哪一枚 —— 它不是可用的令牌。',
+          body: '<div data-list></div>',
+        }),
+      ].join(''),
     }),
   ].join('');
 

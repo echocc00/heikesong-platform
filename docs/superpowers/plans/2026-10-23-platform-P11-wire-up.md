@@ -1585,7 +1585,7 @@ export function removeStageTeam({ db, stageId, teamId, actorId = null, now }) {
 import { escapeHtml } from '../escape.js';
 import {
   badge, emptyState, emptyRow, errorState, loadingState, noticeState, pageHead,
-  panel, rankBadge, sectionTitle, statRow, tableWrap,
+  panel, rankBadge, sectionTitle, statRow, tableWrap, workbench,
 } from '../ui.js';
 
 /** 投票分范围：0–100 百分制（与服务层 SCORE_OUT_OF_RANGE 同一口径）。 */
@@ -1847,6 +1847,16 @@ function actionsPanelHtml({ round, roster, minutes }) {
  * 整页 HTML（纯函数，可单测）。
  * @param {object} model { loading, error, stageId, stages, round, votes, tallies, teamNames, roster, minutes, feedback, teamDraft, scoreDraft }
  */
+/**
+ * 加时陈述页（纯 HTML）。
+ *
+ * ⚠️ **P12：页面形状 = 操作台（左轨选赛段 + 右画布做操作）**。
+ *    改版前是「head + 赛段面板 + 5 张同款面板」一字排开 ⇒ 改版前实测
+ *    6/10 个面共用同一签名（card-kit 同质化），且「我现在复议的是哪个赛段」
+ *    只有一个孤零零的下拉框，没有位置感。
+ *    ⇒ 左轨 = 赛段（上下文选择器 ⇒ 材质与画布平等，描边）；
+ *      右画布 = 轮次 / 投票 / 统计 / 明细 / 操作。
+ */
 export function tiebreakPageHtml(model = {}) {
   const head = pageHead({
     title: '加时陈述 · 一票破同分',
@@ -1854,25 +1864,31 @@ export function tiebreakPageHtml(model = {}) {
   });
   const stages = Array.isArray(model.stages) ? model.stages : [];
   const stagePanel = panel({
-    title: '赛段',
+    title: '选择赛段',
     desc: '加时陈述按赛段开轮 —— 同一赛段同时只能有一轮进行中的加时陈述。',
     body: stagePickerHtml(stages, model.stageId ?? ''),
   });
 
   if (model.loading) {
-    return `${head}${stagePanel}${loadingState({ rows: 4, label: '正在加载加时陈述…' })}`;
+    return head + workbench({ rail: stagePanel, canvas: loadingState({ rows: 4, label: '正在加载加时陈述…' }) });
   }
   if (model.error) {
-    return `${head}${stagePanel}${errorState({
-      message: model.error,
-      hint: '点「重试」重新拉一次加时陈述数据。',
-    })}`;
+    return head + workbench({
+      rail: stagePanel,
+      canvas: errorState({
+        message: model.error,
+        hint: '点「重试」重新拉一次加时陈述数据。',
+      }),
+    });
   }
   if (!model.stageId) {
-    return `${head}${stagePanel}${emptyState({
-      title: '先选一个赛段',
-      hint: '加时陈述挂在赛段上：同一赛段同时只能有一轮进行中的加时陈述。',
-    })}`;
+    return head + workbench({
+      rail: stagePanel,
+      canvas: emptyState({
+        title: '先选一个赛段',
+        hint: '加时陈述挂在赛段上：同一赛段同时只能有一轮进行中的加时陈述。',
+      }),
+    });
   }
 
   const teamNames = model.teamNames ?? {};
@@ -1889,14 +1905,17 @@ export function tiebreakPageHtml(model = {}) {
     })
     : '';
 
-  return `${head}
-    ${stagePanel}
-    ${feedbackHtml}
-    ${panel({ title: '当前轮次', desc: '陈述截止后由评委席复议投票。', body: roundPanelHtml(model.round, tiedTeams, pendingTeams, voteRows.length) })}
-    ${panel({ title: '投一票', desc: '一人一队一票；观察员无投票权，已回避的评委不能投。', body: voteFormHtml(model.round, tiedTeams, { teamId: model.teamDraft ?? '', score: model.scoreDraft ?? '' }) })}
-    ${panel({ title: '复议分统计', desc: '票数 / 总分 / 均值（均值高者领先）。', body: tallyTableHtml(tallyRows) })}
-    ${panel({ title: '投票明细', desc: '谁投了多少分。', body: voteTableHtml(voteRows, tallyRows) })}
-    ${panel({ title: '轮次操作', desc: '开轮次与关轮次由组委会执行（stage:compute）。', body: actionsPanelHtml({ round: model.round, roster: model.roster ?? [], minutes: model.minutes ?? DEFAULT_MINUTES }) })}`;
+  return head + workbench({
+    rail: stagePanel,
+    canvas: [
+      feedbackHtml,
+      panel({ title: '当前轮次', desc: '陈述截止后由评委席复议投票。', body: roundPanelHtml(model.round, tiedTeams, pendingTeams, voteRows.length) }),
+      panel({ title: '投一票', desc: '一人一队一票；观察员无投票权，已回避的评委不能投。', body: voteFormHtml(model.round, tiedTeams, { teamId: model.teamDraft ?? '', score: model.scoreDraft ?? '' }) }),
+      panel({ title: '复议分统计', desc: '票数 / 总分 / 均值（均值高者领先）。', body: tallyTableHtml(tallyRows) }),
+      panel({ title: '投票明细', desc: '谁投了多少分。', body: voteTableHtml(voteRows, tallyRows) }),
+      panel({ title: '轮次操作', desc: '开轮次与关轮次由组委会执行（stage:compute）。', body: actionsPanelHtml({ round: model.round, roster: model.roster ?? [], minutes: model.minutes ?? DEFAULT_MINUTES }) }),
+    ].join(''),
+  });
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -1916,7 +1935,7 @@ export function tiebreakPageHtml(model = {}) {
 export async function renderTiebreak(ctx) {
   const wrap = document.createElement('div');
   // ⚠️ 只用**既有** class（不造新的 CSS 类、不写 <style>）：stack = 通用纵向堆叠。
-  wrap.className = 'stack';
+  wrap.className = 'stack tiebreak-view';
 
   const state = {
     stageId: String(ctx?.params?.stageId ?? ctx?.query?.stageId ?? ''),
@@ -2218,7 +2237,7 @@ export async function renderTiebreak(ctx) {
 import { escapeHtml } from '../escape.js';
 import {
   badge, emptyState, errorState, loadingState, noticeState, pageHead, panel,
-  statRow, tableWrap, sectionTitle,
+  statRow, tableWrap, sectionTitle, workbench,
 } from '../ui.js';
 
 /**
@@ -2440,29 +2459,38 @@ export function issuedTokenHtml(issued = {}) {
  */
 export async function renderPublicLinks(ctx) {
   const wrap = document.createElement('div');
-  wrap.className = 'stack';
+  wrap.className = 'stack publinks-view';
   const api = ctx.api;
   let items = [];
   // ⛔ 明文只活在这一次的挂载期里（**不进 ctx.setState**：全局 store 会被别的视图读到）。
   let issued = null;
   const editionFilter = ctx.query?.editionId ? String(ctx.query.editionId) : '';
 
+  // ⚠️ **P12：页面形状 = 操作台（左轨签发 + 右画布看结果）**。
+  //    改版前是「head + 指标 + 两张面板」一字排开 ⇒ 签发表单与令牌列表同权重，
+  //    而它们其实是**一对**关系：左轨是动作，右画布是动作的结果。
+  //    ⛔ 三个挂载点（data-stats / data-issued / data-list）**必须保留** ——
+  //    局部重绘靠它们定位（DP-81：不许整页刷新、不许冲掉已填内容）。
   wrap.innerHTML = [
     pageHead({
       title: '公开访问链接',
       sub: '公开榜单与赛程日历接口都必须带 token；在这里签发、查看与吊销。',
     }),
-    `<div data-stats>${statRow(tokenStats(items))}</div>`,
-    '<div data-issued></div>',
-    panel({
-      title: '签发新令牌',
-      desc: '明文只在签发时显示一次；库里只存哈希，丢了只能重发一枚。',
-      body: issueFormHtml(),
-    }),
-    panel({
-      title: '已签发的令牌',
-      desc: '短标识只是哈希的前几位，用来分辨是哪一枚 —— 它不是可用的令牌。',
-      body: '<div data-list></div>',
+    workbench({
+      rail: panel({
+        title: '签发新令牌',
+        desc: '明文只在签发时显示一次；库里只存哈希，丢了只能重发一枚。',
+        body: issueFormHtml(),
+      }),
+      canvas: [
+        '<div data-issued></div>',
+        `<div data-stats>${statRow(tokenStats(items))}</div>`,
+        panel({
+          title: '已签发的令牌',
+          desc: '短标识只是哈希的前几位，用来分辨是哪一枚 —— 它不是可用的令牌。',
+          body: '<div data-list></div>',
+        }),
+      ].join(''),
     }),
   ].join('');
 
@@ -2646,7 +2674,7 @@ export async function renderPublicLinks(ctx) {
 import { escapeHtml } from '../escape.js';
 import {
   badge, emptyState, errorState, loadingState, noticeState, pageHead, panel,
-  sectionTitle, statRow, tableWrap,
+  sectionTitle, statRow, tableWrap, workbench,
 } from '../ui.js';
 
 /** 默认每页条数（服务端 queryAuditLog 的默认 limit 也是 100，这里取更保守的 50）。 */
@@ -2956,30 +2984,35 @@ function actionOf(ev) {
  */
 export async function renderAuditLog(ctx) {
   const wrap = document.createElement('div');
-  wrap.className = 'stack';
+  wrap.className = 'stack auditlog-view';
 
-  const head = document.createElement('div');
-  head.innerHTML = `
-    ${pageHead({
+  // ⚠️ **P12：页面形状 = 操作台（左轨过滤 + 右画布看审计流）**。
+  //    改版前是「head + 过滤面板 + 事件表」一字排开 ⇒ 五个过滤输入框
+  //    与审计流水同权重，**读审计的人第一眼看到的是表单而不是记录**。
+  //    ⇒ 左轨 = 过滤条（控件条 ⇒ 材质平，描边用虚线表示「这是一条控件」）；
+  //      右画布 = 指标 + 状态 + 流水 + 翻页。
+  //    骨架统一由 web/ui.js 的 workbench() 产出（四个委员会页同一份结构）。
+  wrap.innerHTML = [
+    pageHead({
       title: '审计日志',
       sub: '审计与复算：谁、在什么时候、对什么做了什么。记录不可编辑 —— 审计轨迹是复盘的唯一凭据。',
-    })}
-    <div id="al-stats"></div>
-    <p class="muted small" id="al-msg">正在加载审计日志…</p>
-    <div id="al-state"></div>`;
-  wrap.appendChild(head);
+    }),
+    workbench({
+      rail: '<div id="al-filters"></div>',
+      canvas: [
+        '<div id="al-stats"></div>',
+        '<p class="muted small" id="al-msg">正在加载审计日志…</p>',
+        '<div id="al-state"></div>',
+        '<div id="al-body"></div>',
+      ].join(''),
+    }),
+  ].join('');
 
-  const filters = document.createElement('div');
-  filters.id = 'al-filters';
-  wrap.appendChild(filters);
-
-  const body = document.createElement('div');
-  body.id = 'al-body';
-  wrap.appendChild(body);
-
-  const msg = head.querySelector('#al-msg');
-  const statsBox = head.querySelector('#al-stats');
-  const stateBox = head.querySelector('#al-state');
+  const filters = wrap.querySelector('#al-filters');
+  const statsBox = wrap.querySelector('#al-stats');
+  const msg = wrap.querySelector('#al-msg');
+  const stateBox = wrap.querySelector('#al-state');
+  const body = wrap.querySelector('#al-body');
 
   // ⚠️ 初始过滤条件从 ctx.query 取（深链可分享）；本视图自己持有后续改动
   //    （不写全局 store：全局 store 会被别的视图读到）。
@@ -5316,7 +5349,8 @@ test('DOM：页面调的是 GET /api/audit/log，流水表与指标都渲染出�
   assert.equal(api.calls.length, 1, '首次挂载必须请求一次');
   assert.ok(api.calls[0].startsWith('/api/audit/log'), `端点不对：${api.calls[0]}`);
 
-  const head = wrap.children[0];
+  // ⚠️ P12：页面改成「左轨过滤 + 右画布看流水」的操作台 ⇒ 指标行在画布里，
+  //    不再是 wrap 的第一个子节点（旧写法 wrap.children[0] 已经取不到它）。
   const body = wrap.querySelector('#al-body');
   assert.ok(body.innerHTML.includes('<table'), '要有审计流水表');
   assert.ok(body.innerHTML.includes('computation.record'), '动作列要出现');
@@ -5324,7 +5358,7 @@ test('DOM：页面调的是 GET /api/audit/log，流水表与指标都渲染出�
   assert.ok(body.innerHTML.includes('u_admin'), '操作者列要出现');
   assert.ok(body.innerHTML.includes('2026-10-22T00:00:00.000Z'), '时间列要出现');
 
-  const stats = head.querySelector('#al-stats').innerHTML;
+  const stats = wrap.querySelector('#al-stats').innerHTML;
   assert.ok(stats.includes('总条数'), '指标行要有总条数');
   assert.ok(stats.includes('当前页条数'), '指标行要有当前页条数');
   assert.ok(stats.includes('可查起始日'), '指标行要有可查起始日');
@@ -5464,8 +5498,8 @@ test('DOM：错误态给可点的重试按钮，点它真的重跑一次', async
   };
   const wrap = await renderAuditLog({ api });
 
-  const head = wrap.children[0];
-  const state = head.querySelector('#al-state');
+  // ⚠️ P12：操作台改造后状态区在右画布里，不再是 wrap 的第一个子节点。
+  const state = wrap.querySelector('#al-state');
   assert.ok(state.innerHTML.includes('data-action="retry"'), '错误态必须有可点的重试按钮');
   assert.ok(state.innerHTML.includes('后端炸了'), '错误消息要透出来');
 
@@ -9354,7 +9388,7 @@ test('⛔ E158：**赛段级**授权也能读这些口（写端点认赛段级�
 import { escapeHtml } from '../escape.js';
 import {
   badge, emptyState, errorState, kvList, loadingState, noticeState, pageHead,
-  panel, sectionTitle, statRow, tableWrap,
+  panel, sectionTitle, statRow, tableWrap, workbench, workbenchItem,
 } from '../ui.js';
 
 // ── 枚举（口径与服务层 src/services/stage.js 同一份）──────────────────
@@ -9529,7 +9563,20 @@ export function editionPickerHtml(editions, editionId) {
     </div>`;
 }
 
-/** 赛段列表（纯 HTML）：代号 / 名称 / 类型 / 时间窗 / 状态 + 选中的入口。 */
+/**
+ * 赛段列表（纯 HTML）：左轨里的**赛段选择器**。
+ *
+ * ⚠️ **P12：从表格改成列表**（不是为了好看，是因为表格放不下）：
+ *    改版前这里是一张 6 列表格（代号/名称/类型/时间窗/状态/操作），
+ *    而整个页面是「一列面板一字排开」⇒ 表格和 5 张操作面板**同权重**，
+ *    访客在一屏里既找不到「我现在操作的是哪个赛段」，也读不完一张宽表。
+ *    ⇒ 改成左轨的**条目列表**（代号 / 名称 / 类型·状态·时间窗一行），
+ *      当前赛段用 `is-active` 着色（tinted）标出。
+ *    ⚠️ **类型与状态用纯文字而不是 badge**：左轨是导航面，
+ *      再往里塞彩色徽章会把「每屏强调色 ≤ 3」顶破（实测赛段配置页曾出现 4 档）。
+ * @param {Array}  stages      赛段列表
+ * @param {string} selectedId  当前选中的赛段 id
+ */
 export function stageListHtml(stages, selectedId) {
   const list = Array.isArray(stages) ? stages : [];
   if (!list.length) {
@@ -9538,25 +9585,24 @@ export function stageListHtml(stages, selectedId) {
       hint: '用下面的「新建赛段」建一条 —— 评审、发榜、破同分、企业签字台全都挂在赛段上，没有赛段这些页面一个都进不去。',
     });
   }
-  const rows = list.map((s) => {
+  const items = list.map((s) => {
     const kind = stageKindLabel(s.kind);
     const status = stageStatusLabel(s.status);
     const on = String(s.id ?? '') === String(selectedId ?? '');
     const window = `${fmtStageTime(s.startsAt) || '—'} → ${fmtStageTime(s.endsAt) || '—'}`;
-    return `<tr${on ? ' class="is-active"' : ''}>
-      <td>${escapeHtml(s.key ?? '—')}</td>
-      <td>${escapeHtml(s.name ?? '—')}</td>
-      <td>${badge(kind.label, kind.tone)}</td>
-      <td>${escapeHtml(window)}</td>
-      <td>${badge(status.label, status.tone)}</td>
-      <td><button type="button" class="btn btn--ghost btn--sm" data-action="stage-select" data-stage-id="${escapeHtml(s.id ?? '')}"${on ? ' disabled' : ''}>${on ? '当前赛段' : '进入配置'}</button></td>
-    </tr>`;
+    // ⚠️ 条目的形状由 web/ui.js 的 workbenchItem() 统一产出
+    //    （条件 class 不许在视图里用模板表达式拼 —— 见 ui.js 的说明）。
+    return `<li>${workbenchItem({
+      key: s.key ?? '—',
+      name: s.name ?? '—',
+      meta: `${kind.label} · ${status.label} · ${window}`,
+      active: on,
+      action: 'stage-select',
+      dataKey: 'stage-id',
+      dataValue: s.id ?? '',
+    })}</li>`;
   }).join('');
-  return tableWrap(
-    `<thead><tr><th>代号</th><th>名称</th><th>类型</th><th>时间窗</th><th>状态</th><th></th></tr></thead>
-     <tbody>${rows}</tbody>`,
-    { caption: '本届期赛段列表' },
-  );
+  return `<ul class="workbench__list">${items}</ul>`;
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -10044,6 +10090,17 @@ export function stageConfigStats(model = {}) {
  *   drafts, pending
  * }
  */
+/**
+ * 赛段配置页（纯 HTML）。
+ *
+ * ⚠️ **P12：页面形状 = 操作台（左轨选对象 + 右画布做操作）**。
+ *    改版前是「head + 指标行 + 6 张同款面板」的一字排开（实测顶层结构：
+ *    div.stack > header + div.stat-row + section.panel × 6）⇒
+ *    六个面板同权重同材质，访客既分不出主次，也找不到「我现在操作的是哪个赛段」。
+ *    ⇒ 左轨 = 届期 + 赛段选择器（导航器 ⇒ 材质下沉）；
+ *      右画布 = 指标 + 五个操作面板（工作面 ⇒ 材质浮起）。
+ *    样式见 web/styles.css ⑫ 段；结构由 web/ui.js 的 workbench() 统一产出。
+ */
 export function stageConfigPageHtml(model = {}) {
   const head = pageHead({
     title: '赛段配置与权重表',
@@ -10059,76 +10116,84 @@ export function stageConfigPageHtml(model = {}) {
     })
     : '';
 
-  if (model.loading) {
-    return head + loadingState({ rows: 4, label: '正在加载赛段配置…' });
-  }
-
   const editions = Array.isArray(model.editions) ? model.editions : [];
   const stages = Array.isArray(model.stages) ? model.stages : [];
-  const listPanel = panel({
+  const railPanel = panel({
     title: '届期与赛段',
     desc: '赛段从属于届期：建段、改配置、派评委、报名册都在本届期下操作。',
     body: editionPickerHtml(editions, model.editionId ?? '') + stageListHtml(stages, model.stageId ?? ''),
   });
 
+  if (model.loading) {
+    // ⚠️ 加载中**不要**先渲染赛段列表（那时 stages 还是空数组 ⇒ 会闪一句
+    //    「本届期还没有赛段」，那是**假消息**）⇒ 轨里只放加载态。
+    return head + workbench({
+      rail: panel({ title: '届期与赛段', body: loadingState({ rows: 2, label: '正在加载届期与赛段…' }) }),
+      canvas: loadingState({ rows: 4, label: '正在加载赛段配置…' }),
+    });
+  }
+
   if (model.error) {
-    return head
-      + listPanel
-      + feedbackHtml
-      + errorState({
+    return head + workbench({
+      rail: railPanel,
+      canvas: feedbackHtml + errorState({
         message: stageErrorText(model.errorStatus, model.error),
         hint: '赛段配置需要组委会能力（stage:compute）；确认已登录并拥有该能力后点「重试」。',
-      });
+      }),
+    });
   }
 
   const drafts = model.drafts ?? {};
   const stage = model.stage ?? null;
 
-  return head
-    + feedbackHtml
-    + statRow(stageConfigStats(model))
-    + listPanel
-    + panel({
-      title: '新建赛段',
-      desc: '代号与类型建后不可改 —— 它们决定赛段在赛程里的位置。',
-      body: stageCreateFormHtml({ draft: drafts.create ?? {}, configs: model.configs ?? [] }),
-    })
-    + panel({
-      title: '赛段配置',
-      desc: '改名称、时间窗、冻结时间与权重表；代号与类型不可改。',
-      body: stageConfigHtml({ stage, draft: drafts.edit ?? {}, configs: model.configs ?? [] }),
-    })
-    + panel({
-      title: '权重表（只读）',
-      desc: '当前赛段用的是哪一张权重表、席构成约束是什么。改表要改 rules/scoring-*.json，重启即生效。',
-      body: weightTableHtml({
-        configs: model.configs ?? [],
-        scoringConfigKey: stage?.scoringConfigKey ?? stage?.scoring_config_key ?? '',
-        degraded: Boolean(model.configsDegraded),
-        degradedStatus: model.configsStatus ?? null,
+  return head + workbench({
+    rail: railPanel,
+    canvas: [
+      feedbackHtml,
+      statRow(stageConfigStats(model)),
+      panel({
+        title: '新建赛段',
+        desc: '代号与类型建后不可改 —— 它们决定赛段在赛程里的位置。',
+        body: stageCreateFormHtml({ draft: drafts.create ?? {}, configs: model.configs ?? [] }),
       }),
-    })
-    + panel({
-      title: '评委席',
-      desc: '派评委 = 选人 + 选席；撤评委是逆向路径，会连带解除该评委在本赛段签署的利益冲突声明。',
-      body: judgeSeatHtml({
-        judges: model.judges ?? [],
-        candidates: model.candidates ?? [],
-        draft: drafts.assign ?? {},
-        pending: model.pending ?? null,
-        stageName: stage?.name ?? '',
+      panel({
+        title: '赛段配置',
+        desc: '改名称、时间窗、冻结时间与权重表；代号与类型不可改。',
+        body: stageConfigHtml({ stage, draft: drafts.edit ?? {}, configs: model.configs ?? [] }),
       }),
-    })
-    + panel({
-      title: '名册',
-      desc: '名册里的队伍才会出现在本赛段的评审与名次里；退名册是逆向路径。',
-      body: rosterHtml({
-        teams: model.teams ?? [],
-        rosterTeamIds: model.rosterTeamIds ?? [],
-        pending: model.pending ?? null,
-        stageName: stage?.name ?? '',
+      panel({
+        title: '权重表（只读）',
+        desc: '当前赛段用的是哪一张权重表、席构成约束是什么。改表要改 rules/scoring-*.json，重启即生效。',
+        body: weightTableHtml({
+          configs: model.configs ?? [],
+          scoringConfigKey: stage?.scoringConfigKey ?? stage?.scoring_config_key ?? '',
+          degraded: Boolean(model.configsDegraded),
+          degradedStatus: model.configsStatus ?? null,
+        }),
       }),
-    });
+      panel({
+        title: '评委席',
+        desc: '派评委 = 选人 + 选席；撤评委是逆向路径，会连带解除该评委在本赛段签署的利益冲突声明。',
+        body: judgeSeatHtml({
+          judges: model.judges ?? [],
+          candidates: model.candidates ?? [],
+          draft: drafts.assign ?? {},
+          pending: model.pending ?? null,
+          stageName: stage?.name ?? '',
+        }),
+      }),
+      panel({
+        title: '名册',
+        desc: '名册里的队伍才会出现在本赛段的评审与名次里；退名册是逆向路径。',
+        body: rosterHtml({
+          teams: model.teams ?? [],
+          rosterTeamIds: model.rosterTeamIds ?? [],
+          pending: model.pending ?? null,
+          stageName: stage?.name ?? '',
+        }),
+      }),
+    ].join(''),
+  });
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -10148,7 +10213,7 @@ export function stageConfigPageHtml(model = {}) {
  */
 export async function renderStageConfig(ctx) {
   const wrap = document.createElement('div');
-  wrap.className = 'stack';
+  wrap.className = 'stack stagecfg-view';
 
   const state = {
     loading: true,
@@ -10943,7 +11008,10 @@ test('赛段列表：可以点选进入配置（委托用的 data-action）', ()
   const html = stageListHtml(STAGES, 'st_1');
   assert.ok(html.includes('data-action="stage-select"'), '要有选择动作');
   assert.ok(html.includes('data-stage-id="st_2"'), '要带上赛段 id');
-  assert.ok(html.includes('当前赛段'), '选中的那个要标出来');
+  // ⚠️ P12：选中的那个改成「左轨条目 + is-active + aria-current」，
+  //    旧的「当前赛段」按钮文字没有了 ⇒ 断言改看这两个标记。
+  assert.ok(html.includes('is-active'), '选中的那个要标出来');
+  assert.ok(html.includes('aria-current="true"'), '选中的那个要告诉读屏器「你在这儿」');
 });
 
 test('赛段列表：一个赛段都没有 ⇒ 空态（不是报错）', () => {

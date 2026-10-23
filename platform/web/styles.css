@@ -62,6 +62,10 @@
   --brand-strong: #a8bfff;
   --brand-soft: rgba(124, 156, 255, 0.14);
   --brand-line: rgba(124, 156, 255, 0.32);
+  /* ⚠️ P12：落地页 hero 的品牌辉光**原来写的是字面色** rgba(124,156,255,.13) ——
+   *    那是**设计系统里从未声明过的色相** ⇒ 亮色主题切不掉它（切了还是暗蓝辉光），
+   *    也违反「颜色只经 token」。⇒ 提到 token 层，两套主题各给一档。 */
+  --brand-glow: rgba(124, 156, 255, .13);
   /* ⚠️ --on-brand 是**压在 --brand 实底上的文字色**，不是「品牌色文字」。
    *    实底上的文字必须满足 4.5:1（WCAG AA 普通文本）——
    *    白字压 #7c9cff 只有 2.6:1（不合格），
@@ -143,6 +147,8 @@
   --brand-strong: #1f47b8;
   --brand-soft: rgba(47, 95, 224, 0.10);
   --brand-line: rgba(47, 95, 224, 0.28);
+  /* P12：亮色主题的品牌辉光（暗色版是 rgba(124,156,255,.13)） */
+  --brand-glow: rgba(47, 95, 224, .10);
   --on-brand: #ffffff;
 
   --success: #0a6d3c;
@@ -613,7 +619,7 @@ pre {
 label { display: block; margin: var(--sp-3) 0; font-size: var(--fs-sm); color: var(--fg-muted); }
 label > input, label > select, label > textarea { margin-top: var(--sp-1); }
 .checkbox, .radio { display: inline-flex; align-items: center; gap: var(--sp-2); margin: 0; color: var(--fg); }
-.checkbox input, .radio input { margin: 0; width: auto; }
+.checkbox input, .radio input { margin: 0; }
 
 .radio-group { display: flex; gap: var(--sp-2); flex-wrap: wrap; }
 .radio-group .radio {
@@ -622,7 +628,31 @@ label > input, label > select, label > textarea { margin-top: var(--sp-1); }
   background: var(--surface-sunken); cursor: pointer; font-size: var(--fs-sm);
 }
 .radio-group .radio:has(input:checked) { border-color: var(--brand); background: var(--brand-soft); color: var(--fg-strong); }
-.radio-group input { width: auto; margin: 0; }
+.radio-group input { margin: 0; }
+
+/* ⚠️ **P12：勾选框 / 单选框必须自己定尺寸与勾选色**（浏览器实测抓到的两个真缺陷）。
+ *
+ *   缺陷 ①（硬失败）：浏览器默认复选框是 **13×13 CSS px** ⇒ 低于
+ *     WCAG 2.5.8「目标尺寸（最小）」的 **24×24 硬线**（AA 级）。
+ *     「登记队伍」「勾选同分队伍」这类列表在手机上根本点不准
+ *     （实测：赛段配置页 5 个、破同分页 5 个 < 24px）。
+ *
+ *   缺陷 ②（纪律违反）：浏览器默认的勾选蓝是 **Chrome 的 #0075FF** ——
+ *     那是一个**设计系统里从未声明过的色相** ⇒ 违反「颜色只经 token」，
+ *     也把「每屏强调色 ≤ 3」顶破（实测：赛段配置页桌面端出现 4 档强调色）。
+ *
+ *   ⇒ 一条规则同时修掉两个缺陷：尺寸 24×24（硬线）+ accent-color 走 --brand（token）。
+ *   ⚠️ 放在 `.checkbox input` / `.radio-group input` **之后** ⇒ 同特异性下后者胜。
+ */
+input[type="checkbox"],
+input[type="radio"] {
+  width: 24px;
+  height: 24px;
+  margin: 0;
+  flex: none;                  /* 在 flex 容器里不许被压扁 */
+  accent-color: var(--brand);  /* 勾选色 = 品牌色（经 token） */
+  cursor: pointer;
+}
 
 /* ─────────────────────────────────────────────────────────────────────────
  * ⑭ 轻提示 / 其他
@@ -722,6 +752,18 @@ label > input, label > select, label > textarea { margin-top: var(--sp-1); }
   /* 表单控件：正文 14px × 1.65 ≈ 23px + 2×p + 2px 边框 ⇒ 44px 需 p ≈ 9.5px ⇒ 取 --sp-3 */
   .input, .select, .textarea { padding-top: var(--sp-3); padding-bottom: var(--sp-3); }
   .textarea { min-height: 96px; }
+  /* ⚠️ P12：页脚链接宽度只有 24–36px（两三个汉字）⇒ 触屏上左右也补内边距到 ≥44px 宽。
+   *    （高度已由上面的通用规则垫到 44px；这一条补的是**宽度**这一维。） */
+  .landing__footer-links a {
+    padding-top: var(--sp-3); padding-bottom: var(--sp-3);
+    padding-left: var(--sp-3); padding-right: var(--sp-3);
+    /* ⚠️ **必须显式 min-height**：--fs-xs 12px × 1.65 行高 ≈ 19.8px
+     *    + 上下内边距 2×12px = **43.8px** ⇒ 差 0.2px 到不了 44（子像素）。
+     *    ⇒ 用 min-height 兜住，别靠内边距算高度。 */
+    min-height: 44px;
+    display: inline-flex;
+    align-items: center;
+  }
 }
 
 @media (max-width: 560px) {
@@ -760,7 +802,7 @@ label > input, label > select, label > textarea { margin-top: var(--sp-1); }
   border-radius: var(--r-xl);
   background-color: var(--surface);
   background-image:
-    radial-gradient(120% 80% at 88% -12%, rgba(124, 156, 255, .13), transparent 62%),
+    radial-gradient(120% 80% at 88% -12%, var(--brand-glow), transparent 62%),
     var(--grain);
   background-size: 100% 100%, 140px 140px;
 }
@@ -863,6 +905,8 @@ label > input, label > select, label > textarea { margin-top: var(--sp-1); }
   border-top: 1px solid var(--border);
   border-bottom: 1px solid var(--border);
 }
+/* ⚠️ **2px 不是 4pt 网格的破格**：小号等宽标签与它的数值是「一组」，
+ *    4px 的缝会让它们看起来是两行独立的字 ⇒ 用 2px 的光学紧距把它们绑成一组。 */
 .landing__fact { display: flex; flex-direction: column; gap: 2px; }
 .landing__fact-label {
   margin: 0;
@@ -878,6 +922,9 @@ label > input, label > select, label > textarea { margin-top: var(--sp-1); }
 .landing__stats {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(128px, 1fr));
+  /* ⚠️ **1px 不是 4pt 网格的破格**：这是**发丝线分隔法** ——
+   *    格子自己的底色是 --surface，1px 的缝漏出 --border 当分隔线
+   *    ⇒ 用 4px 的缝会变成 4px 宽的黑沟（像栅格而不是分栏）。 */
   gap: 1px;
   background: var(--border);
   border: 1px solid var(--border);
@@ -908,6 +955,8 @@ label > input, label > select, label > textarea { margin-top: var(--sp-1); }
   position: relative;
   display: flex;
   flex-direction: column;
+  /* ⚠️ **2px 不是 4pt 网格的破格**：节点之间的缝要小到「看不见」，
+   *    贯通轴（::before 那条竖线）才读成**一条连续的线**而不是一串断点。 */
   gap: 2px;
   padding-left: var(--sp-6);
   min-height: 336px;
@@ -915,6 +964,11 @@ label > input, label > select, label > textarea { margin-top: var(--sp-1); }
 .spine__track::before {
   /* 贯通的竖线：赛程的「轴」 */
   content: "";
+  /* ⚠️ 7px / 14px 不是 4pt 网格的破格，是**对齐解算**：
+   *    节点圆点钉在 left:-22px、宽 9px（.spine__node::before），
+   *    轨道左内边距 24px ⇒ 圆点横跨 2–11px、中心 ≈ 6.5px
+   *    ⇒ 轴放在 7px 才是**穿过圆点中心**，不是随手取的数。
+   *    两端各缩进 14px ⇒ 竖线**不越过首尾节点的圆点**。 */
   position: absolute; left: 7px; top: 14px; bottom: 14px;
   width: 1px;
   background: linear-gradient(180deg, var(--border-strong), var(--border-strong) 55%, var(--border));
@@ -942,6 +996,15 @@ label > input, label > select, label > textarea { margin-top: var(--sp-1); }
               border-color var(--dur-1) var(--ease);
 }
 .spine__node:hover { background: var(--surface-raised); color: var(--fg); }
+/* ⚠️ P12：赛程脊节点的高度 **∝ 时间占比**（P10 签名动作）⇒ 短赛段的节点只有 35px 高，
+ *    触屏上点不准（实测：S4/S5 两个节点 35px）。
+ *    ⇒ 触屏加 **min-height 底线**：44px 以下一律垫到 44px，
+ *      时间占比仍在底线**之上**继续生效（长赛段的相对关系不变）。
+ * ⚠️ **必须写在这里，不能写进 ⑯ 段**：上面的 `.spine__node { min-height: 0 }`
+ *    在源码里**更靠后**，同特异性下会把它盖掉（实测踩过：写在 ⑯ 段里不生效）。 */
+@media (pointer: coarse) {
+  .spine__node { min-height: 44px; }
+}
 .spine__node::before {
   /* 节点圆点：钉在贯通线上 */
   content: "";
@@ -1040,9 +1103,22 @@ label > input, label > select, label > textarea { margin-top: var(--sp-1); }
   padding: var(--sp-5);
   border: 1px solid var(--border);
   border-radius: var(--r-lg);
-  background: var(--surface);
+  background-color: var(--surface);
+  /* ⚠️ P12：补上材质三件套里的后两件 —— 规则磁贴原先**只有底色 + 边框**，
+   *    在落地页上读起来是「扁盒子」，与其它面（panel / signoff__group）不是一套语汇。
+   *    ⇒ 顶面渐变（--sheen）+ 顶边 1px 高光（--hairline），仍然**零外阴影**。 */
+  background-image: var(--sheen);
+  box-shadow: inset 0 1px 0 var(--hairline);
 }
-.ruletile--wide { grid-column: 1 / -1; }
+/* ⚠️ 宽幅磁贴是**另一种角色**（整行铺开的主规则）⇒ 给它抬高一档材质。
+ *    ⛔ 同宽度的窄磁贴**保持完全一致** —— 它们是同一个栅格里的同级条目，
+ *    统一才是语义；design-audit 的 card-kit 检查分不清「同级栅格」与「一锅卡片汤」，
+ *    这一项按**已知误报**记录（见 docs/deployment.md 台账）。 */
+.ruletile--wide {
+  grid-column: 1 / -1;
+  padding: var(--sp-6);
+  background-color: var(--surface-raised);
+}
 .ruletile__head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--sp-3); margin-bottom: var(--sp-4); }
 .ruletile__title { margin: 0; font-size: var(--fs-md); color: var(--fg-strong); }
 .ruletile__meta { font-family: var(--mono); font-size: var(--fs-xs); color: var(--fg-subtle); font-variant-numeric: tabular-nums; }
@@ -1310,10 +1386,8 @@ label > input, label > select, label > textarea { margin-top: var(--sp-1); }
 }
 .landing__footer-links { display: flex; gap: var(--sp-4); flex-wrap: wrap; }
 /* ⚠️ 落地页页脚链接在窄屏上只有 20px 高 —— 手指点不准。
- *    与全局触控目标规则同口径（pointer: coarse 时加内边距，字号不变）。 */
-@media (pointer: coarse) {
-  .landing__footer-links a { padding-top: var(--sp-3); padding-bottom: var(--sp-3); }
-}
+ *    与全局触控目标规则同口径（pointer: coarse 时加内边距，字号不变）。
+ *    ⛔ **这条规则已并入 ⑯ 段**（触控目标统一归口）—— 别在这里另起一份。 */
 
 /* ── ⑨ 进入视口的揭示动画 ────────────────────────────────────────── */
 /* ⚠️ 刻意**不做**「每段滚动淡入」（skill 的 tell 目录把 scroll-fade-sections 列为俗套）——
@@ -1400,6 +1474,150 @@ label > input, label > select, label > textarea { margin-top: var(--sp-1); }
   border: 1px solid var(--warn);
   color: var(--warn);
   font-size: var(--fs-xs);
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * ⑫ P12 · 委员会操作台（workbench）：左轨选对象 + 右画布做操作
+ * ─────────────────────────────────────────────────────────────────────────
+ * ⚠️ **为什么要有这个形状**（P12 实测诊断，不是审美偏好）：
+ *    P11 新建的四个委员会页（赛段配置 / 破同分 / 公开链接 / 审计日志）
+ *    **页面专属 class 数为 0**（实测：stages 页用到的 77 个 class 全是通用类）
+ *    ⇒ 四页全是同一套通用卡片栈一字排开，顶层结构恒为
+ *       `header.page__head + 若干 section.panel`（stages 桌面端实测：
+ *       div.stack > header + div.stat-row + section.panel × 6）。
+ *    ⇒ 三个后果：① 四页长得一模一样，访客分不清自己在哪一页；
+ *                ② 六个面板同权重同材质，**没有主次**；
+ *                ③ 「我现在操作的是哪一个赛段 / 哪一组筛选条件」
+ *                   这件事**在页面上没有位置放**。
+ *
+ * ⚠️ **形状，不是皮肤**：本段**不新增任何颜色、不换调色盘**（P10「midnight」语言保持）。
+ *    差异化只发生在**宏观结构**（macrostructure）：左轨 = 选对象，右画布 = 做操作。
+ *
+ * ⚠️ **材质按角色分化**（修 card-kit 同质化：实测 tiebreak 页 6/10 个面同签名）：
+ *    右画布 = 浮起（raised，材质三件套：底色差 + 顶边高光 + 顶面渐变）；
+ *    轨内面板 = 平（flat，只描边不浮起）；
+ *    轨内选中项 = 着色（tinted，--brand-soft）—— 当前对象。
+ *    卡片仍然**零外阴影**（P10 签名动作①）。
+ *
+ * ⚠️ **四个页面根类各自给左轨一种处理**（这是「按角色分化」落到页面级）：
+ *    赛段配置 —— 轨是**导航器**（选届期/赛段）⇒ 凹陷通道（视觉退后，它是容器不是内容）；
+ *    破同分   —— 轨是**上下文选择器**（选赛段）⇒ 描边（与画布平等，它决定上下文）；
+ *    公开链接 —— 轨是**操作表单**（签发）⇒ 浮起（它本身就是主要动作）；
+ *    审计日志 —— 轨是**过滤条**（筛条件）⇒ 平（它是控件条，不是内容）。
+ */
+
+/* 页面根：四个委员会页各有自己的根类（页面身份）。 */
+.stagecfg-view, .tiebreak-view, .publinks-view, .auditlog-view { display: block; }
+
+/* 双栏骨架：左轨固定宽度（放选择器），右画布自适应（放操作）。 */
+.workbench {
+  display: grid;
+  grid-template-columns: minmax(0, 300px) minmax(0, 1fr);
+  gap: var(--sp-6);
+  align-items: start;
+}
+.workbench__rail {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+  min-width: 0;
+  padding: var(--sp-4);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  background-color: var(--surface-sunken);
+  /* 窄屏收起为单列时，轨不再是「常驻侧栏」⇒ 不再吸顶。 */
+  position: sticky;
+  top: calc(var(--topbar-h) + var(--sp-4));
+  max-height: calc(100vh - var(--topbar-h) - var(--sp-8));
+  overflow-y: auto;
+}
+.workbench__canvas {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+  min-width: 0;
+}
+
+/* 轨内面板 = 平（flat）：它是导航面，不该和画布里的工作面抢视觉重量。 */
+.workbench__rail .panel {
+  background-color: transparent;
+  background-image: none;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  overflow: visible;
+}
+.workbench__rail .panel__head {
+  padding: 0 0 var(--sp-2);
+  border-bottom: 1px solid var(--border);
+  background-color: transparent;
+  background-image: none;
+}
+.workbench__rail .panel__body { padding: var(--sp-4) 0 0; }
+
+/* 轨内条目（选对象）：默认描边，当前项着色。 */
+.workbench__list {
+  list-style: none; margin: 0; padding: 0;
+  display: flex; flex-direction: column; gap: var(--sp-2);
+}
+.workbench__item {
+  display: flex; flex-direction: column; gap: var(--sp-1);
+  width: 100%; text-align: left;
+  padding: var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background-color: var(--surface);
+  color: var(--fg);
+  font: inherit;
+  cursor: pointer;
+  transition: background-color var(--dur-1) var(--ease), border-color var(--dur-1) var(--ease);
+}
+.workbench__item:hover { background-color: var(--surface-raised); }
+.workbench__item.is-active {
+  background-color: var(--brand-soft);
+  border-color: var(--brand-line);
+}
+.workbench__item-key {
+  font-family: var(--mono); font-size: var(--fs-xs);
+  color: var(--fg-subtle); letter-spacing: .06em;
+}
+.workbench__item.is-active .workbench__item-key { color: var(--brand); }
+.workbench__item-name { font-weight: 600; color: var(--fg-strong); font-size: var(--fs-base); }
+.workbench__item-meta { font-family: var(--mono); font-size: var(--fs-xs); color: var(--fg-muted); }
+
+/* ── 四个页面的左轨处理（按角色，见上文的溯源）────────────────────── */
+
+/* 赛段配置：轨是导航器 ⇒ 凹陷通道（默认样式已是从 --surface-sunken 起）。 */
+.stagecfg-view .workbench__rail { background-color: var(--surface-sunken); }
+
+/* 破同分：轨是上下文选择器 ⇒ 描边（与画布平等，不凹陷也不浮起）。 */
+.tiebreak-view .workbench__rail {
+  background-color: var(--surface);
+  background-image: var(--sheen);
+  box-shadow: inset 0 1px 0 var(--hairline);
+}
+
+/* 公开链接：轨是操作表单 ⇒ 浮起（与画布同材质，它本身就是主要动作）。 */
+.publinks-view .workbench__rail {
+  background-color: var(--surface-raised);
+  background-image: var(--sheen);
+  box-shadow: inset 0 1px 0 var(--hairline);
+}
+
+/* 审计日志：轨是过滤条 ⇒ 平（控件条，不需要材质；只描边不填充）。 */
+.auditlog-view .workbench__rail {
+  background-color: transparent;
+  box-shadow: none;
+}
+
+/* 窄屏：双栏折叠为单列（左轨在上，右画布在下）。 */
+@media (max-width: 980px) {
+  .workbench { grid-template-columns: minmax(0, 1fr); gap: var(--sp-4); }
+  .workbench__rail {
+    position: static;
+    max-height: none;
+    overflow-y: visible;
+  }
 }
 
 /* 打印：榜单/筛选台要能被打印成纸质材料 */

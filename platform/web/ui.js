@@ -223,6 +223,70 @@ export function panel({ title = '', desc = '', body = '', tone: t = 'neutral' } 
 }
 
 /**
+ * 操作台骨架：**左轨选对象 + 右画布做操作**。
+ *
+ * ⚠️ **为什么需要它**（P12 实测诊断）：
+ *   P11 新建的四个委员会页（赛段配置 / 破同分 / 公开链接 / 审计日志）
+ *   此前全是同一套通用卡片栈一字排开（顶层恒为 `header + 若干 section.panel`），
+ *   ⇒ 四页长得一模一样，而且**「我现在在操作哪一个对象」没有位置放**。
+ *   ⇒ 这里给出一个**共同的宏观结构**；差异靠各页左轨的内容，不靠换皮。
+ *
+ * ⚠️ **形状，不是皮肤**：结构类（workbench / workbench__rail / workbench__canvas）
+ *   的样式在 web/styles.css 的 ⑫ 段；本函数**不写字面色值、不写 <style> 标签**。
+ *   窄屏由 CSS 折叠成单列（左轨在上、右画布在下）。
+ *
+ * @param {object}  o
+ * @param {string}  o.rail    左轨内容（选对象：选择器 / 过滤条 / 表单）
+ * @param {string}  o.canvas  右画布内容（做操作：面板 / 表格 / 指标）
+ */
+export function workbench({ rail = '', canvas = '' } = {}) {
+  return `<div class="workbench">
+    <aside class="workbench__rail">${rail}</aside>
+    <div class="workbench__canvas">${canvas}</div>
+  </div>`;
+}
+
+/**
+ * 轨内条目：左轨里的**当前对象**（赛段 / 轮次 / …）的入口。
+ *
+ * ⚠️ **为什么放在这里而不是视图里**（本仓既有纪律）：
+ *   ① 视图里**不许**出现「模板表达式拼 class」（`class="x${cond ? ' y' : ''}"`）——
+ *      机器闸（test/stage-config-view.test.js「不许自造 CSS 类名」）按 `class="…"`
+ *      字面量抽类名，模板表达式会把它抽成 `x${cond` 这种垃圾。
+ *      仓库的既有做法就是**条件 class 走组件层**（badge 的 extraClass / panel 的 tone /
+ *      tableWrap 的 className）—— 这里沿用同一口径。
+ *   ② 四个委员会页共用同一套条目形状 ⇒ 只写一次。
+ *
+ * ⚠️ **当前项不置 disabled**：禁用按钮会被读屏跳过，
+ *    而这里恰恰要告诉用户「你现在就在这个对象上」⇒ 用 `aria-current` 表达。
+ *
+ * @param {object}  o
+ * @param {string}  o.key     小号等宽标识（赛段代号）
+ * @param {string}  o.name    主标题（赛段名称）
+ * @param {string}  o.meta    副行（类型 · 状态 · 时间窗）
+ * @param {boolean} [o.active=false]  是否是当前对象
+ * @param {string}  [o.action]  点击动作名（视图侧事件委托的 data-action）
+ * @param {string}  [o.dataKey]  附加数据属性名（不含 data- 前缀），如 stage-id
+ * @param {string}  [o.dataValue] 附加数据属性值
+ */
+export function workbenchItem({
+  key = '', name = '', meta = '', active = false,
+  action = '', dataKey = '', dataValue = '',
+} = {}) {
+  const cls = active ? 'workbench__item is-active' : 'workbench__item';
+  const actionAttr = action ? ` data-action="${escapeHtml(action)}"` : '';
+  // ⚠️ data-* 的键名也要过一遍白名单：它是拼进 HTML 的属性名，不能是外部输入。
+  const safeKey = /^[a-z][a-z0-9-]*$/.test(dataKey) ? dataKey : '';
+  const dataAttr = safeKey ? ` data-${safeKey}="${escapeHtml(dataValue)}"` : '';
+  const current = active ? ' aria-current="true"' : '';
+  return `<button type="button" class="${cls}"${actionAttr}${dataAttr}${current}>
+    <span class="workbench__item-key">${escapeHtml(key)}</span>
+    <span class="workbench__item-name">${escapeHtml(name)}</span>
+    <span class="workbench__item-meta">${escapeHtml(meta)}</span>
+  </button>`;
+}
+
+/**
  * 标签页（纯展示，靠 URL 切换，不做前端状态机）。
  * ⚠️ 刻意**不用** JS 切页：标签页切换会把 URL 与视图状态拆开 ⇒ 刷新即丢失。
  */
