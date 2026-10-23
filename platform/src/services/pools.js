@@ -13,6 +13,7 @@ import { can } from '../auth/permissions.js';
 import { derivePoolProjects, derivePoolTalents, derivePoolResources, aggregatePersonalPoints } from '../domain/pool-derive.js';
 import * as poolRepo from '../db/repo/pools.js';
 import * as srcRepo from '../db/repo/pool-sources.js';
+import { listEditionIdsByUser } from '../db/repo/registrations.js';
 // ⛔ 事务助手复用 P4 的 withTransaction（src/db/tx.js，SAVEPOINT），**不再自建一份**：
 //    自建 BEGIN IMMEDIATE 的版本在「调用方已经开了事务」时会抛
 //    "cannot start a transaction within a transaction"，而 Task 4 的
@@ -235,6 +236,27 @@ function canReadPool(db, viewer, editionId) {
   return can(viewer, 'pool:read', { scopeType: 'edition', scopeId: editionId }, db);
 }
 
+/**
+ * 解析「这次读池属于哪一届」（2026-10-23 审计 F33）。
+ *
+ * ⚠️ **原来缺 editionId 就是全表**：`listPoolTalentRows(db, null)` 不带 WHERE
+ *    ⇒ 登录用户不带 editionId 就能读到**其它届期**的参赛者姓名、单位、积分、MBA 状态、
+ *    参赛赛段数 ⇒ **届期隔离形同虚设**（届期隔离是平台级约束：设计文档 §3.1 S2）。
+ *    而闸门 `canReadPool` 也拦不住 —— `scopeId` 传 `null` 时，
+ *    `pool:read` 的角色授权照样命中（角色授权是全局的，INTERFACES.md:22）。
+ *
+ * ⇒ 修法：**缺省届期从 viewer 自己的报名记录推导**（他属于哪一届，就只能看哪一届）。
+ *    ⚠️ **推导不出唯一届期 ⇒ 不给**（fail-closed）：没报名过、或报过多届的人，
+ *    「他该看哪一届」没有唯一答案 ⇒ 列表不满足 ⇒ 返回**空集**（200 + 空集），
+ *    绝不能退化成「全表」。
+ */
+function resolvePoolEditionId(db, viewer, editionId) {
+  if (editionId) return editionId;
+  if (!viewer?.id) return null;
+  const ids = listEditionIdsByUser(db, viewer.id);
+  return ids.length === 1 ? ids[0] : null;
+}
+
 function applyLimit(rows, limit) {
   if (!Number.isInteger(limit) || limit <= 0) return rows;
   return rows.slice(0, limit);
@@ -242,8 +264,10 @@ function applyLimit(rows, limit) {
 
 /** 项目池只读查询。⛔ 列表不满足 → 空数组（200 + 空集）。 */
 export function listPoolProjects({ db, filter = {}, viewer }) {
-  if (!canReadPool(db, viewer, filter.editionId ?? null)) return [];
-  const rows = poolRepo.listPoolProjectRows(db, filter.editionId ?? null);
+  const editionId = resolvePoolEditionId(db, viewer, filter.editionId);
+  if (!editionId) return [];
+  if (!canReadPool(db, viewer, editionId)) return [];
+  const rows = poolRepo.listPoolProjectRows(db, editionId);
   return applyLimit(rows, filter.limit).map((r) => ({
     id: r.id,
     editionId: r.edition_id,
@@ -259,8 +283,10 @@ export function listPoolProjects({ db, filter = {}, viewer }) {
 
 /** 人才池只读查询。 */
 export function listPoolTalents({ db, filter = {}, viewer }) {
-  if (!canReadPool(db, viewer, filter.editionId ?? null)) return [];
-  let rows = poolRepo.listPoolTalentRows(db, filter.editionId ?? null);
+  const editionId = resolvePoolEditionId(db, viewer, filter.editionId);
+  if (!editionId) return [];
+  if (!canReadPool(db, viewer, editionId)) return [];
+  let rows = poolRepo.listPoolTalentRows(db, editionId);
   if (filter.userId) rows = rows.filter((r) => r.user_id === filter.userId);
   if (Number.isFinite(filter.minPoints)) rows = rows.filter((r) => r.total_points >= filter.minPoints);
   return applyLimit(rows, filter.limit).map((r) => ({
@@ -278,8 +304,10 @@ export function listPoolTalents({ db, filter = {}, viewer }) {
 
 /** 资源池只读查询。 */
 export function listPoolResources({ db, filter = {}, viewer }) {
-  if (!canReadPool(db, viewer, filter.editionId ?? null)) return [];
-  let rows = poolRepo.listPoolResourceRows(db, filter.editionId ?? null);
+  const editionId = resolvePoolEditionId(db, viewer, filter.editionId);
+  if (!editionId) return [];
+  if (!canReadPool(db, viewer, editionId)) return [];
+  let rows = poolRepo.listPoolResourceRows(db, editionId);
   if (filter.enterpriseId) rows = rows.filter((r) => r.enterprise_id === filter.enterpriseId);
   if (filter.kind) rows = rows.filter((r) => r.kind === filter.kind);
   return applyLimit(rows, filter.limit).map((r) => ({

@@ -78,6 +78,26 @@ export function listRegistrationRows(db, {
     .all(...params);
 }
 
+/**
+ * 某人**报名过的届期** id 列表（去重、升序）。
+ *
+ * ⚠️ **为什么需要它**（2026-10-23 审计 F33）：
+ *    三池读取接口的 `editionId` 是**可选**的 ⇒ 缺省时原实现查的是**全表**
+ *    （`listPoolTalentRows(db, null)` ⇒ 不带 WHERE）⇒ 登录用户不带 editionId
+ *    就能读到**其它届期**的参赛者姓名、单位、积分、MBA 状态。
+ *    ⇒ 缺省届期的正确来源是**viewer 自己的报名记录**（他属于哪一届）。
+ *    ⚠️ 推导不出**唯一**届期时（没报名过 / 报过多届）⇒ 调用方必须 fail-closed（不给），
+ *    本函数只负责如实返回事实，不替调用方决定。
+ */
+export function listEditionIdsByUser(db, userId) {
+  return db
+    .prepare(`SELECT DISTINCT edition_id FROM registrations
+              WHERE user_id = ? AND deleted_at IS NULL
+              ORDER BY edition_id`)
+    .all(userId)
+    .map((r) => r.edition_id);
+}
+
 export function updateRegistrationRow(db, id, patch) {
   const keys = Object.keys(patch).filter((k) => UPDATABLE.has(k));
   if (keys.length) {

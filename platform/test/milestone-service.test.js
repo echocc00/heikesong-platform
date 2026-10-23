@@ -53,17 +53,23 @@ function setup() {
     name: '首届', city: '上海', startsAt: '2026-10-01', endsAt: '2099-12-31',
   });
   const enterprise = createUser(db, { name: '某企业', phone: '13900007001', password: 'pw', mbaStatus: 'other' });
-  const pkg = createTaskPackage(db, {
-    editionId: edition.id, title: '门店排班优化', painPoint: 'p', expectedDelivery: 'd',
-    acceptanceCriteria: 'a', submittedBy: enterprise.id, now: NOW,
-  });
-  updateTaskPackage(db, pkg.id, { solvability_grade: 'A', solvability_score: 11, status: 'published' });
-
   const captain = createUser(db, { name: '队长甲', phone: '13900007002', password: 'pw', mbaStatus: 'mba' });
   const seat = createUser(db, { name: '企业席乙', phone: '13900007003', password: 'pw', mbaStatus: 'other' });
   const seat2 = createUser(db, { name: '企业席丙', phone: '13900007004', password: 'pw', mbaStatus: 'other' });
   const admin = createUser(db, { name: '组委会', phone: '13900007005', password: 'pw', mbaStatus: 'mba' });
   setSuperadmin(db, admin.id);
+  // ⚠️ **夹具按生产口径造**（2026-10-23 审计 F30 修完后）：
+  //    企业席提交任务卡 ⇒ `task_packages.enterprise_id` = 提交人自己（企业主体）。
+  //    原来 enterprise_id 留空、submitted_by 指向「某企业」⇒
+  //    那是一张**无主卡** + 一个**不相干的企业**在签字 ⇒ 既测不出「跨企业」，
+  //    也不符合 F31 修完后的生产口径 ⇒ 夹具更新（保持判别性：seed 那条用例
+  //    现在断言的正是「出题企业本人签字成功 / 他企签字 403」）。
+  const pkg = createTaskPackage(db, {
+    editionId: edition.id, title: '门店排班优化', painPoint: 'p', expectedDelivery: 'd',
+    acceptanceCriteria: 'a', enterpriseId: seat.id, enterpriseName: '某零售',
+    submittedBy: seat.id, now: NOW,
+  });
+  updateTaskPackage(db, pkg.id, { solvability_grade: 'A', solvability_score: 11, status: 'published' });
 
   insertRegistration(db, {
     editionId: edition.id, userId: captain.id, answers: GOOD, rawScore: 80,
@@ -117,6 +123,37 @@ test('★ R-STG-03：建队时里程碑清单落表（7 类，固定不可自行
     // 清单本身仍来自 teams.milestones_json（两处同源）
     const stored = JSON.parse(s.db.prepare('SELECT milestones_json FROM teams WHERE id = ?').get(team.id).milestones_json);
     assert.deepEqual(stored.items.map((i) => i.key).sort(), expected, '清单仍是报名时固定的那份');
+  } finally {
+    s.close(); rmSync(s.dataDir, { recursive: true, force: true });
+  }
+});
+
+test('★ 他企不得给本队里程碑签字（跨企业伪造客观事实 ⇒ 403）', async () => {
+  // ⚠️ 2026-10-23 审计 F30：签字是「**客观事实**」⇒ 被 `services/tier.js`
+  //    当成有效事实消费（business_signoff_count 影响段位）⇒ 他企签了就是「替别人抬段位」。
+  //    口径与「企业确认」端点（routes/review.js 的 N03 闸）同源：
+  //    出题企业本人 / 同一企业（org 相同）才可签，组委会可代签。
+  const s = setup();
+  try {
+    const team = await createTeam(s);
+    const ms = s.db.prepare("SELECT * FROM milestones WHERE team_id = ? AND key = 'problem_confirmed'").get(team.id);
+    assert.ok(ms, '要有该里程碑');
+
+    // seat2 是**另一个企业席**（卡是 seat 出的）⇒ 不得签字
+    const res = await call(s.app, 'POST', `/api/milestones/${ms.id}/signoff`, {
+      token: s.tokenSeat2, body: { department: '业务部门', content: '确认已落地' },
+    });
+    assert.equal(res.status, 403, `他企签字必须被拒，实际 ${res.status}：${res.body}`);
+    assert.equal(
+      s.db.prepare('SELECT COUNT(*) AS n FROM milestone_signoffs WHERE milestone_id = ?').get(ms.id).n, 0,
+      '伪造的签字不得落库',
+    );
+
+    // 对照组：出题企业本人签字必须成功（不能靠「一律拒」骗绿）
+    const ok = await call(s.app, 'POST', `/api/milestones/${ms.id}/signoff`, {
+      token: s.tokenSeat, body: { department: '业务部门', content: '确认已落地' },
+    });
+    assert.equal(ok.status, 200, `出题企业本人签字必须成功：${ok.body}`);
   } finally {
     s.close(); rmSync(s.dataDir, { recursive: true, force: true });
   }

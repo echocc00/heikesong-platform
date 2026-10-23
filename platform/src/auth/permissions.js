@@ -15,7 +15,7 @@ import {
   hasRoleCapability,
   capabilityExists,
 } from '../db/repo/assignments.js';
-import { userExists } from '../db/repo/users.js';
+import { userExists, getUserById } from '../db/repo/users.js';
 import { listUserRoles } from '../db/repo/roles.js';
 import { appError } from '../errors.js';
 
@@ -42,6 +42,37 @@ export function isCommitteeActor(db, user) {
   if (user.is_superadmin === 1 || user.isSuperadmin === true) return true;
   if (!user.id) return false;
   return listUserRoles(db, user.id).includes('admin');
+}
+
+/**
+ * 「这件事的企业主体是不是你」判定（2026-10-23 审计 F30 / F42）。
+ *
+ * ⛔ **为什么不能用 `can()` 表达这件事**：
+ *    `can()` 判的是**能力点**（这个角色/授权有没有「签字」「重评」这个权限），
+ *    而 F30 / F42 的问题是**另一层**：拿到了能力点的企业 A，能不能对**企业 B 的**题动手。
+ *    角色能力是全局的（INTERFACES.md:22）⇒ `can()` 对此**表达不了**。
+ *    ⇒ 这里判的是**领域事实**（跟 `isCommitteeActor()` 同一个性质）：
+ *      ① 提交人本人 —— 他出的题，他当然能重评；
+ *      ② 出题企业本人 —— enterprise_id 指向的用户；
+ *      ③ 同一企业（org 相同）—— 企业管理员代表本企业行事。
+ *
+ * ⚠️ **同企业判定要求 `org` 非空**：org 为空 ⇒ 两个不相干的企业账号都算「同企业」吗？
+ *    不。空值一律**判否**（fail-closed）—— 宁可少给权限，不可把甲公司当成乙公司。
+ *
+ * @param {object} db
+ * @param {string} actorId 行动者用户 id
+ * @param {{enterpriseId?: string|null, submittedBy?: string|null}} subject 归属事实
+ * @returns {boolean}
+ */
+export function isEnterpriseOwner(db, actorId, { enterpriseId = null, submittedBy = null } = {}) {
+  if (!db || !actorId) return false;
+  if (submittedBy && String(submittedBy) === String(actorId)) return true;
+  if (!enterpriseId) return false;
+  if (String(enterpriseId) === String(actorId)) return true;
+  const actor = getUserById(db, actorId);
+  const issuer = getUserById(db, enterpriseId);
+  if (!actor || !issuer) return false;
+  return Boolean(actor.org) && actor.org === issuer.org;
 }
 
 export function grantAssignment(

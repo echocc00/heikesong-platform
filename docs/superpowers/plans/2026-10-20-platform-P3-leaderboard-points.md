@@ -6664,6 +6664,10 @@ P3 计划偏差表 3c 明写「服务层接线在 Task 7（P3 自己的写入口
 // 依据：S10 §4 商业里程碑 7 类 + R-ENT-02「企业签字里程碑」
 //   + R-JDG-14（签字必须写清解决哪个环节 / 落地时间 / 我方角色）
 //   + R-PTS-03（S 段只认业务部门签字）+ 规则表 rules/milestones.default.json 的 signoffRequires。
+//   + R-PTS-11（里程碑 7 类即 L2 商业里程碑分的完整类目 —— 规则表在 milestones.default.json）
+//   + R-PTS-12（L2 里程碑与段位**共享「企业签字」这一个数据源**，但**不共享任何一条规则**：
+//        里程碑的类目/签字要求读 milestones.default.json，段位的门槛与权益读 ranks.json，
+//        两边各自独立配置 —— 改段位表**不会**动到里程碑口径，反之亦然）。
 //
 // ⛔ 本模块与 P2 的 enterprise_confirmations 是**两张不同的表**：
 //    这里签的是「这件事到底发生了没有」（客观事实，单签，不进总分）；
@@ -6672,9 +6676,10 @@ P3 计划偏差表 3c 明写「服务层接线在 Task 7（P3 自己的写入口
 // ⛔ 权限模型 = capability + assignment，can() 是唯一判定入口。
 import { randomUUID } from 'node:crypto';
 import { AppError } from '../errors.js';
-import { can } from '../auth/permissions.js';
+import { can, isCommitteeActor, isEnterpriseOwner } from '../auth/permissions.js';
 import { getUserById } from '../db/repo/users.js';
 import { getTeam } from '../db/repo/leaderboard.js';
+import { getTaskPackage } from '../db/repo/taskPackages.js';
 import * as tierRepo from '../db/repo/tiers.js';
 
 /**
@@ -6691,6 +6696,18 @@ export function createSignoff({ db, milestoneId, actorId, body, now = new Date()
   // 能力点闸门：只有企业席 / 企业管理员能签（seed 里 signoff:create 授予这两个角色）
   if (!can(actor, 'signoff:create', { scopeType: 'edition', scopeId: team.edition_id }, db)) {
     throw new AppError(403, 'FORBIDDEN', '你没有企业签字的权限');
+  }
+  // ⚠️ **企业归属闸**（F30）：能力点只说明「你**能**签字」，不说明「这份签字**该由你**签」。
+  //    原来只判能力点 ⇒ 企业 A 可以给**企业 B 的题目**上的队伍里程碑签字，
+  //    而签字是「**客观事实**」⇒ 被 `services/tier.js` 当成有效事实消费（`businessSignoff_count`）
+  //    ⇒ **他企可以白送对手档位**（或拉低自己队伍以外任何队伍的统计）。
+  //    归属口径与同族的「企业确认」端点（routes/review.js 的 N03 闸）**逐字同源**：
+  //    提交人本人 / 出题企业本人 / 同一企业（org 相同）三者之一；组委会可代签。
+  const pkg = team.task_package_id ? getTaskPackage(db, team.task_package_id) : null;
+  if (pkg && !isCommitteeActor(db, actor) && !isEnterpriseOwner(db, actor.id, {
+    enterpriseId: pkg.enterprise_id, submittedBy: pkg.submitted_by,
+  })) {
+    throw new AppError(403, 'FORBIDDEN', '只能为自己企业的队伍里程碑签字');
   }
   const req = rules.milestones?.signoffRequires ?? {};
   const department = String(body?.department ?? '').trim();
@@ -6907,6 +6924,10 @@ import { createTaskPackage, updateTaskPackage } from '../src/db/repo/taskPackage
 import { insertRegistration } from '../src/db/repo/registrations.js';
 import { computeTeamTier } from '../src/services/tier.js';
 import { call } from '../test-helpers/http-call.js';
+import { isolateTempDir } from '../test-helpers/tmp.js';
+
+// ⚠️ 隔离本进程临时目录：进程退出时整体回收（防临时目录泄漏，详见 test-helpers/tmp.js）
+isolateTempDir();
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrationsDir = join(here, '..', 'db', 'migrations');
@@ -6928,17 +6949,23 @@ function setup() {
     name: '首届', city: '上海', startsAt: '2026-10-01', endsAt: '2099-12-31',
   });
   const enterprise = createUser(db, { name: '某企业', phone: '13900007001', password: 'pw', mbaStatus: 'other' });
-  const pkg = createTaskPackage(db, {
-    editionId: edition.id, title: '门店排班优化', painPoint: 'p', expectedDelivery: 'd',
-    acceptanceCriteria: 'a', submittedBy: enterprise.id, now: NOW,
-  });
-  updateTaskPackage(db, pkg.id, { solvability_grade: 'A', solvability_score: 11, status: 'published' });
-
   const captain = createUser(db, { name: '队长甲', phone: '13900007002', password: 'pw', mbaStatus: 'mba' });
   const seat = createUser(db, { name: '企业席乙', phone: '13900007003', password: 'pw', mbaStatus: 'other' });
   const seat2 = createUser(db, { name: '企业席丙', phone: '13900007004', password: 'pw', mbaStatus: 'other' });
   const admin = createUser(db, { name: '组委会', phone: '13900007005', password: 'pw', mbaStatus: 'mba' });
   setSuperadmin(db, admin.id);
+  // ⚠️ **夹具按生产口径造**（2026-10-23 审计 F30 修完后）：
+  //    企业席提交任务卡 ⇒ `task_packages.enterprise_id` = 提交人自己（企业主体）。
+  //    原来 enterprise_id 留空、submitted_by 指向「某企业」⇒
+  //    那是一张**无主卡** + 一个**不相干的企业**在签字 ⇒ 既测不出「跨企业」，
+  //    也不符合 F31 修完后的生产口径 ⇒ 夹具更新（保持判别性：seed 那条用例
+  //    现在断言的正是「出题企业本人签字成功 / 他企签字 403」）。
+  const pkg = createTaskPackage(db, {
+    editionId: edition.id, title: '门店排班优化', painPoint: 'p', expectedDelivery: 'd',
+    acceptanceCriteria: 'a', enterpriseId: seat.id, enterpriseName: '某零售',
+    submittedBy: seat.id, now: NOW,
+  });
+  updateTaskPackage(db, pkg.id, { solvability_grade: 'A', solvability_score: 11, status: 'published' });
 
   insertRegistration(db, {
     editionId: edition.id, userId: captain.id, answers: GOOD, rawScore: 80,
@@ -6992,6 +7019,37 @@ test('★ R-STG-03：建队时里程碑清单落表（7 类，固定不可自行
     // 清单本身仍来自 teams.milestones_json（两处同源）
     const stored = JSON.parse(s.db.prepare('SELECT milestones_json FROM teams WHERE id = ?').get(team.id).milestones_json);
     assert.deepEqual(stored.items.map((i) => i.key).sort(), expected, '清单仍是报名时固定的那份');
+  } finally {
+    s.close(); rmSync(s.dataDir, { recursive: true, force: true });
+  }
+});
+
+test('★ 他企不得给本队里程碑签字（跨企业伪造客观事实 ⇒ 403）', async () => {
+  // ⚠️ 2026-10-23 审计 F30：签字是「**客观事实**」⇒ 被 `services/tier.js`
+  //    当成有效事实消费（business_signoff_count 影响段位）⇒ 他企签了就是「替别人抬段位」。
+  //    口径与「企业确认」端点（routes/review.js 的 N03 闸）同源：
+  //    出题企业本人 / 同一企业（org 相同）才可签，组委会可代签。
+  const s = setup();
+  try {
+    const team = await createTeam(s);
+    const ms = s.db.prepare("SELECT * FROM milestones WHERE team_id = ? AND key = 'problem_confirmed'").get(team.id);
+    assert.ok(ms, '要有该里程碑');
+
+    // seat2 是**另一个企业席**（卡是 seat 出的）⇒ 不得签字
+    const res = await call(s.app, 'POST', `/api/milestones/${ms.id}/signoff`, {
+      token: s.tokenSeat2, body: { department: '业务部门', content: '确认已落地' },
+    });
+    assert.equal(res.status, 403, `他企签字必须被拒，实际 ${res.status}：${res.body}`);
+    assert.equal(
+      s.db.prepare('SELECT COUNT(*) AS n FROM milestone_signoffs WHERE milestone_id = ?').get(ms.id).n, 0,
+      '伪造的签字不得落库',
+    );
+
+    // 对照组：出题企业本人签字必须成功（不能靠「一律拒」骗绿）
+    const ok = await call(s.app, 'POST', `/api/milestones/${ms.id}/signoff`, {
+      token: s.tokenSeat, body: { department: '业务部门', content: '确认已落地' },
+    });
+    assert.equal(ok.status, 200, `出题企业本人签字必须成功：${ok.body}`);
   } finally {
     s.close(); rmSync(s.dataDir, { recursive: true, force: true });
   }

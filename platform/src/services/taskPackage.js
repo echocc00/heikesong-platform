@@ -10,7 +10,7 @@ import { getEdition } from '../db/repo/editions.js';
 import { getUserById } from '../db/repo/users.js';
 import { listUserRoles } from '../db/repo/roles.js';
 import { writeAuditLog } from '../audit/log.js';
-import { can } from '../auth/permissions.js';
+import { can, isCommitteeActor, isEnterpriseOwner } from '../auth/permissions.js';
 
 // ⚠️ 父代理预审修正（Important，状态机）：任务卡的生命周期是
 //    submitted → assessed → published | returned →（补短板后）assessed → …
@@ -130,6 +130,17 @@ export function assessSolvability({ db, taskPackageId, answers, actorId, now = n
   const config = rules.solvability;
   const row = getTaskPackage(db, taskPackageId);
   if (!row) throw new AppError(404, 'TASK_PACKAGE_NOT_FOUND', '任务包不存在');
+  // ⚠️ **企业归属闸**（F42）：`task_package:write` 能力点被 `enterprise` 角色持有，
+  //    而角色授权是**全局**的（INTERFACES.md:22）⇒ 原来企业 A 可以对**企业 B 的**任务卡
+  //    重评六维可解性与分数 —— 而这两项正是 `grade`（进池的等级）与承诺的**输入**。
+  //    ⇒ 归属口径与「企业确认」端点（routes/review.js 的 N03 闸）**逐字同源**：
+  //    提交人本人 / 出题企业本人 / 同一企业（org 相同）三者之一；组委会可代评。
+  const actor = getUserById(db, actorId);
+  if (!isCommitteeActor(db, actor) && !isEnterpriseOwner(db, actorId, {
+    enterpriseId: row.enterprise_id, submittedBy: row.submitted_by,
+  })) {
+    throw new AppError(403, 'FORBIDDEN', '只能重新评估自己企业的任务卡');
+  }
   // ⚠️ 父代理预审修正（Important，状态机）：已发布的卡不能再评估。
   if (!ASSESSABLE.has(row.status)) {
     throw new AppError(409, 'TASK_PACKAGE_STATE_INVALID', `当前状态（${row.status}）不允许重新评估`);

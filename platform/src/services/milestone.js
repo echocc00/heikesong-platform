@@ -14,9 +14,10 @@
 // ⛔ 权限模型 = capability + assignment，can() 是唯一判定入口。
 import { randomUUID } from 'node:crypto';
 import { AppError } from '../errors.js';
-import { can } from '../auth/permissions.js';
+import { can, isCommitteeActor, isEnterpriseOwner } from '../auth/permissions.js';
 import { getUserById } from '../db/repo/users.js';
 import { getTeam } from '../db/repo/leaderboard.js';
+import { getTaskPackage } from '../db/repo/taskPackages.js';
 import * as tierRepo from '../db/repo/tiers.js';
 
 /**
@@ -33,6 +34,18 @@ export function createSignoff({ db, milestoneId, actorId, body, now = new Date()
   // 能力点闸门：只有企业席 / 企业管理员能签（seed 里 signoff:create 授予这两个角色）
   if (!can(actor, 'signoff:create', { scopeType: 'edition', scopeId: team.edition_id }, db)) {
     throw new AppError(403, 'FORBIDDEN', '你没有企业签字的权限');
+  }
+  // ⚠️ **企业归属闸**（F30）：能力点只说明「你**能**签字」，不说明「这份签字**该由你**签」。
+  //    原来只判能力点 ⇒ 企业 A 可以给**企业 B 的题目**上的队伍里程碑签字，
+  //    而签字是「**客观事实**」⇒ 被 `services/tier.js` 当成有效事实消费（`businessSignoff_count`）
+  //    ⇒ **他企可以白送对手档位**（或拉低自己队伍以外任何队伍的统计）。
+  //    归属口径与同族的「企业确认」端点（routes/review.js 的 N03 闸）**逐字同源**：
+  //    提交人本人 / 出题企业本人 / 同一企业（org 相同）三者之一；组委会可代签。
+  const pkg = team.task_package_id ? getTaskPackage(db, team.task_package_id) : null;
+  if (pkg && !isCommitteeActor(db, actor) && !isEnterpriseOwner(db, actor.id, {
+    enterpriseId: pkg.enterprise_id, submittedBy: pkg.submitted_by,
+  })) {
+    throw new AppError(403, 'FORBIDDEN', '只能为自己企业的队伍里程碑签字');
   }
   const req = rules.milestones?.signoffRequires ?? {};
   const department = String(body?.department ?? '').trim();

@@ -1323,3 +1323,201 @@ test('F38 行为分必须有频次/去重约束（weekly_progress 无 once 且�
     'behavior 写入路径没有任何去重/幂等/周期检查',
   );
 });
+
+// ══════════════════════════════════════════════════════════════════
+// 第 7 批（E173）：授权 / 归属类 4 条 —— F30 / F40 / F42 / F33
+//   F30 任意企业可伪造**他企**队伍的里程碑签字（被当作客观事实消费）
+//   F40 竞品可往**任意队**写行为事件（改变对方的完赛认定）
+//   F42 跨企业**签级重评**被授权（改的是进池的输入）
+//   F33 人才池读取**不按届期隔离**（不带 editionId ⇒ 全表）
+//
+// ⚠️ **夹具按生产口径造**：企业席提交任务卡 ⇒ `task_packages.enterprise_id` = 提交人自己
+//    （F31 修完后的服务层口径）。旧夹具把 enterprise_id 留空 ⇒ 那是「无主卡」，
+//    根本触发不了「跨企业」这条路径 ⇒ **夹具不符合契约，用例就是假绿**。
+// ⚠️ 每条用例都带**对照组**（本企业/本队必须仍然成功）——
+//    只测「被拒」不测「该过的还过」，实现可以靠「一律拒」骗绿。
+// ══════════════════════════════════════════════════════════════════
+
+const SOLVABILITY_FULL = {
+  problem_clarity: 3, data_access: 3, validation: 2,
+  decision_chain: 1, accountability: 1, precedent: 1,
+};
+const BEHAVIOR_EVIDENCE = { repo: 'git@example.com:team/repo', version: 'v1.2.0', artifact: 'demo.zip' };
+
+/** 两家企业 + 两支队的越权夹具（真实库 + 真 HTTP 服务）。 */
+async function withTwoEnterprises(fn) {
+  const dataDir = mkdtempSync(join(tmpdir(), 'hks-ent-'));
+  const { db, close } = openDatabase({ dataDir });
+  applyMigrations(db, migrationsDir);
+  const { rules } = loadRules(rulesDir);
+  const app = createApp({ db, rules, webDir });
+  const server = createServer(app.handle);
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const now = new Date().toISOString();
+  try {
+    for (const [k, d] of [
+      ['signoff:create', '企业里程碑签字'],
+      ['task_package:write', '提交任务卡'],
+      ['behavior:write', '提交行为分记录'],
+    ]) insertCapability(db, k, d);
+
+    // 两家企业，org 不同 ⇒「同企业」判定不能把甲误判成乙
+    const entA = createUser(db, { name: '甲企业', phone: '13800001701', password: 'pw', org: '甲公司' });
+    const entB = createUser(db, { name: '乙企业', phone: '13800001702', password: 'pw', org: '乙公司' });
+    const capA = createUser(db, { name: 'A队长', phone: '13800001703', password: 'pw', mbaStatus: 'mba' });
+    const capB = createUser(db, { name: 'B队长', phone: '13800001704', password: 'pw', mbaStatus: 'mba' });
+
+    db.exec(`INSERT INTO editions (id,name,city,starts_at,ends_at,created_at) VALUES ('ed1','首届','上海','2026-01-01','2026-12-31','${now}')`);
+    // ⚠️ 出题企业 = 乙公司（enterprise_id 与 submitted_by 都是乙企业本人）
+    db.exec(`INSERT INTO task_packages (id,edition_id,enterprise_id,enterprise_name,title,pain_point,expected_delivery,acceptance_criteria,is_free_brief,submitted_by,status,meta_json,submitted_at)
+             VALUES ('tp_b','ed1','${entB.id}','乙公司','乙队任务包','p','e','a',0,'${entB.id}','submitted','{}','${now}')`);
+    db.exec(`INSERT INTO teams (id,edition_id,name,captain_id,task_package_id,status,created_at) VALUES ('team_b','ed1','乙队','${capB.id}','tp_b','active','${now}')`);
+    db.exec(`INSERT INTO team_members (id,team_id,user_id,role,joined_at) VALUES ('tm_b','team_b','${capB.id}','captain','${now}')`);
+    db.exec(`INSERT INTO teams (id,edition_id,name,captain_id,task_package_id,status,created_at) VALUES ('team_a','ed1','甲队','${capA.id}','tp_b','active','${now}')`);
+    db.exec(`INSERT INTO team_members (id,team_id,user_id,role,joined_at) VALUES ('tm_a','team_a','${capA.id}','captain','${now}')`);
+    db.exec(`INSERT INTO milestones (id,team_id,key,label,counts_toward_tier,requires_signoff,fixed_at,created_at)
+             VALUES ('ms_b','team_b','problem_confirmed','企业问题确认',1,1,'${now}','${now}')`);
+
+    const grant = (userId, capability) => grantAssignment(db, {
+      userId, capability, scopeType: 'global', scopeId: null, grantedBy: null,
+    });
+    for (const u of [entA, entB]) { grant(u.id, 'signoff:create'); grant(u.id, 'task_package:write'); }
+    for (const u of [capA, capB]) grant(u.id, 'behavior:write');
+
+    await fn({
+      base, db, now, entA, entB, capA, capB,
+      tokenEntA: createSession(db, entA.id).token,
+      tokenEntB: createSession(db, entB.id).token,
+      tokenCapA: createSession(db, capA.id).token,
+      tokenCapB: createSession(db, capB.id).token,
+    });
+  } finally {
+    await new Promise((r) => server.close(r));
+    close();
+  }
+}
+
+// ═══ F30：任意企业可伪造他企队伍的里程碑签字 ═══
+test('F30 任意企业不得给他企队伍的里程碑签字（伪造客观事实）', async () => {
+  await withTwoEnterprises(async ({ base, db, tokenEntA, tokenEntB }) => {
+    const r = await call(base, 'POST', '/api/milestones/ms_b/signoff', {
+      cookie: `hk_session=${tokenEntA}`,
+      body: { department: '业务部', content: '确认已落地' },
+    });
+    assert.equal(r.status, 403, `甲企业给乙企业的队伍签字必须被拒，实际 ${r.status}：${r.text}`);
+    assert.equal(
+      db.prepare('SELECT COUNT(*) AS n FROM milestone_signoffs').get().n, 0,
+      '伪造的签字不得落库（签字是「客观事实」，被系统消费后直接影响段位）',
+    );
+    // 对照组：出题企业本人签字必须成功（不能靠「一律拒」骗绿）
+    const ok = await call(base, 'POST', '/api/milestones/ms_b/signoff', {
+      cookie: `hk_session=${tokenEntB}`,
+      body: { department: '业务部', content: '确认已落地' },
+    });
+    assert.equal(ok.status, 200, `出题企业本人签字必须成功：${ok.text}`);
+  });
+});
+
+// ═══ F40：竞品可往任意队写行为事件 ═══
+test('F40 竞品不得往他队写行为事件（行为分直接改变对方的完赛认定）', async () => {
+  await withTwoEnterprises(async ({ base, db, tokenCapA, tokenCapB }) => {
+    const r = await call(base, 'POST', '/api/teams/team_b/behavior-events', {
+      cookie: `hk_session=${tokenCapA}`,
+      body: { type: 'weekly_progress', evidence: BEHAVIOR_EVIDENCE },
+    });
+    assert.equal(r.status, 403, `A 队队长给 B 队写行为事件必须被拒，实际 ${r.status}：${r.text}`);
+    assert.equal(
+      db.prepare('SELECT COUNT(*) AS n FROM behavior_events').get().n, 0,
+      '他队的行为事件不得落库',
+    );
+    // 对照组：本队队长写自己的队必须成功
+    const ok = await call(base, 'POST', '/api/teams/team_b/behavior-events', {
+      cookie: `hk_session=${tokenCapB}`,
+      body: { type: 'weekly_progress', evidence: BEHAVIOR_EVIDENCE },
+    });
+    assert.equal(ok.status, 200, `本队队长写本队必须成功：${ok.text}`);
+  });
+});
+
+// ═══ F42：跨企业签级重评被授权 ═══
+test('F42 跨企业签级重评必须被拒（他企任务卡的评级不得被改）', async () => {
+  await withTwoEnterprises(async ({ base, db, tokenEntA, tokenEntB }) => {
+    const r = await call(base, 'POST', '/api/task-packages/tp_b/solvability', {
+      cookie: `hk_session=${tokenEntA}`,
+      body: { answers: SOLVABILITY_FULL },
+    });
+    assert.equal(r.status, 403, `甲企业重评乙企业的任务卡必须被拒，实际 ${r.status}：${r.text}`);
+    const row = db.prepare('SELECT solvability_score FROM task_packages WHERE id = ?').get('tp_b');
+    assert.equal(row.solvability_score, null, '他企任务卡的评级被改了');
+    // 对照组：出题企业本人重评必须成功
+    const ok = await call(base, 'POST', '/api/task-packages/tp_b/solvability', {
+      cookie: `hk_session=${tokenEntB}`,
+      body: { answers: SOLVABILITY_FULL },
+    });
+    assert.equal(ok.status, 200, `出题企业本人重评必须成功：${ok.text}`);
+  });
+});
+
+// ═══ F42b：提交人本人仍可评自己提交的卡（代提交场景）═══
+test('F42b 代提交场景：提交人本人可评自己提交的卡（提交人是唯一凭据时）', async () => {
+  await withTwoEnterprises(async ({ base, db, entA, entB, tokenEntA, tokenEntB }) => {
+    // 「企业管理员代企业 B 提交」：submitted_by = 管理员 A，enterprise_id = 出题企业 B
+    // ⇒ A（提交人）可评；B（出题企业）可评；**别人**不可评。
+    db.exec(`INSERT INTO task_packages (id,edition_id,enterprise_id,enterprise_name,title,pain_point,expected_delivery,acceptance_criteria,is_free_brief,submitted_by,status,meta_json,submitted_at)
+             VALUES ('tp_c','ed1','${entB.id}','乙公司','代提交卡','p','e','a',0,'${entA.id}','submitted','{}','${new Date().toISOString()}')`);
+
+    // 提交人 A：可评（他提交的卡）
+    const bySubmitter = await call(base, 'POST', '/api/task-packages/tp_c/solvability', {
+      cookie: `hk_session=${tokenEntA}`,
+      body: { answers: SOLVABILITY_FULL },
+    });
+    assert.equal(bySubmitter.status, 200, `提交人本人必须能评自己提交的卡：${bySubmitter.text}`);
+
+    // 出题企业 B：可评（这是他出的题）
+    db.exec(`UPDATE task_packages SET status = 'submitted' WHERE id = 'tp_c'`);
+    const byIssuer = await call(base, 'POST', '/api/task-packages/tp_c/solvability', {
+      cookie: `hk_session=${tokenEntB}`,
+      body: { answers: SOLVABILITY_FULL },
+    });
+    assert.equal(byIssuer.status, 200, `出题企业本人必须能能评自己出的题：${byIssuer.text}`);
+  });
+});
+
+// ═══ F33：人才池读取不按届期隔离 ═══
+test('F33 人才池读取必须按届期隔离（不带 editionId 不得返回其它届期的行）', async () => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'hks-pool-'));
+  const { db, close } = openDatabase({ dataDir });
+  applyMigrations(db, migrationsDir);
+  const now = new Date().toISOString();
+  try {
+    insertCapability(db, 'pool:read', '读三池');
+    const viewer = createUser(db, { name: '参赛者', phone: '13800001711', password: 'pw', mbaStatus: 'mba' });
+    grantAssignment(db, {
+      userId: viewer.id, capability: 'pool:read', scopeType: 'global', scopeId: null, grantedBy: null,
+    });
+    db.exec(`INSERT INTO editions (id,name,city,starts_at,ends_at,created_at) VALUES ('ed_1','首届','上海','2026-01-01','2026-12-31','${now}')`);
+    db.exec(`INSERT INTO editions (id,name,city,starts_at,ends_at,created_at) VALUES ('ed_2','第二届','上海','2027-01-01','2027-12-31','${now}')`);
+    // 参赛者报名了 ed_1 ⇒ 缺省届期应落到 ed_1
+    db.exec(`INSERT INTO registrations (id,edition_id,user_id,answers_json,dimension_scores_json,raw_score,level,level_final,status,created_at)
+             VALUES ('r_v','ed_1','${viewer.id}','{}','{}',80,'B','B','accepted','${now}')`);
+    db.exec(`INSERT INTO pool_talents (id,user_id,edition_id,name,org,total_points,mba_status,stages_joined,skills_json,created_at)
+             VALUES ('pt_1','${viewer.id}','ed_1','本人','某公司',10,'mba',1,'[]','${now}')`);
+    db.exec(`INSERT INTO pool_talents (id,user_id,edition_id,name,org,total_points,mba_status,stages_joined,skills_json,created_at)
+             VALUES ('pt_2','${viewer.id}','ed_2','别届的人','别家公司',99,'other',3,'[]','${now}')`);
+
+    const { listPoolTalents } = await import('../src/services/pools.js');
+    const all = listPoolTalents({ db, filter: {}, viewer });
+    assert.ok(
+      all.every((r) => r.editionId === 'ed_1'),
+      `不带 editionId 读人才池返回了其它届期的行：${JSON.stringify(all.map((r) => r.editionId))}`
+      + ' —— 届期隔离是平台级约束（S2），池读取必须按届期隔离',
+    );
+    // 对照组：显式指定届期仍然只返回该届
+    const scoped = listPoolTalents({ db, filter: { editionId: 'ed_1' }, viewer });
+    assert.equal(scoped.length, 1, '指定届期时只返回该届的行');
+    assert.equal(scoped[0].editionId, 'ed_1');
+  } finally {
+    close();
+  }
+});

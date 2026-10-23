@@ -13,6 +13,7 @@ import { AppError } from '../errors.js';
 import { can } from '../auth/permissions.js';
 import { getUserById } from '../db/repo/users.js';
 import { getTeam } from '../db/repo/leaderboard.js';
+import { hasActiveMembership } from '../db/repo/teamMembers.js';
 import { insertBehaviorEvent, listBehaviorEventsByTeams } from '../db/repo/points.js';
 import { behaviorScore } from '../domain/behavior.js';
 
@@ -27,6 +28,16 @@ export function submitBehaviorEvent({ db, teamId, actorId, body, now = new Date(
   if (!team) throw new AppError(404, 'TEAM_NOT_FOUND', '战队不存在');
   if (!can(actor, 'behavior:write', { scopeType: 'edition', scopeId: team.edition_id }, db)) {
     throw new AppError(403, 'FORBIDDEN', '你没有提交行为分记录的权限');
+  }
+  // ⚠️ **本队成员闸**（F40）：能力点只说明「你**能**提交行为事件」，不说明「这条事件**属于哪支队**」。
+  //    原来无成员校验 ⇒ A 队的人可以给 **B 队**写「每周进度」等事件，
+  //    直接改变 B 队的 `behaviorScore` 与完赛认定，而 B 队队长**看不到也拦不住**
+  //    （叠加 F38 的次数约束后仍可跨队刷分 ⇒ 破同分链的最后一档被跨队操纵）。
+  //    ⇒ 口径与同文件的同族端点（routes/review.js 的互评/自评端点）**逐字同源**：
+  //    只有**本队在队成员**（含队长）能写本队的行为事件。
+  //    ⚠️ 组委会**不开口子**：代写行为分 = 代刷对方的完赛认定。
+  if (!hasActiveMembership(db, teamId, actorId)) {
+    throw new AppError(403, 'FORBIDDEN', '只能给自己所在的队提交行为分记录');
   }
   const type = String(body?.type ?? '').trim();
   const def = (rules.behavior?.events ?? []).find((d) => d.key === type);

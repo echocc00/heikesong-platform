@@ -234,8 +234,14 @@ function seedP1({ db, rules, adminId, now = '2026-10-20T00:00:00.000Z' }) {
     }
     // 幂等续跑：卡在哪个阶段就从哪个阶段往下走
     if (pkg.status === 'submitted') {
+      // ⚠️ **评估者必须与卡片的企业主体一致**（2026-10-23 审计 F42 修完后）：
+      //    「可解性六维评估」改的是**进池的输入**（grade 与承诺）⇒ 只能由
+      //    出题企业（或组委会）做，否则企业 A 能改企业 B 的卡的评级。
+      //    非自由卡：企业席出题（enterprise_id = 企业席自己）⇒ 企业席本人评估；
+      //    自由题：无企业主体（R-ENT-10，committee 提交）⇒ 组委会评估。
       assessSolvability({
-        db, taskPackageId: pkg.id, answers: ANSWERS[spec.grade], actorId: enterprise.id, now, rules,
+        db, taskPackageId: pkg.id, answers: ANSWERS[spec.grade],
+        actorId: spec.free ? adminId : enterprise.id, now, rules,
       });
       pkg = { ...pkg, status: 'assessed' };
     }
