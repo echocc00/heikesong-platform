@@ -113,6 +113,10 @@ export const NAV_SECTIONS = [
       { path: '/admin/public-links', label: '公开访问链接' },
       // ⚠️ P11：审计日志（`GET /api/audit/log` 早就挂在后端，前端**从来没调用过**）
       { path: '/audit/log', label: '审计日志' },
+      // ⚠️ E158：赛段配置与权重表（设计 §9「组委会视角」明写要有这块界面）。
+      //   此前 P11 把建段 / 改配置 / 派评委 / 报名册 6 个**写**端点全做完了，
+      //   却**一个界面都没有** ⇒ 端点零调用方（与 E149/E150 同一族的「写了没接线」）。
+      { path: '/stages', label: '赛段配置' },
     ],
   },
 ];
@@ -193,6 +197,11 @@ export const ROUTE_CAPABILITIES = {
   //    ⇒ 前端**必须**声明这个能力点，否则没权限的人会看到一张「空空如也的审计表」，
   //    把「无权」误读成「没记录」（视图侧也据此显示「可能压根没权限」）。
   '/audit/log': 'audit:read',
+  // ⚠️ E158：赛段配置页要求 `stage:compute`（与 API 同口径 ⇒ 前后端一致）。
+  //    注意 API 侧的口径是「**届期级或赛段级**都放行」（routes/stages.js 的
+  //    requireStageComputeForEdition）⇒ 前端声明的是能力点**名称**，
+  //    真正的裁决在 API 层（前端拿不到「你是赛段级还是届期级授权」）。
+  '/stages': 'stage:compute',
 };
 
 /** 路径归一：去掉 query 与结尾斜杠（'/flags/' 与 '/flags' 是同一个页面）。 */

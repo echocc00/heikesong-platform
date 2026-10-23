@@ -147,6 +147,19 @@ const VIEW_ENDPOINTS = [
   { method: 'GET', path: '/api/stages/stage_final/publish' },
   { method: 'GET', path: '/api/stages/stage_final/tiebreak/rounds' },
   { method: 'GET', path: '/api/public/tokens' },
+  // ── E158：赛段配置页（设计 §9「赛段配置与权重表」）────────────────
+  // ⚠️ 这组端点是「赛段配置」页的**全部**数据来源：
+  //    届期 / 候选队伍 / 评委候选池 / 权重表 + 赛段读口。
+  //    演示适配器漏一个 ⇒ 公网演示站那页就有一块是 404。
+  { method: 'GET', path: '/api/editions' },
+  { method: 'GET', path: '/api/editions/ed_demo/teams' },
+  { method: 'GET', path: '/api/editions/ed_demo/judge-candidates' },
+  { method: 'GET', path: '/api/editions/ed_demo/scoring-configs' },
+  { method: 'GET', path: '/api/stages/stage_final/judges' },
+  { method: 'GET', path: '/api/stages/stage_final/teams' },
+  { method: 'POST', path: '/api/editions/ed_demo/stages', body: { key: 's_demo', name: '演示赛段', kind: 'initial', scoringConfigKey: 'initial' } },
+  { method: 'POST', path: '/api/stages/stage_final/judges', body: { userId: 'j_lenient', seat: 'judge' } },
+  { method: 'POST', path: '/api/stages/stage_final/teams', body: { teamIds: ['t_alpha'] } },
 ];
 
 test('演示适配器必须实现前端用到的**每一个**端点（缺一个 ⇒ 演示站那页就是 404）', async () => {

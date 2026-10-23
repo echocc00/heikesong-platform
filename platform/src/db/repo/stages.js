@@ -98,7 +98,15 @@ export function listStages(db, { editionId } = {}) {
  *    真正需要按人过滤的是评分与名单（那些走 /api/leaderboard 等端点）。
  */
 export function listStageSummaries(db, { editionId } = {}) {
-  const sql = `SELECT id, "key" AS key, name, kind, status, starts_at AS startsAt, ends_at AS endsAt
+  // ⚠️ E158：补 freeze_at / scoring_config_key 两个字段。
+  //    起因：「赛段配置」页（设计 §9「赛段配置与权重表」）刷新后要能回填
+  //    「冻结时间」与「用的哪张权重表」—— 摘要里没有这两项 ⇒ 页面只能把
+  //    PATCH 的 body 留空（服务端语义「不传=不改」），改配置时**看不出当前值**。
+  //    ⛔ 公开面不变宽：freezeAt 是赛程信息（与 startsAt/endsAt 同类）；
+  //       scoringConfigKey 只是「用 initial 还是 final 这张权重表」——
+  //       而两张权重表的维度与权重早已由 `GET /api/event-info` 公开。
+  const sql = `SELECT id, "key" AS key, name, kind, status, starts_at AS startsAt, ends_at AS endsAt,
+                       freeze_at AS freezeAt, scoring_config_key AS scoringConfigKey
                  FROM stages ${editionId ? 'WHERE edition_id = ?' : ''}
                 ORDER BY starts_at, id`;
   return editionId ? db.prepare(sql).all(editionId) : db.prepare(sql).all();
@@ -201,6 +209,39 @@ export function listStageJudges(db, stageId) {
 
 export function getStageJudge(db, stageId, userId) {
   return db.prepare('SELECT * FROM stage_judges WHERE stage_id = ? AND user_id = ?').get(stageId, userId) ?? null;
+}
+
+/**
+ * 评委**候选池**（组委会派评委时可选的人）。
+ *
+ * ⚠️ 为什么不用 `listAllUsers`（pool-sources.js）：
+ *   那个函数返回**全部在册用户**（不分角色、不分届期），机器闸的 allow.json 已把它
+ *   明确判为「未被消费是语义上正确的结果」—— 顶层文档 §3.1 S2「一切按 edition 隔离」。
+ *   ⇒ 评委候选池**不是「全部用户」**，而是「**持有评委类角色**的人」。
+ *
+ * ⚠️ 角色集合的来源（P0 seed.js 的 ROLE_CAPABILITIES）：
+ *   `judge` 专家席 / `enterprise` 企业席 / `observer` 观察员（无投票权）。
+ *   ⛔ 角色本身**不带 edition_id**（一人可跨多届当评委）⇒ 这里不做届期过滤，
+ *     与 S2 的隔离要求不冲突：S2 隔离的是**参赛者/队伍/积分**这类赛事数据，
+ *     评委是**组委会资源**，跨届复用是正常的。
+ *
+ * ⚠️ 排序兜底键用 SQLite 隐式 `rowid`（全局约束）：
+ *   `u.created_at` 相等时由 `rowid`（插入顺序）兜底 ⇒ 顺序确定，不随机。
+ *
+ * @param {object} db
+ * @returns {Array<{id: string, name: string, org: string|null}>}
+ */
+export function listStageJudgeCandidates(db) {
+  return db
+    .prepare(
+      `SELECT DISTINCT u.id AS id, u.name AS name, u.org AS org
+         FROM users u
+         JOIN user_roles r ON r.user_id = u.id
+        WHERE u.active = 1
+          AND r.role_key IN ('judge', 'enterprise', 'observer')
+        ORDER BY u.created_at, u.rowid`,
+    )
+    .all();
 }
 
 /**
