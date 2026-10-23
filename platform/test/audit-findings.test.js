@@ -1052,6 +1052,49 @@ test('F36 review_state 必须有 FINALIZED 的生产者（否则 team_result 申
   );
 });
 
+// ═══ F36（运行时）：发榜后 team_result 申诉必须真的能被受理 ═══
+// ⚠️ 上面那条用例只是**静态扫描**（查源码里有没有 `to: 'FINALIZED'` 字面量）——
+//    它能抓住「生产者根本不存在」，但抓不住「生产者写了、却写错了状态/主体/时机」。
+//    ⇒ 这里补一条**端到端**用例：真的发一次榜，然后真的去提交一条 team_result 申诉。
+test('F36 发榜后对赛段结果提交申诉必须被受理（FINALIZED 的生产者真的在工作）', async () => {
+  const { db, close } = freshDb();
+  try {
+    const { rules } = loadRules(rulesDir);
+    const now = new Date().toISOString();
+    db.exec(`INSERT INTO editions (id,name,city,starts_at,ends_at,created_at) VALUES ('ed1','E','北京','2026-01-01','2026-12-31','${now}')`);
+    db.exec(`INSERT INTO stages (id,edition_id,"key",name,kind,status,starts_at,ends_at,scoring_config_key) VALUES ('st1','ed1','s1','S1','initial','open','2026-01-01','2026-02-01','initial')`);
+    const admin = createUser(db, { name: '组委会', phone: '13900000031', password: 'pw' });
+    const captain = createUser(db, { name: '一队队长', phone: '13900000032', password: 'pw' });
+    insertCapability(db, 'stage:compute', '触发计算发榜');
+    grantAssignment(db, {
+      userId: admin.id, capability: 'stage:compute', scopeType: 'global', scopeId: null, grantedBy: admin.id,
+    });
+    db.exec(`INSERT INTO teams (id,edition_id,name,captain_id,created_at) VALUES ('tm1','ed1','一队','${captain.id}','${now}')`);
+    // 赛段结果已算出来（否则 F12 的闸会拦下发榜）
+    db.exec(`INSERT INTO stage_results (id,stage_id,team_id,total,seat_p,seat_e,created_at) VALUES ('sr1','st1','tm1',80,80,0,'${now}')`);
+    // 档位 D（可申诉档位：rules/audit.json 的 appealAllowedTiers = ['D']）
+    db.exec(`INSERT INTO tier_records (id,team_id,tier,milestone_count,business_signoff_count,reasons_json,computed_at) VALUES ('tr1','tm1','D',0,0,'[]','${now}')`);
+
+    const { publishLeaderboard } = await import('../src/services/leaderboard.js');
+    const published = publishLeaderboard({ db, editionId: 'ed1', stageId: 'st1', actorId: admin.id, now, rules });
+    assert.equal(published.reviewState, 'FINALIZED', '发榜后赛段结果的复核状态必须是 FINALIZED');
+
+    // 三步迁移都要留痕（可复盘）
+    const moves = db.prepare("SELECT detail_json FROM audit_log WHERE action = 'review_state.transition' ORDER BY rowid").all();
+    assert.equal(moves.length, 3, `发榜应写 3 条状态迁移（SUBMITTED→PENDING_REVIEW→CONFIRMED→FINALIZED），实际 ${moves.length} 条`);
+
+    // 关键：队长对**本队**的结果提申诉 —— 必须被受理（修复前永远 409「未进入复核」）
+    const { fileAppeal } = await import('../src/services/review-state.js');
+    const appeal = fileAppeal({
+      db, filedBy: captain.id, now, rules,
+      subjectType: 'team_result',
+      subjectId: 'st1:tm1',
+      reason: '名次有异议',
+    });
+    assert.ok(appeal?.id, `发榜后申诉必须被受理，实际返回：${JSON.stringify(appeal)}`);
+  } finally { close(); }
+});
+
 // ═══ F35：破同分链用 String(value) 分桶 ═══
 test('F35 破同分分桶不得用 String(value) —— 1 ULP 之差会被判为不同名次', async () => {
   const { applyTiebreakChain } = await import('../src/domain/ranking.js');

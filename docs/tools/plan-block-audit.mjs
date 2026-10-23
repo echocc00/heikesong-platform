@@ -86,6 +86,15 @@ const PLANS = [
   //    ⛔ **不能漏**：P12 改的是 styles.css / ui.js / 四个视图（P0 / P7 / P11 owns），
   //      同步回 owning 阶段后，P12 自己拥有的新文件也必须被审计到。
   ['P12', 'docs/superpowers/plans/2026-10-23-platform-P12-ui-retrofit.md'],
+  // ⚠️ P13（审计缺陷全量修复：47 条）：新建文件的规格块在这里
+  //    （src/runtime/service-probe.js —— 服务存活探测；
+  //      src/services/review-state-core.js —— 状态机内核；
+  //      test/audit-findings.test.js —— 审计回归用例全集）。
+  //    ⛔ **不能漏**：P13 改的既有文件（services/leaderboard.js → P3 owns、
+  //      db/repo/leaderboard.js → P3 owns、services/review-state.js → P4 owns）
+  //      已**逐字同步回 owning 阶段**；P13 自己新建的文件必须被审计到，
+  //      否则「抽内核」「加探测」这类新增文件**连漂移都没人查**。
+  ['P13', 'docs/superpowers/plans/2026-10-23-platform-P13-defect-fixes.md'],
 ];
 
 /**

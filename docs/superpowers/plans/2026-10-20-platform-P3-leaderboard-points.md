@@ -3848,6 +3848,28 @@ export function getTeam(db, teamId) {
   return db.prepare('SELECT * FROM teams WHERE id = ? AND deleted_at IS NULL').get(teamId) ?? null;
 }
 
+/**
+ * 回写赛段结果的**名次 / 并列数 / 积分**（E170 / F7）。
+ *
+ * ⚠️ 为什么这三列此前永远是 NULL：
+ *   P2 建表时留了三列空位并约定「**P3 来填**」，而 P3 从来没填 ——
+ *   全仓唯一碰这三列的 SQL 是 `resetStageResults` 的 `SET rank = NULL, tied_with = NULL, points = NULL`
+ *   （**只置 NULL**）⇒ 公开榜单的 `rank` / `points` / `tiedWith` 恒为 null，
+ *   而排序退化成 `team_id` 序（**低分队排在高分队前面**）⇒ 榜单的名次是错的。
+ *   （与本仓已修的 E149/E150「服务写好了但没有路由触达」同款病根：P2 留了坑，P3 没填。）
+ *
+ * @param {number} rank      名次（1 起）
+ * @param {number} tiedWith  **与本队并列的队伍数**（0 = 不并列）。
+ *   ⚠️ 口径：领域层的 `rankTeams` 给的是「并列组里除自己外的队 id 数组」，
+ *      而本列是 INTEGER ⇒ 落库的是**个数**（0/1/2…），与 P3 计划里的夹具口径一致。
+ * @param {number} points    本赛段名次积分
+ */
+export function updateStageResultRanking(db, { stageId, teamId, rank, tiedWith = 0, points = null }) {
+  db.prepare(
+    'UPDATE stage_results SET rank = ?, tied_with = ?, points = ? WHERE stage_id = ? AND team_id = ?',
+  ).run(rank, tiedWith, points, stageId, teamId);
+}
+
 export function listTeamMembers(db, teamId) {
   return db.prepare('SELECT * FROM team_members WHERE team_id = ? AND left_at IS NULL').all(teamId);
 }
@@ -4094,6 +4116,12 @@ import { computeTeamTier } from './tier.js';
 import { buildReverseAuditTasks } from './anticheat.js';
 import { getTiebreakExtraScores } from './tiebreak.js';
 import { cmpStr } from '../domain/util.js';
+import { withTransaction } from '../db/tx.js';
+// ⚠️ 从 **core** 模块 import（不是 review-state.js）：
+//   review-state.js 是**可选模块**（路由层动态加载；模块不在 ⇒ 申诉端点 503，
+//   但平台必须照常启动）⇒ 发榜这条**始终在场**的路径不能静态依赖它。
+//   状态机内核（迁移表 / transition / 终稿推进）已抽到 core 模块 ⇒ 两边共用同一份实现。
+import { finalizeStageResult } from './review-state-core.js';
 import * as repo from '../db/repo/leaderboard.js';
 import * as pointsRepo from '../db/repo/points.js';
 import * as tierRepo from '../db/repo/tiers.js';
@@ -4222,19 +4250,21 @@ function collectWarnings({ db, stage, ranking }) {
   return out;
 }
 
-function buildRankPayload({ db, stage, R }) {
-  const built = buildStageRanking({ db, stage, R });
+function buildRankPayload({ db, stage, R, built = null }) {
+  // ⚠️ `built` 可由调用方传入（发榜路径已经算过一次 ⇒ 复用，别算两遍）；
+  //    读路径不传 ⇒ 这里现算。
+  const ranking = built ?? buildStageRanking({ db, stage, R });
   const tiers = indexBy(tierRepo.listLatestTiersByEdition(db, stage.edition_id), 'team_id', 'tier');
-  const rows = built.ranking.ordered.map((row) => {
-    const res = built.results.find((r) => r.team_id === row.teamId);
+  const rows = ranking.ranking.ordered.map((row) => {
+    const res = ranking.results.find((r) => r.team_id === row.teamId);
     return {
       teamId: row.teamId,
       teamName: res?.team_name ?? null,
       taskPackageId: res?.task_package_id ?? null,
       rank: row.rank,
       tiedWith: row.tiedWith,
-      packageRank: built.packageRank[row.teamId] ?? null,
-      points: built.points[row.teamId] ?? 0,
+      packageRank: ranking.packageRank[row.teamId] ?? null,
+      points: ranking.points[row.teamId] ?? 0,
       total: row.total,
       tier: tiers[row.teamId] ?? 'D',
       enterpriseName: null,   // ⛔ 企业名不公示（S10 §8）
@@ -4244,7 +4274,7 @@ function buildRankPayload({ db, stage, R }) {
   });
   return {
     scope: 'rank', stageId: stage.id, editionId: stage.edition_id, rows,
-    warnings: built.warnings, rankStyle: built.ranking.rankStyle, tiebreakApplied: built.ranking.applied,
+    warnings: ranking.warnings, rankStyle: ranking.ranking.rankStyle, tiebreakApplied: ranking.ranking.applied,
   };
 }
 
@@ -4280,8 +4310,8 @@ function buildPersonalPayload({ db, stage, R }) {
   return { scope: 'personal', stageId: stage.id, editionId: stage.edition_id, rows, warnings: [] };
 }
 
-const buildPayload = ({ db, stage, scope, rules: R }) => (scope === 'rank'
-  ? buildRankPayload({ db, stage, R })
+const buildPayload = ({ db, stage, scope, rules: R, built = null }) => (scope === 'rank'
+  ? buildRankPayload({ db, stage, R, built })
   : scope === 'business' ? buildBusinessPayload({ db, stage }) : buildPersonalPayload({ db, stage, R }));
 
 /**
@@ -4392,31 +4422,87 @@ export function publishLeaderboard({ db, editionId, stageId, actorId, now, rules
   if (!stage) throw new AppError(404, 'STAGE_NOT_FOUND', '赛段不存在');
   const createdAt = now ?? new Date().toISOString();
 
-  const snapshots = {};
-  for (const scope of SCOPES) {
-    const payload = buildPayload({ db, stage, scope, rules: R });   // 原始快照（内部可见）
-    const id = randomUUID();
-    repo.insertSnapshot(db, { id, editionId, stageId, scope, payloadJson: JSON.stringify(payload), createdAt });
-    snapshots[scope] = { id, scope, createdAt };
+  // ⛔ F12：**没有计算结果的赛段不得发榜**。
+  //    修复前这条路径对「算过没有」零检查 ⇒ 对一个从未算过的赛段发榜会**成功**，
+  //    产出一个**空榜**，而且 `leaderboard.publish` 审计照写不误
+  //    （实测 getPublishState → published:true、snapshotCount:3、rows 为 0）。
+  //    ⇒ 「发榜」的对象是**赛段结果**：没有结果就没有可发的东西（发出来是空榜），
+  //      而且 F7 的名次回写也无处可写。
+  //    ⚠️ 判据为什么用「**stage_results 非空**」而不是「有没有计算快照」：
+  //      重算中途失败时 computeStage 已把旧结果清空、而旧快照还在
+  //      ⇒ 只看快照会放行一个**空榜**。结果才是发榜的对象。
+  //      （「没有计算快照」这件事由 collectWarnings 的 NO_COMPUTATION_SNAPSHOT 告警暴露，
+  //        它是**告警**不是**闸门** —— 快照缺失不影响「结果是否存在」这个事实。）
+  if (!repo.listStageResults(db, stage.id).length) {
+    throw new AppError(409, 'STAGE_NOT_COMPUTED', '该赛段还没有计算结果，不能发榜（请先计算再发榜）');
   }
 
-  // ★ 发榜前重算段位：段位记录是榜单快照与段位公示的依据，
-  //    不重算就永远是兜底的 D 段（P3-15）。
-  const tierUpdates = [];
-  for (const row of repo.listStageResults(db, stageId)) {
-    if (tierUpdates.some((t) => t.teamId === row.team_id)) continue;
-    tierUpdates.push(computeTeamTier({ db, teamId: row.team_id, now: createdAt, rules: R }));
-  }
+  // ⚠️ F37：**整体包进一个事务**。
+  //    修复前的写入序列是「写 3 个快照 → 写档位 → 记积分 → 写 MVP 积分 → 写审计」，
+  //    **没有事务** ⇒ 中途失败（例如 MVP 分写入时外键失败）会留下**半成品**：
+  //    快照已写、赛段积分已写、档位已写，却**没有审计行、也没有 MVP 积分**，
+  //    而 `getPublishState` 还报 `published: true` ⇒ R-AUD-01 依赖的审计轨迹缺失。
+  //    （同一份纪律，compute 路径遵守了、publish 路径没有 —— 见 src/services/compute.js。）
+  return withTransaction(db, () => {
+    // 一次排名结果，发榜全程复用（buildStageRanking 不便宜：破同分/行为分/企业分都要算）
+    const built = buildStageRanking({ db, stage, R });
 
-  const awarded = {
-    stage: awardStagePoints({ db, editionId, stageId, rules: R, createdAt }),
-    mvp: awardMvp({ db, editionId, stageId, rules: R, createdAt }),
-  };
-  repo.insertAuditLog(db, {
-    id: randomUUID(), actorId, action: 'leaderboard.publish', entity: 'stage', entityId: stageId,
-    detailJson: JSON.stringify({ editionId, stageId, snapshots, awarded }), createdAt,
+    // ⚠️ F7：**名次 / 并列 / 积分必须回写 stage_results**。
+    //    这三列 P2 建表时留了空位并约定「P3 来填」，P3 从来没填 ⇒
+    //    公开榜单的 rank / points / tiedWith 恒为 null，而排序退化成 team_id 序
+    //    （**低分队排在高分队前面**）⇒ 榜单的名次是错的。
+    //    ⇒ 现在发榜时把 rankTeams 产出的名次与名次积分落库。
+    //    ⚠️ 口径：`rankTeams` 给的 `tiedWith` 是「并列组里除自己外的队 id 数组」，
+    //    而本列是 INTEGER ⇒ 落库的是**并列队伍数**（0 = 不并列）。
+    for (const row of built.ranking.ordered) {
+      repo.updateStageResultRanking(db, {
+        stageId: stage.id,
+        teamId: row.teamId,
+        rank: row.rank,
+        tiedWith: Array.isArray(row.tiedWith) ? row.tiedWith.length : 0,
+        points: built.points[row.teamId] ?? 0,
+      });
+    }
+
+    const snapshots = {};
+    for (const scope of SCOPES) {
+      const payload = buildPayload({ db, stage, scope, rules: R, built });   // 原始快照（内部可见）
+      const id = randomUUID();
+      repo.insertSnapshot(db, { id, editionId, stageId, scope, payloadJson: JSON.stringify(payload), createdAt });
+      snapshots[scope] = { id, scope, createdAt };
+    }
+
+    // ★ 发榜前重算段位：段位记录是榜单快照与段位公示的依据，
+    //    不重算就永远是兜底的 D 段（P3-15）。
+    const tierUpdates = [];
+    for (const row of repo.listStageResults(db, stageId)) {
+      if (tierUpdates.some((t) => t.teamId === row.team_id)) continue;
+      tierUpdates.push(computeTeamTier({ db, teamId: row.team_id, now: createdAt, rules: R }));
+    }
+
+    const awarded = {
+      stage: awardStagePoints({ db, editionId, stageId, rules: R, createdAt }),
+      mvp: awardMvp({ db, editionId, stageId, rules: R, createdAt }),
+    };
+
+    // ⚠️ F36：**终稿落库 ⇒ 复核状态推进到 FINALIZED**。
+    //    修复前全仓**没有任何一处**生产 FINALIZED ⇒ `fileAppeal` 对 team_result 永远 409
+    //    ⇒「提交申诉 → 裁决 → 撤销终稿 → 重算」整条链在生产上不可达。
+    //    ⇒ 现在随终稿一起写这条迁移（与终稿同事务 ⇒ 要么都有、要么都没有）。
+    const reviewState = finalizeStageResult({
+      db, stageId: stage.id, actorId, reason: '发榜终稿', now: createdAt,
+    });
+
+    repo.insertAuditLog(db, {
+      id: randomUUID(), actorId, action: 'leaderboard.publish', entity: 'stage', entityId: stageId,
+      detailJson: JSON.stringify({ editionId, stageId, snapshots, awarded, reviewState: reviewState.state }),
+      createdAt,
+    });
+    return {
+      editionId, stageId, snapshots, awarded, reviewState: reviewState.state,
+      createdAt, reverseAuditTasks: buildTopReverseAuditTasks({ db, stage, R }),
+    };
   });
-  return { editionId, stageId, snapshots, awarded, createdAt, reverseAuditTasks: buildTopReverseAuditTasks({ db, stage, R }) };
 }
 
 /**

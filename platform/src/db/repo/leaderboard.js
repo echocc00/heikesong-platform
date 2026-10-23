@@ -23,6 +23,28 @@ export function getTeam(db, teamId) {
   return db.prepare('SELECT * FROM teams WHERE id = ? AND deleted_at IS NULL').get(teamId) ?? null;
 }
 
+/**
+ * 回写赛段结果的**名次 / 并列数 / 积分**（E170 / F7）。
+ *
+ * ⚠️ 为什么这三列此前永远是 NULL：
+ *   P2 建表时留了三列空位并约定「**P3 来填**」，而 P3 从来没填 ——
+ *   全仓唯一碰这三列的 SQL 是 `resetStageResults` 的 `SET rank = NULL, tied_with = NULL, points = NULL`
+ *   （**只置 NULL**）⇒ 公开榜单的 `rank` / `points` / `tiedWith` 恒为 null，
+ *   而排序退化成 `team_id` 序（**低分队排在高分队前面**）⇒ 榜单的名次是错的。
+ *   （与本仓已修的 E149/E150「服务写好了但没有路由触达」同款病根：P2 留了坑，P3 没填。）
+ *
+ * @param {number} rank      名次（1 起）
+ * @param {number} tiedWith  **与本队并列的队伍数**（0 = 不并列）。
+ *   ⚠️ 口径：领域层的 `rankTeams` 给的是「并列组里除自己外的队 id 数组」，
+ *      而本列是 INTEGER ⇒ 落库的是**个数**（0/1/2…），与 P3 计划里的夹具口径一致。
+ * @param {number} points    本赛段名次积分
+ */
+export function updateStageResultRanking(db, { stageId, teamId, rank, tiedWith = 0, points = null }) {
+  db.prepare(
+    'UPDATE stage_results SET rank = ?, tied_with = ?, points = ? WHERE stage_id = ? AND team_id = ?',
+  ).run(rank, tiedWith, points, stageId, teamId);
+}
+
 export function listTeamMembers(db, teamId) {
   return db.prepare('SELECT * FROM team_members WHERE team_id = ? AND left_at IS NULL').all(teamId);
 }

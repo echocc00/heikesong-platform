@@ -11,8 +11,15 @@
 //   ④ 申诉触发 revision + 1 重算，不覆盖历史（旧 revision 保留）
 //     ⚠️ DP-106：**只对赛段结果类申诉（team_result）成立** ——
 //        报名类申诉（registration）撤销的是**分级裁定**，不涉及赛段分数 ⇒ 不触发重算。
-import { findLatestTransition } from '../db/repo/audit-log.js';
-import { findIdempotency, insertIdempotency } from '../db/repo/idempotency.js';
+//
+// ⚠️ **状态机内核已抽出到 `src/services/review-state-core.js`**（E170 / F36）：
+//    本模块是**可选模块**（路由层用 loadOptionalModule 动态加载；模块不在 ⇒ 申诉端点
+//    回 503，但**平台必须照常启动**）⇒ 任何**始终在场**的代码路径都不能静态 import 本文件。
+//    而「发榜时生产 FINALIZED」（F36 的修复）必须始终可用 ⇒ 内核（迁移表 + transition +
+//    终稿推进）搬进 core 模块，本文件只留申诉队列 / 报名类申诉 / 档位判定。
+import {
+  REVIEW_STATES, REVIEW_TRANSITIONS, getSubjectState, transition,
+} from './review-state-core.js';
 import { insertAppeal, getAppeal, listAppealRows, updateAppeal } from '../db/repo/appeals.js';
 import { getTeamTierRow } from '../db/repo/tiers.js';
 // ⚠️ DP-106（报名类申诉）：报名的行与状态事件也要落库 ——
@@ -26,7 +33,10 @@ import { writeAuditLog } from '../audit/log.js';
 import { can, isCommitteeActor } from '../auth/permissions.js';
 import { badRequest, conflict, forbidden, notFound } from '../errors.js';
 
-export const REVIEW_STATES = ['SUBMITTED', 'PENDING_REVIEW', 'CONFIRMED', 'FINALIZED', 'REJECTED', 'FLAGGED'];
+// ⛔ 对外 API 不变：内核虽然搬走了，但历史调用方仍可从本模块 import（转出即可）。
+export {
+  REVIEW_STATES, REVIEW_TRANSITIONS, getSubjectState, transition,
+} from './review-state-core.js';
 
 /**
  * ⚠️ DP-106：**申诉是两件事，同一条队列**。
@@ -46,113 +56,10 @@ const REGISTRATION_TERMINAL_STATUSES = ['accepted', 'rejected'];
 /** 申诉的**未裁决**状态（还有一条在队列里等人处理）⇒ 不许重复提交。 */
 const APPEAL_PENDING_STATUSES = ['submitted', 'reviewing'];
 
-// 合法迁移表。REJECTED → PENDING_REVIEW 是"选手申诉后重新复核"；
-// FINALIZED → REJECTED 是"申诉成立、撤销终稿"，随后走 revision + 1 重算。
-export const REVIEW_TRANSITIONS = {
-  SUBMITTED: ['PENDING_REVIEW'],
-  PENDING_REVIEW: ['CONFIRMED', 'REJECTED', 'FLAGGED'],
-  CONFIRMED: ['FINALIZED'],
-  REJECTED: ['PENDING_REVIEW', 'CONFIRMED'],
-  FLAGGED: ['REJECTED', 'CONFIRMED'],
-  FINALIZED: ['REJECTED'],
-};
-
-export function getSubjectState({ db, subjectType, subjectId }) {
-  const latest = findLatestTransition(db, subjectType, subjectId);
-  if (!latest || !latest.to) return null;
-  return latest.to;
-}
-
-/**
- * 把迁移时间戳单调化：同一 subject 的相邻迁移必须**严格递增**。
- *
- * ⚠️ 为什么要有这个（2026-10-21 Task 5 实跑发现的 Critical 缺陷）：
- *   「当前状态」的真值来源是 audit_log 里最后一条 `review_state.transition`。
- *   ⚠️ **这条注释里的根因描述已被 P4 终审修正（2026-10-21）** ——
- *   原先写的是「仓储层排序是 `created_at DESC, id DESC`」，**与实际代码不符**：
- *   仓储层 `findLatestTransition` 的破并列键**早已改成 SQLite 隐式 `rowid`**
- *   （P4-13 根因修复，提交 `fba7b6e`；`id` 是 randomUUID()，同毫秒内次序随机）。
- *   当时的缺陷（实测三条迁移共用同一 created_at 时，200 次里有 135 次读到**过期**状态；
- *   `decideAppeal` 连续两次迁移用同一个 now → 约 50% 概率假报 409）因此**已治本**：
- *     · 根因修复：仓储层 `ORDER BY created_at DESC, rowid DESC`；
- *     · 双保险（本函数）：本服务是 `review_state.transition` 的**唯一写入方**，
- *       自己写出去的时间戳严格递增 ⇒ 正常调用根本不会出现并列。
- *   本函数**保留**：① 兼容「同毫秒内多条迁移」的外部写入；② 防止将来有人
- *   把仓储层的 ORDER BY 改回去时，静默退化回随机次序。
- *   只有「时间戳完全相同」时才 +1ms，正常调用**不动**调用方的 now。
- */
-function monotonicAt(db, subjectType, subjectId, now) {
-  const prev = findLatestTransition(db, subjectType, subjectId);
-  if (!prev || !prev.at) return now;
-  const prevMs = Date.parse(prev.at);
-  const nowMs = Date.parse(now);
-  if (!Number.isFinite(prevMs) || !Number.isFinite(nowMs)) return now;
-  if (nowMs > prevMs) return now;
-  return new Date(prevMs + 1).toISOString();
-}
-
 export function parseAppealSubject(subjectId) {
   const idx = String(subjectId ?? '').indexOf(':');
   if (idx < 0) return { stageId: null, teamId: String(subjectId ?? '') };
   return { stageId: subjectId.slice(0, idx), teamId: subjectId.slice(idx + 1) };
-}
-
-/**
- * 状态迁移。三条硬规则见文件头注释。
- * @returns {{ applied: boolean, from: string, to: string, state: string, at: string }}
- */
-export function transition({
-  db, subjectType, subjectId, from, to, actorId = null, reason,
-  idempotencyKey = null, now = new Date().toISOString(),
-}) {
-  if (!subjectType || !subjectId) throw badRequest('状态迁移必须给 subjectType 与 subjectId');
-  if (!REVIEW_STATES.includes(from)) throw badRequest(`未知状态: ${from}`);
-  if (!REVIEW_STATES.includes(to)) throw badRequest(`未知状态: ${to}`);
-
-  // 幂等守卫：同一 idempotencyKey 重复触发不产生二次迁移
-  if (idempotencyKey) {
-    const scope = `review_state:${subjectType}:${subjectId}`;
-    const existing = findIdempotency(db, { key: idempotencyKey, scope });
-    if (existing) {
-      const stored = existing.response_json ? JSON.parse(existing.response_json) : {};
-      return { ...stored, applied: false, replayed: true };
-    }
-  }
-
-  const allowed = REVIEW_TRANSITIONS[from] ?? [];
-  if (!allowed.includes(to)) {
-    throw conflict(`非法迁移：${from} → ${to}（允许：${allowed.join(' / ') || '无'}）`);
-  }
-
-  const current = getSubjectState({ db, subjectType, subjectId }) ?? 'SUBMITTED';
-  if (current !== from) {
-    throw conflict(`状态冲突：当前是 ${current}，本次声明 ${from}`);
-  }
-
-  const at = monotonicAt(db, subjectType, subjectId, now);
-  writeAuditLog(db, {
-    actorId,
-    action: 'review_state.transition',
-    entity: subjectType,
-    entityId: subjectId,
-    detail: { from, to, reason, at, idempotencyKey },
-    now: at,
-  });
-
-  const result = { applied: true, from, to, state: to, at, replayed: false };
-
-  if (idempotencyKey) {
-    const scope = `review_state:${subjectType}:${subjectId}`;
-    insertIdempotency(db, {
-      key: idempotencyKey,
-      scope,
-      requestId: idempotencyKey,
-      response: result,
-      now: at,
-    });
-  }
-
-  return result;
 }
 
 /**
