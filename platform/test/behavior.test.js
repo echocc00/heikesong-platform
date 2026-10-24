@@ -280,3 +280,64 @@ test('★ 排序口径：先按创建时间，同一时刻再按 id 码位序（
   assert.deepEqual(byId.items.map((i) => i.type), ['weekly_progress', 'milestone_on_time'],
     '同一时刻按 id 码位序兜底（e_1 < e_2）');
 });
+
+// ═══════════════════════════════════════════════════════════════════
+// M0-1「完赛线可达性」：交付里程碑按【里程碑】计次
+// ═══════════════════════════════════════════════════════════════════
+// 规则溯源：S10 §3.1 计分明细（交付里程碑 5 分）+ M0-1 口径收口（按里程碑计次）。
+// ⚠️ 为什么这条必须钉死：修复前 `milestone_on_time` 是**终身一次** ⇒ 一支队伍
+//    最多拿 5 分 ⇒ 加上其它事件，赛程内上限只有 33 分 < 完赛线 60
+//    ⇒ **没有任何队伍能被认定为完赛**（这是 M0-1 发现的核心业务缺陷）。
+const msEvent = (id, subjectId, createdAt) => ({
+  id, type: 'milestone_on_time', created_at: createdAt, evidence: OK, subject_id: subjectId,
+});
+
+test('★ M0-1：交付里程碑按【里程碑】计次 —— 同一里程碑只计一次，不同里程碑各计一次', () => {
+  const out = behaviorScore({
+    events: [
+      msEvent('m_1', 'ms_a', '2026-10-10T00:00:00.000Z'),
+      msEvent('m_2', 'ms_a', '2026-10-12T00:00:00.000Z'),   // 同一个里程碑再来一次 ⇒ 不计
+      msEvent('m_3', 'ms_b', '2026-10-13T00:00:00.000Z'),   // 另一个里程碑 ⇒ 计
+    ],
+    behaviorConfig: B,
+  });
+  assert.equal(out.total, 10, '两个里程碑 × 5 分 = 10（同里程碑的重复提交不计）');
+  assert.deepEqual(out.items.map((i) => i.counted), [true, false, true]);
+  assert.equal(out.items[1].reason, 'subject_limit', '同里程碑重复 ⇒ reason 必须是 subject_limit');
+});
+
+test('★ M0-1 fail-closed：拿不到里程碑 id 的交付事件只能计一次（不许靠多提交刷分）', () => {
+  const out = behaviorScore({
+    events: [
+      msEvent('m_1', undefined, '2026-10-10T00:00:00.000Z'),
+      msEvent('m_2', undefined, '2026-10-11T00:00:00.000Z'),
+    ],
+    behaviorConfig: B,
+  });
+  assert.equal(out.total, 5, '无主体的事件共用「无主体桶」⇒ 只计一次');
+  assert.equal(out.items[1].reason, 'subject_limit');
+});
+
+test('★ M0-1 可达性：满打满算（7 个里程碑 + 每周进度 + 其余一次性事件）恰好能完赛', () => {
+  // ⚠️ 夹具必须**判别性**：逐个里程碑各一条 + 每周进度按 7 天窗口铺满赛程。
+  //    赛程 10-01 ~ 10-31 = 31 天 ⇒ 每周进度最多兑现 5 次（2×5=10 分）。
+  //    ⇒ 10 + 3（workshop）+ 5×7（里程碑）+ 5（企业对接会）+ 10（首次 Demo）= **63 分** ≥ 60。
+  const events = [];
+  for (let i = 0; i < 7; i += 1) {
+    events.push(msEvent(`ms_${i}`, `milestone_${i}`, `2026-10-${String(10 + i).padStart(2, '0')}T00:00:00.000Z`));
+  }
+  for (let i = 0; i < 5; i += 1) {
+    events.push({
+      id: `w_${i}`, type: 'weekly_progress', evidence: OK,
+      created_at: `2026-10-${String(1 + i * 7).padStart(2, '0')}T00:00:00.000Z`,
+    });
+  }
+  events.push({ id: 'wsp', type: 'workshop_output', evidence: JSON.stringify({ output: 'o' }), created_at: '2026-10-11T00:00:00.000Z' });
+  events.push({ id: 'ent', type: 'enterprise_meeting', evidence: JSON.stringify({ enterpriseConfirmationId: 'e' }), created_at: '2026-10-12T00:00:00.000Z' });
+  events.push({ id: 'demo', type: 'first_demo', evidence: OK, created_at: '2026-10-13T00:00:00.000Z' });
+
+  const out = behaviorScore({ events, behaviorConfig: B });
+  assert.equal(out.total, 63, '满打满算 = 63 分（10 + 3 + 35 + 5 + 10）');
+  assert.equal(out.completionThreshold, 60);
+  assert.equal(out.completed, true, '★ 满打满算的队伍**能**完赛（M0-1 之前这是不可能的）');
+});

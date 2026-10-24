@@ -108,6 +108,21 @@ export function getSignoff(db, signoffId) {
   return db.prepare('SELECT * FROM milestone_signoffs WHERE id = ?').get(signoffId) ?? null;
 }
 
+/**
+ * 该里程碑有没有**未撤回**的签字（M0-1：行为分「交付里程碑」的达成校验）。
+ *
+ * ⚠️ 口径与 `services/tier.js` 的 `achieved` 完全一致：
+ *    `achieved = requires_signoff === 0 || 有未撤回签字` ⇒ 这里查的就是「有未撤回签字」。
+ *    ⛔ 必须排除已撤回的（revoked_at IS NOT NULL）—— 撤回后里程碑回到「未达成」，
+ *    段位由重算体现降档；行为分若还认它 ⇒ 两套口径对不上。
+ */
+export function hasActiveSignoff(db, milestoneId) {
+  const row = db.prepare(
+    'SELECT COUNT(*) AS n FROM milestone_signoffs WHERE milestone_id = ? AND revoked_at IS NULL',
+  ).get(milestoneId);
+  return Number(row?.n || 0) > 0;
+}
+
 /** 撤回签字 = 软删除（置 revoked_at）；已撤回的返回 0（幂等） */
 export function revokeSignoff(db, { id, revokedAt }) {
   const r = db.prepare('UPDATE milestone_signoffs SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL').run(revokedAt, id);

@@ -1198,12 +1198,16 @@ import { randomUUID } from 'node:crypto';
 
 export function insertAppeal(db, {
   id = randomUUID(), subjectType, subjectId, filedBy = null, reason,
+  // ⚠ reason_kind（M0-2，迁移 010）：程序性错误类型（scoring_error / procedure_violation /
+  //    data_error）⇒ 裁决队列里要看得见「这条申诉属于哪一类错」。
+  //    ⛔ 报名类申诉可以为 NULL（选手侧前端契约不传这个字段）。
+  reasonKind = null,
   status = 'submitted', now = new Date().toISOString(),
 }) {
   db.prepare(
-    `INSERT INTO appeals (id, subject_type, subject_id, filed_by, reason, status, decided_by, decided_at, decision_note, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?)`,
-  ).run(id, subjectType, subjectId, filedBy, reason, status, now);
+    `INSERT INTO appeals (id, subject_type, subject_id, filed_by, reason, reason_kind, status, decided_by, decided_at, decision_note, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?)`,
+  ).run(id, subjectType, subjectId, filedBy, reason, reasonKind ?? null, status, now);
   return id;
 }
 
@@ -2662,7 +2666,7 @@ Expected: FAIL —— `Cannot find module '../src/services/rate-limit.js'`
 ```javascript
 {
   "id": "audit",
-  "version": "2026-10-25",
+  "version": "2026-10-26",
   "source": "设计文档 §11/§12 + 一页纸 §第 3 步 闸二 + 周报 2026-10-12~18 §4.2 教训 5",
   "note": "所有阈值都是待组委会确认的机制件，必须配置化（溯源表结论：60 条机制件不得硬编码）",
   "loginAttemptByIpNote": "登录限频的**来源维度**（2026-10-24 评审轮）。⚠️ 复核更正：评审说的「知道手机号的人可以把受害者锁在门外」**不成立** —— 限频判定只在口令校验**失败**的分支里 ⇒ **正确口令永远能登录**（这条不变量要保住）。真正的残余是**另一条**：限频判定发生在 scrypt **之后** ⇒ 被限流的请求**照样跑一遍 scrypt** ⇒ 限频挡不住 **CPU 打爆**。⇒ 本 profile 的作用 = 给「来源」加一道**前置只读预检**（判定在 scrypt 之前 ⇒ 被挡请求不跑 scrypt）+ 失败时消耗。⚠️ ⚠️⚠️ **sliding 必须比 loginAttempt 更紧（8 < 10）** —— 否则永远是**账号**配额先触顶，来源预检**根本不会触发** ⇒ CPU 保护落空（实测：IP=20 时第 11 次就由账号配额挡下，来源计数停在 10，预检永不生效）。⚠️ sliding 8 的含义：同一个出口 IP 在 60 秒内失败 8 次即被判定为攻击源 ⇒ **连正确口令一起挡**（fail-closed）。⚠️ 代价：共享出口 IP（同一办公室/校园网）的人**共享**这一个桶 ⇒ 阈值必须按「一个办公室的自然误输量」定（8 次/分钟 ⇒ 正常办公网远达不到，但连坐风险真实存在 ⇒ 这就是管理员**整体解除**应急出口存在的理由）。perHour 300 只挡**持续**喷洒，不影响正常办公网。",
@@ -2699,7 +2703,9 @@ Expected: FAIL —— `Cannot find module '../src/services/rate-limit.js'`
   },
   "reviewState": {
     "appealSubjectType": "team_result",
-    "appealAllowedTiers": ["D"]
+    "appealAllowedTiers": ["A", "B", "C", "D"],
+    "appealReasonKinds": ["scoring_error", "procedure_violation", "data_error"],
+    "appealNote": "M0-2（2026-10-26）：① appealAllowedTiers 由 [\"D\"] 改为**全员** —— 修复前只有 D 段（低可见档）能申诉 ⇒ A 段队伍对算分错误**连门都进不了**（403）；档位闸保留（仍是配置项、仍 fail-closed），但不再用于排除人。② appealReasonKinds = **程序性错误白名单**（fail-closed）：赛段结果类申诉必须声明理由类型且命中白名单 ⇒ 「我不服这个名次」这类**主观不服**进不了裁决队列（否则队列被淹没、72h SLA 必然失守）。三类：scoring_error=算分错误 / procedure_violation=流程违规 / data_error=数据错误。⚠ 报名类申诉（subjectType='registration'）**不强制**理由类型 —— 选手侧前端契约已固定（web/views/registration.js 只发 reason），强改会让选手点「提交申诉」直接失败；传了则同样要命中白名单。"
   },
   "reverseAudit": {
     "topN": 10,
@@ -5661,6 +5667,67 @@ const REGISTRATION_TERMINAL_STATUSES = ['accepted', 'rejected'];
 /** 申诉的**未裁决**状态（还有一条在队列里等人处理）⇒ 不许重复提交。 */
 const APPEAL_PENDING_STATUSES = ['submitted', 'reviewing'];
 
+/**
+ * 申诉 SLA（M0-2）：组委会应在 `rules/compliance.json` 规定的时限内裁决。
+ *
+ * ⚠ 口径：SLA 是**对组委会的承诺**（不是对选手的）⇒ 超期**不自动改变裁决结果**，
+ *    只在审计里留痕（是否逾期 + 逾期多久）并在裁决队列里显式标注。
+ * ⚠ 时限来自配置（默认没有 = 不启用）⇒ 改时限只改 rules/compliance.json，代码只读它。
+ */
+function appealSlaHours(rules) {
+  const hours = Number(rules?.compliance?.appeal?.slaHours);
+  return Number.isFinite(hours) && hours > 0 ? hours : null;
+}
+
+/**
+ * 申诉的截止时刻与逾期状态（M0-2）。
+ * 截止 = 提交时刻 + SLA 时长；逾期 = 现在晚于截止。
+ * @param appeal 申诉行（created_at 或 createdAt 皆可）
+ * @param rules 规则（读 rules.compliance.appeal.slaHours）
+ * @param now 当前时刻（可注入 ⇒ 可测）
+ */
+function appealSlaOf(appeal, rules, now) {
+  const hours = appealSlaHours(rules);
+  const createdAt = appeal?.created_at ?? appeal?.createdAt ?? null;
+  if (!hours || !createdAt) return { slaHours: hours, slaDueAt: null, slaOverdue: false };
+  const createdMs = Date.parse(createdAt);
+  if (!Number.isFinite(createdMs)) return { slaHours: hours, slaDueAt: null, slaOverdue: false };
+  const dueMs = createdMs + hours * 3_600_000;
+  const atMs = Date.parse(now ?? '') || Date.now();
+  return {
+    slaHours: hours,
+    slaDueAt: new Date(dueMs).toISOString(),
+    slaOverdue: atMs > dueMs,
+  };
+}
+
+/**
+ * 程序性错误白名单（M0-2「限程序性错误」）。
+ *
+ * ⚠ 规则驱动：白名单为空 ⇒ 不做限制（老配置 / 自定义规则集仍可用）。
+ *    白名单非空 ⇒ **赛段结果类申诉必须声明理由类型且命中白名单**（fail-closed）。
+ * ⚠ 为什么报名类不强制：选手侧前端契约已固定（web/views/registration.js 只发 reason），
+ *    强改会让选手点「提交申诉」直接失败 ⇒ 报名类只在「传了」时校验。
+ */
+function appealReasonKindGate({ subjectType, reasonKind, rules }) {
+  const allowed = Array.isArray(rules?.audit?.reviewState?.appealReasonKinds)
+    ? rules.audit.reviewState.appealReasonKinds : [];
+  if (!allowed.length) return null;
+  const kind = String(reasonKind ?? '').trim();
+  if (subjectType !== 'team_result' && !kind) return null;   // 报名类：可以不传
+  if (!kind) {
+    throw badRequest(
+      `申诉必须声明理由类型（reasonKind），只能是：${allowed.join(' / ')}`
+      + ' —— 申诉只受理**程序性错误**（算分错误 / 流程违规 / 数据错误）；'
+      + '「我不服这个名次」这类主观不服不在受理范围（否则裁决队列会被淹没、SLA 必然失守）',
+    );
+  }
+  if (!allowed.includes(kind)) {
+    throw badRequest(`申诉理由类型非法：${kind}（只能是 ${allowed.join(' / ')}）`);
+  }
+  return kind;
+}
+
 export function parseAppealSubject(subjectId) {
   const idx = String(subjectId ?? '').indexOf(':');
   if (idx < 0) return { stageId: null, teamId: String(subjectId ?? '') };
@@ -5698,7 +5765,8 @@ export function filterVisibleScores({ db, stageId, viewer = null, scores = [] })
  *   ⇒ 选手点「提交申诉」永远失败。
  */
 export function fileAppeal({
-  db, subjectType = 'team_result', subjectId, filedBy = null, reason, now = new Date().toISOString(), rules,
+  db, subjectType = 'team_result', subjectId, filedBy = null, reason, reasonKind = null,
+  now = new Date().toISOString(), rules,
 }) {
   // ⚠️ **F26（Medium，2026-10-23 审计）：本函数的写路径原先**全程无事务**** ——
   //   `withTransaction` / `SAVEPOINT` / `BEGIN` 一个都没有，却有十几处写调用 ⇒
@@ -5710,10 +5778,13 @@ export function fileAppeal({
   return withTransaction(db, () => {
     if (!subjectId) throw badRequest('申诉必须给 subjectId');
     if (!reason || !String(reason).trim()) throw badRequest('申诉必须写理由（空理由 = 无法复核）');
+    // ⚠️ M0-2「限程序性错误」：理由类型白名单（fail-closed）。
+    //    白名单为空（老配置 / 自定义规则集）⇒ 不限制，保持兼容。
+    const kind = appealReasonKindGate({ subjectType, reasonKind, rules });
 
     // ── 报名类申诉（DP-106）：独立的校验口径，见 fileRegistrationAppeal ──────
     if (subjectType === 'registration') {
-      return fileRegistrationAppeal({ db, subjectId, filedBy, reason, now, rules });
+      return fileRegistrationAppeal({ db, subjectId, filedBy, reason, reasonKind: kind, now, rules });
     }
 
     const { stageId, teamId } = parseAppealSubject(subjectId);
@@ -5749,18 +5820,22 @@ export function fileAppeal({
     }
 
     const id = insertAppeal(db, {
-      subjectType, subjectId, filedBy, reason, status: 'submitted', now,
+      subjectType, subjectId, filedBy, reason, reasonKind: kind, status: 'submitted', now,
     });
+    // ⚠️ M0-2：SLA 截止时刻写进审计（提交时刻 + rules.compliance.appeal.slaHours）。
+    const sla = appealSlaOf({ created_at: now }, rules, now);
     writeAuditLog(db, {
       actorId: filedBy,
       action: 'appeal.filed',
       entity: 'appeal',
       entityId: id,
-      detail: { subjectType, subjectId, reason, stageId, teamId, tier },
+      detail: {
+        subjectType, subjectId, reason, stageId, teamId, tier,
+        reasonKind: kind, slaDueAt: sla.slaDueAt, slaHours: sla.slaHours,
+      },
       now,
     });
-    return getAppeal(db, id);
-
+    return { ...getAppeal(db, id), ...sla };
   });}
 
 /**
@@ -5785,7 +5860,7 @@ export function fileAppeal({
  *     选手不能再申诉（要改只能走组委会直接复核那条路径）。
  *   - ④ 是防重复提交：同一报名同时只允许一条**待裁决**的申诉在队列里。
  */
-function fileRegistrationAppeal({ db, subjectId, filedBy, reason, now, rules }) {
+function fileRegistrationAppeal({ db, subjectId, filedBy, reason, reasonKind = null, now, rules }) {
   // ① 存在性 → 404
   const reg = findRegistrationRow(db, subjectId);
   if (!reg) throw notFound(`报名记录不存在: ${subjectId}`);
@@ -5822,8 +5897,9 @@ function fileRegistrationAppeal({ db, subjectId, filedBy, reason, now, rules }) 
   }
 
   const id = insertAppeal(db, {
-    subjectType: 'registration', subjectId, filedBy, reason, status: 'submitted', now,
+    subjectType: 'registration', subjectId, filedBy, reason, reasonKind, status: 'submitted', now,
   });
+  const sla = appealSlaOf({ created_at: now }, rules, now);
   writeAuditLog(db, {
     actorId: filedBy,
     action: 'appeal.filed',
@@ -5833,12 +5909,15 @@ function fileRegistrationAppeal({ db, subjectId, filedBy, reason, now, rules }) 
       subjectType: 'registration',
       subjectId,
       reason,
+      reasonKind: reasonKind ?? null,
       registrationStatus: reg.status,
       onBehalf,
+      slaDueAt: sla.slaDueAt,
+      slaHours: sla.slaHours,
     },
     now,
   });
-  return getAppeal(db, id);
+  return { ...getAppeal(db, id), ...sla };
 }
 
 /**
@@ -5919,12 +5998,23 @@ export function decideAppeal({
     }
 
     updateAppeal(db, { id: appealId, status: decision, decidedBy, decidedAt: now, decisionNote: note });
+    // ⚠️ M0-2：裁决时把 SLA 状态一并留痕（是否超期、超期多久）⇒ 事后能复盘「委员会响应时效」。
+    const sla = appealSlaOf(appeal, rules, now);
     writeAuditLog(db, {
       actorId: decidedBy,
       action: 'appeal.decided',
       entity: 'appeal',
       entityId: appealId,
-      detail: { decision, note, subjectType: appeal.subject_type, subjectId: appeal.subject_id, recomputeRequired },
+      detail: {
+        decision,
+        note,
+        subjectType: appeal.subject_type,
+        subjectId: appeal.subject_id,
+        recomputeRequired,
+        slaHours: sla.slaHours,
+        slaDueAt: sla.slaDueAt,
+        slaOverdue: sla.slaOverdue,
+      },
       now,
     });
 
@@ -5933,14 +6023,18 @@ export function decideAppeal({
       transitions,
       // 申诉成立必须重算；重算走 revision + 1，旧 revision 保留（不覆盖历史）
       recomputeRequired,
+      ...sla,
     };
 
   });}
 
 /**
  * 申诉列表。列表不满足 → 200 + 空集。
+ *
+ * ⚠️ M0-2：每行带 **reasonKind**（程序性错误类型）+ **SLA**（slaDueAt / slaOverdue）
+ *    ⇒ 组委会的裁决队列里能直接看到「这条是哪类错」与「还剩多久必须裁决」。
  */
-export function listAppeals({ db, filter = {}, viewer = null }) {
+export function listAppeals({ db, filter = {}, viewer = null, rules = null, now = new Date().toISOString() }) {
   const allowed = viewer ? can(viewer, 'audit:read', null, db) : false;
   if (!allowed) return { rows: [], total: 0 };
   const { rows, total } = listAppealRows(db, filter);
@@ -5951,11 +6045,14 @@ export function listAppeals({ db, filter = {}, viewer = null }) {
       subjectId: r.subject_id,
       filedBy: r.filed_by,
       reason: r.reason,
+      // ⚠️ M0-2：老申诉（迁移前）没有理由类型 ⇒ null（不许假装成某一类）。
+      reasonKind: r.reason_kind ?? null,
       status: r.status,
       decidedBy: r.decided_by,
       decidedAt: r.decided_at,
       decisionNote: r.decision_note,
       createdAt: r.created_at,
+      ...appealSlaOf(r, rules, now),
     })),
     total,
   };
@@ -6408,7 +6505,7 @@ test('POST /api/appeals 无权提交返回 403，未登录返回 401（能力点
   const { db, close, dataDir, app } = setup();
   const refs = seedRefs(db);
   const judgeToken = createSession(db, refs.judge.id).token;
-  const body = { subjectType: 'team_result', subjectId: `${refs.stage.id}:${refs.team.id}`, reason: '理由' };
+  const body = { subjectType: 'team_result', subjectId: `${refs.stage.id}:${refs.team.id}`, reason: '理由', reasonKind: 'scoring_error' };
   const denied = await callJson(app, 'POST', '/api/appeals', { token: judgeToken, body });
   assert.equal(denied.status, 403);
   const anon = await callJson(app, 'POST', '/api/appeals', { body });
@@ -6431,7 +6528,7 @@ test('POST /api/appeals 超限返回 429 + Retry-After（不静默丢包）', { 
       actorId: refs.admin.id, reason: 'x', idempotencyKey: key, now: NOW,
     });
   }
-  const body = { subjectType: 'team_result', subjectId: `${refs.stage.id}:${refs.team.id}`, reason: '企业确认分与事实不符' };
+  const body = { subjectType: 'team_result', subjectId: `${refs.stage.id}:${refs.team.id}`, reason: '企业确认分与事实不符', reasonKind: 'scoring_error' };
   const first = await callJson(app, 'POST', '/api/appeals', { token, body });
   assert.equal(first.status, 200);
   const second = await callJson(app, 'POST', '/api/appeals', { token, body });
@@ -6461,7 +6558,7 @@ test('POST /api/appeals 超限后换连接（模拟重启）仍然超限（限�
       actorId: refs.admin.id, reason: 'x', idempotencyKey: key, now: NOW,
     });
   }
-  const body = { subjectType: 'team_result', subjectId: `${refs.stage.id}:${refs.team.id}`, reason: '企业确认分与事实不符' };
+  const body = { subjectType: 'team_result', subjectId: `${refs.stage.id}:${refs.team.id}`, reason: '企业确认分与事实不符', reasonKind: 'scoring_error' };
   const first = await callJson(app, 'POST', '/api/appeals', { token, body });
   assert.equal(first.status, 200);
   close();
@@ -6481,7 +6578,7 @@ test('POST /api/appeals 理由为空返回 400', { skip: skipNoReviewState }, as
   const refs = seedRefs(db);
   const token = createSession(db, refs.captain.id).token;
   const res = await callJson(app, 'POST', '/api/appeals', {
-    token, body: { subjectType: 'team_result', subjectId: `${refs.stage.id}:${refs.team.id}`, reason: '' },
+    token, body: { subjectType: 'team_result', subjectId: `${refs.stage.id}:${refs.team.id}`, reason: '', reasonKind: 'scoring_error' },
   });
   assert.equal(res.status, 400);
   close();
@@ -6501,7 +6598,7 @@ test('POST /api/appeals/:id/decide 成立返回 recomputeRequired=true', { skip:
   }
   const filed = await callJson(app, 'POST', '/api/appeals', {
     token: captainToken,
-    body: { subjectType: 'team_result', subjectId: `${refs.stage.id}:${refs.team.id}`, reason: '企业确认分与事实不符' },
+    body: { subjectType: 'team_result', subjectId: `${refs.stage.id}:${refs.team.id}`, reason: '企业确认分与事实不符', reasonKind: 'scoring_error' },
   });
   assert.equal(filed.status, 200);
   const decided = await callJson(app, 'POST', `/api/appeals/${filed.json.id}/decide`, {
@@ -6528,6 +6625,7 @@ test('POST /api/appeals 同一 requestId 重复提交只生效一次，返回首
     subjectType: 'team_result',
     subjectId: `${refs.stage.id}:${refs.team.id}`,
     reason: '企业确认分与事实不符',
+    reasonKind: 'scoring_error',
     requestId: 'req-001',
   };
   const first = await callJson(app, 'POST', '/api/appeals', { token, body });
@@ -6555,7 +6653,7 @@ test('GET /api/appeals 申诉列表：无权返回 200 + 空集，有权返回�
   const captainToken = createSession(db, refs.captain.id).token;
   const filed = await callJson(app, 'POST', '/api/appeals', {
     token: captainToken,
-    body: { subjectType: 'team_result', subjectId: `${refs.stage.id}:${refs.team.id}`, reason: '理由' },
+    body: { subjectType: 'team_result', subjectId: `${refs.stage.id}:${refs.team.id}`, reason: '理由', reasonKind: 'scoring_error' },
   });
   assert.equal(filed.status, 200);
   const denied = await callJson(app, 'GET', '/api/appeals', { token: judgeToken });
@@ -6677,7 +6775,7 @@ test('Task 5 未落地时申诉接口必须 503（fail closed，不静默放行�
   const refs = seedRefs(db);
   const token = createSession(db, refs.captain.id).token;
   const res = await callJson(app, 'POST', '/api/appeals', {
-    token, body: { subjectType: 'team_result', subjectId: `${refs.stage.id}:${refs.team.id}`, reason: '理由' },
+    token, body: { subjectType: 'team_result', subjectId: `${refs.stage.id}:${refs.team.id}`, reason: '理由', reasonKind: 'scoring_error' },
   });
   assert.equal(res.status, 503);
   assert.equal(res.json.error.code, 'REVIEW_STATE_UNAVAILABLE');
@@ -6708,7 +6806,7 @@ test('【终审修正 M-5】503 fail closed 必须有**活体**覆盖：用「�
   const copiedApp = copied.createApp({ db, rules, webDir });
 
   const res = await callJson(copiedApp, 'POST', '/api/appeals', {
-    token, body: { subjectType: 'team_result', subjectId: `${refs.stage.id}:${refs.team.id}`, reason: '理由' },
+    token, body: { subjectType: 'team_result', subjectId: `${refs.stage.id}:${refs.team.id}`, reason: '理由', reasonKind: 'scoring_error' },
   });
   assert.equal(res.status, 503, '模块不在时必须 fail closed');
   assert.equal(res.json.error.code, 'REVIEW_STATE_UNAVAILABLE');
@@ -8873,6 +8971,10 @@ import { loadRules } from '../src/config.js';
 import { computeStage } from '../src/services/compute.js';
 import { recordComputation, recomputeAndDiff } from '../src/services/audit.js';
 import { getSnapshot } from '../src/db/repo/computations.js';
+import { isolateTempDir } from '../test-helpers/tmp.js';
+
+// ⚠️ 隔离本进程临时目录：进程退出时整体回收（防临时目录泄漏，详见 test-helpers/tmp.js）
+isolateTempDir();
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrationsDir = join(here, '..', 'db', 'migrations');
@@ -8887,7 +8989,8 @@ function setup() {
 }
 
 // 10 席 = 5 企业 + 5 专家：满足 rules/scoring-final.json 的 judgePool 段
-// （voting ≥ 9、企业席 ≥ 30%、专家席 ≤ 50%）⇒ 评委池**合规** ⇒ computeStage 不会追加
+// （⚠️ M0-3：下限已从 9 降到 3 —— 首届口径，见 rule-decisions.md C-07；
+//    企业席 ≥ 30%、专家席 ≤ 50% 两项不变）⇒ 评委池**合规** ⇒ computeStage 不会追加
 // `judge_pool_invalid`（那是**计算期**告警，引擎重放时复现不了 —— 见「已知限制」那条用例）。
 const JUDGES = [
   { id: 'j1', seat: 'judge' }, { id: 'j2', seat: 'judge' }, { id: 'j3', seat: 'judge' },
@@ -9038,9 +9141,12 @@ test('【已知限制】评委池不合规时：分数本身仍可复算，但�
   //    **该文件归 P2**，P4 不越界改，只在此**显式登记**并断言「它至少是可见的，不是静默通过」。
   const { db, close, dataDir, rules } = setup();
   seedStage(db);
-  // 抽掉 4 个评委 ⇒ 评委池不合规（voting 6 < 9）
-  db.prepare("DELETE FROM stage_judges WHERE stage_id = 'st1' AND user_id IN ('e4','e5','j4','j5')").run();
-  db.prepare("DELETE FROM stage_reviews WHERE stage_id = 'st1' AND judge_id IN ('e4','e5','j4','j5')").run();
+  // ⚠️ M0-3：评委池下限从 9 降到 3（首届口径，rule-decisions.md C-07）⇒
+  //    「抽掉几个人就凑不齐下限」这条路不再成立 ⇒ 改用**席构成**让池不合规：
+  //    抽掉 3 个企业席 ⇒ 企业席占比 2/7 = 28.6% < 30%（下限）⇒ 池不合规。
+  //    （删的仍然只有企业席 ⇒ 专家席与分数口径不受影响 ⇒ 复算的 teams 仍然必须逐字一致。）
+  db.prepare("DELETE FROM stage_judges WHERE stage_id = 'st1' AND user_id IN ('e3','e4','e5')").run();
+  db.prepare("DELETE FROM stage_reviews WHERE stage_id = 'st1' AND judge_id IN ('e3','e4','e5')").run();
 
   const computed = computeStage({
     db, stageId: 'st1', actorId: 'u_admin', now: '2026-10-20T00:00:00.000Z', rules,

@@ -1123,7 +1123,7 @@ Expected: FAIL —— `Cannot find module '../src/domain/registration.js'`
 ```javascript
 {
   "id": "registration",
-  "version": "2026-10-25",
+  "version": "2026-10-26",
   "source": "SABC v1 §二 3 维画像筛选 + §六 待补 1 问卷字段设计",
   "scale": { "min": 1, "max": 5, "scoreMax": 100 },
   "dimensions": [
@@ -2159,7 +2159,7 @@ import { registerRegistrationRoutes } from './http/routes/registration.js';
 ```javascript
 {
   "id": "team-formation",
-  "version": "2026-10-25",
+  "version": "2026-10-26",
   "source": "任务书 §六 组队规则 + 顶层文档 §3.1",
   "teamSize": { "min": 2, "max": 5 },
   "captainMustBeMba": true,
@@ -2176,7 +2176,7 @@ import { registerRegistrationRoutes } from './http/routes/registration.js';
 ```javascript
 {
   "id": "schedule",
-  "version": "2026-10-25",
+  "version": "2026-10-26",
   "source": "任务书 2.0 §六 赛段表（R-STG-01）",
   "note": "日期为赛段相对日序（月-日）；落到具体日历日期由 edition.starts_at 偏移。",
   "stages": [
@@ -2206,7 +2206,7 @@ import { registerRegistrationRoutes } from './http/routes/registration.js';
 ```javascript
 {
   "id": "compliance",
-  "version": "2026-10-25",
+  "version": "2026-10-26",
   "source": "顶层文档 §3.1 S9（R-ENT-11 IP 与成果归属）+ §3.1 S15 与 §3.9（R-ENT-12 合规红线与同意记录）",
   "ipOwnership": {
     "team": "团队保留全部知识产权",
@@ -2224,6 +2224,10 @@ import { registerRegistrationRoutes } from './http/routes/registration.js';
     "required": true,
     "prompt": "我已阅读并同意《参赛协议》《IP 与成果归属说明》《数据与隐私合规红线》",
     "enterprisePrompt": "我确认本任务卡不涉及未授权数据出境，且我方已指定唯一责任人"
+  },
+  "appeal": {
+    "slaHours": 72,
+    "slaNote": "M0-2（2026-10-26）：组委会应在 **72 小时**内裁决一条待处理的申诉（从提交时刻起算）⇒ 裁决队列按「剩余时间」排序、超期条目显式标注。⚠ 口径：SLA 是**对组委会的承诺**（不是对选手的）⇒ 超期**不自动改变裁决结果**，只在审计里留痕（逾期时长 + 是否逾期）。⚠ 72 小时的来源：这是本平台自定的**待组委会确认**口径（源文档未给时限）—— 改成别的值只需改这里，代码只读它。"
   }
 }
 ```

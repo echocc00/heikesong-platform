@@ -77,6 +77,9 @@ export const DEMO_RULE_FILES = {
   //    缺它 ⇒ 演示站的落地页**赛程是空的**（spine 没有任何节点），
   //    而正式平台读的是服务端 loadRules（那份加载全部 17 份规则）⇒ 两边不一致。
   schedule: 'schedule.json',
+  // ⚠️ M0-2 新增：**申诉规则**（可申诉档位 + 程序性错误白名单）——
+  //    缺它 ⇒ 演示站收下「我不服」类申诉而正式站拒绝 ⇒ 形状与行为都不一致。
+  audit: 'audit.json',
 };
 
 export function createMemoryStorage() {
@@ -347,11 +350,16 @@ export function demoAppealView(a) {
     subjectId: a?.subjectId ?? null,
     filedBy: a?.filedBy ?? null,
     reason: a?.reason ?? null,
+    // ⚠️ M0-2：程序性错误类型 + SLA（与正式站 src/services/review-state.js 的 listAppeals 同字段）
+    reasonKind: a?.reasonKind ?? null,
     status: a?.status ?? null,
     decidedBy: a?.decidedBy ?? null,
     decidedAt: a?.decidedAt ?? null,
     decisionNote: a?.decisionNote ?? null,
     createdAt: a?.createdAt ?? null,
+    slaDueAt: a?.slaDueAt ?? null,
+    slaOverdue: a?.slaOverdue === true,
+    slaHours: a?.slaHours ?? null,
   };
 }
 
@@ -1075,7 +1083,13 @@ export function demoTierBoard({ state, rules, viewer = null }) {
 export function demoRollingLeaderboard({ state, rules, viewer = null }) {
   const stageId = state.lastStageId ?? 'stage_final';
   const result = state.results?.[stageId];
-  if (!result) return { scope: 'rolling', rows: [], warnings: [], demo: true, empty: true };
+  if (!result) {
+    // ⚠️ M0-4：空态也必须带这两个口径字段（形状与正式站逐字一致）
+    return {
+      scope: 'rolling', rows: [], warnings: [], demo: true, empty: true,
+      unpublishedStages: [], pointsIncludeUnpublishedStages: false,
+    };
+  }
   const pointsByTeam = new Map((result.points ?? []).map((p) => [p.teamId, p.points]));
   const rankByTeam = new Map((result.ordered ?? []).map((r) => [r.teamId, r.rank]));
   const rows = (state.teams ?? []).map((t) => ({
@@ -1089,8 +1103,22 @@ export function demoRollingLeaderboard({ state, rules, viewer = null }) {
   })).sort((a, b) => b.points - a.points
     || (a.bestRank ?? 99) - (b.bestRank ?? 99)
     || cmpStr(a.teamId, b.teamId));
+  // ⚠️ M0-4：**未发榜赛段**（其预估分已计入总榜）—— 与正式站
+  //    src/services/leaderboard.js 的 getRollingLeaderboard 同字段同口径。
+  //    演示站只有一个赛段 ⇒ 它发榜前就是「未发榜赛段」⇒ 总榜含预估分。
+  const published = Boolean(state.published?.[stageId]);
+  const stageRow = (state.stages ?? []).find((s) => s?.id === stageId) ?? null;
+  const unpublishedStages = published ? [] : [{
+    id: stageId,
+    key: stageRow?.key ?? 'S_FINAL',
+    name: stageRow?.name ?? '决赛',
+  }];
   return applyVisibility({
-    payload: { scope: 'rolling', rows, warnings: collectDemoWarnings(result), demo: true },
+    payload: {
+      scope: 'rolling', rows, warnings: collectDemoWarnings(result), demo: true,
+      unpublishedStages,
+      pointsIncludeUnpublishedStages: unpublishedStages.length > 0,
+    },
     viewer,
     visibilityConfig: rules.visibility,
     context: { scope: 'rolling', viewerTeamId: viewer?.teamId ?? null, canAudit: demoCanAudit(viewer) },
@@ -1916,6 +1944,24 @@ export function createDemoApi({ storage = defaultStorage(), seed = null, rules =
       if (!subjectId) throw httpError(400, 'BAD_REQUEST', '申诉必须给 subjectId');
       const reason = String(body?.reason ?? '').trim();
       if (!reason) throw httpError(400, 'BAD_REQUEST', '申诉必须写理由（空理由 = 无法复核）');
+      // ⚠️ M0-2：程序性错误类型白名单（与正式站 src/services/review-state.js 同一口径）
+      const allowedKinds = Array.isArray(rules?.audit?.reviewState?.appealReasonKinds)
+        ? rules.audit.reviewState.appealReasonKinds : [];
+      const reasonKind = String(body?.reasonKind ?? '').trim();
+      if (allowedKinds.length && subjectType === 'team_result') {
+        if (!reasonKind) {
+          throw httpError(400, 'BAD_REQUEST', `申诉必须声明理由类型（reasonKind），只能是：${allowedKinds.join(' / ')}`);
+        }
+        if (!allowedKinds.includes(reasonKind)) {
+          throw httpError(400, 'BAD_REQUEST', `申诉理由类型非法：${reasonKind}（只能是 ${allowedKinds.join(' / ')}）`);
+        }
+      }
+      // ⚠️ M0-2：SLA 截止时刻（提交时刻 + rules.compliance.appeal.slaHours）
+      const createdAt = new Date().toISOString();
+      const slaHours = Number(rules?.compliance?.appeal?.slaHours) || null;
+      const slaDueAt = slaHours
+        ? new Date(Date.parse(createdAt) + slaHours * 3_600_000).toISOString()
+        : null;
       if (subjectType === 'registration') {
         const reg = (s.registrations ?? []).find((r) => r.id === subjectId);
         if (!reg) throw httpError(404, 'NOT_FOUND', `报名记录不存在: ${subjectId}`);
@@ -1931,11 +1977,15 @@ export function createDemoApi({ storage = defaultStorage(), seed = null, rules =
         subjectId,
         filedBy: s.me?.id ?? 'demo_user',
         reason,
+        reasonKind: reasonKind || null,
         status: 'submitted',
         decidedBy: null,
         decidedAt: null,
         decisionNote: null,
-        createdAt: new Date().toISOString(),
+        createdAt,
+        slaDueAt,
+        slaOverdue: false,
+        slaHours,
       };
       s.appeals.push(appeal);
       persist();

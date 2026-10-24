@@ -149,6 +149,8 @@ export function registerAuditRoutes(router, { db, rules }) {
         subjectId: body?.subjectId,
         filedBy: user.id,
         reason: body?.reason,
+        // ⚠️ M0-2：程序性错误类型（白名单在 rules/audit.json 的 appealReasonKinds）。
+        reasonKind: body?.reasonKind,
         now: now(),
         rules,
       });
@@ -196,6 +198,6 @@ export function registerAuditRoutes(router, { db, rules }) {
     requireLogin(user);
     const reviewState = await loadReviewState();
     if (!reviewState) return reviewStateUnavailable();
-    return reviewState.listAppeals({ db, filter: pickFilter(query), viewer: user });
+    return reviewState.listAppeals({ db, filter: pickFilter(query), viewer: user, rules, now: now() });
   });
 }

@@ -15,6 +15,7 @@ import { getUserById } from '../db/repo/users.js';
 import { getTeam } from '../db/repo/leaderboard.js';
 import { hasActiveMembership } from '../db/repo/teamMembers.js';
 import { insertBehaviorEvent, listBehaviorEventsByTeams } from '../db/repo/points.js';
+import { getMilestone, hasActiveSignoff } from '../db/repo/tiers.js';
 import { behaviorScore } from '../domain/behavior.js';
 
 /**
@@ -43,6 +44,32 @@ export function submitBehaviorEvent({ db, teamId, actorId, body, now = new Date(
   const def = (rules.behavior?.events ?? []).find((d) => d.key === type);
   if (!def) throw new AppError(400, 'UNKNOWN_EVENT_TYPE', `未知的行为事件类型：${type}`);
 
+  // ⚠️ M0-1：**按主体计次**的事件（countBy='milestone'）必须挂在一个**具体的里程碑**上。
+  //    两道闸（都在计分之前）：
+  //    ① 归属闸：里程碑必须属于**本队** ⇒ 不能拿别队的里程碑给自己加分。
+  //    ② 达成闸：里程碑必须有**未撤回的企业签字**（= 客观事实确认，与 services/tier.js
+  //       的 `achieved` 同一把尺子）⇒ 否则「交付里程碑」就是自己给自己发分。
+  //       （修复前该事件**零证据要求** ⇒ 队长自己报一个就拿 5 分。）
+  let subjectId = null;
+  if (def.countBy === 'milestone') {
+    const milestoneId = String(body?.milestoneId ?? '').trim();
+    if (!milestoneId) {
+      throw new AppError(400, 'MISSING_MILESTONE', '「交付里程碑」必须指定里程碑（milestoneId）');
+    }
+    const milestone = getMilestone(db, milestoneId);
+    if (!milestone) throw new AppError(404, 'MILESTONE_NOT_FOUND', '里程碑不存在');
+    if (milestone.team_id !== teamId) {
+      throw new AppError(403, 'FORBIDDEN', '只能提交本队的里程碑');
+    }
+    if (!hasActiveSignoff(db, milestoneId)) {
+      throw new AppError(
+        400, 'MILESTONE_NOT_ACHIEVED',
+        '该里程碑尚未确认达成（企业未签字或签字已撤回）—— 未达成的里程碑不计行为分',
+      );
+    }
+    subjectId = milestoneId;
+  }
+
   // 证据校验：借用域函数同一套口径（不另写一份）
   const behaviorConfig = {
     ...(rules.behavior || {}),
@@ -52,20 +79,31 @@ export function submitBehaviorEvent({ db, teamId, actorId, body, now = new Date(
   //    而真实的刷分手法正是「同一条事件反复提交」⇒ 必须把**本队已有事件**一起喂进去。
   const prior = listBehaviorEventsByTeams(db, [teamId]).map((e) => ({
     id: e.id, type: e.type, evidence: e.evidence, created_at: e.created_at,
+    // ⚠️ M0-1：历史事件必须带上主体，否则历史计数会全落到「无主体桶」⇒
+    //    同一个里程碑的第二次提交会绕过「每个里程碑只计一次」的约束。
+    subject_id: e.subject_id ?? null,
   }));
   const probe = behaviorScore({
-    events: [...prior, { id: 'probe', type, evidence: body?.evidence, created_at: now }],
+    events: [...prior, {
+      id: 'probe', type, evidence: body?.evidence, created_at: now, subject_id: subjectId,
+    }],
     behaviorConfig,
   });
   const item = probe.items.find((i) => i.id === 'probe');
   if (!item || !item.counted) {
     // ⛔ **次数/频次超限**与**证据不合规**是两回事，必须分开报：
     //    证据不合规 = 400（重写证据再来）；次数超限 = 409（这个周期已经计过分了）。
-    if (item?.reason === 'once_limit' || item?.reason === 'cadence_limit') {
+    if (item?.reason === 'once_limit' || item?.reason === 'cadence_limit' || item?.reason === 'subject_limit') {
       throw new AppError(
         409, 'BEHAVIOR_CADENCE_LIMIT',
         `该行为事件在本计分周期内已提交过（${def.label}），不能重复计分`,
-        { type, reason: item.reason, once: Boolean(def.once), cadence: def.cadence ?? null },
+        {
+          type,
+          reason: item.reason,
+          once: Boolean(def.once),
+          cadence: def.cadence ?? null,
+          subjectId,
+        },
       );
     }
     throw new AppError(400, 'EVIDENCE_REJECTED', `证据不合规，不予计分：${item?.reason ?? 'unknown'}`);
@@ -75,6 +113,10 @@ export function submitBehaviorEvent({ db, teamId, actorId, body, now = new Date(
   const evidence = typeof body?.evidence === 'string' ? body.evidence : JSON.stringify(body?.evidence ?? {});
   insertBehaviorEvent(db, {
     id, teamId, userId: actor.id, type, points: Number(item.points) || 0, evidence, createdAt: now,
+    subjectId,
   });
-  return { id, teamId, userId: actor.id, type, points: item.points, counted: true, createdAt: now };
+  return {
+    id, teamId, userId: actor.id, type, points: item.points, counted: true, createdAt: now,
+    subjectId,
+  };
 }

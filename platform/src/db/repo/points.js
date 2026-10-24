@@ -17,9 +17,13 @@ export function listLedgerByStage(db, stageId) {
   return db.prepare('SELECT * FROM points_ledger WHERE stage_id = ? ORDER BY created_at ASC, rowid ASC').all(stageId);
 }
 
-export function insertBehaviorEvent(db, { id, teamId, userId, type, points, evidence, createdAt }) {
-  db.prepare(`INSERT INTO behavior_events (id, team_id, user_id, type, points, evidence, created_at)
-    VALUES (?,?,?,?,?,?,?)`).run(id, teamId, userId ?? null, type, points, evidence ?? null, createdAt);
+// ⚠️ subject_id（M0-1，迁移 009）：按**主体**计次的事件（countBy='milestone'）把
+//    里程碑 id 记在这里 ⇒ 领域层按「事件类型 + 主体」分桶计次。
+//    ⛔ 其它事件一律写 NULL —— 「没有主体」与「有主体」必须可区分：
+//    没有主体的按主体事件落进「无主体桶」，那一桶仍然只计一次（fail-closed）。
+export function insertBehaviorEvent(db, { id, teamId, userId, type, points, evidence, createdAt, subjectId }) {
+  db.prepare(`INSERT INTO behavior_events (id, team_id, user_id, type, points, evidence, created_at, subject_id)
+    VALUES (?,?,?,?,?,?,?,?)`).run(id, teamId, userId ?? null, type, points, evidence ?? null, createdAt, subjectId ?? null);
 }
 
 /** ★ 行为分的数据源：独立表，绝不从 stage_results 派生 */

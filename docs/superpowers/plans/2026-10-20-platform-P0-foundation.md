@@ -1998,7 +1998,7 @@ Expected: FAIL —— `Cannot find module '../src/config.js'`
 ```javascript
 {
   "id": "tiebreak",
-  "version": "2026-10-25",
+  "version": "2026-10-26",
   "conflictRef": "C-03",
   "source": "S7 §3.3 + S10 §0.4 + S10 §3.3（原文互相冲突，此处为裁决后的有序链）",
   "chain": [
@@ -2017,7 +2017,7 @@ Expected: FAIL —— `Cannot find module '../src/config.js'`
 ```javascript
 {
   "id": "ranks",
-  "version": "2026-10-25",
+  "version": "2026-10-26",
   "source": "S10 §2.2 段位表 + §2.3 降级与权益",
   "tiers": [
     { "key": "D", "name": "出题", "minMilestones": 0, "requiresBusinessSignoff": false },
@@ -2047,15 +2047,16 @@ Expected: FAIL —— `Cannot find module '../src/config.js'`
 ```javascript
 {
   "id": "behavior",
-  "version": "2026-10-25",
+  "version": "2026-10-26",
   "source": "S10 §3.1 计分明细 + §3.2 达标线 + §3.3 占比上限",
   "completionThreshold": 60,
   "maxWeightShare": 0.10,
+  "note": "⚠ M0-1（2026-10-26）：`milestone_on_time` 改为**按里程碑计次**（countBy='milestone'）—— 一支队伍最多 7 个里程碑（rules/milestones.default.json）⇒ 该事件上限从 5 分抬到 35 分 ⇒ 行为分总上限 33 → **63 分** ≥ 完赛线 60 ⇒ 完赛认定不再不可达（src/config.js 有一道可达性机器闸守着，改坏配置拒绝启动）。⚠ **判定口径**：平台当前判「**已达成**」（该里程碑有未撤回的企业签字 = 客观事实确认），**不判定是否准时** —— 数据模型里里程碑没有截止日（milestones.stage_id 恒为 NULL）⇒「准时」口径待组委会确认（台账已登记）。⚠ S10 §3.1 的原始措辞是「按时交付里程碑」，此处 label 收敛为「交付里程碑」，以免配置在说谎（口径收口，2026-10-26）。",
   "events": [
     { "key": "weekly_progress",   "label": "每周提交一次进度",   "points": 2,  "once": true, "cadence": { "windowDays": 7, "maxCount": 1 }, "requiresRunnableOrBlocker": true },
-    { "key": "workshop_output",   "label": "参加 workshop 并提交课后产出", "points": 3,  "once": true, "requiresOutput": true },
-    { "key": "milestone_on_time", "label": "按时交付里程碑",     "points": 5,  "once": true },
-    { "key": "enterprise_meeting","label": "完成一次企业对接会", "points": 5,  "once": true, "requiresEnterpriseConfirm": true },
+    { "key": "workshop_output",   "label": "参加 workshop 并提交课后产出", "points": 3, "once": true, "requiresOutput": true },
+    { "key": "milestone_on_time", "label": "交付里程碑",     "points": 5, "once": true, "countBy": "milestone" },
+    { "key": "enterprise_meeting","label": "完成一次企业对接会", "points": 5, "once": true, "requiresEnterpriseConfirm": true },
     { "key": "first_demo",        "label": "首次提交 Demo",      "points": 10, "once": true }
   ],
   "sortUse": "tiebreak_only"
@@ -2067,7 +2068,7 @@ Expected: FAIL —— `Cannot find module '../src/config.js'`
 ```javascript
 {
   "id": "visibility",
-  "version": "2026-10-25",
+  "version": "2026-10-26",
   "conflictRef": "C-02",
   "source": "S10 §0.3 分层公开 + §8 风险表",
   "rank": {
@@ -2114,7 +2115,7 @@ Expected: FAIL —— `Cannot find module '../src/config.js'`
 ```javascript
 {
   "id": "solvability",
-  "version": "2026-10-25",
+  "version": "2026-10-26",
   "source": "顶层文档 §3.2 六维可解性准入",
   "dimensions": [
     { "key": "problem_clarity", "label": "问题确定性", "weight": 0.30, "max": 3 },
@@ -2152,7 +2153,7 @@ Expected: FAIL —— `Cannot find module '../src/config.js'`
 ```javascript
 {
   "id": "milestones-default",
-  "version": "2026-10-25",
+  "version": "2026-10-26",
   "source": "S10 §4 商业里程碑 7 类 + §3.4 里程碑清单报名时固定｜R-PTS-11：下面这 7 类就是「L2 商业里程碑分」的完整类目（企业问题确认 / 真实数据接入 / 可演示原型 / 试点合同 / 业务迭代 N 轮 / 意向客户 M 家 / 确认收入 ¥X）｜R-PTS-12：里程碑与段位**共享「企业签字」这一个数据源**（countsTowardTier / signoffRequires），但**不共享任何一条规则** —— 里程碑表在这里，段位表在 rules/ranks.json，两边各自独立配置",
   "note": "报名时随战队固定，赛程中不可自行新增（S10 §3.4 防拆单刷里程碑）",
   "items": [

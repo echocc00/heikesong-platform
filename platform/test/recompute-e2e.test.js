@@ -41,7 +41,8 @@ function setup() {
 }
 
 // 10 席 = 5 企业 + 5 专家：满足 rules/scoring-final.json 的 judgePool 段
-// （voting ≥ 9、企业席 ≥ 30%、专家席 ≤ 50%）⇒ 评委池**合规** ⇒ computeStage 不会追加
+// （⚠️ M0-3：下限已从 9 降到 3 —— 首届口径，见 rule-decisions.md C-07；
+//    企业席 ≥ 30%、专家席 ≤ 50% 两项不变）⇒ 评委池**合规** ⇒ computeStage 不会追加
 // `judge_pool_invalid`（那是**计算期**告警，引擎重放时复现不了 —— 见「已知限制」那条用例）。
 const JUDGES = [
   { id: 'j1', seat: 'judge' }, { id: 'j2', seat: 'judge' }, { id: 'j3', seat: 'judge' },
@@ -192,9 +193,12 @@ test('【已知限制】评委池不合规时：分数本身仍可复算，但�
   //    **该文件归 P2**，P4 不越界改，只在此**显式登记**并断言「它至少是可见的，不是静默通过」。
   const { db, close, dataDir, rules } = setup();
   seedStage(db);
-  // 抽掉 4 个评委 ⇒ 评委池不合规（voting 6 < 9）
-  db.prepare("DELETE FROM stage_judges WHERE stage_id = 'st1' AND user_id IN ('e4','e5','j4','j5')").run();
-  db.prepare("DELETE FROM stage_reviews WHERE stage_id = 'st1' AND judge_id IN ('e4','e5','j4','j5')").run();
+  // ⚠️ M0-3：评委池下限从 9 降到 3（首届口径，rule-decisions.md C-07）⇒
+  //    「抽掉几个人就凑不齐下限」这条路不再成立 ⇒ 改用**席构成**让池不合规：
+  //    抽掉 3 个企业席 ⇒ 企业席占比 2/7 = 28.6% < 30%（下限）⇒ 池不合规。
+  //    （删的仍然只有企业席 ⇒ 专家席与分数口径不受影响 ⇒ 复算的 teams 仍然必须逐字一致。）
+  db.prepare("DELETE FROM stage_judges WHERE stage_id = 'st1' AND user_id IN ('e3','e4','e5')").run();
+  db.prepare("DELETE FROM stage_reviews WHERE stage_id = 'st1' AND judge_id IN ('e3','e4','e5')").run();
 
   const computed = computeStage({
     db, stageId: 'st1', actorId: 'u_admin', now: '2026-10-20T00:00:00.000Z', rules,

@@ -25,6 +25,7 @@ import { insertCapability } from '../src/db/repo/capabilities.js';
 import { createTaskPackage, updateTaskPackage } from '../src/db/repo/taskPackages.js';
 import { insertRegistration } from '../src/db/repo/registrations.js';
 import { getLeaderboard } from '../src/services/leaderboard.js';
+import { createSignoff } from '../src/services/milestone.js';
 import { call } from '../test-helpers/http-call.js';
 import { isolateTempDir } from '../test-helpers/tmp.js';
 
@@ -209,6 +210,112 @@ test('★ 端到端：API 提交的事件真的进了破同分链的 behavior �
     const after = getLeaderboard({ db: s.db, stageId: 'st_1', scope: 'rank', viewer: null });
     assert.deepEqual(after.rows.map((r) => r.teamId), [teamA.id, 't_b'], '行为分高的甲队排到前面（破同分生效）');
     assert.deepEqual(after.rows.map((r) => r.rank), [1, 2], '行为分把并列拆开');
+  } finally {
+    s.close(); rmSync(s.dataDir, { recursive: true, force: true });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// M0-1「交付里程碑」：归属闸 + 达成闸 + 按里程碑计次
+// ═══════════════════════════════════════════════════════════════════
+test('★ M0-1：交付里程碑必须挂在本队【已达成】的里程碑上；同一里程碑只计一次', async () => {
+  const s = setup();
+  try {
+    const team = await createTeam(s);
+    const msRows = s.db.prepare('SELECT id, key FROM milestones WHERE team_id = ? ORDER BY key ASC').all(team.id);
+    assert.equal(msRows.length, 7, '组队时固定 7 个里程碑（R-PTS-10 防拆单）');
+
+    const submit = (body) => call(s.app, 'POST', `/api/teams/${team.id}/behavior-events`, {
+      token: s.tokenCaptain, body: { type: 'milestone_on_time', ...body },
+    });
+
+    // ① 没写 milestoneId ⇒ 400（不许「不指里程碑就拿 5 分」）
+    const noId = await submit({});
+    assert.equal(noId.status, 400, noId.body);
+    assert.equal(JSON.parse(noId.body).error.code, 'MISSING_MILESTONE');
+
+    // ② 里程碑未达成（企业没签字）⇒ 400（修复前这个事件**零证据要求** ⇒ 白拿 5 分）
+    const notAchieved = await submit({ milestoneId: msRows[0].id });
+    assert.equal(notAchieved.status, 400, notAchieved.body);
+    assert.equal(JSON.parse(notAchieved.body).error.code, 'MILESTONE_NOT_ACHIEVED');
+
+    // ③ 企业签字 ⇒ 里程碑达成
+    const enterpriseId = s.db.prepare('SELECT id FROM users WHERE phone = ?').get('13900008001').id;
+    insertCapability(s.db, 'signoff:create', '企业签字');
+    grantAssignment(s.db, {
+      userId: enterpriseId, capability: 'signoff:create', scopeType: 'global', scopeId: null, grantedBy: s.admin.id,
+    });
+    const sign = (milestoneId) => createSignoff({
+      db: s.db, milestoneId, actorId: enterpriseId,
+      body: { department: '业务部门', content: '试点合同已签，问题已确认' },
+      now: NOW, rules: s.rules,
+    });
+    sign(msRows[0].id);
+
+    // ④ 已达成 ⇒ 200 + 主体落库
+    const first = await submit({ milestoneId: msRows[0].id });
+    assert.equal(first.status, 200, first.body);
+    assert.equal(JSON.parse(first.body).points, 5, '交付里程碑 = 5 分（规则值）');
+
+    // ⑤ 同一个里程碑再来一次 ⇒ 409（这个里程碑已经计过分了）
+    const dup = await submit({ milestoneId: msRows[0].id });
+    assert.equal(dup.status, 409, dup.body);
+    assert.equal(JSON.parse(dup.body).error.code, 'BEHAVIOR_CADENCE_LIMIT');
+
+    // ⑥ 另一个里程碑（也签字）⇒ 200（**按里程碑计次** ⇒ 第二个里程碑各计一次）
+    sign(msRows[1].id);
+    const second = await submit({ milestoneId: msRows[1].id });
+    assert.equal(second.status, 200, second.body);
+
+    const rows = s.db.prepare('SELECT type, subject_id, points FROM behavior_events WHERE team_id = ? ORDER BY rowid ASC').all(team.id);
+    assert.equal(rows.length, 2, '只落两条（重复的那条被 409 挡住）');
+    assert.deepEqual(rows.map((r) => r.subject_id), [msRows[0].id, msRows[1].id], '主体（里程碑 id）必须落库');
+    assert.deepEqual(rows.map((r) => r.points), [5, 5], '分值取自规则');
+  } finally {
+    s.close(); rmSync(s.dataDir, { recursive: true, force: true });
+  }
+});
+
+test('★ M0-1：不能拿别队的里程碑给自己加分（归属闸）', async () => {
+  const s = setup();
+  try {
+    const teamA = await createTeam(s, '甲队');
+    // 乙队由**另一个队长**建（一个账号不能同时在两支队 —— team_members.user_id 唯一）
+    insertRegistration(s.db, {
+      editionId: s.edition.id, userId: s.captainB.id, answers: GOOD, rawScore: 78,
+      level: 'S', status: 'submitted', now: NOW,
+    });
+    grantAssignment(s.db, {
+      userId: s.captainB.id, capability: 'team:create', scopeType: 'global', scopeId: null, grantedBy: s.admin.id,
+    });
+    const resB = await call(s.app, 'POST', '/api/teams', {
+      token: createSession(s.db, s.captainB.id).token,
+      body: { editionId: s.edition.id, taskPackageId: s.pkg.id, name: '乙队' },
+    });
+    assert.equal(resB.status, 200, resB.body);
+    const teamB = JSON.parse(resB.body);
+    const msB = s.db.prepare('SELECT id FROM milestones WHERE team_id = ? ORDER BY key ASC').all(teamB.id)[0];
+    // 乙队的里程碑被乙队队长签字（达成）
+    const enterpriseId = s.db.prepare('SELECT id FROM users WHERE phone = ?').get('13900008001').id;
+    insertCapability(s.db, 'signoff:create', '企业签字');
+    grantAssignment(s.db, {
+      userId: enterpriseId, capability: 'signoff:create', scopeType: 'global', scopeId: null, grantedBy: s.admin.id,
+    });
+    createSignoff({
+      db: s.db, milestoneId: msB.id, actorId: enterpriseId,
+      body: { department: '业务部门', content: '乙队的问题已确认' },
+      now: NOW, rules: s.rules,
+    });
+    // 甲队队长拿**乙队**的里程碑来计分 ⇒ 必须被拒
+    const res = await call(s.app, 'POST', `/api/teams/${teamA.id}/behavior-events`, {
+      token: s.tokenCaptain, body: { type: 'milestone_on_time', milestoneId: msB.id },
+    });
+    assert.equal(res.status, 403, res.body);
+    assert.equal(JSON.parse(res.body).error.code, 'FORBIDDEN');
+    assert.equal(
+      s.db.prepare('SELECT COUNT(*) AS n FROM behavior_events WHERE team_id = ?').get(teamA.id).n, 0,
+      '被拒的事件一条都不能落库',
+    );
   } finally {
     s.close(); rmSync(s.dataDir, { recursive: true, force: true });
   }

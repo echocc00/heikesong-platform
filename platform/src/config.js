@@ -80,6 +80,71 @@ function hasMissingKey(items) {
 }
 
 /**
+ * 赛程总天数（M0-1 可达性闸用）。
+ *
+ * ⚠️ rules/schedule.json 的日期是「月-日」（相对日序，落到具体日历日期由 edition 偏移）。
+ *    这里按**真实日历日**换算成日序（固定用 2026 年 —— 非闰年，2 月 29 日会顺延到 3 月 1 日，
+ *    对「跨多少天」这个量级无影响）⇒ 跨月也能算对。
+ * @returns {number} 总天数（含首尾）；无法解析时返回 0。
+ */
+function competitionDays(stages) {
+  if (!Array.isArray(stages) || !stages.length) return 0;
+  const dayOf = (value) => {
+    const m = /^(\d{1,2})-(\d{1,2})$/.exec(String(value ?? '').trim());
+    if (!m) return null;
+    const month = Number(m[1]);
+    const day = Number(m[2]);
+    if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+    return Math.floor(Date.UTC(2026, month - 1, day) / 86_400_000);
+  };
+  const spans = [];
+  for (const st of stages) {
+    const start = dayOf(st?.start);
+    const end = dayOf(st?.end);
+    if (start === null || end === null) continue;
+    spans.push([Math.min(start, end), Math.max(start, end)]);
+  }
+  if (!spans.length) return 0;
+  const first = Math.min(...spans.map(([a]) => a));
+  const last = Math.max(...spans.map(([, b]) => b));
+  return Math.max(0, last - first + 1);
+}
+
+/**
+ * 行为分可达性（M0-1）：一支队伍在**整个赛程内**最多能拿多少行为分。
+ *
+ * ⛔ 为什么必须算「赛程内」而不是「理论上」：次数约束里的 `cadence`（每周一次）
+ *    是**按时间**封顶的 ⇒ 赛程只有 31 天时，「每周一次」最多兑现 5 次 ⇒
+ *    **把 cadence 事件算成无限次 ⇒ 会算出「完赛线可达」的假绿结论**。
+ *    （这正是 M0-1 之前那条规则的病根：理论上限 60+ 但真实赛程内只有 33 分。）
+ *
+ * 各项事件的兑现次数：
+ *   · `countBy: 'milestone'` ⇒ 一支队伍最多有的里程碑条数（rules/milestones.default.json）
+ *   · `once` 且无 cadence ⇒ 1 次
+ *   · `once` 且有 cadence{windowDays, maxCount} ⇒ 滚动窗口在赛程内能开的窗口数 × maxCount
+ */
+function behaviorReachability(behavior, rules) {
+  const days = competitionDays(rules?.schedule?.stages);
+  const milestoneCount = Array.isArray(rules?.milestones?.items) ? rules.milestones.items.length : 0;
+  const events = Array.isArray(behavior?.events) ? behavior.events : [];
+  let maxPoints = 0;
+  for (const e of events) {
+    const points = Number(e?.points) || 0;
+    let occurrences = 1;
+    if (e?.countBy === 'milestone') {
+      occurrences = milestoneCount;
+    } else if (e?.cadence) {
+      const windowDays = Number(e.cadence.windowDays) || 0;
+      const maxCount = Number(e.cadence.maxCount) || 1;
+      // 赛程 D 天、窗口 W 天、每窗口 C 次 ⇒ 最多能塞进 ceil(D×C / W) 次
+      occurrences = windowDays > 0 ? Math.ceil((days * maxCount) / windowDays) : maxCount;
+    }
+    maxPoints += points * occurrences;
+  }
+  return { days, milestoneCount, maxPoints };
+}
+
+/**
  * 把配置对象摊平收集到 out。
  * 「有 id 的是一份配置，没 id 的是命名空间」（scoring = { initial, final }）。
  */
@@ -476,6 +541,26 @@ export function validateRules(rules, expectedCount = null) {
             push(`behavior.events 事件 ${e.key} 的 cadence 必须是 { windowDays>0, maxCount>=1 }`);
           }
         }
+        // ⚠️ **M0-1**：`countBy` 只允许 'milestone'（按里程碑计次）。
+        //    写错拼写必须当场拒绝 —— 否则「按主体计次」会**静默失效**
+        //    （回到终身一次 ⇒ 完赛线又不可达），而症状要到算分时才看得见。
+        if (e.countBy !== undefined && e.countBy !== 'milestone') {
+          push(`behavior.events 事件 ${e.key} 的 countBy 非法（合法取值：milestone）`);
+        }
+      }
+      // ⚠️ **M0-1 可达性机器闸**：完赛线必须在**真实赛程内**够得着。
+      //    ⛔ 为什么这道闸必须有：次数约束里的 `cadence`（每周一次）是**按时间**封顶的
+      //    ⇒ 赛程 31 天时最多兑现 5 次 ⇒ 只看「理论事件上限」会算出假绿的「可达」。
+      //    （M0-1 之前正是这个病：理论上限 60+ 但赛程内只有 33 分 ⇒ 完赛线不可达。）
+      const reach = behaviorReachability(behavior, rules);
+      if (reach.days > 0 && reach.milestoneCount > 0
+        && reach.maxPoints < behavior.completionThreshold) {
+        push(
+          `behavior 完赛线不可达：按 rules/schedule.json 的赛程（${reach.days} 天）`
+          + `与 rules/milestones.default.json 的里程碑条数（${reach.milestoneCount}），`
+          + `行为分上限只有 ${reach.maxPoints} 分 < 完赛线 ${behavior.completionThreshold} 分`
+          + ' —— 没有任何队伍能被认定为完赛',
+        );
       }
     }
   }
@@ -585,6 +670,14 @@ export function validateRules(rules, expectedCount = null) {
   }
   if (!rules.compliance?.ipOwnership?.team) {
     errors.push('compliance.ipOwnership.team 缺失（R-ENT-11 团队保留 IP）');
+  }
+  // ⚠️ M0-2：申诉裁决时限（SLA）必须是正数 —— 0 / 负数 = 「没有时限」，
+  //    而没有时限的 SLA 等于没有 SLA（裁决队列可以无限期积压）。
+  if (rules.compliance?.appeal?.slaHours !== undefined) {
+    const hours = Number(rules.compliance.appeal.slaHours);
+    if (!(Number.isFinite(hours) && hours > 0)) {
+      errors.push('compliance.appeal.slaHours 必须是正数（申诉裁决时限）');
+    }
   }
 
   // ── 报名问卷（R-REG-11）──
@@ -735,6 +828,37 @@ export function validateRules(rules, expectedCount = null) {
     }
     if (!Array.isArray(audit.reviewState?.appealAllowedTiers) || audit.reviewState.appealAllowedTiers.length === 0) {
       errors.push('audit.reviewState.appealAllowedTiers 不得为空');
+    }
+    // ⚠️ **M0-2 交叉引用**：可申诉档位必须是**真实存在的段位** ——
+    //    写错一个拼写 ⇒ 那支队永远**进不了申诉门**（静默失效：队列里看不到原因）。
+    for (const t of audit.reviewState?.appealAllowedTiers ?? []) {
+      if (tierKeys.size && !tierKeys.has(t)) {
+        errors.push(`audit.reviewState.appealAllowedTiers 引用了不存在的段位 ${t}`);
+      }
+    }
+    // ⚠️ **M0-2**：程序性错误白名单必须是非空字符串数组（空数组 = 不限制 = 白名单形同虚设）。
+    const kinds = audit.reviewState?.appealReasonKinds;
+    if (kinds !== undefined
+      && (!Array.isArray(kinds) || kinds.length === 0 || kinds.some((k) => typeof k !== 'string' || !k))) {
+      errors.push('audit.reviewState.appealReasonKinds 必须是非空字符串数组（程序性错误白名单）');
+    }
+    // ⚠️ **M0-5 跨规则阈值校验**：来源维度的限频必须**比账号维度更紧**。
+    //    ⛔ 为什么这是硬约束（不是建议）：登录路由的判定顺序是
+    //      ① **来源预检**（只读，在 scrypt **之前**）→ ② 口令校验 → ③ **账号配额**（在失败分支里消耗）
+    //      ⇒ 两条计数**同时增长**（每次失败各记一次）。
+    //      ⇒ 若来源阈值不更紧，**永远是账号配额先触顶** ⇒ 第 11 次请求就被账号配额挡在 ③
+    //      ⇒ 来源预检（①）永远轮不到触发 ⇒ **挡不住 CPU 打爆**（scrypt 照跑）。
+    //    实测（2026-10-24 评审轮）：来源阈值设成 20 时，第 11 次就由账号配额挡下，
+    //    来源计数停在 10 ⇒ 预检形同虚设。
+    const ipSlidingMax = audit.rateLimit?.loginAttemptByIp?.sliding?.max;
+    const acctSlidingMax = audit.rateLimit?.loginAttempt?.sliding?.max;
+    if (Number.isInteger(ipSlidingMax) && Number.isInteger(acctSlidingMax) && ipSlidingMax >= acctSlidingMax) {
+      errors.push(
+        `audit.rateLimit.loginAttemptByIp.sliding.max（${ipSlidingMax}）必须严格小于 `
+        + `audit.rateLimit.loginAttempt.sliding.max（${acctSlidingMax}）`
+        + ' —— 来源预检在口令校验**之前**跑、账号配额在**之后**消耗；'
+        + '来源阈值不更紧 ⇒ 永远是账号配额先触顶 ⇒ 来源预检永远不触发 ⇒ CPU 保护落空',
+      );
     }
   }
 

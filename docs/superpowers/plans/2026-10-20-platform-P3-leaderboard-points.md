@@ -154,6 +154,10 @@ import { createUser } from '../src/db/repo/users.js';
 import { insertStage } from '../src/db/repo/stages.js';
 import { insertTeam } from '../src/db/repo/teams.js';
 import { registerStageTeams, listStageTeamIds, isTeamInStage, hasStageRoster } from '../src/db/repo/stage-teams.js';
+import { isolateTempDir } from '../test-helpers/tmp.js';
+
+// ⚠️ 隔离本进程临时目录：进程退出时整体回收（防临时目录泄漏，详见 test-helpers/tmp.js）
+isolateTempDir();
 
 const here = dirname(fileURLToPath(import.meta.url));
 const rulesDir = join(here, '..', 'rules');
@@ -174,7 +178,9 @@ test('004 迁移建出 4 张榜单表，字段与 INTERFACES.md §4 逐字一致
   assert.deepEqual(cols(db, 'tier_records'),
     ['id', 'team_id', 'tier', 'milestone_count', 'business_signoff_count', 'reasons_json', 'computed_at', 'deleted_at']);
   assert.deepEqual(cols(db, 'behavior_events'),
-    ['id', 'team_id', 'user_id', 'type', 'points', 'evidence', 'created_at']);
+    // ⚠️ subject_id 是 M0-1（2026-10-26）加的列（迁移 009）：按**里程碑**计次的事件
+    //    把里程碑 id 记在这里 ⇒ 一支队伍最多计 7 次「交付里程碑」，而不是终身 1 次。
+    ['id', 'team_id', 'user_id', 'type', 'points', 'evidence', 'created_at', 'subject_id']);
   assert.deepEqual(cols(db, 'leaderboard_snapshots'),
     ['id', 'edition_id', 'stage_id', 'scope', 'payload_json', 'created_at']);
   close(); rmSync(dataDir, { recursive: true, force: true });
@@ -610,7 +616,7 @@ export function removeStageTeam(db, { stageId, teamId }) {
 ```javascript
 {
   "id": "points",
-  "version": "2026-10-25",
+  "version": "2026-10-26",
   "source": "任务书 §七 + S10 §3.3",
   "stagePoints": [10, 8, 5],
   "stagePointsOnlyTopN": 3,
@@ -651,7 +657,7 @@ export function removeStageTeam(db, { stageId, teamId }) {
 ```javascript
 {
   "id": "criteria",
-  "version": "2026-10-25",
+  "version": "2026-10-26",
   "source": "S10 §2.2 段位表附加条件 + R-PTS-03 + R-STG-04 + R-PTS-10 + 任务书 §七（MVP 口径待确认）",
   "tier": {
     "dataOrPrototypeMilestones": ["data_connected", "demo_ready"],
@@ -2753,19 +2759,40 @@ function checkEvidence(def, ev, requirements) {
  *   · `once: true` **且有 cadence** ⇒ 每个滚动窗口内最多 `maxCount` 次
  *     （reason: `cadence_limit`）—— 「每周提交一次进度」真的按**周**算，
  *     而不是「一次性事件」也不是「无限次」。
+ *   · `once: true` **且 `countBy: 'milestone'`** ⇒ **按里程碑计次**（M0-1）：
+ *     同一个里程碑只计一次，**不同里程碑各计一次**（reason: `subject_limit`）。
+ *     ⚠️ 没有主体的事件落进「无主体桶」⇒ 那一桶仍然只计一次（fail-closed：
+ *     拿不到里程碑 id 的事件**不能**靠多提交刷分）。
  *
  * ⚠️ 为什么用**滚动窗口**而不是「自然周」：自然周要定时区（跨时区队伍会差一天），
  *    而滚动窗口只依赖事件自身的时间戳 ⇒ **可复算**（R-AUD-01）。
  *
- * @returns {{max:number, windowMs:number|null}|null} null = 无次数约束
+ * @returns {{max:number, windowMs:number|null, countBy:string|null}|null} null = 无次数约束
  */
 function countLimitOf(def) {
   if (!def?.once) return null;
+  // ⚠️ `countBy` 与 `cadence` **互斥**：按主体计次就是「每个里程碑一次」，
+  //    再叠时间窗口没有意义（里程碑不是按时间重复的事件）。
+  if (def.countBy === 'milestone') return { max: 1, windowMs: null, countBy: 'milestone' };
   const cadence = def.cadence ?? null;
-  if (!cadence) return { max: 1, windowMs: null };
+  if (!cadence) return { max: 1, windowMs: null, countBy: null };
   const maxCount = Number.isInteger(cadence.maxCount) && cadence.maxCount > 0 ? cadence.maxCount : 1;
   const windowDays = Number.isFinite(cadence.windowDays) && cadence.windowDays > 0 ? cadence.windowDays : null;
-  return { max: maxCount, windowMs: windowDays === null ? null : windowDays * 86_400_000 };
+  return { max: maxCount, windowMs: windowDays === null ? null : windowDays * 86_400_000, countBy: null };
+}
+
+/**
+ * 计次桶的键（M0-1）。
+ *
+ * ⚠️ 普通事件：桶 = 事件 key ⇒ 整支队伍共享一个桶（终身一次 / 每周一次）。
+ * ⚠️ `countBy: 'milestone'` 的事件：桶 = key + 主体 id ⇒ **每个里程碑一个桶**。
+ *    主体取 `subject_id`（迁移 009 加的列）⇒ 没有主体的事件落进「无主体桶」
+ *    （空串）⇒ 那一桶仍然只计一次（fail-closed）。
+ */
+function countBucketOf(def, ev) {
+  if (!def?.countBy) return def.key;
+  const subject = ev?.subject_id ?? ev?.subjectId ?? '';
+  return `${def.key} ${String(subject)}`;
 }
 
 /**
@@ -2802,9 +2829,12 @@ export function behaviorScore({ events, behaviorConfig }) {
       continue;
     }
     const limit = countLimitOf(def);
+    // ⚠️ M0-1：计次桶按「事件类型 + 主体」分桶 ⇒ `countBy:'milestone'` 的事件
+    //    每个里程碑各占一个桶 ⇒ 每个里程碑各计一次。
+    const bucket = countBucketOf(def, ev);
     if (limit) {
       const atMs = Date.parse(ev?.created_at ?? '');
-      const times = countedAt.get(def.key) ?? [];
+      const times = countedAt.get(bucket) ?? [];
       // ⛔ 时间戳坏掉 ⇒ **不猜**：按「无法归入任何窗口」处理 ⇒ 不计分（宁可漏一分也不可无限刷）
       if (!Number.isFinite(atMs)) {
         items.push({ id: ev?.id ?? null, type: def.key, points: 0, label: def.label, counted: false, reason: 'cadence_unknown_time' });
@@ -2816,7 +2846,7 @@ export function behaviorScore({ events, behaviorConfig }) {
       if (inWindow >= limit.max) {
         items.push({
           id: ev?.id ?? null, type: def.key, points: 0, label: def.label, counted: false,
-          reason: limit.windowMs === null ? 'once_limit' : 'cadence_limit',
+          reason: limit.countBy ? 'subject_limit' : (limit.windowMs === null ? 'once_limit' : 'cadence_limit'),
         });
         continue;
       }
@@ -2827,9 +2857,9 @@ export function behaviorScore({ events, behaviorConfig }) {
       continue;
     }
     if (limit) {
-      const times = countedAt.get(def.key) ?? [];
+      const times = countedAt.get(bucket) ?? [];
       times.push(Date.parse(ev.created_at));
-      countedAt.set(def.key, times);
+      countedAt.set(bucket, times);
     }
     const pts = Number(def.points) || 0;
     total += pts;
@@ -5340,8 +5370,55 @@ test('★ 滚动总榜的告警要标出是哪一段降级（多赛段来源）'
   assert.ok(html.indexOf('空赛段') < html.indexOf('A队'), '告警仍然置顶');
 });
 
-test('榜单渲染并列名次与积分；队名必须转义', () => {
+// ═══════════════════════════════════════════════════════════════════
+// M0-4「滚动榜口径接 UI」：含未发榜赛段的预估分必须显式标注
+// ═══════════════════════════════════════════════════════════════════
+// ⚠️ 服务层早已产出 unpublishedStages / pointsIncludeUnpublishedStages，
+//    但此前 web/ **零消费** ⇒ 选手把总榜当最终积分、发榜后数字变了却无人解释。
+
+test('★ M0-4：滚动总榜含未发榜赛段 ⇒ 必须显式标注「含预估分」并列出是哪几段', () => {
   const html = leaderboardHtml({
+    scope: 'rolling',
+    warnings: [],
+    unpublishedStages: [{ id: 'st_4', key: 'S4', name: '路演赛段' }],
+    pointsIncludeUnpublishedStages: true,
+    rows: [{ teamId: 't_a', teamName: 'A队', rank: 1, points: 18, stages: 2, bestRank: 1, tier: 'A' }],
+  });
+  assert.ok(html.includes('未发榜赛段'), '必须渲染口径标注');
+  assert.ok(html.includes('路演赛段'), '必须列出是哪几个赛段（不能只说「有未发榜赛段」）');
+  assert.ok(html.includes('预估分'), '必须说清积分是预估的');
+  assert.ok(html.includes('累计积分（含预估）'), '积分列头必须带「含预估」标注');
+  assert.ok(
+    html.indexOf('路演赛段') < html.indexOf('A队'),
+    '口径标注必须排在队名之前（读者扫榜时先看到口径）',
+  );
+});
+
+test('★ M0-4：全部赛段都已发榜 ⇒ 不得出现预估分标注（不许无谓噪声）', () => {
+  const html = leaderboardHtml({
+    scope: 'rolling',
+    warnings: [],
+    unpublishedStages: [],
+    pointsIncludeUnpublishedStages: false,
+    rows: [{ teamId: 't_a', teamName: 'A队', rank: 1, points: 18, stages: 2, bestRank: 1, tier: 'A' }],
+  });
+  assert.ok(!html.includes('预估分'), '没有未发榜赛段时不得出现预估分标注');
+  assert.ok(html.includes('累计积分'), '列头仍是「累计积分」');
+  assert.ok(!html.includes('累计积分（含预估）'));
+});
+
+test('★ M0-4：A 榜（单赛段）不受滚动榜口径影响', () => {
+  const html = leaderboardHtml({
+    scope: 'rank',
+    warnings: [],
+    unpublishedStages: [{ id: 'st_4', key: 'S4', name: '路演赛段' }],
+    pointsIncludeUnpublishedStages: true,
+    rows: [{ teamId: 't_a', teamName: 'A队', rank: 1, total: 90, points: 10, tier: 'A' }],
+  });
+  assert.ok(!html.includes('预估分'), 'A 榜是单赛段口径，不该出现滚动榜的预估分标注');
+});
+
+test('榜单渲染并列名次与积分；队名必须转义', () => {  const html = leaderboardHtml({
     scope: 'rank', warnings: [],
     rows: [
       { teamId: 't_a', teamName: 'A队', rank: 1, total: 90, points: 10, tier: 'A', tiedWith: ['t_b'] },
@@ -5564,8 +5641,32 @@ function warningsHtml(warnings) {
     + `</div>`;
 }
 
-/** 页头（标题 + 副标题 + 跨页入口）。 */
-function headHtml(meta) {
+/**
+ * 滚动总榜的**口径标注**：本榜含未发榜赛段的**预估分**（M0-4）。
+ *
+ * ⚠️ 为什么必须显式展示（这是 P3-9「降级必须显式展示」的同款纪律）：
+ *    总榜累计的是各赛段的**内存积分**，而 `points_ledger` 里**只有已发榜**赛段的积分
+ *    ⇒ 未发榜赛段的预估分也混在总榜里 ⇒ 读者若把总榜当最终积分，
+ *    发榜后数字就会变 ⇒ 必须**明说是哪几个赛段**。
+ * ⚠️ 位置：排在降级告警**之后**、表格之前（降级告警置顶是硬契约，测试断言了字符索引）。
+ * ⛔ 颜色纪律：用既有的 `notice notice--info`（**不新造 CSS 类**），
+ *    且本屏强调色 ≤ 3（降级告警 warn + 本条 info）。
+ */
+function unpublishedNoticeHtml(stages) {
+  const list = Array.isArray(stages) ? stages : [];
+  if (!list.length) return '';
+  const names = list
+    .map((s) => escapeHtml(s?.name || s?.key || s?.id || ''))
+    .filter(Boolean)
+    .join('、');
+  return `<div class="notice notice--info" role="status">`
+    + `<p class="notice__title">本榜含 ${list.length} 个未发榜赛段的预估分</p>`
+    + `<ul class="notice__list"><li>未发榜赛段：${names} —— `
+    + `这些赛段的积分是发榜前的预估分，发榜后本榜数字会变化。</li></ul>`
+    + `</div>`;
+}
+
+/** 页头（标题 + 副标题 + 跨页入口）。 */function headHtml(meta) {
   return pageHead({
     title: meta.title,
     sub: meta.sub,
@@ -5680,8 +5781,11 @@ function rankRowsHtml(rows, meta) {
 }
 
 /** 滚动总榜表格（届期级：累计积分 + 参赛赛段数 + 最好名次）。 */
-function rollingRowsHtml(rows, meta) {
+function rollingRowsHtml(rows, meta, opts = {}) {
   if (!rows.length) return emptyState({ title: '暂无数据', hint: meta.empty });
+  // ⚠️ M0-4：含未发榜赛段时，「累计积分」列头必须带**预估**标注 ——
+  //    表头是读者扫榜时第一眼看到的地方 ⇒ 标注放在这里比只放一段提示更不容易被漏。
+  const pointsHeader = opts.includesEstimate ? '累计积分（含预估）' : '累计积分';
   const body = rows.map((r, i) => {
     const rank = r?.rank ?? i + 1;
     const best = r?.bestRank ?? '—';
@@ -5695,7 +5799,7 @@ function rollingRowsHtml(rows, meta) {
       + `</tr>`;
   }).join('');
   return tableWrap(
-    `<thead><tr><th>名次</th><th>队伍</th><th class="td-num">累计积分</th>`
+    `<thead><tr><th>名次</th><th>队伍</th><th class="td-num">${pointsHeader}</th>`
     + `<th class="td-num">参赛赛段</th><th class="td-num">最好名次</th><th>段位</th></tr></thead>`
     + `<tbody>${body}</tbody>`,
     { caption: '滚动总榜：全赛段累计' },
@@ -5762,9 +5866,17 @@ export function leaderboardHtml(model) {
   const warnings = Array.isArray(model?.warnings) ? model.warnings : [];
   const stages = Array.isArray(model?.stages) ? model.stages : [];
   const stageId = String(model?.stageId ?? '');
+  // ⚠️ M0-4：未发榜赛段（其**预估分**已计入总榜）—— 服务层已产出（unpublishedStages），
+  //    但此前 web/ **零消费** ⇒ 读者把总榜当最终积分、发榜后数字变了却无人解释。
+  const unpublishedStages = Array.isArray(model?.unpublishedStages) ? model.unpublishedStages : [];
+  const includesEstimate = model?.pointsIncludeUnpublishedStages === true;
 
   // ⚠️ 告警置顶（硬契约）：必须排在整页最前，不能排在表格后面。
   const warnHtml = warningsHtml(warnings);
+  // ⚠️ 口径标注排在告警之后（告警置顶优先）、表格之前。
+  const estimateHtml = scope === 'rolling' && includesEstimate
+    ? unpublishedNoticeHtml(unpublishedStages)
+    : '';
   const head = headHtml(meta);
   const switcher = scopeTabsHtml(scope, stageId, stages);
 
@@ -5773,10 +5885,10 @@ export function leaderboardHtml(model) {
 
   const body = scope === 'business' ? businessRowsHtml(rows, meta)
     : scope === 'personal' ? personalRowsHtml(rows, meta)
-      : scope === 'rolling' ? rollingRowsHtml(rows, meta)
+      : scope === 'rolling' ? rollingRowsHtml(rows, meta, { includesEstimate })
         : rankRowsHtml(rows, meta);
 
-  return `${warnHtml}${head}${switcher}`
+  return `${warnHtml}${estimateHtml}${head}${switcher}`
     + `${statsHtml(scope, rows, warnings)}`
     + `${stagePickerHtml(scope, stageId, stages)}`
     + `${sectionTitle(scope === 'business' ? '商业战绩' : '榜单')}`
@@ -5830,6 +5942,10 @@ export async function renderLeaderboard(ctx) {
       stages,
       rows: data?.rows ?? [],
       warnings: data?.warnings ?? [],
+      // ⚠️ M0-4：把「未发榜赛段」与「本榜含预估分」这两个口径字段**带进视图**
+      //    （服务层早已产出，此前 web/ 零消费 ⇒ 读者看不到口径差异）。
+      unpublishedStages: data?.unpublishedStages ?? [],
+      pointsIncludeUnpublishedStages: data?.pointsIncludeUnpublishedStages === true,
       error,
     });
     // ⚠️ 错误态的重试按钮必须真的能重跑（生产级错误态不能是死路一条）

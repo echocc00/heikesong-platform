@@ -98,8 +98,32 @@ function warningsHtml(warnings) {
     + `</div>`;
 }
 
-/** 页头（标题 + 副标题 + 跨页入口）。 */
-function headHtml(meta) {
+/**
+ * 滚动总榜的**口径标注**：本榜含未发榜赛段的**预估分**（M0-4）。
+ *
+ * ⚠️ 为什么必须显式展示（这是 P3-9「降级必须显式展示」的同款纪律）：
+ *    总榜累计的是各赛段的**内存积分**，而 `points_ledger` 里**只有已发榜**赛段的积分
+ *    ⇒ 未发榜赛段的预估分也混在总榜里 ⇒ 读者若把总榜当最终积分，
+ *    发榜后数字就会变 ⇒ 必须**明说是哪几个赛段**。
+ * ⚠️ 位置：排在降级告警**之后**、表格之前（降级告警置顶是硬契约，测试断言了字符索引）。
+ * ⛔ 颜色纪律：用既有的 `notice notice--info`（**不新造 CSS 类**），
+ *    且本屏强调色 ≤ 3（降级告警 warn + 本条 info）。
+ */
+function unpublishedNoticeHtml(stages) {
+  const list = Array.isArray(stages) ? stages : [];
+  if (!list.length) return '';
+  const names = list
+    .map((s) => escapeHtml(s?.name || s?.key || s?.id || ''))
+    .filter(Boolean)
+    .join('、');
+  return `<div class="notice notice--info" role="status">`
+    + `<p class="notice__title">本榜含 ${list.length} 个未发榜赛段的预估分</p>`
+    + `<ul class="notice__list"><li>未发榜赛段：${names} —— `
+    + `这些赛段的积分是发榜前的预估分，发榜后本榜数字会变化。</li></ul>`
+    + `</div>`;
+}
+
+/** 页头（标题 + 副标题 + 跨页入口）。 */function headHtml(meta) {
   return pageHead({
     title: meta.title,
     sub: meta.sub,
@@ -214,8 +238,11 @@ function rankRowsHtml(rows, meta) {
 }
 
 /** 滚动总榜表格（届期级：累计积分 + 参赛赛段数 + 最好名次）。 */
-function rollingRowsHtml(rows, meta) {
+function rollingRowsHtml(rows, meta, opts = {}) {
   if (!rows.length) return emptyState({ title: '暂无数据', hint: meta.empty });
+  // ⚠️ M0-4：含未发榜赛段时，「累计积分」列头必须带**预估**标注 ——
+  //    表头是读者扫榜时第一眼看到的地方 ⇒ 标注放在这里比只放一段提示更不容易被漏。
+  const pointsHeader = opts.includesEstimate ? '累计积分（含预估）' : '累计积分';
   const body = rows.map((r, i) => {
     const rank = r?.rank ?? i + 1;
     const best = r?.bestRank ?? '—';
@@ -229,7 +256,7 @@ function rollingRowsHtml(rows, meta) {
       + `</tr>`;
   }).join('');
   return tableWrap(
-    `<thead><tr><th>名次</th><th>队伍</th><th class="td-num">累计积分</th>`
+    `<thead><tr><th>名次</th><th>队伍</th><th class="td-num">${pointsHeader}</th>`
     + `<th class="td-num">参赛赛段</th><th class="td-num">最好名次</th><th>段位</th></tr></thead>`
     + `<tbody>${body}</tbody>`,
     { caption: '滚动总榜：全赛段累计' },
@@ -296,9 +323,17 @@ export function leaderboardHtml(model) {
   const warnings = Array.isArray(model?.warnings) ? model.warnings : [];
   const stages = Array.isArray(model?.stages) ? model.stages : [];
   const stageId = String(model?.stageId ?? '');
+  // ⚠️ M0-4：未发榜赛段（其**预估分**已计入总榜）—— 服务层已产出（unpublishedStages），
+  //    但此前 web/ **零消费** ⇒ 读者把总榜当最终积分、发榜后数字变了却无人解释。
+  const unpublishedStages = Array.isArray(model?.unpublishedStages) ? model.unpublishedStages : [];
+  const includesEstimate = model?.pointsIncludeUnpublishedStages === true;
 
   // ⚠️ 告警置顶（硬契约）：必须排在整页最前，不能排在表格后面。
   const warnHtml = warningsHtml(warnings);
+  // ⚠️ 口径标注排在告警之后（告警置顶优先）、表格之前。
+  const estimateHtml = scope === 'rolling' && includesEstimate
+    ? unpublishedNoticeHtml(unpublishedStages)
+    : '';
   const head = headHtml(meta);
   const switcher = scopeTabsHtml(scope, stageId, stages);
 
@@ -307,10 +342,10 @@ export function leaderboardHtml(model) {
 
   const body = scope === 'business' ? businessRowsHtml(rows, meta)
     : scope === 'personal' ? personalRowsHtml(rows, meta)
-      : scope === 'rolling' ? rollingRowsHtml(rows, meta)
+      : scope === 'rolling' ? rollingRowsHtml(rows, meta, { includesEstimate })
         : rankRowsHtml(rows, meta);
 
-  return `${warnHtml}${head}${switcher}`
+  return `${warnHtml}${estimateHtml}${head}${switcher}`
     + `${statsHtml(scope, rows, warnings)}`
     + `${stagePickerHtml(scope, stageId, stages)}`
     + `${sectionTitle(scope === 'business' ? '商业战绩' : '榜单')}`
@@ -364,6 +399,10 @@ export async function renderLeaderboard(ctx) {
       stages,
       rows: data?.rows ?? [],
       warnings: data?.warnings ?? [],
+      // ⚠️ M0-4：把「未发榜赛段」与「本榜含预估分」这两个口径字段**带进视图**
+      //    （服务层早已产出，此前 web/ 零消费 ⇒ 读者看不到口径差异）。
+      unpublishedStages: data?.unpublishedStages ?? [],
+      pointsIncludeUnpublishedStages: data?.pointsIncludeUnpublishedStages === true,
       error,
     });
     // ⚠️ 错误态的重试按钮必须真的能重跑（生产级错误态不能是死路一条）

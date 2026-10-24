@@ -57,6 +57,67 @@ const REGISTRATION_TERMINAL_STATUSES = ['accepted', 'rejected'];
 /** 申诉的**未裁决**状态（还有一条在队列里等人处理）⇒ 不许重复提交。 */
 const APPEAL_PENDING_STATUSES = ['submitted', 'reviewing'];
 
+/**
+ * 申诉 SLA（M0-2）：组委会应在 `rules/compliance.json` 规定的时限内裁决。
+ *
+ * ⚠ 口径：SLA 是**对组委会的承诺**（不是对选手的）⇒ 超期**不自动改变裁决结果**，
+ *    只在审计里留痕（是否逾期 + 逾期多久）并在裁决队列里显式标注。
+ * ⚠ 时限来自配置（默认没有 = 不启用）⇒ 改时限只改 rules/compliance.json，代码只读它。
+ */
+function appealSlaHours(rules) {
+  const hours = Number(rules?.compliance?.appeal?.slaHours);
+  return Number.isFinite(hours) && hours > 0 ? hours : null;
+}
+
+/**
+ * 申诉的截止时刻与逾期状态（M0-2）。
+ * 截止 = 提交时刻 + SLA 时长；逾期 = 现在晚于截止。
+ * @param appeal 申诉行（created_at 或 createdAt 皆可）
+ * @param rules 规则（读 rules.compliance.appeal.slaHours）
+ * @param now 当前时刻（可注入 ⇒ 可测）
+ */
+function appealSlaOf(appeal, rules, now) {
+  const hours = appealSlaHours(rules);
+  const createdAt = appeal?.created_at ?? appeal?.createdAt ?? null;
+  if (!hours || !createdAt) return { slaHours: hours, slaDueAt: null, slaOverdue: false };
+  const createdMs = Date.parse(createdAt);
+  if (!Number.isFinite(createdMs)) return { slaHours: hours, slaDueAt: null, slaOverdue: false };
+  const dueMs = createdMs + hours * 3_600_000;
+  const atMs = Date.parse(now ?? '') || Date.now();
+  return {
+    slaHours: hours,
+    slaDueAt: new Date(dueMs).toISOString(),
+    slaOverdue: atMs > dueMs,
+  };
+}
+
+/**
+ * 程序性错误白名单（M0-2「限程序性错误」）。
+ *
+ * ⚠ 规则驱动：白名单为空 ⇒ 不做限制（老配置 / 自定义规则集仍可用）。
+ *    白名单非空 ⇒ **赛段结果类申诉必须声明理由类型且命中白名单**（fail-closed）。
+ * ⚠ 为什么报名类不强制：选手侧前端契约已固定（web/views/registration.js 只发 reason），
+ *    强改会让选手点「提交申诉」直接失败 ⇒ 报名类只在「传了」时校验。
+ */
+function appealReasonKindGate({ subjectType, reasonKind, rules }) {
+  const allowed = Array.isArray(rules?.audit?.reviewState?.appealReasonKinds)
+    ? rules.audit.reviewState.appealReasonKinds : [];
+  if (!allowed.length) return null;
+  const kind = String(reasonKind ?? '').trim();
+  if (subjectType !== 'team_result' && !kind) return null;   // 报名类：可以不传
+  if (!kind) {
+    throw badRequest(
+      `申诉必须声明理由类型（reasonKind），只能是：${allowed.join(' / ')}`
+      + ' —— 申诉只受理**程序性错误**（算分错误 / 流程违规 / 数据错误）；'
+      + '「我不服这个名次」这类主观不服不在受理范围（否则裁决队列会被淹没、SLA 必然失守）',
+    );
+  }
+  if (!allowed.includes(kind)) {
+    throw badRequest(`申诉理由类型非法：${kind}（只能是 ${allowed.join(' / ')}）`);
+  }
+  return kind;
+}
+
 export function parseAppealSubject(subjectId) {
   const idx = String(subjectId ?? '').indexOf(':');
   if (idx < 0) return { stageId: null, teamId: String(subjectId ?? '') };
@@ -94,7 +155,8 @@ export function filterVisibleScores({ db, stageId, viewer = null, scores = [] })
  *   ⇒ 选手点「提交申诉」永远失败。
  */
 export function fileAppeal({
-  db, subjectType = 'team_result', subjectId, filedBy = null, reason, now = new Date().toISOString(), rules,
+  db, subjectType = 'team_result', subjectId, filedBy = null, reason, reasonKind = null,
+  now = new Date().toISOString(), rules,
 }) {
   // ⚠️ **F26（Medium，2026-10-23 审计）：本函数的写路径原先**全程无事务**** ——
   //   `withTransaction` / `SAVEPOINT` / `BEGIN` 一个都没有，却有十几处写调用 ⇒
@@ -106,10 +168,13 @@ export function fileAppeal({
   return withTransaction(db, () => {
     if (!subjectId) throw badRequest('申诉必须给 subjectId');
     if (!reason || !String(reason).trim()) throw badRequest('申诉必须写理由（空理由 = 无法复核）');
+    // ⚠️ M0-2「限程序性错误」：理由类型白名单（fail-closed）。
+    //    白名单为空（老配置 / 自定义规则集）⇒ 不限制，保持兼容。
+    const kind = appealReasonKindGate({ subjectType, reasonKind, rules });
 
     // ── 报名类申诉（DP-106）：独立的校验口径，见 fileRegistrationAppeal ──────
     if (subjectType === 'registration') {
-      return fileRegistrationAppeal({ db, subjectId, filedBy, reason, now, rules });
+      return fileRegistrationAppeal({ db, subjectId, filedBy, reason, reasonKind: kind, now, rules });
     }
 
     const { stageId, teamId } = parseAppealSubject(subjectId);
@@ -145,18 +210,22 @@ export function fileAppeal({
     }
 
     const id = insertAppeal(db, {
-      subjectType, subjectId, filedBy, reason, status: 'submitted', now,
+      subjectType, subjectId, filedBy, reason, reasonKind: kind, status: 'submitted', now,
     });
+    // ⚠️ M0-2：SLA 截止时刻写进审计（提交时刻 + rules.compliance.appeal.slaHours）。
+    const sla = appealSlaOf({ created_at: now }, rules, now);
     writeAuditLog(db, {
       actorId: filedBy,
       action: 'appeal.filed',
       entity: 'appeal',
       entityId: id,
-      detail: { subjectType, subjectId, reason, stageId, teamId, tier },
+      detail: {
+        subjectType, subjectId, reason, stageId, teamId, tier,
+        reasonKind: kind, slaDueAt: sla.slaDueAt, slaHours: sla.slaHours,
+      },
       now,
     });
-    return getAppeal(db, id);
-
+    return { ...getAppeal(db, id), ...sla };
   });}
 
 /**
@@ -181,7 +250,7 @@ export function fileAppeal({
  *     选手不能再申诉（要改只能走组委会直接复核那条路径）。
  *   - ④ 是防重复提交：同一报名同时只允许一条**待裁决**的申诉在队列里。
  */
-function fileRegistrationAppeal({ db, subjectId, filedBy, reason, now, rules }) {
+function fileRegistrationAppeal({ db, subjectId, filedBy, reason, reasonKind = null, now, rules }) {
   // ① 存在性 → 404
   const reg = findRegistrationRow(db, subjectId);
   if (!reg) throw notFound(`报名记录不存在: ${subjectId}`);
@@ -218,8 +287,9 @@ function fileRegistrationAppeal({ db, subjectId, filedBy, reason, now, rules }) 
   }
 
   const id = insertAppeal(db, {
-    subjectType: 'registration', subjectId, filedBy, reason, status: 'submitted', now,
+    subjectType: 'registration', subjectId, filedBy, reason, reasonKind, status: 'submitted', now,
   });
+  const sla = appealSlaOf({ created_at: now }, rules, now);
   writeAuditLog(db, {
     actorId: filedBy,
     action: 'appeal.filed',
@@ -229,12 +299,15 @@ function fileRegistrationAppeal({ db, subjectId, filedBy, reason, now, rules }) 
       subjectType: 'registration',
       subjectId,
       reason,
+      reasonKind: reasonKind ?? null,
       registrationStatus: reg.status,
       onBehalf,
+      slaDueAt: sla.slaDueAt,
+      slaHours: sla.slaHours,
     },
     now,
   });
-  return getAppeal(db, id);
+  return { ...getAppeal(db, id), ...sla };
 }
 
 /**
@@ -315,12 +388,23 @@ export function decideAppeal({
     }
 
     updateAppeal(db, { id: appealId, status: decision, decidedBy, decidedAt: now, decisionNote: note });
+    // ⚠️ M0-2：裁决时把 SLA 状态一并留痕（是否超期、超期多久）⇒ 事后能复盘「委员会响应时效」。
+    const sla = appealSlaOf(appeal, rules, now);
     writeAuditLog(db, {
       actorId: decidedBy,
       action: 'appeal.decided',
       entity: 'appeal',
       entityId: appealId,
-      detail: { decision, note, subjectType: appeal.subject_type, subjectId: appeal.subject_id, recomputeRequired },
+      detail: {
+        decision,
+        note,
+        subjectType: appeal.subject_type,
+        subjectId: appeal.subject_id,
+        recomputeRequired,
+        slaHours: sla.slaHours,
+        slaDueAt: sla.slaDueAt,
+        slaOverdue: sla.slaOverdue,
+      },
       now,
     });
 
@@ -329,14 +413,18 @@ export function decideAppeal({
       transitions,
       // 申诉成立必须重算；重算走 revision + 1，旧 revision 保留（不覆盖历史）
       recomputeRequired,
+      ...sla,
     };
 
   });}
 
 /**
  * 申诉列表。列表不满足 → 200 + 空集。
+ *
+ * ⚠️ M0-2：每行带 **reasonKind**（程序性错误类型）+ **SLA**（slaDueAt / slaOverdue）
+ *    ⇒ 组委会的裁决队列里能直接看到「这条是哪类错」与「还剩多久必须裁决」。
  */
-export function listAppeals({ db, filter = {}, viewer = null }) {
+export function listAppeals({ db, filter = {}, viewer = null, rules = null, now = new Date().toISOString() }) {
   const allowed = viewer ? can(viewer, 'audit:read', null, db) : false;
   if (!allowed) return { rows: [], total: 0 };
   const { rows, total } = listAppealRows(db, filter);
@@ -347,11 +435,14 @@ export function listAppeals({ db, filter = {}, viewer = null }) {
       subjectId: r.subject_id,
       filedBy: r.filed_by,
       reason: r.reason,
+      // ⚠️ M0-2：老申诉（迁移前）没有理由类型 ⇒ null（不许假装成某一类）。
+      reasonKind: r.reason_kind ?? null,
       status: r.status,
       decidedBy: r.decided_by,
       decidedAt: r.decided_at,
       decisionNote: r.decision_note,
       createdAt: r.created_at,
+      ...appealSlaOf(r, rules, now),
     })),
     total,
   };

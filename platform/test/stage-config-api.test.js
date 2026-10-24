@@ -234,7 +234,8 @@ test('⛔ E158：GET /api/editions/:editionId/scoring-configs —— 权重表 +
     // ⛔ 席构成约束：企业席 ≥30% / 专家席 ≤50% / observer 无投票权
     assert.equal(initial.judgePool.minEnterpriseSeatShare, 0.30);
     assert.equal(initial.judgePool.maxExpertSeatShare, 0.50);
-    assert.equal(initial.judgePool.minJudgesPerDimension, 7);
+    // ⚠️ M0-3：评委池下限由 7 降到 **3**（首届口径，rule-decisions.md C-07）
+    assert.equal(initial.judgePool.minJudgesPerDimension, 3);
     assert.deepEqual(initial.judgePool.nonVotingSeats, ['observer']);
     assert.ok(initial.judgePool.votingSeats.includes('enterprise'));
 

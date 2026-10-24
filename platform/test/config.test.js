@@ -238,3 +238,130 @@ test('P2：归一化策略参数（trimmedIterations / bayesPriorStrength）非�
   assert.ok(errors.some((e) => e.includes('trimmedIterations')));
   assert.ok(errors.some((e) => e.includes('bayesPriorStrength')));
 });
+
+// ═══════════════════════════════════════════════════════════════════
+// M0-1「完赛线可达性机器闸」
+// ═══════════════════════════════════════════════════════════════════
+// ⚠️ 为什么这道闸必须存在：行为分的次数约束里有**按时间**封顶的事件
+//    （weekly_progress = 每周 1 次）⇒ 赛程只有 31 天时最多兑现 5 次。
+//    ⇒ 只看「事件理论上限」会算出假绿的「完赛线可达」。
+//    M0-1 之前正是这个病：理论上限 60+，赛程内实际只有 33 分 ⇒ 完赛线不可达。
+
+test('★ M0-1：仓库自带的规则在真实赛程内够得着完赛线（正对照）', () => {
+  const { rules } = loadRules(rulesDir);
+  assert.deepEqual(validateRules(rules), [], '仓库自带规则必须通过全部校验（含可达性闸）');
+  // 夹具判别性：把口径钉死 —— 上限 63 = 10（每周 5 次）+ 3 + 5×7（7 个里程碑）+ 5 + 10
+  const ms = rules.behavior.events.find((e) => e.key === 'milestone_on_time');
+  assert.equal(ms.countBy, 'milestone', '交付里程碑必须按里程碑计次');
+  assert.equal(rules.behavior.completionThreshold, 60);
+  assert.equal(rules.milestones.items.length, 7, '7 个里程碑（上限 5×7 = 35 分）');
+});
+
+test('★ M0-1：把交付里程碑改回终身一次 ⇒ 上限掉回 33 < 60 ⇒ 拒绝启动', () => {
+  const { rules } = loadRules(rulesDir);
+  const broken = structuredClone(rules);
+  broken.behavior.events = broken.behavior.events.map((e) => (
+    e.key === 'milestone_on_time' ? { ...e, countBy: undefined } : e
+  ));
+  const errors = validateRules(broken);
+  assert.ok(
+    errors.some((e) => e.includes('完赛线不可达')),
+    `完赛线不可达必须被拒绝，实际校验结果：${JSON.stringify(errors)}`,
+  );
+  assert.ok(
+    errors.some((e) => e.includes('33') && e.includes('60')),
+    `报错必须带**人话数字**（当前上限 vs 完赛线），实际：${JSON.stringify(errors)}`,
+  );
+});
+
+test('★ M0-1：完赛线抬到 100 ⇒ 63 < 100 ⇒ 拒绝启动（闸对改坏配置真的拦得住）', () => {
+  const { rules } = loadRules(rulesDir);
+  const broken = structuredClone(rules);
+  broken.behavior.completionThreshold = 100;
+  const errors = validateRules(broken);
+  assert.ok(errors.some((e) => e.includes('完赛线不可达')), JSON.stringify(errors));
+});
+
+test('★ M0-1：赛程被压短（每周进度兑现次数变少）⇒ 上限不够 ⇒ 拒绝启动', () => {
+  const { rules } = loadRules(rulesDir);
+  const broken = structuredClone(rules);
+  // 把 5 个赛段压进 3 天 ⇒ 每周进度只能兑现 1 次 ⇒ 上限 = 2 + 3 + 35 + 5 + 10 = 55 < 60
+  broken.schedule.stages = broken.schedule.stages.map((st, i) => ({
+    ...st, start: '10-01', end: '10-03',
+  }));
+  const errors = validateRules(broken);
+  assert.ok(errors.some((e) => e.includes('完赛线不可达')), JSON.stringify(errors));
+});
+
+test('★ M0-1：countBy 写错拼写必须当场拒绝（不许静默退回终身一次）', () => {
+  const { rules } = loadRules(rulesDir);
+  const broken = structuredClone(rules);
+  broken.behavior.events = broken.behavior.events.map((e) => (
+    e.key === 'milestone_on_time' ? { ...e, countBy: 'milestones' } : e
+  ));
+  const errors = validateRules(broken);
+  assert.ok(errors.some((e) => e.includes('countBy')), JSON.stringify(errors));
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// M0-5「IP 阈值开机校验」
+// ═══════════════════════════════════════════════════════════════════
+// ⚠️ 为什么必须机器闸：登录路由的顺序是「来源预检（scrypt 前）→ 口令校验 → 账号配额」，
+//    两条计数同时增长 ⇒ 来源阈值不更紧 ⇒ 永远是账号配额先触顶 ⇒ 来源预检不触发
+//    ⇒ 限频挡不住 CPU 打爆。这条约束写在规则注释里，但**机器必须自己守着**。
+
+test('★ M0-5：来源阈值必须比账号阈值更紧（正对照：仓库自带配置 8 < 10）', () => {
+  const { rules } = loadRules(rulesDir);
+  assert.equal(rules.audit.rateLimit.loginAttemptByIp.sliding.max, 8);
+  assert.equal(rules.audit.rateLimit.loginAttempt.sliding.max, 10);
+  assert.deepEqual(validateRules(rules), []);
+});
+
+test('★ M0-5：把来源阈值改成 11 ⇒ 拒绝启动并报人话', () => {
+  const { rules } = loadRules(rulesDir);
+  const broken = structuredClone(rules);
+  broken.audit.rateLimit.loginAttemptByIp.sliding.max = 11;
+  const errors = validateRules(broken);
+  const hit = errors.find((e) => e.includes('loginAttemptByIp.sliding.max'));
+  assert.ok(hit, `必须报错，实际校验结果：${JSON.stringify(errors)}`);
+  assert.ok(hit.includes('11') && hit.includes('10'), `报错必须带两个阈值数字，实际：${hit}`);
+  assert.ok(hit.includes('CPU'), `报错必须说清后果（CPU 保护落空），实际：${hit}`);
+});
+
+test('★ M0-5：来源阈值与账号阈值相等 ⇒ 也必须拒绝（不是「不小于」而是「严格小于」）', () => {
+  const { rules } = loadRules(rulesDir);
+  const broken = structuredClone(rules);
+  broken.audit.rateLimit.loginAttemptByIp.sliding.max = 10;
+  const errors = validateRules(broken);
+  assert.ok(errors.some((e) => e.includes('loginAttemptByIp.sliding.max')), JSON.stringify(errors));
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// M0-3「首届口径调整」（归一化策略 + 评委池下限 + 样本数门槛）
+// ═══════════════════════════════════════════════════════════════════
+// ⚠️ 为什么这三项必须一起改：只改策略不改门槛 ⇒ 样本数仍 < 门槛 ⇒ 归一化照样
+//    **永远走全局回退** ⇒ 「降级」仍是常态路径（C-05 结构性张力在首届的具体表现）。
+
+test('★ M0-3：首届默认用 trimmed 归一化 + 评委池下限 3 + 样本数门槛 3', () => {
+  const { rules } = loadRules(rulesDir);
+  for (const key of ['initial', 'final']) {
+    const cfg = rules.scoring[key];
+    assert.equal(cfg.normalizationStrategy, 'trimmed', `${key} 归一化策略必须是 trimmed`);
+    assert.equal(cfg.judgePool.minJudgesPerDimension, 3, `${key} 评委池下限必须是 3`);
+    assert.equal(cfg.minSamplesForJudgeNormalization, 3, `${key} 样本数门槛必须是 3`);
+  }
+  // ⚠️ **可恢复性**：三个值都只是配置 ⇒ 恢复全文赛制口径（zscore / 7 / 9 / 5）
+  //    只需改 rules/scoring-*.json，代码不硬编码任何阈值 ⇒ 这里断言「配置层可改」。
+  const broken = structuredClone(rules);
+  broken.scoring.initial.normalizationStrategy = 'zscore';
+  broken.scoring.initial.judgePool.minJudgesPerDimension = 7;
+  broken.scoring.initial.minSamplesForJudgeNormalization = 5;
+  assert.deepEqual(validateRules(broken), [], '改回全文赛制口径必须仍然能启动（不是硬编码）');
+});
+
+test('★ M0-3：归一化策略写错必须拒绝启动（VALID_NORMALIZATIONS 闸）', () => {
+  const { rules } = loadRules(rulesDir);
+  const broken = structuredClone(rules);
+  broken.scoring.initial.normalizationStrategy = 'robust_zscore';
+  assert.ok(validateRules(broken).some((e) => e.includes('normalizationStrategy')));
+});

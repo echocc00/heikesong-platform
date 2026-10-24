@@ -365,7 +365,8 @@ points_ledger(id, edition_id, stage_id, team_id, user_id, kind, points REAL, cre
    -- kind: stage_rank | mvp | roadshow | personal_rollup
 tier_records(id, team_id, tier, milestone_count, business_signoff_count, reasons_json,
              computed_at, deleted_at)
-behavior_events(id, team_id, user_id, type, points REAL, evidence, created_at)
+behavior_events(id, team_id, user_id, type, points REAL, evidence, created_at, subject_id)
+   -- subject_id: 按主体计次的事件（M0-1：交付里程碑）挂的里程碑 id；其余事件为 NULL
 leaderboard_snapshots(id, edition_id, stage_id, scope, payload_json, created_at)
 ```
 

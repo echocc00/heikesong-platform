@@ -1144,6 +1144,7 @@ test('F34 对他人队伍的结果提交申诉必须被拒（须校验申诉人�
         subjectType: 'team_result',
         subjectId: 'st1:teamB',       // ← 别人的队伍
         reason: 'ha',
+        reasonKind: 'scoring_error',
       });
     } catch (e) { err = e; }
     // 修复前：不是 403 —— 要么因状态不对 409，要么直接受理（无归属校验）
@@ -1222,7 +1223,9 @@ test('F36 发榜后对赛段结果提交申诉必须被受理（FINALIZED 的生
       db, filedBy: captain.id, now, rules,
       subjectType: 'team_result',
       subjectId: 'st1:tm1',
-      reason: '名次有异议',
+      reason: '企业确认分与事实不符',
+      // ⚠️ M0-2：赛段结果类申诉必须声明**程序性错误**类型（白名单在 rules/audit.json）
+      reasonKind: 'scoring_error',
     });
     assert.ok(appeal?.id, `发榜后申诉必须被受理，实际返回：${JSON.stringify(appeal)}`);
   } finally { close(); }

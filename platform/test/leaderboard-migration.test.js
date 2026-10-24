@@ -36,7 +36,9 @@ test('004 迁移建出 4 张榜单表，字段与 INTERFACES.md §4 逐字一致
   assert.deepEqual(cols(db, 'tier_records'),
     ['id', 'team_id', 'tier', 'milestone_count', 'business_signoff_count', 'reasons_json', 'computed_at', 'deleted_at']);
   assert.deepEqual(cols(db, 'behavior_events'),
-    ['id', 'team_id', 'user_id', 'type', 'points', 'evidence', 'created_at']);
+    // ⚠️ subject_id 是 M0-1（2026-10-26）加的列（迁移 009）：按**里程碑**计次的事件
+    //    把里程碑 id 记在这里 ⇒ 一支队伍最多计 7 次「交付里程碑」，而不是终身 1 次。
+    ['id', 'team_id', 'user_id', 'type', 'points', 'evidence', 'created_at', 'subject_id']);
   assert.deepEqual(cols(db, 'leaderboard_snapshots'),
     ['id', 'edition_id', 'stage_id', 'scope', 'payload_json', 'created_at']);
   close(); rmSync(dataDir, { recursive: true, force: true });

@@ -36,8 +36,55 @@ test('★ 滚动总榜的告警要标出是哪一段降级（多赛段来源）'
   assert.ok(html.indexOf('空赛段') < html.indexOf('A队'), '告警仍然置顶');
 });
 
-test('榜单渲染并列名次与积分；队名必须转义', () => {
+// ═══════════════════════════════════════════════════════════════════
+// M0-4「滚动榜口径接 UI」：含未发榜赛段的预估分必须显式标注
+// ═══════════════════════════════════════════════════════════════════
+// ⚠️ 服务层早已产出 unpublishedStages / pointsIncludeUnpublishedStages，
+//    但此前 web/ **零消费** ⇒ 选手把总榜当最终积分、发榜后数字变了却无人解释。
+
+test('★ M0-4：滚动总榜含未发榜赛段 ⇒ 必须显式标注「含预估分」并列出是哪几段', () => {
   const html = leaderboardHtml({
+    scope: 'rolling',
+    warnings: [],
+    unpublishedStages: [{ id: 'st_4', key: 'S4', name: '路演赛段' }],
+    pointsIncludeUnpublishedStages: true,
+    rows: [{ teamId: 't_a', teamName: 'A队', rank: 1, points: 18, stages: 2, bestRank: 1, tier: 'A' }],
+  });
+  assert.ok(html.includes('未发榜赛段'), '必须渲染口径标注');
+  assert.ok(html.includes('路演赛段'), '必须列出是哪几个赛段（不能只说「有未发榜赛段」）');
+  assert.ok(html.includes('预估分'), '必须说清积分是预估的');
+  assert.ok(html.includes('累计积分（含预估）'), '积分列头必须带「含预估」标注');
+  assert.ok(
+    html.indexOf('路演赛段') < html.indexOf('A队'),
+    '口径标注必须排在队名之前（读者扫榜时先看到口径）',
+  );
+});
+
+test('★ M0-4：全部赛段都已发榜 ⇒ 不得出现预估分标注（不许无谓噪声）', () => {
+  const html = leaderboardHtml({
+    scope: 'rolling',
+    warnings: [],
+    unpublishedStages: [],
+    pointsIncludeUnpublishedStages: false,
+    rows: [{ teamId: 't_a', teamName: 'A队', rank: 1, points: 18, stages: 2, bestRank: 1, tier: 'A' }],
+  });
+  assert.ok(!html.includes('预估分'), '没有未发榜赛段时不得出现预估分标注');
+  assert.ok(html.includes('累计积分'), '列头仍是「累计积分」');
+  assert.ok(!html.includes('累计积分（含预估）'));
+});
+
+test('★ M0-4：A 榜（单赛段）不受滚动榜口径影响', () => {
+  const html = leaderboardHtml({
+    scope: 'rank',
+    warnings: [],
+    unpublishedStages: [{ id: 'st_4', key: 'S4', name: '路演赛段' }],
+    pointsIncludeUnpublishedStages: true,
+    rows: [{ teamId: 't_a', teamName: 'A队', rank: 1, total: 90, points: 10, tier: 'A' }],
+  });
+  assert.ok(!html.includes('预估分'), 'A 榜是单赛段口径，不该出现滚动榜的预估分标注');
+});
+
+test('榜单渲染并列名次与积分；队名必须转义', () => {  const html = leaderboardHtml({
     scope: 'rank', warnings: [],
     rows: [
       { teamId: 't_a', teamName: 'A队', rank: 1, total: 90, points: 10, tier: 'A', tiedWith: ['t_b'] },

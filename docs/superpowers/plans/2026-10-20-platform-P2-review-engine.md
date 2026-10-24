@@ -9525,12 +9525,26 @@ export function registerReviewRoutes(router) {
 
 `platform/rules/scoring-initial.json`（在 `minJudgesForTrim` 之后、`dimensions` 之前插入）：
 
-```json
+```javascript
+{
+  "id": "scoring-initial",
+  "version": "2026-10-26",
+  "conflictRef": "C-01",
+  "source": "S7 §2.1 初赛权重表 + §3.1 评分公式",
+  "note": "初赛 wEnterprise=0.10 —— 依据权重表合计正好 100% 反推，见 rule-decisions.md C-01；fallback=global 依据 C-05 裁决（S7 §3.1 原文：样本数<5 退回全局均值方差）。⚠️ **M0-3（2026-10-26）首届口径调整（见 rule-decisions.md C-07，待组委会确认）**：① normalizationStrategy 由 zscore 改为 **trimmed**（截尾均值做中心估计）—— zscore 需要标准差做尺度，样本少时尺度本身不稳；② minSamplesForJudgeNormalization 由 5 降为 **3** —— 样本数 = 该评委在本赛段评过的**队伍数**，4 队试赛最多 4 ⇒ 门槛 5 ⇒ **归一化永远走全局回退** ⇒ 「降级」变成常态路径（C-05 的结构性张力在首届的具体表现）；③ judgePool.minJudgesPerDimension 由 7 降为 **3**（S7 §3.4 R-JDG-10 的全文赛制值是 7）—— 首届 4 队试赛凑不齐 7 名评委 ⇒ 每个赛段的评委池都判不合规 ⇒ 同样「降级成常态」。⚠️ 三个数都只是**配置值**，恢复全文赛制口径只需改这里三行，代码不硬编码任何阈值。",
+  "wEnterprise": 0.10,
+  "normalizationStrategy": "trimmed",
+  "minSamplesForJudgeNormalization": 3,
+  "minSamplesScope": "judge_ratings_count",
+  "fallback": "global",
+  "trimOutliers": true,
+  "minJudgesForTrim": 5,
+  "trimPolicy": "threshold",
   "trimmedIterations": 20,
   "bayesPriorStrength": 5,
   "selfEvalThreshold": 10,
   "judgePool": {
-    "minJudgesPerDimension": 7,
+    "minJudgesPerDimension": 3,
     "minEnterpriseSeatShare": 0.30,
     "maxExpertSeatShare": 0.50,
     "votingSeats": ["judge", "enterprise"],
@@ -9540,16 +9554,39 @@ export function registerReviewRoutes(router) {
     "judgeDimension": "track_fit",
     "label": "需求真实性的公开证据"
   },
+  "dimensions": [
+    { "key": "track_fit",     "name": "赛题契合度", "weight": 0.10, "seat": "judge" },
+    { "key": "innovation",    "name": "创新性",     "weight": 0.20, "seat": "judge" },
+    { "key": "feasibility",   "name": "技术可行性", "weight": 0.20, "seat": "judge" },
+    { "key": "completeness",  "name": "完成度",     "weight": 0.25, "seat": "judge" },
+    { "key": "enterprise",    "name": "企业确认",   "weight": 0.10, "seat": "enterprise" },
+    { "key": "collaboration", "name": "团队协作",   "weight": 0.15, "seat": "judge" }
+  ]
+}
 ```
 
 `platform/rules/scoring-final.json`（同位置插入；决赛下限 ≥9，R-JDG-10）：
 
-```json
+```javascript
+{
+  "id": "scoring-final",
+  "version": "2026-10-26",
+  "conflictRef": "C-04",
+  "source": "S7 §2.2 决赛权重表 + §3.1 评分公式",
+  "note": "完成度以 §2.2 权重表的 20% 为准；S7 §6 的「25%→15%」是历史叙述章节、不具规则效力（rule-decisions.md C-04）。fallback=global 依据 C-05 裁决。⚠️ **M0-3（2026-10-26）首届口径调整（见 rule-decisions.md C-07，待组委会确认）**：① normalizationStrategy 由 zscore 改为 **trimmed**；② minSamplesForJudgeNormalization 由 5 降为 **3**（样本数 = 评委评过的队伍数，4 队试赛最多 4 ⇒ 门槛 5 ⇒ 归一化永远走全局回退 ⇒ 降级成常态）；③ judgePool.minJudgesPerDimension 由 9 降为 **3**（S7 §3.4 R-JDG-10 的全文赛制值是 9）—— 首届凑不齐 9 名评委 ⇒ 评委池每个赛段都判不合规。⚠️ 三个数都只是**配置值**，恢复全文赛制口径只需改这里三行。",
+  "wEnterprise": 0.25,
+  "normalizationStrategy": "trimmed",
+  "minSamplesForJudgeNormalization": 3,
+  "minSamplesScope": "judge_ratings_count",
+  "fallback": "global",
+  "trimOutliers": true,
+  "minJudgesForTrim": 5,
+  "trimPolicy": "threshold",
   "trimmedIterations": 20,
   "bayesPriorStrength": 5,
   "selfEvalThreshold": 10,
   "judgePool": {
-    "minJudgesPerDimension": 9,
+    "minJudgesPerDimension": 3,
     "minEnterpriseSeatShare": 0.30,
     "maxExpertSeatShare": 0.50,
     "votingSeats": ["judge", "enterprise"],
@@ -9559,6 +9596,15 @@ export function registerReviewRoutes(router) {
     "judgeDimension": "feasibility",
     "label": "需求真实性的公开证据"
   },
+  "dimensions": [
+    { "key": "enterprise",    "name": "企业确认",   "weight": 0.25, "seat": "enterprise" },
+    { "key": "innovation",    "name": "创新性",     "weight": 0.20, "seat": "judge" },
+    { "key": "feasibility",   "name": "技术可行性", "weight": 0.20, "seat": "judge" },
+    { "key": "completeness",  "name": "完成度",     "weight": 0.20, "seat": "judge" },
+    { "key": "collaboration", "name": "团队协作",   "weight": 0.10, "seat": "judge" },
+    { "key": "self_eval",     "name": "自评测",     "weight": 0.05, "seat": "self" }
+  ]
+}
 ```
 
 - [ ] **Step 8: 修改 src/config.js（新增字段 fail-fast 校验）**

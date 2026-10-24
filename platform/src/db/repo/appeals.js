@@ -4,12 +4,16 @@ import { randomUUID } from 'node:crypto';
 
 export function insertAppeal(db, {
   id = randomUUID(), subjectType, subjectId, filedBy = null, reason,
+  // ⚠ reason_kind（M0-2，迁移 010）：程序性错误类型（scoring_error / procedure_violation /
+  //    data_error）⇒ 裁决队列里要看得见「这条申诉属于哪一类错」。
+  //    ⛔ 报名类申诉可以为 NULL（选手侧前端契约不传这个字段）。
+  reasonKind = null,
   status = 'submitted', now = new Date().toISOString(),
 }) {
   db.prepare(
-    `INSERT INTO appeals (id, subject_type, subject_id, filed_by, reason, status, decided_by, decided_at, decision_note, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?)`,
-  ).run(id, subjectType, subjectId, filedBy, reason, status, now);
+    `INSERT INTO appeals (id, subject_type, subject_id, filed_by, reason, reason_kind, status, decided_by, decided_at, decision_note, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?)`,
+  ).run(id, subjectType, subjectId, filedBy, reason, reasonKind ?? null, status, now);
   return id;
 }
 

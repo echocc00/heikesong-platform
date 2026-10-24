@@ -353,7 +353,7 @@ test('POST /api/appeals 无权提交返回 403，未登录返回 401（能力点
   const { db, close, dataDir, app } = setup();
   const refs = seedRefs(db);
   const judgeToken = createSession(db, refs.judge.id).token;
-  const body = { subjectType: 'team_result', subjectId: `${refs.stage.id}:${refs.team.id}`, reason: '理由' };
+  const body = { subjectType: 'team_result', subjectId: `${refs.stage.id}:${refs.team.id}`, reason: '理由', reasonKind: 'scoring_error' };
   const denied = await callJson(app, 'POST', '/api/appeals', { token: judgeToken, body });
   assert.equal(denied.status, 403);
   const anon = await callJson(app, 'POST', '/api/appeals', { body });
@@ -376,7 +376,7 @@ test('POST /api/appeals 超限返回 429 + Retry-After（不静默丢包）', { 
       actorId: refs.admin.id, reason: 'x', idempotencyKey: key, now: NOW,
     });
   }
-  const body = { subjectType: 'team_result', subjectId: `${refs.stage.id}:${refs.team.id}`, reason: '企业确认分与事实不符' };
+  const body = { subjectType: 'team_result', subjectId: `${refs.stage.id}:${refs.team.id}`, reason: '企业确认分与事实不符', reasonKind: 'scoring_error' };
   const first = await callJson(app, 'POST', '/api/appeals', { token, body });
   assert.equal(first.status, 200);
   const second = await callJson(app, 'POST', '/api/appeals', { token, body });
@@ -406,7 +406,7 @@ test('POST /api/appeals 超限后换连接（模拟重启）仍然超限（限�
       actorId: refs.admin.id, reason: 'x', idempotencyKey: key, now: NOW,
     });
   }
-  const body = { subjectType: 'team_result', subjectId: `${refs.stage.id}:${refs.team.id}`, reason: '企业确认分与事实不符' };
+  const body = { subjectType: 'team_result', subjectId: `${refs.stage.id}:${refs.team.id}`, reason: '企业确认分与事实不符', reasonKind: 'scoring_error' };
   const first = await callJson(app, 'POST', '/api/appeals', { token, body });
   assert.equal(first.status, 200);
   close();
@@ -426,7 +426,7 @@ test('POST /api/appeals 理由为空返回 400', { skip: skipNoReviewState }, as
   const refs = seedRefs(db);
   const token = createSession(db, refs.captain.id).token;
   const res = await callJson(app, 'POST', '/api/appeals', {
-    token, body: { subjectType: 'team_result', subjectId: `${refs.stage.id}:${refs.team.id}`, reason: '' },
+    token, body: { subjectType: 'team_result', subjectId: `${refs.stage.id}:${refs.team.id}`, reason: '', reasonKind: 'scoring_error' },
   });
   assert.equal(res.status, 400);
   close();
@@ -446,7 +446,7 @@ test('POST /api/appeals/:id/decide 成立返回 recomputeRequired=true', { skip:
   }
   const filed = await callJson(app, 'POST', '/api/appeals', {
     token: captainToken,
-    body: { subjectType: 'team_result', subjectId: `${refs.stage.id}:${refs.team.id}`, reason: '企业确认分与事实不符' },
+    body: { subjectType: 'team_result', subjectId: `${refs.stage.id}:${refs.team.id}`, reason: '企业确认分与事实不符', reasonKind: 'scoring_error' },
   });
   assert.equal(filed.status, 200);
   const decided = await callJson(app, 'POST', `/api/appeals/${filed.json.id}/decide`, {
@@ -473,6 +473,7 @@ test('POST /api/appeals 同一 requestId 重复提交只生效一次，返回首
     subjectType: 'team_result',
     subjectId: `${refs.stage.id}:${refs.team.id}`,
     reason: '企业确认分与事实不符',
+    reasonKind: 'scoring_error',
     requestId: 'req-001',
   };
   const first = await callJson(app, 'POST', '/api/appeals', { token, body });
@@ -500,7 +501,7 @@ test('GET /api/appeals 申诉列表：无权返回 200 + 空集，有权返回�
   const captainToken = createSession(db, refs.captain.id).token;
   const filed = await callJson(app, 'POST', '/api/appeals', {
     token: captainToken,
-    body: { subjectType: 'team_result', subjectId: `${refs.stage.id}:${refs.team.id}`, reason: '理由' },
+    body: { subjectType: 'team_result', subjectId: `${refs.stage.id}:${refs.team.id}`, reason: '理由', reasonKind: 'scoring_error' },
   });
   assert.equal(filed.status, 200);
   const denied = await callJson(app, 'GET', '/api/appeals', { token: judgeToken });
@@ -622,7 +623,7 @@ test('Task 5 未落地时申诉接口必须 503（fail closed，不静默放行�
   const refs = seedRefs(db);
   const token = createSession(db, refs.captain.id).token;
   const res = await callJson(app, 'POST', '/api/appeals', {
-    token, body: { subjectType: 'team_result', subjectId: `${refs.stage.id}:${refs.team.id}`, reason: '理由' },
+    token, body: { subjectType: 'team_result', subjectId: `${refs.stage.id}:${refs.team.id}`, reason: '理由', reasonKind: 'scoring_error' },
   });
   assert.equal(res.status, 503);
   assert.equal(res.json.error.code, 'REVIEW_STATE_UNAVAILABLE');
@@ -653,7 +654,7 @@ test('【终审修正 M-5】503 fail closed 必须有**活体**覆盖：用「�
   const copiedApp = copied.createApp({ db, rules, webDir });
 
   const res = await callJson(copiedApp, 'POST', '/api/appeals', {
-    token, body: { subjectType: 'team_result', subjectId: `${refs.stage.id}:${refs.team.id}`, reason: '理由' },
+    token, body: { subjectType: 'team_result', subjectId: `${refs.stage.id}:${refs.team.id}`, reason: '理由', reasonKind: 'scoring_error' },
   });
   assert.equal(res.status, 503, '模块不在时必须 fail closed');
   assert.equal(res.json.error.code, 'REVIEW_STATE_UNAVAILABLE');

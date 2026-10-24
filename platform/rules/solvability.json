@@ -1,6 +1,6 @@
 {
   "id": "solvability",
-  "version": "2026-10-25",
+  "version": "2026-10-26",
   "source": "顶层文档 §3.2 六维可解性准入",
   "dimensions": [
     { "key": "problem_clarity", "label": "问题确定性", "weight": 0.30, "max": 3 },

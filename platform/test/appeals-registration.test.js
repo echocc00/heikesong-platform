@@ -484,7 +484,12 @@ test('申诉列表：无 audit:read 的人仍拿到**空集**（可见性没被�
   assert.equal(allowed.total, 1);
   assert.deepEqual(
     Object.keys(allowed.rows[0]).sort(),
-    ['createdAt', 'decidedAt', 'decidedBy', 'decisionNote', 'filedBy', 'id', 'reason', 'status', 'subjectId', 'subjectType'],
+    [
+      'createdAt', 'decidedAt', 'decidedBy', 'decisionNote', 'filedBy', 'id', 'reason',
+      // ⚠️ M0-2 新增：程序性错误类型 + SLA（slaDueAt / slaOverdue / slaHours）
+      'reasonKind', 'slaDueAt', 'slaHours', 'slaOverdue',
+      'status', 'subjectId', 'subjectType',
+    ],
     '列表行的字段名必须与正式站口径逐字一致',
   );
   assert.equal(allowed.rows[0].subjectType, 'registration');
@@ -542,7 +547,12 @@ test('演示适配器：申诉三端点齐全（列表 / 提交 / 裁决），�
   assert.equal(list.total, 1);
   assert.deepEqual(
     Object.keys(list.rows[0]).sort(),
-    ['createdAt', 'decidedAt', 'decidedBy', 'decisionNote', 'filedBy', 'id', 'reason', 'status', 'subjectId', 'subjectType'],
+    [
+      'createdAt', 'decidedAt', 'decidedBy', 'decisionNote', 'filedBy', 'id', 'reason',
+      // ⚠️ M0-2 新增：程序性错误类型 + SLA（与正式站同字段）
+      'reasonKind', 'slaDueAt', 'slaHours', 'slaOverdue',
+      'status', 'subjectId', 'subjectType',
+    ],
     '演示站的申诉行字段名必须与正式站一致（P9 教训：不能另写一份形状）',
   );
 
@@ -565,4 +575,128 @@ test('演示适配器：申诉三端点齐全（列表 / 提交 / 裁决），�
     () => api.post('/api/appeals', { subjectType: 'registration', subjectId: reg.id, reason: '  ' }),
     (e) => e.status === 400,
   );
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 七、M0-2「申诉范围」：全员可申诉 + 限程序性错误 + 72h SLA
+// ══════════════════════════════════════════════════════════════════
+// ⚠️ **红灯用例的由来**：修复前 rules/audit.json 的 appealAllowedTiers = ["D"]
+//    ⇒ 只有 D 段（低可见档）能申诉 ⇒ **A 段队伍对算分错误连门都进不了**（403）
+//    ⇒ 选手看得见自己的名次却没有任何渠道说「这个分算错了」。
+//    ⇒ M0-2 把它改成全员 + 程序性错误白名单 + 72 小时裁决时限。
+
+/** 造一条赛段结果类申诉要用的夹具：队伍 + 指定档位 + 已 FINALIZED 的赛段。 */
+function seedTeamResultWithTier(db, tier) {
+  db.prepare(
+    `INSERT INTO users (id, name, phone, password_hash, mba_status, org, is_superadmin, active, created_at)
+     VALUES ('u_captain','甲队队长','13900000988','x','other',NULL,0,1,'2026-10-20T00:00:00.000Z')`,
+  ).run();
+  db.prepare(
+    `INSERT INTO teams (id, edition_id, name, captain_id, tier, status, created_at)
+     VALUES ('t1','ed_team','甲队','u_captain',NULL,'active','2026-10-20T00:00:00.000Z')`,
+  ).run();
+  db.prepare(
+    `INSERT INTO tier_records (id, team_id, tier, milestone_count, business_signoff_count, reasons_json, computed_at, deleted_at)
+     VALUES ('tr_t1','t1',?,0,0,'[]','2026-10-20T00:00:00.000Z',NULL)`,
+  ).run(tier);
+  const steps = [
+    ['SUBMITTED', 'PENDING_REVIEW', 'k1'],
+    ['PENDING_REVIEW', 'CONFIRMED', 'k2'],
+    ['CONFIRMED', 'FINALIZED', 'k3'],
+  ];
+  for (const [from, to, key] of steps) {
+    transition({
+      db, subjectType: 'stage_result', subjectId: 'st1', from, to,
+      actorId: 'u_captain', reason: 'x', idempotencyKey: key, now: '2026-10-20T00:00:00.000Z',
+    });
+  }
+}
+
+test('★ M0-2：A 段队对算错可申诉（修复前是 403 —— 只有 D 段能进门）', () => {
+  const { db, close, dataDir, rules, committee } = setup();
+  db.prepare(
+    `INSERT INTO editions (id, name, city, starts_at, ends_at, created_at)
+     VALUES ('ed_team','届','上海','2026-10-01','2099-12-31','2026-10-20T00:00:00.000Z')`,
+  ).run();
+  seedTeamResultWithTier(db, 'A');
+  // ⚠️ 用**仓库自带规则**（rules/audit.json 的 appealAllowedTiers = 全员）
+  const appeal = fileAppeal({
+    db, subjectType: 'team_result', subjectId: 'st1:t1', filedBy: 'u_captain',
+    reason: '企业确认分与事实不符', reasonKind: 'scoring_error', now: APPEAL_NOW, rules,
+  });
+  assert.equal(appeal.subject_type, 'team_result');
+  assert.equal(appeal.reason_kind, 'scoring_error', '理由类型必须落库（裁决队列里要看得见）');
+  // 裁决队列里也要看得见理由类型与 SLA
+  const list = listAppeals({ db, filter: {}, viewer: committee, rules, now: APPEAL_NOW });
+  assert.equal(list.total, 1);
+  assert.equal(list.rows[0].reasonKind, 'scoring_error');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('★ M0-2：不声明理由类型 ⇒ 400（申诉只受理程序性错误，主观不服进不了队列）', () => {
+  const { db, close, dataDir, rules } = setup();
+  db.prepare(
+    `INSERT INTO editions (id, name, city, starts_at, ends_at, created_at)
+     VALUES ('ed_team','届','上海','2026-10-01','2099-12-31','2026-10-20T00:00:00.000Z')`,
+  ).run();
+  seedTeamResultWithTier(db, 'A');
+  assert.throws(
+    () => fileAppeal({
+      db, subjectType: 'team_result', subjectId: 'st1:t1', filedBy: 'u_captain',
+      reason: '我就是不服这个名次', now: APPEAL_NOW, rules,
+    }),
+    (e) => e.status === 400 && /reasonKind/.test(e.message),
+    '不声明理由类型必须被拒（且错误文案要说出该传什么）',
+  );
+});
+
+test('★ M0-2：理由类型不在白名单 ⇒ 400', () => {
+  const { db, close, dataDir, rules } = setup();
+  db.prepare(
+    `INSERT INTO editions (id, name, city, starts_at, ends_at, created_at)
+     VALUES ('ed_team','届','上海','2026-10-01','2099-12-31','2026-10-20T00:00:00.000Z')`,
+  ).run();
+  seedTeamResultWithTier(db, 'A');
+  assert.throws(
+    () => fileAppeal({
+      db, subjectType: 'team_result', subjectId: 'st1:t1', filedBy: 'u_captain',
+      reason: '我就是不服', reasonKind: 'i_disagree', now: APPEAL_NOW, rules,
+    }),
+    (e) => e.status === 400,
+  );
+});
+
+test('★ M0-2：72 小时 SLA —— 截止时刻 = 提交 + 72h；超期可判定', () => {
+  const { db, close, dataDir, rules, committee } = setup();
+  db.prepare(
+    `INSERT INTO editions (id, name, city, starts_at, ends_at, created_at)
+     VALUES ('ed_team','届','上海','2026-10-01','2099-12-31','2026-10-20T00:00:00.000Z')`,
+  ).run();
+  seedTeamResultWithTier(db, 'A');
+  assert.equal(rules.compliance.appeal.slaHours, 72, 'SLA 时限来自 rules/compliance.json');
+  const appeal = fileAppeal({
+    db, subjectType: 'team_result', subjectId: 'st1:t1', filedBy: 'u_captain',
+    reason: '算错了', reasonKind: 'scoring_error', now: APPEAL_NOW, rules,
+  });
+  assert.equal(appeal.slaHours, 72);
+  assert.equal(
+    appeal.slaDueAt, new Date(Date.parse(APPEAL_NOW) + 72 * 3_600_000).toISOString(),
+    '截止时刻 = 提交时刻 + 72 小时',
+  );
+  assert.equal(appeal.slaOverdue, false, '刚提交不逾期');
+  // 71 小时后：还没到截止 ⇒ 不逾期
+  const before = listAppeals({
+    db, filter: {}, viewer: committee, rules,
+    now: new Date(Date.parse(APPEAL_NOW) + 71 * 3_600_000).toISOString(),
+  });
+  assert.equal(before.rows[0].slaOverdue, false);
+  // 73 小时后：逾期 ⇒ 必须显式标出来（不许静默）
+  const after = listAppeals({
+    db, filter: {}, viewer: committee, rules,
+    now: new Date(Date.parse(APPEAL_NOW) + 73 * 3_600_000).toISOString(),
+  });
+  assert.equal(after.rows[0].slaOverdue, true, '超过 72 小时必须标为逾期');
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
 });
