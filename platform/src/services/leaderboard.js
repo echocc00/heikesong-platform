@@ -474,7 +474,9 @@ export function publishLeaderboard({ db, editionId, stageId, actorId, now, rules
   } catch (err) {
     warnings.push({
       code: 'anticheat_detection_failed',
-      message: `发榜后的反作弊检测未能完成：${String(err?.message ?? err)}（检测失败不影响已发出的榜单）`,
+      // ⚠️ 文案分层（E184）：**原始错误消息不进正文**（可能是数据库/代码错误原文）⇒ 进 detail
+      message: '发榜后的反作弊检测未能完成（检测失败不影响已发出的榜单）',
+      detail: `检测失败原因：${String(err?.message ?? err)}`,
     });
   }
 

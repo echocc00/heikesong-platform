@@ -238,7 +238,11 @@ test('追加·榜单告警按正式口径合并（计算告警 + 破同分告警
   assert.ok(lb.warnings.length > 0, '榜单必须带告警');
   assert.ok(lb.warnings.some((w) => w.source === 'computation'), '必须有计算告警');
   assert.ok(lb.warnings.some((w) => w.source === 'tiebreak'), '必须有破同分告警');
-  for (const w of lb.warnings) assert.ok(w.code, '每条告警都要有 code');
+  for (const w of lb.warnings) {
+    assert.ok(w.message, '每条告警都要有人话正文');
+    // ⛔ E184：**匿名访客**拿不到内部规则键（演示站与正式站同一把尺）
+    assert.equal(w.code, undefined, '匿名访客不得拿到内部规则键');
+  }
 });
 
 test('追加·段位榜：C 段及以上公示，D 段只给本人进度卡（可见性在 API 层过滤）', () => {

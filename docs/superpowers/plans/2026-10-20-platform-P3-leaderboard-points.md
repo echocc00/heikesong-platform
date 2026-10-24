@@ -3072,12 +3072,14 @@ test('过滤的输入输出边界：scope 兜底、空 rows、payload 其他字�
 
   // payload 的其他字段（scope / warnings 等）必须原样带出
   const kept = apply({
-    scope: 'rank', warnings: [{ code: 'x' }], editionId: 'e_1',
+    scope: 'rank', warnings: [{ code: 'x', message: '有一条降级提示' }], editionId: 'e_1',
     rows: [{ teamId: 't_a', rank: 1 }],
   }, { scope: 'rank' });
   assert.equal(kept.scope, 'rank');
   assert.equal(kept.editionId, 'e_1');
-  assert.deepEqual(kept.warnings, [{ code: 'x' }]);
+  // ⚠️ 告警**一条都不许少**（S-5 / C-05：降级不许藏）⇒ 人话正文原样带出；
+  //    但**内部规则键被裁掉**（E184：公开视角不该拿到 code）。
+  assert.deepEqual(kept.warnings, [{ message: '有一条降级提示' }]);
 });
 
 test('段位榜：段位顺序取自上下文、旁观者拿不到任何进度卡、本人卡片不含名次', () => {
@@ -3164,23 +3166,35 @@ const ENTERPRISE_NAME_KEYS = ['enterpriseName', 'enterprise_name', 'enterpriseId
 // ⚠️ **修复前是黑名单**（`['detail','teamId','teamIds','dimension']`）⇒ **新增字段默认外泄**：
 //    `compute.js` 塞进告警的 `errors`（评委池错误，**含原始 judgeId**）与 `stats`
 //    不在名单里 ⇒ **匿名访客能看到评委的真实 id**（F11）。
-//    ⇒ 改成**白名单**（fail-closed）：没有 audit:read 时**只发这三个键**，
+//    ⇒ 改成**白名单**（fail-closed）：没有 audit:read 时**只发这几个键**，
 //    新增任何内部字段都**不会**自动外泄（黑名单的老毛病正是在这里）。
-//    - `code`：机器判据 / 审计定位要靠它（**故意保留**，见 warning-wording.test.js）
 //    - `message`：人话正文
 //    - `stageName` / `stageId` / `stageKey`：告警来自**哪个赛段**（前端要渲染赛段名；
 //      滚动总榜要标明来源赛段）—— 赛段本身是公开信息（榜单本来就按赛段分段公示）
 //    - `source`：告警来源（计算 / 破同分）—— 用来区分是哪一环出的问题
-const WARNING_PUBLIC_KEYS = ['code', 'message', 'stageName', 'stageId', 'stageKey', 'source'];
+//
+// ⛔ **`code` 不在白名单里**（E184 · 2026-10-28）：
+//    `code` 是**内部规则键**（`normalization_fallback` / `R2_missing_dual_signature` 这种）
+//    ⇒ 它和 `detail` 是**同一类**东西：内部工作语言。
+//    ⚠️ **E172 当初把 `code`「故意保留」在白名单里，理由是「机器判据 / 审计靠它定位」** ——
+//       但那条理由**只对有 audit:read 的人成立**：审计定位在审计页
+//       （`/api/audit/computations/:id` 的留痕原文）与审计日志里就有 code，
+//       **不需要**把它摊给每一个匿名访客。
+//    ⚠️ E135 修的是 `[code]` **前缀**（带方括号那层），E172 修的是 `detail` **字段** ——
+//       两次都留下了「裸 code 本身」这个洞：P10 把 `[code]` 降级成小号标签后，
+//       code **仍然作为可见文本**渲染在公开榜单页上（真机截图实测）。
+//    ⇒ **界面上不渲染的，就不该发到浏览器**（「前端隐藏 = 数据已经发到浏览器 = 任何人都能看到」）
+//       ⇒ 公开响应里连 `code` 都不下发；有 audit:read 的人拿到的仍是**完整**告警（含 code 与 detail）。
+const WARNING_PUBLIC_KEYS = ['message', 'stageName', 'stageId', 'stageKey', 'source'];
 
 /**
  * 告警可见性裁剪（纯函数，⛔ 必须在 API 层裁决 —— 「前端隐藏 = 数据已经发到浏览器」）。
  *
  * 口径：
- *   - 有 `audit:read` 能力点 ⇒ 完整告警（含 `detail` 内部明细与内部标识）。
- *   - 没有（匿名访客 / 普通参与者）⇒ **只发白名单里的三个键**
- *     （`code` 机器判据 / `message` 人话正文 / `stageName` 赛段名），
- *     其余**一律不发**（`detail` 内部明细、`teamId`/`teamIds`/`dimension` 内部标识、
+ *   - 有 `audit:read` 能力点 ⇒ 完整告警（含 `code` / `detail` 内部明细与内部标识）。
+ *   - 没有（匿名访客 / 普通参与者）⇒ **只发白名单里的键**
+ *     （`message` 人话正文 / `stageName` 赛段名 / `source` 告警来源），
+ *     其余**一律不发**（`code` 内部规则键、`detail` 内部明细、`teamId`/`teamIds`/`dimension` 内部标识、
  *     `errors`/`stats` 评委池内部数据 …）。
  *     ⇒ **白名单而不是黑名单**（F11）：黑名单的默认值是「外泄」，
  *       任何**新加**的内部字段（`errors` / `stats` 就是这么漏出去的）都会自动外泄。
@@ -3277,7 +3291,7 @@ export function applyVisibility({ payload, viewer, visibilityConfig, context }) 
   out.rows = rows;
 
   // ⛔ 告警的内部明细同属「可见性」⇒ 也在这个**唯一入口**里裁掉（DP-107）。
-  //    口径与 src/services/leaderboard.js 的旧口径逐字一致：无 audit:read ⇒ 只留 code + message。
+  //    口径：无 audit:read ⇒ 只留人话正文与赛段标识（**不含 `code`** —— 它是内部规则键，E184）。
   //    ⚠️ 告警一条都不许少（S-5 / C-05）：裁的是字段，不是告警本身。
   if (Array.isArray(payload?.warnings)) {
     out.warnings = applyWarningVisibility(payload.warnings, { canAudit: ctx.canAudit === true });
@@ -3441,7 +3455,12 @@ test('★ GET /api/leaderboard/:stageId?scope=rank 返回 A 榜并把 P2 的降�
   assert.deepEqual(data.rows.map((r) => r.teamId), ['t_a', 't_b', 't_c', 't_d']);
   assert.equal(data.rows[0].rank, 1);
   assert.ok(data.warnings.length > 0);
-  assert.ok(data.warnings.some((w) => w.code === 'judge_sample_too_small'), '降级告警必须显式带上来');
+  // ⚠️ E184：公开响应里**不再下发内部规则键** ⇒ 按人话正文认这条告警
+  assert.ok(
+    data.warnings.some((w) => w.message === '本轮该维度未做评委宽严归一化（样本不足 5）'),
+    '降级告警必须显式带上来',
+  );
+  assert.ok(!res.body.includes('judge_sample_too_small'), '公开响应里不得出现内部规则键');
   close(); rmSync(dataDir, { recursive: true, force: true });
 });
 
@@ -3933,9 +3952,11 @@ test('★ 滚动总榜必须汇总各赛段的降级告警（终审 I-2：曾静
     assert.equal(res.status, 200);
     const data = JSON.parse(res.body);
     assert.equal(data.scope, 'rolling');
-    // ⚠️ 判别点：st_1 的计算快照带 judge_sample_too_small —— 修复前滚动榜 warnings 恒为 []
+    // ⚠️ 判别点：st_1 的计算快照带「本轮该维度未做评委宽严归一化」——
+    //    修复前滚动榜 warnings 恒为 []
+    //    ⚠️ E184：公开响应里**不再下发内部规则键** ⇒ 按人话正文认这条告警
     assert.ok(data.warnings.length > 0, '滚动总榜不得把降级告警静默丢掉');
-    const w = data.warnings.find((x) => x.code === 'judge_sample_too_small');
+    const w = data.warnings.find((x) => x.message === '本轮该维度未做评委宽严归一化（样本不足 5）');
     assert.ok(w, 'st_1 的降级告警必须出现在滚动总榜上');
     assert.equal(w.stageId, 'st_1', '告警要标注来源赛段');
     assert.equal(w.stageKey, 'S1', '告警要标注赛段键');
@@ -3955,6 +3976,88 @@ test('★ 段位记录的原因说明是脏数据时降级为空列表并显式�
     // 走一遍真实 HTTP：修复前这里会 500（INTERNAL）
     const res = await call(app, 'GET', '/api/teams/t_a/tier', { cookie: sessionCookie(db, 'u_cap') });
     assert.equal(res.status, 200, '脏数据不得让接口 500');
+  } finally {
+    close(); rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 第 11 批（2026-10-24 独立评审轮）：发榜链路的三个瑕疵
+//   ① B1：`awarded.corrections` 挂在**数组**上 ⇒ JSON.stringify 后恒为 undefined
+//      ⇒ 发榜审计里看不到「为什么多/扣一笔」（奖金场景要能追溯）。
+//   ② B2：滚动总榜累计了**未发榜赛段**的内存积分，与 points_ledger 流水
+//      **两个口径并存**且响应里没有任何标注。
+//   ③ C6：一次发榜把 buildStageRanking 跑了 4+ 遍（纯浪费）。
+// ══════════════════════════════════════════════════════════════════
+
+test('★ B1 发榜审计里必须能看到「差额更正」（corrections 不能被 JSON.stringify 丢掉）', () => {
+  const { db, close, dataDir } = setup();
+  try {
+    // 第一次发榜
+    publishLeaderboard({ db, editionId: 'ed_1', stageId: 'st_1', actorId: 'u_admin', now: NOW });
+    // ⚠️ 必须改到**名次**变掉才测得到：名次积分是**按任务包内名次**发的
+    //    （名次 1 → 10 分、名次 2 → 8 分）⇒ 只改分值不改名次 ⇒ 积分不变 ⇒ 没有差额。
+    //    t_c（70 分）与 t_d（60 分）同属任务包 tp_2 ⇒ 把 t_c 压到 t_d 之下
+    //    ⇒ 两者名次对调 ⇒ t_c 10→8（-2）、t_d 8→10（+2）⇒ 产生差额更正。
+    db.prepare("UPDATE stage_results SET total = 10 WHERE id = 'sr_3'").run();
+    publishLeaderboard({ db, editionId: 'ed_1', stageId: 'st_1', actorId: 'u_admin', now: NOW });
+
+    const rows = db.prepare(
+      "SELECT detail_json FROM audit_log WHERE action = 'leaderboard.publish' ORDER BY created_at ASC, rowid ASC",
+    ).all();
+    assert.equal(rows.length, 2, '两次发榜 ⇒ 两条审计');
+    // ⚠️ 关键断言：**审计落库的那份 JSON** 里必须能看到 corrections
+    //    （不是看内存里的对象 —— 内存对象是有的，丢在 JSON.stringify 上）
+    const detail = JSON.parse(rows[1].detail_json);
+    assert.ok(detail.awarded, '审计里必须有 awarded');
+    assert.ok(detail.awarded.corrections, `审计里必须有 awarded.corrections：${rows[1].detail_json}`);
+    assert.ok(Array.isArray(detail.awarded.corrections.stage), 'corrections.stage 必须是数组');
+    assert.ok(
+      detail.awarded.corrections.stage.length > 0,
+      '改了分数后重发榜必然产生差额更正 ⇒ corrections 不得为空'
+      + `：${rows[1].detail_json}`,
+    );
+    const first = detail.awarded.corrections.stage[0];
+    assert.ok(
+      Object.prototype.hasOwnProperty.call(first, 'points') && typeof first.points === 'number',
+      `每条更正必须带 points（多/扣了多少）：${JSON.stringify(first)}`,
+    );
+    assert.ok(first.teamId && first.userId, `每条更正必须指明谁：${JSON.stringify(first)}`);
+    // ⚠️ 对照组：`awarded.stage` / `awarded.mvp` **仍是数组**（既有契约不动）
+    assert.ok(Array.isArray(detail.awarded.stage), 'awarded.stage 仍必须是数组（既有契约）');
+    assert.ok(Array.isArray(detail.awarded.mvp), 'awarded.mvp 仍必须是数组（既有契约）');
+  } finally {
+    close(); rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('★ B2 滚动总榜必须标注「含未发榜赛段的预估分」（两个口径并存不许静默）', async () => {
+  const { getRollingLeaderboard } = await import('../src/services/leaderboard.js');
+  const { db, close, dataDir, rules } = setup();
+  try {
+    // ⚠️ 给路演赛段 st_r 补结果行（种子里它是空的 ⇒ 不进滚动榜 ⇒ 测不到「未发榜赛段」）
+    db.prepare("INSERT INTO stage_results (id, stage_id, team_id, rank, total, seat_p, seat_e, tied_with, points, computation_id, created_at) VALUES ('sr_lb1','st_r','t_a',1,90,90,0,0,NULL,NULL,'${NOW}'), ('sr_lb2','st_r','t_b',2,70,70,0,0,NULL,NULL,'${NOW}')").run();
+    // ① 未发榜时：st_1 / st_r 都只是「算过」，没有发榜快照
+    const before = getRollingLeaderboard({ db, editionId: 'ed_1', viewer: null, rules });
+    assert.equal(
+      before.pointsIncludeUnpublishedStages, true,
+      '存在未发榜赛段时必须标注 true（否则读者会把总榜当最终积分）',
+    );
+    const unpublishedKeys = before.unpublishedStages.map((s) => s.key).sort();
+    assert.deepEqual(
+      unpublishedKeys, ['S1', 'S4'],
+      `未发榜赛段必须逐个列出（让读者知道哪些赛段的预估分混在里面）：${JSON.stringify(before.unpublishedStages)}`,
+    );
+
+    // ② 发榜后：该赛段不再算「未发榜」
+    publishLeaderboard({ db, editionId: 'ed_1', stageId: 'st_1', actorId: 'u_admin', now: NOW });
+    const after = getRollingLeaderboard({ db, editionId: 'ed_1', viewer: null, rules });
+    const afterKeys = after.unpublishedStages.map((s) => s.key).sort();
+    assert.deepEqual(
+      afterKeys, ['S4'],
+      `发榜后该赛段必须从未发榜清单里消失：${JSON.stringify(after.unpublishedStages)}`,
+    );
+    assert.equal(after.pointsIncludeUnpublishedStages, true, '还有未发榜赛段 ⇒ 标注仍为 true');
   } finally {
     close(); rmSync(dataDir, { recursive: true, force: true });
   }
@@ -4739,7 +4842,9 @@ export function publishLeaderboard({ db, editionId, stageId, actorId, now, rules
   } catch (err) {
     warnings.push({
       code: 'anticheat_detection_failed',
-      message: `发榜后的反作弊检测未能完成：${String(err?.message ?? err)}（检测失败不影响已发出的榜单）`,
+      // ⚠️ 文案分层（E184）：**原始错误消息不进正文**（可能是数据库/代码错误原文）⇒ 进 detail
+      message: '发榜后的反作弊检测未能完成（检测失败不影响已发出的榜单）',
+      detail: `检测失败原因：${String(err?.message ?? err)}`,
     });
   }
 
@@ -5356,8 +5461,10 @@ test('★ 降级告警置顶：warnings 出现在榜单之前', () => {
     warnings: [{ code: 'judge_sample_too_small', message: '本轮该维度未做评委宽严归一化（样本不足 5）' }],
     rows: [{ teamId: 't_a', teamName: 'A队', rank: 1, total: 90, points: 10, tier: 'A' }],
   });
-  assert.ok(html.includes('judge_sample_too_small'), '告警必须渲染');
-  assert.ok(html.indexOf('judge_sample_too_small') < html.indexOf('A队'), '告警必须排在榜单之前（置顶）');
+  assert.ok(html.includes('本轮该维度未做评委宽严归一化'), '告警正文必须渲染');
+  assert.ok(html.indexOf('本轮该维度未做评委宽严归一化') < html.indexOf('A队'), '告警必须排在榜单之前（置顶）');
+  // ⛔ E184：内部规则键不许出现在页面上（它与 `detail` 同一类：内部工作语言）
+  assert.ok(!html.includes('judge_sample_too_small'), '内部规则键不许出现在页面上');
 });
 
 test('★ 滚动总榜的告警要标出是哪一段降级（多赛段来源）', () => {
@@ -5551,7 +5658,7 @@ Run: `cd platform && node --test test/leaderboard-web.test.js` → Expected: FAI
 // ⛔ 降级告警置顶：P2 计算出的 warnings 显式展示在最上方，不静默（S-5 / C-05）。
 //    ⚠️ **位置是硬契约**：测试断言「告警的字符索引 < 队名的字符索引」，
 //        所以告警块必须排在整页最前（页头之前），不能塞到表格下面。
-// ⛔ 告警正文不许出现内部工作语言：英文维度键 / 队伍 id / 评委 id / 内部原因码
+// ⛔ 告警正文不许出现内部工作语言：英文维度键 / 队伍 id / 评委 id / 内部原因码 / **内部规则键（code）**
 //    一律由后端分层（message = 人话，detail = 内部明细），前端只渲染。
 // ⚠️ 口径切换靠 URL（?scope=）而不是前端状态机 —— 刷新 / 分享链接都停在同一屏。
 // ⚠️ 转义统一走 `web/escape.js`（P0 建立，全站唯一入口）——
@@ -5609,15 +5716,24 @@ const SCOPES = {
  * 【文案分层 2026-10-23 —— 内部工作语言不许出现在公开页正文】
  *   ⛔ 原来把 `[code]`（normalization_fallback / R2_missing_dual_signature 这种
  *      内部审计键）当正文前缀直接打出来 ⇒ 每个访客都看得见内部规则键。
- *      现在：**人话 message 为主体**，code 降级成**小号等宽标签**跟在后面
- *      （`.warn__code`，title 属性做 tooltip），`detail`（内部明细）单独一行
+ *      现在：**人话 message 为主体**，`detail`（内部明细）单独一行
  *      （`.warn__detail`，更弱的颜色）。
+ *   ⛔ **E184（2026-10-28）：`code` 也不再渲染了** —— 上一版把它降级成
+ *      「小号等宽标签」（`.warn__code`）跟在正文后面，理由是「机器判据不能丢」，
+ *      但**标签仍然是可见文本** ⇒ 匿名访客照样看得见 `normalization_fallback`
+ *      与 `R2_missing_dual_signature` ⇒ 同一个洞只补了方括号那一层。
+ *      ⚠️ 这条纪律在本文件**开头就写着**（「告警正文不许出现内部工作语言：
+ *      …… 内部原因码」），实现却没做到 ⇒ 这次把 `code` 从界面上**彻底拿掉**。
+ *      审计定位不受影响：code 仍在**有 audit:read 的人的 API 响应**里，
+ *      也在审计页的留痕原文里（`/api/audit/computations/:id`）。
  *   ⚠️ 可见性在 API 层裁决：`detail` 有没有、是什么，由后端按 `audit:read` 决定
  *      （领域层唯一入口 src/domain/visibility.js 的 applyWarningVisibility，
  *      由 applyVisibility 内部调用；正式站与演示站共用同一份）⇒ 前端只「有就显示」，不自己判断。
+ *      ⚠️ 同一条纪律落到 API 层：**公开响应里连 `code` 都不下发**（E184）
+ *      ⇒ 前端就算想渲染也拿不到 ⇒ 结构上不可能再漏。
  *   ⚠️ **位置是硬契约**：告警块仍然置顶（S-5 / C-05；测试断言「告警的字符索引 < 队名的字符索引」）。
  *   ⚠️ 这一段不直接用 ui.js 的 noticeState()：它的 items 是**纯文本**（统一 escapeHtml），
- *      渲染不出「正文 + 代码标签 + 明细行」的三段结构；这里自己拼这段结构，
+ *      渲染不出「正文 + 明细行」的两段结构；这里自己拼这段结构，
  *      但沿用 notice 的 class 契约（notice / notice--warn / notice__title / notice__list）。
  */
 function warningsHtml(warnings) {
@@ -5626,13 +5742,11 @@ function warningsHtml(warnings) {
   const items = list.map((w) => {
     const stage = w?.stageName ? `【${escapeHtml(w.stageName)}】` : '';
     const msg = escapeHtml(w?.message ?? '');
-    const code = w?.code
-      ? `<span class="warn__code" title="内部规则键：${escapeHtml(w.code)}">${escapeHtml(w.code)}</span>`
-      : '';
     const detail = w?.detail
       ? `<div class="warn__detail">${escapeHtml(String(w.detail))}</div>`
       : '';
-    return `<li class="warn__item">${stage}${msg}${code ? ` ${code}` : ''}${detail}</li>`;
+    // ⛔ **不渲染 `w.code`**（E184）：内部规则键不进公开页正文。
+    return `<li class="warn__item">${stage}${msg}${detail}</li>`;
   });
   const title = `本轮降级提示（${list.length}）—— 以下维度未按标准口径计算`;
   return `<div class="notice notice--warn" role="alert">`

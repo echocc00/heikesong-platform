@@ -22,8 +22,10 @@ test('★ 降级告警置顶：warnings 出现在榜单之前', () => {
     warnings: [{ code: 'judge_sample_too_small', message: '本轮该维度未做评委宽严归一化（样本不足 5）' }],
     rows: [{ teamId: 't_a', teamName: 'A队', rank: 1, total: 90, points: 10, tier: 'A' }],
   });
-  assert.ok(html.includes('judge_sample_too_small'), '告警必须渲染');
-  assert.ok(html.indexOf('judge_sample_too_small') < html.indexOf('A队'), '告警必须排在榜单之前（置顶）');
+  assert.ok(html.includes('本轮该维度未做评委宽严归一化'), '告警正文必须渲染');
+  assert.ok(html.indexOf('本轮该维度未做评委宽严归一化') < html.indexOf('A队'), '告警必须排在榜单之前（置顶）');
+  // ⛔ E184：内部规则键不许出现在页面上（它与 `detail` 同一类：内部工作语言）
+  assert.ok(!html.includes('judge_sample_too_small'), '内部规则键不许出现在页面上');
 });
 
 test('★ 滚动总榜的告警要标出是哪一段降级（多赛段来源）', () => {

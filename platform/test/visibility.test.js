@@ -146,12 +146,14 @@ test('过滤的输入输出边界：scope 兜底、空 rows、payload 其他字�
 
   // payload 的其他字段（scope / warnings 等）必须原样带出
   const kept = apply({
-    scope: 'rank', warnings: [{ code: 'x' }], editionId: 'e_1',
+    scope: 'rank', warnings: [{ code: 'x', message: '有一条降级提示' }], editionId: 'e_1',
     rows: [{ teamId: 't_a', rank: 1 }],
   }, { scope: 'rank' });
   assert.equal(kept.scope, 'rank');
   assert.equal(kept.editionId, 'e_1');
-  assert.deepEqual(kept.warnings, [{ code: 'x' }]);
+  // ⚠️ 告警**一条都不许少**（S-5 / C-05：降级不许藏）⇒ 人话正文原样带出；
+  //    但**内部规则键被裁掉**（E184：公开视角不该拿到 code）。
+  assert.deepEqual(kept.warnings, [{ message: '有一条降级提示' }]);
 });
 
 test('段位榜：段位顺序取自上下文、旁观者拿不到任何进度卡、本人卡片不含名次', () => {

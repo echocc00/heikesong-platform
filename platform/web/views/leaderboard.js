@@ -8,7 +8,7 @@
 // ⛔ 降级告警置顶：P2 计算出的 warnings 显式展示在最上方，不静默（S-5 / C-05）。
 //    ⚠️ **位置是硬契约**：测试断言「告警的字符索引 < 队名的字符索引」，
 //        所以告警块必须排在整页最前（页头之前），不能塞到表格下面。
-// ⛔ 告警正文不许出现内部工作语言：英文维度键 / 队伍 id / 评委 id / 内部原因码
+// ⛔ 告警正文不许出现内部工作语言：英文维度键 / 队伍 id / 评委 id / 内部原因码 / **内部规则键（code）**
 //    一律由后端分层（message = 人话，detail = 内部明细），前端只渲染。
 // ⚠️ 口径切换靠 URL（?scope=）而不是前端状态机 —— 刷新 / 分享链接都停在同一屏。
 // ⚠️ 转义统一走 `web/escape.js`（P0 建立，全站唯一入口）——
@@ -66,15 +66,24 @@ const SCOPES = {
  * 【文案分层 2026-10-23 —— 内部工作语言不许出现在公开页正文】
  *   ⛔ 原来把 `[code]`（normalization_fallback / R2_missing_dual_signature 这种
  *      内部审计键）当正文前缀直接打出来 ⇒ 每个访客都看得见内部规则键。
- *      现在：**人话 message 为主体**，code 降级成**小号等宽标签**跟在后面
- *      （`.warn__code`，title 属性做 tooltip），`detail`（内部明细）单独一行
+ *      现在：**人话 message 为主体**，`detail`（内部明细）单独一行
  *      （`.warn__detail`，更弱的颜色）。
+ *   ⛔ **E184（2026-10-28）：`code` 也不再渲染了** —— 上一版把它降级成
+ *      「小号等宽标签」（`.warn__code`）跟在正文后面，理由是「机器判据不能丢」，
+ *      但**标签仍然是可见文本** ⇒ 匿名访客照样看得见 `normalization_fallback`
+ *      与 `R2_missing_dual_signature` ⇒ 同一个洞只补了方括号那一层。
+ *      ⚠️ 这条纪律在本文件**开头就写着**（「告警正文不许出现内部工作语言：
+ *      …… 内部原因码」），实现却没做到 ⇒ 这次把 `code` 从界面上**彻底拿掉**。
+ *      审计定位不受影响：code 仍在**有 audit:read 的人的 API 响应**里，
+ *      也在审计页的留痕原文里（`/api/audit/computations/:id`）。
  *   ⚠️ 可见性在 API 层裁决：`detail` 有没有、是什么，由后端按 `audit:read` 决定
  *      （领域层唯一入口 src/domain/visibility.js 的 applyWarningVisibility，
  *      由 applyVisibility 内部调用；正式站与演示站共用同一份）⇒ 前端只「有就显示」，不自己判断。
+ *      ⚠️ 同一条纪律落到 API 层：**公开响应里连 `code` 都不下发**（E184）
+ *      ⇒ 前端就算想渲染也拿不到 ⇒ 结构上不可能再漏。
  *   ⚠️ **位置是硬契约**：告警块仍然置顶（S-5 / C-05；测试断言「告警的字符索引 < 队名的字符索引」）。
  *   ⚠️ 这一段不直接用 ui.js 的 noticeState()：它的 items 是**纯文本**（统一 escapeHtml），
- *      渲染不出「正文 + 代码标签 + 明细行」的三段结构；这里自己拼这段结构，
+ *      渲染不出「正文 + 明细行」的两段结构；这里自己拼这段结构，
  *      但沿用 notice 的 class 契约（notice / notice--warn / notice__title / notice__list）。
  */
 function warningsHtml(warnings) {
@@ -83,13 +92,11 @@ function warningsHtml(warnings) {
   const items = list.map((w) => {
     const stage = w?.stageName ? `【${escapeHtml(w.stageName)}】` : '';
     const msg = escapeHtml(w?.message ?? '');
-    const code = w?.code
-      ? `<span class="warn__code" title="内部规则键：${escapeHtml(w.code)}">${escapeHtml(w.code)}</span>`
-      : '';
     const detail = w?.detail
       ? `<div class="warn__detail">${escapeHtml(String(w.detail))}</div>`
       : '';
-    return `<li class="warn__item">${stage}${msg}${code ? ` ${code}` : ''}${detail}</li>`;
+    // ⛔ **不渲染 `w.code`**（E184）：内部规则键不进公开页正文。
+    return `<li class="warn__item">${stage}${msg}${detail}</li>`;
   });
   const title = `本轮降级提示（${list.length}）—— 以下维度未按标准口径计算`;
   return `<div class="notice notice--warn" role="alert">`

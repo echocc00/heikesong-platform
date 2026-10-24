@@ -788,9 +788,14 @@ test('F11 运行时：匿名访客的榜单响应里不得泄漏评委 id（走�
       `匿名访客的榜单里泄漏了评委 id：${dumped.slice(0, 400)}`,
     );
     // 告警**一条都不许少**（裁的是字段，不是告警）
+    // ⚠️ E184：公开视角**不再下发内部规则键** ⇒ 按人话正文认这条告警
     assert.ok(
-      (lb.warnings ?? []).some((w) => w.code === 'judge_pool_invalid'),
+      (lb.warnings ?? []).some((w) => w.message === '评委池不合规（1 项）：duplicate_judge'),
       '告警本身必须保留（降级必须显式展示，不静默）',
+    );
+    assert.ok(
+      !JSON.stringify(lb).includes('judge_pool_invalid'),
+      '匿名访客的告警里不得出现内部规则键（E184）',
     );
     // 正对照：有 audit:read 的人**必须**拿到完整明细（否则就成了「把告警藏起来」）
     const admin = createUser(db, { name: '组委会', phone: '13900000083', password: 'pw' });

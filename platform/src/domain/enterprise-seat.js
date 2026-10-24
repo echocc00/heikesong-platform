@@ -169,7 +169,7 @@ export function applyEnterpriseRules({ confirmations = [], teams = [], judges = 
       score = 0;
       warnings.push({
         code: 'R_JDG14_missing_content',
-        message: '企业确认缺签字内容（R-JDG-14 要求写明解决哪个环节 / 落地时间 / 我方角色），该项按 0 分计',
+        message: '企业确认缺签字内容（应写明解决哪个环节 / 落地时间 / 我方角色），该项按 0 分计',
         detail: `队伍 ${team.teamId}（规则 R-JDG-14：签字必须有内容）`,
         teamId: team.teamId,
       });

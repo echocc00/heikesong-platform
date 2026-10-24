@@ -18,23 +18,35 @@ const ENTERPRISE_NAME_KEYS = ['enterpriseName', 'enterprise_name', 'enterpriseId
 // ⚠️ **修复前是黑名单**（`['detail','teamId','teamIds','dimension']`）⇒ **新增字段默认外泄**：
 //    `compute.js` 塞进告警的 `errors`（评委池错误，**含原始 judgeId**）与 `stats`
 //    不在名单里 ⇒ **匿名访客能看到评委的真实 id**（F11）。
-//    ⇒ 改成**白名单**（fail-closed）：没有 audit:read 时**只发这三个键**，
+//    ⇒ 改成**白名单**（fail-closed）：没有 audit:read 时**只发这几个键**，
 //    新增任何内部字段都**不会**自动外泄（黑名单的老毛病正是在这里）。
-//    - `code`：机器判据 / 审计定位要靠它（**故意保留**，见 warning-wording.test.js）
 //    - `message`：人话正文
 //    - `stageName` / `stageId` / `stageKey`：告警来自**哪个赛段**（前端要渲染赛段名；
 //      滚动总榜要标明来源赛段）—— 赛段本身是公开信息（榜单本来就按赛段分段公示）
 //    - `source`：告警来源（计算 / 破同分）—— 用来区分是哪一环出的问题
-const WARNING_PUBLIC_KEYS = ['code', 'message', 'stageName', 'stageId', 'stageKey', 'source'];
+//
+// ⛔ **`code` 不在白名单里**（E184 · 2026-10-28）：
+//    `code` 是**内部规则键**（`normalization_fallback` / `R2_missing_dual_signature` 这种）
+//    ⇒ 它和 `detail` 是**同一类**东西：内部工作语言。
+//    ⚠️ **E172 当初把 `code`「故意保留」在白名单里，理由是「机器判据 / 审计靠它定位」** ——
+//       但那条理由**只对有 audit:read 的人成立**：审计定位在审计页
+//       （`/api/audit/computations/:id` 的留痕原文）与审计日志里就有 code，
+//       **不需要**把它摊给每一个匿名访客。
+//    ⚠️ E135 修的是 `[code]` **前缀**（带方括号那层），E172 修的是 `detail` **字段** ——
+//       两次都留下了「裸 code 本身」这个洞：P10 把 `[code]` 降级成小号标签后，
+//       code **仍然作为可见文本**渲染在公开榜单页上（真机截图实测）。
+//    ⇒ **界面上不渲染的，就不该发到浏览器**（「前端隐藏 = 数据已经发到浏览器 = 任何人都能看到」）
+//       ⇒ 公开响应里连 `code` 都不下发；有 audit:read 的人拿到的仍是**完整**告警（含 code 与 detail）。
+const WARNING_PUBLIC_KEYS = ['message', 'stageName', 'stageId', 'stageKey', 'source'];
 
 /**
  * 告警可见性裁剪（纯函数，⛔ 必须在 API 层裁决 —— 「前端隐藏 = 数据已经发到浏览器」）。
  *
  * 口径：
- *   - 有 `audit:read` 能力点 ⇒ 完整告警（含 `detail` 内部明细与内部标识）。
- *   - 没有（匿名访客 / 普通参与者）⇒ **只发白名单里的三个键**
- *     （`code` 机器判据 / `message` 人话正文 / `stageName` 赛段名），
- *     其余**一律不发**（`detail` 内部明细、`teamId`/`teamIds`/`dimension` 内部标识、
+ *   - 有 `audit:read` 能力点 ⇒ 完整告警（含 `code` / `detail` 内部明细与内部标识）。
+ *   - 没有（匿名访客 / 普通参与者）⇒ **只发白名单里的键**
+ *     （`message` 人话正文 / `stageName` 赛段名 / `source` 告警来源），
+ *     其余**一律不发**（`code` 内部规则键、`detail` 内部明细、`teamId`/`teamIds`/`dimension` 内部标识、
  *     `errors`/`stats` 评委池内部数据 …）。
  *     ⇒ **白名单而不是黑名单**（F11）：黑名单的默认值是「外泄」，
  *       任何**新加**的内部字段（`errors` / `stats` 就是这么漏出去的）都会自动外泄。
@@ -131,7 +143,7 @@ export function applyVisibility({ payload, viewer, visibilityConfig, context }) 
   out.rows = rows;
 
   // ⛔ 告警的内部明细同属「可见性」⇒ 也在这个**唯一入口**里裁掉（DP-107）。
-  //    口径与 src/services/leaderboard.js 的旧口径逐字一致：无 audit:read ⇒ 只留 code + message。
+  //    口径：无 audit:read ⇒ 只留人话正文与赛段标识（**不含 `code`** —— 它是内部规则键，E184）。
   //    ⚠️ 告警一条都不许少（S-5 / C-05）：裁的是字段，不是告警本身。
   if (Array.isArray(payload?.warnings)) {
     out.warnings = applyWarningVisibility(payload.warnings, { canAudit: ctx.canAudit === true });

@@ -1639,17 +1639,15 @@ input[type="radio"] {
   .card, .panel, .table-wrap { border-color: #ccc; box-shadow: none; }
 }
 
-/* ── 降级告警的两层文案（2026-10-23）────────────────────────────────────
+/* ── 降级告警的文案分层（2026-10-23；2026-10-28 E184 去掉 .warn__code）─────────
  * ⚠️ **只经 token**（不写面色值）；**零外阴影**（卡片靠 1px 边框分层）。
- *   .warn__code   = 内部规则键的小号等宽标签（跟在人话正文后面，不当正文读）
  *   .warn__detail = 内部明细行（更弱的颜色，单独一行）
+ * ⛔ **`.warn__code` 已删除（E184）**：内部规则键（normalization_fallback 这种）
+ *    曾经在页面上渲染成「小号等宽标签」⇒ 仍是**可见文本** ⇒ 匿名访客照样看得见
+ *    ⇒ 内部语言不许出现在公开页正文（这条纪律在 leaderboard.js 开头就写着）。
+ *    ⇒ 现在界面上只剩人话正文 + 内部明细行（后者只有 audit:read 的人拿得到）。
+ *    ⚠️ 别「顺手加回来」：code 属于**数据层**（API 响应 / 审计留痕原文），不属于界面。
  */
-.warn__code {
-  margin-left: var(--sp-1); padding: 0 var(--sp-1);
-  border: 1px solid var(--border); border-radius: var(--r-sm);
-  background: var(--surface-sunken); color: var(--fg-muted);
-  font-family: var(--mono); font-size: var(--fs-xs); white-space: nowrap;
-}
 .warn__detail {
   margin-top: var(--sp-1); color: var(--fg-subtle); font-size: var(--fs-xs);
 }

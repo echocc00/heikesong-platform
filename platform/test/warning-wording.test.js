@@ -6,7 +6,16 @@
 //     公开端点的内部明细由**后端**裁剪，前端不许自己判断权限。
 //   - 文案分层（2026-10-23）：`message` 只给人读（禁止英文维度键 / 队伍 id /
 //     评委 id / 内部原因码 / 浮点噪声），`detail` 是内部明细（只给 audit:read 的人看），
-//     `code` 保留（审计与机器判据要用），前端不再把它当正文渲染。
+//     `code` 是**内部规则键**（2026-10-28 E184 起，**公开响应与公开界面都不许出现**）。
+//
+// ⚠️ **E184（2026-10-28）：本文件有三处断言被改写** —— 不是「改测试迁就实现」，
+//    是**旧断言把错的契约钉成了规格**：
+//    旧断言①「`html.includes('normalization_fallback')` 必须为 true」
+//    旧断言②「`code` 必须保留在公开响应里」
+//    旧断言③「`warn__code` 标签照常渲染」
+//    ⇒ 三条都在说「内部规则键必须出现在公开页 / 公开响应里」⇒ 那是**缺陷本身**，不是规格。
+//    ⇒ 新断言更强：不是「这几个码不许出现」，而是「**领域层产出的每一个码都不许出现**」
+//      （清单从源码实时抽 ⇒ 新加的码自动进清单 ⇒ 漏一个就红）。
 //
 // ⚠️ 全部是**行为断言**：断言真实返回值（领域层输出 / HTTP 响应体 / 渲染出的 HTML），
 //    不是「源码里有某个字符串」—— 那种断言会被无关代码顶替。
@@ -256,30 +265,40 @@ test('★ 公开端点（滚动总榜 / 赛段榜）：匿名与普通用户拿�
   }
 });
 
-test('★ 公开端点：告警的 code 与 message 一条不少、一条不改（裁剪只裁内部明细）', async () => {
+test('★ 公开端点：人话正文一条不少、一条不改；内部规则键（code）一个都不许下发', async () => {
   const { db, close, dataDir, app } = setup();
   try {
     const res = await callJson(app, 'GET', '/api/leaderboard/rolling?editionId=ed_1');
     assert.equal(res.status, 200);
     assert.deepEqual(
-      res.json.warnings.map((w) => w.code),
-      SNAPSHOT_WARNINGS.map((w) => w.code),
-      '告警的条数与顺序必须与快照一致（不许为了好看把告警藏了）',
-    );
-    assert.deepEqual(
       res.json.warnings.map((w) => w.message),
       SNAPSHOT_WARNINGS.map((w) => w.message),
-      '人话正文必须原样透出',
+      '人话正文必须原样透出（一条不少、一条不改）',
     );
+    // ⛔ **E184（2026-10-28）：公开响应里不许再下发 `code`** ——
+    //    `code` 是**内部规则键**（normalization_fallback / R2_missing_dual_signature 这种），
+    //    与 `detail` 同一类（内部工作语言）。
+    //    ⚠️ E172 当初把 `code`「故意保留」的理由是「机器判据 / 审计靠它定位」，
+    //    但那条理由**只对有 audit:read 的人成立** ⇒ 审计定位在审计页与留痕原文里就够。
+    //    ⇒ 界面上不渲染的，就不该发到浏览器（「前端隐藏 = 数据已经发到浏览器」）。
+    for (const w of res.json.warnings) {
+      assert.equal(w.code, undefined, `公开响应里不得下发内部规则键（${w.code}）`);
+    }
+    assert.ok(!res.text.includes('normalization_fallback'), '响应体里不许出现内部规则键');
     // 内部标识字段对没权限的人也不下发（前端不渲染 ⇒ 不该发出去）
     for (const w of res.json.warnings) {
       assert.equal(w.teamId, undefined, '公开响应里不得下发队伍 id');
       assert.equal(w.dimension, undefined, '公开响应里不得下发英文维度键');
     }
-    // 有权限的人拿得到内部标识
+    // 有权限的人拿得到全部内部信息（审计定位不受影响）
     const auditor = await callJson(app, 'GET', '/api/leaderboard/rolling?editionId=ed_1', {
       token: sessionToken(db, 'u_auditor'),
     });
+    assert.deepEqual(
+      auditor.json.warnings.map((w) => w.code),
+      SNAPSHOT_WARNINGS.map((w) => w.code),
+      '审计员必须拿得到全部 code（审计定位靠它）',
+    );
     assert.equal(auditor.json.warnings[1].teamId, 't_a', '审计员应拿到队伍 id');
     assert.equal(auditor.json.warnings[1].dimension, 'self_eval', '审计员应拿到维度键');
   } finally {
@@ -292,7 +311,7 @@ test('★ 公开端点：告警的 code 与 message 一条不少、一条不改�
 // 三、前端渲染：code 降级成小号标签，detail 单独成行
 // ══════════════════════════════════════════════════════════════════
 
-test('★ 前端渲染：code 不再以 [code] 当正文前缀，detail 单独成行', () => {
+test('★ 前端渲染：内部规则键（code）完全不渲染，detail 单独成行', () => {
   const html = leaderboardHtml({
     scope: 'rolling',
     warnings: [{
@@ -305,9 +324,11 @@ test('★ 前端渲染：code 不再以 [code] 当正文前缀，detail 单独�
   });
   // ⛔ code 不得再当正文前缀
   assert.ok(!html.includes('[normalization_fallback]'), 'code 不得再以 [code] 形式出现在正文');
-  // ✅ code 仍然出现，但降级成小号标签（机器判据不能丢）
-  assert.ok(html.includes('warn__code'), 'code 必须渲染成小号标签');
-  assert.ok(html.includes('normalization_fallback'), 'code 的内容必须渲染出来');
+  // ⛔ **E184：code 一点都不许渲染** —— 上一版把它降级成「小号等宽标签」
+  //    （`warn__code`）跟在正文后面，理由是「机器判据不能丢」，
+  //    但**标签仍然是可见文本** ⇒ 匿名访客照样看得见 `normalization_fallback`。
+  assert.ok(!html.includes('warn__code'), '内部规则键不许渲染成任何标签');
+  assert.ok(!html.includes('normalization_fallback'), '内部规则键不许出现在页面上');
   // ✅ detail 单独成行
   assert.ok(html.includes('warn__detail'), 'detail 必须单独成行');
   assert.ok(/<div class="warn__detail">[^<]+<\/div>/.test(html), 'detail 必须是独立的块级行');
@@ -323,7 +344,7 @@ test('★ 前端渲染：没有 detail 时不渲染明细行（后端裁剪掉�
     rows: [{ teamId: 't_a', teamName: 'A队', rank: 1, total: 90, points: 10, tier: 'A' }],
   });
   assert.ok(!html.includes('warn__detail'), '没有 detail 时不许留空的明细行');
-  assert.ok(html.includes('warn__code'), 'code 标签照常渲染');
+  assert.ok(!html.includes('R2_missing_dual_signature'), '内部规则键不许渲染');
   assert.ok(html.includes('企业确认缺双签'), '人话正文照常渲染');
 });
 
@@ -352,18 +373,17 @@ test('★ 领域层唯一入口 applyVisibility：没有 audit:read ⇒ 裁掉�
     assert.equal(w.teamId, undefined, `队伍 id 必须被裁掉（${w.code}）`);
     assert.equal(w.teamIds, undefined, `队伍 id 列表必须被裁掉（${w.code}）`);
     assert.equal(w.dimension, undefined, `英文维度键必须被裁掉（${w.code}）`);
-    assert.ok(w.code, 'code 必须保留（机器判据 / 审计靠它定位）');
+    // ⛔ **E184**：内部规则键（code）也必须被裁掉（它是内部工作语言，不是公开信息）
+    assert.equal(w.code, undefined, `内部规则键必须被裁掉（${w.code}）`);
     assert.ok(w.message, 'message 必须保留（人话正文）');
   }
   const dumped = JSON.stringify(out.warnings);
   assert.ok(!dumped.includes('judge_sample_too_small'), '告警里不许出现内部原因码');
   assert.ok(!dumped.includes('t_a'), '告警里不许出现队伍 id');
-  // ⚠️ `code`（normalization_fallback 这种机器判据）**故意保留** —— 审计要靠它定位，
-  //    它不是内部明细（DP-107）。这里显式钉住，避免后人把 code 也裁掉。
-  assert.ok(dumped.includes('normalization_fallback'), 'code 必须保留（机器判据）');
+  assert.ok(!dumped.includes('normalization_fallback'), '告警里不许出现内部规则键');
 });
 
-test('★ 领域层唯一入口 applyVisibility：canAudit ⇒ 内部明细完整可见', () => {
+test('★ 领域层唯一入口 applyVisibility：canAudit ⇒ 内部明细与内部规则键完整可见', () => {
   const out = applyVisibility({
     payload: VIS_PAYLOAD,
     viewer: { id: 'u_auditor' },
@@ -373,6 +393,7 @@ test('★ 领域层唯一入口 applyVisibility：canAudit ⇒ 内部明细完�
   assert.equal(out.warnings.length, SNAPSHOT_WARNINGS.length, '告警数量不变');
   for (const [i, w] of out.warnings.entries()) {
     assert.equal(w.detail, SNAPSHOT_WARNINGS[i].detail, '审计员必须拿到 detail');
+    assert.equal(w.code, SNAPSHOT_WARNINGS[i].code, '审计员必须拿到 code（审计定位靠它）');
   }
   assert.equal(out.warnings[1].teamId, 't_a', '审计员必须拿到队伍 id');
   assert.equal(out.warnings[1].dimension, 'self_eval', '审计员必须拿到英文维度键');
@@ -410,13 +431,15 @@ test('★ 演示站与正式站同口径：匿名访客拿不到 detail，演示
     assert.equal(w.detail, undefined, `匿名访客不得拿到 detail（${w.code}）`);
     assert.equal(w.teamId, undefined, `匿名访客不得拿到队伍 id（${w.code}）`);
     assert.equal(w.dimension, undefined, `匿名访客不得拿到英文维度键（${w.code}）`);
-    assert.ok(w.code && w.message, 'code 与 message 必须保留');
+    // ⛔ **E184**：内部规则键也不许下发（演示站与正式站**同一把尺**）
+    assert.equal(w.code, undefined, `匿名访客不得拿到内部规则键（${w.code}）`);
+    assert.ok(w.message, '人话正文必须保留');
   }
   const dumped = JSON.stringify(anon.warnings);
-  // ⚠️ `code`（normalization_fallback / self_eval_written_explanation）是**故意保留**的
-  //    机器判据（DP-107），不是内部明细；内部明细是 `detail` 里那串
-  //    （评委 id + 内部原因码 / 队伍 id / 英文维度键 / 内部破同分键名）。
-  for (const marker of ['judge_sample_too_small', 'partial:', '/ 维度 ', 'tiebreak_extra', 't_alpha']) {
-    assert.ok(!dumped.includes(marker), `匿名访客不得看到内部明细「${marker}」`);
+  // ⚠️ `detail`（评委 id + 内部原因码 / 队伍 id / 英文维度键 / 内部破同分键名）
+  //    与 `code`（内部规则键）**都不许**出现在匿名访客的响应里（E184）。
+  for (const marker of ['judge_sample_too_small', 'partial:', '/ 维度 ', 'tiebreak_extra', 't_alpha',
+    'normalization_fallback', 'R2_missing_dual_signature']) {
+    assert.ok(!dumped.includes(marker), `匿名访客不得看到内部标识「${marker}」`);
   }
 });

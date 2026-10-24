@@ -122,7 +122,12 @@ test('★ GET /api/leaderboard/:stageId?scope=rank 返回 A 榜并把 P2 的降�
   assert.deepEqual(data.rows.map((r) => r.teamId), ['t_a', 't_b', 't_c', 't_d']);
   assert.equal(data.rows[0].rank, 1);
   assert.ok(data.warnings.length > 0);
-  assert.ok(data.warnings.some((w) => w.code === 'judge_sample_too_small'), '降级告警必须显式带上来');
+  // ⚠️ E184：公开响应里**不再下发内部规则键** ⇒ 按人话正文认这条告警
+  assert.ok(
+    data.warnings.some((w) => w.message === '本轮该维度未做评委宽严归一化（样本不足 5）'),
+    '降级告警必须显式带上来',
+  );
+  assert.ok(!res.body.includes('judge_sample_too_small'), '公开响应里不得出现内部规则键');
   close(); rmSync(dataDir, { recursive: true, force: true });
 });
 
@@ -614,9 +619,11 @@ test('★ 滚动总榜必须汇总各赛段的降级告警（终审 I-2：曾静
     assert.equal(res.status, 200);
     const data = JSON.parse(res.body);
     assert.equal(data.scope, 'rolling');
-    // ⚠️ 判别点：st_1 的计算快照带 judge_sample_too_small —— 修复前滚动榜 warnings 恒为 []
+    // ⚠️ 判别点：st_1 的计算快照带「本轮该维度未做评委宽严归一化」——
+    //    修复前滚动榜 warnings 恒为 []
+    //    ⚠️ E184：公开响应里**不再下发内部规则键** ⇒ 按人话正文认这条告警
     assert.ok(data.warnings.length > 0, '滚动总榜不得把降级告警静默丢掉');
-    const w = data.warnings.find((x) => x.code === 'judge_sample_too_small');
+    const w = data.warnings.find((x) => x.message === '本轮该维度未做评委宽严归一化（样本不足 5）');
     assert.ok(w, 'st_1 的降级告警必须出现在滚动总榜上');
     assert.equal(w.stageId, 'st_1', '告警要标注来源赛段');
     assert.equal(w.stageKey, 'S1', '告警要标注赛段键');

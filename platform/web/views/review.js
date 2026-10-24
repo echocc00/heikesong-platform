@@ -45,7 +45,7 @@ export function parseScore(raw) {
  *    有一题没填就发请求，服务端会整批拒（`assertScoreInRange`），评委白等一次往返。
  *
  * @param {Record<string,string>} values key = `${teamId}::${dimension}`
- * @param {Array<{teamId:string,key:string,name:string}>} cells 要打的格子
+ * @param {Array<{teamId:string,key:string,name?:string}>} cells 要打的格子
  * @returns {{items: Array<object>, errors: Array<object>}}
  */
 export function buildReviewItems(values, cells) {
@@ -55,16 +55,40 @@ export function buildReviewItems(values, cells) {
     const raw = (values ?? {})[`${cell.teamId}::${cell.key}`];
     const parsed = parseScore(raw);
     if (parsed.error) {
-      errors.push({ teamId: cell.teamId, dimension: cell.key, message: parsed.error });
+      errors.push({ teamId: cell.teamId, dimension: cell.key, dimensionName: cell.name ?? null, message: parsed.error });
       continue;
     }
     if (parsed.value === null) {
-      errors.push({ teamId: cell.teamId, dimension: cell.key, message: '还没打分' });
+      errors.push({ teamId: cell.teamId, dimension: cell.key, dimensionName: cell.name ?? null, message: '还没打分' });
       continue;
     }
     items.push({ teamId: cell.teamId, dimension: cell.key, rawScore: parsed.value });
   }
   return { items, errors };
+}
+
+/**
+ * 维度键 → 中文维度名（展示层专用，E184）。
+ * ⚠️ 找不到名字时**退到「未知维度」**，不把英文键打给人看
+ *    （内部标识不许出现在界面上 —— 与告警 `code` 同一类纪律）。
+ */
+function dimNameOf(dims, key) {
+  const hit = (dims ?? []).find((d) => d?.key === key);
+  return hit?.name || '未知维度';
+}
+
+/**
+ * 评审页的**错误提示正文**（纯函数，E184）。
+ * ⚠️ 必须是**纯函数且被生产路径调用** —— 否则「不许显示英文维度键」这条闸
+ *    就会在测试里**重写一遍拼接逻辑** ⇒ 改生产代码闸不会红 ⇒ 假绿
+ *    （变异检验 M5 实测抓到过这个洞）。
+ * @param {Array<{dimension?:string, dimensionName?:string|null, message?:string}>} errors
+ * @param {Array<{key:string,name?:string}>} dims 维度表（judgeDimensions）
+ */
+export function reviewErrorHint(errors, dims) {
+  return (errors ?? [])
+    .map((x) => `${x?.dimensionName || dimNameOf(dims, x?.dimension)}：${x?.message ?? ''}`)
+    .join('；');
 }
 
 /** 幂等键：每次提交生成一个（见 §「为什么每次点击都换 requestId」）。 */
@@ -290,7 +314,13 @@ export async function renderReview(ctx) {
       if (feedback) {
         feedback.innerHTML = errorState({
           message: `还有 ${errors.length} 格没填好`,
-          hint: errors.map((x) => `${x.dimension}：${x.message}`).join('；'),
+          // ⚠️ **E184（2026-10-28）：显示中文维度名，不显示英文维度键** ——
+          //    `feasibility` 是**内部标识**（与告警的 `code` 同一类：内部工作语言），
+          //    评委看到的是「技术可行性」而不是键名。
+          //    ⚠️ 数据层仍然保留键（`errors[].dimension` 是机器判据，提交时要用）
+          //    ⇒ **只改展示层**，不改数据形状。
+          //    找不到名字时退到「未知维度」而不是键名（宁可少说，不许把内部键打给人看）。
+          hint: reviewErrorHint(errors, dims),
         });
       }
       return;

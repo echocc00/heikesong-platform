@@ -47,6 +47,12 @@ const HARD_WARNING_CODES = new Set([
 
 /**
  * 告警分级（纯函数）。
+ * ⚠️ **E184（2026-10-28）：分级标签改成人话（`【硬降级】` / `【提示】`）** ——
+ *    原来把内部规则键当正文前缀打出来（`【normalization_fallback】……`）
+ *    ⇒ 界面上出现了内部工作语言。分级判定本身**仍然按 code 判**
+ *    （`HARD_WARNING_CODES` 是判据，不是展示物）⇒ 只是不把 code 显示出来。
+ *    ⚠️ 这条纪律与 `web/views/audit.js` 的审计页口径一致（那里用的是
+ *    `【硬降级】` / `【提示】`）⇒ 两处不再各说一套。
  * @param {Array<object>} warnings
  * @returns {{hard: string[], soft: string[]}}
  */
@@ -56,8 +62,8 @@ export function publishWarnings(warnings) {
   for (const w of Array.isArray(warnings) ? warnings : []) {
     const code = w?.code ?? '';
     const text = w?.message ?? String(w);
-    if (HARD_WARNING_CODES.has(code)) hard.push(`【${code}】${text}`);
-    else soft.push(`【${code || '提示'}】${text}`);
+    if (HARD_WARNING_CODES.has(code)) hard.push(`【硬降级】${text}`);
+    else soft.push(`【提示】${text}`);
   }
   return { hard, soft };
 }
@@ -130,8 +136,14 @@ export function publishResultHtml(result, boardTeams) {
  *    只能靠猜。P9.1 的真机复验已经踩过同一个坑（`total=0` 却显示「都有打分」）。
  *
  * ⚠️ 组委会视角的 `missing` 带 `judgeId` ⇒ 按评委分组展示；普通评委视角只有自己的缺格。
+ *
+ * ⛔ **E184（2026-10-28）：显示中文维度名，不显示英文维度键** ——
+ *    `feasibility` 是**内部标识**（与告警 `code` 同一类：内部工作语言）。
+ *    ⚠️ 名字来自**同一份 review-board**（`judgeDimensions`）⇒ 与打分表里显示的名字同源，
+ *    不会出现「打分表写中文、催评清单写英文」的两套口径。
+ *    找不到名字时退到「未知维度」而不是键名（宁可少说，不许把内部键打给人看）。
  */
-export function publishMissingHtml(reviewState, boardTeams) {
+export function publishMissingHtml(reviewState, boardTeams, judgeDimensions = []) {
   const missing = Array.isArray(reviewState?.missing) ? reviewState.missing : [];
   if (!missing.length) {
     return noticeState({
@@ -144,6 +156,10 @@ export function publishMissingHtml(reviewState, boardTeams) {
     const hit = (boardTeams ?? []).find((t) => t.id === id);
     return hit ? hit.name : id;
   };
+  const dimNameOf = (key) => {
+    const hit = (judgeDimensions ?? []).find((d) => d?.key === key);
+    return hit?.name || '未知维度';
+  };
   // 按评委分组（组委会视角才有 judgeId）
   const byJudge = new Map();
   for (const m of missing) {
@@ -153,7 +169,7 @@ export function publishMissingHtml(reviewState, boardTeams) {
   }
   const items = [...byJudge.entries()].map(([judgeId, list]) => {
     const who = judgeId === 'me' ? '我' : `评委 ${judgeId}`;
-    const cells = list.map((m) => `${nameOf(m.teamId)} · ${m.dimension ?? '—'}`);
+    const cells = list.map((m) => `${nameOf(m.teamId)} · ${dimNameOf(m.dimension)}`);
     return `${who}：还差 ${list.length} 格 —— ${cells.join('；')}`;
   });
   return noticeState({
@@ -344,7 +360,9 @@ export function publishHtml(model) {
       : noticeState({ tone: 'success', title: '本轮没有告警', items: ['归一化生效、评委池合规、无回避剔除。'] }))
     : '';
 
-  const missingBody = model.reviewState ? publishMissingHtml(model.reviewState, board.teams) : '';
+  const missingBody = model.reviewState
+    ? publishMissingHtml(model.reviewState, board.teams, board.judgeDimensions)
+    : '';
   const stateBody = publishStateHtml(model.publishState, board.teams);
 
   return head

@@ -2653,7 +2653,7 @@ export function applyEnterpriseRules({ confirmations = [], teams = [], judges = 
       score = 0;
       warnings.push({
         code: 'R_JDG14_missing_content',
-        message: '企业确认缺签字内容（R-JDG-14 要求写明解决哪个环节 / 落地时间 / 我方角色），该项按 0 分计',
+        message: '企业确认缺签字内容（应写明解决哪个环节 / 落地时间 / 我方角色），该项按 0 分计',
         detail: `队伍 ${team.teamId}（规则 R-JDG-14：签字必须有内容）`,
         teamId: team.teamId,
       });
@@ -8157,7 +8157,10 @@ export function scoreStage({
   if (!teams.length) {
     warnings.push({
       code: 'team_roster_missing',
-      message: '没有队伍名册（R1 / R4 需要任务包归属与自由命题标记），相关判定按「不适用」处理',
+      // ⚠️ 文案分层（E184）：**正文只给人话** —— 内部规则号（R1 / R4）进 detail，
+      //    不进正文（内部规则号与 `code` 同一类：内部工作语言）。
+      message: '没有队伍名册（无法判断任务包归属与自由命题标记），相关判定按「不适用」处理',
+      detail: '规则 R1 / R4 需要任务包归属与自由命题标记',
     });
   }
   const ent = applyEnterpriseRules({
@@ -8245,10 +8248,11 @@ export function scoreStage({
         const r4Label = dimensionLabel(dimensions, r4.dimension);
         warnings.push({
           code: 'R4_substitute_no_scores',
+          // ⚠️ 文案分层（E184）：正文不写内部规则号「R4」⇒ 进 detail
           message: r4Label
-            ? `自由命题组触发 R4，但替代维度「${r4Label}」上该队没有任何评委打分，企业项按 0 分计`
-            : '自由命题组触发 R4，但替代维度上该队没有任何评委打分，企业项按 0 分计',
-          detail: `队伍 ${teamId} / 替代维度 ${r4.dimension}`,
+            ? `自由命题组触发替代规则，但替代维度「${r4Label}」上该队没有任何评委打分，企业项按 0 分计`
+            : '自由命题组触发替代规则，但替代维度上该队没有任何评委打分，企业项按 0 分计',
+          detail: `队伍 ${teamId} / 替代维度 ${r4.dimension}（规则 R4：自由命题组由评委代评）`,
           teamId,
           dimension: r4.dimension,
         });
@@ -8772,7 +8776,12 @@ export function computeStage({ db, stageId, actorId, now, rules }) {
   if (!judgePool.ok) {
     result.warnings.push({
       code: 'judge_pool_invalid',
-      message: `评委池不合规（${judgePool.errors.length} 项）：${judgePool.errors.map((e) => e.code).join(', ')}`,
+      // ⚠️ 文案分层（E184）：**正文只给人话** —— 内部错误码
+      //    （duplicate_judge / unknown_seat / judge_pool_too_small 这种）
+      //    与 `code` 同一类：内部工作语言 ⇒ 进 detail（只给有 audit:read 的人看）。
+      //    ⚠️ 原因码**必须留痕**：错误明细本身在 `errors` 里（同样受可见性裁剪保护）。
+      message: `评委池不合规（${judgePool.errors.length} 项）—— 评委名单或席构成不满足本赛段的评分规则`,
+      detail: `评委池错误码：${judgePool.errors.map((e) => e.code).join(', ')}`,
       errors: judgePool.errors,
       stats: judgePool.stats,
     });
@@ -8899,7 +8908,10 @@ export function computeStage({ db, stageId, actorId, now, rules }) {
   } catch (err) {
     out.warnings.push({
       code: 'anticheat_detection_failed',
-      message: `反作弊检测未能完成：${String(err?.message ?? err)}（检测失败不影响已算出的分数）`,
+      // ⚠️ 文案分层（E184）：**原始错误消息不进正文**（可能是数据库/代码错误原文，
+      //    含表名、SQL 片段、绝对路径这类内部信息）⇒ 进 detail（受可见性裁剪保护）。
+      message: '反作弊检测未能完成（检测失败不影响已算出的分数）',
+      detail: `检测失败原因：${String(err?.message ?? err)}`,
     });
   }
 

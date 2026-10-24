@@ -212,7 +212,12 @@ export function computeStage({ db, stageId, actorId, now, rules }) {
   if (!judgePool.ok) {
     result.warnings.push({
       code: 'judge_pool_invalid',
-      message: `评委池不合规（${judgePool.errors.length} 项）：${judgePool.errors.map((e) => e.code).join(', ')}`,
+      // ⚠️ 文案分层（E184）：**正文只给人话** —— 内部错误码
+      //    （duplicate_judge / unknown_seat / judge_pool_too_small 这种）
+      //    与 `code` 同一类：内部工作语言 ⇒ 进 detail（只给有 audit:read 的人看）。
+      //    ⚠️ 原因码**必须留痕**：错误明细本身在 `errors` 里（同样受可见性裁剪保护）。
+      message: `评委池不合规（${judgePool.errors.length} 项）—— 评委名单或席构成不满足本赛段的评分规则`,
+      detail: `评委池错误码：${judgePool.errors.map((e) => e.code).join(', ')}`,
       errors: judgePool.errors,
       stats: judgePool.stats,
     });
@@ -339,7 +344,10 @@ export function computeStage({ db, stageId, actorId, now, rules }) {
   } catch (err) {
     out.warnings.push({
       code: 'anticheat_detection_failed',
-      message: `反作弊检测未能完成：${String(err?.message ?? err)}（检测失败不影响已算出的分数）`,
+      // ⚠️ 文案分层（E184）：**原始错误消息不进正文**（可能是数据库/代码错误原文，
+      //    含表名、SQL 片段、绝对路径这类内部信息）⇒ 进 detail（受可见性裁剪保护）。
+      message: '反作弊检测未能完成（检测失败不影响已算出的分数）',
+      detail: `检测失败原因：${String(err?.message ?? err)}`,
     });
   }
 
