@@ -1546,6 +1546,116 @@ test('F33 人才池读取必须按届期隔离（不带 editionId 不得返回�
   }
 });
 
+// ═══ F33b：F33 的**残留面** —— 显式传 editionId 时也必须按届期隔离 ═══
+// ⚠️ **为什么这是独立的一条**：F33 第一版只钉了「不带 editionId」的路径。
+//    显式传 editionId 时 `canReadPool` 走 `can()` 的**角色分支**
+//    （角色授权是全局的，INTERFACES.md:22）⇒ 任何持有 `pool:read` 的登录用户
+//    带上**别届**的 editionId 就能读到别届参赛者的姓名 / 单位 / 积分 / MBA 状态。
+//    ⇒ 届期隔离（S2）在显式路径上仍然是破的。
+// ⚠️ **判别性要求**：本条必须同时钉住「别届读不到」**和**「本届读得到」
+//    （只钉前者 ⇒ 实现退化成「一律拒」也能骗绿）。
+test('F33b 显式传别届 editionId 也必须读不到（届期隔离在显式路径上不能是破的）', async () => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'hks-pool-b-'));
+  const { db, close } = openDatabase({ dataDir });
+  applyMigrations(db, migrationsDir);
+  const now = new Date().toISOString();
+  try {
+    insertCapability(db, 'pool:read', '读三池');
+    const viewer = createUser(db, { name: '参赛者', phone: '13800001721', password: 'pw', mbaStatus: 'mba' });
+    // ⚠️ 授权走**角色**（captain/member/enterprise 都持有 pool:read）⇒ 角色分支全局命中
+    insertRole(db, 'member', '组员');
+    insertRoleCapability(db, 'member', 'pool:read');
+    insertUserRole(db, viewer.id, 'member');
+    db.exec(`INSERT INTO editions (id,name,city,starts_at,ends_at,created_at) VALUES ('ed_1','首届','上海','2026-01-01','2026-12-31','${now}')`);
+    db.exec(`INSERT INTO editions (id,name,city,starts_at,ends_at,created_at) VALUES ('ed_2','第二届','上海','2027-01-01','2027-12-31','${now}')`);
+    // 参赛者只报名了 ed_1
+    db.exec(`INSERT INTO registrations (id,edition_id,user_id,answers_json,dimension_scores_json,raw_score,level,level_final,status,created_at)
+             VALUES ('r_v','ed_1','${viewer.id}','{}','{}',80,'B','B','accepted','${now}')`);
+    // 本届的池行（自己）
+    db.exec(`INSERT INTO pool_talents (id,user_id,edition_id,name,org,total_points,mba_status,stages_joined,skills_json,created_at)
+             VALUES ('pt_1','${viewer.id}','ed_1','本人','某公司',10,'mba',1,'[]','${now}')`);
+    // **别届**的池行：别届的另一个人
+    const other = createUser(db, { name: '别届的人', phone: '13800001722', password: 'pw', mbaStatus: 'other' });
+    db.exec(`INSERT INTO pool_talents (id,user_id,edition_id,name,org,total_points,mba_status,stages_joined,skills_json,created_at)
+             VALUES ('pt_2','${other.id}','ed_2','别届的人','别家公司',99,'other',3,'[]','${now}')`);
+
+    const { listPoolTalents } = await import('../src/services/pools.js');
+
+    // ① 别届：必须读不到
+    const otherEdition = listPoolTalents({ db, filter: { editionId: 'ed_2' }, viewer });
+    assert.deepEqual(
+      otherEdition, [],
+      `显式传别届 editionId 却读到了 ${otherEdition.length} 行 —— 届期隔离（S2）在显式路径上是破的`
+      + `（角色授权全局命中 ⇒ can() 表达不了「他属于哪一届」）`,
+    );
+
+    // ② 对照组：本届必须仍然读得到（防「一律拒」骗绿）
+    const own = listPoolTalents({ db, filter: { editionId: 'ed_1' }, viewer });
+    assert.equal(own.length, 1, '本人报名的那一届必须仍然读得到（不能把闸修成「一律拒」）');
+    assert.equal(own[0].editionId, 'ed_1');
+  } finally {
+    close();
+  }
+});
+
+// ═══ F33c：对照组 —— 组委会可以跨届读（防止把闸修成「谁都读不到」）═══
+test('F33c 组委会（admin 角色）必须能跨届读池（闸不能修成「一律拒」）', async () => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'hks-pool-c-'));
+  const { db, close } = openDatabase({ dataDir });
+  applyMigrations(db, migrationsDir);
+  const now = new Date().toISOString();
+  try {
+    insertCapability(db, 'pool:read', '读三池');
+    const chair = createUser(db, { name: '组委会', phone: '13800001731', password: 'pw' });
+    insertRole(db, 'admin', '组委会');
+    insertRoleCapability(db, 'admin', 'pool:read');
+    insertUserRole(db, chair.id, 'admin');
+    db.exec(`INSERT INTO editions (id,name,city,starts_at,ends_at,created_at) VALUES ('ed_2','第二届','上海','2027-01-01','2027-12-31','${now}')`);
+    const someone = createUser(db, { name: '别届的人', phone: '13800001732', password: 'pw' });
+    db.exec(`INSERT INTO pool_talents (id,user_id,edition_id,name,org,total_points,mba_status,stages_joined,skills_json,created_at)
+             VALUES ('pt_2','${someone.id}','ed_2','别届的人','别家公司',99,'other',3,'[]','${now}')`);
+
+    const { listPoolTalents } = await import('../src/services/pools.js');
+    const rows = listPoolTalents({ db, filter: { editionId: 'ed_2' }, viewer: chair });
+    assert.equal(rows.length, 1, '组委会必须能跨届读池（跨届调度是组委会的职责）');
+    assert.equal(rows[0].editionId, 'ed_2');
+  } finally {
+    close();
+  }
+});
+
+// ═══ F33d：对照组 —— 企业侧（不报名，只出题）必须能读该届人才池 ═══
+// ⚠️ 这一条钉的是**业务不回归**：企业通过提交任务卡参与，**不报名**
+//    ⇒ 关联判据若只认报名，企业就永远看不到人才池（而人才池正是给企业挑人用的）。
+test('F33d 出题企业（不报名）必须能读该届人才池（关联判据不能只认报名）', async () => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'hks-pool-d-'));
+  const { db, close } = openDatabase({ dataDir });
+  applyMigrations(db, migrationsDir);
+  const now = new Date().toISOString();
+  try {
+    insertCapability(db, 'pool:read', '读三池');
+    const ent = createUser(db, { name: '出题企业', phone: '13800001741', password: 'pw' });
+    insertRole(db, 'enterprise', '企业席');
+    insertRoleCapability(db, 'enterprise', 'pool:read');
+    insertUserRole(db, ent.id, 'enterprise');
+    db.exec(`INSERT INTO editions (id,name,city,starts_at,ends_at,created_at) VALUES ('ed_2','第二届','上海','2027-01-01','2027-12-31','${now}')`);
+    // 企业在 ed_2 出了一张任务卡（**没有报名记录**）
+    db.exec(`INSERT INTO task_packages
+              (id,edition_id,enterprise_id,enterprise_name,title,pain_point,expected_delivery,acceptance_criteria,status,submitted_by,submitted_at,deleted_at)
+             VALUES ('tp_1','ed_2','${ent.id}','出题企业','题目','痛点','交付','验收','published','${ent.id}','${now}',NULL)`);
+    const someone = createUser(db, { name: '人才', phone: '13800001742', password: 'pw' });
+    db.exec(`INSERT INTO pool_talents (id,user_id,edition_id,name,org,total_points,mba_status,stages_joined,skills_json,created_at)
+             VALUES ('pt_2','${someone.id}','ed_2','人才','某公司',50,'mba',2,'[]','${now}')`);
+
+    const { listPoolTalents } = await import('../src/services/pools.js');
+    const rows = listPoolTalents({ db, filter: { editionId: 'ed_2' }, viewer: ent });
+    assert.equal(rows.length, 1, '出题企业必须能读该届人才池（企业侧不报名 ⇒ 关联判据不能只认报名）');
+    assert.equal(rows[0].editionId, 'ed_2');
+  } finally {
+    close();
+  }
+});
+
 // ══════════════════════════════════════════════════════════════════
 // 第 8 批（E174）：领域算法 4 条 —— F43 / F44 / F45 / F46
 //   F43 `scope:'tied_only'` 根本没实现（配置在说谎：改链序就能让互评变成主排序键）
@@ -2647,6 +2757,9 @@ function f9ProbeTable(fx) {
     { pattern: '/api/appeals/:id/decide', method: 'POST', path: `/api/appeals/${F9_NE}/decide`, body: { decision: 'accepted', note: '成立' } },
     { pattern: '/api/teams/:id/behavior-events', method: 'POST', path: `/api/teams/${F9_NE}/behavior-events`, body: { type: 'weekly_progress', evidence: { note: 'x' } } },
     { pattern: '/api/pools/sync', method: 'POST', path: '/api/pools/sync', body: { editionId: F9_NE } },
+    // 管理端点（2026-10-24 评审轮新增）：登录限频的人工解锁
+    // ⚠️ 探测用**普通用户**的会话 ⇒ 期望 403（无 audit:write）
+    { pattern: '/api/admin/login-unlock', method: 'POST', path: '/api/admin/login-unlock', body: { phone: F9_NE }, tag: '管理端点：解锁不存在的手机号' },
     { pattern: '/api/registrations', method: 'POST', path: '/api/registrations', body: { editionId: F9_NE, answers: {} } },
     { pattern: '/api/registrations/:id/level', method: 'POST', path: `/api/registrations/${F9_NE}/level`, body: { level: 'A' } },
     { pattern: '/api/stages/:stageId/tiebreak/rounds', method: 'POST', path: `/api/stages/${F9_NE}/tiebreak/rounds`, body: { tiedTeamIds: [F9_NE, 'other'] } },
@@ -3059,4 +3172,170 @@ test('F47c 对照组：两队同分但**没有互投**时不得报「同分互�
     close();
     rmSync(dataDir, { recursive: true, force: true });
   }
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 第 11 批（2026-10-24 独立评审轮）：评审提出的「登录限频定向 DoS」
+//
+// ⚠️⚠️ **复核结论与评审说的不一样（这是本批最重要的产出）**：
+//   评审原话：「登录限频按手机号 60s/10 次锁定，知道评委手机号的人
+//              可以在打分窗口把他锁在门外。」
+//   ⇒ **复核后判定：该后果不成立**。原因：限频判定**只在口令校验失败的分支里**
+//     执行（src/server.js 的登录路由：`if (!ok) { assertRateLimit(...); throw 401; }`）
+//     ⇒ **受害者只要输对口令，登录永远不会被挡**。
+//     ⇒ 「正确口令永远能登录」是一条**必须保住的不变量** —— 它正是对
+//        「账号被锁死」的根本防护（限频只罚失败，不罚成功）。
+//
+//   ⇒ **但真正的问题在隔壁**：限频判定发生在 **scrypt 之后**
+//     ⇒ **被限流的请求照样跑一遍 scrypt** ⇒ 限频只把 401 换成 429，
+//     **挡不住 CPU 打爆**（⇒ 这才是真实的 DoS 面：打的是**服务器**，不是账号）。
+//     ⇒ 修法：① **只读预检前置**（来源维度，判定在 scrypt 之前
+//              ⇒ 被挡请求**不跑 scrypt**）；② 补「来源」维度的独立配额；
+//             ③ 应急出口：管理员可**整体解除**登录限频（限频误伤整个出口时）。
+//
+//   ⇒ 本批用例必须钉住：**①** 正确口令永远能登录（不变量）
+//     **②** 来源被判定为攻击源后连正确口令也挡（预检前置 + fail-closed）
+//     **③** 枚举安全（存在与不存在的号在同一处触顶）
+//     **④** 管理员应急出口可用且留痕。
+// ══════════════════════════════════════════════════════════════════
+
+/** 用指定「来源 IP」打一次登录（X-Real-IP 由同机 nginx **覆盖**写入 ⇒ 可信）。 */
+async function loginFrom(base, { phone, password, ip }) {
+  return call(base, 'POST', '/api/auth/login', {
+    body: { phone, password },
+    headers: ip ? { 'X-Real-IP': ip } : {},
+  });
+}
+
+// ═══ R1：不变量 —— 账号配额被耗光后，正确口令仍必须能登录 ═══
+// ⚠️ 这是本批的**核心钉子**：它同时**证伪**评审的「把受害者锁在门外」，
+//    并**锁住**「正确口令永远能登录」这条防护。
+//    判别性：实现若改成「配额也管成功登录」，本条立刻红。
+test('R1 账号配额被耗光后，正确口令仍必须能登录（限频只罚失败、不罚成功）', async () => {
+  await withServer(async ({ base, db }) => {
+    createUser(db, { name: '评委', phone: '13800009901', password: 'right-pw' });
+    // 用**多个来源**打满该手机号的账号配额（10 次/60s）
+    for (const ip of ['10.0.3.1', '10.0.3.2', '10.0.3.3']) {
+      for (let i = 0; i < 4; i += 1) {
+        await loginFrom(base, { phone: '13800009901', password: 'wrong-pw', ip });
+      }
+    }
+    const ok = await loginFrom(base, { phone: '13800009901', password: 'right-pw', ip: '10.0.3.9' });
+    assert.equal(
+      ok.status, 200,
+      `正确口令被挡了（返回 ${ok.status}）—— 这条不变量是防「账号被锁死」的根本防护；`
+      + ' 限频必须只罚失败、不罚成功',
+    );
+  });
+});
+
+// ═══ R2：对照组 —— 正常误输不得误伤 ═══
+test('R2 正常误输几次后必须仍能登录（来源配额不能误伤正常用户）', async () => {
+  await withServer(async ({ base, db }) => {
+    createUser(db, { name: '组员', phone: '13800009902', password: 'right-pw' });
+    for (let i = 0; i < 3; i += 1) {
+      const r = await loginFrom(base, { phone: '13800009902', password: 'wrong-pw', ip: '10.0.1.1' });
+      assert.equal(r.status, 401, '口令错就是 401（⛔ 不是 429 —— 3 次误输不该触发任何配额）');
+    }
+    const ok = await loginFrom(base, { phone: '13800009902', password: 'right-pw', ip: '10.0.1.1' });
+    assert.equal(ok.status, 200, '误输 3 次后必须仍能正常登录');
+  });
+});
+
+// ═══ R3：枚举安全 —— 「账号存在」与「账号不存在」必须在同一处触顶 ═══
+// ⚠️ 这是**否决评审第二条建议**（「存在与否分开计数」）的理由的机器钉子：
+//    若分开计数，攻击者拿不存在的号试到 429、拿真实号还拿到 401 ⇒ 可枚举已注册手机号。
+test('R3 登录限频不得泄露手机号是否已注册（存在与不存在的号必须在同一处触顶）', async () => {
+  await withServer(async ({ base, db }) => {
+    createUser(db, { name: '真实用户', phone: '13800009903', password: 'right-pw' });
+
+    const first429 = async (phone, ip) => {
+      for (let i = 0; i < 40; i += 1) {
+        const r = await loginFrom(base, { phone, password: 'wrong-pw', ip });
+        if (r.status === 429) return i + 1;
+      }
+      return -1;
+    };
+    const missing = await first429('13800000000', '10.0.2.1');   // 不存在的号
+    const exists = await first429('13800009903', '10.0.2.2');   // 存在的号
+    assert.ok(missing > 0 && exists > 0, '两边都必须在某处触顶 429');
+    assert.equal(
+      missing, exists,
+      `「账号不存在」第 ${missing} 次触顶、「账号存在」第 ${exists} 次触顶 ⇒ 两者时机不同 ⇒ 可被用来枚举已注册手机号`,
+    );
+  });
+});
+
+// ═══ R4：来源维度的预检必须**前置**（判定在 scrypt 之前）═══
+// ⚠️ 这条钉的是**真问题**：原实现里限频判定在 scrypt **之后**
+//    ⇒ 被限流的请求照样跑一遍 scrypt ⇒ 挡不住 CPU 打爆。
+//    ⇒ 修后：来源被判定为攻击源 ⇒ **连正确口令也 429**（预检在前 ⇒ 不跑 scrypt）。
+//    ⚠️ 判别性：若把预检挪回 scrypt 之后，本条会红（正确口令会 200）。
+test('R4 来源被判定为攻击源后必须直接 429（预检必须前置到 scrypt 之前）', async () => {
+  await withServer(async ({ base, db }) => {
+    createUser(db, { name: '评委', phone: '13800009904', password: 'right-pw' });
+    // 把来源 10.0.4.1 打成攻击源（sliding 20/60s）
+    let got429 = false;
+    for (let i = 0; i < 30; i += 1) {
+      const r = await loginFrom(base, { phone: '13800009904', password: 'wrong-pw', ip: '10.0.4.1' });
+      if (r.status === 429) { got429 = true; break; }
+    }
+    assert.ok(got429, '来源配额必须能触发（否则来源维度没生效）');
+    // ⚠️ 连**正确口令**也必须 429 —— 这证明预检在 scrypt 之前（否则会 200）
+    const ok = await loginFrom(base, { phone: '13800009904', password: 'right-pw', ip: '10.0.4.1' });
+    assert.equal(
+      ok.status, 429,
+      `正确口令居然能登录（返回 ${ok.status}）⇒ 预检不在 scrypt 之前 ⇒ `
+      + '被限流的请求照样跑 scrypt ⇒ 挡不住 CPU 打爆',
+    );
+    assert.ok(ok.headers['retry-after'], '429 必须带 Retry-After（⛔ 不静默丢包）');
+  });
+});
+
+// ═══ R5：管理员应急出口 —— 整体解除登录限频 + 权限 + 留痕 ═══
+// ⚠️ 为什么必须有它：来源预检是 fail-closed 的 ⇒ 共享出口 IP（办公室/校园网）
+//    一旦被误判 ⇒ **整个出口的人都被挡**（含正确口令）⇒ 必须有人能立刻解除。
+test('R5 管理员可整体解除登录限频；非管理员 403、未登录 401、且必须留痕', async () => {
+  await withServer(async ({ base, db }) => {
+    const admin = createUser(db, { name: '组委会', phone: '13800009905', password: 'admin-pw' });
+    insertRole(db, 'admin', '组委会');
+    insertCapability(db, 'audit:write', '裁决复核项与申诉');
+    insertRoleCapability(db, 'admin', 'audit:write');
+    insertUserRole(db, admin.id, 'admin');
+    const member = createUser(db, { name: '组员', phone: '13800009906', password: 'member-pw' });
+    insertRole(db, 'member', '组员');
+    insertUserRole(db, member.id, 'member');
+    createUser(db, { name: '评委', phone: '13800009907', password: 'right-pw' });
+
+    // ① 把来源打成攻击源
+    for (let i = 0; i < 30; i += 1) {
+      const r = await loginFrom(base, { phone: '13800009907', password: 'wrong-pw', ip: '10.0.5.1' });
+      if (r.status === 429) break;
+    }
+    const blocked = await loginFrom(base, { phone: '13800009907', password: 'right-pw', ip: '10.0.5.1' });
+    assert.equal(blocked.status, 429, '此刻该来源应当被挡');
+
+    // ② 未登录 ⇒ 401；③ 非组委会 ⇒ 403
+    const anon = await call(base, 'POST', '/api/admin/login-unlock', { body: { all: true } });
+    assert.equal(anon.status, 401, '未登录解除限频必须 401');
+    const memberSession = createSession(db, member.id);
+    const asMember = await call(base, 'POST', '/api/admin/login-unlock', {
+      body: { all: true }, cookie: `hk_session=${memberSession.token}`,
+    });
+    assert.equal(asMember.status, 403, '非组委会不得解除限频（⛔ 否则限频等于没有）');
+
+    // ④ 组委会整体解除 ⇒ 该来源立刻恢复
+    const adminSession = createSession(db, admin.id);
+    const cleared = await call(base, 'POST', '/api/admin/login-unlock', {
+      body: { all: true }, cookie: `hk_session=${adminSession.token}`,
+    });
+    assert.equal(cleared.status, 200, '组委会必须能整体解除登录限频');
+    const after = await loginFrom(base, { phone: '13800009907', password: 'right-pw', ip: '10.0.5.1' });
+    assert.equal(after.status, 200, '解除后必须立刻能登录（应急出口的意义就在这里）');
+
+    // ⑤ 必须留痕（人工干预安全闸 ⇒ 谁、何时、解除范围）
+    const rows = db.prepare('SELECT * FROM audit_log WHERE action = ?').all('auth.login_limit_clear_all');
+    assert.equal(rows.length, 1, '解除限频必须写审计日志');
+    assert.equal(rows[0].actor_id, admin.id, '审计日志必须记下操作人');
+  });
 });

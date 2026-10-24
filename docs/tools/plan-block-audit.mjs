@@ -22,7 +22,17 @@
 //
 // 用法： node docs/tools/plan-block-audit.mjs platform
 //   node docs/tools/plan-block-audit.mjs --selftest   （自检：正则与归因是否正确）
-import { readFileSync } from 'node:fs';
+//
+// ⛔ **必须从仓库根运行**：计划文件的路径（docs/superpowers/plans/*.md）是**相对 cwd** 解析的，
+//    cwd 不对时读不到计划文件 ⇒ 本工具直接报「请从仓库根运行」并退出码 2（**不打 node 栈**）。
+//
+// 退出码：
+//   0 = 没有真漂移（C-RW = 0）
+//   1 = 有真漂移（C-RW > 0）—— 计划块必须同步到当前实现（或登记豁免）才允许发布
+//   2 = 用法错误（cwd 不是仓库根 / 平台目录不对 / 内置自检失败）
+// ⚠️ **退出码语义由本工具自己承担**（C-RW > 0 ⇒ 1），不再寄生在 CI 的 grep 逻辑里：
+//    以前本地裸跑「有真漂移也是绿的」（README 里「有红就停下」的承诺在本地不成立）。
+import { readFileSync, existsSync, statSync, writeSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -133,8 +143,40 @@ export function resolveImplPath(platformDir, rel) {
 // ⇒ 兜底用 argv[1] 比对（与同目录 `dead-service-scan.mjs` 同一套写法）⇒ 任何版本都真跑。
 const IS_MAIN = import.meta.main === true
   || (typeof process.argv[1] === 'string' && resolve(process.argv[1]) === fileURLToPath(import.meta.url));
-if (IS_MAIN) {
+
+/**
+ * 主流程（读计划、比对实现、打印清单、给出退出码）。
+ *
+ * ⚠️ 做成**函数**而不是顶层代码块，是为了能「提前 return」——
+ *    用法错误（cwd 不对）必须**只打印一行人话**然后退出码 2，
+ *    不能继续往下跑、也不能抛 node 的 ENOENT 栈。
+ */
+function runAudit() {
 const platformDir = process.argv[2] || 'platform';
+
+// ── 用法自检（先于任何读文件）────────────────────────────────────────
+// ⛔ **cwd 不对 ⇒ 一行人话错误 + 退出码 2**，不许抛 node:fs 的 ENOENT 栈
+//    （真实症状：`node ../docs/tools/plan-block-audit.mjs .` 在 platform/ 里跑 ⇒
+//     「open 'docs/superpowers/plans/2026-10-20-platform-P0-foundation.md'」的栈，
+//     用户完全看不懂是自己跑错了目录）。
+const USAGE_HINT = '请从仓库根运行：node docs/tools/plan-block-audit.mjs platform';
+function failUsage(why) {
+  // ⛔ 必须用 **writeSync 同步写** stderr：Linux 上管道里的 stderr 是**异步写**，
+  //    「异步写 + 立刻 process.exit()」会把诊断信息**截断**（CI 的 `OUT="$(node …)"`
+  //    就是管道）⇒ 报错信息必须完整落到日志里。
+  writeSync(2, `[plan-block-audit] ${why}\n[plan-block-audit] ${USAGE_HINT}\n`);
+  process.exit(2);
+}
+// ① 平台目录不对（不存在 / 不是目录 / 里面没有 src/）
+if (!existsSync(platformDir) || !statSync(platformDir).isDirectory() || !existsSync(join(platformDir, 'src'))) {
+  failUsage(`平台目录不对：${platformDir}（找不到 ${join(platformDir, 'src')}）`);
+}
+// ② 计划文件读不到 ⇒ 十有八九是 cwd 不对（计划路径是相对仓库根写的）
+const missingPlan = PLANS.find(([, p]) => !existsSync(p));
+if (missingPlan) {
+  failUsage(`读不到计划文件 ${missingPlan[1]}（计划路径按「相对仓库根」解析）`);
+}
+
 const best = new Map();  // rel → {phase, open, body, lang}
 for (const [pn, p] of PLANS) {
   const lines = readFileSync(p, 'utf8').split('\n');
@@ -238,6 +280,9 @@ best.clear();
 for (const [rel, c] of picked) best.set(rel, c);
 const counts = { A: 0, B: 0, CEXT: 0, CRW: 0, D: 0 };
 const bad = [];
+// ⚠️ C-RW 的**独立清单**：C 清单是「良性扩展 + 真重写」混在一起的，
+//    退出码只认「真重写」⇒ 必须在退出前把 C-RW 单独列出来（不能让人自己从 C 清单里挑）。
+const crw = [];
 const missing = [];
 /**
  * 行序保持率：块的行**按原顺序**能在这个文件里找到多少（贪心子序列匹配）。
@@ -281,14 +326,20 @@ for (const [rel, b] of [...best].sort()) {
   }
   counts[kind]++;
   if (kind === 'CEXT' || kind === 'CRW') {
-    bad.push(`${kind === 'CEXT' ? '良性扩展' : '真重写'}  ${rel}  ← ${b.phase} 计划第 ${b.open + 1} 行（块 ${b.body.split('\n').length} 行）`);
+    const line = `${kind === 'CEXT' ? '良性扩展' : '真重写'}  ${rel}  ← ${b.phase} 计划第 ${b.open + 1} 行（块 ${b.body.split('\n').length} 行）`;
+    bad.push(line);
+    if (kind === 'CRW') crw.push(line);
   }
   // ⛔ C-RW **必须打印失配明细**：只计数不列清单 ⇒ 「只改了一行却被判真重写」
   //    这种假阳性会静默潜伏（真实教训：P7 改一行 import ⇒ 保持率 0.043 ⇒ 看起来像整文件被重写）。
   if (kind === 'CRW' && diag) {
-    bad.push(`  └ 保持率 ${diag.rate.toFixed(3)}（${diag.kept}/${diag.total} 行）｜第一处失配：`);
-    for (const l of diag.lost.slice(0, 3)) bad.push(`     ✗ ${l.trim().slice(0, 120)}`);
-    if (diag.lost.length > 3) bad.push(`     …（另有 ${diag.lost.length - 3} 行失配）`);
+    const detail = [
+      `  └ 保持率 ${diag.rate.toFixed(3)}（${diag.kept}/${diag.total} 行）｜第一处失配：`,
+    ];
+    for (const l of diag.lost.slice(0, 3)) detail.push(`     ✗ ${l.trim().slice(0, 120)}`);
+    if (diag.lost.length > 3) detail.push(`     …（另有 ${diag.lost.length - 3} 行失配）`);
+    bad.push(...detail);
+    crw.push(...detail);
   }
   // ⛔ D 类**必须打印明细**：只计数不列清单 ⇒ 「路径被扩展名截断」这类假阳性会静默潜伏
   //    （真实教训：`rules/tiebreak.json` 被截成 `rules/tiebreak.js` ⇒ 18 个存在的文件被判 D）。
@@ -337,8 +388,31 @@ if (process.argv.includes('--selftest')) {
   if (problems.length) {
     console.error('\n⛔ 自检失败：');
     problems.forEach(p => console.error('  ' + p));
-    process.exit(2);
+    // ⛔ 不用 process.exit(2)：Linux 的管道上异步写 + 立即 exit 会**截断诊断输出**。
+    //    改用 process.exitCode ⇒ 进程自然结束、输出完整落盘。
+    process.exitCode = 2;
+  } else {
+    console.log('\n✅ 自检通过（扩展名提取无截断）');
   }
-  console.log('\n✅ 自检通过（扩展名提取无截断）');
 }
-} // ← import.meta.main 守卫闭合
+
+// ── 退出码：C-RW > 0 ⇒ 1（真漂移必须同步回计划块）────────────────────
+// ⚠️ **退出码语义由本工具自己承担**，不再寄生在 CI 的 grep 逻辑里。
+//    真实后果（修复前）：本地裸跑这个工具，**有真漂移也是绿的**（退出码 0），
+//    README 里「有红就停下」的承诺在本地根本不成立。
+//    CI 那边（ci.yml 的 plan-sync job）用 grep 从输出里抠 C-RW 计数来判失败；
+//    工具自己判之后，CI 会在**更早**的地方失败（命令本身非 0 ⇒ 步骤直接红）。
+if (process.exitCode === undefined || process.exitCode === 0) {
+  if (counts.CRW > 0) {
+    console.log('\n--- C-RW 清单（真重写 · 计划块必须同步到当前实现，或登记豁免）---');
+    crw.forEach(x => console.log('  ' + x));
+    console.error(`\n[plan-block-audit] ⛔ C-RW = ${counts.CRW} ⇒ 计划块必须同步到当前实现（或登记豁免）⇒ 退出码 1`);
+    process.exitCode = 1;
+  } else {
+    process.exitCode = 0;
+  }
+}
+} // ← runAudit 闭合
+
+// ⚠️ 主流程**只在直接运行时执行**（import 时不能去读相对路径下的计划文件）。
+if (IS_MAIN) runAudit();

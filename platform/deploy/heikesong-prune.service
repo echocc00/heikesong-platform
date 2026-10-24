@@ -1,0 +1,42 @@
+# deploy/heikesong-prune.service — 过期数据清理单元（oneshot）
+#
+# 依据：设计文档 §14.2「运维生命周期」+ 2026-10-25 评审轮 P2-7a
+#   清理两类只增不减的表：过期会话（sessions）、过期限频计数（rate_limit_events）。
+#   触发方：deploy/heikesong-prune.timer（每日一次）。
+#
+# ⚠️ **为什么清理可以与 heikesong.service 并发跑**（单写者约束的边界，刻意为之）：
+#   · 单写者闸拦的是**批量写 / 改 schema**（seed 会让规则与账号对不上；
+#     migrate 会让运行中的服务撞「no such column」）—— 那两类**必须**停服。
+#   · prune 只删**已经过期、没人再引用的行**，且是**短事务**：
+#     WAL + busy_timeout(5000) 让它与服务端的写**串行化** ⇒ 不可能写坏数据。
+#   · 反过来：若 prune 也要停服，那为了删几行过期数据而中断比赛服务 ⇒ 运维上更糟。
+#   ⇒ 详细论证见 platform/scripts/prune.js 的文件头。
+#
+# ⚠️ 占位符说明（由 deploy/install.sh 自动替换）：
+#   __APP_DIR__   程序目录（默认 /opt/heikesong/platform）
+#   __DATA_DIR__  数据目录（默认 /var/lib/heikesong/data）
+#   __RUN_USER__  运行用户（默认 heikesong）
+
+[Unit]
+Description=Heikesong Platform 过期数据清理（会话 + 限频计数）
+Documentation=file:__APP_DIR__/README.md
+After=heikesong.service
+
+[Service]
+Type=oneshot
+User=__RUN_USER__
+Group=__RUN_USER__
+WorkingDirectory=__APP_DIR__
+
+# 环境文件：PORT / DATA_DIR / NODE_ENV 等（同名变量以环境文件为准）
+EnvironmentFile=-/etc/heikesong/platform.env
+
+# 环境默认值（EnvironmentFile 里的同名变量优先）
+Environment=DATA_DIR=__DATA_DIR__
+Environment=NODE_ENV=production
+
+ExecStart=/usr/bin/env node __APP_DIR__/scripts/prune.js
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=heikesong-prune

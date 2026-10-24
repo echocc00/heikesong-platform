@@ -1,0 +1,42 @@
+# deploy/heikesong-backup.service — 定时备份单元（oneshot）
+#
+# 依据：设计文档 §14.2【决策】备份用 sqlite.backup() API（不用 cp），并且是**定时**执行的。
+#   触发方：deploy/heikesong-backup.timer（每日一次）。
+#
+# ⚠️ 为什么备份**不与** heikesong.service 冲突（单写者约束的边界）：
+#   备份走 SQLite 官方 backup API —— 它**只读**源库、不改源库，
+#   且 scripts/backup.js 走 openDatabase（带 busy_timeout=5000）⇒
+#   **可以在服务运行中执行**（scripts/backup.js 的文件头就写着这条）。
+#   ⇒ 这正是「备份要在服务还活着的时候也能做」的意义：出事时不必先停服。
+# ⛔ 单写者约束：这里【绝不】加常驻 / 多 worker / 集群启动参数 ——
+#    备份是**一次性**任务（Type=oneshot），不是第二个常驻写进程。
+#
+# ⚠️ 占位符说明（由 deploy/install.sh 自动替换）：
+#   __APP_DIR__   程序目录（默认 /opt/heikesong/platform）
+#   __DATA_DIR__  数据目录（默认 /var/lib/heikesong/data）
+#   __RUN_USER__  运行用户（默认 heikesong）
+
+[Unit]
+Description=Heikesong Platform 定时备份（sqlite.backup API · 一致性快照）
+Documentation=file:__APP_DIR__/README.md
+After=heikesong.service
+
+[Service]
+Type=oneshot
+User=__RUN_USER__
+Group=__RUN_USER__
+WorkingDirectory=__APP_DIR__
+
+# 环境文件：PORT / DATA_DIR / NODE_ENV 等（同名变量以环境文件为准）
+EnvironmentFile=-/etc/heikesong/platform.env
+
+# 环境默认值（EnvironmentFile 里的同名变量优先）
+Environment=DATA_DIR=__DATA_DIR__
+Environment=NODE_ENV=production
+
+ExecStart=/usr/bin/env node __APP_DIR__/scripts/backup.js
+
+# 备份失败必须**让人看见** ⇒ 走 journald（journalctl -u heikesong-backup -f）
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=heikesong-backup

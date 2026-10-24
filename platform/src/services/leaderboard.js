@@ -270,6 +270,12 @@ export function getRollingLeaderboard({ db, editionId, viewer = null, rules = nu
   //    口径：滚动总榜汇总**每一届赛段**的告警，并标注来源赛段（stageId / stageKey / stageName），
   //    让读者知道是哪一段降级了；前端按 stageName 渲染。
   const warnings = [];
+  // ⚠️ **口径标注（2026-10-24 评审轮）**：滚动总榜累计的是**各赛段的内存积分**
+  //    （buildStageRanking 当场算出来的），而 `points_ledger` 流水里**只有已发榜**
+  //    赛段的积分 ⇒ **未发榜赛段的预估分也被算进总榜** ⇒ 两个口径并存。
+  //    ⇒ 响应里必须**明说**（否则读榜的人会把总榜当最终积分，而发榜后数字会变）。
+  //    ⚠️ 「已发榜」的判据 = `stage_results.rank` 已回写（rank 只在发榜时写，见 F7）。
+  const unpublishedStages = [];
 
   for (const stage of stages) {
     const built = buildStageRanking({ db, stage, R });
@@ -277,6 +283,14 @@ export function getRollingLeaderboard({ db, editionId, viewer = null, rules = nu
       warnings.push({ ...w, stageId: stage.id, stageKey: stage.key, stageName: stage.name });
     }
     if (!built.results.length) continue;
+    // ⚠️ 判据 = **该赛段有没有发榜快照**（leaderboard_snapshots）。
+    //    ⛔ 不用 `stage_results.rank IS NOT NULL` 判：那列是**发榜时**回写的，
+    //    但种子数据会预置 rank ⇒ 会把没发过榜的赛段误判成「已发榜」。
+    //    ⇒ 「已发榜」的权威记录是快照（有快照 = 发过榜 = 积分已进 points_ledger）。
+    const published = repo.listSnapshotsByStage(db, stage.id).length > 0;
+    if (!published) {
+      unpublishedStages.push({ id: stage.id, key: stage.key, name: stage.name });
+    }
     for (const row of built.ranking.ordered) {
       const res = built.results.find((r) => r.team_id === row.teamId);
       const cur = totals.get(row.teamId) || {
@@ -298,6 +312,9 @@ export function getRollingLeaderboard({ db, editionId, viewer = null, rules = nu
     payload: {
       scope: 'rolling', editionId, rows, warnings,
       stages: stages.map((s) => ({ id: s.id, key: s.key, name: s.name })),
+      // ⚠️ 未发榜赛段（其预估分已计入总榜）—— 见上面的口径标注
+      unpublishedStages,
+      pointsIncludeUnpublishedStages: unpublishedStages.length > 0,
     },
     viewer,
     visibilityConfig: R.visibility,
@@ -386,9 +403,17 @@ export function publishLeaderboard({ db, editionId, stageId, actorId, now, rules
       tierUpdates.push(computeTeamTier({ db, teamId: row.team_id, now: createdAt, rules: R }));
     }
 
+    // ⚠️ 2026-10-24 评审轮：排名结果**算一次**（事务内数据不变）⇒ 往下传，
+    //    不再让 awardStagePoints / awardMvp / 反向审计各自重算一遍。
+    const stageAward = awardStagePoints({ db, editionId, stageId, rules: R, createdAt, built });
+    const mvpAward = awardMvp({ db, editionId, stageId, rules: R, createdAt, built });
+    // ⚠️ B1：corrections 提到 **awarded 对象**上（不是挂在数组上）
+    //    ⇒ `JSON.stringify` 不会丢 ⇒ 发榜审计里能看到「为什么多/扣一笔」。
+    //    ⚠️ `awarded.stage` / `awarded.mvp` **仍是数组**（既有契约不动 ⇒ 既有测试不动）。
     const awarded = {
-      stage: awardStagePoints({ db, editionId, stageId, rules: R, createdAt }),
-      mvp: awardMvp({ db, editionId, stageId, rules: R, createdAt }),
+      stage: stageAward.rows,
+      mvp: mvpAward.rows,
+      corrections: { stage: stageAward.corrections, mvp: mvpAward.corrections },
     };
 
     // ⚠️ F36：**终稿落库 ⇒ 复核状态推进到 FINALIZED**。
@@ -406,7 +431,7 @@ export function publishLeaderboard({ db, editionId, stageId, actorId, now, rules
     });
     return {
       editionId, stageId, snapshots, awarded, reviewState: reviewState.state,
-      createdAt, reverseAuditTasks: buildTopReverseAuditTasks({ db, stage, R }),
+      createdAt, reverseAuditTasks: buildTopReverseAuditTasks({ db, stage, R, built }),
     };
   });
 
@@ -463,8 +488,8 @@ export function publishLeaderboard({ db, editionId, stageId, actorId, now, rules
  *    ⇒ TOP 名单回访这件事在产品里**根本做不了**。现在发榜时一并产出。
  * ⚠️ 口径：只给**名次**与**未撤回的里程碑签字**，不代劳、不自动结案（检测 ≠ 处罚）。
  */
-function buildTopReverseAuditTasks({ db, stage, R, topN = 10 }) {
-  const built = buildStageRanking({ db, stage, R });
+function buildTopReverseAuditTasks({ db, stage, R, topN = 10, built: builtArg = null }) {
+  const built = builtArg ?? buildStageRanking({ db, stage, R });
   const results = built.ranking.ordered.map((row) => ({
     teamId: row.teamId,
     rank: row.rank,
@@ -518,8 +543,12 @@ export function getPublishState({ db, stageId, rules = null, topN = 10 }) {
  *   · **中途入队的成员**在下次发榜时补齐他应得的那份（因为他此前没有流水行）；
  *   · 队内成员之间的份额是**同额**的（该队名次积分），不按贡献分配。
  */
-function awardStagePoints({ db, editionId, stageId, rules: R, createdAt }) {
-  const built = buildStageRanking({ db, stage: repo.getStage(db, stageId), R });
+function awardStagePoints({ db, editionId, stageId, rules: R, createdAt, built: builtArg = null }) {
+  // ⚠️ 2026-10-24 评审轮：发榜链路里 buildStageRanking 被跑 **4 次**
+  //    （主调用 / awardStagePoints / awardMvp / 反向审计）⇒ 同一份数据算四遍。
+  //    事务内数据不变 ⇒ 算一次往下传即可（⚠️ 事务内**不能**看到自己写的结果，
+  //    所以复用主调用那份才是对的；这里只是省掉三次重复计算）。
+  const built = builtArg ?? buildStageRanking({ db, stage: repo.getStage(db, stageId), R });
   // 本轮该发多少：队 → 名次积分
   const desired = new Map();
   for (const row of built.ranking.ordered) {
@@ -552,8 +581,11 @@ function awardStagePoints({ db, editionId, stageId, rules: R, createdAt }) {
     }
     if (pts) awarded.push({ teamId, points: pts });
   }
-  awarded.corrections = corrections;
-  return awarded;
+  // ⚠️ **B1（2026-10-24 评审轮）：corrections 原来挂在数组上 ⇒ JSON.stringify 后恒为 undefined**
+  //    ⇒ 发榜审计里看不到「为什么多/扣一笔」（奖金场景下这是要能追溯的）。
+  //    ⇒ 改成**对象**返回：{ rows, corrections }（⛔ 不是给数组挂属性 ——
+  //    JSON.stringify 只序列化数组的**索引**元素，挂在数组上的自定义属性会被丢掉）。
+  return { rows: awarded, corrections };
 }
 
 /**
@@ -572,27 +604,32 @@ function awardStagePoints({ db, editionId, stageId, rules: R, createdAt }) {
  *    ⛔ 本届没有路演赛段、或路演赛段尚无评分结果 ⇒ **不发 MVP**
  *       （公式缺最后一个输入，不做半个公式的奖 —— 见 P3 计划「已知限制」）。
  */
-function awardMvp({ db, editionId, stageId, rules: R, createdAt }) {
+function awardMvp({ db, editionId, stageId, rules: R, createdAt, built: builtArg = null }) {
   const stages = repo.listEditionStages(db, editionId);
   const roadshowStage = stages.find((s) => s.kind === 'roadshow');
   // ① 发放时机：只有路演赛段发榜才发 MVP
-  if (!roadshowStage || roadshowStage.id !== stageId) return [];
+  if (!roadshowStage || roadshowStage.id !== stageId) return { rows: [], corrections: [] };
   const roadshowScores = repo.listStageResults(db, roadshowStage.id)
     .map((r) => ({ teamId: r.team_id, score: r.total }));
-  if (!roadshowScores.length) return [];      // 路演还没评分 → 公式的最后一个输入缺失 → 不发
+  if (!roadshowScores.length) return { rows: [], corrections: [] };   // 路演还没评分 → 公式的最后一个输入缺失 → 不发
 
   const stagePoints = [];
   const packageOf = new Map();
   for (const stage of stages) {
     if (stage.kind === 'roadshow') continue;
-    const built = buildStageRanking({ db, stage, R });
+    // ⚠️ 2026-10-24 评审轮：**当前赛段**的排名结果由发榜主调用算好并传进来
+    //    ⇒ 直接复用（省掉一次重复计算）；**其它赛段**的排名是 MVP 公式的输入
+    //    ⇒ 必须各算各的（不是冗余）。
+    const built = stage.id === stageId && builtArg
+      ? builtArg
+      : buildStageRanking({ db, stage, R });
     for (const row of built.ranking.ordered) {
       const res = built.results.find((r) => r.team_id === row.teamId);
       stagePoints.push({ teamId: row.teamId, stageId: stage.key, points: built.points[row.teamId] ?? 0 });
       packageOf.set(row.teamId, res?.task_package_id ?? null);
     }
   }
-  if (!stagePoints.length) return [];
+  if (!stagePoints.length) return { rows: [], corrections: [] };
 
   // MVP 决胜口径在 criteria.json（P3 自有），computeMvp 只认 pointsConfig.mvp → 服务层合并注入
   const mvpPointsConfig = {
@@ -655,6 +692,6 @@ function awardMvp({ db, editionId, stageId, rules: R, createdAt }) {
     }
     if (want) awarded.push({ teamId, packageId: want.packageId, points: want.points });
   }
-  awarded.corrections = corrections;
-  return awarded;
+  // ⚠️ B1：corrections 必须**对象**返回（数组挂属性 ⇒ JSON.stringify 后丢失）
+  return { rows: awarded, corrections };
 }

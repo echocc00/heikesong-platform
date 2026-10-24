@@ -640,3 +640,85 @@ test('★ 段位记录的原因说明是脏数据时降级为空列表并显式�
     close(); rmSync(dataDir, { recursive: true, force: true });
   }
 });
+
+// ══════════════════════════════════════════════════════════════════
+// 第 11 批（2026-10-24 独立评审轮）：发榜链路的三个瑕疵
+//   ① B1：`awarded.corrections` 挂在**数组**上 ⇒ JSON.stringify 后恒为 undefined
+//      ⇒ 发榜审计里看不到「为什么多/扣一笔」（奖金场景要能追溯）。
+//   ② B2：滚动总榜累计了**未发榜赛段**的内存积分，与 points_ledger 流水
+//      **两个口径并存**且响应里没有任何标注。
+//   ③ C6：一次发榜把 buildStageRanking 跑了 4+ 遍（纯浪费）。
+// ══════════════════════════════════════════════════════════════════
+
+test('★ B1 发榜审计里必须能看到「差额更正」（corrections 不能被 JSON.stringify 丢掉）', () => {
+  const { db, close, dataDir } = setup();
+  try {
+    // 第一次发榜
+    publishLeaderboard({ db, editionId: 'ed_1', stageId: 'st_1', actorId: 'u_admin', now: NOW });
+    // ⚠️ 必须改到**名次**变掉才测得到：名次积分是**按任务包内名次**发的
+    //    （名次 1 → 10 分、名次 2 → 8 分）⇒ 只改分值不改名次 ⇒ 积分不变 ⇒ 没有差额。
+    //    t_c（70 分）与 t_d（60 分）同属任务包 tp_2 ⇒ 把 t_c 压到 t_d 之下
+    //    ⇒ 两者名次对调 ⇒ t_c 10→8（-2）、t_d 8→10（+2）⇒ 产生差额更正。
+    db.prepare("UPDATE stage_results SET total = 10 WHERE id = 'sr_3'").run();
+    publishLeaderboard({ db, editionId: 'ed_1', stageId: 'st_1', actorId: 'u_admin', now: NOW });
+
+    const rows = db.prepare(
+      "SELECT detail_json FROM audit_log WHERE action = 'leaderboard.publish' ORDER BY created_at ASC, rowid ASC",
+    ).all();
+    assert.equal(rows.length, 2, '两次发榜 ⇒ 两条审计');
+    // ⚠️ 关键断言：**审计落库的那份 JSON** 里必须能看到 corrections
+    //    （不是看内存里的对象 —— 内存对象是有的，丢在 JSON.stringify 上）
+    const detail = JSON.parse(rows[1].detail_json);
+    assert.ok(detail.awarded, '审计里必须有 awarded');
+    assert.ok(detail.awarded.corrections, `审计里必须有 awarded.corrections：${rows[1].detail_json}`);
+    assert.ok(Array.isArray(detail.awarded.corrections.stage), 'corrections.stage 必须是数组');
+    assert.ok(
+      detail.awarded.corrections.stage.length > 0,
+      '改了分数后重发榜必然产生差额更正 ⇒ corrections 不得为空'
+      + `：${rows[1].detail_json}`,
+    );
+    const first = detail.awarded.corrections.stage[0];
+    assert.ok(
+      Object.prototype.hasOwnProperty.call(first, 'points') && typeof first.points === 'number',
+      `每条更正必须带 points（多/扣了多少）：${JSON.stringify(first)}`,
+    );
+    assert.ok(first.teamId && first.userId, `每条更正必须指明谁：${JSON.stringify(first)}`);
+    // ⚠️ 对照组：`awarded.stage` / `awarded.mvp` **仍是数组**（既有契约不动）
+    assert.ok(Array.isArray(detail.awarded.stage), 'awarded.stage 仍必须是数组（既有契约）');
+    assert.ok(Array.isArray(detail.awarded.mvp), 'awarded.mvp 仍必须是数组（既有契约）');
+  } finally {
+    close(); rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('★ B2 滚动总榜必须标注「含未发榜赛段的预估分」（两个口径并存不许静默）', async () => {
+  const { getRollingLeaderboard } = await import('../src/services/leaderboard.js');
+  const { db, close, dataDir, rules } = setup();
+  try {
+    // ⚠️ 给路演赛段 st_r 补结果行（种子里它是空的 ⇒ 不进滚动榜 ⇒ 测不到「未发榜赛段」）
+    db.prepare("INSERT INTO stage_results (id, stage_id, team_id, rank, total, seat_p, seat_e, tied_with, points, computation_id, created_at) VALUES ('sr_lb1','st_r','t_a',1,90,90,0,0,NULL,NULL,'${NOW}'), ('sr_lb2','st_r','t_b',2,70,70,0,0,NULL,NULL,'${NOW}')").run();
+    // ① 未发榜时：st_1 / st_r 都只是「算过」，没有发榜快照
+    const before = getRollingLeaderboard({ db, editionId: 'ed_1', viewer: null, rules });
+    assert.equal(
+      before.pointsIncludeUnpublishedStages, true,
+      '存在未发榜赛段时必须标注 true（否则读者会把总榜当最终积分）',
+    );
+    const unpublishedKeys = before.unpublishedStages.map((s) => s.key).sort();
+    assert.deepEqual(
+      unpublishedKeys, ['S1', 'S4'],
+      `未发榜赛段必须逐个列出（让读者知道哪些赛段的预估分混在里面）：${JSON.stringify(before.unpublishedStages)}`,
+    );
+
+    // ② 发榜后：该赛段不再算「未发榜」
+    publishLeaderboard({ db, editionId: 'ed_1', stageId: 'st_1', actorId: 'u_admin', now: NOW });
+    const after = getRollingLeaderboard({ db, editionId: 'ed_1', viewer: null, rules });
+    const afterKeys = after.unpublishedStages.map((s) => s.key).sort();
+    assert.deepEqual(
+      afterKeys, ['S4'],
+      `发榜后该赛段必须从未发榜清单里消失：${JSON.stringify(after.unpublishedStages)}`,
+    );
+    assert.equal(after.pointsIncludeUnpublishedStages, true, '还有未发榜赛段 ⇒ 标注仍为 true');
+  } finally {
+    close(); rmSync(dataDir, { recursive: true, force: true });
+  }
+});

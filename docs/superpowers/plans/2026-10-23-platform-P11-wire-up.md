@@ -6945,7 +6945,7 @@ test('⛔ E150 回归闸：种子跑完后 ⇒ 经 HTTP 路由，赛段列表非
 
 机器闸：服务层导出函数 ⇒ 生产必有调用方（W4）。
 
-```javascript
+```
 // docs/tools/dead-service-scan.mjs — 死服务扫描：找出「导出了、但生产代码里没有调用方」的函数
 //
 // 依据：设计文档 §8「API 设计」+ 本仓事故复盘（发榜端点漏接的那次坑）：
@@ -6960,8 +6960,10 @@ test('⛔ E150 回归闸：种子跑完后 ⇒ 经 HTTP 路由，赛段列表非
 //   即「实现了、测试也绿了、但产品路径接不上」的死代码。
 //
 // 判定口径（宁可漏报，不可误报）：
-//   · 只扫 platform/src/services/*.js 与 platform/src/db/repo/*.js 两个目录
-//     （⛔ 不扫 platform/src/domain/ —— 领域层是纯函数，调用关系不同，容易误报）。
+//   · 扫描范围（**显式登记**，不静默）：见下面的 SCAN_DIRS / SCAN_FILES。
+//     ⚠️ **没纳入扫描的目录必须在 allow.json 的 "unscanned" 段里登记理由**
+//        （「没登记的盲区」= 「没人知道这层没被检查」= 假的全覆盖）。
+//        本工具每次运行都会把那一节打印出来，并核对「登记的盲区是否真的没在扫 / 路径是否还在」。
 //   · 只看「导出的**函数**」：export function / export async function /
 //     export const f = (…) => / export const f = async (…) =>
 //     （跳过 export class、export default、以及 re-export 如 export { x } from './y.js'）。
@@ -6983,6 +6985,15 @@ test('⛔ E150 回归闸：种子跑完后 ⇒ 经 HTTP 路由，赛段列表非
 //   · **以值/回调形式被引用**（rows.map(presentRegistrationEvent)）按本闸口径**不算调用**
 //     （口径 = 调用表达式），但会在排查提示里单独列出来，免得「从未被调用过」这句话是假的。
 //
+// ⛔ **本仓明确不扫的目录（盲区）—— 理由登记在 dead-service-scan.allow.json 的 unscanned 段**：
+//   · src/domain/   —— 领域层是纯函数，调用关系与「服务/仓储」不同，静态扫必然大面积误报。
+//   · src/http/     —— HTTP 层的 handler 是**动态接线**（router.add('POST', path, handler)），
+//                      静态扫不到调用方 ⇒ 纳入会大面积误报（详见 allow.json 的理由）。
+//   · src/auth/     —— 它的几个导出在生产路径上**确实**没有调用方 ⇒ 纳入会直接让本闸变红，
+//                      而那是**真的产品接线缺口**，机器闸不该替产品做豁免决定 ⇒ 交人工裁决。
+//   · src/db/（非 repo 部分）—— 迁移器的导出只在部署期运维脚本里被调用 ⇒ 误报面小但收益低，
+//                      登记为盲区（要纳入需先把它们登记进允许清单）。
+//
 // 用法：
 //   node docs/tools/dead-service-scan.mjs [platformDir]
 //   node docs/tools/dead-service-scan.mjs --json [platformDir]
@@ -7001,6 +7012,18 @@ import { fileURLToPath } from 'node:url';
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_PLATFORM_DIR = resolve(HERE, '../../platform');
 const DEFAULT_ALLOW_PATH = join(HERE, 'dead-service-scan.allow.json');
+
+// ── 扫描范围（显式登记，不静默）────────────────────────────────────────
+// ⚠️ **每一条都要写清「为什么扫它」**：扫描范围本身就是一种取舍，
+//    范围外的层 = 没人检查的层 ⇒ 必须能被登记、能被核对。
+const SCAN_DIRS = [
+  { rel: 'services', why: '服务层：产品路径的主体（对外入口都落在这里）' },
+  { rel: 'db/repo', why: '仓储层：服务层的唯一数据出口' },
+  { rel: 'runtime', why: '运行时辅助（pid 文件 / 服务存活探测）：导出少、调用方单一，误报面已逐条核实并登记进允许清单' },
+];
+const SCAN_FILES = [
+  { rel: 'config.js', why: '配置加载与规则校验：3 个导出全部在生产路径上被调用（server.js / services/leaderboard.js / services/performance-card.js）⇒ 纳入不产生任何豁免' },
+];
 
 // ── 词法层：保留字 / 标点 ────────────────────────────────────────────
 // ⚠️ `of` / `get` / `set` / `async` / `static` / `from` / `as` / `let` 都是**上下文关键字**
@@ -7902,11 +7925,19 @@ function listJsFiles(dir) {
   return out.sort();
 }
 
-/** 读允许清单 */
+/**
+ * 读允许清单。
+ *
+ * 清单有两段：
+ *   allow[]    —— 单个函数的豁免（必须有 file / name / reason）
+ *   unscanned[] —— **扫描盲区登记**（必须有 path / reason）：哪些目录**有意不扫**、为什么。
+ *                 ⚠️ 这段是「盲区不静默」的载体：没登记的盲区 = 没人知道这层没被检查。
+ * @returns {{allow: Array, unscanned: Array}}
+ */
 function loadAllow(allowPath, required) {
   if (!existsSync(allowPath)) {
     if (required) throw new Error(`允许清单不存在：${allowPath}`);
-    return [];
+    return { allow: [], unscanned: [] };
   }
   let parsed;
   try {
@@ -7914,8 +7945,12 @@ function loadAllow(allowPath, required) {
   } catch (err) {
     throw new Error(`允许清单解析失败：${allowPath}（${err.message}）`);
   }
-  const list = Array.isArray(parsed && parsed.allow) ? parsed.allow : [];
-  return list.filter((x) => x && typeof x.file === 'string' && typeof x.name === 'string');
+  const allow = Array.isArray(parsed && parsed.allow) ? parsed.allow : [];
+  const unscanned = Array.isArray(parsed && parsed.unscanned) ? parsed.unscanned : [];
+  return {
+    allow: allow.filter((x) => x && typeof x.file === 'string' && typeof x.name === 'string'),
+    unscanned: unscanned.filter((x) => x && typeof x.path === 'string' && typeof x.reason === 'string' && x.reason.trim()),
+  };
 }
 
 /**
@@ -7931,9 +7966,12 @@ export function scanPlatform(platformDir, opts = {}) {
 
   const relTo = (abs) => relative(platformAbs, abs).split(sep).join('/');
 
-  // 目标目录：只扫服务层与仓储层
-  const targetDirs = [join(srcRoot, 'services'), join(srcRoot, 'db', 'repo')];
-  const targetFiles = targetDirs.flatMap((d) => listJsFiles(d)).sort();
+  // 目标目录：见 SCAN_DIRS / SCAN_FILES（显式登记，理由写在代码与 allow.json 里）
+  const targetDirs = SCAN_DIRS.map((d) => join(srcRoot, d.rel));
+  const targetFiles = [
+    ...targetDirs.flatMap((d) => listJsFiles(d)),
+    ...SCAN_FILES.map((f) => join(srcRoot, f.rel)).filter((f) => existsSync(f)),
+  ].sort();
 
   // 调用方范围：platform/src/**（排除 test/ scripts/ web/ —— 这三个在 src 之外，
   // 排除规则照样写上，防止有人把 platformDir 指到别处时口径漂移）
@@ -8149,9 +8187,25 @@ export function scanPlatform(platformDir, opts = {}) {
 
   // ── 允许清单 ──
   const allowPath = opts.allowPath || DEFAULT_ALLOW_PATH;
-  const allowList = loadAllow(allowPath, !!opts.allowRequired);
+  const { allow: allowList, unscanned: unscannedList } = loadAllow(allowPath, !!opts.allowRequired);
   const allowMap = new Map();
   for (const a of allowList) allowMap.set(`${a.file}::${a.name}`, a.reason || '');
+
+  // ── 扫描盲区：核对「登记的盲区」与「实际扫描范围」是否一致 ──
+  // ⚠️ 两类漂移都必须说出来（不静默）：
+  //   ① 登记为盲区的路径**其实在扫描范围里** ⇒ 登记过期了（要么删登记，要么改范围）
+  //   ② 登记的盲区路径**已经不存在** ⇒ 可能已改名/删除（登记过期）
+  const scannedRelDirs = new Set(SCAN_DIRS.map((d) => `src/${d.rel}/`));
+  const scannedRelFiles = new Set(SCAN_FILES.map((f) => `src/${f.rel}`));
+  const unscanned = unscannedList.map((u) => {
+    const rel = u.path.replace(/^\.\//, '');
+    const inScope = scannedRelDirs.has(rel) || scannedRelFiles.has(rel)
+      || [...scannedRelDirs].some((d) => rel.startsWith(d));
+    const abs = join(platformAbs, rel);
+    let exists = false;
+    try { exists = existsSync(abs); } catch { exists = false; }
+    return { path: rel, reason: u.reason, inScope, exists };
+  });
 
   // ── 汇总 ──
   // ⚠️ 允许清单**每一条都要打印**（包括没命中的）——
@@ -8191,6 +8245,11 @@ export function scanPlatform(platformDir, opts = {}) {
     allowed,
     undetermined: undeterminedRelevant,
     allowPath,
+    unscanned,
+    scanScope: {
+      dirs: SCAN_DIRS.map((d) => ({ path: `src/${d.rel}/`, why: d.why })),
+      files: SCAN_FILES.map((f) => ({ path: `src/${f.rel}`, why: f.why })),
+    },
     targetFiles: targetFiles.map(relTo),
   };
 }
@@ -8200,10 +8259,29 @@ function formatText(result) {
   const lines = [];
   lines.push('死服务扫描（dead-service-scan）');
   lines.push(`平台目录：${result.platformDir}`);
-  lines.push(`扫描目录：src/services/*.js、src/db/repo/*.js（领域层不扫）`);
+  lines.push(`扫描目录：${result.scanScope.dirs.map((d) => d.path).join('、')}${result.scanScope.files.length ? `、${result.scanScope.files.map((f) => f.path).join('、')}` : ''}`);
   lines.push(`被扫描文件：${result.scannedFiles} 个`);
   lines.push(`导出函数：${result.exported} 个`);
   lines.push(`有生产调用方：${result.wired} 个 ｜ 死函数：${result.dead.length} 个 ｜ 允许清单：${result.allowed.length} 条（命中 ${result.allowed.filter((a) => a.matched).length} 条）｜ 无法判定：${result.undetermined.length} 条`);
+  lines.push('');
+
+  lines.push('--- 扫描范围（纳入的目录/文件与理由）---');
+  for (const d of result.scanScope.dirs) lines.push(`  ✓ ${d.path} —— ${d.why}`);
+  for (const f of result.scanScope.files) lines.push(`  ✓ ${f.path} —— ${f.why}`);
+  lines.push('');
+
+  // ⚠️ 盲区**必须打印**：没登记的盲区 = 没人知道这层没被检查 = 假的全覆盖。
+  lines.push('--- 扫描盲区（有意不扫 · 理由登记在 allow.json 的 unscanned 段）---');
+  if (!result.unscanned.length) {
+    lines.push('  （无登记 —— 若确实有目录没被扫，必须补登记，否则「全覆盖」是假的）');
+  } else {
+    for (const u of result.unscanned) {
+      let mark = '';
+      if (u.inScope) mark = '  ⚠️ 这条登记与实际扫描范围**矛盾**（它其实在扫）—— 登记已过期';
+      else if (!u.exists) mark = '  ⚠️ 登记的路径在 platform/ 下**不存在**（可能已改名/删除）—— 登记已过期';
+      lines.push(`  ✗ ${u.path} —— ${u.reason}${mark}`);
+    }
+  }
   lines.push('');
 
   lines.push('--- 死函数清单（导出了但生产代码里没有调用方）---');
@@ -8299,6 +8377,8 @@ export function main(argv) {
       })),
       allowed: result.allowed,
       undetermined: result.undetermined,
+      scanScope: result.scanScope,
+      unscanned: result.unscanned,
     }, null, 2));
   } else {
     console.log(formatText(result));
@@ -8307,7 +8387,7 @@ export function main(argv) {
 }
 
 // ⚠️ 主流程只在**直接运行时**执行 ⇒ 回归测试可以 `import { scanPlatform }` 而不触发扫描。
-//    `import.meta.main`（Node ≥ 22.16）；老版本上兜底用 argv[1] 比对，避免静默不跑。
+//    `import.meta.main`（**新增于 v24.2.0 / v22.18.0**；22.16/22.17 上是 undefined）；老版本上兜底用 argv[1] 比对，避免静默不跑。
 const IS_MAIN = import.meta.main === true
   || (typeof process.argv[1] === 'string' && resolve(process.argv[1]) === fileURLToPath(import.meta.url));
 if (IS_MAIN) {

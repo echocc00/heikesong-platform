@@ -211,3 +211,77 @@ test('滑动续期不得突破绝对过期上限（设计文档 §7.5）', async
   close();
   rmSync(dataDir, { recursive: true, force: true });
 });
+
+// ══════════════════════════════════════════════════════════════════
+// P1-3a：会话滑动续期改「脏才写」——读路径不该每次 GET 都写库
+//   依据：2026-10-24 独立评审轮 P1-3a「拆掉读路径的隐性写库」
+//   修复前：每次命中有效会话都 UPDATE sessions SET expires_at = ?
+//     ⇒ 每个 GET 请求都产生一次写事务 ⇒ 纯读压测下写事务数随请求数线性增长。
+// ══════════════════════════════════════════════════════════════════
+test('P1-3a 距上次续期不足 30 分钟不得写库（读路径不再每次 GET 都产生写事务）', async () => {
+  const { db, close, dataDir, user } = setup();
+  const { createSession, resolveSession } = await import('../src/auth/session.js');
+  const t0 = new Date('2026-03-01T00:00:00.000Z');
+  const { token } = createSession(db, user.id, { ttlDays: 1, now: t0 });
+  const row0 = db.prepare('SELECT expires_at, last_touch_at FROM sessions').get();
+  assert.equal(row0.expires_at, '2026-03-02T00:00:00.000Z', '前提：签发时的有效期 = 签发 + 1 天');
+  assert.equal(row0.last_touch_at, '2026-03-01T00:00:00.000Z', '前提：签发即记下「上次续期时刻」');
+
+  // ① 签发后 10 分钟访问 ⇒ 距上次续期不足 30 分钟 ⇒ **不得写库**
+  const t1 = new Date(t0.getTime() + 10 * 60_000);
+  const got1 = resolveSession(db, token, { now: t1, ttlDays: 1 });
+  assert.ok(got1, '会话仍应有效');
+  const row1 = db.prepare('SELECT expires_at, last_touch_at FROM sessions').get();
+  assert.equal(row1.expires_at, row0.expires_at, '不足 30 分钟不得顺延有效期（否则每次 GET 都写库）');
+  assert.equal(row1.last_touch_at, row0.last_touch_at, '不足 30 分钟不得改写续期时刻');
+  assert.equal(
+    got1.expiresAt, row0.expires_at,
+    '返回值必须与库里存的一致（客户端 cookie 的有效期不得比库里更晚）',
+  );
+
+  // ② 签发后 31 分钟访问 ⇒ 超过阈值 ⇒ **真的续期**
+  const t2 = new Date(t0.getTime() + 31 * 60_000);
+  const got2 = resolveSession(db, token, { now: t2, ttlDays: 1 });
+  assert.ok(got2, '会话仍应有效');
+  const row2 = db.prepare('SELECT expires_at, last_touch_at FROM sessions').get();
+  assert.equal(row2.expires_at, '2026-03-02T00:31:00.000Z', '超过 30 分钟必须顺延有效期');
+  assert.equal(row2.last_touch_at, '2026-03-01T00:31:00.000Z', '必须记下本次续期时刻');
+  assert.equal(got2.expiresAt, '2026-03-02T00:31:00.000Z', '返回值必须与库里一致');
+
+  // ③ 再过 9 分钟（距上次续期 9 分钟）⇒ 又不写
+  const t3 = new Date(t2.getTime() + 9 * 60_000);
+  resolveSession(db, token, { now: t3, ttlDays: 1 });
+  const row3 = db.prepare('SELECT expires_at, last_touch_at FROM sessions').get();
+  assert.equal(row3.expires_at, row2.expires_at, '距上次续期不足 30 分钟不得再写');
+  assert.equal(row3.last_touch_at, row2.last_touch_at, '距上次续期不足 30 分钟不得再写');
+
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('P1-3a 连续 100 次只读访问只产生个位数写事务', async () => {
+  // 验收口径（评审原话）：「连续 1000 次 GET 只产生个位数写」。
+  // 这里取 100 次（够判别，且不拖慢测试），断言写事务数 ≤ 1。
+  const { db, close, dataDir, user } = setup();
+  const { createSession, resolveSession } = await import('../src/auth/session.js');
+  const t0 = new Date('2026-03-01T00:00:00.000Z');
+  const { token } = createSession(db, user.id, { ttlDays: 1, now: t0 });
+
+  // 第一次访问已距签发 31 分钟 ⇒ 触发一次续期；此后 100 秒内的访问都不得再写
+  const first = new Date(t0.getTime() + 31 * 60_000);
+  resolveSession(db, token, { now: first, ttlDays: 1 });
+  const before = db.prepare('SELECT total_changes() AS n').get().n;
+
+  for (let i = 1; i <= 100; i++) {
+    const at = new Date(first.getTime() + i * 1000);
+    assert.ok(resolveSession(db, token, { now: at, ttlDays: 1 }), `第 ${i} 次访问仍应有效`);
+  }
+  const after = db.prepare('SELECT total_changes() AS n').get().n;
+  assert.ok(
+    after - before <= 1,
+    `100 次只读访问产生了 ${after - before} 次写事务（必须 ≤ 1）—— 读路径写放大没被消掉`,
+  );
+
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});

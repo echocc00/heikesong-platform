@@ -129,9 +129,14 @@ function seedRepo(db) {
 
 test('迁移到 007：七张表全部建出', () => {
   const { db, close, dataDir, result } = setup();
-  // ⚠️ **版本 7 是本轮新增的**（2026-10-23 审计 F23 / F25 的约束补强迁移
-  //    `007_p13_defect_fixes.sql`：幂等键加请求体摘要列 + 签字的部分唯一索引）。
-  assert.equal(result.version, 7, '迁移版本必须是 7（P0=1, P1=2, P2=3, P3=4, P4=5, P5=6, P13=7）');
+  // ⚠️ **版本 8 是本轮新增的**（2026-10-25 评审 P1-3a「会话滑动续期改脏才写」的
+  //    `008_session_touch.sql`：sessions 表加 last_touch_at 列）。
+  //    版本 7 是 2026-10-23 审计 F23 / F25 的约束补强迁移
+  //    （`007_p13_defect_fixes.sql`：幂等键加请求体摘要列 + 签字的部分唯一索引）。
+  assert.equal(
+    result.version, 8,
+    '迁移版本必须是 8（P0=1, P1=2, P2=3, P3=4, P4=5, P5=6, P13=7, P13b=8）',
+  );
   const names = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((r) => r.name);
   for (const t of ['workflows', 'workflow_tasks', 'task_claims', 'pool_projects', 'pool_talents', 'pool_resources', 'public_tokens']) {
     assert.ok(names.includes(t), `缺表 ${t}`);

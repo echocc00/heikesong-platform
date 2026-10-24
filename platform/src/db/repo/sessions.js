@@ -3,21 +3,38 @@
 // ⛔ 预审修正（I5-1）：会话的全部 SQL 从 src/auth/session.js 搬到这里。
 // ⛔ 库里只存 token_hash（SHA-256 十六进制），**不存明文 token**。
 export function insertSession(db, { tokenHash, userId, createdAt, expiresAt }) {
+  // ⚠️ last_touch_at 落库时就是 created_at —— 会话**刚签发**时的那次「续期」，
+  //    正是「脏才写」的起点（P1-3a）。不落这一列 ⇒ 第一次访问就会写库。
   db.prepare(
-    'INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)',
-  ).run(tokenHash, userId, createdAt, expiresAt);
+    'INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_touch_at) VALUES (?, ?, ?, ?, ?)',
+  ).run(tokenHash, userId, createdAt, expiresAt, createdAt);
 }
 
 export function findSessionByHash(db, tokenHash) {
   // ⚠️ created_at 必须一起取：绝对过期上限是从**签发时刻**算起的（设计文档 §7.5），
   //    没有签发时刻就无从判断"这个会话最多能活多久"。
+  // ⚠️ last_touch_at 也要取：P1-3a「脏才写」要靠它判断「距上次续期是否已过阈值」。
   return db
-    .prepare('SELECT user_id, created_at, expires_at FROM sessions WHERE token_hash = ?')
+    .prepare('SELECT user_id, created_at, expires_at, last_touch_at FROM sessions WHERE token_hash = ?')
     .get(tokenHash) ?? null;
 }
 
-/** 滑动续期：把 expires_at 顺延（设计文档 §7.5） */
-export function touchSessionExpiry(db, tokenHash, expiresAt) {
+/**
+ * 滑动续期：把 expires_at 顺延，**并记下本次续期时刻**（设计文档 §7.5 + P1-3a）。
+ *
+ * ⚠️ lastTouchAt 缺省不写 —— 那样只会改 expires_at，「脏才写」的判据就永远停在旧值上，
+ *    下一次访问又会再写一次（等于没修）。调用方必须传。
+ *
+ * @param {string} tokenHash
+ * @param {string} expiresAt 新的过期时刻（ISO）
+ * @param {string} [lastTouchAt] 本次续期时刻（ISO）
+ */
+export function touchSessionExpiry(db, tokenHash, expiresAt, lastTouchAt = null) {
+  if (lastTouchAt) {
+    return db
+      .prepare('UPDATE sessions SET expires_at = ?, last_touch_at = ? WHERE token_hash = ?')
+      .run(expiresAt, lastTouchAt, tokenHash).changes;
+  }
   return db
     .prepare('UPDATE sessions SET expires_at = ? WHERE token_hash = ?')
     .run(expiresAt, tokenHash).changes;

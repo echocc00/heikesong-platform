@@ -11,7 +11,7 @@ import { isRetryableDbError } from './db/tx.js';
 import { loadRules, validateRules } from './config.js';
 import { createRouter } from './http/router.js';
 import { json, error, text } from './http/respond.js';
-import { responseHeaders, corsPreflightHeaders } from './http/security-headers.js';
+import { responseHeaders, corsPreflightHeaders, clientIp } from './http/security-headers.js';
 import { registerWorkflowRoutes } from './http/routes/workflow.js';
 import { registerPoolsRoutes } from './http/routes/pools.js';
 import { registerPublicRoutes } from './http/routes/public.js';
@@ -22,13 +22,13 @@ import { createSession, resolveSession, revokeSession } from './auth/session.js'
 import { can } from './auth/permissions.js';
 import { verifyPassword, hashPassword } from './auth/password.js';
 import { changePassword, logoutAllSessions } from './services/auth.js';
-import { assertRateLimit, loginSubjectKey } from './services/rate-limit.js';
+import { assertRateLimit, checkRateLimit, loginSubjectKey, loginIpSubjectKey } from './services/rate-limit.js';
 import { getUserById, getCredentialsByPhone, toPublicUser } from './db/repo/users.js';
 import { listUserRoles } from './db/repo/roles.js';
 import { listUserCapabilities } from './db/repo/assignments.js';
 import { getStage, getStageJudge, listStageSummaries } from './db/repo/stages.js';
 import { listWorkflowSummaries } from './db/repo/workflows.js';
-import { appError, AppError } from './errors.js';
+import { appError, AppError, rateLimited } from './errors.js';
 import { registerRegistrationRoutes, pickCurrentEdition } from './http/routes/registration.js';
 import { registerTaskPackageRoutes } from './http/routes/taskPackage.js';
 import { registerTeamRoutes } from './http/routes/team.js';
@@ -37,6 +37,7 @@ import { registerMilestoneRoutes } from './http/routes/milestone.js';
 import { registerSignoffRoutes } from './http/routes/signoff.js';
 import { registerBehaviorRoutes } from './http/routes/behavior.js';
 import { registerAuditRoutes } from './http/routes/audit.js';
+import { registerAdminRoutes } from './http/routes/admin.js';
 import { registerPublishRoutes } from './http/routes/publish.js';
 import { registerTiebreakRoutes } from './http/routes/tiebreak.js';
 import { registerStageRoutes } from './http/routes/stages.js';
@@ -45,7 +46,7 @@ import { getLeaderboard, getRollingLeaderboard } from './services/leaderboard.js
 import { getPerformanceCard } from './services/performance-card.js';
 import { getTeamTier, getTierBoard } from './services/tier.js';
 import { listEditions, getEdition } from './db/repo/editions.js';
-import { writePidFile, removePidFile, writePortFile, removePortFile, readPidFile, isProcessAlive } from './runtime/pidfile.js';
+import { removePidFile, writePortFile, removePortFile, claimPidFile, releasePidFile } from './runtime/pidfile.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -233,6 +234,8 @@ export function createApp({ db, rules, webDir }) {
   router.add('GET', '/api/health', async () => ({ ok: true, at: new Date().toISOString() }));
   // P4 审计 API（7 个接口 + 申诉列表）：计算快照 / 复算 diff / 审计日志 / 复核队列 / 申诉
   registerAuditRoutes(router, { db, rules });
+  // 管理端点（2026-10-24 评审补记）：登录限频的人工解锁兜底
+  registerAdminRoutes(router, { db });
 
   // ── P3 榜单与积分 ───────────────────────────────────────────
   // ⚠️ 路由优先级由 P0 的 router **逐段比较**决定：静态段胜参数段
@@ -305,13 +308,44 @@ export function createApp({ db, rules, webDir }) {
 
   // ⛔ 预审修正（I7-1）：P0 原本**没有登录接口** → README 宣称的「能登录的空系统」不成立，
   //    Task 5 产出的 createSession 也没有任何调用方。补上登录/登出。
-  router.add('POST', '/api/auth/login', async ({ body }) => {
+  router.add('POST', '/api/auth/login', async ({ body, ip }) => {
     const phone = String(body?.phone ?? '').trim();
     const password = String(body?.password ?? '');
     const cred = getCredentialsByPhone(db, phone);
     // 用户不存在与密码错误返回**同一个**错误码 → 避免用户枚举（响应层）
     // ⛔ 而且**耗时也必须一致**（时间层）：用户不存在时照样跑一次 scrypt，
     //    否则两条路径差 100 倍 → 枚举手机号。见 dummyHash() 的注释。
+    // ⚠️⚠️ **来源维度的只读预检 —— 必须在 scrypt 之前**（2026-10-24 评审轮）。
+    //    复核发现：原实现的限频判定**在口令校验之后** ⇒ 被限流的请求
+    //    **照样跑一遍 scrypt** ⇒ 限频只把 401 换成 429，**挡不住 CPU 打爆**
+    //    ⇒ 那才是真实的 DoS 面。
+    //    ⚠️ **评审说的「把受害者锁在门外」并不成立**：限频判定**只在口令校验失败
+    //    的分支里**执行 ⇒ **正确口令永远能登录** ⇒ 这条不变量必须保住
+    //    （它正是对「账号被锁死」的根本防护）。
+    //    ⇒ 这里用 consume:false 的**只读预检**：来源已被判定为攻击源 ⇒
+    //      **直接 429，scrypt 根本不跑**。
+    //    ⚠️ **只对「来源」维度做前置预检**；「账号」维度的判定**留在失败分支**
+    //    ⇒ 正确口令永远能登录。
+    //    ⚠️ **代价（必须写清楚）**：来源预检会**连正确口令一起挡**
+    //    ⇒ 共享出口 IP（同一办公室/校园网）的人共享这一个桶 ⇒
+    //      这是**刻意 fail-closed**（宁可多人等 60 秒，也不许 CPU 被打爆）。
+    //      阈值见 rules/audit.json 的 loginAttemptByIp（按共享出口的规模调）。
+    const ipSubject = loginIpSubjectKey(ip);
+    const ipPre = checkRateLimit({
+      db,
+      subjectKey: ipSubject,
+      rule: 'loginAttemptByIp',
+      now: new Date().toISOString(),
+      limits: rules?.audit?.rateLimit,
+      subjects: { default: ipSubject },
+      consume: false,
+    });
+    if (!ipPre.allowed) {
+      throw rateLimited(
+        `登录来源触发限频，请 ${ipPre.retryAfterSeconds} 秒后重试`,
+        { retryAfterSeconds: ipPre.retryAfterSeconds, rule: 'loginAttemptByIp', layers: ipPre.layers },
+      );
+    }
     const passwordOk = verifyPassword(password, cred ? cred.password_hash : dummyHash());
     const ok = !!cred && cred.active === 1 && passwordOk;
     if (!ok) {
@@ -321,6 +355,18 @@ export function createApp({ db, rules, webDir }) {
       //    （否则多设备/多标签页反复登录会被自己的配额挡住）。
       //    配额用尽 ⇒ 429 + Retry-After（server.js 的错误分支统一加头），不再回 401。
       //    ⚠️ 放在口令校验**之后**：先校验、再计数 —— 只有「真的错了」才消耗配额。
+      //    ⚠️ **两个维度都记**：来源维度（攻击者的流量消耗自己的桶）
+      //      + 账号维度（挡的是「爆破某一个账号的口令」）。
+      //    ⚠️ **枚举安全**：来源维度的判定与「账号是否存在」**完全无关**
+      //      ⇒ 不泄露手机号是否已注册（与下面「用户不存在也照样跑 scrypt」同一纪律）。
+      assertRateLimit({
+        db,
+        subjectKey: ipSubject,
+        rule: 'loginAttemptByIp',
+        now: new Date().toISOString(),
+        limits: rules?.audit?.rateLimit,
+        subjects: { default: ipSubject },
+      });
       const loginSubject = loginSubjectKey(phone);
       assertRateLimit({
         db,
@@ -511,6 +557,12 @@ export function createApp({ db, rules, webDir }) {
           sessionToken,
           db,
           rules,
+          // ⚠️ 客户端 IP（2026-10-24 评审补记）：登录限频要按**来源**再记一份，
+          //    否则知道手机号的人可以故意输错口令把受害者本人锁在门外。
+          //    ⚠️ 可信度由传输层保证（见 http/security-headers.js 的 clientIp）：
+          //    对端是回环（同机 nginx）才采信 X-Real-IP / X-Forwarded-For 末段；
+          //    否则一律用 socket.remoteAddress（不可伪造）。
+          ip: clientIp(req),
           params: match.params,
           body,
           query: Object.fromEntries(new URL(url, 'http://x').searchParams),
@@ -641,23 +693,34 @@ if (isMain) {
 
   const { rules, version } = loadRules(rulesDir);
 
-  // ── 单写者闸（E169 / F5）────────────────────────────────────────
+  // ── 单写者闸（E169 / F5 + P1-4b 独占创建）────────────────────────
   // 依据：README 的头号架构承诺「SQLite 只允许单写进程」+ 设计文档 §14.2。
   // 修复前：pid 文件在 listen **之前**写、而且**从不检查**是否已有实例
   //        ⇒ 同一个 DATA_DIR 可以同时起两个服务、两个都启动成功
   //        ⇒ F8 已证明这种双写会直接撞出 SQLITE_BUSY / 517。
   // ⚠️ 必须在**开库之前**判：库一打开就可能与对方抢写锁了。
-  const livePid = readPidFile(dataDir);
-  if (livePid && livePid !== process.pid && isProcessAlive(livePid)) {
+  //
+  // ⚠️⚠️ P1-4b：**只检查不占有**是有洞的（TOCTOU）——
+  //    修复前的时序是「① 读 pid 文件判断有没有别人 → ……（开库、跑迁移、建应用、
+  //    listen，几百毫秒）…… → ② listen 成功后写自己的 pid」。
+  //    两个并发启动的实例可以**同时**通过 ① ⇒ 一起开库、一起写 ⇒ SQLITE_BUSY。
+  //    ⇒ 现在用**独占创建**（O_CREAT|O_EXCL）占住闸：内核保证只有一个能拿到。
+  //    陈旧残留（进程已死）⇒ 自动接管，运维不用手工删文件。
+  const claim = claimPidFile(dataDir);
+  if (!claim.ok) {
     console.error(
-      `[server] 拒绝启动：数据目录 ${dataDir} 已被进程 ${livePid} 占用。`
+      `[server] 拒绝启动：数据目录 ${dataDir} 已被占用（${claim.reason}）。`
       + '单写者约束：同一个 SQLite 文件只允许一个写进程（并发写会撞 SQLITE_BUSY / 517）。'
       + '请先停掉那个进程再启动本实例。',
     );
     process.exit(1);
   }
-  // ⚠️ pid 文件指向**已死**进程 ⇒ 上次崩溃留下的残留 ⇒ 允许接管（并覆盖它）。
-  //    不允许接管 ⇒ 崩一次就再也起不来（运维得手工删 pid 文件才能重启）。
+  // ⚠️ 从这一刻起，pid 文件登记的是**本进程** ⇒ 别的实例来了会被挡。
+  //    下面任何一条启动失败路径都必须把它还回去（否则留下一个指向已死进程的
+  //    陈旧 pid ⇒ 恢复闸会把「服务已停」误判成「服务还在跑」，见 F13）。
+  const releaseClaim = () => { releasePidFile(dataDir, process.pid); };
+  // 进程退出（含未捕获异常）时把闸还回去 —— 正常退出路径另有 removePidFile。
+  process.on('exit', releaseClaim);
 
   const { db, close } = openDatabase({ dataDir });
   applyMigrations(db, migrationsDir);
@@ -671,17 +734,20 @@ if (isMain) {
   //    退出码也不是 1 ⇒ 运维看不出「到底为什么没起来」。
   server.on('error', (err) => {
     console.error(`[server] 启动失败：${err.message}`);
+    // ⚠️ F13：启动失败**不得留下 pid 文件** —— 指向已死进程的陈旧 pid
+    //    会让恢复闸误判「服务没在跑」（恢复会在服务正在写库时进行）。
+    //    闸是本进程自己拿到的（独占创建）⇒ 现在还回去。
+    releaseClaim();
     process.exit(1);
   });
   server.listen(port, '127.0.0.1', () => {
-    // ── P6：写 pid 文件 + 端口文件 ───────────────────────────────
-    // ⚠️ 必须挪到 **listen 成功之后**（E169 / F13）：
-    //    修复前写在 listen 之前 ⇒ 启动失败（端口被占）时也把 pid 文件覆盖成自己的 pid
-    //    ⇒ 留下一个指向**已死进程**的陈旧 pid ⇒ 恢复闸误判「服务没在跑」。
+    // ── P6：写端口文件 ───────────────────────────────────────────
+    // ⚠️ pid 文件**已经在启动最前面**写好了（独占创建，见上面的单写者闸）——
+    //    这里**不再**覆盖写：那会是一次**非独占**的写 ⇒ 可能把别人的 pid 覆盖掉
+    //    ⇒ 单写者闸形同虚设（P1-4b 要修的正是这个洞）。
     // ⚠️ 端口文件记的是**实际**监听端口（PORT=0 时是内核分配的，不是 0）——
     //    恢复闸靠它去主动探测「服务还在不在」（见 src/runtime/service-probe.js）。
     const actualPort = server.address()?.port ?? port;
-    writePidFile(dataDir);
     writePortFile(dataDir, actualPort);
     console.log(`heikesong-platform 启动于 http://127.0.0.1:${actualPort}（规则版本 ${version}）`);
   });

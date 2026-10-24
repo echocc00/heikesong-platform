@@ -9,11 +9,16 @@ import {
   copyFileSync, existsSync, renameSync, unlinkSync, readdirSync, mkdirSync, realpathSync,
 } from 'node:fs';
 import { join, basename, dirname } from 'node:path';
-import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { readPidFile, pidFilePath, isProcessAlive } from '../src/runtime/pidfile.js';
-import { probeService } from '../src/runtime/service-probe.js';
+import { checkServiceState } from '../src/runtime/service-state.js';
 import { currentVersion } from '../src/db/migrate.js';
+
+// ⚠️ 对外契约不变：`checkServiceState` 一直是从本文件导出的（既有回归用例直接
+//    `import { checkServiceState } from '../scripts/restore.js'`）。
+//    2026-10-25 评审 P1-4a：判定逻辑下沉到 src/runtime/service-state.js ——
+//    写库脚本（seed / migrate）需要同一份判定，而 `src/` 不能反向依赖 `scripts/`。
+//    ⇒ 这里只做**转出**，调用方一行都不用改。
+export { checkServiceState };
 
 /** 列出备份文件（新 → 旧）：文件名是 UTC 时间戳，字典序倒排即时间倒序。 */
 function listBackupFiles(dir) {
@@ -23,57 +28,6 @@ function listBackupFiles(dir) {
     .sort()
     .reverse()
     .map((f) => join(dir, f));
-}
-
-/** 服务是否还在跑。优先看 pid 文件（跨平台），Linux 上再兜底 systemd。 */
-export function checkServiceState({ dataDir = './data', serviceName = 'heikesong' } = {}) {
-  const pid = readPidFile(dataDir);
-  if (pid && isProcessAlive(pid)) {
-    return { running: true, reason: `pid 文件显示进程 ${pid} 仍在运行`, pid };
-  }
-  // ⚠️ pid 文件在，但内容**不是合法 pid**（写坏了）→ 证明不了服务已停 → 保守判为「还在跑」。
-  //    依据：设计文档 §14.2【决策】恢复前必须先停服务 —— 这条是**安全闸**，
-  //    拿不到证据时必须拒绝，而不是当成「服务没在跑」。
-  //    运维确认服务确实停了，删掉这个 pid 文件即可继续。
-  // ⚠️ 判据是「**读不出合法 pid**」（`!pid`），**不是**「文件存在」——
-  //    文件存在但内容合法、只是进程已退出 ⇒ 那是**陈旧残留**，走下面的探测分支，
-  //    不能被这条「内容无法解析」误伤（这条曾经把陈旧残留判成「还在跑」，
-  //    被 test/restore.test.js 的既有用例当场抓住）。
-  if (!pid && existsSync(pidFilePath(dataDir))) {
-    return { running: true, reason: 'pid 文件存在但内容无法解析，无法确认服务已停止' };
-  }
-  // ⚠️⚠️ pid 文件**不存在**，或它指向的进程**已退出** ⇒「进程已停」这个证据**不成立**
-  //   ⇒ 必须**主动探测服务本身**（E169 / F5b）。
-  //   为什么不能只看 pid 文件：「服务确实停了」（正常退出时 server.js 会删掉 pid 文件）
-  //   与「服务还在跑、只是 pid 文件没了」（被误删 / 被第二个实例覆盖）**看起来一模一样**，
-  //   而恢复的后果天差地别：
-  //     · 前者 ⇒ 恢复正是该做的事；
-  //     · 后者 ⇒ 恢复会把正在被写入的库文件换掉 ⇒ 丢数据 / 库损坏。
-  //   ⇒ 唯一能分辨的证据是「服务还在不在应答」（见 src/runtime/service-probe.js）。
-  const probe = probeService(dataDir);
-  if (probe.alive) {
-    return {
-      running: true,
-      reason: pid
-        ? `pid 文件显示进程 ${pid} 已退出，但 ${probe.reason} ⇒ 服务仍在运行`
-        : `pid 文件缺失，但 ${probe.reason} ⇒ 服务仍在运行（拿不到「服务已停」的证据，保守拒绝恢复）`,
-      ...(pid ? { pid, stale: true } : {}),
-    };
-  }
-  if (pid) {
-    return { running: false, reason: `pid 文件存在但进程 ${pid} 已退出（可能是异常终止的残留）`, pid, stale: true };
-  }
-  if (process.platform === 'linux' && existsSync('/run/systemd/system')) {
-    try {
-      const res = spawnSync('systemctl', ['is-active', serviceName], { encoding: 'utf8' });
-      if (res.status === 0 && String(res.stdout).trim() === 'active') {
-        return { running: true, reason: `systemd 服务 ${serviceName} 处于 active` };
-      }
-    } catch {
-      // systemctl 不可用 → 忽略这一路探测
-    }
-  }
-  return { running: false, reason: '未发现运行中的服务进程' };
 }
 
 /**

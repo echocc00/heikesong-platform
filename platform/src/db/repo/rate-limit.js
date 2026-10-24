@@ -101,3 +101,87 @@ export function releaseLock(db, { subjectKey, rule }) {
   ).run(subjectKey, rule, 'lock');
   return r.changes;
 }
+
+/**
+ * 删掉某个 subject 的**全部**限频计数（管理员解锁用）。
+ *
+ * ⚠️ **为什么需要它**（2026-10-24 评审）：登录限频是**按账号**记的
+ *    ⇒ 知道手机号的人可以故意输错口令，把**受害者本人**的配额耗光
+ *    ⇒ 评委在自己想登录时被 429 挡在门外（打分窗口里就是「评委进不去」）。
+ *    ⇒ 除了「按来源限频」这层自动防护，还要留一条**人工兜底**：
+ *      管理员发现某人被锁 ⇒ 立刻清掉他的计数 ⇒ 人马上能登录。
+ *
+ * ⚠️ **为什么按 subject 删、而不是按 rule 删**：解锁要清的是
+ *    **这个人**的配额（`login:<hash>`），不是**所有账号**的计数 ——
+ *    按 rule 删会把全场的登录限频一起清掉（等于闸门失效）。
+ *
+ * @param {object} db
+ * @param {string} subjectKey 目标主体（如 `login:<sha256前16位>`）
+ * @returns {number} 删除的行数
+ */
+export function deleteRateLimitEventsBySubject(db, subjectKey) {
+  if (!subjectKey) return 0;
+  const r = db.prepare('DELETE FROM rate_limit_events WHERE subject_key = ?').run(subjectKey);
+  return r.changes;
+}
+
+/**
+ * 删掉**某个规则名**下的全部限频计数（管理员应急解除用）。
+ *
+ * ⚠️ **为什么需要它**（2026-10-24 评审轮）：来源维度的预检是**前置**的
+ *    （判定在 scrypt 之前 ⇒ 被挡请求不跑 scrypt）⇒ 它会**连正确口令一起挡**。
+ *    ⇒ 一旦某个出口 IP 被误判成攻击源（共享出口的办公室/校园网），
+ *    **整个出口的人都会被挡** ⇒ 必须有一条**人能立刻执行的**应急通道。
+ *
+ * ⚠️ **匹配式是「层名冒号 + 规则名」**：计数表里存的 rule 列是
+ *    `sliding:<rule>` / `minute:<rule>` / `hour:<rule>` / `lock:<rule>`
+ *    ⇒ 规则名在**后缀**位置，不在开头 ⇒ 匹配式必须是 `%:<规则名>%`
+ *    （⛔ 写成 `规则名%` 会**匹配不到任何行** —— 那正是本函数第一版的 bug：
+ *      应急解除「执行成功但一行没删」，症状是「解了还是 429」）。
+ *    ⇒ `%:loginAttempt%` 一次命中**账号维度**（`loginAttempt`）与
+ *      **来源维度**（`loginAttemptByIp`）的全部层级 ⇒ 一次清干净。
+ *    ⚠️ 反过来说，它**不会**误伤别的规则（申诉/评分限频的规则名是
+ *      `appealSubmit` / `reviewSubmit` / `judgeHourly` ⇒ 不含 `loginAttempt`）。
+ *
+ * @param {object} db
+ * @param {string} ruleName 规则名（如 'loginAttempt'）
+ * @returns {number} 删除的行数
+ */
+export function deleteRateLimitEventsByRulePrefix(db, ruleName) {
+  if (!ruleName) return 0;
+  const esc = String(ruleName).replace(/([%_\\])/g, '\\$1');
+  const r = db
+    .prepare("DELETE FROM rate_limit_events WHERE rule LIKE ? ESCAPE '\\'")
+    .run(`%:${esc}%`);
+  return r.changes;
+}
+
+/**
+ * 删掉**早已过期**的限频计数事件（运维清理用）。
+ *
+ * ⚠️ **为什么必须按「窗口早已过去」来删，不能按「行数」或「随便删」**：
+ *    删掉还在窗口内的行 ⇒ 计数被清零 ⇒ **限频被绕过**（用户可以无限重试）。
+ *    ⇒ 判据是「updated_at 早于 now - retentionSeconds」，且 retentionSeconds
+ *    必须**大于任何规则的窗口**。
+ *    本仓最宽的窗口是 `perHour`（1 小时，见 rules/audit.json）⇒ 默认 24 小时
+ *    留了 24 倍余量 ⇒ 任何一条被删的行，其窗口**必定**早已结束。
+ *
+ * ⚠️ 为什么删旧行**不改变任何限频判定**：
+ *    · `sliding:<rule>` 计数按 `window_start >= now - sliding.seconds` 过滤（≤ 60 秒）；
+ *    · `minute:<rule>` / `hour:<rule>` 的 bucket 键里带着**分钟/小时戳**
+ *      （bucketKey('m'|'h', ...)）⇒ 旧桶的键**永远不会再被查**；
+ *    · `lock:<rule>` 是 TTL 锁（5 秒），过期后由 CAS 路径接管。
+ *    ⇒ 24 小时前的行对任何一次判定都**不可见**。
+ *
+ * @param {object} db
+ * @param {{ now?: Date|string, retentionSeconds?: number }} [opts]
+ * @returns {number} 删除的行数
+ */
+export function deleteRateLimitEventsOlderThan(db, { now = new Date(), retentionSeconds = 86400 } = {}) {
+  const at = now instanceof Date ? now : new Date(now);
+  const cutoff = new Date(at.getTime() - retentionSeconds * 1000).toISOString();
+  const r = db
+    .prepare('DELETE FROM rate_limit_events WHERE datetime(updated_at) < datetime(?)')
+    .run(cutoff);
+  return r.changes;
+}

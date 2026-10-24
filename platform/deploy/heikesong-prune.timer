@@ -1,0 +1,23 @@
+# deploy/heikesong-prune.timer — 每日清理过期数据
+#
+# 依据：设计文档 §14.2「运维生命周期」+ 2026-10-25 评审轮 P2-7a
+#
+# ⚠️ 为什么排在备份**之后**（03:47 vs 03:17）：
+#   备份是一次一致性快照；清理是删旧行。
+#   先备份、后清理 ⇒ 备份里**包含**清理前的那份完整状态
+#   ⇒ 万一「清理删错了行」，还有一份清理前的备份可以回退。
+#   （反过来的话，备份里就已经是删完的状态 ⇒ 没有退路。）
+# ⚠️ RandomizedDelaySec=300：与备份同理，避免多台机器同时打 IO。
+
+[Unit]
+Description=每日清理过期数据（Heikesong Platform）
+Documentation=file:__APP_DIR__/README.md
+
+[Timer]
+OnCalendar=*-*-* 03:47:00
+Persistent=true
+RandomizedDelaySec=300
+Unit=heikesong-prune.service
+
+[Install]
+WantedBy=timers.target

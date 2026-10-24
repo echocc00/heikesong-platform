@@ -3,7 +3,32 @@
     "允许清单（有意豁免）—— 每条都必须写清「谁在用 / 为什么这不算产品路径缺口」，否则不许进本清单。",
     "口径与 docs/tools/dead-service-scan.mjs 一致：生产调用方 = platform/src/** 下的一处调用表达式。",
     "分类：①种子/运维脚本路径 ②同文件辅助（导出仅为测试便利）③回调/传参值引用 ④仓储层替代读口（能力已由另一条已接线的路径承担）。",
-    "⚠️ W5（赛段接线）批次不在本清单里 —— 那不是「合理豁免」，是集成人正在修的真缺口，由集成人收口。"
+    "⚠️ W5（赛段接线）批次不在本清单里 —— 那不是「合理豁免」，是集成人正在修的真缺口，由集成人收口。",
+    "",
+    "本文件还有第二段 unscanned[] = **扫描盲区登记**：哪些目录**有意不扫**、为什么。",
+    "  · 工具每次运行都会把这一节打印出来，并核对「登记的盲区是不是其实在扫 / 路径还在不在」。",
+    "  · 登记过期（路径已改名、或它其实在扫描范围内）会被明确标成 ⚠️，不静默。",
+    "  · ⛔ 盲区登记**只登记「为什么不扫」，不许用它替产品缺口开脱**：",
+    "    真正「写了没接线」的导出（只有测试在调、生产路径上确实没有调用方）必须让闸变红，",
+    "    由人工裁决，而不是塞进 allow[] 或 unscanned[] 里糊弄过去。"
+  ],
+  "unscanned": [
+    {
+      "path": "src/domain/",
+      "reason": "领域层是**纯函数**（无 I/O、无状态），它的「调用方」语义与「服务/仓储」完全不同：同一个领域函数常被多个服务层按不同口径组合调用，静态扫「导出函数 → 单一调用方」会大面积误报。本仓口径从 P0 起就只扫服务层与仓储层。"
+    },
+    {
+      "path": "src/http/",
+      "reason": "⛔ **不能盲目纳入**：HTTP 路由的 handler 是**动态接线**（router.add('POST', path, handler)）—— 静态扫看不到调用方，只要 handler 被单独导出就会大面积误报。另有一条硬约束：把 src/http/ 纳入**目标目录**会直接打破本工具自己的自测（docs/tools/dead-service-scan.test.mjs 的假工程里 `src/http/routes/route.js :: handler` 没有任何调用方 ⇒ 会被判死 ⇒ 退出码从 0 变 1 ⇒ 自测用例 6/7 变红）。本仓的 http/ 导出分两类：registerXxxRoutes(router, …) 由 src/server.js 调用（能被扫到），以及若干「导出仅为可测」的同文件辅助（如 isSameFile / pipeFd / tokenHint）—— 后者与本仓既有的「②同文件辅助」豁免同型，纳入需逐条登记，收益低于风险。"
+    },
+    {
+      "path": "src/auth/",
+      "reason": "⛔ **纳入会让本闸直接变红，而那是真的产品缺口**：src/auth/permissions.js 的 grantAssignment / revokeAssignment / scopeClause 三个导出在生产路径上**确实**没有调用方（只有 test/ 在调 —— 评审任务分配没有对应的 HTTP 端点）。机器闸不该替产品做「这是可接受的豁免」这个决定 ⇒ 登记为盲区并交人工裁决，而不是塞进 allow[] 里糊弄过去。listAssignments 是同文件辅助（②），纳入后需逐条登记。"
+    },
+    {
+      "path": "src/db/",
+      "reason": "⚠️ 只覆盖 src/db/repo/（仓储层）；**src/db/ 的非 repo 部分**（sqlite.js / migrate.js / tx.js）不扫：sqlite.js 的 openDatabase 与 tx.js 的 withTransaction 等都在生产路径上（纳入零误报），但 migrate.js 的三个导出（readMigrationFiles / applyMigrations / currentVersion）只在部署期运维脚本 platform/scripts/migrate.js 里被调用 ⇒ 纳入需先把它们登记进 allow[] 的「①种子/运维脚本路径」一类。要纳入随时可以纳入（本仓只差 3 条登记），本轮先登记为盲区，避免「盲区没登记」这种更严重的问题。"
+    }
   ],
   "allow": [
     {
@@ -87,29 +112,14 @@
       "reason": "②同文件辅助：导出了但只有**同文件**调用（platform/src/services/compute.js:148）。它是仓储层 listStageTeams（platform/src/db/repo/stages.js:210，在本文件 :25 以别名 listStageTeamsRows 导入）的**带兜底包装**（compute.js:50-62：表未建时返回空并由调用方记 warning，其余错误照抛 —— 静默返回空名册会让 R1/R4 判定整段跳过、榜单分数静默出错）⇒ 服务层内部实现细节，导出为测试便利 ⇒ 非产品路径缺口。"
     },
     {
-      "file": "src/services/rate-limit.js",
-      "name": "checkRateLimit",
-      "reason": "②同文件辅助：导出了但只有**同文件**调用（platform/src/services/rate-limit.js:159，assertRateLimit 内部）⇒ 限流算法本体（设计 §11.1「防刷分」）；对外入口 assertRateLimit 已在生产接线（如 platform/src/http/routes/audit.js:14/:127）⇒ 非产品路径缺口。"
-    },
-    {
       "file": "src/services/registration.js",
       "name": "presentRegistration",
       "reason": "②同文件辅助：导出了但只有**同文件**调用（platform/src/services/registration.js:139 / 167 / 178 / 225 / 251）⇒ 它是「报名行 → 对外视图」的**单一映射函数**（registration.js:26-42 的注释锁死了「level = 提交那一刻的快照 / grading = 按当前配置重算」两套口径不许分叉）⇒ 服务层内部实现细节，导出为测试便利 ⇒ 非产品路径缺口。"
     },
     {
       "file": "src/services/review-state.js",
-      "name": "getSubjectState",
-      "reason": "②同文件辅助：导出了但只有**同文件**调用（platform/src/services/review-state.js:125 / 161 / 198）⇒ 复核/申诉状态机的「当前状态」读口（review-state.js:68-76：真值来源是 audit_log 里最后一条 review_state.transition）；对外入口 getReviewState（GET /api/stages/:stageId/review-state）已接线 ⇒ 非产品路径缺口。"
-    },
-    {
-      "file": "src/services/review-state.js",
       "name": "parseAppealSubject",
       "reason": "②同文件辅助：导出了但只有**同文件**调用（platform/src/services/review-state.js:197 / 357）⇒ 申诉主体串「stageId:teamId」的拆解工具（review-state.js:182 记录了「不能无条件拆」的修正）；对外入口 submitAppeal / decideAppeal 已接线 ⇒ 非产品路径缺口。"
-    },
-    {
-      "file": "src/services/review-state.js",
-      "name": "transition",
-      "reason": "②同文件辅助：导出了但只有**同文件**调用（platform/src/services/review-state.js:359 / 364）⇒ 状态机迁移的**唯一写入方**（review-state.js:76 明写「本服务是 review_state.transition 的唯一写入方」）；对外入口 submitAppeal / decideAppeal 已接线 ⇒ 非产品路径缺口。"
     },
     {
       "file": "src/services/taskPackage.js",
@@ -188,11 +198,6 @@
     },
     {
       "file": "src/db/repo/users.js",
-      "name": "getUserByPhone",
-      "reason": "④仓储层替代读口（同能力的另一个读口已接线）：登录路径取的是 getCredentialsByPhone（users.js:86，唯一允许取 password_hash 的读口，服务层口令校验在用）；唯一性查重走 findUserByPhone（users.js:74，不看 active）。getUserByPhone（users.js:78，带 active 过滤）是第三种同义读口，生产不需要 ⇒ 非产品路径缺口。"
-    },
-    {
-      "file": "src/db/repo/users.js",
       "name": "listUsers",
       "reason": "④仓储层替代读口（生产用它的「读全部用户」需求已由另一个读口承担）：P0 建它是为了给仓储层行形状做断言（P0 计划:3882「for (const row of listUsers(db)) assert.equal(row.password_hash, undefined)」）；生产上「读全部用户」的真实需求是反作弊多账号检测，走的是 listUsersForDetection（services/compute.js:31 import、:272 使用）。而**用户管理本身不是本产品的能力**：设计 §8 无 GET /api/users、§9 前端 IA 无「用户管理」条目（全文 grep 无「用户管理 / 成员管理 / 账号管理」）⇒ listUsers 是预留的管理读口，非产品路径缺口。"
     },
@@ -205,6 +210,26 @@
       "file": "src/db/repo/workflows.js",
       "name": "listWorkflowsByEdition",
       "reason": "④仓储层替代读口（同能力的另一个读口已接线）：届期工作流列表的生产出口是 GET /api/workflows → listWorkflowSummaries（server.js:274；P7 计划已把它定成对外形状）；listWorkflowsByEdition 是同族的对内读口（server.js:260 的注释即写明「仓储层本来就有 listStages / listWorkflowsByEdition，只是没有端点」）⇒ 非产品路径缺口。"
+    },
+    {
+      "file": "src/runtime/pidfile.js",
+      "name": "portFilePath",
+      "reason": "②同文件辅助：导出了但只有**同文件**调用（platform/src/runtime/pidfile.js:36 / :47 / :59 —— writePortFile / removePortFile / readPortFile 共用同一份路径规则）。它与 pidFilePath 是同族的「路径拼装」函数（pid 文件与端口文件放在同一处）⇒ 导出为测试便利，非产品路径缺口。"
+    },
+    {
+      "file": "src/runtime/service-state.js",
+      "name": "checkServiceState",
+      "reason": "①种子/运维脚本路径：调用方是 platform/scripts/restore.js（import + 恢复前的停服检查）与**同文件**的 assertServiceStopped。它回答的是「服务还在不在跑」这个**运维问题** —— 产品路径上不需要「探测自己还活着」这件事（服务自己不会给自己发 /api/health）。它从 scripts/restore.js 下沉到 src/runtime/ 的唯一原因，就是让 scripts/ 一侧的写库脚本（seed / migrate）能复用同一份判定（见 assertServiceStopped 条）⇒ **不能**放回 scripts/（src/ 不能反向依赖 scripts/）。"
+    },
+    {
+      "file": "src/runtime/service-state.js",
+      "name": "assertServiceStopped",
+      "reason": "①种子/运维脚本路径：唯一调用方是 platform/scripts/seed.js 与 platform/scripts/migrate.js（两个**部署期**脚本），而 scripts/ 按本闸口径**不算产品路径**。它是「单写者闸」的执行点（设计文档 §14.2 单写者约束 + README「SQLite 只允许单写进程」）：服务还活着时**拒绝**执行批量写 / 改 schema 的脚本。⚠️ 这是**刻意**的部署期闸 —— 与「改了数据库状态、必须留痕、必须可查」的运营动作同类，不是产品功能。"
+    },
+    {
+      "file": "src/db/repo/rate-limit.js",
+      "name": "deleteRateLimitEventsOlderThan",
+      "reason": "①种子/运维脚本路径：唯一调用方是 platform/scripts/prune.js（运维清理脚本），而 scripts/ 按本闸口径**不算产品路径**。限频计数事件表**只增不减**（每次登录失败 / 评分提交 / 申诉提交都写一行，窗口过了也不删）⇒ 需要一条批量清理的写口。⚠️ 删除判据是「updated_at 早于 now - retentionSeconds」，且 retentionSeconds 必须**严格大于任何规则的窗口**（本仓最宽的是 perHour = 1 小时，默认保留 24 小时）—— 删窗口内的行等于**绕过限频**，那才是真正的缺口。（有回归用例 test/ops-lifecycle.test.js 钉住这条不等式。）"
     }
   ]
 }

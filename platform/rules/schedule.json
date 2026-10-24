@@ -1,6 +1,6 @@
 {
   "id": "schedule",
-  "version": "2026-10-24",
+  "version": "2026-10-25",
   "source": "任务书 2.0 §六 赛段表（R-STG-01）",
   "note": "日期为赛段相对日序（月-日）；落到具体日历日期由 edition.starts_at 偏移。",
   "stages": [

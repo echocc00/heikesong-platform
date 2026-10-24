@@ -359,6 +359,28 @@ write_systemd_unit() {
   systemctl enable "$SERVICE_NAME"
 }
 
+write_systemd_timers() {
+  # 定时备份 + 定时清理（2026-10-25 评审 P2-7b）。
+  # ⚠️ 为什么必须补这一步：设计文档 §14.2 承诺了备份是**定时**的，
+  #    但 deploy/ 下此前只有 heikesong.service、**没有任何 .timer**
+  #    ⇒ 「定时」一直只是文档里的一句话，机器上并不会真的跑。
+  log "写 systemd 定时单元（备份 / 清理）"
+  install -d -m 0755 "$SYSTEMD_UNIT_DIR"
+  local unit
+  for unit in heikesong-backup.service heikesong-backup.timer \
+              heikesong-prune.service heikesong-prune.timer; do
+    [ -f "$ROOT/deploy/$unit" ] || die "缺少 $ROOT/deploy/${unit}（脚本必须在 platform/deploy/ 下）"
+    sed -e "s|__APP_DIR__|$(sed_escape "$APP_DIR")|g" \
+        -e "s|__DATA_DIR__|$(sed_escape "$DATA_DIR")|g" \
+        -e "s|__RUN_USER__|$(sed_escape "$RUN_USER")|g" \
+        "$ROOT/deploy/$unit" > "$SYSTEMD_UNIT_DIR/$unit"
+  done
+  systemctl daemon-reload
+  # ⚠️ `--now` 是**启动定时器**（不是立刻跑一次备份）：
+  #    定时器只是「到点触发」的调度器本身，enable 只是让它开机自启。
+  systemctl enable --now heikesong-backup.timer heikesong-prune.timer
+}
+
 # ── nginx reload 的「生效校验」 ────────────────────────────────────────
 # 踩过的坑（真实事故）：机器上残留着**另一个** nginx 实例（一个遗留的测试进程），
 # 它把 /run/nginx.pid 覆盖了 ⇒ `systemctl reload nginx` 把 SIGHUP 发给了
@@ -522,6 +544,32 @@ start_service() {
   fi
 }
 
+# ⛔ 迁移 / 种子数据之前必须**停服**（2026-10-25 评审 P1-4a 的单写者闸）。
+#
+# 为什么必须停：
+#   · 迁移改的是 **schema** —— 运行中的服务连接的还是旧 schema
+#     ⇒ 迁移一落地，服务的下一条 SQL 就可能撞「no such column」；
+#   · 种子会重写能力点 / 角色映射 ⇒ 在服务正在读写时跑
+#     ⇒ 库里一半旧规则、一半新规则 ⇒ 权限判定直接对不上。
+#
+# ⚠️ 这不是「多此一举」：scripts/migrate.js 与 scripts/seed.js 现在**自己**会查
+#    pid 文件，服务还活着时**拒绝执行**（人话报错 + 退出码 1）。
+#    ⇒ 本函数就是那道闸存在的理由；没有它，这一步会**静默地写坏库**。
+#    （本仓既有流程本来就在**首次**安装时先于 start_service 跑迁移，
+#      但**升级**时服务是运行中的 —— 那个洞一直在这里。）
+stop_service_for_maintenance() {
+  if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+    log "停服（迁移与种子数据前）"
+    systemctl stop "$SERVICE_NAME"
+    # 等它真的停下（server.js 退出时会删 pid 文件，闸才放行）
+    local i=0
+    while [ "$i" -lt 10 ] && systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; do
+      sleep 1
+      i=$((i + 1))
+    done
+  fi
+}
+
 main() {
   need_root
   # ⛔ 先查前置条件，再动任何东西：
@@ -544,8 +592,10 @@ main() {
   prepare_dirs
   copy_app
   write_env_file
+  stop_service_for_maintenance
   init_database
   write_systemd_unit
+  write_systemd_timers
   start_service
   write_nginx_site
 
@@ -556,6 +606,8 @@ main() {
   if [ -f "$APP_DIR/scripts/backup.js" ]; then
     log "  备份命令： cd $APP_DIR && DATA_DIR=$DATA_DIR node scripts/backup.js"
   fi
+  log "  定时备份： systemctl list-timers heikesong-backup.timer"
+  log "  定时清理： systemctl list-timers heikesong-prune.timer"
   log "  查看日志： journalctl -u $SERVICE_NAME -f"
 }
 

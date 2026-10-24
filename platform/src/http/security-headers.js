@@ -146,3 +146,51 @@ export function corsPreflightHeaders(req, allowMethods) {
     'Access-Control-Max-Age': String(maxAge),
   };
 }
+
+/**
+ * 这条请求的**客户端 IP**（用于「按来源」限频 —— 见 src/services/rate-limit.js）。
+ *
+ * ⚠️ **为什么不能直接用 `X-Forwarded-For`**：那个头是**客户端可伪造**的
+ *    （客户端随便填）⇒ 直接拿它当限频主体 ⇒ 攻击者换一个头就能绕过限频。
+ *    同款提醒见 services/rate-limit.js 的头部注释。
+ *
+ * ⚠️ **为什么「对端是回环」时可以信 X-Real-IP**：
+ *    本仓的 nginx 模板（deploy/nginx-plain-http.conf:62、
+ *    deploy/nginx-tls-port.conf:95）写的是
+ *      `proxy_set_header X-Real-IP $remote_addr;`
+ *    —— **覆盖写**（不是追加）⇒ 客户端伪造的同名头会被 nginx **整个替换**。
+ *    而 Node 只绑 127.0.0.1（src/server.js 的 listen）⇒ 对端是回环 = 同机的 nginx。
+ *
+ * ⚠️ **X-Forwarded-For 取「最后一段」**：nginx 用 `$proxy_add_x_forwarded_for`
+ *    （= 客户端自己填的 + nginx 追加的真实对端）⇒ **最后一段才是真实对端**，
+ *    前面的段全是客户端塞的 ⇒ 取最后一段，不取第一段。
+ *
+ * ⛔ **对端不是回环 ⇒ 一律用 `socket.remoteAddress`**（TCP 对端，不可伪造）。
+ *    这条是 fail-closed：宁可把所有人算成同一个来源（导致误伤），
+ *    也不能让攻击者靠伪造头**拿到独立配额**。
+ *
+ * ⚠️ **部署形态变更的注意**：如果运维把 Node 改成绑 0.0.0.0（对外直连），
+ *    对端就不再是回环 ⇒ 一律走 remoteAddress（= 真实客户端）⇒ 限频按真实 IP 生效，
+ *    **但此时 X-Real-IP / X-Forwarded-For 完全不被信任** —— 这是刻意的。
+ *
+ * @param {object} req node 的 IncomingMessage
+ * @returns {string} 客户端 IP；拿不到时返回 'unknown'（**不返回空串** —— 空串会
+ *                    让所有「拿不到 IP」的请求共享同一个限频桶）
+ */
+export function clientIp(req) {
+  const peer = String(req?.socket?.remoteAddress ?? '').trim();
+  const isLoopback = peer === '127.0.0.1' || peer === '::1' || peer === '::ffff:127.0.0.1';
+  if (isLoopback) {
+    const real = req?.headers?.['x-real-ip'];
+    if (real) {
+      const first = String(real).split(',')[0].trim();
+      if (first) return first;
+    }
+    const xff = req?.headers?.['x-forwarded-for'];
+    if (xff) {
+      const parts = String(xff).split(',').map((s) => s.trim()).filter(Boolean);
+      if (parts.length) return parts[parts.length - 1];
+    }
+  }
+  return peer || 'unknown';
+}

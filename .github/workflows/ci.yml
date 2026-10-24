@@ -150,9 +150,18 @@ jobs:
 
       # 计划块漂移审计：计划文档里的「已落地」必须与代码事实一致。
       # 只卡 C-RW（内容被改写导致的真漂移）；C-EXT 是结构性现象（后续阶段追加），不断言。
+      #
+      # ⚠️ 2026-10-25：plan-block-audit.mjs 现在**自己**承担退出码语义（C-RW > 0 ⇒ 退出码 1），
+      #    不再寄生在下面的 grep 逻辑里 ⇒ 这里必须**显式接住退出码**：
+      #    GitHub Actions 的默认 shell 带 `-e -o pipefail` ⇒ 命令替换返回非 0 会
+      #    **当场掐断这一步** ⇒ 下面的 echo / ::error:: 注解全跑不到
+      #    ⇒ 失败会变成「早但不细」（没有 C-RW 清单、没有指向哪个文件）。
       - name: 计划块漂移审计
         run: |
+          set +e
           OUT="$(node docs/tools/plan-block-audit.mjs platform)"
+          CODE=$?
+          set -e
           echo "$OUT"
           # 从汇总行里取 C-RW 计数，非 0 即失败（真漂移 ⇒ 计划块必须同步到当前实现）
           # ⛔ 提取为空**必须报错**：原来写的是 ${RW:-0} —— grep 没匹配上时 RW 是空串，
@@ -167,5 +176,11 @@ jobs:
           fi
           if [ "$RW" != "0" ]; then
             echo "::error::计划块真漂移 C-RW=$RW —— 计划块必须同步到当前实现"
+            exit 1
+          fi
+          # 工具自己的退出码也要看：它覆盖「读不到计划文件 / cwd 不对 / 自检失败」这些
+          # 「根本跑不起来」的情形（退出码 2）⇒ 不能只看 C-RW 计数。
+          if [ "$CODE" != "0" ]; then
+            echo "::error::计划块漂移闸退出码 $CODE（非 0 ⇒ 闸没通过）"
             exit 1
           fi

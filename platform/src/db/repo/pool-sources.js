@@ -17,6 +17,57 @@ export function getEdition(db, editionId) {
   return db.prepare('SELECT * FROM editions WHERE id = ?').get(editionId) ?? null;
 }
 
+/**
+ * 某人**与哪些届期有关联**（去重、升序）—— 三池读取的届期授权依据。
+ *
+ * ⚠️ **为什么不能只看报名**（2026-10-24 评审，F33 的残留面）：
+ *    F33 的第一版修法把「缺省届期」从 **viewer 自己的报名记录**推导。
+ *    但**显式传 `editionId` 的那条路径没有任何届期校验** ⇒ 只要带上别的届期 id，
+ *    `canReadPool` 走的是 `can()` 的**角色分支**（角色授权是全局的，
+ *    INTERFACES.md:22 明文）⇒ 任何持有 `pool:read` 的登录用户
+ *    （captain / member / enterprise / enterprise_admin 四个角色都持有）
+ *    都能读到**其它届期**参赛者的姓名、单位、积分、MBA 状态。
+ *    ⇒ 修法必须补一条**领域事实**闸（与 F30 / F42 同一把尺子）：
+ *      非组委会 ⇒ viewer 必须**与该届有关联**。
+ *
+ * ⚠️ **为什么关联是四条事实的并集，而不是「报名过」一条**：
+ *    **企业侧不报名** —— 企业通过①提交任务卡、②在赛段上做企业确认来参与，
+ *    而 `submitRegistration` 只面向选手（种子数据里只有队长/组员报名）。
+ *    ⇒ 只认报名会把「本该看人才池的企业」也挡在门外（业务回归）。
+ *    ⇒ 四条事实：
+ *      ① 报名           registrations(user_id)
+ *      ② 出题 / 代提交   task_packages(enterprise_id | submitted_by)
+ *      ③ 企业确认        enterprise_confirmations(enterprise_id) → stages.edition_id
+ *      ④ 积分记录        points_ledger(user_id)
+ *         —— ④ 之所以要加：池成员的定义**本身就是**「该届有积分的人」
+ *            （见同文件 listEditionUsers）⇒ 「谁在这个池里」与「谁能看这个池」
+ *            必须是**同一个口径**，否则会出现「你在池里，却看不到这个池」。
+ *
+ * ⚠️ **本函数只如实返回事实，不替调用方决定放不放行**（放行判定在服务层：
+ *    src/services/pools.js 的 canReadPool）—— 与同文件 listEditionIdsByUser 同款纪律。
+ */
+export function listPoolEditionIds(db, userId) {
+  return db
+    .prepare(
+      `SELECT edition_id FROM (
+         SELECT DISTINCT edition_id FROM registrations
+          WHERE user_id = ? AND deleted_at IS NULL
+         UNION
+         SELECT DISTINCT edition_id FROM task_packages
+          WHERE deleted_at IS NULL AND (enterprise_id = ? OR submitted_by = ?)
+         UNION
+         SELECT DISTINCT s.edition_id
+            FROM enterprise_confirmations ec
+            JOIN stages s ON s.id = ec.stage_id
+           WHERE ec.deleted_at IS NULL AND ec.enterprise_id = ?
+         UNION
+         SELECT DISTINCT edition_id FROM points_ledger WHERE user_id = ?
+       ) ORDER BY edition_id`,
+    )
+    .all(userId, userId, userId, userId, userId)
+    .map((r) => r.edition_id);
+}
+
 export function listEditionTeams(db, editionId) {
   return db
     .prepare('SELECT id, name, task_package_id, tier FROM teams WHERE edition_id = ? AND deleted_at IS NULL ORDER BY id')

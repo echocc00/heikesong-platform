@@ -1,0 +1,25 @@
+# deploy/heikesong-backup.timer — 每日定时备份
+#
+# 依据：设计文档 §14.2【决策】备份是**定时**的（此前 deploy/ 下只有 .service、没有 .timer
+#   ⇒ 「定时」这件事一直是**口头承诺**，机器上并没有真的会跑）。
+#
+# ⚠️ 为什么是 03:17 而不是 03:00：
+#   整点是全网备份任务的峰值（各家 cron / 云盘快照都挤在 00:00）。
+#   错开几分钟 ⇒ 本机不会和别的任务抢磁盘 IO。
+# ⚠️ RandomizedDelaySec=300：再叠加最多 5 分钟的随机延迟 ——
+#   多台机器（城市联络员 / 评审机）不会在同一秒同时打 IO。
+# ⚠️ Persistent=true：关机期间错过的触发，**开机后补跑一次**
+#   （否则「周末关机 ⇒ 整个周末没有备份」这种坑会真实发生）。
+
+[Unit]
+Description=每日定时备份（Heikesong Platform）
+Documentation=file:__APP_DIR__/README.md
+
+[Timer]
+OnCalendar=*-*-* 03:17:00
+Persistent=true
+RandomizedDelaySec=300
+Unit=heikesong-backup.service
+
+[Install]
+WantedBy=timers.target

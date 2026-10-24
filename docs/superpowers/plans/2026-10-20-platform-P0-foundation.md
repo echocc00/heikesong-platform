@@ -1998,7 +1998,7 @@ Expected: FAIL —— `Cannot find module '../src/config.js'`
 ```javascript
 {
   "id": "tiebreak",
-  "version": "2026-10-24",
+  "version": "2026-10-25",
   "conflictRef": "C-03",
   "source": "S7 §3.3 + S10 §0.4 + S10 §3.3（原文互相冲突，此处为裁决后的有序链）",
   "chain": [
@@ -2017,7 +2017,7 @@ Expected: FAIL —— `Cannot find module '../src/config.js'`
 ```javascript
 {
   "id": "ranks",
-  "version": "2026-10-24",
+  "version": "2026-10-25",
   "source": "S10 §2.2 段位表 + §2.3 降级与权益",
   "tiers": [
     { "key": "D", "name": "出题", "minMilestones": 0, "requiresBusinessSignoff": false },
@@ -2047,7 +2047,7 @@ Expected: FAIL —— `Cannot find module '../src/config.js'`
 ```javascript
 {
   "id": "behavior",
-  "version": "2026-10-24",
+  "version": "2026-10-25",
   "source": "S10 §3.1 计分明细 + §3.2 达标线 + §3.3 占比上限",
   "completionThreshold": 60,
   "maxWeightShare": 0.10,
@@ -2067,7 +2067,7 @@ Expected: FAIL —— `Cannot find module '../src/config.js'`
 ```javascript
 {
   "id": "visibility",
-  "version": "2026-10-24",
+  "version": "2026-10-25",
   "conflictRef": "C-02",
   "source": "S10 §0.3 分层公开 + §8 风险表",
   "rank": {
@@ -2114,7 +2114,7 @@ Expected: FAIL —— `Cannot find module '../src/config.js'`
 ```javascript
 {
   "id": "solvability",
-  "version": "2026-10-24",
+  "version": "2026-10-25",
   "source": "顶层文档 §3.2 六维可解性准入",
   "dimensions": [
     { "key": "problem_clarity", "label": "问题确定性", "weight": 0.30, "max": 3 },
@@ -2152,7 +2152,7 @@ Expected: FAIL —— `Cannot find module '../src/config.js'`
 ```javascript
 {
   "id": "milestones-default",
-  "version": "2026-10-24",
+  "version": "2026-10-25",
   "source": "S10 §4 商业里程碑 7 类 + §3.4 里程碑清单报名时固定｜R-PTS-11：下面这 7 类就是「L2 商业里程碑分」的完整类目（企业问题确认 / 真实数据接入 / 可演示原型 / 试点合同 / 业务迭代 N 轮 / 意向客户 M 家 / 确认收入 ¥X）｜R-PTS-12：里程碑与段位**共享「企业签字」这一个数据源**（countsTowardTier / signoffRequires），但**不共享任何一条规则** —— 里程碑表在这里，段位表在 rules/ranks.json，两边各自独立配置",
   "note": "报名时随战队固定，赛程中不可自行新增（S10 §3.4 防拆单刷里程碑）",
   "items": [
@@ -4340,21 +4340,38 @@ export function listUsersForDetection(db) {
 // ⛔ 预审修正（I5-1）：会话的全部 SQL 从 src/auth/session.js 搬到这里。
 // ⛔ 库里只存 token_hash（SHA-256 十六进制），**不存明文 token**。
 export function insertSession(db, { tokenHash, userId, createdAt, expiresAt }) {
+  // ⚠️ last_touch_at 落库时就是 created_at —— 会话**刚签发**时的那次「续期」，
+  //    正是「脏才写」的起点（P1-3a）。不落这一列 ⇒ 第一次访问就会写库。
   db.prepare(
-    'INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)',
-  ).run(tokenHash, userId, createdAt, expiresAt);
+    'INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_touch_at) VALUES (?, ?, ?, ?, ?)',
+  ).run(tokenHash, userId, createdAt, expiresAt, createdAt);
 }
 
 export function findSessionByHash(db, tokenHash) {
   // ⚠️ created_at 必须一起取：绝对过期上限是从**签发时刻**算起的（设计文档 §7.5），
   //    没有签发时刻就无从判断"这个会话最多能活多久"。
+  // ⚠️ last_touch_at 也要取：P1-3a「脏才写」要靠它判断「距上次续期是否已过阈值」。
   return db
-    .prepare('SELECT user_id, created_at, expires_at FROM sessions WHERE token_hash = ?')
+    .prepare('SELECT user_id, created_at, expires_at, last_touch_at FROM sessions WHERE token_hash = ?')
     .get(tokenHash) ?? null;
 }
 
-/** 滑动续期：把 expires_at 顺延（设计文档 §7.5） */
-export function touchSessionExpiry(db, tokenHash, expiresAt) {
+/**
+ * 滑动续期：把 expires_at 顺延，**并记下本次续期时刻**（设计文档 §7.5 + P1-3a）。
+ *
+ * ⚠️ lastTouchAt 缺省不写 —— 那样只会改 expires_at，「脏才写」的判据就永远停在旧值上，
+ *    下一次访问又会再写一次（等于没修）。调用方必须传。
+ *
+ * @param {string} tokenHash
+ * @param {string} expiresAt 新的过期时刻（ISO）
+ * @param {string} [lastTouchAt] 本次续期时刻（ISO）
+ */
+export function touchSessionExpiry(db, tokenHash, expiresAt, lastTouchAt = null) {
+  if (lastTouchAt) {
+    return db
+      .prepare('UPDATE sessions SET expires_at = ?, last_touch_at = ? WHERE token_hash = ?')
+      .run(expiresAt, lastTouchAt, tokenHash).changes;
+  }
   return db
     .prepare('UPDATE sessions SET expires_at = ? WHERE token_hash = ?')
     .run(expiresAt, tokenHash).changes;
@@ -4366,6 +4383,28 @@ export function deleteSessionByHash(db, tokenHash) {
 
 export function deleteSessionsByUser(db, userId) {
   return db.prepare('DELETE FROM sessions WHERE user_id = ?').run(userId).changes;
+}
+
+/**
+ * 吊销某用户的会话，但**保留指定的某一个**。
+ *
+ * 依据：设计文档 §7.5「强制下线」与「改口令后其它设备掉线」两个场景：
+ *   · 强制下线 ⇒ exceptHash = null ⇒ 全删（含当前会话）。
+ *   · 改口令   ⇒ exceptHash = 当前会话的哈希 ⇒ 只删别的设备。
+ * ⛔ 保留的那一个用 `token_hash <> ?` 排除 —— 数据库只存哈希，
+ *    调用方传进来的必须是 tokenHash(token)（见 src/auth/session.js）。
+ *
+ * @param {string} userId
+ * @param {string|null} exceptHash 要保留的会话哈希（null = 全删）
+ * @returns {number} 被删除的会话条数
+ */
+export function deleteSessionsByUserExcept(db, userId, exceptHash = null) {
+  if (!exceptHash) {
+    return db.prepare('DELETE FROM sessions WHERE user_id = ?').run(userId).changes;
+  }
+  return db
+    .prepare('DELETE FROM sessions WHERE user_id = ? AND token_hash <> ?')
+    .run(userId, exceptHash).changes;
 }
 
 export function countActiveSessions(db, userId, { now = new Date() } = {}) {
@@ -7349,6 +7388,7 @@ import { isRetryableDbError } from './db/tx.js';
 import { loadRules, validateRules } from './config.js';
 import { createRouter } from './http/router.js';
 import { json, error, text } from './http/respond.js';
+import { responseHeaders, corsPreflightHeaders, clientIp } from './http/security-headers.js';
 import { registerWorkflowRoutes } from './http/routes/workflow.js';
 import { registerPoolsRoutes } from './http/routes/pools.js';
 import { registerPublicRoutes } from './http/routes/public.js';
@@ -7359,13 +7399,13 @@ import { createSession, resolveSession, revokeSession } from './auth/session.js'
 import { can } from './auth/permissions.js';
 import { verifyPassword, hashPassword } from './auth/password.js';
 import { changePassword, logoutAllSessions } from './services/auth.js';
-import { assertRateLimit, loginSubjectKey } from './services/rate-limit.js';
+import { assertRateLimit, checkRateLimit, loginSubjectKey, loginIpSubjectKey } from './services/rate-limit.js';
 import { getUserById, getCredentialsByPhone, toPublicUser } from './db/repo/users.js';
 import { listUserRoles } from './db/repo/roles.js';
 import { listUserCapabilities } from './db/repo/assignments.js';
 import { getStage, getStageJudge, listStageSummaries } from './db/repo/stages.js';
 import { listWorkflowSummaries } from './db/repo/workflows.js';
-import { appError, AppError } from './errors.js';
+import { appError, AppError, rateLimited } from './errors.js';
 import { registerRegistrationRoutes, pickCurrentEdition } from './http/routes/registration.js';
 import { registerTaskPackageRoutes } from './http/routes/taskPackage.js';
 import { registerTeamRoutes } from './http/routes/team.js';
@@ -7374,6 +7414,7 @@ import { registerMilestoneRoutes } from './http/routes/milestone.js';
 import { registerSignoffRoutes } from './http/routes/signoff.js';
 import { registerBehaviorRoutes } from './http/routes/behavior.js';
 import { registerAuditRoutes } from './http/routes/audit.js';
+import { registerAdminRoutes } from './http/routes/admin.js';
 import { registerPublishRoutes } from './http/routes/publish.js';
 import { registerTiebreakRoutes } from './http/routes/tiebreak.js';
 import { registerStageRoutes } from './http/routes/stages.js';
@@ -7382,7 +7423,7 @@ import { getLeaderboard, getRollingLeaderboard } from './services/leaderboard.js
 import { getPerformanceCard } from './services/performance-card.js';
 import { getTeamTier, getTierBoard } from './services/tier.js';
 import { listEditions, getEdition } from './db/repo/editions.js';
-import { writePidFile, removePidFile, writePortFile, removePortFile, readPidFile, isProcessAlive } from './runtime/pidfile.js';
+import { removePidFile, writePortFile, removePortFile, claimPidFile, releasePidFile } from './runtime/pidfile.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -7457,6 +7498,20 @@ function hasMalformedEncoding(path) {
   } catch {
     return true;
   }
+}
+
+/**
+ * Allow 头的值：该路径上注册的方法 + HEAD（GET 隐含 HEAD）+ OPTIONS。
+ *
+ * ⚠️ F27（缺陷报告 2026-10-23 §3.5，:1637-1671）：OPTIONS 原来 404 ⇒ 跨源预检失败。
+ *    修法 ② 原文：「在 src/server.js 里统一处理 OPTIONS，回 Allow + Access-Control-Allow-Methods」。
+ *    ⚠️ Allow 必须**如实**（RFC 9110 §9.3.2）：只写 GET 的端点不能被列成 POST。
+ */
+function allowHeader(methods) {
+  const set = new Set(methods);
+  if (set.has('GET')) set.add('HEAD');
+  set.add('OPTIONS');
+  return [...set].sort().join(', ');
 }
 
 /**
@@ -7556,6 +7611,8 @@ export function createApp({ db, rules, webDir }) {
   router.add('GET', '/api/health', async () => ({ ok: true, at: new Date().toISOString() }));
   // P4 审计 API（7 个接口 + 申诉列表）：计算快照 / 复算 diff / 审计日志 / 复核队列 / 申诉
   registerAuditRoutes(router, { db, rules });
+  // 管理端点（2026-10-24 评审补记）：登录限频的人工解锁兜底
+  registerAdminRoutes(router, { db });
 
   // ── P3 榜单与积分 ───────────────────────────────────────────
   // ⚠️ 路由优先级由 P0 的 router **逐段比较**决定：静态段胜参数段
@@ -7628,13 +7685,44 @@ export function createApp({ db, rules, webDir }) {
 
   // ⛔ 预审修正（I7-1）：P0 原本**没有登录接口** → README 宣称的「能登录的空系统」不成立，
   //    Task 5 产出的 createSession 也没有任何调用方。补上登录/登出。
-  router.add('POST', '/api/auth/login', async ({ body }) => {
+  router.add('POST', '/api/auth/login', async ({ body, ip }) => {
     const phone = String(body?.phone ?? '').trim();
     const password = String(body?.password ?? '');
     const cred = getCredentialsByPhone(db, phone);
     // 用户不存在与密码错误返回**同一个**错误码 → 避免用户枚举（响应层）
     // ⛔ 而且**耗时也必须一致**（时间层）：用户不存在时照样跑一次 scrypt，
     //    否则两条路径差 100 倍 → 枚举手机号。见 dummyHash() 的注释。
+    // ⚠️⚠️ **来源维度的只读预检 —— 必须在 scrypt 之前**（2026-10-24 评审轮）。
+    //    复核发现：原实现的限频判定**在口令校验之后** ⇒ 被限流的请求
+    //    **照样跑一遍 scrypt** ⇒ 限频只把 401 换成 429，**挡不住 CPU 打爆**
+    //    ⇒ 那才是真实的 DoS 面。
+    //    ⚠️ **评审说的「把受害者锁在门外」并不成立**：限频判定**只在口令校验失败
+    //    的分支里**执行 ⇒ **正确口令永远能登录** ⇒ 这条不变量必须保住
+    //    （它正是对「账号被锁死」的根本防护）。
+    //    ⇒ 这里用 consume:false 的**只读预检**：来源已被判定为攻击源 ⇒
+    //      **直接 429，scrypt 根本不跑**。
+    //    ⚠️ **只对「来源」维度做前置预检**；「账号」维度的判定**留在失败分支**
+    //    ⇒ 正确口令永远能登录。
+    //    ⚠️ **代价（必须写清楚）**：来源预检会**连正确口令一起挡**
+    //    ⇒ 共享出口 IP（同一办公室/校园网）的人共享这一个桶 ⇒
+    //      这是**刻意 fail-closed**（宁可多人等 60 秒，也不许 CPU 被打爆）。
+    //      阈值见 rules/audit.json 的 loginAttemptByIp（按共享出口的规模调）。
+    const ipSubject = loginIpSubjectKey(ip);
+    const ipPre = checkRateLimit({
+      db,
+      subjectKey: ipSubject,
+      rule: 'loginAttemptByIp',
+      now: new Date().toISOString(),
+      limits: rules?.audit?.rateLimit,
+      subjects: { default: ipSubject },
+      consume: false,
+    });
+    if (!ipPre.allowed) {
+      throw rateLimited(
+        `登录来源触发限频，请 ${ipPre.retryAfterSeconds} 秒后重试`,
+        { retryAfterSeconds: ipPre.retryAfterSeconds, rule: 'loginAttemptByIp', layers: ipPre.layers },
+      );
+    }
     const passwordOk = verifyPassword(password, cred ? cred.password_hash : dummyHash());
     const ok = !!cred && cred.active === 1 && passwordOk;
     if (!ok) {
@@ -7644,6 +7732,18 @@ export function createApp({ db, rules, webDir }) {
       //    （否则多设备/多标签页反复登录会被自己的配额挡住）。
       //    配额用尽 ⇒ 429 + Retry-After（server.js 的错误分支统一加头），不再回 401。
       //    ⚠️ 放在口令校验**之后**：先校验、再计数 —— 只有「真的错了」才消耗配额。
+      //    ⚠️ **两个维度都记**：来源维度（攻击者的流量消耗自己的桶）
+      //      + 账号维度（挡的是「爆破某一个账号的口令」）。
+      //    ⚠️ **枚举安全**：来源维度的判定与「账号是否存在」**完全无关**
+      //      ⇒ 不泄露手机号是否已注册（与下面「用户不存在也照样跑 scrypt」同一纪律）。
+      assertRateLimit({
+        db,
+        subjectKey: ipSubject,
+        rule: 'loginAttemptByIp',
+        now: new Date().toISOString(),
+        limits: rules?.audit?.rateLimit,
+        subjects: { default: ipSubject },
+      });
       const loginSubject = loginSubjectKey(phone);
       assertRateLimit({
         db,
@@ -7790,6 +7890,26 @@ export function createApp({ db, rules, webDir }) {
           sendSseEvent(res, 'connected', { stageId: ssePath.stageId, at: new Date().toISOString() });
           return;
         }
+        // ── F27：OPTIONS 统一处理（跨源预检 / 能力探测）────────────
+        // ⚠️ 修法（缺陷报告 §3.5 F27 ②）：OPTIONS 原来一律 404 ⇒ 跨源预检直接失败。
+        //    现在：**该路径上有注册路由** ⇒ 回 204 + Allow（如实列出支持的方法）
+        //    + 预检头（CORS 开启时才有，见 security-headers.js）；
+        //    **没有注册路由** ⇒ 仍然 404（OPTIONS 不是万能 204）。
+        if (req.method === 'OPTIONS') {
+          const methods = router.allowedMethods(url);
+          if (!methods.length) {
+            error(res, 404, 'NOT_FOUND', `无此接口: ${req.method} ${url}`);
+            return;
+          }
+          const allow = allowHeader(methods);
+          res.writeHead(204, {
+            ...responseHeaders(req),
+            Allow: allow,
+            ...corsPreflightHeaders(req, allow),
+          });
+          res.end();
+          return;
+        }
         const match = router.match(req.method, url);
         if (!match) {
           // 畸形 URL 编码 → 400（请求本身非法）；真没这个接口 → 404
@@ -7814,6 +7934,12 @@ export function createApp({ db, rules, webDir }) {
           sessionToken,
           db,
           rules,
+          // ⚠️ 客户端 IP（2026-10-24 评审补记）：登录限频要按**来源**再记一份，
+          //    否则知道手机号的人可以故意输错口令把受害者本人锁在门外。
+          //    ⚠️ 可信度由传输层保证（见 http/security-headers.js 的 clientIp）：
+          //    对端是回环（同机 nginx）才采信 X-Real-IP / X-Forwarded-For 末段；
+          //    否则一律用 socket.remoteAddress（不可伪造）。
+          ip: clientIp(req),
           params: match.params,
           body,
           query: Object.fromEntries(new URL(url, 'http://x').searchParams),
@@ -7830,7 +7956,8 @@ export function createApp({ db, rules, webDir }) {
         if (result && typeof result === 'object' && typeof result.status === 'number') {
           const { status, body: payload } = result;
           if (status === 204) {
-            res.writeHead(204);
+            // ⚠️ F28：204 也是一条响应 ⇒ 同样带安全头（口径见 security-headers.js）。
+            res.writeHead(204, responseHeaders(req));
             res.end();
             return;
           }
@@ -7883,7 +8010,11 @@ export function createApp({ db, rules, webDir }) {
     // ⛔ 评审修正（Important）：静态分支原来在 try/catch **之外** ——
     //    serveStatic 抛出的任何异常都会逸出 handle → 进程死亡。
     //    现在它在自己的 try 里；异常一律回 404，不影响进程。
-    if (req.method === 'GET') {
+    // ⚠️ F27：HEAD 也走静态分支（HEAD 与 GET 共享同一套响应头，只是不带响应体；
+    //    探针常探 `/` 而不是 `/api/health` ⇒ 静态页也必须能被 HEAD 命中）。
+    //    Node 自己会丢弃 HEAD 的响应体（ServerResponse._hasBody = false），
+    //    而 Content-Length 照发（探针要靠它判断体量）。
+    if (req.method === 'GET' || req.method === 'HEAD') {
       try {
         if (serveStatic(webDir, req, res)) return;
         // 演示模式（DEMO_MODE=1）：领域层与规则配置不在 web/ 下，挂出去。
@@ -7939,23 +8070,34 @@ if (isMain) {
 
   const { rules, version } = loadRules(rulesDir);
 
-  // ── 单写者闸（E169 / F5）────────────────────────────────────────
+  // ── 单写者闸（E169 / F5 + P1-4b 独占创建）────────────────────────
   // 依据：README 的头号架构承诺「SQLite 只允许单写进程」+ 设计文档 §14.2。
   // 修复前：pid 文件在 listen **之前**写、而且**从不检查**是否已有实例
   //        ⇒ 同一个 DATA_DIR 可以同时起两个服务、两个都启动成功
   //        ⇒ F8 已证明这种双写会直接撞出 SQLITE_BUSY / 517。
   // ⚠️ 必须在**开库之前**判：库一打开就可能与对方抢写锁了。
-  const livePid = readPidFile(dataDir);
-  if (livePid && livePid !== process.pid && isProcessAlive(livePid)) {
+  //
+  // ⚠️⚠️ P1-4b：**只检查不占有**是有洞的（TOCTOU）——
+  //    修复前的时序是「① 读 pid 文件判断有没有别人 → ……（开库、跑迁移、建应用、
+  //    listen，几百毫秒）…… → ② listen 成功后写自己的 pid」。
+  //    两个并发启动的实例可以**同时**通过 ① ⇒ 一起开库、一起写 ⇒ SQLITE_BUSY。
+  //    ⇒ 现在用**独占创建**（O_CREAT|O_EXCL）占住闸：内核保证只有一个能拿到。
+  //    陈旧残留（进程已死）⇒ 自动接管，运维不用手工删文件。
+  const claim = claimPidFile(dataDir);
+  if (!claim.ok) {
     console.error(
-      `[server] 拒绝启动：数据目录 ${dataDir} 已被进程 ${livePid} 占用。`
+      `[server] 拒绝启动：数据目录 ${dataDir} 已被占用（${claim.reason}）。`
       + '单写者约束：同一个 SQLite 文件只允许一个写进程（并发写会撞 SQLITE_BUSY / 517）。'
       + '请先停掉那个进程再启动本实例。',
     );
     process.exit(1);
   }
-  // ⚠️ pid 文件指向**已死**进程 ⇒ 上次崩溃留下的残留 ⇒ 允许接管（并覆盖它）。
-  //    不允许接管 ⇒ 崩一次就再也起不来（运维得手工删 pid 文件才能重启）。
+  // ⚠️ 从这一刻起，pid 文件登记的是**本进程** ⇒ 别的实例来了会被挡。
+  //    下面任何一条启动失败路径都必须把它还回去（否则留下一个指向已死进程的
+  //    陈旧 pid ⇒ 恢复闸会把「服务已停」误判成「服务还在跑」，见 F13）。
+  const releaseClaim = () => { releasePidFile(dataDir, process.pid); };
+  // 进程退出（含未捕获异常）时把闸还回去 —— 正常退出路径另有 removePidFile。
+  process.on('exit', releaseClaim);
 
   const { db, close } = openDatabase({ dataDir });
   applyMigrations(db, migrationsDir);
@@ -7969,17 +8111,20 @@ if (isMain) {
   //    退出码也不是 1 ⇒ 运维看不出「到底为什么没起来」。
   server.on('error', (err) => {
     console.error(`[server] 启动失败：${err.message}`);
+    // ⚠️ F13：启动失败**不得留下 pid 文件** —— 指向已死进程的陈旧 pid
+    //    会让恢复闸误判「服务没在跑」（恢复会在服务正在写库时进行）。
+    //    闸是本进程自己拿到的（独占创建）⇒ 现在还回去。
+    releaseClaim();
     process.exit(1);
   });
   server.listen(port, '127.0.0.1', () => {
-    // ── P6：写 pid 文件 + 端口文件 ───────────────────────────────
-    // ⚠️ 必须挪到 **listen 成功之后**（E169 / F13）：
-    //    修复前写在 listen 之前 ⇒ 启动失败（端口被占）时也把 pid 文件覆盖成自己的 pid
-    //    ⇒ 留下一个指向**已死进程**的陈旧 pid ⇒ 恢复闸误判「服务没在跑」。
+    // ── P6：写端口文件 ───────────────────────────────────────────
+    // ⚠️ pid 文件**已经在启动最前面**写好了（独占创建，见上面的单写者闸）——
+    //    这里**不再**覆盖写：那会是一次**非独占**的写 ⇒ 可能把别人的 pid 覆盖掉
+    //    ⇒ 单写者闸形同虚设（P1-4b 要修的正是这个洞）。
     // ⚠️ 端口文件记的是**实际**监听端口（PORT=0 时是内核分配的，不是 0）——
     //    恢复闸靠它去主动探测「服务还在不在」（见 src/runtime/service-probe.js）。
     const actualPort = server.address()?.port ?? port;
-    writePidFile(dataDir);
     writePortFile(dataDir, actualPort);
     console.log(`heikesong-platform 启动于 http://127.0.0.1:${actualPort}（规则版本 ${version}）`);
   });

@@ -1,6 +1,6 @@
 {
   "id": "visibility",
-  "version": "2026-10-24",
+  "version": "2026-10-25",
   "conflictRef": "C-02",
   "source": "S10 §0.3 分层公开 + §8 风险表",
   "rank": {

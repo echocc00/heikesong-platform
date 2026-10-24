@@ -764,7 +764,17 @@ Expected: FAIL —— `Cannot find module '../scripts/backup.js'`
 //      · 后者 ⇒ 恢复正是该做的事。
 //    ⇒ 恢复闸在 pid 文件缺失或陈旧时，会用端口文件去**主动探测**服务是否还在应答
 //      （见 src/runtime/service-probe.js）—— 这是唯一能分辨这两种情况的证据。
-import { writeFileSync, readFileSync, unlinkSync, existsSync, mkdirSync } from 'node:fs';
+//
+// ⚠️ **pid 文件同时是「单写者闸」的独占锁**（2026-10-25 评审 P1-4b）：
+//    修复前 server.js 的时序是「① 检查 pid 文件有没有别人 → ……（开库、跑迁移、
+//    建应用、listen 几百毫秒）…… → ② listen 成功后写自己的 pid」⇒
+//    两个实例**同时**启动时，两个都能通过 ① ⇒ 一起开库、一起写 ⇒ SQLITE_BUSY。
+//    ⇒ 现在改成**独占创建**（claimPidFile）：`openSync(path, 'wx')` 是原子的
+//      「不存在才创建」⇒ 天然互斥 ⇒ 只有一个实例能拿到闸。
+import {
+  writeFileSync, readFileSync, unlinkSync, existsSync, mkdirSync,
+  openSync, writeSync, closeSync, fsyncSync,
+} from 'node:fs';
 import { join } from 'node:path';
 
 export function pidFilePath(dataDir) {
@@ -776,11 +786,79 @@ export function portFilePath(dataDir) {
   return join(dataDir, 'app.port');
 }
 
-export function writePidFile(dataDir, pid = process.pid) {
+/**
+ * **独占**地占住 pid 文件（单写者闸的原子原语）。
+ *
+ * ⚠️ 为什么必须是 `openSync(path, 'wx')`（O_CREAT | O_EXCL）：
+ *    「先看文件在不在、再写」在并发下是**有洞的**（TOCTOU）——
+ *    两个实例可以同时看到「文件不存在」，然后都写进去。
+ *    O_EXCL 让「创建」本身成为原子操作：内核保证**只有一个**调用者成功。
+ *
+ * ⚠️ 拿到闸之后**立刻**把自己的 pid 写进去：别的实例读到的是「一个活着的 pid」
+ *    ⇒ 它们会直接拒绝启动，而不是「文件存在但读不出 pid」那种说不清的状态。
+ *
+ * ⚠️ **fail-closed**：文件存在但内容读不出合法 pid ⇒ **无法证明**上一个实例已死
+ *    ⇒ 拒绝启动（而不是当成陈旧残留抢过来）。
+ *    运维确认服务确实停了，删掉这个 pid 文件即可继续。
+ *    （与 src/runtime/service-state.js 的同一口径：拿不到证据就拒绝。）
+ *
+ * @param {string} dataDir
+ * @param {number} [pid]
+ * @returns {{ ok: true, pid: number } | { ok: false, pid: number|null, reason: string }}
+ */
+export function claimPidFile(dataDir, pid = process.pid) {
   mkdirSync(dataDir, { recursive: true });
   const p = pidFilePath(dataDir);
-  writeFileSync(p, String(pid), 'utf8');
-  return p;
+  // 只重试一次：第一次撞到 EEXIST 时若判定为「陈旧残留」⇒ 清掉后再试一次。
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let fd;
+    try {
+      fd = openSync(p, 'wx');
+    } catch (err) {
+      if (err.code !== 'EEXIST') throw err;
+      const existing = readPidFile(dataDir);
+      if (existing && isProcessAlive(existing)) {
+        return { ok: false, pid: existing, reason: `pid 文件显示进程 ${existing} 仍在运行` };
+      }
+      if (existing === null) {
+        // 文件存在但内容不是合法 pid ⇒ 拿不到「拥有者已死」的证据 ⇒ 拒绝（fail-closed）
+        return { ok: false, pid: null, reason: 'pid 文件存在但内容无法解析，无法确认上一个实例已退出' };
+      }
+      // 陈旧残留（进程已退出）⇒ 清掉后重试一次
+      try { unlinkSync(p); } catch { /* 已被别人清掉 ⇒ 重试时自然成功 */ }
+      continue;
+    }
+    try {
+      writeSync(fd, String(pid));
+      // fsync：让「pid 文件一定有完整内容」这件事在崩溃后也成立
+      //（否则可能留下一个**空文件** ⇒ 下次启动只能 fail-closed 地让人手工清理）。
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    return { ok: true, pid };
+  }
+  return { ok: false, pid: null, reason: '无法独占 pid 文件（可能刚被并发启动的实例抢走）' };
+}
+
+/**
+ * 释放 pid 文件 —— **只释放自己的**。
+ *
+ * ⚠️ 为什么不能无条件删：万一这个文件已经是别人的了（陈旧残留被接管等），
+ *    删掉它就等于**把别人的单写者闸拆了** ⇒ 下一个实例可能同时开库。
+ *
+ * @returns {boolean} 是否真的删掉了
+ */
+export function releasePidFile(dataDir, pid = process.pid) {
+  const p = pidFilePath(dataDir);
+  if (!existsSync(p)) return false;
+  if (readPidFile(dataDir) !== pid) return false;
+  try {
+    unlinkSync(p);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export function writePortFile(dataDir, port) {
@@ -1063,11 +1141,16 @@ import {
   copyFileSync, existsSync, renameSync, unlinkSync, readdirSync, mkdirSync, realpathSync,
 } from 'node:fs';
 import { join, basename, dirname } from 'node:path';
-import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { readPidFile, pidFilePath, isProcessAlive } from '../src/runtime/pidfile.js';
-import { probeService } from '../src/runtime/service-probe.js';
+import { checkServiceState } from '../src/runtime/service-state.js';
 import { currentVersion } from '../src/db/migrate.js';
+
+// ⚠️ 对外契约不变：`checkServiceState` 一直是从本文件导出的（既有回归用例直接
+//    `import { checkServiceState } from '../scripts/restore.js'`）。
+//    2026-10-25 评审 P1-4a：判定逻辑下沉到 src/runtime/service-state.js ——
+//    写库脚本（seed / migrate）需要同一份判定，而 `src/` 不能反向依赖 `scripts/`。
+//    ⇒ 这里只做**转出**，调用方一行都不用改。
+export { checkServiceState };
 
 /** 列出备份文件（新 → 旧）：文件名是 UTC 时间戳，字典序倒排即时间倒序。 */
 function listBackupFiles(dir) {
@@ -1077,57 +1160,6 @@ function listBackupFiles(dir) {
     .sort()
     .reverse()
     .map((f) => join(dir, f));
-}
-
-/** 服务是否还在跑。优先看 pid 文件（跨平台），Linux 上再兜底 systemd。 */
-export function checkServiceState({ dataDir = './data', serviceName = 'heikesong' } = {}) {
-  const pid = readPidFile(dataDir);
-  if (pid && isProcessAlive(pid)) {
-    return { running: true, reason: `pid 文件显示进程 ${pid} 仍在运行`, pid };
-  }
-  // ⚠️ pid 文件在，但内容**不是合法 pid**（写坏了）→ 证明不了服务已停 → 保守判为「还在跑」。
-  //    依据：设计文档 §14.2【决策】恢复前必须先停服务 —— 这条是**安全闸**，
-  //    拿不到证据时必须拒绝，而不是当成「服务没在跑」。
-  //    运维确认服务确实停了，删掉这个 pid 文件即可继续。
-  // ⚠️ 判据是「**读不出合法 pid**」（`!pid`），**不是**「文件存在」——
-  //    文件存在但内容合法、只是进程已退出 ⇒ 那是**陈旧残留**，走下面的探测分支，
-  //    不能被这条「内容无法解析」误伤（这条曾经把陈旧残留判成「还在跑」，
-  //    被 test/restore.test.js 的既有用例当场抓住）。
-  if (!pid && existsSync(pidFilePath(dataDir))) {
-    return { running: true, reason: 'pid 文件存在但内容无法解析，无法确认服务已停止' };
-  }
-  // ⚠️⚠️ pid 文件**不存在**，或它指向的进程**已退出** ⇒「进程已停」这个证据**不成立**
-  //   ⇒ 必须**主动探测服务本身**（E169 / F5b）。
-  //   为什么不能只看 pid 文件：「服务确实停了」（正常退出时 server.js 会删掉 pid 文件）
-  //   与「服务还在跑、只是 pid 文件没了」（被误删 / 被第二个实例覆盖）**看起来一模一样**，
-  //   而恢复的后果天差地别：
-  //     · 前者 ⇒ 恢复正是该做的事；
-  //     · 后者 ⇒ 恢复会把正在被写入的库文件换掉 ⇒ 丢数据 / 库损坏。
-  //   ⇒ 唯一能分辨的证据是「服务还在不在应答」（见 src/runtime/service-probe.js）。
-  const probe = probeService(dataDir);
-  if (probe.alive) {
-    return {
-      running: true,
-      reason: pid
-        ? `pid 文件显示进程 ${pid} 已退出，但 ${probe.reason} ⇒ 服务仍在运行`
-        : `pid 文件缺失，但 ${probe.reason} ⇒ 服务仍在运行（拿不到「服务已停」的证据，保守拒绝恢复）`,
-      ...(pid ? { pid, stale: true } : {}),
-    };
-  }
-  if (pid) {
-    return { running: false, reason: `pid 文件存在但进程 ${pid} 已退出（可能是异常终止的残留）`, pid, stale: true };
-  }
-  if (process.platform === 'linux' && existsSync('/run/systemd/system')) {
-    try {
-      const res = spawnSync('systemctl', ['is-active', serviceName], { encoding: 'utf8' });
-      if (res.status === 0 && String(res.stdout).trim() === 'active') {
-        return { running: true, reason: `systemd 服务 ${serviceName} 处于 active` };
-      }
-    } catch {
-      // systemctl 不可用 → 忽略这一路探测
-    }
-  }
-  return { running: false, reason: '未发现运行中的服务进程' };
 }
 
 /**
@@ -2780,6 +2812,28 @@ write_systemd_unit() {
   systemctl enable "$SERVICE_NAME"
 }
 
+write_systemd_timers() {
+  # 定时备份 + 定时清理（2026-10-25 评审 P2-7b）。
+  # ⚠️ 为什么必须补这一步：设计文档 §14.2 承诺了备份是**定时**的，
+  #    但 deploy/ 下此前只有 heikesong.service、**没有任何 .timer**
+  #    ⇒ 「定时」一直只是文档里的一句话，机器上并不会真的跑。
+  log "写 systemd 定时单元（备份 / 清理）"
+  install -d -m 0755 "$SYSTEMD_UNIT_DIR"
+  local unit
+  for unit in heikesong-backup.service heikesong-backup.timer \
+              heikesong-prune.service heikesong-prune.timer; do
+    [ -f "$ROOT/deploy/$unit" ] || die "缺少 $ROOT/deploy/${unit}（脚本必须在 platform/deploy/ 下）"
+    sed -e "s|__APP_DIR__|$(sed_escape "$APP_DIR")|g" \
+        -e "s|__DATA_DIR__|$(sed_escape "$DATA_DIR")|g" \
+        -e "s|__RUN_USER__|$(sed_escape "$RUN_USER")|g" \
+        "$ROOT/deploy/$unit" > "$SYSTEMD_UNIT_DIR/$unit"
+  done
+  systemctl daemon-reload
+  # ⚠️ `--now` 是**启动定时器**（不是立刻跑一次备份）：
+  #    定时器只是「到点触发」的调度器本身，enable 只是让它开机自启。
+  systemctl enable --now heikesong-backup.timer heikesong-prune.timer
+}
+
 # ── nginx reload 的「生效校验」 ────────────────────────────────────────
 # 踩过的坑（真实事故）：机器上残留着**另一个** nginx 实例（一个遗留的测试进程），
 # 它把 /run/nginx.pid 覆盖了 ⇒ `systemctl reload nginx` 把 SIGHUP 发给了
@@ -2943,6 +2997,32 @@ start_service() {
   fi
 }
 
+# ⛔ 迁移 / 种子数据之前必须**停服**（2026-10-25 评审 P1-4a 的单写者闸）。
+#
+# 为什么必须停：
+#   · 迁移改的是 **schema** —— 运行中的服务连接的还是旧 schema
+#     ⇒ 迁移一落地，服务的下一条 SQL 就可能撞「no such column」；
+#   · 种子会重写能力点 / 角色映射 ⇒ 在服务正在读写时跑
+#     ⇒ 库里一半旧规则、一半新规则 ⇒ 权限判定直接对不上。
+#
+# ⚠️ 这不是「多此一举」：scripts/migrate.js 与 scripts/seed.js 现在**自己**会查
+#    pid 文件，服务还活着时**拒绝执行**（人话报错 + 退出码 1）。
+#    ⇒ 本函数就是那道闸存在的理由；没有它，这一步会**静默地写坏库**。
+#    （本仓既有流程本来就在**首次**安装时先于 start_service 跑迁移，
+#      但**升级**时服务是运行中的 —— 那个洞一直在这里。）
+stop_service_for_maintenance() {
+  if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+    log "停服（迁移与种子数据前）"
+    systemctl stop "$SERVICE_NAME"
+    # 等它真的停下（server.js 退出时会删 pid 文件，闸才放行）
+    local i=0
+    while [ "$i" -lt 10 ] && systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; do
+      sleep 1
+      i=$((i + 1))
+    done
+  fi
+}
+
 main() {
   need_root
   # ⛔ 先查前置条件，再动任何东西：
@@ -2965,8 +3045,10 @@ main() {
   prepare_dirs
   copy_app
   write_env_file
+  stop_service_for_maintenance
   init_database
   write_systemd_unit
+  write_systemd_timers
   start_service
   write_nginx_site
 
@@ -2977,6 +3059,8 @@ main() {
   if [ -f "$APP_DIR/scripts/backup.js" ]; then
     log "  备份命令： cd $APP_DIR && DATA_DIR=$DATA_DIR node scripts/backup.js"
   fi
+  log "  定时备份： systemctl list-timers heikesong-backup.timer"
+  log "  定时清理： systemctl list-timers heikesong-prune.timer"
   log "  查看日志： journalctl -u $SERVICE_NAME -f"
 }
 
@@ -3383,6 +3467,280 @@ Expected: FAIL —— `main(['--evidence-chain', ...])` 返回值不是 0（参�
 在 P4 的 `main(argv)` 里加上参数解析与发布产物扫描。**保留 P4 已有的所有行为**（清单为空报错、豁免语境、排除项打印）：
 
 ```javascript
+// scripts/audit-scan.js — 发布前证据链扫描闸
+// 依据：R-AUD-03「禁用词/证伪清单扫描：禁用清单必须真有词条，空清单不等于已保护」
+//   溯源：evidence-chain Skill 闸 3；项目自己的踩坑记录——
+//   「跑扫描发现 forbidden.txt 存在但无词条 —— 该闸未生效」。
+// ⛔ 清单为空 → 直接报错退出（不静默通过）。
+// ⛔ 排除项（清单自身、扫描器、测试夹具、被跳过的目录）必须在报告里打印出来——不静默的排除。
+// ✅ 语法已与共享 skill 对齐（2026-10-20）：
+//    共享的 `~/.minimax/skills/evidence-chain/scripts/audit-evidence.js` 现已支持
+//    `@skip-path <路径正则>` 与 `<禁用词>|<豁免正则1>,<豁免正则2>` 两种语法，
+//    并且空清单告警、回环地址不计入发行方、占位符密度只统计正文（不含围栏代码块）。
+//    本平台的扫描器与它【必须行为一致】——同一个 forbidden.txt 在两边跑，结果不能不同。
+// 用法：node scripts/audit-scan.js [root...]   默认扫 ../docs 与 .（即 platform/）
+// P6 追加（发布前扫描闸）：默认范围再加【发布产物 platform/web/dist/】——
+//   发布产物本身也必须过闸（构建出来的静态站里不许有禁用表述）。
+//   ⚠️ 这一趟【不认清单里的 @skip-path】：否则清单自己就能把闸关掉
+//      （与「空清单 ≠ 已保护」同一类病）。
+import { spawnSync } from 'node:child_process';
+import { readFileSync, readdirSync, statSync, existsSync, realpathSync } from 'node:fs';
+import { join, relative, dirname, resolve, extname, sep, isAbsolute } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const PLATFORM_DIR = resolve(HERE, '..');
+const REPO_ROOT = resolve(PLATFORM_DIR, '..');
+
+const TEXT_EXT = new Set(['.md', '.txt', '.js', '.json', '.sql', '.html', '.css', '.yml', '.yaml']);
+const DEFAULT_EXCLUDES = [
+  'node_modules', '.git', 'data', 'dist', 'build', 'coverage',
+  'forbidden.txt', 'audit-scan.js', '*.test.js',
+];
+
+/**
+ * 每个默认排除项的**理由**（报告里必须说清楚「为什么被排除」，不静默）。
+ * ⚠️ 「排除项」本身是有代价的：排错了 ⇒ 真违规被藏起来 ⇒ 闸失效。
+ *   ⇒ 理由写在这里，而不是「大家都知道」。
+ */
+const DEFAULT_EXCLUDE_REASONS = {
+  'node_modules': '第三方依赖目录（不是本仓产物）',
+  '.git': '版本库内部目录',
+  'data': '运行期数据目录（库文件是二进制，与文档无关）',
+  'dist': '构建产物目录（发布产物 platform/web/dist/ 由审计扫描器**单独**再扫一遍，那一趟不认本项排除）',
+  'build': '构建产物目录',
+  'coverage': '覆盖率报告目录',
+  'forbidden.txt': '**禁用清单自身** —— 清单按设计必须逐字写出被禁词条，否则闸不生效 ⇒ 自己命中自己是恒真',
+  'audit-scan.js': '扫描器自身（词条字面量写在源码里）',
+  '*.test.js': '测试夹具（故意写错的样本，不是交付物）',
+};
+
+/**
+ * 解析禁用清单。
+ * 语法：
+ *   <禁用词>[|<豁免正则1>,<豁免正则2>]   命中即违规；同行命中豁免正则 → 记为"更正语境"，不计违规但会出现在报告里
+ *   @skip-path <路径正则>                整条路径跳过（相对仓库根；排除项会打印）
+ *   # 开头为注释，空行忽略
+ */
+export function parseManifest(text) {
+  const terms = [];
+  const skipPaths = [];
+  // ⚠️ 每条 @skip-path 的**理由**：取它上方那段连续的注释（清单里就写着理由，
+  //    报告里必须把它**带出来** —— 「跳过了但不知道为什么」= 没登记）。
+  const skipPathMeta = [];
+  const errors = [];
+  const seen = new Set();
+  let commentBuf = [];
+
+  for (const rawLine of String(text ?? '').split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) { commentBuf = []; continue; }
+    if (line.startsWith('#')) {
+      // 单独一行 '#' 是**分隔符** ⇒ 它之前的注释不属于下一条的由
+      if (line === '#') commentBuf = [];
+      else commentBuf.push(line.replace(/^#\s?/, ''));
+      continue;
+    }
+    if (line.startsWith('@skip-path')) {
+      const pattern = line.slice('@skip-path'.length).trim();
+      const reason = commentBuf.join(' ');
+      commentBuf = [];
+      if (!pattern) {
+        errors.push('@skip-path 后面必须跟路径正则');
+        continue;
+      }
+      try {
+        skipPaths.push(new RegExp(pattern));
+        skipPathMeta.push({ pattern, regex: skipPaths[skipPaths.length - 1], reason });
+      } catch (e) {
+        errors.push(`@skip-path 正则非法：${pattern}（${e.message}）`);
+      }
+      continue;
+    }
+    commentBuf = [];
+    const [term, exemptPart] = splitOnce(line, '|');
+    const t = term.trim();
+    if (!t) {
+      errors.push(`清单里有一行只有分隔符没有词条：${line}`);
+      continue;
+    }
+    if (seen.has(t)) {
+      errors.push(`清单里有重复词条：${t}`);
+      continue;
+    }
+    seen.add(t);
+    let exemptRegex = null;
+    if (exemptPart !== null) {
+      const pattern = exemptPart.split(',').map((s) => s.trim()).filter(Boolean).join('|');
+      if (pattern) {
+        try {
+          exemptRegex = new RegExp(pattern);
+        } catch (e) {
+          errors.push(`词条「${t}」的豁免正则非法：${pattern}（${e.message}）`);
+        }
+      }
+    }
+    terms.push({ term: t, exemptRegex });
+  }
+
+  if (terms.length === 0) {
+    // ⛔ 空清单 = 闸未生效。这是最重要的一个失败。
+    errors.push('禁用清单为空 —— 闸未生效（空清单 ≠ 已保护）。请在 scripts/forbidden.txt 写入真实禁用词条。');
+  }
+  return { terms, skipPaths, skipPathMeta, errors };
+}
+
+function splitOnce(line, ch) {
+  const i = line.indexOf(ch);
+  if (i < 0) return [line, null];
+  return [line.slice(0, i), line.slice(i + 1)];
+}
+
+/**
+ * 逐行扫描一段文本。
+ */
+export function scanText(text, terms, { file = '<text>' } = {}) {
+  const violations = [];
+  const exempted = [];
+  const lines = String(text ?? '').split(/\r?\n/);
+  lines.forEach((line, idx) => {
+    for (const { term, exemptRegex } of terms) {
+      if (!line.includes(term)) continue;
+      if (exemptRegex && exemptRegex.test(line)) {
+        exempted.push({ file, line: idx + 1, term, text: line.trim() });
+      } else {
+        violations.push({ file, line: idx + 1, term, text: line.trim() });
+      }
+    }
+  });
+  return { violations, exempted };
+}
+
+/**
+ * 某个路径命中了哪个排除项（没命中 ⇒ null）。
+ * ⚠️ 返回**命中的那一条**（而不是布尔）—— 因为报告必须说清「为什么被排除」。
+ */
+function matchExclude(relPath, baseName, excludePaths) {
+  for (const pattern of excludePaths) {
+    if (pattern.includes('*')) {
+      const re = new RegExp(`^${pattern.split('*').map(escapeRe).join('.*')}$`);
+      if (re.test(baseName) || re.test(relPath)) return pattern;
+    } else if (baseName === pattern || relPath.endsWith(sep + pattern)) {
+      return pattern;
+    }
+  }
+  return null;
+}
+
+function isExcluded(relPath, baseName, excludePaths) {
+  return matchExclude(relPath, baseName, excludePaths) !== null;
+}
+
+function escapeRe(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * 把 evidence-chain 报出来的禁用词命中分成「落在已登记的豁免范围内」与「真违规」。
+ *
+ * 豁免来源**只有两类**，且两类都是本扫描器自己已经登记、并且在报告里打印过的排除项：
+ *   ① @skip-path —— 清单里登记的整目录跳过（理由取自清单里该 @skip-path 上方的注释块）
+ *   ② 默认排除 —— 清单自身 / 扫描器自身 / 测试夹具 / 依赖与构建目录
+ * ⛔ 不许出现「第三类豁免」：那等于把闸自己关掉。
+ *
+ * ⚠️ 为什么需要这一步：共享 skill 的扫描器**只报命中、不管豁免**，
+ *    它的输出「禁用词命中 46 处 —— 已证伪内容可能已回流」配上本扫描器的退出码 0
+ *    ⇒ **宣称与行为相左**（正是本仓反复要消灭的那类问题）。
+ *    ⇒ 这里把每一处命中**落到具体的豁免项上**（并带理由），
+ *    没落到任何已登记豁免项上的 ⇒ **真违规 ⇒ 退出码非 0**（fail-closed）。
+ *
+ * @param {Array<{file:string,line:number,word:string,text:string}>} hits
+ * @param {{skipPathMeta: Array, excludePaths: string[], repoRoot: string}} opts
+ */
+export function classifyEvidenceHits(hits, { skipPathMeta = [], excludePaths = DEFAULT_EXCLUDES, repoRoot = REPO_ROOT } = {}) {
+  const exempted = [];
+  const violations = [];
+  for (const h of hits || []) {
+    const abs = isAbsolute(h.file) ? h.file : resolve(repoRoot, h.file);
+    const rel = relative(repoRoot, abs);
+    const baseName = abs.split(sep).pop();
+    const skip = (skipPathMeta || []).find((m) => m.regex.test(rel));
+    if (skip) {
+      exempted.push({ ...h, kind: '@skip-path', label: skip.pattern, reason: skip.reason || '（清单里未写理由）' });
+      continue;
+    }
+    const ex = matchExclude(rel, baseName, excludePaths);
+    if (ex) {
+      exempted.push({ ...h, kind: '默认排除', label: ex, reason: DEFAULT_EXCLUDE_REASONS[ex] || '（未登记理由）' });
+      continue;
+    }
+    violations.push(h);
+  }
+  return { exempted, violations };
+}
+
+/** 把豁免命中按「豁免项」归组 ⇒ 一句话说明「命中 N 处，落在哪几个豁免项上，各是什么理由」 */
+export function groupExemptions(exempted) {
+  const byKey = new Map();
+  for (const e of exempted || []) {
+    const key = `${e.kind}｜${e.label}`;
+    if (!byKey.has(key)) byKey.set(key, { kind: e.kind, label: e.label, reason: e.reason, n: 0 });
+    byKey.get(key).n += 1;
+  }
+  return [...byKey.values()]
+    .map((g) => `${g.kind} ${g.label}（${g.n} 处；理由：${g.reason}）`)
+    .join('；');
+}
+
+/**
+ * 扫描一组目录/文件。
+ */
+export function scanRoots(roots, { terms, skipPaths = [], excludePaths = DEFAULT_EXCLUDES }) {
+  const violations = [];
+  const exempted = [];
+  const scannedFiles = [];
+  const excludedPaths = [];
+  const visited = new Set();
+
+  const walk = (target) => {
+    const abs = resolve(target);
+    if (visited.has(abs)) return;
+    visited.add(abs);
+    if (!existsSync(abs)) return;
+
+    const info = statSync(abs);
+    const rel = relative(REPO_ROOT, abs);
+
+    if (skipPaths.some((re) => re.test(rel))) {
+      excludedPaths.push({ path: rel, reason: '@skip-path' });
+      return;
+    }
+    if (info.isDirectory()) {
+      for (const entry of readdirSync(abs)) {
+        if (isExcluded(rel ? join(rel, entry) : entry, entry, excludePaths)) {
+          excludedPaths.push({ path: relative(REPO_ROOT, join(abs, entry)), reason: '默认排除' });
+          continue;
+        }
+        walk(join(abs, entry));
+      }
+      return;
+    }
+    if (!TEXT_EXT.has(extname(abs).toLowerCase())) return;
+    if (isExcluded(rel, abs.split(sep).pop(), excludePaths)) {
+      excludedPaths.push({ path: rel, reason: '默认排除' });
+      return;
+    }
+    const text = readFileSync(abs, 'utf8');
+    scannedFiles.push(rel);
+    const r = scanText(text, terms, { file: rel });
+    violations.push(...r.violations);
+    exempted.push(...r.exempted);
+  };
+
+  for (const root of roots) walk(root);
+  return { violations, exempted, scannedFiles, excludedPaths };
+}
+
 /**
  * 命令行入口。
  * P4 已有：node scripts/audit-scan.js [root...]
@@ -3462,7 +3820,23 @@ export function main(argv = []) {
     report.excludedPaths.push(...distReport.excludedPaths);
     release.scannedFiles = distReport.scannedFiles.length;
   }
-  const evidence = runEvidenceChain(evidenceChainPath, targets);
+  const evidence = runEvidenceChain(evidenceChainPath, targets, manifestPath);
+
+  // ── evidence-chain 增强的命中 ⇒ 落到「已登记的豁免项」或「真违规」 ──
+  // ⛔ 这一步是「宣称与行为自洽」的关键：共享 skill 只报命中、不管豁免，
+  //    它说「命中 N 处 —— 可能已回流」，而本扫描器退出码 0 ⇒ 自相矛盾。
+  //    ⇒ 这里把每一处命中**归到具体的豁免项**（带理由）；
+  //    归不到任何已登记豁免项的 ⇒ 真违规 ⇒ 退出码非 0（fail-closed）。
+  const evidenceVerdict = { exempted: [], violations: [] };
+  if (evidence.available && evidence.json) {
+    const r = classifyEvidenceHits(evidence.json.forbiddenHits, {
+      skipPathMeta: parsed.skipPathMeta,
+      excludePaths: DEFAULT_EXCLUDES,
+      repoRoot,
+    });
+    evidenceVerdict.exempted = r.exempted;
+    evidenceVerdict.violations = r.violations;
+  }
 
   // ⛔ 静默的空产出比报错更危险：一份文件都没扫到 = 闸没生效 = 报错退出（退出码 2）。
   const emptyScan = report.scannedFiles.length === 0;
@@ -3477,7 +3851,13 @@ export function main(argv = []) {
       violations: report.violations,
       exempted: report.exempted,
       excludedPaths: report.excludedPaths,
-      evidenceChain: evidence,
+      evidenceChain: {
+        available: evidence.available,
+        path: evidence.path,
+        reason: evidence.reason || null,
+        exemptedHits: evidenceVerdict.exempted,
+        violationHits: evidenceVerdict.violations,
+      },
     }, null, 2));
   } else {
     console.log(`[audit-scan] 词条 ${parsed.terms.length} 条｜扫描 ${report.scannedFiles.length} 个文件`);
@@ -3501,12 +3881,26 @@ export function main(argv = []) {
     if (evidence.available) {
       console.log(`[audit-scan] evidence-chain 增强报告（${evidence.path}）：`);
       console.log(evidence.output.trim());
+      // ⛔ **判定必须与输出同源**：报告说「命中 N 处」，就必须说清这 N 处落在哪、
+      //    哪些是真违规。含糊的「已证伪内容可能已回流」+ 退出码 0 = 假绿。
+      if (evidenceVerdict.violations.length) {
+        console.error(`[audit-scan] ✗ evidence-chain 增强发现 ${evidenceVerdict.violations.length} 处**未豁免**的禁用表述（同一份 forbidden.txt）：`);
+        for (const v of evidenceVerdict.violations) {
+          console.error(`  - ${relative(repoRoot, isAbsolute(v.file) ? v.file : resolve(repoRoot, v.file))}:${v.line} 「${v.word}」 ${v.text}`);
+        }
+      } else if (evidenceVerdict.exempted.length) {
+        console.log(`[audit-scan] evidence-chain 增强：禁用词命中 ${evidenceVerdict.exempted.length} 处 —— 全部落在已登记的豁免范围内（${groupExemptions(evidenceVerdict.exempted)}）⇒ 不计违规`);
+      } else {
+        console.log('[audit-scan] evidence-chain 增强：禁用词命中 0 处 ⇒ 与本扫描器同一份 forbidden.txt，结论一致');
+      }
     } else {
       console.log(`[audit-scan] evidence-chain 增强不可用：${evidence.reason}（不影响本闸结论）`);
     }
   }
 
   if (report.violations.length) return 1;
+  // ⛔ 增强扫描器发现的**未豁免**命中同样必须让闸失败（fail-closed）
+  if (evidenceVerdict.violations.length) return 1;
   if (emptyScan) {
     if (asJson) console.error('[audit-scan] 扫描范围内没有任何可扫描的文件 —— 闸未生效（静默的空产出比报错更危险）');
     return 2;
@@ -3517,8 +3911,17 @@ export function main(argv = []) {
 /**
  * 可选增强：复用 evidence-chain skill 的 audit-evidence.js。
  * ⛔ 平台自身必须能独立跑：找不到就返回 available=false，不影响闸结论。
+ *
+ * ⚠️ **必须传 `--forbidden <本仓清单>`**：共享 skill 默认读的是**它自己旁边**那份
+ *    forbidden.txt，与本仓的不是同一份 ⇒ 两边跑的其实不是同一个闸
+ *    （文件头「同一个 forbidden.txt 在两边跑，结果不能不同」的承诺此前是**假的**）。
+ *
+ * ⚠️ **跑两遍**（一遍取人看的报告、一遍取机器判定用的结构化命中）：
+ *    文本报告里只有 basename、没有路径 ⇒ **没法**判断命中落在「已登记的豁免范围」里
+ *    还是落在真违规上 ⇒ 就会出现「输出报『禁用词命中 N 处 —— 可能已回流』但退出码 0」
+ *    的自相矛盾。两遍扫的是同一批文件（多花约 0.2s，换来判定与输出同源）。
  */
-function runEvidenceChain(scriptPath, targets) {
+function runEvidenceChain(scriptPath, targets, manifestPath) {
   const candidates = [
     scriptPath,
     process.env.HOME
@@ -3528,18 +3931,49 @@ function runEvidenceChain(scriptPath, targets) {
   for (const p of candidates) {
     if (!existsSync(p)) continue;
     try {
-      const res = spawnSync(process.execPath, [p, ...targets], { encoding: 'utf8' });
+      // ① 人看的报告
+      const res = spawnSync(process.execPath, [p, ...targets, '--forbidden', manifestPath], {
+        encoding: 'utf8',
+        cwd: REPO_ROOT,
+      });
+      // ② 机器判定用的结构化命中
+      const resJson = spawnSync(process.execPath, [p, ...targets, '--forbidden', manifestPath, '--json'], {
+        encoding: 'utf8',
+        cwd: REPO_ROOT,
+      });
+      let json = null;
+      try { json = JSON.parse(resJson.stdout); } catch { json = null; }
+      if (!json || !Array.isArray(json.forbiddenHits)) {
+        return {
+          available: false,
+          path: p,
+          output: `${res.stdout || ''}${res.stderr || ''}`,
+          reason: 'evidence-chain 扫描器的 --json 输出无法解析（版本不兼容？）—— 不参与判定，但报告照常打印',
+        };
+      }
       return {
         available: true,
         path: p,
         status: res.status,
         output: `${res.stdout || ''}${res.stderr || ''}`,
+        json,
       };
     } catch (err) {
       return { available: false, path: p, reason: `执行失败：${err.message}` };
     }
   }
   return { available: false, path: null, reason: '未找到 evidence-chain 扫描器（可选增强）' };
+}
+
+// ⚠️ 必须按 realpath 比较：macOS 的 /tmp → /private/tmp、/var → /private/var 都是符号链接，
+// 直接比字符串会不相等 ⇒ isMain 判 false ⇒ 脚本【什么都不做、退出码 0】＝静默放行。
+// 对一道发布闸来说，「静默通过」是最坏的失败模式（R-AUD-03 的同类病）。
+function realPathOrSelf(p) {
+  try { return realpathSync(p); } catch { return p; }
+}
+const isMain = process.argv[1] && realPathOrSelf(process.argv[1]) === realPathOrSelf(fileURLToPath(import.meta.url));
+if (isMain) {
+  process.exit(main(process.argv.slice(2)));
 }
 ```
 

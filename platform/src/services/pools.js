@@ -9,7 +9,7 @@
 // ⛔ 派生值只有一个计算点：src/domain/pool-derive.js。
 import { randomUUID } from 'node:crypto';
 import { appError } from '../errors.js';
-import { can } from '../auth/permissions.js';
+import { can, isCommitteeActor, listAssignments } from '../auth/permissions.js';
 import { derivePoolProjects, derivePoolTalents, derivePoolResources, aggregatePersonalPoints } from '../domain/pool-derive.js';
 import * as poolRepo from '../db/repo/pools.js';
 import * as srcRepo from '../db/repo/pool-sources.js';
@@ -255,9 +255,63 @@ export function syncPoolResources({ db, editionId, now, rules }) {
   });
 }
 
+/**
+ * 「这个人能不能读这一届的池」—— **三池读取的唯一闸门**。
+ *
+ * ⚠️ **F33 的残留面（2026-10-24 评审）**：
+ *    F33 第一版只修了「**缺省**届期」那条路径（从报名记录推导、推导不出唯一届期就空集）。
+ *    但**显式传 `editionId` 的路径当时没有任何届期校验** ⇒ 只要带上别的届期 id，
+ *    这里走的是 `can()` 的**角色分支** —— 而角色授权是**全局**的
+ *    （INTERFACES.md:22 明文「超管 / role_capability 授权一律不做行级过滤」）
+ *    ⇒ 任何持有 `pool:read` 的登录用户都能读到**其它届期**参赛者的
+ *    姓名、单位、积分、MBA 状态、参赛赛段数 ⇒ **届期隔离仍然是破的**。
+ *    ⚠️ 角色本身确实持有 `pool:read`（captain / member / enterprise / enterprise_admin
+ *    四个角色都有 —— 见 scripts/seed.js）⇒ 光靠 `can()` 表达不了「他属于哪一届」。
+ *
+ * ⇒ **修法与 F30 / F42 同一把尺子**（同一族根因：角色授权无行级过滤）：
+ *   ① 能力点闸（`can`）：他没有 `pool:read` ⇒ 不给；
+ *   ② **领域事实闸**：非组委会 ⇒ 他必须**与该届有关联**（报名 / 出题 / 企业确认）。
+ *      组委会（admin 角色或超管）可以跨届调度 ⇒ 直接放行。
+ *
+ * ⚠️ **为什么关联要四条事实的并集**（不是只认报名）：**企业侧不报名** ——
+ *    企业通过提交任务卡、在赛段上做企业确认来参与（`submitRegistration` 只面向选手）。
+ *    ⇒ 只认报名会把「本该看人才池的企业」挡在门外（业务回归）。
+ *    第四条（积分记录）保证「池成员定义」与「读池资格」是**同一个口径**。
+ *
+ * ⚠️ **失败方向**：拿不到证据 ⇒ **不给**（fail-closed）。
+ *    「他与这一届无关」与「他与这一届有关」一样，都是**可以查出来的事实**，
+ *    不存在「查不出来 ⇒ 放行」的中间态。
+ */
 function canReadPool(db, viewer, editionId) {
   if (!viewer) return false;
-  return can(viewer, 'pool:read', { scopeType: 'edition', scopeId: editionId }, db);
+  if (!can(viewer, 'pool:read', { scopeType: 'edition', scopeId: editionId }, db)) return false;
+  // ⚠️ 组委会按**身份**判定（admin 角色 / 超管），与 F30 / F42 / F40 同一口径。
+  if (isCommitteeActor(db, viewer)) return true;
+  if (!viewer.id) return false;
+  // ⚠️ **显式的届期作用域授权，本身就是授权** ⇒ 直接放行。
+  //    这条是既有契约（test/pools-sync.test.js「有 edition 作用域授权的用户
+  //    读得到本届时，读不到别届」）：`assignments` 里 scope_type='edition'
+  //    且 scope_id=该届 ⇒ 授权人**点名了这一届** ⇒ 不需要再叠加领域事实闸。
+  //    ⛔ 少了这一条就会把该契约打破（实测：加了领域事实闸后，
+  //    那条既有用例从 2 行变成 0 行 ⇒ 作用域授权被领域事实闸覆盖掉了）。
+  if (hasEditionScopedGrant(db, viewer.id, 'pool:read', editionId)) return true;
+  // ⚠️ 走到这里说明授权来自**角色**（全局）或 **global 授权**（也是全局）
+  //    ⇒ 它们表达不了「他属于哪一届」⇒ 必须补一条**领域事实**闸。
+  return srcRepo.listPoolEditionIds(db, viewer.id).includes(editionId);
+}
+
+/**
+ * 他有没有被**显式授予**某个届期的某能力点（`assignments.scope_type='edition'`）。
+ *
+ * ⚠️ **比较口径与 can() 保持一致**：`scope_id` 是 TEXT 列、`editionId` 可能是数字
+ *    ⇒ 统一按**字符串**比较（与 src/auth/permissions.js 的 scopeIdEquals 同款纪律，
+ *    否则 can() 说「有权」而这里说「无权」⇒ 两者结论相反 ⇒ 违反 INTERFACES.md:22）。
+ */
+function hasEditionScopedGrant(db, userId, capability, editionId) {
+  if (!userId || editionId === null || editionId === undefined) return false;
+  return listAssignments(db, { userId, capability }).some(
+    (a) => a.scope_type === 'edition' && String(a.scope_id ?? '') === String(editionId),
+  );
 }
 
 /**
@@ -273,6 +327,15 @@ function canReadPool(db, viewer, editionId) {
  *    ⚠️ **推导不出唯一届期 ⇒ 不给**（fail-closed）：没报名过、或报过多届的人，
  *    「他该看哪一届」没有唯一答案 ⇒ 列表不满足 ⇒ 返回**空集**（200 + 空集），
  *    绝不能退化成「全表」。
+ *
+ * ⚠️ **缺省用「报名」、显式用「三条事实的并集」—— 这个不对称是故意的**：
+ *    · **缺省**时平台要替用户**猜**「你要看哪一届」⇒ 只按**报名**猜
+ *      （他作为**选手**属于哪一届）⇒ 猜不出唯一答案就不给（上面那条 fail-closed）。
+ *    · **显式**时用户已经**点名**了哪一届 ⇒ 平台要回答的是「你有没有资格看这一届」
+ *      ⇒ 判据是**关联**（报名 / 出题 / 企业确认 / 积分）—— 企业侧不报名，
+ *      只认报名会把该看的人才池的企业挡在门外。
+ *    ⇒ 两条路径**共用** `canReadPool` 的领域事实闸 ⇒ 缺省推导出来的届期
+ *      必然也在关联集合里（报名 ⊂ 关联），不会自相矛盾。
  */
 function resolvePoolEditionId(db, viewer, editionId) {
   if (editionId) return editionId;

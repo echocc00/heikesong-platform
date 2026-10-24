@@ -19,6 +19,7 @@ import { submitRegistration } from '../src/services/registration.js';
 import { submitTaskPackage, assessSolvability, approveTaskPackage } from '../src/services/taskPackage.js';
 import { createTeam, addMember } from '../src/services/team.js';
 import { loadRules } from '../src/config.js';
+import { assertServiceStopped } from '../src/runtime/service-state.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const dataDir = process.env.DATA_DIR || join(here, '..', 'data');
@@ -90,6 +91,20 @@ const ROLE_CAPABILITIES = [
   ['observer', 'score:read'], ['observer', 'team:read'], ['observer', 'task_package:read'],
   ['enterprise_admin', 'task_package:write'], ['enterprise_admin', 'signoff:create'], ['enterprise_admin', 'pool:read'],
 ];
+
+// ⛔ 单写者闸（P1-4a，2026-10-25 评审轮）：服务还在跑时**拒绝**执行种子数据初始化。
+//    依据：设计文档 §14.2 单写者约束 + README「SQLite 只允许单写进程」。
+//    ⚠️ 为什么 seed 尤其危险：它会写能力点 / 角色映射 / 管理员账号 ⇒
+//    在服务正在读写时跑 ⇒ 库里一半是旧规则、一半是新规则 ⇒ 权限判定直接对不上。
+//    ⚠️ 判定放在**开库之前**：库一打开就可能与对方抢写锁了。
+//    ⚠️ 与 backup 的区别：backup 走 SQLite 官方 backup API（**只读**、与服务并发安全，
+//    它的文件头就写着「可以在服务运行中执行」）⇒ 不受这条闸约束。
+try {
+  assertServiceStopped({ dataDir, action: '种子数据初始化' });
+} catch (err) {
+  console.error(`[seed] ${err.message}`);
+  process.exit(1);
+}
 
 const { db, close } = openDatabase({ dataDir });
 try {

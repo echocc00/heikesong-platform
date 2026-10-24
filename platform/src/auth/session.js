@@ -32,6 +32,22 @@ export function sessionTtlDays() {
   return Number.isFinite(n) && n > 0 ? n : DEFAULT_TTL_DAYS;
 }
 
+/**
+ * 滑动续期的「脏」阈值（毫秒）：距上次续期超过这个时长才**真的写库**。
+ *
+ * 依据：P1-3a「拆掉读路径的隐性写库」（2026-10-24 独立评审轮）。
+ *   · 修复前：每次命中有效会话都 UPDATE sessions SET expires_at = ?
+ *     ⇒ **每个 GET 请求都产生一次写事务** ⇒ 读路径写放大。
+ *   · 现在：只有距上次续期超过阈值才 UPDATE。
+ *
+ * ⚠️ 取 30 分钟的理由：会话 TTL 默认 7 天 ⇒ 续期粒度从 7 天粗到 30 分钟，
+ *    对用户完全无感（少掉的只是「已经快到期时再多用一会儿」的边际），
+ *    却把读路径的写量降到原来的 1/350 量级。
+ * ⚠️ **不能更粗**：TTL 可被 SESSION_TTL_DAYS 调小 ⇒ 阈值必须远小于 TTL
+ *    （否则会话会在用户还在用时过期）。30 分钟 ≪ 最小可用 TTL（1 小时）。
+ */
+const TOUCH_INTERVAL_MS = 30 * 60 * 1000;
+
 /** 绝对过期上限（天）。默认 30 天，用 SESSION_ABSOLUTE_TTL_DAYS 覆盖。 */
 export function sessionAbsoluteTtlDays() {
   const raw = process.env.SESSION_ABSOLUTE_TTL_DAYS;
@@ -97,8 +113,23 @@ export function resolveSession(
     return null;
   }
   // 滑动续期（设计文档 §7.5）：命中有效会话就顺延一个 ttl，但不得越过绝对上限。
+  // ── P1-3a：改「脏才写」──────────────────────────────────────────────
+  //   修复前：每次命中都 UPDATE ⇒ 每个 GET 请求都产生一次写事务（读路径写放大）。
+  //   现在：只有距**上次续期**超过 TOUCH_INTERVAL_MS 才真的 UPDATE。
+  //
+  // ⚠️ 不续期时返回**库里存着的** expires_at（而不是重新算一个）：
+  //    返回值必须与数据库始终一致 ⇒ 客户端 cookie 的有效期不会比库里更晚
+  //    （否则客户端以为会话还活着，服务端已经按库里的时间判它过期 ⇒ 表现为
+  //      「用户还在操作就突然被登出」，而且没有任何报错可查）。
+  const lastTouchAt = row.last_touch_at ? Date.parse(row.last_touch_at) : NaN;
+  // ⚠️ `nowMs - lastTouchAt` 可能为负（时钟回拨 / 迁移回填异常）⇒ 那时**不写**
+  //    （写下去只会把续期时刻推到更早，越写越频繁）。
+  const needsTouch = !Number.isFinite(lastTouchAt) || (nowMs - lastTouchAt) >= TOUCH_INTERVAL_MS;
+  if (!needsTouch) {
+    return { userId: row.user_id, expiresAt: row.expires_at };
+  }
   const expiresAt = earlierIso(expiryFrom(now, ttlDays), absoluteExpiresAt);
-  touchSessionExpiry(db, hash, expiresAt);
+  touchSessionExpiry(db, hash, expiresAt, now.toISOString());
   return { userId: row.user_id, expiresAt };
 }
 

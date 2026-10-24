@@ -3769,6 +3769,1501 @@ export function corsPreflightHeaders(req, allowMethods) {
 
 ---
 
+### 4.7 2026-10-24 独立评审轮 —— 新建文件登记
+
+本轮（2026-10-24 独立评审，20 条清单核实后 17 条属实）新建了以下文件。
+按本仓纪律「**新建文件必须登记进计划块，否则它的漂移查不出来**」，逐个登记如下
+（`plan-block-audit.mjs` 的归因靠「Step 标题里的路径」+「块首行的文件头注释」两个信号，
+两者都不命中 ⇒ 这个文件对它完全不可见）。
+
+| 文件 | 为什么必须是**新文件** |
+|---|---|
+| `platform/src/http/routes/admin.js` | 管理员「解除登录限频」需要一条**带审计留痕**的 HTTP 写口。既有路由文件里没有管理端点目录（`src/http/routes/` 下全是业务域路由），而把管理员端点混进业务路由会让「谁能调」的判定散在两处 ⇒ 单独成文件，权限点与审计口径集中在一处。 |
+| `platform/src/runtime/service-state.js` | 「服务还在不在跑」的判定原先住在 `scripts/restore.js` 里。现在写库脚本（seed / migrate）也需要同一份判定，而 `src/` **不能反向依赖** `scripts/`（依赖方向反了）⇒ 判定下沉到 `src/runtime/`，`scripts/restore.js` 改为**转出**（对外契约不变）。 |
+| `platform/scripts/prune.js` | `purgeExpiredSessions` 早就在仓储层实现了，但**零调用方**；限频计数事件表更是只增不减。清理必须是**独立于服务进程**的一次性任务（随 systemd timer 跑）⇒ 单独成脚本。 |
+| `platform/db/migrations/008_session_touch.sql` | 「上次续期时刻」必须**落在库里**才能跨进程、跨重启判脏。若放在内存里，进程一重启所有会话都会被当成「该续期」⇒ 读路径写量回弹。⇒ 必须走迁移加列（沿用 007 的 `ALTER TABLE ADD COLUMN` 先例）。 |
+| `platform/deploy/heikesong-backup.service` | 备份是**运维动作**，不是平台进程 ⇒ 必须是独立的 oneshot 单元（`Type=oneshot`），绝不能起第二个常驻写进程（单写者约束）。 |
+| `platform/deploy/heikesong-backup.timer` | 设计文档 §14.2 承诺备份是**定时**的，但 `deploy/` 下此前只有 `.service`、**没有任何 `.timer`** ⇒ 「定时」一直只是文档里的一句话，机器上并不会真的跑。 |
+| `platform/deploy/heikesong-prune.service` | 清理与备份同理：运维动作 ⇒ 独立 oneshot 单元。 |
+| `platform/deploy/heikesong-prune.timer` | 同上；排在备份**之后**（备份里保留清理前的完整状态 ⇒ 万一删错了还有退路）。 |
+| `platform/test/signoff-board-api.test.js` | 签字台两个读口此前**零真实路由测试**（只有演示适配器与前端 mock 在测）⇒ 企业「读得到自己的工作台、读不到别家的」这条契约没有任何机器保证。 |
+| `platform/test/static-traversal.test.js` | `src/http/static.js` 自述「只有 realpath 层被测」。三层防线必须**逐层**钉住 —— 而第二层（Windows 反斜杠变体）在行为上被第一、三层掩盖 ⇒ 只能靠**接线断言**证明它还在 ⇒ 需要独立的测试文件承载这组断言。 |
+| `platform/test/ops-lifecycle.test.js` | 单写者闸（写库脚本被拒 / 并发只活一个）与 prune 清理行为是**运维契约**，与业务用例无关 ⇒ 独立成文件，避免把「起两个服务进程」这类慢用例混进业务测试。 |
+
+**Step 1: 创建 src/http/routes/admin.js**
+
+`platform/src/http/routes/admin.js`：
+
+```javascript
+// src/http/routes/admin.js — 管理端点（2026-10-24 独立评审补记）
+//
+// 规则溯源：2026-10-24 独立评审 P0「登录限频的定向 DoS 面」
+//   评审原话：「登录限频按手机号 60s/10 次锁定，知道评委手机号的人
+//              可以在打分窗口把他锁在门外」。
+//   评审给的三个修法里，本仓**采纳两条**、**明确否决一条**：
+//   ① 按来源 IP 的独立配额 → **采纳**（src/server.js 的登录路由 +
+//      rules/audit.json 的 `loginAttemptByIp` profile）；
+//   ② 「账号存在且密码错」与「账号不存在」分别计数 → **否决**：
+//      那会让「账号存在」与「账号不存在」的**配额耗尽时机不同**
+//      ⇒ 攻击者拿不存在的号试到 N 次拿 429、拿真实号试却还拿 401
+//      ⇒ **重新打开了用户枚举**。而本仓在登录路由与
+//      src/services/rate-limit.js 里都在**刻意**让这两种情况的
+//      **错误码与耗时完全一致**（连 scrypt 都照样跑一遍）。
+//      ⇒ 否决理由写在 src/services/rate-limit.js 的 loginSubjectKey 注释里，
+//         别只看这里。
+//   ③ 管理员手动解锁 → **采纳但改了形态**（本文件）：复核发现「受害者被锁在门外」
+//     在本仓语义下**不成立**（正确口令永远能登录）⇒ 「按人解锁」没有用武之地；
+//     真正会被挡的是**来源维度**（前置预检，fail-closed）⇒ 端点改为支持
+//     `{ all: true }` ⇒ **整体解除登录限频**（限频误伤整个出口时的应急出口）。
+//
+// ⛔ 权限口径：`audit:write`（裁决复核项与申诉）—— **只有组委会持有**
+//    （见 scripts/seed.js 的 ROLE_CAPABILITIES）。
+// ⛔ 必须写审计日志：解锁是「**人工干预安全闸**」⇒ 必须留痕（谁、何时、解了谁）。
+//    ⛔ 留痕里**只存限频主体的哈希**（`login:<sha256前16位>`）——
+//    那张表会进备份 ⇒ 不把明文手机号复制到第二张表（与限频表同一纪律）。
+// ⛔ 三态语义：未登录 → 401；无能力点 → 403；手机号不存在 → 404。
+import { unlockLoginAttempts, clearAllLoginLimiters } from '../../services/rate-limit.js';
+import { getUserByPhone } from '../../db/repo/users.js';
+import { insertAuditLogRow } from '../../db/repo/audit-log.js';
+import { can } from '../../auth/permissions.js';
+import { unauthenticated, forbidden, appError } from '../../errors.js';
+
+function requireLogin(user) {
+  if (!user) throw unauthenticated();
+}
+
+/**
+ * 注册管理端点。
+ * @param {object} router 路由表
+ * @param {object} deps   { db }
+ */
+export function registerAdminRoutes(router, { db }) {
+  /**
+   * POST /api/admin/login-unlock —— 清掉某个手机号的登录限频计数。
+   *
+   * ⚠️ **为什么这是管理员能力点、而不是「谁都能解锁自己的」**：
+   *    如果允许本人自助解锁 ⇒ 攻击者先耗尽受害者配额、再让受害者自助解锁
+   *    ⇒ 限频等于没有。⇒ 只能由**组委会**执行（且必须留痕）。
+   */
+  router.add('POST', '/api/admin/login-unlock', async ({ user, body }) => {
+    requireLogin(user);
+    if (!can(user, 'audit:write', null, db)) throw forbidden('无权解锁登录限频');
+
+    const all = body?.all === true;
+
+    // ① **整体解除**（应急）：来源维度的预检是**前置**的 ⇒ 某个出口 IP 被误判成
+    //    攻击源时，**整个出口的人都会被挡**（含正确口令）⇒ 必须有一条人能立刻
+    //    执行的通道。只清**登录**限频；申诉/评分/评委小时配额**不动**。
+    if (all) {
+      const removed = clearAllLoginLimiters(db);
+      insertAuditLogRow(db, {
+        actorId: user.id,
+        action: 'auth.login_limit_clear_all',
+        entity: 'rate_limit',
+        entityId: null,
+        detailJson: JSON.stringify({ scope: 'login', removed }),
+        createdAt: new Date().toISOString(),
+      });
+      return { status: 200, body: { cleared: removed, scope: 'login' } };
+    }
+
+    // ② **按人解锁**
+    const phone = String(body?.phone ?? '').trim();
+    if (!phone) throw appError(400, 'INVALID_REQUEST', 'phone 必填（或传 all: true 整体解除）');
+
+    const target = getUserByPhone(db, phone);
+    if (!target) throw appError(404, 'USER_NOT_FOUND', '该手机号没有对应的用户');
+
+    const result = unlockLoginAttempts(db, phone);
+
+    // ⚠️ 解锁是**人工干预安全闸** ⇒ 必须留痕（谁、何时、解了谁）
+    insertAuditLogRow(db, {
+      actorId: user.id,
+      action: 'auth.login_unlock',
+      entity: 'user',
+      entityId: target.id,
+      // ⚠️ 只存限频主体的哈希，不存明文手机号
+      detailJson: JSON.stringify({ subjectKey: result.subjectKey, removed: result.removed }),
+      createdAt: new Date().toISOString(),
+    });
+
+    return { status: 200, body: { unlocked: result.removed, userId: target.id } };
+  });
+}
+```
+
+**Step 2: 创建 src/runtime/service-state.js**
+
+`platform/src/runtime/service-state.js`：
+
+```javascript
+// src/runtime/service-state.js — 「服务还在不在跑」的判定（写库闸的底座）
+//
+// 为什么把它从 scripts/restore.js 里搬出来（2026-10-25 评审 P1-4a）：
+//   恢复脚本需要「服务是否已停」的判定，**写库脚本**（seed / migrate）也需要同一份判定
+//   —— 但后者在 `src/` 一侧，而 `src/` 不该反向依赖 `scripts/`（依赖方向反了）。
+//   ⇒ 把判定下沉到 `src/runtime/`，`scripts/restore.js` 改为**转出**（对外契约不变）。
+//
+// ⚠️ 这份判定的铁律是 **fail-closed**（拿不到「服务已停」的证据 ⇒ 一律按「还在跑」处理）：
+//   理由：判错的代价不对称 ——
+//     · 误判「还在跑」⇒ 运维多停一次服务，代价是几分钟；
+//     · 误判「已停」⇒ 在服务正在写库时改 schema / 恢复备份 ⇒ **丢数据 / 库损坏**。
+//
+// 依据：设计文档 §14.2 单写者约束 —— 同一个 SQLite 文件只允许一个写进程
+//   （并发写会撞 SQLITE_BUSY / 517，见 README 的头号架构承诺）。
+import { spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { readPidFile, pidFilePath, isProcessAlive } from './pidfile.js';
+import { probeService } from './service-probe.js';
+
+/**
+ * 服务是否还在跑。优先看 pid 文件（跨平台），Linux 上再兜底 systemd。
+ *
+ * @param {{ dataDir?: string, serviceName?: string }} [opts]
+ * @returns {{ running: boolean, reason: string, pid?: number, stale?: boolean }}
+ */
+export function checkServiceState({ dataDir = './data', serviceName = 'heikesong' } = {}) {
+  const pid = readPidFile(dataDir);
+  if (pid && isProcessAlive(pid)) {
+    return { running: true, reason: `pid 文件显示进程 ${pid} 仍在运行`, pid };
+  }
+  // ⚠️ pid 文件在，但内容**不是合法 pid**（写坏了）→ 证明不了服务已停 → 保守判为「还在跑」。
+  //    依据：设计文档 §14.2【决策】恢复前必须先停服务 —— 这条是**安全闸**，
+  //    拿不到证据时必须拒绝，而不是当成「服务没在跑」。
+  //    运维确认服务确实停了，删掉这个 pid 文件即可继续。
+  // ⚠️ 判据是「**读不出合法 pid**」（`!pid`），**不是**「文件存在」——
+  //    文件存在但内容合法、只是进程已退出 ⇒ 那是**陈旧残留**，走下面的探测分支，
+  //    不能被这条「内容无法解析」误伤（这条曾经把陈旧残留判成「还在跑」，
+  //    被 test/restore.test.js 的既有用例当场抓住）。
+  if (!pid && existsSync(pidFilePath(dataDir))) {
+    return { running: true, reason: 'pid 文件存在但内容无法解析，无法确认服务已停止' };
+  }
+  // ⚠️⚠️ pid 文件**不存在**，或它指向的进程**已退出** ⇒「进程已停」这个证据**不成立**
+  //   ⇒ 必须**主动探测服务本身**（E169 / F5b）。
+  //   为什么不能只看 pid 文件：「服务确实停了」（正常退出时 server.js 会删掉 pid 文件）
+  //   与「服务还在跑、只是 pid 文件没了」（被误删 / 被第二个实例覆盖）**看起来一模一样**，
+  //   而恢复的后果天差地别：
+  //     · 前者 ⇒ 恢复正是该做的事；
+  //     · 后者 ⇒ 恢复会把正在被写入的库文件换掉 ⇒ 丢数据 / 库损坏。
+  //   ⇒ 唯一能分辨的证据是「服务还在不在应答」（见 src/runtime/service-probe.js）。
+  const probe = probeService(dataDir);
+  if (probe.alive) {
+    return {
+      running: true,
+      reason: pid
+        ? `pid 文件显示进程 ${pid} 已退出，但 ${probe.reason} ⇒ 服务仍在运行`
+        : `pid 文件缺失，但 ${probe.reason} ⇒ 服务仍在运行（拿不到「服务已停」的证据，保守拒绝恢复）`,
+      ...(pid ? { pid, stale: true } : {}),
+    };
+  }
+  if (pid) {
+    return { running: false, reason: `pid 文件存在但进程 ${pid} 已退出（可能是异常终止的残留）`, pid, stale: true };
+  }
+  // ⚠️ 用「**能力探测**」而不是「平台判断」：/run/systemd/system 这个目录
+  //    **只在 systemd 体系上存在**（macOS / Windows 上不存在；Linux 容器里也可能没有）
+  //    ⇒ 它的存在性本身就是「这台机器有 systemd」的判据。
+  //    ⛔ 不能写 `process.platform === 'linux'`：那会把平台分支带进 src/
+  //    （违反 R-OPS-02：运行时代码不得有平台分支 —— 见 test/portability.test.js）。
+  if (existsSync('/run/systemd/system')) {
+    try {
+      const res = spawnSync('systemctl', ['is-active', serviceName], { encoding: 'utf8' });
+      if (res.status === 0 && String(res.stdout).trim() === 'active') {
+        return { running: true, reason: `systemd 服务 ${serviceName} 处于 active` };
+      }
+    } catch {
+      // systemctl 不可用 → 忽略这一路探测
+    }
+  }
+  return { running: false, reason: '未发现运行中的服务进程' };
+}
+
+/**
+ * 写库前的**单写者闸**：服务还在跑 ⇒ 直接拒绝执行。
+ *
+ * 依据：设计文档 §14.2 单写者约束 + README「SQLite 只允许单写进程」。
+ *   适用对象：**批量写 / 改 schema** 的运维脚本（seed / migrate）。
+ *   ⚠️ **不适用**于 backup（读，走 SQLite 官方 backup API，与服务并发安全）
+ *      与 prune（只删已过期行，短事务，见 scripts/prune.js 的论证）。
+ *
+ * @param {{ dataDir?: string, serviceName?: string, action?: string }} [opts]
+ * @returns {object} checkServiceState 的结果（服务已停时）
+ * @throws {Error} 带 `code = 'SERVICE_STILL_RUNNING'` —— 调用方须转成人话错误并退出码 1
+ */
+export function assertServiceStopped({
+  dataDir = './data',
+  serviceName = 'heikesong',
+  action = '写库操作',
+} = {}) {
+  const state = checkServiceState({ dataDir, serviceName });
+  if (state.running) {
+    const err = new Error(
+      `拒绝执行${action}：${state.reason}。`
+      + '单写者约束：同一个 SQLite 文件只允许一个写进程（并发写会撞 SQLITE_BUSY / 517）。'
+      + '请先停掉服务再执行本操作。',
+    );
+    err.code = 'SERVICE_STILL_RUNNING';
+    throw err;
+  }
+  return state;
+}
+```
+
+**Step 3: 创建 scripts/prune.js**
+
+`platform/scripts/prune.js`：
+
+```javascript
+// scripts/prune.js — 清理过期数据（会话 + 限频计数）
+//
+// 依据：设计文档 §14.2「运维生命周期」+ 2026-10-25 评审轮 P2-7a
+//   · `purgeExpiredSessions`（src/db/repo/sessions.js）早就在仓储层实现了，
+//     但**零调用方** ⇒ 过期会话永远堆在表里（服务端的 resolveSession 只在
+//     「有人正好拿着那个过期 token 来访问」时才顺手删一行）。
+//   · 限频计数同理：每次登录失败 / 评分提交 / 申诉提交都写一行，
+//     窗口过了也不删 ⇒ 这张表只增不减。
+//
+// ⚠️ **为什么 prune 不走单写者闸**（与 seed / migrate 的区别，刻意为之）：
+//   · 单写者闸（src/runtime/service-state.js 的 assertServiceStopped）拦的是
+//     **批量写 / 改 schema** 的脚本 —— 那类操作与服务并发会写坏数据
+//     （seed 会让规则与账号对不上；migrate 会让运行中的服务撞「no such column」）。
+//   · 本脚本只做两件事：**删掉已经过期、没人再引用的行**：
+//       ① sessions 里 expires_at 已过的会话 —— 服务端早已不再认它们
+//          （resolveSession 命中过期行本来就会删行）；
+//       ② rate_limit_events 里窗口早已结束的事件 —— 判据见仓储层注释
+//          （24 小时 ≫ 本仓最宽的窗口 perHour = 1 小时 ⇒ 删掉的行对任何判定都不可见）。
+//   · 两者的写入都是**短事务**，WAL + busy_timeout(5000) 会与服务端的写**串行化**
+//     （README 的原话就是「单写者约束：SQLite 只允许单写进程，**写入串行化**」）
+//     ⇒ 不可能与服务并发写坏数据。
+//   · ⚠️ 反过来看：若把 prune 也用闸拦住，systemd timer 就必须**先停服务**才能清理
+//     ⇒ 为了删几行过期数据而中断比赛服务 ⇒ 运维上更糟。
+//   ⇒ 结论：**prune 与服务并发安全，故不受单写者闸约束**（这是刻意的区分，不是漏了）。
+//
+// ⚠️ 为什么删旧行**不会**削弱限频：见
+//    src/db/repo/rate-limit.js 的 deleteRateLimitEventsOlderThan 注释。
+import { fileURLToPath } from 'node:url';
+import { realpathSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { openDatabase } from '../src/db/sqlite.js';
+import { purgeExpiredSessions } from '../src/db/repo/sessions.js';
+import { deleteRateLimitEventsOlderThan } from '../src/db/repo/rate-limit.js';
+
+/** 限频计数的保留时长（秒）。默认 24 小时 ≫ 本仓最宽的窗口（perHour = 1 小时）。 */
+export const RATE_LIMIT_RETENTION_SECONDS = 86400;
+
+/**
+ * 清理过期数据。
+ *
+ * @param {object} db
+ * @param {{ now?: Date, rateLimitRetentionSeconds?: number }} [opts]
+ * @returns {{ sessions: number, rateLimit: number }} 各删了多少行
+ */
+export function pruneExpiredData(db, {
+  now = new Date(),
+  rateLimitRetentionSeconds = RATE_LIMIT_RETENTION_SECONDS,
+} = {}) {
+  const sessions = purgeExpiredSessions(db, { now });
+  const rateLimit = deleteRateLimitEventsOlderThan(db, {
+    now,
+    retentionSeconds: rateLimitRetentionSeconds,
+  });
+  return { sessions, rateLimit };
+}
+
+// ── 命令行入口 ────────────────────────────────────────────────
+// ⚠️ 符号链接入口：与 src/server.js / scripts/restore.js 同一处判定（两边都 realpath 再比）
+//    —— Node 会把主入口 realpath 化，而 process.argv[1] 保留链接路径
+//    ⇒ 字符串全等为假 ⇒ 脚本静默不执行、退出码 0。
+const here = dirname(fileURLToPath(import.meta.url));
+const isMain = (() => {
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+})();
+if (isMain) {
+  const dataDir = process.env.DATA_DIR || join(here, '..', 'data');
+  const { db, close } = openDatabase({ dataDir });
+  try {
+    const result = pruneExpiredData(db);
+    console.log(`[prune] 过期会话已清理：${result.sessions} 行`);
+    console.log(`[prune] 过期限频计数已清理：${result.rateLimit} 行`);
+  } finally {
+    close();
+  }
+}
+```
+
+**Step 4: 创建 db/migrations/008_session_touch.sql**
+
+`platform/db/migrations/008_session_touch.sql`：
+
+```sql
+-- 008_session_touch.sql —— 会话滑动续期改「脏才写」（2026-10-25）
+--
+-- 依据：2026-10-24 独立评审轮 P1-3a「拆掉读路径的隐性写库」
+--   · 修复前：每次命中有效会话都执行 `UPDATE sessions SET expires_at = ?`
+--     ⇒ **每个 GET 请求都产生一次写事务** ⇒ 纯读压测下写事务数随请求数线性增长。
+--     ⇒ 读路径的写放大在评委打分窗口（几百并发只读页面）会把 SQLite 的写锁排起队。
+--   · 修法：显式记一列「上次续期时刻」，只有距上次续期超过阈值才真的 UPDATE。
+--
+-- ⚠️ 为什么必须**显式存一列**，不能用 expires_at 反推「上次续期时刻」：
+--    expires_at 会被「绝对过期上限」夹住（earlierIso）⇒ 反推出的续期时刻越来越旧
+--    ⇒ 越接近绝对上限写得越频繁 ⇒ 等于白改。所以直接记 last_touch_at。
+--
+-- ⚠️ 老会话（迁移前签发的）没有这一列 ⇒ 用 created_at 回填
+--    （created_at ≈ 当初那次续期时刻）⇒ 它们的第一次访问会续期一次，
+--    之后转入「脏才写」。回填放在同一迁移里 ⇒ 不会留下 NULL 洞。
+ALTER TABLE sessions ADD COLUMN last_touch_at TEXT;
+
+UPDATE sessions SET last_touch_at = created_at WHERE last_touch_at IS NULL;
+```
+
+**Step 5: 创建 deploy/heikesong-backup.service**
+
+`platform/deploy/heikesong-backup.service`：
+
+```systemd
+# deploy/heikesong-backup.service — 定时备份单元（oneshot）
+#
+# 依据：设计文档 §14.2【决策】备份用 sqlite.backup() API（不用 cp），并且是**定时**执行的。
+#   触发方：deploy/heikesong-backup.timer（每日一次）。
+#
+# ⚠️ 为什么备份**不与** heikesong.service 冲突（单写者约束的边界）：
+#   备份走 SQLite 官方 backup API —— 它**只读**源库、不改源库，
+#   且 scripts/backup.js 走 openDatabase（带 busy_timeout=5000）⇒
+#   **可以在服务运行中执行**（scripts/backup.js 的文件头就写着这条）。
+#   ⇒ 这正是「备份要在服务还活着的时候也能做」的意义：出事时不必先停服。
+# ⛔ 单写者约束：这里【绝不】加常驻 / 多 worker / 集群启动参数 ——
+#    备份是**一次性**任务（Type=oneshot），不是第二个常驻写进程。
+#
+# ⚠️ 占位符说明（由 deploy/install.sh 自动替换）：
+#   __APP_DIR__   程序目录（默认 /opt/heikesong/platform）
+#   __DATA_DIR__  数据目录（默认 /var/lib/heikesong/data）
+#   __RUN_USER__  运行用户（默认 heikesong）
+
+[Unit]
+Description=Heikesong Platform 定时备份（sqlite.backup API · 一致性快照）
+Documentation=file:__APP_DIR__/README.md
+After=heikesong.service
+
+[Service]
+Type=oneshot
+User=__RUN_USER__
+Group=__RUN_USER__
+WorkingDirectory=__APP_DIR__
+
+# 环境文件：PORT / DATA_DIR / NODE_ENV 等（同名变量以环境文件为准）
+EnvironmentFile=-/etc/heikesong/platform.env
+
+# 环境默认值（EnvironmentFile 里的同名变量优先）
+Environment=DATA_DIR=__DATA_DIR__
+Environment=NODE_ENV=production
+
+ExecStart=/usr/bin/env node __APP_DIR__/scripts/backup.js
+
+# 备份失败必须**让人看见** ⇒ 走 journald（journalctl -u heikesong-backup -f）
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=heikesong-backup
+```
+
+**Step 6: 创建 deploy/heikesong-backup.timer**
+
+`platform/deploy/heikesong-backup.timer`：
+
+```
+# deploy/heikesong-backup.timer — 每日定时备份
+#
+# 依据：设计文档 §14.2【决策】备份是**定时**的（此前 deploy/ 下只有 .service、没有 .timer
+#   ⇒ 「定时」这件事一直是**口头承诺**，机器上并没有真的会跑）。
+#
+# ⚠️ 为什么是 03:17 而不是 03:00：
+#   整点是全网备份任务的峰值（各家 cron / 云盘快照都挤在 00:00）。
+#   错开几分钟 ⇒ 本机不会和别的任务抢磁盘 IO。
+# ⚠️ RandomizedDelaySec=300：再叠加最多 5 分钟的随机延迟 ——
+#   多台机器（城市联络员 / 评审机）不会在同一秒同时打 IO。
+# ⚠️ Persistent=true：关机期间错过的触发，**开机后补跑一次**
+#   （否则「周末关机 ⇒ 整个周末没有备份」这种坑会真实发生）。
+
+[Unit]
+Description=每日定时备份（Heikesong Platform）
+Documentation=file:__APP_DIR__/README.md
+
+[Timer]
+OnCalendar=*-*-* 03:17:00
+Persistent=true
+RandomizedDelaySec=300
+Unit=heikesong-backup.service
+
+[Install]
+WantedBy=timers.target
+```
+
+**Step 7: 创建 deploy/heikesong-prune.service**
+
+`platform/deploy/heikesong-prune.service`：
+
+```systemd
+# deploy/heikesong-prune.service — 过期数据清理单元（oneshot）
+#
+# 依据：设计文档 §14.2「运维生命周期」+ 2026-10-25 评审轮 P2-7a
+#   清理两类只增不减的表：过期会话（sessions）、过期限频计数（rate_limit_events）。
+#   触发方：deploy/heikesong-prune.timer（每日一次）。
+#
+# ⚠️ **为什么清理可以与 heikesong.service 并发跑**（单写者约束的边界，刻意为之）：
+#   · 单写者闸拦的是**批量写 / 改 schema**（seed 会让规则与账号对不上；
+#     migrate 会让运行中的服务撞「no such column」）—— 那两类**必须**停服。
+#   · prune 只删**已经过期、没人再引用的行**，且是**短事务**：
+#     WAL + busy_timeout(5000) 让它与服务端的写**串行化** ⇒ 不可能写坏数据。
+#   · 反过来：若 prune 也要停服，那为了删几行过期数据而中断比赛服务 ⇒ 运维上更糟。
+#   ⇒ 详细论证见 platform/scripts/prune.js 的文件头。
+#
+# ⚠️ 占位符说明（由 deploy/install.sh 自动替换）：
+#   __APP_DIR__   程序目录（默认 /opt/heikesong/platform）
+#   __DATA_DIR__  数据目录（默认 /var/lib/heikesong/data）
+#   __RUN_USER__  运行用户（默认 heikesong）
+
+[Unit]
+Description=Heikesong Platform 过期数据清理（会话 + 限频计数）
+Documentation=file:__APP_DIR__/README.md
+After=heikesong.service
+
+[Service]
+Type=oneshot
+User=__RUN_USER__
+Group=__RUN_USER__
+WorkingDirectory=__APP_DIR__
+
+# 环境文件：PORT / DATA_DIR / NODE_ENV 等（同名变量以环境文件为准）
+EnvironmentFile=-/etc/heikesong/platform.env
+
+# 环境默认值（EnvironmentFile 里的同名变量优先）
+Environment=DATA_DIR=__DATA_DIR__
+Environment=NODE_ENV=production
+
+ExecStart=/usr/bin/env node __APP_DIR__/scripts/prune.js
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=heikesong-prune
+```
+
+**Step 8: 创建 deploy/heikesong-prune.timer**
+
+`platform/deploy/heikesong-prune.timer`：
+
+```
+# deploy/heikesong-prune.timer — 每日清理过期数据
+#
+# 依据：设计文档 §14.2「运维生命周期」+ 2026-10-25 评审轮 P2-7a
+#
+# ⚠️ 为什么排在备份**之后**（03:47 vs 03:17）：
+#   备份是一次一致性快照；清理是删旧行。
+#   先备份、后清理 ⇒ 备份里**包含**清理前的那份完整状态
+#   ⇒ 万一「清理删错了行」，还有一份清理前的备份可以回退。
+#   （反过来的话，备份里就已经是删完的状态 ⇒ 没有退路。）
+# ⚠️ RandomizedDelaySec=300：与备份同理，避免多台机器同时打 IO。
+
+[Unit]
+Description=每日清理过期数据（Heikesong Platform）
+Documentation=file:__APP_DIR__/README.md
+
+[Timer]
+OnCalendar=*-*-* 03:47:00
+Persistent=true
+RandomizedDelaySec=300
+Unit=heikesong-prune.service
+
+[Install]
+WantedBy=timers.target
+```
+
+**Step 9: 创建 test/signoff-board-api.test.js**
+
+`platform/test/signoff-board-api.test.js`：
+
+```javascript
+// platform/test/signoff-board-api.test.js —— 企业签字台**两个真实读口**的 HTTP 闸
+//
+// ⚠️ **这个文件为什么必须存在（独立评审指出的测试盲区）**：
+//   `src/services/signoff-board.js` 导出两个读口业务函数：
+//     · `getSignoffWorklist`            → GET /api/signoffs/mine
+//     · `getEnterpriseConfirmationBoard` → GET /api/stages/:stageId/enterprise-confirmations
+//   全仓引用它们的**只有**两处：
+//     ① `src/http/routes/signoff.js`（**真实路由**）
+//     ② `web/api.demo.js`（**演示适配器 —— 另一份独立实现**）
+//   而 `web/api.demo.js` 的那份实现（demoSignoffWorklist / demoEnterpriseConfirmationBoard）
+//   **压根不做企业过滤**：它遍历 `state.teams` 全部队伍、返回 `scope:'committee'`，
+//   确认记录也是 `state.enterpriseConfirmations` 全量 ⇒
+//   **演示站测绿了也证明不了真实后端没坏**（两条实现的过滤口径根本不是一回事）。
+//   ⇒ 真实 HTTP 路径（`createApp` + 真请求）此前**零覆盖** ⇒ 本文件补上。
+//
+// ⚠️ **断言的判别性纪律**（本文件的硬要求）：
+//   · 只断言「非空」= 假绿 ⇒ 每条都断言**精确集合 / 精确条数 / 逐个 id**；
+//   · 「实现退化成返回全部」与「实现退化成返回空」**都必须变红**；
+//   · 每条用例都带**对照组**（该过的必须过）⇒ 不能靠「一律拒/一律空」骗绿；
+//   · ⛔ **不许为了让用例通过而放宽断言** —— 用例红就是发现，改实现是别人的事。
+//
+// 规则溯源：
+//   - 「企业席只看**自己出题**的队」（里程碑签字 = 客观事实确认，别的企业没资格替它确认）
+//     → R-ENT-02 / R-PTS-02（见 src/services/signoff-board.js 的口径注释）
+//   - 「签字不公开」（R-ENT-04）+ 「非本赛道签字把该队企业项权重归零」（R-JDG-06 R1）
+//     ⇒ 企业席不得看到别家企业的确认记录
+//   - 「三态状态码」：列表 200 + 空集 ｜ 单条 404（赛段不存在）｜ 禁用 403（没有能力点）
+//     → 设计文档 §7.3
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { createServer } from 'node:http';
+import { openDatabase } from '../src/db/sqlite.js';
+import { applyMigrations } from '../src/db/migrate.js';
+import { loadRules } from '../src/config.js';
+import { createApp } from '../src/server.js';
+import { createUser } from '../src/db/repo/users.js';
+import { createSession } from '../src/auth/session.js';
+import { grantAssignment } from '../src/auth/permissions.js';
+import { insertCapability } from '../src/db/repo/capabilities.js';
+import { isolateTempDir } from '../test-helpers/tmp.js';
+
+// ⚠️ 隔离本进程临时目录：进程退出时整体回收（防临时目录泄漏，详见 test-helpers/tmp.js）
+//    ⚠️ 必须在临时目录第一次被求值之前调用（temp-leak-scan 的 R1 / R2 闸）。
+isolateTempDir();
+
+const here = dirname(fileURLToPath(import.meta.url));
+const migrationsDir = join(here, '..', 'db', 'migrations');
+const rulesDir = join(here, '..', 'rules');
+const webDir = join(here, '..', 'web');
+
+/** 本文件用到的三个能力点（注册后才有资格被 grant）。 */
+const CAPS = [
+  ['signoff:create', '企业里程碑签字'],
+  ['score:write', '写入评分'],
+  ['stage:compute', '触发计算发榜'],
+];
+
+/**
+ * 真实 HTTP 调用（真服务器 + 真 fetch）。
+ * ⚠️ 为什么不用 test-helpers/http-call.js 的进程内 call()：
+ *    本文件要证明的是「**HTTP 路径**真的能读口」，进程内调用跳过 socket 与报文编解码；
+ *    这里起真服务器，Cookie 走真实请求头 ⇒ 与真机链路一致。
+ */
+async function call(base, method, path, { body, cookie } = {}) {
+  const headers = {};
+  if (body !== undefined) headers['Content-Type'] = 'application/json';
+  if (cookie) headers.Cookie = cookie;
+  const res = await fetch(base + path, {
+    method, headers, body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const text = await res.text();
+  let json = null;
+  try {
+    json = text ? JSON.parse(text) : null;
+  } catch {
+    json = null;
+  }
+  return { status: res.status, text, json };
+}
+
+/**
+ * 夹具：两家公司、两个任务包、两支队、一个赛段、两条企业确认。
+ *
+ * ⚠️ **夹具按生产口径造**（F30/F31 修完后的口径）：
+ *    `task_packages.enterprise_id` = 出题企业本人 ⇒ 「谁出的题」这件事在库里是**真的**，
+ *    否则「只看到自己出题的队」这条根本触发不了（那是个无主卡 ⇒ 假绿）。
+ *
+ * ⚠️ 每个用例都拿到**全新的库**（每次调用新建 dataDir + 迁移）⇒ 用例之间零共享状态。
+ */
+async function withTwoEnterprises(fn) {
+  const dataDir = mkdtempSync(join(tmpdir(), 'hks-signboard-'));
+  const { db, close } = openDatabase({ dataDir });
+  applyMigrations(db, migrationsDir);
+  const { rules } = loadRules(rulesDir);
+  const app = createApp({ db, rules, webDir });
+  const server = createServer(app.handle);
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const now = new Date().toISOString();
+  try {
+    for (const [k, d] of CAPS) insertCapability(db, k, d);
+
+    const entA = createUser(db, { name: '甲企业席', phone: '13900009001', password: 'pw', org: '甲公司', mbaStatus: 'other' });
+    const entB = createUser(db, { name: '乙企业席', phone: '13900009002', password: 'pw', org: '乙公司', mbaStatus: 'other' });
+    const capA = createUser(db, { name: '甲队长', phone: '13900009003', password: 'pw', mbaStatus: 'mba' });
+    const capB = createUser(db, { name: '乙队长', phone: '13900009004', password: 'pw', mbaStatus: 'mba' });
+    const judge = createUser(db, { name: '评委丙', phone: '13900009005', password: 'pw', mbaStatus: 'mba' });
+    // 无任何能力点 ⇒ 两个读口都必须回 403
+    const outsider = createUser(db, { name: '无关路人', phone: '13900009006', password: 'pw', mbaStatus: 'mba' });
+    // 只有 score:write、没有 signoff:create ⇒ 企业双签清单必须回 403（不是放行）
+    const scoreOnly = createUser(db, { name: '只有评分权', phone: '13900009007', password: 'pw', mbaStatus: 'mba' });
+    // 只有 signoff:create、没有 score:write ⇒ 企业双签清单必须回 403（写端点是无条件校验的）
+    const seatOnly = createUser(db, { name: '只有签字权', phone: '13900009008', password: 'pw', org: '丙公司', mbaStatus: 'other' });
+    // 组委会：stage:compute ⇒ 全量视角（对照组：可见性过滤不是「谁都看不到」）
+    const committee = createUser(db, { name: '组委会', phone: '13900009009', password: 'pw', mbaStatus: 'mba' });
+
+    const grant = (userId, capability) => grantAssignment(db, {
+      userId, capability, scopeType: 'global', scopeId: null, grantedBy: null,
+    });
+    for (const u of [entA, entB]) { grant(u.id, 'signoff:create'); grant(u.id, 'score:write'); }
+    grant(judge.id, 'score:write');
+    grant(scoreOnly.id, 'score:write');
+    grant(seatOnly.id, 'signoff:create');
+    grant(committee.id, 'stage:compute');
+    grant(committee.id, 'score:write');
+
+    // ── 届期 / 任务包（enterprise_id = 出题企业本人）──
+    db.exec(`INSERT INTO editions (id,name,city,starts_at,ends_at,created_at)
+             VALUES ('ed_1','首届','上海','2026-01-01','2026-12-31','${now}')`);
+    for (const [tp, ent, name] of [['tp_a', entA, '甲公司'], ['tp_b', entB, '乙公司']]) {
+      db.exec(`INSERT INTO task_packages (id,edition_id,enterprise_id,enterprise_name,title,pain_point,
+                expected_delivery,acceptance_criteria,is_free_brief,submitted_by,status,meta_json,submitted_at)
+               VALUES ('${tp}','ed_1','${ent.id}','${name}','${name}任务包','p','e','a',0,'${ent.id}','published','{}','${now}')`);
+    }
+    // ── 两支队（各属各的任务包）──
+    db.exec(`INSERT INTO teams (id,edition_id,name,captain_id,task_package_id,status,created_at)
+             VALUES ('team_a','ed_1','甲队','${capA.id}','tp_a','active','${now}')`);
+    db.exec(`INSERT INTO teams (id,edition_id,name,captain_id,task_package_id,status,created_at)
+             VALUES ('team_b','ed_1','乙队','${capB.id}','tp_b','active','${now}')`);
+    // ── 每队 2 个里程碑（条数刻意不等于 1 ⇒ 「返回空 / 返回全部」都判得出来）──
+    for (const [ms, team, key, label] of [
+      ['ms_a1', 'team_a', 'problem_confirmed', '企业问题确认'],
+      ['ms_a2', 'team_a', 'pilot_signed', '试点合同已签'],
+      ['ms_b1', 'team_b', 'problem_confirmed', '企业问题确认'],
+      ['ms_b2', 'team_b', 'pilot_signed', '试点合同已签'],
+    ]) {
+      db.exec(`INSERT INTO milestones (id,team_id,key,label,counts_toward_tier,requires_signoff,fixed_at,created_at)
+               VALUES ('${ms}','${team}','${key}','${label}',1,1,'${now}','${now}')`);
+    }
+    // ── 里程碑签字（客观事实）：甲签了自己的一条，乙签了自己的一条 ──
+    db.exec(`INSERT INTO milestone_signoffs (id,milestone_id,enterprise_id,signatory_user_id,department,content,signed_at,revoked_at)
+             VALUES ('so_a','ms_a1','${entA.id}','${entA.id}','业务部','甲企业确认问题已确认','${now}',NULL)`);
+    db.exec(`INSERT INTO milestone_signoffs (id,milestone_id,enterprise_id,signatory_user_id,department,content,signed_at,revoked_at)
+             VALUES ('so_b','ms_b1','${entB.id}','${entB.id}','业务部','乙企业确认问题已确认','${now}',NULL)`);
+    // ── 赛段 + 评委席 ──
+    db.exec(`INSERT INTO stages (id,edition_id,"key",name,kind,starts_at,ends_at,scoring_config_key,status)
+             VALUES ('st_1','ed_1','s1','决赛','final','2026-01-01','2026-06-30','final','open')`);
+    db.prepare(
+      'INSERT INTO stage_judges (stage_id,user_id,seat,scope_type,scope_id,assigned_at) VALUES (?,?,?,?,?,?)',
+    ).run('st_1', judge.id, 'judge', 'global', null, now);
+    // ── 企业确认（主观评分，双签）：各企业各签各的队 ──
+    db.exec(`INSERT INTO enterprise_confirmations (id,stage_id,team_id,enterprise_id,dimension,raw_score,
+              cross_judge_id,signatory_user_id,content,created_at)
+             VALUES ('ec_a','st_1','team_a','${entA.id}','enterprise',85,'${judge.id}','${entA.id}','甲企业双签确认内容','${now}')`);
+    db.exec(`INSERT INTO enterprise_confirmations (id,stage_id,team_id,enterprise_id,dimension,raw_score,
+              cross_judge_id,signatory_user_id,content,created_at)
+             VALUES ('ec_b','st_1','team_b','${entB.id}','enterprise',60,'${judge.id}','${entB.id}','乙企业双签确认内容','${now}')`);
+
+    await fn({
+      base, db,
+      entA, entB, capA, capB, judge, outsider, scoreOnly, seatOnly, committee,
+      tokenEntA: createSession(db, entA.id).token,
+      tokenEntB: createSession(db, entB.id).token,
+      tokenOutsider: createSession(db, outsider.id).token,
+      tokenScoreOnly: createSession(db, scoreOnly.id).token,
+      tokenSeatOnly: createSession(db, seatOnly.id).token,
+      tokenCommittee: createSession(db, committee.id).token,
+    });
+  } finally {
+    await new Promise((r) => server.close(r));
+    close();
+    rmSync(dataDir, { recursive: true, force: true });
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 读口 ①：GET /api/signoffs/mine（企业席签字台）
+// ══════════════════════════════════════════════════════════════════
+
+test('签字台读口：企业席只读得到**自己出题**的队的里程碑（别家的读不到）', async () => {
+  await withTwoEnterprises(async ({ base, tokenEntA, tokenEntB }) => {
+    const r = await call(base, 'GET', '/api/signoffs/mine', { cookie: `hk_session=${tokenEntA}` });
+    assert.equal(r.status, 200, `企业席读自己的签字台必须 200：${r.text}`);
+    assert.equal(r.json.scope, 'enterprise', `企业席看到的必须是企业视角，实际 ${r.json.scope}`);
+
+    // 判别性①：**精确条数** —— 甲队 2 条里程碑。
+    //   ⇒ 实现退化成「返回全部」（4 条）⇒ 红；退化成「返回空」（0 条）⇒ 红。
+    assert.equal(
+      r.json.items.length, 2,
+      `甲企业只该看到自己出题的甲队的 2 条里程碑，实际 ${r.json.items.length} 条：${r.text}`,
+    );
+    // 判别性②：**逐个 id 点名** —— 不能靠「条数对了」蒙混（换了内容也算错）
+    assert.deepEqual(
+      r.json.items.map((i) => i.milestoneId).sort(),
+      ['ms_a1', 'ms_a2'],
+      `甲企业的清单里必须只有甲队的两个里程碑：${r.text}`,
+    );
+    assert.ok(
+      r.json.items.every((i) => i.teamId === 'team_a'),
+      `甲企业的清单里不得出现别家的队：${r.text}`,
+    );
+    // 判别性③：**按名字点名** —— 乙队的队名 / 乙队的里程碑 id 一个都不许出现
+    assert.equal(r.text.includes('乙队'), false, '别家的队名不得出现在我的签字台里');
+    assert.equal(r.text.includes('ms_b1'), false, '别家的里程碑不得出现在我的签字台里');
+    assert.equal(r.text.includes('team_b'), false, '别家的队 id 不得出现在我的签字台里');
+
+    // ── 对照组：乙企业看到的是**乙队**的（该过的必须过 ⇒ 不能靠「一律空」骗绿）──
+    const rb = await call(base, 'GET', '/api/signoffs/mine', { cookie: `hk_session=${tokenEntB}` });
+    assert.equal(rb.status, 200, rb.text);
+    assert.equal(rb.json.scope, 'enterprise');
+    assert.equal(
+      rb.json.items.length, 2,
+      `乙企业只该看到自己出题的乙队的 2 条里程碑，实际 ${rb.json.items.length} 条：${rb.text}`,
+    );
+    assert.deepEqual(
+      rb.json.items.map((i) => i.milestoneId).sort(),
+      ['ms_b1', 'ms_b2'],
+      `乙企业的清单里必须只有乙队的两个里程碑：${rb.text}`,
+    );
+    assert.ok(rb.json.items.every((i) => i.teamId === 'team_b'), '乙企业的清单里不得出现甲队');
+  });
+});
+
+test('签字台读口：已签状态与「是不是我签的」必须如实（签字人不公开）', async () => {
+  await withTwoEnterprises(async ({ base, tokenEntA, tokenEntB }) => {
+    const r = await call(base, 'GET', '/api/signoffs/mine', { cookie: `hk_session=${tokenEntA}` });
+    assert.equal(r.status, 200, r.text);
+    const signed = r.json.items.find((i) => i.milestoneId === 'ms_a1');
+    const unsigned = r.json.items.find((i) => i.milestoneId === 'ms_a2');
+    assert.ok(signed, '清单里必须有 ms_a1');
+    assert.ok(unsigned, '清单里必须有 ms_a2');
+    assert.equal(signed.signed, true, '已签字的里程碑 signed 必须为 true');
+    assert.equal(signed.signedByMe, true, '自己签的必须 signedByMe=true');
+    assert.equal(signed.canWithdraw, true, '自己签的必须可以撤回');
+    assert.equal(unsigned.signed, false, '没签的里程碑 signed 必须为 false');
+    assert.equal(unsigned.signedByMe, false, '没签的 signedByMe 必须是 false');
+    // R-ENT-04「签字不公开」：条目里**不得**出现签字人姓名 / id
+    assert.equal(r.text.includes('甲企业席'), false, '签字人姓名不得出现在签字台里');
+    assert.ok(
+      !r.json.items.some((i) => Object.keys(i).some((k) => /signatory|signer|signerId/i.test(k))),
+      '签字台条目里不得有「签字人」字段',
+    );
+
+    // 对照组：乙企业**看不到**甲的签字（甲那条不在乙的清单里）
+    const rb = await call(base, 'GET', '/api/signoffs/mine', { cookie: `hk_session=${tokenEntB}` });
+    assert.equal(rb.status, 200, rb.text);
+    assert.equal(
+      rb.json.items.some((i) => i.milestoneId === 'ms_a1'),
+      false,
+      '乙企业的清单里不得出现甲企业的里程碑',
+    );
+    const own = rb.json.items.find((i) => i.milestoneId === 'ms_b1');
+    assert.equal(own.signed, true, '乙自己签的那条 signed 必须为 true');
+    assert.equal(own.signedByMe, true, '乙自己签的那条 signedByMe 必须为 true');
+  });
+});
+
+test('签字台读口：组委会是全量视角（对照组 —— 可见性过滤不是「谁都看不到」）', async () => {
+  await withTwoEnterprises(async ({ base, tokenCommittee }) => {
+    const r = await call(base, 'GET', '/api/signoffs/mine', { cookie: `hk_session=${tokenCommittee}` });
+    assert.equal(r.status, 200, r.text);
+    assert.equal(r.json.scope, 'committee', `组委会看到的必须是 committee 视角，实际 ${r.json.scope}`);
+    assert.equal(
+      r.json.items.length, 4,
+      `组委会看得到两队共 4 条里程碑，实际 ${r.json.items.length} 条：${r.text}`,
+    );
+    assert.deepEqual(
+      [...new Set(r.json.items.map((i) => i.teamId))].sort(),
+      ['team_a', 'team_b'],
+      `组委会的清单必须覆盖两支队：${r.text}`,
+    );
+  });
+});
+
+test('签字台读口：未登录 ⇒ 401（不是 500、不是空集）；无能力点 ⇒ 403', async () => {
+  await withTwoEnterprises(async ({ base, tokenOutsider }) => {
+    const anon = await call(base, 'GET', '/api/signoffs/mine');
+    assert.equal(anon.status, 401, `未登录必须是 401，实际 ${anon.status}：${anon.text}`);
+    assert.equal(anon.json?.error?.code, 'UNAUTHENTICATED', '未登录的错误码必须是 UNAUTHENTICATED');
+    assert.notEqual(anon.status, 500, '未登录不得变成 500');
+
+    const noPerm = await call(base, 'GET', '/api/signoffs/mine', { cookie: `hk_session=${tokenOutsider}` });
+    assert.equal(noPerm.status, 403, `没有能力点必须是 403，实际 ${noPerm.status}：${noPerm.text}`);
+    assert.equal(noPerm.json?.error?.code, 'FORBIDDEN', '无能力点的错误码必须是 FORBIDDEN');
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 读口 ②：GET /api/stages/:stageId/enterprise-confirmations（企业双签清单）
+// ══════════════════════════════════════════════════════════════════
+
+test('企业双签清单读口：企业席只读得到**本企业相关**的行（别家的行读不到）', async () => {
+  await withTwoEnterprises(async ({ base, entA, entB, tokenEntA, tokenEntB }) => {
+    const r = await call(base, 'GET', '/api/stages/st_1/enterprise-confirmations', {
+      cookie: `hk_session=${tokenEntA}`,
+    });
+    assert.equal(r.status, 200, `企业席读双签清单必须 200：${r.text}`);
+    assert.equal(r.json.scope, 'enterprise', `企业席看到的必须是企业视角，实际 ${r.json.scope}`);
+    assert.equal(r.json.myEnterpriseId, entA.id, 'myEnterpriseId 必须是当前登录人自己');
+
+    // 判别性①：**精确条数** —— 甲企业只有 1 条确认记录。
+    //   ⇒ 退化成「返回全部」（2 条）⇒ 红；退化成「返回空」（0 条）⇒ 红。
+    assert.equal(
+      r.json.confirmations.length, 1,
+      `甲企业只该看到自己那 1 条确认记录，实际 ${r.json.confirmations.length} 条：${r.text}`,
+    );
+    // 判别性②：逐个字段点名 —— enterpriseId / teamId 都必须是自己家的
+    assert.equal(r.json.confirmations[0].enterpriseId, entA.id, '确认记录的 enterpriseId 必须是本企业');
+    assert.equal(r.json.confirmations[0].teamId, 'team_a', '确认记录必须挂在自家出题的队上');
+    // 判别性③：别家的确认记录一个都不许出现
+    assert.equal(
+      r.json.confirmations.some((c) => c.enterpriseId !== entA.id),
+      false,
+      `不得看到别家企业的确认记录：${r.text}`,
+    );
+    assert.equal(r.text.includes('乙企业双签确认内容'), false, '别家企业的确认内容不得泄露');
+    // 判别性④：**名册**也必须过滤 —— 只列自家出题的队
+    assert.deepEqual(
+      r.json.teams.map((t) => t.teamId),
+      ['team_a'],
+      `名册里只该有自家出题的队：${r.text}`,
+    );
+    assert.equal(r.text.includes('乙队'), false, '别家的队名不得出现在双签清单里');
+
+    // ── 对照组：乙企业看到的是**乙队 + 乙的确认**（该过的必须过）──
+    const rb = await call(base, 'GET', '/api/stages/st_1/enterprise-confirmations', {
+      cookie: `hk_session=${tokenEntB}`,
+    });
+    assert.equal(rb.status, 200, rb.text);
+    assert.equal(rb.json.scope, 'enterprise');
+    assert.deepEqual(rb.json.teams.map((t) => t.teamId), ['team_b'], `乙企业的名册里只该有乙队：${rb.text}`);
+    assert.equal(
+      rb.json.confirmations.length, 1,
+      `乙企业只该看到自己那 1 条确认记录，实际 ${rb.json.confirmations.length} 条：${rb.text}`,
+    );
+    assert.equal(rb.json.confirmations[0].teamId, 'team_b', '乙的确认记录必须挂在乙队上');
+    assert.equal(rb.json.confirmations[0].enterpriseId, entB.id, '乙看到的确认记录必须属于乙企业');
+    assert.equal(rb.json.myEnterpriseId, entB.id, '乙的 myEnterpriseId 必须是乙企业自己');
+  });
+});
+
+test('企业双签清单读口：组委会是全量视角（对照组 —— 过滤不是「谁都看不到」）', async () => {
+  await withTwoEnterprises(async ({ base, tokenCommittee }) => {
+    const r = await call(base, 'GET', '/api/stages/st_1/enterprise-confirmations', {
+      cookie: `hk_session=${tokenCommittee}`,
+    });
+    assert.equal(r.status, 200, r.text);
+    assert.equal(r.json.scope, 'committee', `组委会看到的必须是 committee 视角，实际 ${r.json.scope}`);
+    assert.equal(r.json.teams.length, 2, `组委会的名册必须有两支队，实际 ${r.json.teams.length}：${r.text}`);
+    assert.equal(
+      r.json.confirmations.length, 2,
+      `组委会必须看得到两家的确认记录，实际 ${r.json.confirmations.length}：${r.text}`,
+    );
+  });
+});
+
+test('企业双签清单读口：未登录 ⇒ 401；缺能力点 ⇒ 403；赛段不存在 ⇒ 404', async () => {
+  await withTwoEnterprises(async ({ base, tokenOutsider, tokenScoreOnly, tokenSeatOnly }) => {
+    // ① 未登录 ⇒ 401（不是 500、不是空集）
+    const anon = await call(base, 'GET', '/api/stages/st_1/enterprise-confirmations');
+    assert.equal(anon.status, 401, `未登录必须是 401，实际 ${anon.status}：${anon.text}`);
+    assert.equal(anon.json?.error?.code, 'UNAUTHENTICATED', '未登录的错误码必须是 UNAUTHENTICATED');
+    assert.notEqual(anon.status, 500, '未登录不得变成 500');
+
+    // ② 一个能力点都没有 ⇒ 403（不是放行、不是空集）
+    const noPerm = await call(base, 'GET', '/api/stages/st_1/enterprise-confirmations', {
+      cookie: `hk_session=${tokenOutsider}`,
+    });
+    assert.equal(noPerm.status, 403, `没有能力点必须是 403，实际 ${noPerm.status}：${noPerm.text}`);
+    assert.equal(noPerm.json?.error?.code, 'FORBIDDEN', '无能力点的错误码必须是 FORBIDDEN');
+
+    // ③ 只有 score:write（没有 signoff:create）⇒ 403
+    const scoreOnly = await call(base, 'GET', '/api/stages/st_1/enterprise-confirmations', {
+      cookie: `hk_session=${tokenScoreOnly}`,
+    });
+    assert.equal(
+      scoreOnly.status, 403,
+      `没有 signoff:create 的人不得读企业双签清单，实际 ${scoreOnly.status}：${scoreOnly.text}`,
+    );
+
+    // ④ 只有 signoff:create（没有 score:write）⇒ 403
+    //    ⚠️ 写端点 `POST /api/stages/:stageId/enterprise-confirmations` 里
+    //    `requireStageCapability(ctx,'score:write')` 是**无条件**执行的 ⇒ 读端点必须同口径。
+    const seatOnly = await call(base, 'GET', '/api/stages/st_1/enterprise-confirmations', {
+      cookie: `hk_session=${tokenSeatOnly}`,
+    });
+    assert.equal(
+      seatOnly.status, 403,
+      `没有 score:write 的人不得读企业双签清单，实际 ${seatOnly.status}：${seatOnly.text}`,
+    );
+    assert.equal(seatOnly.json?.error?.code, 'FORBIDDEN', '缺 score:write 的错误码必须是 FORBIDDEN');
+
+    // ⑤ 赛段不存在 ⇒ 404（单条语义）
+    const missing = await call(base, 'GET', '/api/stages/st_nope/enterprise-confirmations', {
+      cookie: `hk_session=${tokenOutsider}`,
+    });
+    assert.equal(missing.status, 404, `赛段不存在必须是 404，实际 ${missing.status}：${missing.text}`);
+  });
+});
+
+test('企业双签清单读口：响应形状必须给前端够用的字段（维度 / 跨领域评委候选）', async () => {
+  await withTwoEnterprises(async ({ base, tokenEntA }) => {
+    const r = await call(base, 'GET', '/api/stages/st_1/enterprise-confirmations', {
+      cookie: `hk_session=${tokenEntA}`,
+    });
+    assert.equal(r.status, 200, r.text);
+    assert.equal(r.json.stage.id, 'st_1', '必须回赛段摘要');
+    // 企业确认维度从规则表来（不硬编码 'enterprise' 键）⇒ final 权重表里有这一维
+    assert.deepEqual(
+      r.json.dimensions.map((d) => d.key),
+      ['enterprise'],
+      `企业确认维度必须来自规则表：${r.text}`,
+    );
+    assert.equal(r.json.dimensions[0].seat, 'enterprise', '维度的席别必须是 enterprise');
+    // 跨领域评委候选：排除「我」⇒ 自己不在候选里，但别的评委在
+    assert.ok(Array.isArray(r.json.crossJudgeCandidates), '必须给跨领域评委候选数组');
+    assert.ok(
+      r.json.crossJudgeCandidates.length > 0,
+      `跨领域评委候选不得为空（前端凑不齐 R2 双签就没法提交）：${r.text}`,
+    );
+    // 判别性：候选里**不得**含自己（后端会拒绝 crossJudgeId === 签字人）
+    assert.equal(
+      r.json.crossJudgeCandidates.some((c) => c.userId === r.json.myEnterpriseId),
+      false,
+      '跨领域评委候选里不得包含自己',
+    );
+  });
+});
+```
+
+**Step 10: 创建 test/static-traversal.test.js**
+
+`platform/test/static-traversal.test.js`：
+
+```javascript
+// platform/test/static-traversal.test.js — 静态穿越三层防线的**逐层**断言
+//
+// 背景：src/http/static.js 的注释自己写着：
+//   「⚠️ 穿越防线共三层（'..' 段拒绝 / 分隔符边界 / realpath 边界）：
+//      目前只有 realpath 这一层被断言钉住 —— 另两层单独拆掉不会被测出来
+//      （三层同拆才会红）。三层都要留着：realpath 之前的路径规范化仍需自保。」
+//
+// 本文件把另外两层补上，并把「拆掉任一层就必须变红」变成**可验证**的命题：
+//   第一层「'..' 段拒绝」  —— 路径里出现 '..' 段 ⇒ 直接拒（必须在 decode **之后**判）
+//   第二层「分隔符边界」  —— resolve(root, '.'+rel) 之后必须仍在 root 之下
+//   第三层「realpath 边界」—— **已存在**，本文件**不重复造**：
+//        platform/test/server.test.js 的
+//        「软链指向 web 根外的文件时返回 404，不得读出文件内容（终审 I-1）」
+//        与「软链的判定看真实路径：指向根外的被拒，指向根内的放行（终审 M-7）」
+//        （前者钉「根外软链不得读出内容」，后者同时钉「根外软链 → 404 / 根内软链 → 200」两个方向）
+//        ⇒ 实测：单独拆掉 realpath 那一层 ⇒ 这两条变红（2026-10-24 变异验证）。
+//
+// ⚠️ **为什么第二层只能用「接线断言」钉住**（本文件最关键的一条推理，别删）：
+//   · 行为上，第二层**单独**拆掉是**测不出来的**：对同一个越界目标，
+//     第一层（'..' 段）与第三层（realpath）**都会拦** ⇒ 拆掉第二层，响应照样是 404
+//     ⇒ 只写行为断言 ⇒ 第二层会被无声拆掉 ⇒ 这正是 static.js 注释里说的那个病。
+//   · 而第二层**不能被第一层替代**：第一层只按 '/' 切段，
+//     Windows 上 `..\..\x` 是**一个**段（第一层放行）⇒ 只有第二层能拦它。
+//   ⇒ 所以第二层必须有一条**直接断言那道防线还在**的接线断言
+//     （本仓既有手法：server.test.js 的「serveStatic 必须真的调用 isSameFile 做 dev/ino 对账（接线断言）」），
+//     并且这条断言要带**变异对照**（把防线改坏 ⇒ 断言必须变红），否则它自己也可能恒绿。
+//
+// ⛔ **跨平台纪律**：本仓要求用例在 Windows 与 POSIX 上都成立。
+//   · 第一层的探针（'/sub/../index.html'）在两个平台上的语义**完全一致**
+//     （resolve 是纯词法运算，与分隔符无关）⇒ 断言逐字相同。
+//   · 第二层的**行为**探针（拼出 root 的兄弟目录）在两个平台上都成立；
+//     额外加一条**反斜杠**变体，它在 Windows 上**能单独打到第二层**，
+//     在 POSIX 上则是无害的恒真（POSIX 里 '\' 是普通文件名字符，不是分隔符）——
+//     所以该变体只断言「**不泄露**」（两平台都必须成立），
+//     「能单独打到第二层」这个更强的事实由上面的**接线断言**在两平台上保证。
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, dirname, resolve, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import http from 'node:http';
+import net from 'node:net';
+import { openDatabase } from '../src/db/sqlite.js';
+import { applyMigrations } from '../src/db/migrate.js';
+import { loadRules } from '../src/config.js';
+import { createApp } from '../src/server.js';
+import { stripComments } from '../test-helpers/strip-comments.js';
+import { isolateTempDir } from '../test-helpers/tmp.js';
+
+// ⚠️ 隔离本进程临时目录（防临时目录泄漏，详见 test-helpers/tmp.js）
+isolateTempDir();
+
+const here = dirname(fileURLToPath(import.meta.url));
+const migrationsDir = join(here, '..', 'db', 'migrations');
+const rulesDir = join(here, '..', 'rules');
+const STATIC_SRC = join(here, '..', 'src', 'http', 'static.js');
+
+/**
+ * 搭一个静态根：<dataDir>/web-root/web（静态根）、<dataDir>/web-root/web-secret（**兄弟目录**）。
+ *
+ * ⚠️ 兄弟目录 web-secret/ 是第二层防线要防的那个形状：
+ *    '/x/web-secret'.startsWith('/x/web') 为真 ⇒ 只比前缀会把兄弟目录也放进来。
+ */
+function setup() {
+  const dataDir = mkdtempSync(join(tmpdir(), 'hks-static-'));
+  const { db, close } = openDatabase({ dataDir });
+  applyMigrations(db, migrationsDir);
+  const { rules } = loadRules(rulesDir);
+  const webRoot = join(dataDir, 'web-root');
+  const webDir = join(webRoot, 'web');
+  mkdirSync(join(webDir, 'sub'), { recursive: true });
+  mkdirSync(join(webRoot, 'web-secret'), { recursive: true });
+  writeFileSync(join(webDir, 'index.html'), '<h1>home</h1>');
+  writeFileSync(join(webDir, 'sub', 'inner.txt'), 'INNER\n');
+  writeFileSync(join(webRoot, 'web-secret', 'passwd'), 'TOP-SECRET');
+  const app = createApp({ db, rules, webDir });
+  return { db, close, dataDir, webRoot, webDir, app };
+}
+
+/**
+ * 用**裸 socket** 发原始请求行。
+ * ⚠️ 为什么不能用 fetch / http.request：它们按 WHATWG URL 规范把点段消掉
+ *    （'%2e%2e' 也会被规范化成 '..'）⇒ 请求根本发不出原样 ⇒ 穿越测试成了空转。
+ *    Node 的 HTTP **解析器**不规范化 ⇒ 原样发出去，服务端收到的就是原样的路径。
+ */
+function rawRequest(port, rawPath, timeoutMs = 5000) {
+  return new Promise((resolvePromise, reject) => {
+    const socket = net.connect(port, '127.0.0.1');
+    const chunks = [];
+    const done = (value) => resolvePromise(value);
+    socket.setTimeout(timeoutMs, () => {
+      socket.destroy();
+      reject(new Error(`请求超时：${rawPath}`));
+    });
+    socket.on('connect', () => {
+      socket.write(
+        `GET ${rawPath} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nConnection: close\r\n\r\n`,
+      );
+    });
+    socket.on('data', (d) => chunks.push(d));
+    socket.on('end', () => done(Buffer.concat(chunks).toString('utf8')));
+    socket.on('close', () => done(Buffer.concat(chunks).toString('utf8')));
+    socket.on('error', reject);
+  });
+}
+
+/** 起一个真实 HTTP server（真实 socket ⇒ 真实请求 ⇒ 真实响应） */
+async function withServer(app, fn) {
+  const server = http.createServer(app.handle);
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const { port } = server.address();
+  try {
+    return await fn(port);
+  } finally {
+    server.close();
+  }
+}
+
+/**
+ * 第二层防线的**接线断言**匹配器。
+ *
+ * 必须匹配到的形态：目标路径不在 root 之下时**直接拒**，
+ * 且比较**带分隔符边界**（`root + sep`）—— 只比前缀（`root`）正是 C7-1 那个
+ * 「兄弟目录被放进来」的原始 bug。
+ */
+const BOUNDARY_GUARD = /if\s*\(\s*target\s*!==\s*root\s*&&\s*!\s*target\s*\.\s*startsWith\(\s*root\s*\+\s*sep\s*\)\s*\)\s*\{?\s*return\s+false\s*;?\s*\}?/;
+
+// ══════════════════════════════════════════════════════════════════════
+// 第一层：「'..' 段拒绝」
+// ══════════════════════════════════════════════════════════════════════
+
+test('第一层：路径里带 ".." 段的请求必须被拒（只有第一层能拦住下面那条探针）', async () => {
+  const { db, close, dataDir, webRoot, webDir, app } = setup();
+  try {
+    // ── 探针「只打到第一层」的机器可验证证明 ──
+    // resolve() 是**纯词法**运算（不碰文件系统）⇒ '/sub/../index.html' 归一化后
+    // 落在 root **之内** ⇒ 第二层（分隔符边界）与第三层（realpath 边界）**都会放行**
+    // ⇒ 能拦住它的**只有第一层** ⇒ 把第一层拆掉 ⇒ 这条用例必然变红。
+    const resolved = resolve(webDir, './sub/../index.html');
+    assert.ok(
+      resolved.startsWith(resolve(webDir) + sep),
+      `探针必须落在 root 之内（否则它测的是第二/三层）：${resolved}`,
+    );
+    assert.equal(resolved, resolve(webDir, './index.html'), '探针必须归一化到 root 内的真实文件');
+
+    await withServer(app, async (port) => {
+      // ── 阳性对照：同一个服务器、同一个文件，去掉 ".." 段就必须是 200 ──
+      //    没有这条对照，用例可能因为「服务器根本没起来 / 文件根本不存在」而恒绿。
+      const ok = await rawRequest(port, '/index.html');
+      assert.ok(ok.includes('200 OK'), `阳性对照：/index.html 必须 200，实际：${ok.slice(0, 120)}`);
+      assert.ok(ok.includes('<h1>home</h1>'), '阳性对照：必须真的读到文件内容');
+
+      // ── 真正的断言：带 ".." 段的路径必须被拒 ──
+      const blocked = [
+        '/sub/../index.html',       // ← 只打到第一层的那条
+        '/../etc/passwd',
+        '/a/../../etc/passwd',
+        '/sub/../../etc/passwd',
+        '/%2e%2e/etc/passwd',       // 编码形式：第一层在 decode 之后判 ⇒ 也必须被拒
+      ];
+      for (const p of blocked) {
+        const raw = await rawRequest(port, p);
+        assert.ok(!/^HTTP\/1\.1 200/.test(raw), `${p} 必须被拒（不得 200），实际：${raw.slice(0, 120)}`);
+        assert.ok(!raw.includes('root:'), `${p} 泄露了 /etc/passwd 的内容`);
+      }
+    });
+  } finally {
+    close();
+    rmSync(dataDir, { recursive: true, force: true });
+    rmSync(webRoot, { recursive: true, force: true });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════
+// 第二层：「分隔符边界」
+// ══════════════════════════════════════════════════════════════════════
+
+test('第二层：分隔符边界防线必须还在（接线断言 + 变异对照 ⇒ 单独拆掉它就会变红）', () => {
+  // ⚠️ 必须先剥注释再匹配：否则「把防线改坏、然后在注释里写上正确形态」就能骗过这条断言
+  //    （守卫永不触发却仍判绿 —— server.test.js 的终审复核 F-3 就是这个坑）。
+  const src = stripComments(readFileSync(STATIC_SRC, 'utf8'));
+  assert.ok(
+    BOUNDARY_GUARD.test(src),
+    'static.js 里必须保留「目标不在 root 之下 ⇒ 直接拒」的防线，且比较必须带分隔符边界（root + sep）',
+  );
+
+  // ── 变异对照（阳性对照）：把防线改坏 ⇒ 断言必须**拒绝**它 ──
+  //    没有这一段，这条断言自己也可能恒绿（= 钉不住任何东西）。
+  const mutants = [
+    ['整条防线被删掉', '  const target = resolve(root, `.${relPath}`);\n'],
+    ['只比前缀、丢了分隔符边界（C7-1 的原始 bug）',
+      '  if (target !== root && !target.startsWith(root)) return false;\n'],
+    ['边界条件被削弱成只挡 root 本身',
+      '  if (target !== root) return false;\n'],
+  ];
+  for (const [why, replacement] of mutants) {
+    const mutated = src.replace(BOUNDARY_GUARD, replacement);
+    assert.notEqual(mutated, src, `变异必须真的改动了源码（否则变异对照是假的）：${why}`);
+    assert.ok(
+      !BOUNDARY_GUARD.test(mutated),
+      `变异「${why}」必须让断言变红 —— 否则这条接线断言钉不住任何东西`,
+    );
+  }
+});
+
+test('第二层：拼出 root 兄弟目录的请求拿不到内容（跨平台稳定）', async () => {
+  const { db, close, dataDir, webRoot, app } = setup();
+  try {
+    await withServer(app, async (port) => {
+      // ── 阳性对照：兄弟目录里的文件**确实存在**（否则「拿不到内容」可能是文件不存在）──
+      const { existsSync } = await import('node:fs');
+      assert.ok(
+        existsSync(join(webRoot, 'web-secret', 'passwd')),
+        '阳性对照：兄弟目录里的文件必须真的存在',
+      );
+
+      // ── 正斜杠形态：'/' 分隔的 '..'（第一层与第二层都会拦）──
+      for (const p of ['/../web-secret/passwd', '/sub/../../web-secret/passwd']) {
+        const raw = await rawRequest(port, p);
+        assert.ok(!/^HTTP\/1\.1 200/.test(raw), `${p} 必须被拒，实际：${raw.slice(0, 120)}`);
+        assert.ok(!raw.includes('TOP-SECRET'), `${p} 泄露了兄弟目录的内容`);
+      }
+
+      // ── 反斜杠形态：Windows 上第一层放行（'..\..' 是一个段）⇒ 只有第二层能拦 ──
+      //    ⚠️ POSIX 上 '\' 是普通文件名字符 ⇒ 这条路径根本解析不出兄弟目录 ⇒ 只会 404
+      //    ⇒ 因此这里只断言「**不泄露**」（两平台都必须成立）；
+      //    「第二层被拆掉就变红」这个更强的事实由上面的**接线断言**在两平台上保证。
+      const winish = '/..\\..\\web-secret\\passwd';
+      const rawWin = await rawRequest(port, winish);
+      assert.ok(!/^HTTP\/1\.1 200/.test(rawWin), `${winish} 必须被拒，实际：${rawWin.slice(0, 120)}`);
+      assert.ok(!rawWin.includes('TOP-SECRET'), `${winish} 泄露了兄弟目录的内容`);
+    });
+  } finally {
+    close();
+    rmSync(dataDir, { recursive: true, force: true });
+    rmSync(webRoot, { recursive: true, force: true });
+  }
+});
+```
+
+**Step 11: 创建 test/ops-lifecycle.test.js**
+
+`platform/test/ops-lifecycle.test.js`：
+
+```javascript
+// test/ops-lifecycle.test.js — 运维生命周期回归（2026-10-25 评审轮 P1-4 / P2-7）
+//
+// 覆盖三组：
+//   ① P1-4a 写库脚本（seed / migrate）在服务还活着时**必须拒绝**执行（单写者闸）
+//   ② P1-4b 两个实例**并发**启动同一个 DATA_DIR ⇒ 只有一个能活（独占创建消 TOCTOU）
+//   ③ P2-7a/b prune.js 清理过期数据 + deploy/ 下的 systemd 定时单元
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { spawnSync, spawn } from 'node:child_process';
+import { openDatabase } from '../src/db/sqlite.js';
+import { applyMigrations } from '../src/db/migrate.js';
+import { createUser } from '../src/db/repo/users.js';
+import { insertSession } from '../src/db/repo/sessions.js';
+import { incrementBucket } from '../src/db/repo/rate-limit.js';
+import { pruneExpiredData, RATE_LIMIT_RETENTION_SECONDS } from '../scripts/prune.js';
+import { isolateTempDir } from '../test-helpers/tmp.js';
+
+// ⚠️ 隔离本进程临时目录：进程退出时整体回收（防临时目录泄漏，详见 test-helpers/tmp.js）
+isolateTempDir();
+
+const here = dirname(fileURLToPath(import.meta.url));
+const platformDir = join(here, '..');
+const deployDir = join(platformDir, 'deploy');
+const migrationsDir = join(platformDir, 'db', 'migrations');
+const rulesDir = join(platformDir, 'rules');
+
+function readDeploy(name) {
+  return readFileSync(join(deployDir, name), 'utf8');
+}
+
+// ══════════════════════════════════════════════════════════════════
+// P1-4a：单写者闸 —— 写库脚本在服务还活着时必须拒绝执行
+// ══════════════════════════════════════════════════════════════════
+test('P1-4a 服务还活着时 seed / migrate 必须拒绝执行（单写者闸）', () => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'hks-gate-'));
+  // 造一个「服务还活着」：pid 文件登记**本进程**的 pid（它确实活着）
+  writeFileSync(join(dataDir, 'app.pid'), String(process.pid), 'utf8');
+
+  const cases = [
+    ['seed.js', { ADMIN_PASSWORD: '仅用于测试', ADMIN_PHONE: '13900000001' }],
+    ['migrate.js', {}],
+  ];
+  for (const [script, extraEnv] of cases) {
+    const res = spawnSync(process.execPath, [join(platformDir, 'scripts', script)], {
+      env: { ...process.env, DATA_DIR: dataDir, ...extraEnv },
+      encoding: 'utf8',
+      timeout: 30000,
+    });
+    assert.equal(res.status, 1, `${script} 必须以退出码 1 拒绝执行（实际 ${res.status}）`);
+    assert.match(
+      res.stderr,
+      /单写者|仍在运行|已被占用/,
+      `${script} 必须给人话报错（实际 stderr：${res.stderr.slice(0, 300)}）`,
+    );
+    // ⛔ 闸必须**在开库之前**拦住 ⇒ 库里不该出现任何表（连迁移都没跑）
+    assert.ok(
+      !existsSync(join(dataDir, 'app.db')),
+      `${script} 在闸拦下之前就已经开库了（单写者闸必须早于开库）`,
+    );
+  }
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('P1-4a 服务没在跑时 seed / migrate 必须能正常执行（闸不能误伤）', () => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'hks-gate-ok-'));
+  // 前提：目录里**没有** pid 文件 ⇒ 没有活着的服务
+  const migrate = spawnSync(process.execPath, [join(platformDir, 'scripts', 'migrate.js')], {
+    env: { ...process.env, DATA_DIR: dataDir },
+    encoding: 'utf8',
+    timeout: 30000,
+  });
+  assert.equal(migrate.status, 0, `migrate 必须能跑通（stderr：${migrate.stderr.slice(0, 300)}）`);
+
+  const seed = spawnSync(process.execPath, [join(platformDir, 'scripts', 'seed.js')], {
+    env: {
+      ...process.env,
+      DATA_DIR: dataDir,
+      ADMIN_PASSWORD: '仅用于测试',
+      ADMIN_PHONE: '13900000002',
+    },
+    encoding: 'utf8',
+    timeout: 30000,
+  });
+  assert.equal(seed.status, 0, `seed 必须能跑通（stderr：${seed.stderr.slice(0, 300)}）`);
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+// ══════════════════════════════════════════════════════════════════
+// P1-4b：并发启动同一个 DATA_DIR ⇒ 只有一个能活
+//   （修复前是「先查 pid 文件、几百毫秒后才写自己的 pid」⇒ 两个都能通过检查）
+// ══════════════════════════════════════════════════════════════════
+test('P1-4b 同一个 DATA_DIR 并发启动两个实例，只有一个能活', async () => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'hks-race-'));
+  const start = () => spawn(process.execPath, [join(platformDir, 'src', 'server.js')], {
+    env: { ...process.env, DATA_DIR: dataDir, PORT: '0' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const a = start();
+  const b = start();
+  let aErr = '';
+  let bErr = '';
+  a.stderr.on('data', (d) => { aErr += d; });
+  b.stderr.on('data', (d) => { bErr += d; });
+  await new Promise((r) => setTimeout(r, 3000));
+  try {
+    const alive = [a, b].filter((p) => p.exitCode === null);
+    assert.equal(
+      alive.length, 1,
+      `同一个 DATA_DIR 起了 ${alive.length} 个实例（必须恰好 1 个）—— 单写者闸没起作用`
+      + `（A：${aErr.slice(0, 200)}｜B：${bErr.slice(0, 200)}）`,
+    );
+    const loser = a.exitCode === null ? b : a;
+    const loserErr = a.exitCode === null ? bErr : aErr;
+    assert.match(
+      loserErr,
+      /已被占用|仍在运行|无法解析/,
+      `被挡下的那个实例必须给人话报错（实际：${loserErr.slice(0, 300)}）`,
+    );
+    assert.notEqual(loser.exitCode, null, '被挡下的那个实例必须退出');
+  } finally {
+    a.kill('SIGKILL');
+    b.kill('SIGKILL');
+    await new Promise((r) => setTimeout(r, 300));
+    rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════
+// P2-7a：prune 清理过期会话与过期限频计数
+// ══════════════════════════════════════════════════════════════════
+test('P2-7a prune 删掉过期会话与过期限频计数，且不动还在有效期内的', () => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'hks-prune-'));
+  const { db, close } = openDatabase({ dataDir });
+  applyMigrations(db, migrationsDir);
+  const user = createUser(db, { name: '清理甲', phone: '13900000003', password: 'pw' });
+
+  insertSession(db, {
+    tokenHash: 'h_expired',
+    userId: user.id,
+    createdAt: '2026-01-01T00:00:00.000Z',
+    expiresAt: '2026-01-02T00:00:00.000Z',
+  });
+  insertSession(db, {
+    tokenHash: 'h_valid',
+    userId: user.id,
+    createdAt: '2026-01-01T00:00:00.000Z',
+    expiresAt: '2027-01-02T00:00:00.000Z',
+  });
+
+  incrementBucket(db, {
+    subjectKey: 'login:old',
+    rule: 'sliding:loginAttempt',
+    bucket: 'old',
+    now: '2026-01-01T00:00:00.000Z',
+  });
+  incrementBucket(db, {
+    subjectKey: 'login:new',
+    rule: 'sliding:loginAttempt',
+    bucket: 'new',
+    now: '2026-06-01T00:00:00.000Z',
+  });
+
+  const result = pruneExpiredData(db, { now: new Date('2026-06-02T00:00:00.000Z') });
+  assert.equal(result.sessions, 1, '过期会话必须被删掉');
+  assert.equal(result.rateLimit, 1, '过期限频计数必须被删掉');
+
+  const sessions = db.prepare('SELECT token_hash FROM sessions ORDER BY token_hash').all();
+  assert.deepEqual(sessions.map((r) => r.token_hash), ['h_valid'], '未过期的会话必须留下');
+
+  const events = db.prepare('SELECT subject_key FROM rate_limit_events ORDER BY subject_key').all();
+  assert.deepEqual(events.map((r) => r.subject_key), ['login:new'], '窗口内的限频计数必须留下');
+
+  close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('P2-7a 限频计数的保留时长必须严格大于任何规则的窗口（否则删了等于绕过限频）', () => {
+  // 判据来自**真实规则配置**（rules/audit.json），不是写死的数字：
+  // 保留时长一旦小于某个规则的窗口，那个窗口内的计数就会被删掉 ⇒ 限频被绕过。
+  const rules = JSON.parse(readFileSync(join(rulesDir, 'audit.json'), 'utf8'));
+  let widest = 0;
+  for (const [name, profile] of Object.entries(rules.rateLimit || {})) {
+    const widths = [
+      profile.sliding?.seconds ?? 0,
+      profile.lock?.seconds ?? 0,
+      profile.perMinute ? 60 : 0,
+      profile.perHour ? 3600 : 0,
+    ];
+    for (const w of widths) widest = Math.max(widest, w);
+    assert.ok(widest >= 0, `规则 ${name} 的窗口口径读不出来`);
+  }
+  assert.ok(widest > 0, 'rules/audit.json 里必须真的有限频规则（否则这条断言是假绿）');
+  assert.ok(
+    RATE_LIMIT_RETENTION_SECONDS > widest,
+    `限频计数保留时长 ${RATE_LIMIT_RETENTION_SECONDS}s 必须严格大于最宽的窗口 ${widest}s`
+    + '（否则会删掉还在窗口内的计数 ⇒ 限频被绕过）',
+  );
+});
+
+// ══════════════════════════════════════════════════════════════════
+// P2-7b：systemd 定时单元（备份 / 清理）
+// ══════════════════════════════════════════════════════════════════
+test('P2-7b deploy/ 下必须有备份与清理的 systemd 单元与定时器', () => {
+  const files = [
+    'heikesong-backup.service',
+    'heikesong-backup.timer',
+    'heikesong-prune.service',
+    'heikesong-prune.timer',
+  ];
+  for (const f of files) {
+    assert.ok(existsSync(join(deployDir, f)), `缺少 deploy/${f}`);
+  }
+
+  // 备份单元：oneshot + 指向真实脚本 + 占位符齐全
+  const backupService = readDeploy('heikesong-backup.service');
+  assert.match(backupService, /^Type=oneshot$/m, '备份必须是 oneshot（不是第二个常驻写进程）');
+  assert.match(backupService, /^ExecStart=.*scripts\/backup\.js$/m, '备份单元必须调用 scripts/backup.js');
+  assert.match(backupService, /^User=\w+/m, '备份必须以非 root 运行');
+  for (const ph of ['__APP_DIR__', '__DATA_DIR__', '__RUN_USER__']) {
+    assert.ok(backupService.includes(ph), `备份单元缺少占位符 ${ph}`);
+  }
+
+  // 清理单元：同上
+  const pruneService = readDeploy('heikesong-prune.service');
+  assert.match(pruneService, /^Type=oneshot$/m, '清理必须是 oneshot');
+  assert.match(pruneService, /^ExecStart=.*scripts\/prune\.js$/m, '清理单元必须调用 scripts/prune.js');
+
+  // 定时器：OnCalendar 合法 + Persistent + Unit 指向真实存在的 service
+  for (const [timer, service] of [
+    ['heikesong-backup.timer', 'heikesong-backup.service'],
+    ['heikesong-prune.timer', 'heikesong-prune.service'],
+  ]) {
+    const unit = readDeploy(timer);
+    assert.match(unit, /^OnCalendar=\*-\*-\* \d{2}:\d{2}:\d{2}$/m, `${timer} 必须有合法的每日触发时刻`);
+    assert.match(unit, /^Persistent=true$/m, `${timer} 必须 Persistent（关机期间错过的要补跑）`);
+    assert.match(unit, new RegExp(`^Unit=${service}$`, 'm'), `${timer} 必须指向 ${service}`);
+    assert.match(unit, /^WantedBy=timers\.target$/m, `${timer} 必须开机自启`);
+  }
+});
+
+test('P2-7b install.sh 必须安装并启用这两个定时器', () => {
+  const sh = readDeploy('install.sh');
+  assert.match(sh, /heikesong-backup\.timer/, 'install.sh 必须安装备份定时器');
+  assert.match(sh, /heikesong-prune\.timer/, 'install.sh 必须安装清理定时器');
+  assert.match(
+    sh, /systemctl enable --now [^\n]*heikesong-backup\.timer/,
+    '备份定时器必须被 enable 且立即启动',
+  );
+  assert.match(
+    sh, /systemctl enable --now [^\n]*heikesong-prune\.timer/,
+    '清理定时器必须被 enable 且立即启动',
+  );
+});
+
+test('P1-4a install.sh 必须在迁移/种子之前停服（否则新闸会让升级直接失败）', () => {
+  // ⚠️ 这条是**顺序**断言，不是「有没有这个函数」的断言：
+  //    迁移改的是 schema、种子改的是权限规则 ⇒ 服务还在跑时执行会写坏库
+  //    ⇒ scripts/migrate.js 与 scripts/seed.js 现在自己会拒绝执行
+  //    ⇒ install.sh 必须**先停服**，否则「升级一台在跑的服务」会直接失败。
+  const sh = readDeploy('install.sh');
+  const mainIdx = sh.indexOf('\nmain() {');
+  assert.ok(mainIdx > 0, '找不到 main()，测试本身失效');
+  const mainBody = sh.slice(mainIdx);
+
+  const stopIdx = mainBody.indexOf('stop_service_for_maintenance');
+  const initIdx = mainBody.indexOf('init_database');
+  assert.ok(stopIdx > 0, 'main() 里必须调用停服步骤（升级时服务是运行中的）');
+  assert.ok(initIdx > 0, 'main() 里必须调用 init_database，测试本身失效');
+  assert.ok(
+    stopIdx < initIdx,
+    '⛔ 停服必须在 init_database（迁移 + 种子）**之前** —— 否则升级时闸会拒绝执行',
+  );
+
+  // 停服函数本身必须真的停（不能只是打条日志）
+  const fn = sh.slice(sh.indexOf('stop_service_for_maintenance() {'));
+  assert.match(fn, /systemctl stop "\$SERVICE_NAME"/, '停服函数必须真的 systemctl stop');
+  assert.match(fn, /systemctl is-active/, '停服前必须先判断服务是否在跑（首次安装时它不在跑）');
+});
+```
+
 ## 5. 收尾闸（本阶段交付前必须全绿）
 
 1. **全量测试**：`cd platform && node --test` ⇒ 1993 例全绿

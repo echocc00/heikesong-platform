@@ -39,6 +39,9 @@ import { grantAssignment } from '../src/auth/permissions.js';
 import { createUser, setSuperadmin } from '../src/db/repo/users.js';
 import { insertCapability } from '../src/db/repo/capabilities.js';
 import { createPublicToken } from '../src/services/public-api.js';
+// ⚠️ 这个 import **只**服务于下面「R-OPS-13/14」那条用例里的对照组发榜（见该处注释）。
+//    「正式服务全链路」那条用例的**发榜主链**已经全部改走真实 HTTP 路由
+//    （POST /api/stages/:stageId/publish，路由出处：src/http/routes/publish.js:51）。
 import { publishLeaderboard } from '../src/services/leaderboard.js';
 import { createDemoApi } from '../web/api.demo.js';
 import { call, callJson } from '../test-helpers/http-call.js';
@@ -571,23 +574,32 @@ test('正式服务全链路：报名 → 组队 → 打分 → 计算 → 发榜
     );
 
     // ── 5. 发榜 ──
-    // ⚠️ publishLeaderboard **没有 HTTP 路由**（src/server.js 里只挂了读接口），
-    //    「发榜」= 写快照 + 发名次积分 + 重算段位，只有服务层这一条路。
-    //    这里直接调**真实服务层**（不是 mock）—— 路由缺口登记在 P6 Task 8 台账 G-1。
-    const publish = publishLeaderboard({
-      db, editionId: 'ed_1', stageId: 'st_1', actorId: users.admin.id,
-      now: '2026-10-20T00:00:00.000Z', rules: s.rules,
-    });
-    assert.ok(publish.snapshots.rank, '发榜必须写 A 榜快照');
-    assert.ok(publish.awarded.stage.length > 0, '发榜必须发放名次积分');
+    // ⚠️ **2026-10-24 更正**：这段注释原来写着「publishLeaderboard **没有 HTTP 路由**
+    //    （src/server.js 里只挂了读接口），『发榜』只有服务层这一条路」——
+    //    **那句话现在是错的**（它描述的是 P6 时期的状态；P11 · E149 已经把路由补上了）。
+    //    路由出处：**`src/http/routes/publish.js:51`** 注册了
+    //    `router.add('POST', '/api/stages/:stageId/publish', ...)`
+    //    （同文件 71 行还有配套的读口 `GET /api/stages/:stageId/publish`）。
+    //    ⇒ 发榜主链改走**真实 HTTP 路由**：服务层被直调时，「路由没挂 ⇒
+    //      服务层写好了但产品打不到」这类缺陷（本仓已经犯过一次，见 E149）根本测不出来。
+    const publishRes = await callJson(app, 'POST', '/api/stages/st_1/publish', { token: tokens.admin });
+    assert.equal(publishRes.status, 200, `发榜必须成功：${publishRes.text}`);
+    assert.ok(publishRes.json.snapshots.rank, '发榜必须写 A 榜快照');
+    assert.ok(publishRes.json.awarded.stage.length > 0, '发榜必须发放名次积分');
+    // 判别性：HTTP 打完之后**库里真的有痕迹**（不是只回了个 200 就算发过榜）
+    assert.equal(
+      db.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE action = 'leaderboard.publish'").get().n,
+      1,
+      '发榜必须留痕（操作者 + 时间戳）',
+    );
 
-    // 判别性B7：发榜幂等 —— 再发一次不重复发积分（points_ledger 行数不变）
+    // 判别性B7：发榜幂等 —— **经同一个 HTTP 路由再发一次**不重复发积分（points_ledger 行数不变）
     const ledgerCount = () => db.prepare('SELECT COUNT(*) AS n FROM points_ledger').get().n;
     const beforeRepublish = ledgerCount();
-    publishLeaderboard({
-      db, editionId: 'ed_1', stageId: 'st_1', actorId: users.admin.id,
-      now: '2026-10-20T00:00:01.000Z', rules: s.rules,
-    });
+    // ⚠️ 先断言「流水已经有行」：否则下面那条「行数不变」在流水表恒空时也是绿的（假绿）
+    assert.ok(beforeRepublish > 0, '发榜后积分流水必须已经有行（幂等断言的前提）');
+    const republishRes = await callJson(app, 'POST', '/api/stages/st_1/publish', { token: tokens.admin });
+    assert.equal(republishRes.status, 200, `重复发榜也必须成功（发榜可重发）：${republishRes.text}`);
     assert.equal(ledgerCount(), beforeRepublish, '重复发榜不得重复写积分流水（幂等）');
 
     // ── 6. 榜单（HTTP）──
@@ -612,11 +624,9 @@ test('正式服务全链路：报名 → 组队 → 打分 → 计算 → 发榜
       });
       assert.equal(signRes.status, 200, signRes.text);
     }
-    // 段位记录是**发榜时**重算的 ⇒ 再发一次榜让段位落库
-    publishLeaderboard({
-      db, editionId: 'ed_1', stageId: 'st_1', actorId: users.admin.id,
-      now: '2026-10-20T00:00:02.000Z', rules: s.rules,
-    });
+    // 段位记录是**发榜时**重算的 ⇒ 再发一次榜（走真实 HTTP 路由）让段位落库
+    const tierRepublish = await callJson(app, 'POST', '/api/stages/st_1/publish', { token: tokens.admin });
+    assert.equal(tierRepublish.status, 200, `重发榜必须成功：${tierRepublish.text}`);
     const tierRes = await callJson(app, 'GET', `/api/teams/${teamId}/tier`);
     assert.equal(tierRes.status, 200, tierRes.text);
     assert.equal(tierRes.json.tier, 'S', `5 项里程碑 + 业务部门签字 ⇒ S 段（实际 ${tierRes.json.tier}）`);
@@ -632,11 +642,9 @@ test('正式服务全链路：报名 → 组队 → 打分 → 计算 → 发榜
     const dSelf = await callJson(app, 'GET', `/api/teams/${teamId}/tier`, { token: tokens.captain });
     assert.equal(dSelf.status, 200, '本人看自己的 D 段进度卡必须 200');
     assert.equal(dSelf.json.self, true, '本人拿到的必须是「本人进度卡」而不是公示口径');
-    // 复原：再发一次榜，段位按「5 项里程碑 + 业务部门签字」重算回 S 段
-    publishLeaderboard({
-      db, editionId: 'ed_1', stageId: 'st_1', actorId: users.admin.id,
-      now: '2026-10-20T00:00:04.000Z', rules: s.rules,
-    });
+    // 复原：再发一次榜（走真实 HTTP 路由），段位按「5 项里程碑 + 业务部门签字」重算回 S 段
+    const restoreRes = await callJson(app, 'POST', '/api/stages/st_1/publish', { token: tokens.admin });
+    assert.equal(restoreRes.status, 200, `复原用的重发榜必须成功：${restoreRes.text}`);
 
     // ── 8. 战绩卡（HTTP）──
     const cardRes = await callJson(app, 'GET', `/api/teams/${teamId}/performance-card`, { token: tokens.admin });
@@ -775,6 +783,15 @@ test('R-OPS-13/14：任务完成 ≠ 赛段交付物得分（完成一个任务�
     assert.deepEqual(assignLike, [], '不得存在按岗位/身份分配任务的接口（R-OPS-14 禁止岗位制）');
 
     // 对照：真发一次榜，积分流水才会增加 —— 证明上面那条不是「流水表根本没长」
+    // ⚠️ **这一处故意保留直调服务层**（2026-10-24 独立评审复核后的取舍）：
+    //    本用例要验的是「**任务完成 ≠ 赛段交付物得分**」这条不变式 ——
+    //    断言的对象是「**谁写积分流水**」，不是「发榜路由通不通」。
+    //    ⇒ 对照组要的是「**发榜动作本身**能把名次积分写进流水」，
+    //      直调服务层（真实实现，不是 mock）与走 HTTP 路由在这里**等价**
+    //      （同一条 publishLeaderboard，同一个 actor）。
+    //    ⇒ 发榜的 **HTTP 主链**由「正式服务全链路」那条用例覆盖
+    //      （第 577/587 行两处：主链发榜 + 重复发榜幂等，均走真实路由），
+    //      以及 test/publish-api.test.js 的专项闸。
     db.prepare(
       `INSERT INTO stage_results (id, stage_id, team_id, rank, total, seat_p, seat_e, tied_with, points, computation_id, created_at)
        VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
