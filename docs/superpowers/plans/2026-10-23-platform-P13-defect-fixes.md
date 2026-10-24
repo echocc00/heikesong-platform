@@ -8753,3 +8753,781 @@ M7 缺格面板放回维度键 / M8 公开响应放回 code。
 ⚠️ **M5 首轮存活**（闸无判别力）⇒ 原因是**闸在测试里重写了一遍渲染拼接逻辑**，
 生产代码改了闸不会红 ⇒ 假绿 ⇒ 改成调**生产路径的纯函数** `reviewErrorHint(errors, dims)`（已从 review.js 导出）
 ⇒ M5 被杀。**这条自曝是本轮最有价值的产出**：它证明「行为闸」也可能是假的，必须配变异检验。
+
+### 4.13 2026-10-28 E186 轮（通用赛事模板 · 赛制实例规格 v1）—— 新建文件登记
+
+⚠️ **登记号说明**：E185 号已被 E184 台账里的待办（「发榜页前端硬编码 `HARD_WARNING_CODES`」）占用 ⇒ 本轮登记号用 **E186**（台账不重号）。
+
+本轮做一件事：把「**平台 = 引擎 / 项目 = 赛制实例**」写成一份**可核验的规格**，而不是留在脑子里的共识。
+
+用户明确方向：「做的是个通用的模板，后续根据不同的项目、不同的参赛要求是可以做变动的，
+**先按我们的理解出一版**，之后有了明确的赛制再在目前的框架之上调整」。
+
+⚠️ **为什么这一版是「规格 + 接入清单 + 机器闸」，而不是「全配置化大改造」**：
+没有第二个真实赛制之前改造结构层，等于**照猜的第二个赛制写代码** ⇒ 违反项目纪律「先跑后派」
+⇒ 本轮只产出规格与清单，S1~S3 的改造方案**写进文档当待办**，等真实需求出现再照单执行。
+
+| 文件 | 为什么必须是**新文件** |
+|---|---|
+| `docs/platform-template-spec.md` | ① 它是**平台级契约**（换项目的接入边界），不是某次迭代的说明 ⇒ 必须是独立于任何阶段计划的常驻文档；② 它同时是**下一阶段的输入**（§3 的 S1~S4 改造方案、§5 的 8 条假设清单）⇒ 需要能单独发出去给「另一个项目的人」看；③ 若塞进既有文档（`docs/deployment.md` 是**台账**、`docs/requirements-traceability.md` 是**需求追溯**）⇒ 会被它们的生命周期绑死（台账每轮追加、追溯表按需求条组织）⇒ **放错位置 = 半年后没人找得到**。 |
+| `platform/test/template-spec.test.js` | 这条闸钉的是**跨文件不变量**（文档 ↔ 计划块 ↔ `src/` 实时扫描 ↔ `rules/` 目录）⇒ 塞进任何既有测试文件都会让「这条钉的是哪条口径」看不出来。⚠️ 与既有 `test/config.test.js` 的分工：那条核**配置内容**（权重合计 / 枚举合法性），这条核**规格文档不许过期**（S1 的处数、结构层锚点、登记等价）⇒ 两者互补，不重叠。 |
+
+**Step 1: 创建 docs/platform-template-spec.md**
+
+`docs/platform-template-spec.md`：
+
+```markdown
+# 通用赛事模板 · 赛制实例规格 v1
+
+> **版本**：v1（2026-10-28）
+> **状态**：⚠️ **按当前理解产出**，等赛制明确后复核（见 §5「我们按理解先定的」）
+> **适用对象**：`platform/` 下的平台代码是**赛事引擎**；每个项目提供一套**赛制实例**（配置）+ 一份参赛要求。
+
+---
+
+## 0. 一句话与读法
+
+**平台是引擎，项目是实例。** 引擎不认「这场赛」——它只认一份配置。
+
+本文回答三个问题：
+
+1. 换项目时，**哪些能直接换**（改配置即可）？
+2. 哪些**换不动**，代价多大，什么时候必须动？
+3. 一个新项目从零到「能跑一次」，**要提供什么**？
+
+⚠️ **读法提醒**：本文只描述**模板的形状**（需要什么、边界在哪），不描述任何具体赛制的**口径值**（权重、门槛、时限、名额、题面…）—— 具体值一律以 `platform/rules/*.json` 为准。口径值随实例走，不随模板走。
+
+⚠️ **唯一的例外**：§3 会**举例**说明结构层残留长什么样（如当前实例的席位词表 `judge` / `enterprise` / `observer`、段位字母 `D`…）。那些是**被模板化的对象**，不是模板的形状 —— 它们出现在 §3 的意思是「这里是硬编码，换项目要动」，**不是**「模板要求你用这套词表」。
+
+---
+
+## 1. 两层分离：实例层 vs 结构层
+
+**判据只有一条**：
+
+| | 判据 | 换项目时 |
+|---|---|---|
+| **实例层** | 能用 `rules/` 表达的一切 | **改配置**（版本号同步升版） |
+| **结构层** | 写进代码的一切 | **改代码**（或明示不支持） |
+
+> 这条判据的价值在于：它把「这个项目能不能用这个平台」从一句感觉，变成**一张可勾选的清单**（§3）。含糊的边界是模板化最大的成本来源 —— 每次都要重新吵一遍「这条算配置还是算代码」。
+
+### 1.1 现状体检
+
+- **实例层覆盖度**：**高**。16 份配置承载了几乎全部口径 —— 评分维度与权重、归一化策略与门槛、评委池约束、破同分链、段位数值、里程碑体系、行为分与完赛线、积分规则、公示边界、申诉 SLA 与理由类别、报名筛选漏斗、任务包分级、组队规则、赛程、审计与复算、三池口径。
+- **结构层残留**：**4 类**（§3）。其中 3 类是**改代码即可**，1 类（S4）涉及**表结构**。
+
+⇒ **结论：平台已经是一台「配置驱动的引擎」，不是「为这场赛写死的系统」。** 模板化的剩余工作量集中在 4 类结构假设上，不在 16 份配置上。
+
+---
+
+## 2. 实例层：16 份配置各自管什么
+
+「换项目时最可能变」一列是**经验判断**（按本项目的变更史），不是承诺。
+
+| 配置 | 它管什么（顶层键） | 换项目时最可能变 | 变了对代码的影响 |
+|---|---|---|---|
+| `scoring-initial.json`<br>`scoring-final.json` | 评分维度（键/中文名/权重/席位）、归一化策略与门槛、评委池下限、截尾门槛、企业席权重、自评阈值、自由命题规则 | **几乎必变**（维度体系是赛制核心） | **不动代码**（维度键已是配置） |
+| `tiebreak.json` | 破同分有序链、每级的确定性兜底 | 常变 | 不动代码；⚠️ `final_only` 作用域依赖 S2 |
+| `ranks.json` | 段位档位与门槛、降段、权益、不可解锁项 | 常变 | 不动代码（S3 只影响兜底值） |
+| `milestones.default.json` | 里程碑体系与签字要求 | 常变 | 不动代码 |
+| `behavior-points.json` | 行为分事件、上限、计次桶 | 常变 | 不动代码 |
+| `points.json` | 名次积分、个人积分、奖品结构、并列名次口径 | 常变 | 不动代码 |
+| `compliance.json` | 覆盖率/时限/规模阈值、申诉 SLA 与理由类别白名单、同意条款 | 常变 | 不动代码 |
+| `registration-scoring.json` | 报名筛选漏斗、评分维度与等级、问卷题面 | **几乎必变** | 不动代码 |
+| `solvability.json` | 任务包分级（含一票否决项）、任务配比 | 常变 | 不动代码 |
+| `schedule.json` | 赛段时间轴、晋级与名次规模 | **常变** | ⚠️ 赛段**数量与类型**触及 S2 |
+| `visibility.json` | 公示边界（段位起公示档、企业名、互评来源、签字人） | 常变 | 不动代码 |
+| `audit.json` | 审计留痕、复算、限频、反作弊开关、保留期 | 少变 | 不动代码 |
+| `team-formation.json` | 组队人数下限、队长资格、每包队数、成员变更 | 常变 | 不动代码（⚠️ `captainMustBeMba` 带 MBA 语义，见 S4） |
+| `criteria.json` | 段位证据、行为证据、企业合规、上榜口径 | 常变 | 不动代码 |
+| `pools.json` | 三池范围与公开口径、公开链接有效期 | 少变 | 不动代码 |
+
+**共同约束（所有实例都要满足）**：16 份配置**必须同版本号**，且**每份都必须有 `version`** —— 少一份就会静默失效（校验器按 `id` 识别配置，不按 `version`）。版本号会写进计算留痕，用于判定「这条快照能不能被严格复算」。
+
+---
+
+## 3. 结构层：4 类硬编码假设（真正的模板化工作量）
+
+每条给三件事：**现状（实测）** / **改造方案** / **判定标准（什么时候必须动）**。
+
+### S1 · 席位词表（`judge` / `enterprise` / `observer`）
+
+- **现状**：**24 处硬编码，散在 12 个文件**。⚠️ **计数口径（可复算；机器闸按这条口径核）**：在 `platform/src/` 的**可执行代码**里，席位字面量 `'judge'` / `'enterprise'` / `'observer'` 所在的**行数**（一行算一处；一行里出现多个字面量仍只算一处）；**排除注释与 JSDoc**；**排除 `src/config.js`**（它是配置校验器 ⇒ 那些字面量是「允许值」契约本身，不是业务硬编码）。
+
+| 文件 | 处数 |
+|---|---|
+| `src/domain/scoring.js` | 4 |
+| `src/domain/judge-pool.js` | 4 |
+| `src/services/signoff-board.js` | 3 |
+| `src/services/review.js` | 3 |
+| `src/http/routes/review.js` | 3 |
+| `src/db/repo/stages.js` | 1 |
+| `src/domain/enterprise-seat.js` | 1 |
+| `src/services/compute.js` | 1 |
+| `src/services/readiness.js` | 1 |
+| `src/services/stage.js` | 1 |
+| `src/services/taskPackage.js` | 1 |
+| `src/services/tiebreak.js` | 1 |
+
+⇒ `src/db/repo/stages.js` 那 1 处是 **SQL**（`role_key IN (...)`）⇒ 它改造时**不能**跟着 JS 一起参数化就完事（SQL 里的词表与配置里的词表必须一起改，否则两处词表会不一致 ⇒ 这正是「配置不许说谎」要防的那类漂移）。
+- **半外置的现状**：`domain/judge-pool.js` 已经支持 `config.votingSeats` / `config.nonVotingSeats`（有默认值），`services/signoff-board.js` 已经写着「从规则表来，不写死」。⇒ **方向是对的，只是没做完。**
+- **改造方案**：
+  - **A（推荐）**：把席位词表收进 `scoring-*.json` 的 `judgePool` 段（`votingSeats` / `nonVotingSeats` 已有，缺的是**下游消费方统一读它**）⇒ 逐处把 `d.seat === 'judge'` 改成「按配置里的评委席集合判定」。**代价**：约 24 处点改 + 1 处 SQL 改为参数化。**行为等价**（默认词表不变 ⇒ 零行为变化 ⇒ 现有 2155 例用例全绿）。
+  - **B**：接受「席位三件套是引擎的一部分」，新项目沿用同一套席位语义，只改席位**占比与规则**（已是配置）。**代价**：0。
+  - **C**：支持任意席位（新增「观察团」「媒体席」…）⇒ 需要席位**能力表**（谁能打分、能不能投票、要不要回避），不是加几个字符串。**代价**：大。
+- **判定标准**：新项目要引入**新的席位种类**（不只是改人数/占比）⇒ 必走 A 或 C；只是改人数/占比 ⇒ 已经是配置，走 B。
+
+### S2 · 赛段结构（`initial` / `final` 两段制 + 两个评分配置）
+
+- **现状**：
+  - `services/stage.js` 写死 `STAGE_KINDS = ['initial','final','roadshow','landing']` 与 `SCORING_CONFIG_KEYS = ['initial','final']`。
+  - `services/leaderboard.js` 用 `stage.scoring_config_key === 'final'` 判定「是否终赛段」，破同分链的 `final_only` 作用域依赖这个判定。
+  - 落库侧 `stage.scoring_config_key` 是一个**自由文本列**（不是外键）⇒ **数据层不设限**。
+- **改造方案**：
+  - **A（推荐）**：把「哪些评分配置是终赛段」表达为配置（`schedule.json` 的赛段表里标 `isFinal`，或 `scoring-*.json` 里标 `stageKind`）⇒ 判定改为读配置。**代价**：2~3 处点改 + 16 份配置升版。
+  - **B**：接受「两段制（初赛 + 决赛）」是引擎假设；新项目要三段制时**新增一份评分配置 + 一处标记**即可。**代价**：0~1。
+- **判定标准**：新项目的赛段数 ≠ 2，或终赛段的判定依据不是「评分配置键叫 final」⇒ 走 A。
+
+### S3 · 段位字母与兜底值（`D` / `C` / `B` / `A` / `S`）
+
+- **现状**：段位**数值**在 `ranks.json` ✓；但**兜底值**写死：`domain/visibility.js` 的 `DEFAULT_TIER_ORDER = ['D','C','B','A','S']` 与 `publicFromTier || 'C'`；`domain/tier.js` 的 `{ key: 'D', name: '出题' }`（**中文名也写死**）；多处 `?? 'D'` 兜底。
+- **风险**：`D` 同时被用作「**段位最低档**」与「**任务包退回档**」两个不同语义（后者在 `solvability.json`，是**任务包等级**不是段位）⇒ 换项目时若段位体系里没有 `D`（比如用 `E1/E2` 或数字），兜底值会静默造出一个不存在的段位。
+- **改造方案**：段位顺序与公示起始档改为**从 `ranks.json` 读**（配置里本来就有 `tiers[]`），兜底改为「取配置里的最后一档」而不是硬编码 `'D'`。**代价**：4~5 处点改。
+- **判定标准**：新项目的段位字母体系 ≠ D/C/B/A/S ⇒ 必走。
+
+### S4 · 表结构耦合（团队制 / 企业确认 / MBA 资格）—— 唯一涉及 schema 的一类
+
+| 耦合 | 位置 | 换项目的影响 |
+|---|---|---|
+| **团队制** | `team_id` 是 `stage_reviews` / `points_ledger` / `tier_records` 等的外键；报名、组队、互评、段位全以队为单位 | **个人赛项目不支持**（需把 `team_id` 泛化为「参赛单元」）。⇒ 改造面大（迁移 + 仓储 + 服务 + 视图） |
+| **企业确认** | `enterprise_id` / `enterprise_confirmations` / `task_packages.is_free_brief` / 双签与代评规则 | 无「企业确认」环节的项目 ⇒ **表与代码路径空转**（不报错，但多一套无用配置与界面）。⇒ 可接受，但应在文档里明说 |
+| **MBA 资格** | `users.mba_status`（`mba` / `member` / `other` 三值）+ `team-formation.json` 的 `captainMustBeMba` | 非 MBA 赛事 ⇒ 字段语义不合（但可承载，`mba_status` 变成「参赛资格类别」）。⇒ **建议**：新实例沿用该列但改语义说明，或未来加一个通用的 `eligibility` 段 |
+
+- **改造方案**：
+  - **A（推荐，本版不做）**：把「参赛单元」抽象出来（`team` 是它的一种实现）⇒ 一次性投入大，但模板价值最高。
+  - **B（本版采用）**：**明确声明本模板当前只支持团队制**，并把「个人赛」列入「已知不支持项」（§8）。⇒ 成本 0，代价是诚实。
+  - **C**：新项目用**单人组队**（每人成一队）绕开 ⇒ 数据模型不变，语义上有点 hack，但不阻塞。
+- **判定标准**：新项目是**个人赛** ⇒ 走 A 或 C；是团队赛 ⇒ 走 B（现状）。
+
+---
+
+## 4. 新项目接入清单
+
+从零到「能跑一次打榜」需要提供的东西。**每一步都有机器可校验的产出**。
+
+### 第 1 步 · 定角色与参赛资格
+- [ ] 谁能报名（资格类别 → 映射到 `users.mba_status` 的取值集合）
+- [ ] 谁能做什么（参赛者 / 评委 / 企业 / 观察员 / 组委会 ⇒ 能力点）
+- [ ] 一个队几个人、队长资格、每包几队（→ `team-formation.json`）
+- **校验**：`team-formation.json` + `auth/permissions.js` 的能力点矩阵
+
+### 第 2 步 · 定席位与打分结构
+- [ ] 席位清单、哪些有投票权、哪些要回避（→ `scoring-*.json` 的 `judgePool`；⚠️ 若新增席位种类 ⇒ 触发 S1）
+- [ ] 评分维度：键、中文名、权重、归属席（→ `scoring-*.json` 的 `dimensions[]`）
+- [ ] 有几个评分配置（初赛/决赛/别的 ⇒ 触发 S2）
+- **校验**：`config.js` 开机闸（权重合计 100%、席位归属存在、跨配置引用真实）
+
+### 第 3 步 · 定口径与门槛
+- [ ] 归一化策略与样本门槛、评委池下限、截尾门槛（→ `scoring-*.json`）
+- [ ] 破同分链与每级兜底（→ `tiebreak.json`）
+- [ ] 段位档位与门槛（→ `ranks.json`；⚠️ 字母体系不同 ⇒ 触发 S3）
+- [ ] 里程碑体系与计分、完赛线（→ `milestones.default.json` + `behavior-points.json`）
+- [ ] 报名筛选漏斗与问卷题面（→ `registration-scoring.json`；⚠️ 问卷必须给正式题目，不能跑占位题面）
+- **校验**：`config.js` 开机闸 + 可达性闸（赛程内行为分上限 ≥ 完赛线）
+
+### 第 4 步 · 定赛程与规模
+- [ ] 赛段时间轴、每段的交付与截止（→ `schedule.json`）
+- [ ] 名额、晋级规则、名次规模（→ `schedule.json` 的 `advancement`）
+- [ ] 规模/覆盖率/时限阈值（→ `compliance.json` 的 `readiness`）
+- **校验**：`config.js` + 就绪度闸实跑
+
+### 第 5 步 · 定公示与救济
+- [ ] 什么公开、什么不公开（→ `visibility.json`）
+- [ ] 申诉范围、理由类别白名单、裁决时限（→ `compliance.json` 的 `appeal`）
+- [ ] 审计、复算、保留期（→ `audit.json`）
+- **校验**：可见性在 API 层过滤的白名单闸 + 申诉端点用例
+
+### 第 6 步 · 定组织与产出
+- [ ] 组委会能看什么、导出什么（→ 三池口径 `pools.json`、公开链接 `public-tokens`）
+- [ ] **谁有裁决权**（规则口径的最终决定人）—— ⚠️ **这一条不在代码里，但它决定这套规则能不能被援引**
+- [ ] 规则口径的**授权形态**（谁签、签什么、有效期）
+- **校验**：人工（无法机器化）
+
+### 4.2 送签清单 ↔ 规则字段映射（每个新项目都要做的一步）
+
+⚠️ **第 6 步的产物不是「一张签完的纸」，而是一张映射表。**
+
+新项目的「送签清单」（要组委会逐条确认的口径）**必须**逐条落到配置字段上，
+否则签完之后**没人知道该改哪个文件的哪个字段**
+⇒ 分母每变一次就要手工双向同步 ⇒ 这正是分母四连跳必然出错的根源。
+
+**每条口径必须落在五类落点之一**：
+
+| 落层 | 含义 | 签完之后要做什么 |
+|---|---|---|
+| **配置** | 已经是 `rules/*.json` 的一个字段 | 改一个数 |
+| **配置+结构** | 一半在配置里，一半**既没有配置字段也没有实现** | 改配置 **+** 排开发工时 |
+| **配置+新字段** | 语义要在配置里表达，但当前没有这个字段 | 加一行配置 |
+| **结构** | 落不进配置 ⇒ 要改代码或改表 | 排开发工时 |
+| **人工** | 平台**不需要也不应该**实现（流程、公示、账务） | 线下执行 + 公示 |
+
+⇒ **落层这一列是最重要的产出**：它回答「签字到底换来了什么」。
+⚠️ **不许把「结构」层与「人工」层伪装成「配置」层** ⇒ 那是把开发工时藏起来：
+组委会签完以为「改几个数就行」⇒ 试赛时才发现那一半根本没实现。
+
+⚠️ **清单的分组按「不裁决会怎样」分**（不按「选项是否互斥」分）：
+**先追认**（技术上自洽、签字即可）→ **再填数**（只需给一个数）→ **最后开会**（选项互斥、不裁决会作废首届）
+⇒ 这样「不签就办不成一届」的风险被压到最后，**大部分条目根本不需要开会**。
+
+**机器闸（每个项目自己写一条）**：① 清单条数 == 映射表条数（不重不漏）；
+② 每个引用的 `rules/<file>:<path>` **真实存在**；③ **每个引用的值与真实配置逐字一致**
+（值一旦漂移，映射表就从「施工图」变成「误导」⇒ 照着改会把配置改错）。
+
+---
+
+## 5. 我们按理解先定的（待定项 · 待明确赛制后复核）
+
+⚠️ **以下都是本版的假设，不是既成事实。** 明确赛制到位后逐条复核。
+
+| # | 假设 | 若假设错，影响 |
+|---|---|---|
+| A1 | 存在「出题企业 + 自由命题」双轨 | 去掉双轨 ⇒ `is_free_brief` 与代评路径空转；改成三轨 ⇒ 需扩配置 |
+| A2 | 双席制（评委席 + 企业席）且两者权重分开 | 单席制 ⇒ 企业确认与代评整条链空转 |
+| A3 | 阶段赛制（报名 → 阶段 → 终赛） | 一次性评审制 ⇒ 赛段表退化为单段，其余机制不变 |
+| A4 | 团队制、每队多成员 | 个人赛 ⇒ 触发 S4 |
+| A5 | 段位体系存在「最低档」且不公开 | 无段位制 ⇒ `ranks.json` / 段位榜 / 权益整组空转 |
+| A6 | 企业需要「签字」才算达成（里程碑） | 改为评委确认 ⇒ 签字台与达成闸重做 |
+| A7 | 存在「破同分」场景且需要确定性兜底 | 允许并列 ⇒ 破同分链与名次积分口径重做 |
+| A8 | 行为分/里程碑分参与或影响排名 | 纯评审制 ⇒ 行为分与完赛线整组空转 |
+
+> 这张表是**「等明确赛制」的检查清单**：赛制一到位，逐行打勾；打勾发现对不上，就知道该改的是配置（多数）还是结构层（少数）。
+
+---
+
+## 6. 契约的执行者：机器闸（不是文档的自觉）
+
+规格文档靠人读，**契约靠机器执行**。本仓库已有：
+
+1. **开机 fail-fast**（`src/config.js`）：16 份配置**全部**做内容校验（形状 + **交叉引用真实存在** + 权重合计 + 可达性 + 链不变量）。**任何一条不过 ⇒ 拒绝启动，绝不降级为默认值** —— 否则会安静地算出一份错位的榜单。
+2. **版本全等**：16 份必须同 `version`，且**每份都必须有** `version`（少一份会静默失效）。
+3. **「配置不许说谎」**：配置与实现矛盾的字段**开机拒绝**（有真实的先例：里程碑确认方与实现矛盾 ⇒ 拒绝启动）。
+4. **规则溯源注释**：每份配置带 `source`，指回源文档条款。
+
+⇒ **所以「通用模板」的实例层契约不是一张纸，是 `config.js` 里那套闸。** 新项目接入时，配置写错会被**启动时**挡住，而不是发榜后才发现。
+
+### 6.1 本规格自己的机器闸（本文不许烂掉）
+
+⚠️ **本文里有可数的断言**（S1 的「24 处 / 12 文件」）⇒ 它们会随代码演进而**悄悄过期**
+⇒ 一份过期却还在自称准确的规格，**比没有规格更坏**（它会让人以为「结构层就这些，改完就好了」）。
+
+⇒ 新增 `platform/test/template-spec.test.js`，它机械地核四件事：
+
+| # | 核什么 | 判据 |
+|---|---|---|
+| 1 | **本文与计划块一致** | 本文内容与 P13 §4.13 登记的代码块**逐字节相同** ⇒ 改了本文必须同步登记（规格与计划不许漂移） |
+| 2 | **S1 的数字可复算** | 实时扫描 `platform/src/` 的席位字面量 ⇒ 与 §3 表里写的**逐文件逐处**一致 ⇒ 数字烂了就红 |
+| 3 | **结构层锚点仍在位** | S2/S3/S4 引用的关键符号仍存在（`STAGE_KINDS` / `SCORING_CONFIG_KEYS` / `DEFAULT_TIER_ORDER` / 段位兜底 `D` / SQL 里的 `role_key IN`） |
+| 4 | **16 份配置仍同版本** | §2 / §6 的「版本全等」口径仍成立（少一份会静默失效） |
+
+⇒ **这条闸把本文从「一篇写了就过期的散文」变成「一份每次改动都会被质问的规格」。**
+
+---
+
+## 7. 改动的代价阶梯
+
+| 改动层次 | 例子 | 代价 | 需要升 16 份版本？ |
+|---|---|---|---|
+| **改一个数值** | 权重 20%→15%、时限 72h→48h | 分钟级 | 是 |
+| **改一个配置段** | 换一套维度体系、换破同分链、换段位 | 小时级 | 是 |
+| **换整个赛制实例** | 换 16 份配置 | 1~2 天（含调试与口径复核） | 是（换一套新版本） |
+| **动结构层 S1/S2/S3** | 新席位种类、新赛段数、新段位字母 | 1~3 天（含用例更新） | 视改动面（多半要） |
+| **动结构层 S4** | 团队制 → 个人赛 | 1~2 周（迁移 + 仓储 + 服务 + 视图） | 视改动面 |
+
+⇒ **这就是「通用模板」的收益曲线**：绝大多数项目变更落在前三行（配置层），**只有换参赛形态才落到第四、五行**。
+
+---
+
+## 8. 本版明确不做的事
+
+- **不做「全配置化」的大改造**：在没有第二个真实赛制之前改造结构层，等于**照猜的第二个赛制写代码**。⇒ 按项目纪律「先跑后派」，等真实需求出现再动（S1~S3 的改造方案已经写好，到时候是照单执行）。
+- **不把 16 份配置合成一份**：分开的理由是**变更频率不同**（`audit.json` 少变、`registration-scoring.json` 常变）⇒ 合成一份会让每次改动都碰全部内容。
+- **不改表结构**（S4）：除非明确赛制要求个人赛。
+- **不引入第二套「配置」概念**：模板的参数仍然只从 `rules/` 读，**不允许**代码里再长出一套「按项目分支」的条件。
+
+---
+
+## 附：本规格怎么用
+
+1. **新项目来了** ⇒ 拿 §4 的六步清单走一遍，每步的产出直接落到对应配置。
+2. **走完发现某条落不进配置** ⇒ 那就是一条**结构假设** ⇒ 记到 §3，看判定标准决定走哪个方案。
+3. **赛制明确了** ⇒ 拿 §5 的假设清单逐行复核 ⇒ 改配置 or 触发结构层改造。
+4. **任何时候改了 `rules/`** ⇒ 16 份同步升版 ⇒ 跑 `node --test`（开机闸 + 全量用例）。
+```
+
+⚠️ **本块与 `docs/platform-template-spec.md` 逐字节一致** ⇒ 由 `platform/test/template-spec.test.js` 的「登记等价」那条机器闸机械核验
+⇒ **改了文档忘了同步计划块 ⇒ 立刻变红**（不靠人记得）。
+同步命令：`node docs/tools/plan-block-sync.mjs docs/superpowers/plans/2026-10-23-platform-P13-defect-fixes.md . docs/platform-template-spec.md`
+
+**Step 2: 创建 platform/test/template-spec.test.js**
+
+`platform/test/template-spec.test.js`：
+
+```javascript
+// platform/test/template-spec.test.js —— 「通用赛事模板规格」机器闸
+//
+// 依据：
+//   - `docs/platform-template-spec.md` 是本仓对「平台 = 引擎 / 项目 = 赛制实例」的规格。
+//   - 该规格 §6 自称「契约的执行者是机器闸，不是文档的自觉」
+//     ⇒ **这份规格自己也必须被机器质问**，否则它只是一篇会过期的散文。
+//
+// ⚠️ **为什么需要它**（真实动机）：
+//   这份规格里有**可数的断言**（S1 的「24 处硬编码 / 12 个文件」），
+//   而代码是会演进的 ⇒ 数字会**悄悄过期**。
+//   ⇒ 一份过期却还在自称准确的规格，**比没有规格更坏**：
+//     它会让人以为「结构层就这些，改完就好了」⇒ 照着错的边界做改造。
+//
+// ── 四条判据 ──────────────────────────────────────────────────────────────
+//   ① **登记等价**：规格文档与 P13 §4.13 登记的代码块**逐字节相同**
+//      ⇒ 改了文档必须同步登记（规格与计划不许漂移）。
+//   ② **S1 数字可复算**：实时扫描 `platform/src/` 的席位字面量，
+//      与文档 §3 S1 表**逐文件逐处**一致。
+//   ③ **结构层锚点仍在位**：S2/S3/S4 引用的关键符号仍存在。
+//   ④ **16 份配置仍同版本**：§2 / §6 的「版本全等」口径仍成立。
+//
+// ⚠️ **口径必须写在文档里，不能只活在脑子里**：
+//   ② 的计数口径写在文档 §3 S1（可执行代码 / 一行算一处 / 排除注释 / 排除 config.js）
+//   ⇒ 本闸按**文档写明的口径**扫描，而不是按本文件的私货口径
+//   ⇒ 口径变了 ⇒ 文档先改 ⇒ 闸再照着改 ⇒ 不会出现「文档与闸各算各的」。
+//
+// ⚠️ **为什么 S1 要排除 `src/config.js`**：
+//   那是**配置校验器** ⇒ 它的字面量是「允许值契约」本身
+//   （新项目换席位词表时，那里的字面量恰恰是**要跟着改**的地方之一），
+//   而不是「某处业务偷偷写死了席位」。把它算进去 ⇒ 24 变 29 ⇒ 数字失去意义。
+//
+// ⚠️ 零依赖 / 零 npm 包 / 原生 ESM：只用 node:test + node:assert + node:fs。
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { dirname, join, relative, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import { stripComments } from '../test-helpers/strip-comments.js';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const PLATFORM_DIR = resolve(HERE, '..');
+const REPO_ROOT = resolve(PLATFORM_DIR, '..');
+
+const SPEC_PATH = join(REPO_ROOT, 'docs/platform-template-spec.md');
+const PLAN_PATH = join(REPO_ROOT, 'docs/superpowers/plans/2026-10-23-platform-P13-defect-fixes.md');
+const RULES_DIR = join(PLATFORM_DIR, 'rules');
+const SRC_DIR = join(PLATFORM_DIR, 'src');
+
+// ⚠️ **不适用就跳过，不许假装通过**：公开仓在本文档发布前没有这个文件
+//   （与 E183 的「isFile() 判存在」同一教训：目录 / 缺失都归入「不适用」）。
+const SPEC_EXISTS = existsSync(SPEC_PATH) && statSync(SPEC_PATH).isFile();
+const PLAN_EXISTS = existsSync(PLAN_PATH) && statSync(PLAN_PATH).isFile();
+const SKIP_REASON = '通用模板规格文档尚未在本仓落地（公开仓发布前）⇒ 本闸不适用';
+
+const specText = SPEC_EXISTS ? readFileSync(SPEC_PATH, 'utf8') : '';
+const planText = PLAN_EXISTS ? readFileSync(PLAN_PATH, 'utf8') : '';
+
+/** 递归列出目录下的 .js 文件（按路径排序 ⇒ 扫描结果稳定）。 */
+function listJsFiles(dir) {
+  const out = [];
+  for (const name of readdirSync(dir).sort()) {
+    const p = join(dir, name);
+    if (statSync(p).isDirectory()) out.push(...listJsFiles(p));
+    else if (name.endsWith('.js')) out.push(p);
+  }
+  return out;
+}
+
+/**
+ * 从计划文件里取出「规格文档」的登记代码块（```markdown 围栏）。
+ * 定位信号：紧邻围栏的路径行 —— 本仓约定 `` `docs/xxx.md`： `` 写在围栏上一行。
+ * @returns {string|null} 块内容（不含围栏）；找不到返回 null
+ */
+function extractPlanBlock(text, relPath) {
+  const lines = text.split('\n');
+  const marker = lines.findIndex((l) => l.trim() === '`' + relPath + '`：');
+  if (marker < 0) return null;
+  let i = marker + 1;
+  while (i < lines.length && lines[i].trim() === '') i++;
+  if (i >= lines.length || !lines[i].startsWith('```')) return null;
+  const body = [];
+  for (i += 1; i < lines.length; i++) {
+    if (lines[i] === '```') return body.join('\n');
+    body.push(lines[i]);
+  }
+  return null;
+}
+
+/**
+ * 取文档里某个二级/三级小节的正文（到下一个同级或更高级标题为止）。
+ * @param {string} text 文档全文
+ * @param {string} heading 标题前缀（如 '### S1'）
+ */
+function sectionBody(text, heading) {
+  const lines = text.split('\n');
+  const start = lines.findIndex((l) => l.startsWith(heading));
+  if (start < 0) return null;
+  for (let i = start + 1; i < lines.length; i++) {
+    if (/^#{2,4}\s/.test(lines[i])) return lines.slice(start + 1, i).join('\n');
+  }
+  return lines.slice(start + 1).join('\n');
+}
+
+/**
+ * 实时扫描「席位词表硬编码」的处数（口径 = 文档 §3 S1 写明的那条）。
+ * @returns {Record<string, number>} 相对 platform/ 的文件路径 → 处数
+ */
+function scanSeatLiterals() {
+  const SEAT_LITERALS = ["'judge'", "'enterprise'", "'observer'"];
+  const out = {};
+  for (const file of listJsFiles(SRC_DIR)) {
+    const rel = relative(PLATFORM_DIR, file);
+    // ⛔ 排除配置校验器（口径写在文档 §3 S1，理由见文件头注释）
+    if (rel === 'src/config.js') continue;
+    const src = stripComments(readFileSync(file, 'utf8'));
+    let count = 0;
+    for (const line of src.split('\n')) {
+      // ⚠️ **按行计，不按字面量计**：一行里出现多个席位字面量仍只算一处
+      //    （例：`const JUDGE_SEATS = ['judge','enterprise','observer'];` = 1 处）
+      if (SEAT_LITERALS.some((s) => line.includes(s))) count += 1;
+    }
+    if (count > 0) out[rel] = count;
+  }
+  return out;
+}
+
+/**
+ * 解析文档 §3 S1 表格（| `路径` | 处数 | 两列）。
+ * @returns {Record<string, number>}
+ */
+function parseSeatTable(text) {
+  const body = sectionBody(text, '### S1');
+  assert.ok(body, '文档里找不到 §3 S1 小节（表格是 S1 的硬编码处数清单）');
+  const out = {};
+  for (const line of body.split('\n')) {
+    const m = line.match(/^\|\s*`([^`]+)`\s*\|\s*(\d+)\s*\|\s*$/);
+    if (m) out[m[1]] = Number(m[2]);
+  }
+  return out;
+}
+
+test('★ 规格文档已落地（本文是它的存在前提）', (t) => {
+  if (!SPEC_EXISTS) return t.skip(SKIP_REASON);
+  assert.ok(specText.length > 0, '规格文档是空的');
+});
+
+test('★ 登记等价：规格文档与 P13 §4.13 登记的代码块逐字节一致', (t) => {
+  if (!SPEC_EXISTS || !PLAN_EXISTS) return t.skip(SKIP_REASON);
+  const block = extractPlanBlock(planText, 'docs/platform-template-spec.md');
+  assert.ok(block, 'P13 计划里找不到规格文档的登记块（新增文件必须登记进计划块）');
+  // ⚠️ 比较时**两端都去掉尾换行**：计划的围栏块天然不带尾换行，
+  //    而文件带 ⇒ 直接比会永远差一个字节（假红）。
+  const onDisk = specText.replace(/\r\n/g, '\n').replace(/\n$/, '');
+  assert.equal(block, onDisk,
+    '规格文档与计划块不一致（改了文档必须同步登记：node docs/tools/plan-block-sync.mjs <plan> . docs/platform-template-spec.md）');
+});
+
+test('★ S1 的硬编码处数可复算（文档写的与实时扫描逐文件逐处一致）', (t) => {
+  if (!SPEC_EXISTS) return t.skip(SKIP_REASON);
+  const documented = parseSeatTable(specText);
+  const live = scanSeatLiterals();
+  assert.deepEqual(Object.keys(documented).sort(), Object.keys(live).sort(),
+    '文档 §3 S1 表里的文件清单与实际扫描不一致（结构层残留变了 ⇒ 文档必须更新）');
+  for (const [rel, count] of Object.entries(live)) {
+    assert.equal(documented[rel], count,
+      `文档 §3 S1 表写「${rel} = ${documented[rel]} 处」，实际扫描是 ${count} 处`);
+  }
+  const total = Object.values(live).reduce((a, b) => a + b, 0);
+  const files = Object.keys(live).length;
+  assert.ok(total > 0 && files > 0, '扫描不到任何席位字面量（口径写错了 ⇒ 闸会假绿）');
+});
+
+test('★ 结构层锚点仍在位（S2 / S3 / S4 引用的符号没被悄悄改掉）', (t) => {
+  if (!SPEC_EXISTS) return t.skip(SKIP_REASON);
+  const read = (rel) => readFileSync(join(PLATFORM_DIR, rel), 'utf8');
+
+  // S2 · 赛段结构
+  const stage = read('src/services/stage.js');
+  assert.match(stage, /STAGE_KINDS\s*=\s*\[[^\]]*'initial'[^\]]*'final'/,
+    'S2 锚点失配：services/stage.js 的 STAGE_KINDS 不再是文档写的那组赛段类型');
+  assert.match(stage, /SCORING_CONFIG_KEYS\s*=\s*\[[^\]]*'initial'[^\]]*'final'/,
+    'S2 锚点失配：services/stage.js 的 SCORING_CONFIG_KEYS 不再是文档写的那组评分配置键');
+  assert.match(read('src/services/leaderboard.js'), /scoring_config_key\s*===\s*'final'/,
+    'S2 锚点失配：终赛段判定不再依赖 scoring_config_key === "final"（破同分 final_only 作用域会漂）');
+
+  // S3 · 段位兜底
+  const visibility = read('src/domain/visibility.js');
+  assert.match(visibility, /DEFAULT_TIER_ORDER\s*=\s*\[[^\]]*'D'[^\]]*'C'/,
+    'S3 锚点失配：domain/visibility.js 的 DEFAULT_TIER_ORDER 不再是文档写的兜底顺序');
+  assert.match(visibility, /publicFromTier\s*\|\|\s*'C'/,
+    'S3 锚点失配：domain/visibility.js 的公示起始档兜底不再是 "C"');
+  assert.match(read('src/domain/tier.js'), /key:\s*'D'/,
+    'S3 锚点失配：domain/tier.js 的兜底段位不再是 "D"');
+
+  // S1 · 席位词表（半外置的现状 + SQL 那处）
+  assert.match(read('src/domain/judge-pool.js'), /config\.votingSeats/,
+    'S1 锚点失配：domain/judge-pool.js 不再从 config.votingSeats 读席位');
+  assert.match(read('src/domain/judge-pool.js'), /config\.nonVotingSeats/,
+    'S1 锚点失配：domain/judge-pool.js 不再从 config.nonVotingSeats 读非投票席');
+  assert.match(read('src/db/repo/stages.js'), /role_key\s+IN\s*\(\s*'judge'\s*,\s*'enterprise'\s*,\s*'observer'\s*\)/,
+    'S1 锚点失配：db/repo/stages.js 的 SQL 席位词表不再是文档写的那一组');
+
+  // S4 · 表结构耦合（团队制 / 企业确认 / MBA 资格）
+  // ⚠️ **三处耦合分属不同迁移文件**（不是都在 001）⇒ 别把它们指到同一个文件上：
+  //   · 001：users.mba_status（参赛资格类别）
+  //   · 002：task_packages.enterprise_id / is_free_brief（报名与任务包）
+  //   · 003：stage_reviews.team_id（评审以队为单位）+ enterprise_confirmations（企业确认）
+  //   · 004：points_ledger.team_id / tier_records.team_id（积分与段位以队为单位）
+  const init = readFileSync(join(PLATFORM_DIR, 'db/migrations/001_init.sql'), 'utf8');
+  const reg = readFileSync(join(PLATFORM_DIR, 'db/migrations/002_registration.sql'), 'utf8');
+  const review = readFileSync(join(PLATFORM_DIR, 'db/migrations/003_review.sql'), 'utf8');
+  const lb = readFileSync(join(PLATFORM_DIR, 'db/migrations/004_leaderboard.sql'), 'utf8');
+  assert.match(init, /mba_status/, 'S4 锚点失配：001_init.sql 里不再有 mba_status（参赛资格类别假设已变 ⇒ 文档 §3 S4 必须更新）');
+  assert.match(reg, /enterprise_id/, 'S4 锚点失配：002_registration.sql 里不再有 enterprise_id');
+  assert.match(reg, /is_free_brief/, 'S4 锚点失配：002_registration.sql 里不再有 is_free_brief（自由命题假设已变）');
+  assert.match(review, /CREATE TABLE[\s\S]*?enterprise_confirmations/, 'S4 锚点失配：003_review.sql 里不再有 enterprise_confirmations 表');
+  assert.match(lb, /CREATE TABLE points_ledger[\s\S]*?team_id\s+TEXT REFERENCES teams\(id\)/,
+    'S4 锚点失配：points_ledger 不再以 team_id 为外键（个人赛改造已发生 ⇒ 文档 §3 S4 必须更新）');
+  assert.match(lb, /CREATE TABLE tier_records[\s\S]*?team_id\s+TEXT NOT NULL REFERENCES teams\(id\)/,
+    'S4 锚点失配：tier_records 不再以 team_id 为外键（个人赛改造已发生）');
+  assert.match(review, /CREATE TABLE stage_reviews[\s\S]*?team_id\s+TEXT NOT NULL REFERENCES teams\(id\)/,
+    'S4 锚点失配：stage_reviews 不再以 team_id 为外键（评审不再以队为单位）');
+});
+
+test('★ 16 份配置仍同版本（§2 / §6 的「版本全等」口径仍成立）', (t) => {
+  if (!SPEC_EXISTS) return t.skip(SKIP_REASON);
+  const files = readdirSync(RULES_DIR).filter((n) => n.endsWith('.json')).sort();
+  assert.equal(files.length, 16, `rules/ 目录现在有 ${files.length} 份配置（文档写的是 16 份 ⇒ 文档或配置必须更新）`);
+  const versions = new Set();
+  for (const name of files) {
+    const rules = JSON.parse(readFileSync(join(RULES_DIR, name), 'utf8'));
+    // ⛔ 每份都必须**自带** version：校验器按 id 识别配置，不按 version
+    //    ⇒ 少一份 version 会**静默失效**（不会报错，只会不算）。
+    assert.ok(rules.version, `rules/${name} 没有 version 字段（会静默失效）`);
+    versions.add(rules.version);
+  }
+  assert.equal(versions.size, 1, `16 份配置版本不一致：${[...versions].join(' / ')}`);
+  assert.match(specText, new RegExp(files.length + ' 份配置'),
+    '文档里没有写「' + files.length + ' 份配置」这个口径数（配置份数变了 ⇒ 文档必须更新）');
+});
+```
+
+### 4.14 2026-10-28 E187 轮（送签 27 条 ↔ 规则字段映射表 + 机器闸）—— 新建文件登记
+
+⚠️ **登记号说明**：E186 号已被本轮之前的通用模板规格占用 ⇒ 本轮用 **E187**。
+
+E186 轮把「平台 = 引擎 / 项目 = 赛制实例」写成了规格；本轮把**送签那条线**补上同一件事：
+**送签清单里的每条口径，落到哪个配置字段上。**
+
+⚠️ **为什么要它**：送签件（27 条）目前是**纯人工清单**（事项 / 平台裁决 / 勾选栏）
+⇒ 签完之后「改哪个文件的哪个字段」**没有写**
+⇒ 这正是分母四连跳（17 → 22 → 25 → 27）之后**双向手工同步**必然出错的根源。
+⇒ 本轮补上这张映射表，并给它配一道**不许过期**的机器闸。
+
+| 文件 | 为什么必须是**新文件** |
+|---|---|
+| `` | ① 它是**私有文档**（与送签件同批）⇒ **不抄进计划块**（计划块是公开件 ⇒ 抄进去等于把内部口径公开；E183 对私有送签件 HTML 已有同样处置）；② 它的守门靠 `platform/test/signoff-mapping.test.js` 那道机器闸（比计划块更硬：改了配置而表没改 ⇒ 立刻红）；③ 它是**送签件的施工图** ⇒ 签完照着它改，一个条目 = 一个字段。 |
+| `platform/test/signoff-mapping.test.js` | 这条闸钉的是**跨三个来源的不变量**（送签件的分母 ↔ 映射表的编号集合 ↔ `rules/` 的真实值）⇒ 塞进任何既有测试文件都会让「这条钉的是哪条口径」看不出来。⚠ 与既有 `test/signoff-pack-html.test.js` 的分工：那条核**打印件与 Markdown 逐字节一致**，这条核**映射表与配置逐字节一致 + 分母不重不漏** ⇒ 互补，不重叠。 |
+
+⚠️ **本轮由这道闸抓到的真问题（证明它不是形式主义）**：
+① 映射表把决赛「协作维度」写成 `dimensions[5].weight` ⇒ 实际那是**自评测**（0.05），协作维度是 `dimensions[4].weight`（0.1）
+   ⇒ **照着改会把配置改错** ⇒ 闸抓到。
+② 「互评 ≤20% 权重」这一半**既无配置字段、也无实现**（`total = (1-wE)*seatP + wE*seatE` 里没有互评；互评只产出 `trace.perTeam.peerScore`）
+   ⇒ C-06 与二#9 是**同一处缺口** ⇒ 两条**不能分开签**（否则会签出两条互相矛盾的口径）。
+③ 「辅导期名额只影响同分排序」与 `rules/ranks.json` 的 `benefits`（把名额写成段位权益、且只被展示层消费）**矛盾**
+   ⇒ 裁决要选「改配置」还是「改口径」。
+④ 27 条的落点分布：**17 条改配置就落地 / 4 条半结构 / 1 条需加字段 / 3 条纯结构 / 2 条平台不做**
+   ⇒ **送签不是「改代码的授权」，是「改配置的口径确认」** —— 但有 7 条签完还得排开发工时。
+
+**Step 1: 创建 platform/test/signoff-mapping.test.js**
+
+`platform/test/signoff-mapping.test.js`：
+
+```javascript
+// platform/test/signoff-mapping.test.js —— 「送签 27 条 ↔ 规则字段映射表」机器闸
+//
+// 依据：
+//   - 送签件（）是**要拿回签字**的文件，分母已经四连跳
+//     （17 → 22 → 25 → 27）⇒ 每一次口径变更都要同时改清单。
+//   - 映射表（）把每条口径**落到 rules/ 的具体字段**上，
+//     让「签完之后改哪里」变成机械操作。
+//
+// ⚠️ **为什么这条闸必须单独成一个文件**（而不是塞进 signoff-pack-html.test.js）：
+//   它钉的是**跨三个来源的不变量**（送签件的分母 ↔ 映射表的编号集合 ↔ rules/ 的真实值）
+//   ⇒ 塞进任何既有测试文件都会让它变成「某个既有文件的一条附带断言」。
+//
+// ── 五条判据 ──────────────────────────────────────────────────────────────
+//   ① **分母不许再跳**：映射表的编号集合 == 送签件 §三 的编号集合（不重不漏）。
+//   ② **落点不许空**：每条都有落层（白名单取值）；非「配置」的必须有备注。
+//   ③ **配置路径真实存在**：每个 `rules/<file>:<path>` 都找得到。
+//   ④ **当前值不许过期**：每个被引用的值与真实配置**逐字一致**（本闸最重要的一条）。
+//   ⑤ **三段不重不漏**：甲 13 + 乙 4 + 丙 10 == 27，每条恰属一段。
+//
+// ⚠️ **④ 为什么最重要**：映射表的价值全在「签完照着它改」上
+//   ⇒ 值一旦漂移，它就从「施工图」变成「误导」⇒ 照着改会把配置改错。
+//
+// ⚠️ **公开仓里本件与送签件都不存在** ⇒ 这 5 条**跳过**（不适用，不假装通过）
+//   （与 E183 的「isFile() 判存在」同一教训：目录 / 缺失都归入「不适用」）。
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { existsSync, readFileSync, statSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const PLATFORM_DIR = resolve(HERE, '..');
+const REPO_ROOT = resolve(PLATFORM_DIR, '..');
+const RULES_DIR = join(PLATFORM_DIR, 'rules');
+
+const PACK_PATH = join(REPO_ROOT, '');
+const MAP_PATH = join(REPO_ROOT, '');
+
+const PACK_EXISTS = existsSync(PACK_PATH) && statSync(PACK_PATH).isFile();
+const MAP_EXISTS = existsSync(MAP_PATH) && statSync(MAP_PATH).isFile();
+const SKIP_REASON = '送签件 / 映射表是私有文档（公开仓里不存在）⇒ 本闸不适用';
+
+const packText = PACK_EXISTS ? readFileSync(PACK_PATH, 'utf8') : '';
+const mapText = MAP_EXISTS ? readFileSync(MAP_PATH, 'utf8') : '';
+
+/** 送签件 §三 的 27 条编号（第一组 C-xx / 第二·三组 1..11 / 第四~六组 M0-x）。 */
+function packItemIds(text) {
+  const lines = text.split('\n');
+  const start = lines.findIndex((l) => l.startsWith('## 三、'));
+  const end = lines.findIndex((l, i) => i > start && l.startsWith('## 四、'));
+  assert.ok(start >= 0 && end > start, '送签件里找不到 §三 / §四（27 条一览的边界变了）');
+  const ids = [];
+  for (const line of lines.slice(start, end)) {
+    let m = line.match(/^\|\s*\*\*(C-\d+)\*\*/);
+    if (m) { ids.push(m[1]); continue; }
+    m = line.match(/^\|\s*\*\*(M0-\d+b?)\*\*/);
+    if (m) { ids.push(m[1]); continue; }
+    m = line.match(/^\|\s*(\d{1,2})\s*\|/);
+    if (m) { ids.push(m[1]); continue; }
+  }
+  return ids;
+}
+
+/** 映射表 §2 的 27 行（编号 / 组 / 段 / 事项 / 落层 / 配置路径 / 当前值 / 备注）。 */
+function mappingRows(text) {
+  const lines = text.split('\n');
+  const start = lines.findIndex((l) => l.startsWith('## 2. '));
+  const end = lines.findIndex((l, i) => i > start && l.startsWith('## 3. '));
+  assert.ok(start >= 0 && end > start, '映射表里找不到 §2 / §3（逐条映射表的边界变了）');
+  const rows = [];
+  for (const line of lines.slice(start, end)) {
+    if (!/^\|\s*(C-\d+|M0-\d+b?|\d{1,2})\s*\|/.test(line)) continue;
+    const cells = line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map((c) => c.trim());
+    assert.equal(cells.length, 8, `映射表的行不是 8 列（编号|组|段|事项|落层|路径|值|备注）：${line.slice(0, 80)}`);
+    rows.push({
+      id: cells[0],
+      group: cells[1],
+      segment: cells[2],
+      title: cells[3],
+      layer: cells[4],
+      // ⚠️ 路径 / 值在文档里是**带反引号**的（可读性）⇒ 解析前剥掉
+      paths: cells[5].replace(/`/g, ''),
+      values: cells[6].replace(/`/g, ''),
+      note: cells[7],
+    });
+  }
+  return rows;
+}
+
+const LAYERS = ['配置', '配置+结构', '配置+新字段', '结构', '人工'];
+const SEGMENT_COUNTS = { 甲: 13, 乙: 4, 丙: 10 };
+
+/** 按点号路径取值（支持 `a.b[0].c`）。 */
+function resolvePath(obj, path) {
+  const parts = path.replace(/\[(\d+)\]/g, '.$1').split('.');
+  let cur = obj;
+  for (const p of parts) {
+    if (cur === null || cur === undefined) return undefined;
+    cur = cur[p];
+  }
+  return cur;
+}
+
+function readRule(file) {
+  const p = join(RULES_DIR, file);
+  assert.ok(existsSync(p), `rules/${file} 不存在（映射表引用了不存在的配置）`);
+  return JSON.parse(readFileSync(p, 'utf8'));
+}
+
+test('★ 映射表落地（它是本闸的前提）', (t) => {
+  if (!MAP_EXISTS || !PACK_EXISTS) return t.skip(SKIP_REASON);
+  assert.ok(mapText.length > 0, '映射表是空的');
+});
+
+test('★ 分母不许再跳：映射表的编号集合 == 送签件 §三 的 27 条（不重不漏）', (t) => {
+  if (!MAP_EXISTS || !PACK_EXISTS) return t.skip(SKIP_REASON);
+  const packIds = packItemIds(packText);
+  const mapIds = mappingRows(mapText).map((r) => r.id);
+  assert.equal(packIds.length, 27, `送签件里数出 ${packIds.length} 条（分母又变了 ⇒ 本表必须同步）`);
+  assert.deepEqual([...mapIds].sort(), [...packIds].sort(),
+    '映射表的编号集合与送签件不一致（送签件加/删了条目 ⇒ 映射表必须同步；反之映射表写错了）');
+  assert.equal(new Set(mapIds).size, mapIds.length, '映射表里有重复编号');
+});
+
+test('★ 落点不许空：每条都有落层，非「配置」类必须有备注', (t) => {
+  if (!MAP_EXISTS || !PACK_EXISTS) return t.skip(SKIP_REASON);
+  for (const r of mappingRows(mapText)) {
+    assert.ok(LAYERS.includes(r.layer), `${r.id} 的落层「${r.layer}」不在白名单 ${LAYERS.join('/')} 里`);
+    if (r.layer !== '配置') {
+      assert.ok(r.note && r.note.length > 0, `${r.id} 落在「${r.layer}」但没写备注（不许静默留白）`);
+    }
+    if (r.paths === '-') {
+      assert.ok(r.note && r.note.length > 0, `${r.id} 没有配置路径但没写备注`);
+    }
+  }
+});
+
+test('★ 配置路径真实存在 + 当前值与真实配置逐字一致（映射表不许过期）', (t) => {
+  if (!MAP_EXISTS || !PACK_EXISTS) return t.skip(SKIP_REASON);
+  let checked = 0;
+  for (const r of mappingRows(mapText)) {
+    if (r.paths === '-') continue;
+    const paths = r.paths.split('；').map((s) => s.trim()).filter(Boolean);
+    const values = r.values.split('；').map((s) => s.trim()).filter(Boolean);
+    assert.equal(paths.length, values.length,
+      `${r.id} 的配置路径（${paths.length}）与当前值（${values.length}）数量对不上`);
+    for (let i = 0; i < paths.length; i += 1) {
+      const m = paths[i].match(/^rules\/([^:]+):(.+)$/);
+      assert.ok(m, `${r.id} 的配置路径写法不对：${paths[i]}（应是 rules/<file>:<path>）`);
+      const [, file, path] = m;
+      const rules = readRule(file);
+      const actual = resolvePath(rules, path);
+      assert.notEqual(actual, undefined, `${r.id} 指向的路径在 rules/${file} 里不存在：${path}`);
+      const expected = values[i];
+      if (expected.startsWith('length=')) {
+        assert.ok(Array.isArray(actual), `${r.id} 期望 length= 却不是数组：${path}`);
+        assert.equal(actual.length, Number(expected.slice('length='.length)),
+          `${r.id} 的「${expected}」与真实配置不符（rules/${file}:${path} 实际长度 ${actual.length}）`);
+      } else {
+        assert.deepEqual(actual, JSON.parse(expected),
+          `${r.id} 的当前值「${expected}」与真实配置不符（rules/${file}:${path} 实际是 ${JSON.stringify(actual)}）`);
+      }
+      checked += 1;
+    }
+  }
+  assert.ok(checked >= 40, `只核了 ${checked} 个值（映射表退化成空表 ⇒ 闸会假绿）`);
+});
+
+test('★ 三段不重不漏：甲 13 + 乙 4 + 丙 10 == 27，每条恰属一段', (t) => {
+  if (!MAP_EXISTS || !PACK_EXISTS) return t.skip(SKIP_REASON);
+  const rows = mappingRows(mapText);
+  const counts = { 甲: 0, 乙: 0, 丙: 0 };
+  for (const r of rows) {
+    assert.ok(r.segment in counts, `${r.id} 的段「${r.segment}」不是 甲/乙/丙`);
+    counts[r.segment] += 1;
+  }
+  assert.equal(rows.length, 27, `映射表有 ${rows.length} 行（不是 27）`);
+  for (const [seg, n] of Object.entries(SEGMENT_COUNTS)) {
+    assert.equal(counts[seg], n, `${seg} 段是 ${counts[seg]} 条（规格写的是 ${n}）`);
+  }
+});
+```
