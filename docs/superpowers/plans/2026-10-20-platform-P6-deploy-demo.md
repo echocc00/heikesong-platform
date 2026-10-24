@@ -6931,6 +6931,54 @@ function parseQuery(path) {
   return { path: path.slice(0, i), query: q };
 }
 
+/**
+ * 演示站的过滤键挑选（E182 · F7，2026-10-28）——
+ * **与正式站 `src/http/routes/audit.js` 的 `pickFilter` 同一口径**。
+ *
+ * ⚠️ **为什么必须补上（这不是「让演示站更好看」，是补一个用户可见的假功能）**：
+ *    正式站在 E181 · A3 里把三个审计端点的过滤键改成**按端点精确白名单 + 未知键 400**
+ *    （此前是**一份并集白名单**给三个端点用 ⇒ 仓储层不认识的键被**静默丢弃**
+ *      ⇒ 调用方拿到的是**未筛选的全量**，却以为自己筛过了 ⇒ 「以为筛了其实没筛」）。
+ *    而演示适配器当时**零同步** ⇒ 两个后果：
+ *      ① `web/views/audit-log.js` 的过滤表单**真的会发 query 参数**
+ *         （action / entity / since / until / limit）⇒ **公网演示站上输入日期范围点「筛选」，
+ *         列表纹丝不动**（演示适配器只认 action/entity，把 since/until 丢了）
+ *         ⇒ 给评审看的演示站上摆着一个**假筛选**；
+ *      ② 演示站**静默忽略**未知键 ⇒ 与正式站（400）行为不同。
+ *    ⇒ 现在**同码同判**：三个端点各自的精确白名单 + 未知键 400。
+ *
+ * ⚠️ **limit / offset 保持既有的宽容语义**（非法值静默忽略，不用默认分页）——
+ *    与正式站同款（那边有 test/audit-api.test.js 的用例钉住「不得打成 500」）。
+ */
+const DEMO_AUDIT_LOG_FILTER_KEYS = ['action', 'entity', 'entityId', 'since', 'until'];
+const DEMO_FLAGS_FILTER_KEYS = ['status', 'kind', 'stageId'];
+const DEMO_APPEALS_FILTER_KEYS = ['status', 'subjectType', 'subjectId'];
+const DEMO_PAGINATION_KEYS = ['limit', 'offset'];
+
+function pickDemoFilter(query = {}, allowedKeys = []) {
+  const q = query ?? {};
+  for (const key of Object.keys(q)) {
+    if (allowedKeys.includes(key) || DEMO_PAGINATION_KEYS.includes(key)) continue;
+    throw httpError(
+      400, 'BAD_REQUEST',
+      `不支持的过滤参数：${key}（本接口只支持：${[...allowedKeys, ...DEMO_PAGINATION_KEYS].join(' / ')}）`,
+    );
+  }
+  const out = {};
+  for (const key of allowedKeys) {
+    if (q[key] !== undefined && q[key] !== '') out[key] = q[key];
+  }
+  if (q.limit !== undefined) {
+    const limit = Number(q.limit);
+    if (Number.isInteger(limit) && limit > 0) out.limit = limit;
+  }
+  if (q.offset !== undefined) {
+    const offset = Number(q.offset);
+    if (Number.isInteger(offset) && offset >= 0) out.offset = offset;
+  }
+  return out;
+}
+
 export function createDemoApi({ storage = defaultStorage(), seed = null, rules = null } = {}) {
   let state = null;
 
@@ -7318,8 +7366,16 @@ export function createDemoApi({ storage = defaultStorage(), seed = null, rules =
       };
     }
     if (method === 'GET' && clean === '/api/audit/flags') {
-      const flags = demoFlags(s);
-      return { rows: flags, total: flags.length };
+      // ⚠️ E182 · F7：过滤键按**本端点的精确白名单**，未知键 400（与正式站 pickFilter 同口径）。
+      const filter = pickDemoFilter(query, DEMO_FLAGS_FILTER_KEYS);
+      let flags = demoFlags(s);
+      if (filter.status) flags = flags.filter((f) => f.status === filter.status);
+      if (filter.kind) flags = flags.filter((f) => f.kind === filter.kind);
+      if (filter.stageId) flags = flags.filter((f) => f.stageId === filter.stageId);
+      const total = flags.length;
+      const limit = Number.isInteger(Number(filter.limit)) && Number(filter.limit) > 0 ? Number(filter.limit) : 100;
+      const offset = Number.isInteger(Number(filter.offset)) && Number(filter.offset) >= 0 ? Number(filter.offset) : 0;
+      return { rows: flags.slice(offset, offset + limit), total };
     }
     let flm = clean.match(/^\/api\/audit\/flags\/([^/]+)\/resolve$/);
     if (method === 'POST' && flm) {
@@ -7341,8 +7397,16 @@ export function createDemoApi({ storage = defaultStorage(), seed = null, rules =
     //    POST /api/appeals/:id/decide → { appeal, transitions, recomputeRequired }
     //    （正式站口径：src/services/review-state.js 的 listAppeals / fileAppeal / decideAppeal）
     if (method === 'GET' && clean === '/api/appeals') {
-      const rows = (s.appeals ?? []).map(demoAppealView);
-      return { rows, total: rows.length };
+      // ⚠️ E182 · F7：过滤键按**本端点的精确白名单**，未知键 400（与正式站 pickFilter 同口径）。
+      const filter = pickDemoFilter(query, DEMO_APPEALS_FILTER_KEYS);
+      let rows = (s.appeals ?? []).map(demoAppealView);
+      if (filter.status) rows = rows.filter((a) => a.status === filter.status);
+      if (filter.subjectType) rows = rows.filter((a) => a.subjectType === filter.subjectType);
+      if (filter.subjectId) rows = rows.filter((a) => a.subjectId === filter.subjectId);
+      const total = rows.length;
+      const limit = Number.isInteger(Number(filter.limit)) && Number(filter.limit) > 0 ? Number(filter.limit) : 100;
+      const offset = Number.isInteger(Number(filter.offset)) && Number(filter.offset) >= 0 ? Number(filter.offset) : 0;
+      return { rows: rows.slice(offset, offset + limit), total };
     }
     let apm = clean.match(/^\/api\/appeals\/([^/]+)\/decide$/);
     if (method === 'POST' && apm) {
@@ -7382,12 +7446,24 @@ export function createDemoApi({ storage = defaultStorage(), seed = null, rules =
       };
     }
     if (method === 'POST' && clean === '/api/appeals') {
-      const subjectType = body?.subjectType ?? 'team_result';
+      // ⚠️ E182 · F2（2026-10-28）：主体类型**白名单**（与正式站
+      //    src/services/review-state.js 的 normalizeAppealSubjectType 同一口径）。
+      //    缺省仍是 'team_result'（既有契约）；未知类型 ⇒ 400。
+      //    ⚠️ 为什么演示站也要这道闸：演示适配器与正式站**同码同判**是硬纪律 ——
+      //    演示站放过的东西，正式站 400 ⇒ 公网演示站会让人以为「这条路能走通」。
+      const APPEAL_SUBJECT_TYPES = ['team_result', 'registration'];
+      const subjectType = String(body?.subjectType ?? 'team_result').trim();
+      if (!APPEAL_SUBJECT_TYPES.includes(subjectType)) {
+        throw httpError(400, 'BAD_REQUEST',
+          `申诉主体类型非法：${subjectType || '(空)'}（只能是 ${APPEAL_SUBJECT_TYPES.join(' / ')}）`);
+      }
       const subjectId = String(body?.subjectId ?? '').trim();
       if (!subjectId) throw httpError(400, 'BAD_REQUEST', '申诉必须给 subjectId');
       const reason = String(body?.reason ?? '').trim();
       if (!reason) throw httpError(400, 'BAD_REQUEST', '申诉必须写理由（空理由 = 无法复核）');
       // ⚠️ M0-2：程序性错误类型白名单（与正式站 src/services/review-state.js 同一口径）
+      //    ⛔ E182 · F2：豁免**只限报名类**（正式站同口径）——
+      //    修复前正式站的豁免写的是「一切非 team_result」，未知类型能绕过白名单落库。
       const allowedKinds = Array.isArray(rules?.audit?.reviewState?.appealReasonKinds)
         ? rules.audit.reviewState.appealReasonKinds : [];
       const reasonKind = String(body?.reasonKind ?? '').trim();
@@ -8437,14 +8513,23 @@ export function createDemoApi({ storage = defaultStorage(), seed = null, rules =
     // ⚠️ 形状与正式站 src/services/audit.js 的 listAuditLog 一致。
     if (method === 'GET' && clean === '/api/audit/log') {
       if (!s.me) throw httpError(401, 'UNAUTHENTICATED', '未登录');
+      // ⚠️ E182 · F7：过滤键按**本端点的精确白名单**，未知键 400（与正式站 pickFilter 同口径）。
+      const filter = pickDemoFilter(query, DEMO_AUDIT_LOG_FILTER_KEYS);
       const rows = (s.auditLog ?? []).filter((r) => {
-        if (query.action && r.action !== query.action) return false;
-        if (query.entity && r.entity !== query.entity) return false;
-        if (query.entityId && r.entityId !== query.entityId) return false;
+        if (filter.action && r.action !== filter.action) return false;
+        if (filter.entity && r.entity !== filter.entity) return false;
+        if (filter.entityId && r.entityId !== filter.entityId) return false;
+        // ⚠️ 时间区间：与正式站 `db/repo/audit-log.js` 的 `created_at >= ?` / `<= ?`
+        //    **同一套字符串比较**（ISO 时刻串，按字典序比较即时间序）。
+        //    ⚠️ 注意 `until` 的边界语义：前端传的是**日期**（`2026-10-20`），
+        //    而 created_at 是 `2026-10-20T08:00:00.000Z` ⇒ 字典序上**大于** `2026-10-20`
+        //    ⇒ 当天的行**不含**在结果里 —— 与正式站**完全一致**（不是演示站特有的怪癖）。
+        if (filter.since && String(r.createdAt ?? '') < filter.since) return false;
+        if (filter.until && String(r.createdAt ?? '') > filter.until) return false;
         return true;
       });
-      const limit = Number.isInteger(Number(query.limit)) && Number(query.limit) > 0 ? Number(query.limit) : 50;
-      const offset = Number.isInteger(Number(query.offset)) && Number(query.offset) >= 0 ? Number(query.offset) : 0;
+      const limit = Number.isInteger(Number(filter.limit)) && Number(filter.limit) > 0 ? Number(filter.limit) : 50;
+      const offset = Number.isInteger(Number(filter.offset)) && Number(filter.offset) >= 0 ? Number(filter.offset) : 0;
       const page = rows.slice(offset, offset + limit);
       const archiveMonths = r?.audit?.retention?.archiveMonths ?? null;
       return {

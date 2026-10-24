@@ -1,6 +1,6 @@
 {
   "id": "tiebreak",
-  "version": "2026-10-27",
+  "version": "2026-10-28",
   "conflictRef": "C-03",
   "source": "S7 §3.3 + S10 §0.4 + S10 §3.3（原文互相冲突，此处为裁决后的有序链）",
   "chain": [

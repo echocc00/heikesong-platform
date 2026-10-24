@@ -599,6 +599,31 @@ export function validateRules(rules, expectedCount = null) {
         if (!VALID_CONFIRMERS.includes(it.confirmedBy)) {
           push(`milestones.items 里程碑 ${it.key} 的 confirmedBy=${it.confirmedBy} 非法`);
         }
+        // ⛔ **E182 · F4（2026-10-28）：计分类里程碑的确认方必须是「企业」**。
+        //
+        // ⚠️ **为什么这道闸成立（依据是实现，不是凭空造规则）**：
+        //    里程碑的「达成」在实现里**只有一条路径**：
+        //      src/services/tier.js：`achieved = requires_signoff === 0 || 有未撤回签字`
+        //      而 `requires_signoff` 在表上是 `INTEGER NOT NULL DEFAULT 1` ⇒ 恒为 1
+        //      ⇒ 达成 ⇔ `milestone_signoffs` 里有**未撤回**的一行
+        //    而 `milestone_signoffs.enterprise_id TEXT NOT NULL` ⇒ **结构上企业专用**
+        //    且 `hasActiveSignoff` 只看「有没有未撤回的行」，**不区分是谁签的**
+        //    ⇒ 配置若写 `judge`，评委的确认**没有任何落库路径** ⇒ 该里程碑**永远达不成**
+        //      ⇒ 行为分（countBy='milestone' 的达成闸）与段位对它一律不认。
+        //    ⇒ 口径依据 R-PTS-12：里程碑与段位**共享「企业签字」这一个数据源**。
+        //
+        // ⚠️ **「配置不许说谎」纪律**：这条配置此前**只被校验、从未被消费**
+        //    （`confirmedBy` 在全仓没有任何读取点）⇒ 一份写着 `judge` 的配置
+        //    看上去「评委确认里程碑」，实际是「这个里程碑谁都确认不了」。
+        //    ⇒ 现在它在启动时就被拒绝，而不是让运营在试赛时才发现。
+        if (it.countsTowardTier && it.confirmedBy !== 'enterprise') {
+          push(
+            `milestones.items 里程碑 ${it.key} 的 confirmedBy=${it.confirmedBy} 与实现矛盾：`
+            + '计分类里程碑的「达成」判定读的是 milestone_signoffs 表（enterprise_id NOT NULL ⇒ 结构上企业专用），'
+            + '且与段位共享同一个数据源（R-PTS-12）'
+            + ' ⇒ 评委确认的里程碑在实现里**永远达不成**（评委的确认没有落库路径）',
+          );
+        }
       }
       if (!ms.items.some((it) => it.countsTowardTier)) {
         push('milestones.items 没有任何 countsTowardTier=true 的里程碑，段位将永远无法晋升');

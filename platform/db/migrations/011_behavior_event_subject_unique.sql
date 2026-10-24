@@ -1,0 +1,40 @@
+-- 011_behavior_event_subject_unique.sql —— 「同一里程碑只记一次」落到**数据库层**（2026-10-28）
+--
+-- 依据：E182 · F6（2026-10-27 复评发现的 Minor）
+--   · **服务层已经是对的**：`domain/behavior.js` 的 `countLimitOf` 对 `countBy:'milestone'`
+--     返回 `{ max: 1 }` ⇒ 同一个里程碑只计一次；`services/behavior.js` 在 insert **之前**
+--     先跑一次 probe ⇒ 同一里程碑的第二次提交撞 `subject_limit` ⇒ 409 ⇒ 根本不落库。
+--   · 但 009 建的 `idx_behavior_events_subject` 是**普通索引**，不是 UNIQUE
+--     ⇒ 数据库层**没有任何约束** ⇒ 约束只存在于服务层的「先查再插」里。
+--   · 同款病根在本仓有先例，两处都写着同一句话：
+--       007_p13_defect_fixes.sql（F23）：「服务层的『先查再插』在并发下挡不住
+--         两个同时通过的请求（两边都读到『不存在』）⇒ 唯一约束必须落在数据库上。」
+--       `review_request_keys` 用**复合 PRIMARY KEY** 做幂等的数据库层保证。
+--     ⇒ 本条是把同一纪律补到行为分事件上。
+--
+-- ⚠️ 为什么是**部分唯一索引**（`WHERE subject_id IS NOT NULL`）：
+--    `subject_id` 只对 `countBy:'milestone'` 的事件有值 ——
+--      · 迁移 009 之前的事件一律 NULL（`ALTER TABLE ... ADD COLUMN` 的可空列）；
+--      · `services/behavior.js` 也**只**对 `countBy:'milestone'` 写主体。
+--    ⇒ 而 4 个 `once` 类事件（weekly_progress / workshop_output / enterprise_meeting /
+--      first_demo）**共用同一个「终身一次」桶**（桶键 = 事件类型 + 空主体）。
+--    ⇒ 显式写上 `WHERE subject_id IS NOT NULL` 有两个好处：
+--      ① 语义自解释：这条索引**只管「有主体」的行**；
+--      ② 不用依赖「SQLite 的 UNIQUE 视 NULL 与 NULL 互不相等」这一条实现细节
+--         —— 换到 Postgres（UNIQUE 默认视 NULL 为相等，除非显式 NULLS NOT DISTINCT）
+--            那样**不加 WHERE 就会真的撞键**，把 4 个 once 事件互相顶掉。
+--         ⇒ 把「NULL 主体不受约束」写进索引定义本身，而不是靠引擎的默认值。
+--
+-- ⚠️ **本迁移不删行、不改行**（behavior_events 是**只增不改**的审计型表，
+--    INTERFACES.md §0「追加式」⇒ 只能加列，不能改既有行、不能删列）：
+--    若库里已存在重复的 (team_id, type, subject_id)，下面的建索引会**响亮失败**
+--    （UNIQUE constraint failed）⇒ 整个迁移回滚（`src/db/migrate.js` 的单事务）
+--    ⇒ 部署被挡住 ⇒ **人来看**。
+--    ⇒ 这是刻意的取舍：**宁可部署停下来，也不静默改写审计数据**。
+--    ⇒ 「正常路径不可能产生重复」是可证的，三条：
+--      ① 服务层在 insert 前就 409 挡掉第二次提交（`subject_limit` 分支）；
+--      ② `submitBehaviorEvent` 是**同步函数**（全程没有 await）⇒ 单进程内不会交错；
+--      ③ 单写者闸（设计文档 §14.2 / README「SQLite 只允许单写进程」）⇒ 只有一个写进程。
+CREATE UNIQUE INDEX ux_behavior_events_subject
+  ON behavior_events(team_id, type, subject_id)
+ WHERE subject_id IS NOT NULL;

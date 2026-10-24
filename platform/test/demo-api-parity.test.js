@@ -164,6 +164,55 @@ const VIEW_ENDPOINTS = [
   { method: 'POST', path: '/api/stages/stage_final/teams', body: { teamIds: ['t_alpha'] } },
 ];
 
+/**
+ * 演示适配器**明确不实现**的正式站端点（E182 · F7，2026-10-28）。
+ *
+ * ⚠️ **为什么要有这张清单**：上面的端点覆盖闸只管「**前端用到**的端点」
+ *    ⇒ 正式站有、演示站没有、而前端**不用**的端点 ⇒ **没有任何闸会发现它缺**
+ *    ⇒ 缺口是「悄悄的」。
+ *    ⇒ 这张清单把「已知、且已判定为可接受」的缺口**显式登记**下来并附上理由
+ *    ⇒ 缺口从「悄悄没有」变成「登记在案」。
+ *
+ * ⛔ **登记不是免罪，两条硬要求**：
+ *    ① 每一条都必须写清「**为什么演示站不需要它**」——理由要能站住，不能是「懒得做」；
+ *    ② 下面那条用例会**逐条实测**「它确实没实现」——
+ *       万一哪天演示适配器把它实现了，清单必须同步删掉
+ *       ⇒ **否则这张清单就在说谎**（登记的是「缺口」，实际已经补上了）。
+ */
+const DECLARED_DEMO_EXCLUSIONS = [
+  {
+    method: 'GET',
+    path: '/api/readiness',
+    why: 'S-7~S-10 业务就绪度汇总（组委会专用，`audit:read`）。'
+      + '演示站的数据是**种子数据**：没有赛段级名册登记（`stage_team`）、没有真实发榜时刻 '
+      + '⇒ S-8 覆盖率恒为 `not_applicable`、S-9 恒为 `no_roster` '
+      + '⇒ 演示出来只会是一屏「不可判定」⇒ 对观众零价值、对评审是误导。'
+      + '（这条闸的真值只可能来自**试赛的真实赛段数据**。）',
+  },
+];
+
+test('演示适配器「明确不实现」的端点清单：**逐条实测确实没实现**（清单不许说谎）', async () => {
+  // ⚠️ 为什么要这条闸：清单本身也会过期 ——
+  //    演示适配器哪天把某个端点补上了，而清单没删 ⇒ 清单就在说「这里缺一块」，
+  //    实际上不缺 ⇒ 下一个读清单的人会以为那个缺口还在，去做无用功。
+  const { api } = await bootDemo();
+  for (const ex of DECLARED_DEMO_EXCLUSIONS) {
+    assert.ok(ex.why && String(ex.why).trim().length >= 20,
+      `${ex.method} ${ex.path} 的登记必须写清「为什么演示站不需要它」`);
+    let code = null;
+    try {
+      await api[ex.method.toLowerCase()](ex.path);
+    } catch (e) {
+      code = e.code;
+    }
+    assert.equal(
+      code, 'DEMO_ENDPOINT_MISSING',
+      `${ex.method} ${ex.path} 被登记成「演示站不实现」，但实测结果是 ${code ?? '调通了'}`
+      + ' ⇒ 清单已过期（演示适配器把它实现了）⇒ 请删掉这条登记，或改写理由',
+    );
+  }
+});
+
 test('演示适配器必须实现前端用到的**每一个**端点（缺一个 ⇒ 演示站那页就是 404）', async () => {
   const { api } = await bootDemo();
   const missing = [];

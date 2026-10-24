@@ -6863,16 +6863,51 @@ test('S-9：结束 +90h 发榜 ⇒ **超期**（时限 72h），且延迟小时�
   }
 });
 
-test('S-9：结束 72h 仍**从未发榜** ⇒ 判 never_published 并计入超期', () => {
+test('S-9：结束 84h 仍**从未发榜** ⇒ 判 never_published 并计入超期', () => {
+  // ⚠️ **用例名与断言对齐**：本用例的 now 是 10-13 12:00、赛段 10-10 结束 ⇒ 实际延迟 **84 小时**
+  //    （原名写的「72h」与断言里的 84 不符 —— 已改正；断言值未动）。
   const s = setup();
   try {
     const f = seedStage(s.db, { key: 's3', endsAt: '2026-10-10' });
     const out = readinessSummary({ db: s.db, rules: s.rules, now: '2026-10-13T12:00:00.000Z' }).s9;
     const row = out.stages.find((x) => x.stageId === f.stage.id);
     assert.equal(row.state, 'never_published');
-    assert.equal(row.overdue, true);
+    assert.equal(row.overdue, true, '84h > 72h ⇒ 必须判超期');
     assert.equal(row.publishedAt, null);
     assert.equal(row.delayHours, 84, '结束 10-10 00:00 → now 10-13 12:00 = 84 小时');
+  } finally {
+    s.close();
+  }
+});
+
+test('S-9：**从未发榜**与**已发榜**同一把尺（E182 · F3）：时限内不报红，超时才报', () => {
+  // ⚠️ **这是 F3 的判别性用例**：修复前 `never_published` 分支的 `overdue` 是**无条件 true**
+  //    ⇒ 赛段结束 **1 小时**没发榜就报红，而已发榜的同一时刻要 >72h 才算 late
+  //    ⇒ 同一条 SLA 两种不对称判定 ⇒ 试赛第一天就会误报一片红。
+  // ⇒ 这里必须**同时**钉住两个方向：时限内**不**报 + 超时**才**报。
+  const s = setup();
+  try {
+    const f = seedStage(s.db, { key: 's6', endsAt: '2026-10-10' });
+    // ① 结束 +1h（远在 72h 时限内）⇒ **不得**判超期
+    const early = deadlineOf(s.db, f.stage.id, s.rules, '2026-10-10T01:00:00.000Z');
+    assert.equal(early.state, 'never_published', '状态仍是 never_published（「一次都没发过」与「晚发」是两件事）');
+    assert.equal(early.delayHours, 1);
+    assert.equal(early.overdue, false, '⛔ 时限内没发榜**不得**判超期 —— 修复前这里恒为 true（试赛第一天就误报红）');
+    assert.equal(early.publishedAt, null);
+
+    // ② 结束 +72h（**正好**等于时限）⇒ 仍不报（与「已发榜」分支同尺：严格大于才算超期）
+    const exact = deadlineOf(s.db, f.stage.id, s.rules, '2026-10-13T00:00:00.000Z');
+    assert.equal(exact.delayHours, 72);
+    assert.equal(exact.overdue, false, '正好 72h 不算超期（与已发榜分支同一把尺：严格大于）');
+
+    // ③ 结束 +73h ⇒ 报超期
+    const late = deadlineOf(s.db, f.stage.id, s.rules, '2026-10-13T01:00:00.000Z');
+    assert.equal(late.delayHours, 73);
+    assert.equal(late.overdue, true, '超过 72h 必须报超期');
+    assert.equal(
+      readinessSummary({ db: s.db, rules: s.rules, now: '2026-10-13T01:00:00.000Z' }).s9.overdueCount, 1,
+      '超期计数必须同步（汇总层不得漏）',
+    );
   } finally {
     s.close();
   }
@@ -7271,3 +7306,913 @@ test('三端点的白名单**互不相同**（同一个键在另一个端点必�
   }
 });
 ```
+
+### 4.10 2026-10-28 E182 轮（E180/E181 复评发现的七条修复）—— 新建文件登记
+
+本轮修的是 2026-10-27 第三方复评报告里**经我方逐条亲验属实**的发现。本轮新建了以下文件。
+按本仓纪律「**新建文件必须登记进计划块，否则它的漂移查不出来**」，逐个登记如下：
+
+| 文件 | 为什么必须是**新文件** |
+|---|---|
+| `platform/db/migrations/011_behavior_event_subject_unique.sql` | 「同一里程碑只记一次」的**数据库层**约束必须是**独立的一条迁移**：behavior_events 是**只增不改**的审计型表（INTERFACES.md §0「追加式」）⇒ 只能加列、不能改既有行、不能删列 ⇒ 既有的 009 迁移（加列）**不能**被就地改写（迁移文件名不可变更，`src/db/migrate.js` 会对改名抛错）⇒ 约束补强只能**另起一条**。⚠️ 用**部分唯一索引**（`WHERE subject_id IS NOT NULL`）：`subject_id` 只对 countBy='milestone' 的事件有值 ⇒ 其余 once 类事件共用「终身一次」桶，不受这条索引约束（否则一次类事件会互相顶掉）。 |
+| `platform/test/e182-regression.test.js` | 本轮的七条修复**跨了七个不同的口径**（控制字节 / 申诉白名单 / 发榜时限 / 里程碑确认方 / 截尾门槛 / 数据库约束 / 接口契约登记）⇒ 塞进任何**单个**既有测试文件，都会让「这条钉的是哪条口径」看不出来。⚠️ 它还含一条**跨全仓**的扫描用例（F1：文本源文件不得有裸 NUL / 控制字节）⇒ 只能独立成文件才能扫到 `docs/` 下的计划块（F1 的两处 NUL 里**有一处就在计划块里**）。 |
+
+⚠️ 本轮**同时**改了既有文件（`src/services/review-state.js` → P4 owns、`src/services/readiness.js` → P13 owns、
+`src/config.js` → P0 owns、`src/domain/behavior.js` → P3 owns、`web/api.demo.js` → P6 owns、
+16 份 `rules/*.json` → 各自 owning 阶段）⇒ 它们的计划块**已用 `docs/tools/plan-block-sync.mjs` 逐字同步回 owning 阶段**
+（C-RW 必须清零 ⇒ 本轮同步了 **15 + 5** 处）。
+⚠️ 规则集又升了一版：`2026-10-27` → **`2026-10-28`**（16 份全改 —— 本轮改了
+`rules/milestones.default.json`（demo_ready 的确认方）与两份 `rules/scoring-*.json`（minJudgesForTrim），
+且 `rules/compliance.json` 的 readiness 段未动 ⇒ 版本必须全等，否则 `loadRules` 拒绝启动）。
+
+**Step 1: 创建 db/migrations/011_behavior_event_subject_unique.sql**
+
+`platform/db/migrations/011_behavior_event_subject_unique.sql`：
+
+```sql
+-- 011_behavior_event_subject_unique.sql —— 「同一里程碑只记一次」落到**数据库层**（2026-10-28）
+--
+-- 依据：E182 · F6（2026-10-27 复评发现的 Minor）
+--   · **服务层已经是对的**：`domain/behavior.js` 的 `countLimitOf` 对 `countBy:'milestone'`
+--     返回 `{ max: 1 }` ⇒ 同一个里程碑只计一次；`services/behavior.js` 在 insert **之前**
+--     先跑一次 probe ⇒ 同一里程碑的第二次提交撞 `subject_limit` ⇒ 409 ⇒ 根本不落库。
+--   · 但 009 建的 `idx_behavior_events_subject` 是**普通索引**，不是 UNIQUE
+--     ⇒ 数据库层**没有任何约束** ⇒ 约束只存在于服务层的「先查再插」里。
+--   · 同款病根在本仓有先例，两处都写着同一句话：
+--       007_p13_defect_fixes.sql（F23）：「服务层的『先查再插』在并发下挡不住
+--         两个同时通过的请求（两边都读到『不存在』）⇒ 唯一约束必须落在数据库上。」
+--       `review_request_keys` 用**复合 PRIMARY KEY** 做幂等的数据库层保证。
+--     ⇒ 本条是把同一纪律补到行为分事件上。
+--
+-- ⚠️ 为什么是**部分唯一索引**（`WHERE subject_id IS NOT NULL`）：
+--    `subject_id` 只对 `countBy:'milestone'` 的事件有值 ——
+--      · 迁移 009 之前的事件一律 NULL（`ALTER TABLE ... ADD COLUMN` 的可空列）；
+--      · `services/behavior.js` 也**只**对 `countBy:'milestone'` 写主体。
+--    ⇒ 而 4 个 `once` 类事件（weekly_progress / workshop_output / enterprise_meeting /
+--      first_demo）**共用同一个「终身一次」桶**（桶键 = 事件类型 + 空主体）。
+--    ⇒ 显式写上 `WHERE subject_id IS NOT NULL` 有两个好处：
+--      ① 语义自解释：这条索引**只管「有主体」的行**；
+--      ② 不用依赖「SQLite 的 UNIQUE 视 NULL 与 NULL 互不相等」这一条实现细节
+--         —— 换到 Postgres（UNIQUE 默认视 NULL 为相等，除非显式 NULLS NOT DISTINCT）
+--            那样**不加 WHERE 就会真的撞键**，把 4 个 once 事件互相顶掉。
+--         ⇒ 把「NULL 主体不受约束」写进索引定义本身，而不是靠引擎的默认值。
+--
+-- ⚠️ **本迁移不删行、不改行**（behavior_events 是**只增不改**的审计型表，
+--    INTERFACES.md §0「追加式」⇒ 只能加列，不能改既有行、不能删列）：
+--    若库里已存在重复的 (team_id, type, subject_id)，下面的建索引会**响亮失败**
+--    （UNIQUE constraint failed）⇒ 整个迁移回滚（`src/db/migrate.js` 的单事务）
+--    ⇒ 部署被挡住 ⇒ **人来看**。
+--    ⇒ 这是刻意的取舍：**宁可部署停下来，也不静默改写审计数据**。
+--    ⇒ 「正常路径不可能产生重复」是可证的，三条：
+--      ① 服务层在 insert 前就 409 挡掉第二次提交（`subject_limit` 分支）；
+--      ② `submitBehaviorEvent` 是**同步函数**（全程没有 await）⇒ 单进程内不会交错；
+--      ③ 单写者闸（设计文档 §14.2 / README「SQLite 只允许单写进程」）⇒ 只有一个写进程。
+CREATE UNIQUE INDEX ux_behavior_events_subject
+  ON behavior_events(team_id, type, subject_id)
+ WHERE subject_id IS NOT NULL;
+```
+
+**Step 2: 创建 test/e182-regression.test.js**
+
+`platform/test/e182-regression.test.js`：
+
+```javascript
+// platform/test/e182-regression.test.js —— E182 复评发现的七条修复的回归闸（2026-10-28）
+//
+// 依据：2026-10-27 的 E180/E181 第三方复评报告 + 我方**逐条亲验**后确认属实的发现：
+//   F1（Critical·工程）源码里嵌入了**裸 NUL 字节** ⇒ git 把核心计分文件判成二进制
+//        ⇒ diff / blame / git grep / 基于 diff 的机器闸**全部失效**
+//   F2（Important）申诉理由类型白名单的**豁免写宽**（豁免「一切非 team_result」）
+//        ⇒ 未知 subjectType 能绕过程序性白名单落库
+//   F3（Important）S-9 的 `never_published` **无条件**判超期 ⇒ 与 `published` 分支不对称
+//   F4（Important·业务）`demo_ready` 的确认方写 `judge`，而达成闸只认企业签字
+//        ⇒ 配置与实现、与 R-PTS-12 **三重矛盾**
+//   F5（Minor）`minJudgesForTrim: 5` 与评委池下限 3 **互相打架**
+//        ⇒ `trimmed` 策略在 3 人池下**永不触发** ⇒ C-07 的理由没兑现
+//   F6（Minor）`behavior_events` 的主体索引**非 UNIQUE** ⇒ 缺数据库层兜底
+//   F7（Minor）`readiness` 端点没登记进跨阶段接口契约；demo parity 没有排除项清单
+//
+// ⚠️ **判别性要求**（本仓纪律：用例必须能抓住「把修复去掉」）：
+//   每条用例都钉住**具体行为与具体数字**，不是「不是 undefined」那种糊弄断言。
+//   —— 尤其 F3：修复前 `never_published` 一律 overdue=true ⇒ 用例必须同时钉住
+//      「时限内不报」与「超时才报」两个方向，只钉一个方向等于没钉。
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync, readdirSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, dirname, extname, relative } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { openDatabase } from '../src/db/sqlite.js';
+import { applyMigrations } from '../src/db/migrate.js';
+import { loadRules, validateRules } from '../src/config.js';
+import { fileAppeal } from '../src/services/review-state.js';
+import { transition } from '../src/services/review-state-core.js';
+import { trimOutliers } from '../src/domain/trim.js';
+import { isolateTempDir } from '../test-helpers/tmp.js';
+
+isolateTempDir();
+
+const here = dirname(fileURLToPath(import.meta.url));
+const repoRoot = join(here, '..', '..');
+const migrationsDir = join(here, '..', 'db', 'migrations');
+const rulesDir = join(here, '..', 'rules');
+
+// ── F1：裸 NUL / 控制字节 ───────────────────────────────────────────────
+//
+// ⚠️ **为什么这条闸值得存在**：git 的二进制启发式是「**前 8000 字节**里出现 NUL ⇒ 判二进制」
+// ⇒ 一个裸 NUL 字节会让**整份文件**在 git 眼里变成二进制 ⇒ diff 变成 "Binary files differ"
+// ⇒ 而本仓的核心纪律恰恰是「计划块与实现**逐字**一致」⇒ diff 失效 = 纪律失效。
+// ⚠️ 计划块（docs/superpowers/plans/*.md）也必须扫：F1 的两处 NUL 里**有一处就在计划块里**
+//    ⇒ 只扫实现文件会漏掉「计划块与实现一起带 NUL」的那种。
+const F1_SCAN_DIRS = [
+  'platform/src', 'platform/web', 'platform/test', 'platform/scripts',
+  'platform/rules', 'platform/db', 'docs',
+];
+const F1_TEXT_EXT = new Set([
+  '.js', '.mjs', '.json', '.md', '.sql', '.html', '.css', '.sh', '.txt', '.yml', '.yaml', '.conf', '.service',
+]);
+const F1_SKIP_DIRS = new Set(['node_modules', '.git', '.worktrees', 'dist', 'data', 'backups']);
+
+test('F1：仓库的**文本源文件里不得有裸 NUL / 控制字节**（否则 git 把它们判成二进制 ⇒ diff 失效）', () => {
+  const offenders = [];
+  let scanned = 0;
+  const walk = (dir) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (!F1_SKIP_DIRS.has(entry.name)) walk(full);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      if (!F1_TEXT_EXT.has(extname(entry.name))) continue;
+      const buf = readFileSync(full);
+      scanned += 1;
+      const hits = [];
+      for (let i = 0; i < buf.length; i += 1) {
+        const b = buf[i];
+        // ⛔ 只放行 \t(0x09) / \n(0x0a) / \r(0x0d) —— 其余控制字节（含 NUL）一律算异常。
+        if (b === 0 || b < 0x09 || (b > 0x0a && b < 0x20 && b !== 0x0d)) hits.push([i, b]);
+      }
+      if (hits.length) {
+        offenders.push(`${relative(repoRoot, full)}：${hits.length} 处（首个在偏移 ${hits[0][0]}，字节 0x${hits[0][1].toString(16)}）`);
+      }
+    }
+  };
+  for (const d of F1_SCAN_DIRS) walk(join(repoRoot, d));
+  assert.ok(scanned > 100, `扫描的文件数异常地少（${scanned}）⇒ 扫描范围本身坏了`);
+  assert.deepEqual(
+    offenders, [],
+    `以下文件含裸 NUL / 控制字节 ⇒ git 会把它们判成二进制，diff/blame/git grep 全部失效：\n${offenders.join('\n')}`,
+  );
+});
+
+// ── F2：申诉主体类型白名单 ───────────────────────────────────────────────
+//
+// ⚠️ **修复前的漏洞**：`appealReasonKindGate` 的豁免条件写的是
+//    `subjectType !== 'team_result' && !kind` ⇒ 豁免的是「**一切非 team_result**」
+//    ⇒ 传 `subjectType: 'foo'` + 不传 reasonKind 就能跳过程序性理由类型白名单落库成功。
+//    而 `subjectType` **全链路没有白名单**（表无 CHECK / 路由不校验 / 服务层只分两支）
+//    ⇒ 'foo' 还会落进「赛段结果类」的裁决分支 ⇒ 既绕过了白名单、又没有正确的裁决口径。
+const F2_RULES = {
+  audit: {
+    reviewState: {
+      appealSubjectType: 'team_result',
+      appealAllowedTiers: ['A', 'B', 'C', 'D'],
+      appealReasonKinds: ['scoring_error', 'procedure_violation', 'data_error'],
+    },
+  },
+};
+
+function f2Setup() {
+  const dataDir = mkdtempSync(join(tmpdir(), 'hks-e182-'));
+  const { db, close } = openDatabase({ dataDir });
+  applyMigrations(db, migrationsDir);
+  db.exec(`
+    INSERT INTO users (id, name, phone, password_hash, mba_status, org, is_superadmin, active, created_at)
+    VALUES ('u_admin','组委会','13900000999','x','mba',NULL,1,1,'2026-10-20T00:00:00.000Z'),
+           ('u_captain','甲队队长','13900000888','x','other',NULL,0,1,'2026-10-20T00:00:00.000Z');
+    INSERT INTO editions (id, name, city, starts_at, ends_at, created_at)
+    VALUES ('ed_1','第一届','上海','2026-10-01','2099-12-31','2026-10-20T00:00:00.000Z');
+    INSERT INTO teams (id, edition_id, name, captain_id, tier, status, created_at)
+    VALUES ('t1','ed_1','甲队','u_captain',NULL,'active','2026-10-20T00:00:00.000Z');
+    INSERT INTO tier_records (id, team_id, tier, milestone_count, business_signoff_count, reasons_json, computed_at, deleted_at)
+    VALUES ('tr_t1','t1','D',0,0,'[]','2026-10-20T00:00:00.000Z',NULL);
+  `);
+  return { db, close, dataDir };
+}
+
+/** 把 st1 推到 FINALIZED（赛段结果类申诉的前提） */
+function f2Finalize(db) {
+  for (const [from, to, key] of [
+    ['SUBMITTED', 'PENDING_REVIEW', 'k1'],
+    ['PENDING_REVIEW', 'CONFIRMED', 'k2'],
+    ['CONFIRMED', 'FINALIZED', 'k3'],
+  ]) {
+    transition({
+      db, subjectType: 'stage_result', subjectId: 'st1', from, to,
+      actorId: 'u_admin', reason: 'x', idempotencyKey: key, now: '2026-10-20T00:00:00.000Z',
+    });
+  }
+}
+
+test('F2：未知的申诉主体类型 ⇒ **400**（不得借它绕过程序性理由类型白名单）', () => {
+  const { db, close, dataDir } = f2Setup();
+  try {
+    f2Finalize(db);
+    // ① 未知类型 + **不传** reasonKind ⇒ 必须 400
+    //    ⚠️ 修复前这里是「豁免」⇒ 直接落库成功 ⇒ 这条断言就是那个洞的照妖镜。
+    assert.throws(
+      () => fileAppeal({
+        db, subjectType: 'foo', subjectId: 'st1:t1', filedBy: 'u_captain',
+        reason: '我不服这个名次', now: '2026-10-20T01:00:00.000Z', rules: F2_RULES,
+      }),
+      (e) => e.status === 400 && /主体类型非法/.test(e.message),
+      '未知 subjectType 必须 400 —— 修复前它会绕过白名单落库',
+    );
+    // ② 未知类型 + **传了**合法的 reasonKind ⇒ 仍然 400
+    //    ⚠️ 修复前这一支同样落库 ⇒ 白名单形同虚设。
+    assert.throws(
+      () => fileAppeal({
+        db, subjectType: 'foo', subjectId: 'st1:t1', filedBy: 'u_captain',
+        reason: '算分错误', reasonKind: 'scoring_error',
+        now: '2026-10-20T01:00:00.000Z', rules: F2_RULES,
+      }),
+      (e) => e.status === 400 && /主体类型非法/.test(e.message),
+      '未知 subjectType 即使带了合法理由类型也必须 400（白名单管的是类型，不是理由）',
+    );
+    // ③ 表里**不得**留下任何主体类型非法的行
+    const rows = db.prepare('SELECT subject_type FROM appeals').all();
+    assert.deepEqual(rows, [], '被拒的申诉不得落库');
+  } finally {
+    close();
+    rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('F2：主体类型**缺省**仍是 team_result（既有契约不变），且白名单非空时它必须声明理由类型', () => {
+  const { db, close, dataDir } = f2Setup();
+  try {
+    f2Finalize(db);
+    // ① 缺省（不传 subjectType）⇒ 按 team_result 处理 ⇒ 但**必须**声明理由类型
+    //    （修复前这条也是 400，所以它不是判别性用例，是「不许改坏」的护栏）
+    assert.throws(
+      () => fileAppeal({
+        db, subjectId: 'st1:t1', filedBy: 'u_captain',
+        reason: '算分错误', now: '2026-10-20T01:00:00.000Z', rules: F2_RULES,
+      }),
+      (e) => e.status === 400 && /理由类型/.test(e.message),
+      '赛段结果类必须声明理由类型（白名单 fail-closed）',
+    );
+    // ② 缺省 + 合法理由类型 ⇒ 受理，且**落库的 subject_type 必须是 team_result**
+    const ok = fileAppeal({
+      db, subjectId: 'st1:t1', filedBy: 'u_captain',
+      reason: '企业确认分与事实不符', reasonKind: 'scoring_error',
+      now: '2026-10-20T01:00:00.000Z', rules: F2_RULES,
+    });
+    assert.equal(ok.status, 'submitted');
+    assert.equal(ok.subject_type, 'team_result', '缺省必须归一为 team_result（不能落 NULL 或别的值）');
+  } finally {
+    close();
+    rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('F2：报名类**不强制**理由类型（豁免只限报名类 —— 前端契约只发 reason）', () => {
+  const { db, close, dataDir } = f2Setup();
+  try {
+    // 报名类豁免是**产品契约**（web/views/registration.js 只发 reason）⇒ 不能收窄掉。
+    // 报名记录不存在 ⇒ 404（证明它走的是报名类分支，而不是赛段结果类分支）
+    assert.throws(
+      () => fileAppeal({
+        db, subjectType: 'registration', subjectId: 'rg_not_exist', filedBy: 'u_captain',
+        reason: '复核我的能力维度', now: '2026-10-20T01:00:00.000Z', rules: F2_RULES,
+      }),
+      (e) => e.status === 404 && /报名记录不存在/.test(e.message),
+      '报名类必须走报名类分支（豁免只限 registration）',
+    );
+  } finally {
+    close();
+    rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+// ── F4：里程碑确认方与实现一致 ───────────────────────────────────────────
+//
+// ⚠️ **修复前的三重矛盾**：配置说「评委确认可演示原型」，而实现里
+//    · 达成判定只有一条路径：`milestone_signoffs` 里有未撤回的一行
+//      （`requires_signoff` 在表上是 `NOT NULL DEFAULT 1` ⇒ 恒为 1）
+//    · 而该表 `enterprise_id TEXT NOT NULL` ⇒ **结构上企业专用**
+//    · 且 `hasActiveSignoff` **不区分签字人**
+//    ⇒ 评委的「确认」根本没有落库路径 ⇒ 该里程碑**永远达不成**（配置在说谎）。
+test('F4：里程碑配置的确认方必须与实现一致（计分类只能是企业）', () => {
+  const { rules } = loadRules(rulesDir);
+  // ① 出厂配置：7 类里程碑全部 enterprise
+  for (const it of rules.milestones.items) {
+    assert.equal(
+      it.confirmedBy, 'enterprise',
+      `里程碑 ${it.key} 的确认方是 ${it.confirmedBy} —— 达成闸只认 milestone_signoffs（enterprise_id NOT NULL）`
+      + ' ⇒ 评委确认的里程碑永远达不成（配置不许说谎）',
+    );
+  }
+  // ② 改成 'judge' ⇒ 配置闸必须报错（拒绝启动）
+  const broken = structuredClone(rules);
+  const target = broken.milestones.items.find((i) => i.countsTowardTier);
+  target.confirmedBy = 'judge';
+  const errors = validateRules(broken);
+  assert.ok(
+    errors.some((e) => e.includes('milestones') && e.includes(target.key) && e.includes('enterprise')),
+    `配置闸必须拒绝「计分类里程碑的确认方不是企业」，实际错误：${JSON.stringify(errors)}`,
+  );
+});
+
+test('F4：`confirmedBy` 必须真的被消费（不是只校验、从不读取的死配置）', () => {
+  // ⚠️ 修复前 `confirmedBy` **只被 config.js 校验、从不被任何实现读取** ⇒
+  //    一份写着 'judge' 的配置看上去「评委确认里程碑」，实际是「这个里程碑谁都确认不了」。
+  // ⇒ 现在它被机器闸（上一条用例）读到了 ⇒ 这条用例钉住「机器闸存在」这件事。
+  const { rules } = loadRules(rulesDir);
+  const src = readFileSync(join(here, '..', 'src', 'config.js'), 'utf8');
+  assert.ok(
+    src.includes("it.confirmedBy !== 'enterprise'"),
+    'config.js 必须有一道「计分类里程碑的确认方必须是 enterprise」的机器闸',
+  );
+  assert.ok(
+    rules.milestones.items.every((i) => i.countsTowardTier ? i.confirmedBy === 'enterprise' : true),
+    '出厂配置里计分类里程碑的确认方必须全是 enterprise',
+  );
+});
+
+// ── F5：截尾门槛与评委池下限必须相容 ────────────────────────────────────
+//
+// ⚠️ **修复前的病根**：`minJudgesForTrim: 5` 而 `judgePool.minJudgesPerDimension: 3`
+//    ⇒ `domain/trim.js` 的 `list.length < minJudges` ⇒ 3 人评委池下**根本不去极值**
+//    ⇒ C-07 选 `trimmed` 的理由（「样本少时截尾均值比 zscore 稳」）**在首届根本没兑现**。
+test('F5：截尾门槛必须 ≤ 评委池下限（否则 trimmed 在实际评委池下永不触发）', () => {
+  const { rules } = loadRules(rulesDir);
+  for (const which of ['initial', 'final']) {
+    const cfg = rules.scoring[which];
+    const pool = cfg.judgePool.minJudgesPerDimension;
+    const trim = cfg.minJudgesForTrim;
+    assert.equal(
+      trim, 3,
+      `scoring.${which}.minJudgesForTrim 应为 3（与评委池下限同口径）`,
+    );
+    assert.ok(
+      trim <= pool,
+      `scoring.${which}.minJudgesForTrim（${trim}）> judgePool.minJudgesPerDimension（${pool}）`
+      + ' ⇒ 评委池凑够人时永远轮不到去极值 ⇒ trimmed 策略形同虚设',
+    );
+  }
+});
+
+test('F5：3 名评委时截尾**真的生效**（C-07 的理由必须兑现）', () => {
+  const { rules } = loadRules(rulesDir);
+  const minJudges = rules.scoring.initial.minJudgesForTrim;
+  const values = [
+    { judgeId: 'j1', z: 1 },
+    { judgeId: 'j2', z: 2 },
+    { judgeId: 'j3', z: 99 },   // 极端值
+  ];
+  const out = trimOutliers({ values, minJudges });
+  assert.equal(out.trimmed, true, `3 名评委（门槛 ${minJudges}）时必须去极值 —— 不去极值则 trimmed 策略没兑现`);
+  assert.equal(out.mean, 2, '去极值后取中位数（1、2、99 ⇒ 留 2）');
+  assert.equal(out.removed.max, 'j3', '必须报出被去掉的那个评委');
+});
+
+// ── F6：数据库层的「同一里程碑只记一次」 ────────────────────────────────
+test('F6：迁移 011 建出**部分唯一索引** ⇒ 同一里程碑记两次会被数据库挡下', () => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'hks-e182-mig-'));
+  const { db, close } = openDatabase({ dataDir });
+  try {
+    applyMigrations(db, migrationsDir);
+    // 索引必须在
+    const idx = db.prepare(
+      "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'ux_behavior_events_subject'",
+    ).get();
+    assert.ok(idx, '迁移后必须存在 ux_behavior_events_subject 索引');
+    assert.ok(/UNIQUE/i.test(idx.sql), '它必须是 UNIQUE 索引（普通索引 = 没有数据库层约束）');
+    assert.ok(/subject_id IS NOT NULL/i.test(idx.sql), '必须是**部分**索引（NULL 主体行不受约束）');
+
+    // 造出被引用的行
+    db.exec(`
+      INSERT INTO users (id, name, phone, password_hash, mba_status, org, is_superadmin, active, created_at)
+      VALUES ('u1','甲','13900000001','x','other',NULL,0,1,'2026-10-20T00:00:00.000Z');
+      INSERT INTO editions (id, name, city, starts_at, ends_at, created_at)
+      VALUES ('ed_1','第一届','上海','2026-10-01','2099-12-31','2026-10-20T00:00:00.000Z');
+      INSERT INTO teams (id, edition_id, name, captain_id, tier, status, created_at)
+      VALUES ('t1','ed_1','甲队','u1',NULL,'active','2026-10-20T00:00:00.000Z');
+    `);
+    const ins = db.prepare(
+      'INSERT INTO behavior_events (id, team_id, user_id, type, points, evidence, created_at, subject_id)'
+      + ' VALUES (?,?,?,?,?,?,?,?)',
+    );
+    // ① 同一 (team, type, subject) 记两次 ⇒ 第二条必须被数据库挡下
+    ins.run('be1', 't1', 'u1', 'milestone_on_time', 5, '{}', '2026-10-20T00:00:00.000Z', 'ms_1');
+    assert.throws(
+      () => ins.run('be2', 't1', 'u1', 'milestone_on_time', 5, '{}', '2026-10-20T01:00:00.000Z', 'ms_1'),
+      /UNIQUE constraint failed/i,
+      '同一里程碑的第二次行为分事件必须被**数据库**挡下（服务层已挡，这里是纵深防御）',
+    );
+    // ② 不同里程碑 ⇒ 允许
+    ins.run('be3', 't1', 'u1', 'milestone_on_time', 5, '{}', '2026-10-20T02:00:00.000Z', 'ms_2');
+    // ③ **无主体**的 once 类事件（同队同类型两条）⇒ 必须都放行
+    //    ⚠️ 这正是「部分索引」的意义：once 事件共用「终身一次」桶，不能被这条索引误伤。
+    ins.run('be4', 't1', 'u1', 'weekly_progress', 2, '{}', '2026-10-20T03:00:00.000Z', null);
+    ins.run('be5', 't1', 'u1', 'weekly_progress', 2, '{}', '2026-10-20T04:00:00.000Z', null);
+    assert.equal(
+      db.prepare('SELECT COUNT(*) AS n FROM behavior_events').get().n, 4,
+      '应当只有 4 行（第 2 条被唯一约束挡下，其余都放行）',
+    );
+  } finally {
+    close();
+    rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+// ── F7：跨阶段接口契约的登记 ────────────────────────────────────────────
+test('F7：`GET /api/readiness` 必须登记进**跨阶段接口契约**（端点存在 ≠ 契约存在）', () => {
+  const text = readFileSync(join(repoRoot, 'docs', 'superpowers', 'plans', 'INTERFACES.md'), 'utf8');
+  assert.ok(
+    text.includes('/api/readiness'),
+    'INTERFACES.md 必须登记 GET /api/readiness —— 修复前它 0 次出现 ⇒ 契约里查不到这个端点',
+  );
+  assert.ok(
+    text.includes('ux_behavior_events_subject'),
+    'INTERFACES.md 必须登记迁移 011 的唯一索引（对外可见的 schema 变更）',
+  );
+});
+```
+
+### 4.11 2026-10-28 E183 轮（送签件的**可打印 HTML 版**）—— 新建文件登记
+
+E182 轮把送签件的分母推到 **27 条**（新增 M0-7 / M0-8）。本轮补一件事：**把送签件做成能直接打印 / 贴邮件的 HTML**。
+
+⚠️ **为什么不能手写第二份 HTML**：送签件是**要拿回签字**的文件，而它的分母已经三连跳（17 → 22 → 25 → 27）
+⇒ 每一次口径变更都要改清单 ⇒ 若 Markdown 与 HTML 各写一份，改了 Markdown 忘了改 HTML
+⇒ **打印出去的那份是旧的** ⇒ 组委会签的是一份平台自己都不认的清单。
+⇒ 改法不是「加个提醒」，而是**让漂移不可能**：HTML **由 Markdown 派生**（生成器只做渲染，不新增任何内容）。
+
+| 文件 | 为什么必须是**新文件** |
+|---|---|
+| `docs/tools/build-signoff-pack-html.mjs` | 渲染器必须是**独立工具**：① 它是**通用的**（输入输出都是命令行参数）⇒ 不指向任何特定文件 ⇒ 进公开仓时不需要脱敏；② 它住在 `docs/tools/`（与 `plan-block-sync.mjs` / `dead-service-scan.mjs` 同款位置）⇒ 属于**仓库工具**而不是平台业务代码 ⇒ 不进 `platform/src/`（那会污染分层与死函数扫描的视野）。⚠️ **零依赖、零构建**（全局约束）⇒ 不引任何 Markdown 解析库，只做「本仓这份清单用得到的子集」⇒ 且**遇到不支持的语法要响亮报错**，不许静默丢内容（静默丢 = 打印件少一条口径，而没人看得出来）。 |
+| `` | **生成产物**（不是源文件）⇒ 它的规格是「生成器 + 送签件 Markdown」，**不把 20KB 派生输出抄进计划块**（那正是生成器要消灭的那种重复）。⇒ 它的守门靠 `platform/test/signoff-pack-html.test.js` 那道**逐字节比对**的机器闸（比计划块更硬：手改 HTML 立刻变红）。 |
+| `platform/test/signoff-pack-html.test.js` | 这条闸必须**自成一个文件**：它要同时跨三个文件（生成器 / Markdown 源 / HTML 产物）⇒ 塞进任何既有测试文件都会让「这条钉的是哪条口径」看不出来。 |
+
+**Step 1: 创建 docs/tools/build-signoff-pack-html.mjs**
+
+`docs/tools/build-signoff-pack-html.mjs`：
+
+```javascript
+// docs/tools/build-signoff-pack-html.mjs —— 把一份 Markdown 清单渲染成**可打印 / 可贴邮件**的 HTML
+//
+// 为什么要它（不是「再写一份 HTML」）：
+//   ⚠️ **两份手写的内容一定会漂移** —— 送签件是**要拿回签字**的文件，
+//      而它的分母已经三连跳（17 → 22 → 25 → 27）⇒ 每一次口径变更都要改清单
+//      ⇒ 若 HTML 与 Markdown 各写一份，改了 Markdown 忘了改 HTML ⇒ **打印出去的那份是旧的**
+//      ⇒ 组委会签的是一份平台自己都不认的清单。
+//   ⇒ **HTML 由 Markdown 派生** ⇒ 两者**不可能**不一致（生成器只做渲染，不新增任何内容）。
+//
+// 零依赖（全局约束「零 npm 依赖、零构建」）：
+//   本文件只做「本仓这份清单用得到的 Markdown 子集」的渲染，
+//   **不是**通用 Markdown 解析器 —— 故意不支持表格合并单元格、HTML 块、脚注、代码高亮。
+//   ⚠️ 遇到本子集不支持的语法 ⇒ **响亮报错**，不许静默丢内容
+//      （静默丢 = 打印件少一条口径，而没人看得出来）。
+//
+// 用法：
+//   node docs/tools/build-signoff-pack-html.mjs <input.md> <output.html>
+//
+// ⚠️ **本工具是通用的**：输入输出都是命令行参数 ⇒ 它不指向任何特定文件
+//    ⇒ 进公开仓时不需要脱敏（公开仓里没有私有文档，也就没有「指向私有文件的引用」）。
+//
+// ⚠️ **本文件不属于平台前端**：项目纪律「不许自造 CSS 类 / 不写 <style> 标签」
+//    管的是 `platform/web/` 的设计系统（机器闸 `test/stage-config-view.test.js`
+//    把 `web/views/*.js` 的 class 与 `web/styles.css` 对账）。
+//    本文件是**独立的一次性文档产物**（不进平台 UI、不进 `web/`）⇒ 自带 <style> 是零依赖
+//    打印件的唯一做法（不引 CDN 字体、不引外部图片 ⇒ 断网可印、可贴邮件）。
+import { readFileSync, writeFileSync } from 'node:fs';
+
+const [src, dst] = process.argv.slice(2);
+if (!src || !dst) {
+  console.error('用法： node docs/tools/build-signoff-pack-html.mjs <input.md> <output.html>');
+  process.exit(2);
+}
+
+// ── HTML 转义 ──────────────────────────────────────────────────────
+// ⚠️ **实体名在运行时用字符码拼**（`String.fromCharCode(38)` = `&`）。
+//    原因：本仓的写入通道会把源码里的字面 HTML 实体解码一次
+//    （`&` 落盘变成 `&`）⇒ 若把实体名写进源码，转义函数会退化成**恒等函数**
+//    ⇒ 清单里的 `<` `>` 会被原样带进 HTML ⇒ 标签被浏览器当结构解析（内容可被改写）。
+//    ⇒ 这里**一个字面 `&` 都不写** ⇒ 无论写入通道怎么处理，运行时拼出来的实体都是对的。
+const AMP = String.fromCharCode(38);
+const esc = (s) => String(s)
+  .split(AMP).join(AMP + 'amp;')
+  .split('<').join(AMP + 'lt;')
+  .split('>').join(AMP + 'gt;');
+
+// ── 行内标记 ────────────────────────────────────────────────────────
+// ⚠️ 顺序：**先转义、后套标记** ⇒ 否则 `&` 会被后面的规则二次处理。
+// ⚠️ 允许的原始 HTML 标签只有 `<br>`（清单里用它在一格里分段）⇒ 其余一律转义。
+function inline(text) {
+  let s = esc(text);
+  // <br>：先摘出来（占位符），最后还原 —— 其余尖括号已被转义，不会误伤
+  s = s.replace(/<br\s*\/?>/g, '\u0001BR\u0001');
+  s = s.replace(/`([^`]+)`/g, (_, c) => `<code>${c}</code>`);
+  s = s.replace(/\*\*([^*]+)\*\*/g, (_, c) => `<strong>${c}</strong>`);
+  s = s.replace(/(^|[^*])\*([^*]+)\*(?!\*)/g, (_, p, c) => `${p}<em>${c}</em>`);
+  s = s.replace(/\u0001BR\u0001/g, '<br>');
+  return s;
+}
+
+// ── 段落换行的连接规则 ──────────────────────────────────────────────
+//
+// ⚠️ **中文不该用空格连接**：Markdown 的源文件为了可读性把一句话拆成多行，
+//    直接 `join(' ')` 会在中文句子中间插一个空格（「逐条勾选。 每条的完整依据…」）
+//    ⇒ 读起来像有错别字。
+// ⇒ 规则：**只有前后都是拉丁文/数字时才插空格**（那时空格是必需的），
+//    其余（含中文接中文、中文接标点）**直接相接**。
+const isLatin = (ch) => !!ch && /[A-Za-z0-9]/.test(ch);
+function joinLines(lines) {
+  let s = lines[0].trim();
+  for (let i = 1; i < lines.length; i += 1) {
+    const next = lines[i].trim();
+    const prevTail = s.slice(-1);
+    const nextHead = next.slice(0, 1);
+    s += (isLatin(prevTail) && isLatin(nextHead)) ? ` ${next}` : next;
+  }
+  return s;
+}
+
+// ── Markdown 子集渲染 ────────────────────────────────────────────────
+function renderMarkdown(md) {
+  const lines = md.replace(/\r\n/g, '\n').split('\n');
+  const out = [];
+  let i = 0;
+
+  const flushParagraph = (buf) => {
+    if (!buf.length) return;
+    out.push(`<p>${inline(joinLines(buf))}</p>`);
+    buf.length = 0;
+  };
+
+  const para = [];
+
+  while (i < lines.length) {
+    const line = lines[i];
+
+    // 空行 ⇒ 段落边界
+    if (!line.trim()) {
+      flushParagraph(para);
+      i += 1;
+      continue;
+    }
+
+    // 分隔线
+    if (/^---\s*$/.test(line)) {
+      flushParagraph(para);
+      out.push('<hr>');
+      i += 1;
+      continue;
+    }
+
+    // 标题
+    const h = line.match(/^(#{1,4})\s+(.*)$/);
+    if (h) {
+      flushParagraph(para);
+      const level = h[1].length;
+      out.push(`<h${level}>${inline(h[2].trim())}</h${level}>`);
+      i += 1;
+      continue;
+    }
+
+    // 引用块（连续的 > 行合成一块）
+    if (/^>\s?/.test(line)) {
+      flushParagraph(para);
+      const buf = [];
+      while (i < lines.length && /^>\s?/.test(lines[i])) {
+        buf.push(lines[i].replace(/^>\s?/, ''));
+        i += 1;
+      }
+      out.push(`<blockquote>${renderMarkdown(buf.join('\n'))}</blockquote>`);
+      continue;
+    }
+
+    // 表格：表头行 + `|---|` 分隔行 + 表体
+    if (/^\s*\|/.test(line) && i + 1 < lines.length && /^\s*\|[\s:|-]+\|\s*$/.test(lines[i + 1])) {
+      flushParagraph(para);
+      const cells = (row) => row.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map((c) => c.trim());
+      const head = cells(line);
+      i += 2; // 跳过表头 + 分隔行
+      const body = [];
+      while (i < lines.length && /^\s*\|/.test(lines[i])) {
+        body.push(cells(lines[i]));
+        i += 1;
+      }
+      const th = head.map((c) => `<th>${inline(c)}</th>`).join('');
+      const tb = body.map((r) => {
+        // 补齐/截断到表头列数 ⇒ 列数不齐时**不静默丢格**
+        const cells2 = head.map((_, k) => r[k] ?? '');
+        return `<tr>${cells2.map((c) => `<td>${inline(c)}</td>`).join('')}</tr>`;
+      }).join('');
+      out.push(`<table><thead><tr>${th}</tr></thead><tbody>${tb}</tbody></table>`);
+      continue;
+    }
+
+    // 有序列表
+    if (/^\s*\d+\.\s+/.test(line)) {
+      flushParagraph(para);
+      const items = [];
+      while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) {
+        items.push(lines[i].replace(/^\s*\d+\.\s+/, ''));
+        i += 1;
+      }
+      out.push(`<ol>${items.map((t) => `<li>${inline(t)}</li>`).join('')}</ol>`);
+      continue;
+    }
+
+    // 无序列表
+    if (/^\s*[-*]\s+/.test(line)) {
+      flushParagraph(para);
+      const items = [];
+      while (i < lines.length && /^\s*[-*]\s+/.test(lines[i])) {
+        items.push(lines[i].replace(/^\s*[-*]\s+/, ''));
+        i += 1;
+      }
+      out.push(`<ul>${items.map((t) => `<li>${inline(t)}</li>`).join('')}</ul>`);
+      continue;
+    }
+
+    para.push(line.trim());
+    i += 1;
+  }
+  flushParagraph(para);
+  return out.join('\n');
+}
+
+// ── 页面骨架 ────────────────────────────────────────────────────────
+// ⚠️ 打印纪律：
+//   · A4、页边距 14/12mm、字号 10.5pt（清单表格多，10.5pt 才装得下又不至于太小）
+//   · 表头**每页重复**（display: table-header-group）⇒ 跨页表格不会失去列名
+//   · 每组**不跨页断开**（break-inside: avoid 只给标题与提示块，表格允许断行）
+//   · 勾选框用字符 ☐ 并放大 —— 打印后手写打勾即可（不依赖任何表单交互）
+// ⚠️ 配色：正文近黑、提示块浅灰、**强调色只用 1 个**（深蓝）⇒ 黑白打印也不糊。
+const CSS = `
+:root {
+  --ink: #1a1a1a;
+  --muted: #55585c;
+  --line: #c9ccd1;
+  --soft: #f5f6f7;
+  --accent: #14508c;
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0 auto;
+  padding: 18px 20px 40px;
+  max-width: 980px;
+  color: var(--ink);
+  background: #fff;
+  font: 15px/1.65 "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Source Han Sans SC",
+        "Noto Sans CJK SC", system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+h1 { font-size: 22px; line-height: 1.35; margin: 0 0 6px; letter-spacing: .2px; }
+h2 {
+  font-size: 17px; margin: 30px 0 10px; padding-bottom: 5px;
+  border-bottom: 2px solid var(--accent); color: var(--accent);
+}
+h3 { font-size: 15px; margin: 22px 0 8px; color: var(--ink); }
+h4 { font-size: 14px; margin: 16px 0 6px; }
+p { margin: 8px 0; }
+hr { border: 0; border-top: 1px solid var(--line); margin: 22px 0; }
+a { color: var(--accent); }
+code {
+  font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  background: var(--soft); padding: 1px 4px; border-radius: 3px;
+  /* ⚠️ 用 overflow-wrap 而不是 word-break: break-all ——
+     后者会在**任何**字符处断行（长路径被拦腰截成 "docs/committee-appr / ovals.md"）
+     ⇒ 前者只在真的放不下时才断，且优先在分隔符处断。 */
+  overflow-wrap: anywhere;
+}
+strong { font-weight: 700; }
+blockquote {
+  margin: 10px 0; padding: 8px 14px;
+  background: var(--soft); border-left: 3px solid var(--line);
+  color: var(--muted); font-size: 14px;
+}
+blockquote p { margin: 4px 0; }
+blockquote h1, blockquote h2, blockquote h3 { font-size: 14px; margin: 6px 0 4px; color: var(--muted); border: 0; }
+table {
+  width: 100%; border-collapse: collapse; margin: 10px 0 16px;
+  font-size: 13px; table-layout: fixed;
+}
+th, td {
+  border: 1px solid var(--line); padding: 6px 8px;
+  text-align: left; vertical-align: top; word-wrap: break-word; overflow-wrap: anywhere;
+}
+th { background: var(--soft); font-weight: 700; }
+thead { display: table-header-group; }
+tr { break-inside: avoid; page-break-inside: avoid; }
+ol, ul { margin: 8px 0 8px 22px; padding: 0; }
+li { margin: 3px 0; }
+.doc-head {
+  border-bottom: 2px solid var(--ink); padding-bottom: 12px; margin-bottom: 6px;
+}
+.doc-meta { color: var(--muted); font-size: 13px; margin: 0 0 14px; }
+.box { background: var(--soft); border: 1px solid var(--line); padding: 8px 12px; margin: 10px 0; font-size: 13px; }
+.box p { margin: 3px 0; }
+.tick { font-size: 15px; letter-spacing: .5px; }
+.sign td { height: 42px; }
+.sign-note { color: var(--muted); font-size: 12px; margin-top: 14px; }
+@media print {
+  @page { size: A4; margin: 14mm 12mm; }
+  body { padding: 0; max-width: none; font-size: 10.5pt; line-height: 1.5; }
+  h1 { font-size: 16pt; }
+  h2 { font-size: 13pt; margin: 16pt 0 6pt; break-after: avoid; page-break-after: avoid; }
+  h3 { font-size: 11pt; margin: 12pt 0 5pt; break-after: avoid; page-break-after: avoid; }
+  table { font-size: 9pt; }
+  th, td { padding: 3.5pt 5pt; }
+  code { font-size: 8.5pt; }
+  blockquote { font-size: 9pt; }
+  .box { font-size: 9pt; }
+  a { color: var(--ink); text-decoration: none; }
+  .no-print { display: none; }
+}
+`;
+
+// ── 生成 ────────────────────────────────────────────────────────────
+const md = readFileSync(src, 'utf8');
+const body = renderMarkdown(md);
+
+// ⚠️ **不许静默丢内容**：渲染前后各数一次「勾选框」与「表格行」，
+//    对不上就报错（静默丢 = 打印件少一条口径，而没人看得出来）。
+// ⚠️ 两边的「行」形态不同 ⇒ 各用各的口径：
+//    源文件里表格行是 `|` 开头的行（**分隔行不算数据行**）；
+//    渲染后是 `<tr>` 标签。
+const countTick = (s) => (s.match(/☐/g) || []).length;
+const mdTableRows = (s) => s.split('\n')
+  .filter((l) => /^\s*\|/.test(l) && !/^\s*\|[\s:|-]+\|\s*$/.test(l)).length;
+const htmlTableRows = (s) => (s.match(/<tr>/g) || []).length;
+
+const beforeTicks = countTick(md);
+const beforeRows = mdTableRows(md);
+const afterTicks = countTick(body);
+const afterRows = htmlTableRows(body);
+if (beforeTicks !== afterTicks) {
+  console.error(`❌ 勾选框数量对不上：源 ${beforeTicks} / 渲染后 ${afterTicks} ⇒ 渲染丢了内容`);
+  process.exit(1);
+}
+if (beforeRows !== afterRows) {
+  console.error(`❌ 表格行数对不上：源 ${beforeRows} / 渲染后 ${afterRows} ⇒ 渲染丢了内容`);
+  process.exit(1);
+}
+
+const title = (md.match(/^#\s+(.*)$/m) || [, '送签件'])[1].trim();
+const html = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${esc(title)}</title>
+<style>${CSS}</style>
+</head>
+<body>
+<div class="doc-meta no-print">本文件由 <code>docs/tools/build-signoff-pack-html.mjs</code> 从 Markdown 源生成 —— <strong>请勿直接改 HTML</strong>；改 Markdown 后重新生成即可。打印建议：A4、默认缩放、勾选框可手写打勾。</div>
+${body}
+</body>
+</html>
+`;
+
+writeFileSync(dst, html, 'utf8');
+console.log(`✅ 已生成 ${dst}`);
+console.log(`   勾选框 ${afterTicks} 个 ｜ 表格行 ${afterRows} 行 ｜ 字节 ${Buffer.byteLength(html)}`);
+```
+
+**Step 2: 创建 platform/test/signoff-pack-html.test.js**
+
+`platform/test/signoff-pack-html.test.js`：
+
+```javascript
+// platform/test/signoff-pack-html.test.js —— 送签件 HTML 版的机器闸（2026-10-28）
+//
+// 规则溯源：
+//   - 送签件是**要拿回签字**的文件 ⇒ 它的 HTML 打印件必须与 Markdown 源**逐字同源**
+//     （否则「改了 Markdown 忘了重生成」⇒ 组委会签的是一份平台自己都不认的清单）
+//   - 全局约束「零 npm 依赖、零构建」⇒ HTML 必须**自包含**（断网可印、可贴邮件）
+//
+// ⚠️ **为什么要有这条闸**：
+//   分母已经三连跳（17 → 22 → 25 → 27）⇒ 每一次口径变更都要改清单。
+//   若 HTML 与 Markdown 各写一份 ⇒ 这条「不许手改 HTML」的纪律只靠人记 ⇒ 迟早漂。
+//   ⇒ 改法不是「加个提醒」，而是**让漂移不可能**：HTML 由生成器派生，
+//     本条用例**重新生成一遍并逐字节比对** ⇒ 手改 HTML 立刻变红。
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { execFileSync } from 'node:child_process';
+import { isolateTempDir } from '../test-helpers/tmp.js';
+
+isolateTempDir();
+
+const here = dirname(fileURLToPath(import.meta.url));
+const repoRoot = join(here, '..', '..');
+const toolPath = join(repoRoot, 'docs', 'tools', 'build-signoff-pack-html.mjs');
+const srcPath = join(repoRoot, 'docs', '');
+const outPath = join(repoRoot, 'docs', '');
+
+/**
+ * ⚠️ **本组用例在公开仓镜像里「不适用」**（不是失败）。
+ *
+ * 原因：送签件的 Markdown 与 HTML 产物都是**私有文档** ⇒ 公开仓镜像会把它们**排除**
+ * ⇒ 本组用例守的「产物与源逐字节一致」在公开仓**没有对象可守**。
+ *
+ * ⚠️ **判定必须用「是不是文件」而不是「存不存在」**：
+ *   脱敏替换表会把私有文档的**路径**替换成空串 ⇒ 在公开仓里这两个路径会指向
+ *   `docs/` **目录**（不是文件）⇒ 只判「存在」会把它当成「存在但读不了」⇒ 变成**报错**。
+ *   ⇒ 这里判 `isFile()` ⇒ 目录/缺失都归入「不适用」。
+ */
+const isFile = (p) => {
+  try { return statSync(p).isFile(); } catch { return false; }
+};
+const AVAILABLE = isFile(srcPath) && isFile(outPath);
+const SKIP_REASON = '送签件是私有文档，公开仓镜像已脱敏排除 ⇒ 本组用例不适用';
+
+/** 重新生成到临时目录，返回生成结果 */
+function regenerate() {
+  const dir = mkdtempSync(join(tmpdir(), 'hks-signoff-'));
+  const tmp = join(dir, 'out.html');
+  execFileSync(process.execPath, [toolPath, srcPath, tmp], { cwd: repoRoot, stdio: 'pipe' });
+  const text = readFileSync(tmp, 'utf8');
+  rmSync(dir, { recursive: true, force: true });
+  return text;
+}
+
+test('送签件 HTML：必须与生成器输出**逐字节一致**（手改 HTML ⇒ 本条变红）', { skip: !AVAILABLE && SKIP_REASON }, () => {
+  const onDisk = readFileSync(outPath, 'utf8');
+  const regenerated = regenerate();
+  assert.equal(
+    onDisk, regenerated,
+    ' 与生成器输出不一致 '
+    + '⇒ 它被手改过，或 Markdown 改完没重新生成 '
+    + '⇒ 修法：node docs/tools/build-signoff-pack-html.mjs  ',
+  );
+});
+
+test('送签件 HTML：必须**自包含**（零外部资源 ⇒ 断网可印、可贴邮件）', { skip: !AVAILABLE && SKIP_REASON }, () => {
+  const html = readFileSync(outPath, 'utf8');
+  assert.equal(
+    (html.match(/https?:\/\//g) || []).length, 0,
+    '不得引用任何外部 URL（CDN 字体 / 外部图片 / 远程脚本）⇒ 断网打印会缺样式',
+  );
+  assert.ok(!/<link\b/i.test(html), '不得有 <link>（外部样式表）');
+  assert.ok(!/<script\b/i.test(html), '不得有 <script>（本文件是静态打印件，不需要脚本）');
+  assert.ok(!/@import\b/i.test(html), '不得有 CSS @import');
+});
+
+test('送签件 HTML：正文**不得有未转义的裸尖括号**（否则内容可被浏览器当标签改写）', { skip: !AVAILABLE && SKIP_REASON }, () => {
+  const html = readFileSync(outPath, 'utf8');
+  const stripped = html.replace(/<[^>]*>/g, '');
+  assert.equal(
+    (stripped.match(/[<>]/g) || []).length, 0,
+    '剥掉合法标签后仍出现裸尖括号 ⇒ 转义函数失效（清单里的内容可被结构解析）',
+  );
+});
+
+test('送签件 HTML：27 条与勾选栏**一个不少**（分母是硬事实）', { skip: !AVAILABLE && SKIP_REASON }, () => {
+  const html = readFileSync(outPath, 'utf8');
+  const md = readFileSync(srcPath, 'utf8');
+  // ⛔ 分母以 **Markdown 源**为准（那是唯一的真相来源），HTML 必须与它一致
+  const mdTicks = (md.match(/☐/g) || []).length;
+  const htmlTicks = (html.match(/☐/g) || []).length;
+  assert.ok(mdTicks >= 27, `源文件的勾选框只有 ${mdTicks} 个 ⇒ 分母不对`);
+  assert.equal(htmlTicks, mdTicks, '勾选框数量与源文件不一致');
+  // 六组 + 备案组 ⇒ 七个组标题
+  for (const g of ['第一组', '第二组', '第三组', '第四组', '第五组', '第六组', '第七组']) {
+    assert.ok(html.includes(g), `HTML 里少了「${g}」`);
+  }
+  // 签收表必须存在（这是「拿回签字」的落点）
+  assert.ok(html.includes('签收'), 'HTML 里必须有签收表');
+  assert.ok(html.includes('确认人'), '签收表必须有「确认人」栏');
+});
+
+test('送签件 HTML：打印样式在位（A4 + 表头每页重复 + 不打印编辑提示）', { skip: !AVAILABLE && SKIP_REASON }, () => {
+  const html = readFileSync(outPath, 'utf8');
+  assert.ok(/@page\s*\{[^}]*size:\s*A4/.test(html), '必须声明 A4 页面尺寸');
+  assert.ok(/table-header-group/.test(html), '表头必须每页重复（跨页表格不能失去列名）');
+  assert.ok(/\.no-print\s*\{\s*display:\s*none/.test(html), '「本件由生成器产出」的提示行不得打印');
+});
+```
+
+**Step 3: 生成产物**
+
+```bash
+node docs/tools/build-signoff-pack-html.mjs  
+```
+
+⚠️ **产物是私有文档**（与 `` 同款）⇒ 不进公开仓
+⇒ 公开仓镜像的「私有文档排除表」与「引用中性化替换表」**必须同步加上它**
+⇒ 否则它的文件名会从 commit message 或正文里漏出去（上一轮踩过：新增私有文档忘了进替换表）。
+
+⚠️ **视觉纪律的适用范围**：本文件**不属于平台前端** ⇒ 项目纪律「不许自造 CSS 类 / 不写 <style> 标签」
+管的是 `platform/web/` 的设计系统（机器闸 `test/stage-config-view.test.js` 把 `web/views/*.js` 的 class
+与 `web/styles.css` 对账）。独立打印件自带 `<style>` 是**零依赖打印件的唯一做法**
+（不引 CDN 字体、不引外部图片 ⇒ 断网可印、可贴邮件）。

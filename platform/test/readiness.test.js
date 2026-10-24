@@ -248,16 +248,51 @@ test('S-9：结束 +90h 发榜 ⇒ **超期**（时限 72h），且延迟小时�
   }
 });
 
-test('S-9：结束 72h 仍**从未发榜** ⇒ 判 never_published 并计入超期', () => {
+test('S-9：结束 84h 仍**从未发榜** ⇒ 判 never_published 并计入超期', () => {
+  // ⚠️ **用例名与断言对齐**：本用例的 now 是 10-13 12:00、赛段 10-10 结束 ⇒ 实际延迟 **84 小时**
+  //    （原名写的「72h」与断言里的 84 不符 —— 已改正；断言值未动）。
   const s = setup();
   try {
     const f = seedStage(s.db, { key: 's3', endsAt: '2026-10-10' });
     const out = readinessSummary({ db: s.db, rules: s.rules, now: '2026-10-13T12:00:00.000Z' }).s9;
     const row = out.stages.find((x) => x.stageId === f.stage.id);
     assert.equal(row.state, 'never_published');
-    assert.equal(row.overdue, true);
+    assert.equal(row.overdue, true, '84h > 72h ⇒ 必须判超期');
     assert.equal(row.publishedAt, null);
     assert.equal(row.delayHours, 84, '结束 10-10 00:00 → now 10-13 12:00 = 84 小时');
+  } finally {
+    s.close();
+  }
+});
+
+test('S-9：**从未发榜**与**已发榜**同一把尺（E182 · F3）：时限内不报红，超时才报', () => {
+  // ⚠️ **这是 F3 的判别性用例**：修复前 `never_published` 分支的 `overdue` 是**无条件 true**
+  //    ⇒ 赛段结束 **1 小时**没发榜就报红，而已发榜的同一时刻要 >72h 才算 late
+  //    ⇒ 同一条 SLA 两种不对称判定 ⇒ 试赛第一天就会误报一片红。
+  // ⇒ 这里必须**同时**钉住两个方向：时限内**不**报 + 超时**才**报。
+  const s = setup();
+  try {
+    const f = seedStage(s.db, { key: 's6', endsAt: '2026-10-10' });
+    // ① 结束 +1h（远在 72h 时限内）⇒ **不得**判超期
+    const early = deadlineOf(s.db, f.stage.id, s.rules, '2026-10-10T01:00:00.000Z');
+    assert.equal(early.state, 'never_published', '状态仍是 never_published（「一次都没发过」与「晚发」是两件事）');
+    assert.equal(early.delayHours, 1);
+    assert.equal(early.overdue, false, '⛔ 时限内没发榜**不得**判超期 —— 修复前这里恒为 true（试赛第一天就误报红）');
+    assert.equal(early.publishedAt, null);
+
+    // ② 结束 +72h（**正好**等于时限）⇒ 仍不报（与「已发榜」分支同尺：严格大于才算超期）
+    const exact = deadlineOf(s.db, f.stage.id, s.rules, '2026-10-13T00:00:00.000Z');
+    assert.equal(exact.delayHours, 72);
+    assert.equal(exact.overdue, false, '正好 72h 不算超期（与已发榜分支同一把尺：严格大于）');
+
+    // ③ 结束 +73h ⇒ 报超期
+    const late = deadlineOf(s.db, f.stage.id, s.rules, '2026-10-13T01:00:00.000Z');
+    assert.equal(late.delayHours, 73);
+    assert.equal(late.overdue, true, '超过 72h 必须报超期');
+    assert.equal(
+      readinessSummary({ db: s.db, rules: s.rules, now: '2026-10-13T01:00:00.000Z' }).s9.overdueCount, 1,
+      '超期计数必须同步（汇总层不得漏）',
+    );
   } finally {
     s.close();
   }

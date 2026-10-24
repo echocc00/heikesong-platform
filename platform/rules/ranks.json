@@ -1,6 +1,6 @@
 {
   "id": "ranks",
-  "version": "2026-10-27",
+  "version": "2026-10-28",
   "source": "S10 §2.2 段位表 + §2.3 降级与权益",
   "tiers": [
     { "key": "D", "name": "出题", "minMilestones": 0, "requiresBusinessSignoff": false },

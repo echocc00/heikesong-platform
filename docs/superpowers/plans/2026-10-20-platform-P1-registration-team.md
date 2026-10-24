@@ -1123,7 +1123,7 @@ Expected: FAIL —— `Cannot find module '../src/domain/registration.js'`
 ```javascript
 {
   "id": "registration",
-  "version": "2026-10-27",
+  "version": "2026-10-28",
   "source": "SABC v1 §二 3 维画像筛选 + §六 待补 1 问卷字段设计",
   "scale": { "min": 1, "max": 5, "scoreMax": 100 },
   "dimensions": [
@@ -2159,7 +2159,7 @@ import { registerRegistrationRoutes } from './http/routes/registration.js';
 ```javascript
 {
   "id": "team-formation",
-  "version": "2026-10-27",
+  "version": "2026-10-28",
   "source": "任务书 §六 组队规则 + 顶层文档 §3.1",
   "teamSize": { "min": 2, "max": 5 },
   "captainMustBeMba": true,
@@ -2176,7 +2176,7 @@ import { registerRegistrationRoutes } from './http/routes/registration.js';
 ```javascript
 {
   "id": "schedule",
-  "version": "2026-10-27",
+  "version": "2026-10-28",
   "source": "任务书 2.0 §六 赛段表（R-STG-01）",
   "note": "日期为赛段相对日序（月-日）；落到具体日历日期由 edition.starts_at 偏移。",
   "stages": [
@@ -2206,7 +2206,7 @@ import { registerRegistrationRoutes } from './http/routes/registration.js';
 ```javascript
 {
   "id": "compliance",
-  "version": "2026-10-27",
+  "version": "2026-10-28",
   "source": "顶层文档 §3.1 S9（R-ENT-11 IP 与成果归属）+ §3.1 S15 与 §3.9（R-ENT-12 合规红线与同意记录）",
   "ipOwnership": {
     "team": "团队保留全部知识产权",

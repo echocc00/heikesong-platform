@@ -668,6 +668,89 @@ API（P6 追加）
 
 ---
 
+### 7.2 E181/E182 追加：S-7~S-10 业务就绪度端点 + 申诉主体白名单（2026-10-27 / 2026-10-28）
+
+> **为什么要有这一节**：本节追加的是 **P6 之后**（E181 / E182 两轮）新增的对外接口与契约。
+> ⛔ **E181 的 `GET /api/readiness` 此前没有登记在本文件的任何一节** ⇒
+>    「跨阶段接口契约」里查不到它 ⇒ 下一个按契约写代码的人根本不知道这个端点存在
+>    ⇒ E182 · F7 修的就是这个洞（**端点存在 ≠ 契约存在**）。
+
+```
+迁移（E182 追加）
+  db/migrations/011_behavior_event_subject_unique.sql
+    CREATE UNIQUE INDEX ux_behavior_events_subject
+      ON behavior_events(team_id, type, subject_id)
+     WHERE subject_id IS NOT NULL;
+    ⚠️ 「同一里程碑只记一次」的**数据库层**约束（服务层已对、DB 层此前缺）。
+       ⚠️ 部分唯一索引（WHERE subject_id IS NOT NULL）：`subject_id` 只对
+          countBy='milestone' 的事件有值 ⇒ 其余 once 类事件共用「终身一次」桶不受约束。
+       ⚠️ 不删行不改行（behavior_events 是只增不改的审计型表）⇒ 若已有重复行，
+          建索引**响亮失败** ⇒ 迁移回滚 ⇒ 部署被挡住 ⇒ 人来看。
+
+API（E181 追加）
+  GET    /api/readiness?editionId=<id>
+         → 200 { now, editionId,
+                 s7:  { teamCount, thresholdTeams, met, note },
+                 s8:  { stageCount, measurableCount, worstStageId, worstCoveragePercent,
+                        met, stages: [{ stageId, stageKey, stageName, status, statusNote,
+                                        expected, submitted, coveragePercent, thresholdPercent,
+                                        complete, overSubmitted, missingCount, missing[],
+                                        byDimension{}, warnings[] }] },
+                 s9:  { stageCount, overdueCount, overdueStageIds, met, deadlineHours,
+                        stages: [{ stageId, stageKey, stageName, endsAt, publishedAt,
+                                  rosterSize, deadlineHours, delayHours, overdue, state, note }] },
+                 s10: { met: null, note } }
+         → 401 UNAUTHENTICATED（未登录）
+         → 403 FORBIDDEN（已登录但**无 `audit:read` 能力点** ⇒ **不是 200 + 空集** ——
+             空集会被读成「各项都达标」，那是本端点最危险的误读方向）
+         → 404 NOT_FOUND（**显式**指定了不存在的 `editionId` ⇒ 不静默退回「当届」）
+
+服务层（E181 新建 / E182 修订）
+  src/services/readiness.js
+    readinessSummary({ db, editionId?, rules?, now? })   // → 上面的聚合结构（**唯一**对外出口）
+```
+
+⚠️ **`state` 的取值**（S-9，口径单一来源）：
+
+| state | 含义 | overdue |
+|---|---|---|
+| `not_due` | 赛段尚未结束 | false |
+| `no_roster` | 名册未登记 ⇒ 这段还没开打 ⇒ 不计入超期 | false |
+| `never_published` | 一次都没发榜 | **按 72h 尺判**（见下） |
+| `late` | 发过榜，但晚于时限 | true |
+| `published` | 按时发榜 | false |
+| `unknown_end` | 结束时间不可解析 ⇒ 不可判定 | false |
+
+> ⛔ **`never_published` 与 `late` 同一把尺**（E182 · F3，2026-10-28）：
+> 两者的 `overdue` 都按 `delayHours > publishDeadlineHours` 判
+> （时限读 `rules/compliance.json` 的 `readiness.publishDeadlineHours`，默认 72 小时）
+> ⇒ 修复前 `never_published` 是**无条件** `overdue: true` ⇒ 赛段结束 **1 小时**没发榜就报红，
+> 而已发榜的同一时刻要 >72h 才算 late ⇒ **同一条 SLA 两种不对称判定**（试赛第一天就误报一片红）。
+> ⚠️ 两个 state 仍是**两件事**：「一次都没发过」vs「发过但晚」⇒ 报告里要能分开看。
+
+> ⚠️ **只导出一个函数**（E182 记的纪律）：`reviewCoverage` / `publishDeadlines` 保持**模块私有**
+> —— 死服务扫描闸把「导出了但只有同文件调用」也算死函数 ⇒ 它们只能被 `readinessSummary` 调
+> ⇒ **测试也必须走公开 API**（`readinessSummary`），不得直接调内部函数。
+
+```
+服务层契约修订（E182 · 2026-10-28）
+  src/services/review-state.js
+    APPEAL_SUBJECT_TYPES        // → ['team_result', 'registration']（**申诉主体类型的白名单**）
+    fileAppeal({ db, subjectType?, subjectId, filedBy?, reason, reasonKind?, now?, rules })
+      ⛔ subjectType 缺省仍是 'team_result'（既有契约，不改）
+      ⛔ 传了**未知**的 subjectType ⇒ **400**（fail-closed）——
+         修复前全链路没有白名单（表无 CHECK / 路由不校验 / 服务层只分两支）
+         ⇒ 传 'foo' 会落进赛段结果分支、绕过程序性理由类型白名单、落库后无人按它分流
+      ⛔ 程序性理由类型白名单的豁免**只限报名类**（`subjectType === 'registration'`）——
+         修复前写的是 `subjectType !== 'team_result' && !kind` ⇒ 豁免的是「一切非 team_result」
+```
+
+> ⚠️ **演示适配器必须同码同判**：`web/api.demo.js` 的 `POST /api/appeals` 与上同口径
+> （主体类型白名单 + 豁免只限报名类）⇒ 演示站放过的东西正式站 400 ⇒ 公网演示站不会
+> 让人以为「这条路能走通」。
+
+---
+
 ## 8. 阶段间依赖一览
 
 | 阶段 | 消费上游 | 产出下游依赖的东西 |

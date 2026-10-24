@@ -51,6 +51,41 @@ export {
  */
 export const APPEAL_SUBJECT_TYPES = ['team_result', 'registration'];
 
+/**
+ * 申诉主体类型的**白名单校验 + 归一**（E182 · F2，2026-10-28）。
+ *
+ * ⚠️ **为什么必须校验（这是本轮修掉的一个真漏洞，不是洁癖）**：
+ *    修复前 `subjectType` **全链路没有白名单** —— 表没有 CHECK 约束（`subject_type TEXT NOT NULL`）、
+ *    路由不校验、服务层只按 `=== 'registration'` 分两支 ⇒
+ *    传 `subjectType: 'foo'` 会**落进赛段结果分支**（因为它既不是 'registration'），
+ *    于是它在 appeals 表里带着一个「没人会按它分流」的 subject_type 活下来。
+ *    而裁决时 `decideAppeal` 只认 `=== 'registration'` ⇒ 'foo' **按赛段结果类裁决**
+ *    ⇒ 撤销终稿 + 触发重算 —— 一个本该被程序性白名单挡住的申诉**绕过了白名单**。
+ *    （更糟的是：它同时绕过了 M0-2「赛段结果类必须声明理由类型」那道闸 ——
+ *     豁免条件写的是 `subjectType !== 'team_result' && !kind` ⇒ 'foo' 恰好命中豁免。）
+ *
+ * ⛔ **fail-closed**：未知主体类型 ⇒ **400**，不是「猜一个默认值继续跑」。
+ *    「猜默认值」= 把非法输入变成静默的合法行为 ⇒ 下次再有人加一个分支，同一个洞会再开一次。
+ *
+ * ⚠️ **缺省值仍然是 `team_result`**（既有契约，不改）：
+ *    赛段结果类申诉是**历史默认**，前端与既有调用方都可能不传 subjectType；
+ *    `undefined` / `null` ⇒ 归一为 'team_result'（**不是**新类型，只是缺省）。
+ *    只有「传了一个非空、且不在白名单里的值」才 400。
+ */
+function normalizeAppealSubjectType(subjectType) {
+  const raw = subjectType ?? 'team_result';
+  const st = String(raw).trim();
+  if (!APPEAL_SUBJECT_TYPES.includes(st)) {
+    throw badRequest(
+      `申诉主体类型非法：${st || '(空)'}（只能是 ${APPEAL_SUBJECT_TYPES.join(' / ')}）`
+      + ' —— 申诉主体类型决定裁决口径（赛段结果类 vs 报名类），'
+      + '不允许自定义值：自定义值会落进「既不是报名类也不是赛段结果类」的缝里，'
+      + '既绕过程序性理由类型白名单、又没有对应的裁决口径',
+    );
+  }
+  return st;
+}
+
 /** 报名的**终态裁定**（委员会已拍板）—— 终态不可被选手改写（口径见 src/services/registration.js 的 decideRegistration）。 */
 const REGISTRATION_TERMINAL_STATUSES = ['accepted', 'rejected'];
 
@@ -98,13 +133,22 @@ function appealSlaOf(appeal, rules, now) {
  *    白名单非空 ⇒ **赛段结果类申诉必须声明理由类型且命中白名单**（fail-closed）。
  * ⚠ 为什么报名类不强制：选手侧前端契约已固定（web/views/registration.js 只发 reason），
  *    强改会让选手点「提交申诉」直接失败 ⇒ 报名类只在「传了」时校验。
+ *
+ * ⛔ **E182 · F2（2026-10-28）：豁免条件已收窄为「仅报名类」**。
+ *    修复前写的是 `subjectType !== 'team_result' && !kind` ⇒ **豁免的是「一切非 team_result」**
+ *    ⇒ 传 `subjectType: 'foo'` + 不传 reasonKind 就能跳过程序性白名单落库成功
+ *    ⇒「主观不服进不了队列」失守（那道白名单本来就是为挡主观不服而设）。
+ *    现在豁免只认 `subjectType === 'registration'`（唯一的报名类字面量）。
+ *    ⇒ 双保险：`normalizeAppealSubjectType` 先把未知类型 400 掉，
+ *      即使将来有人再动这里的判断，未知类型也**到不了这里**。
  */
 function appealReasonKindGate({ subjectType, reasonKind, rules }) {
   const allowed = Array.isArray(rules?.audit?.reviewState?.appealReasonKinds)
     ? rules.audit.reviewState.appealReasonKinds : [];
   if (!allowed.length) return null;
   const kind = String(reasonKind ?? '').trim();
-  if (subjectType !== 'team_result' && !kind) return null;   // 报名类：可以不传
+  // ⛔ 豁免**只限报名类**：报名类「传了才校验」；赛段结果类必须声明理由类型。
+  if (subjectType === 'registration' && !kind) return null;   // 报名类：可以不传
   if (!kind) {
     throw badRequest(
       `申诉必须声明理由类型（reasonKind），只能是：${allowed.join(' / ')}`
@@ -168,12 +212,17 @@ export function fileAppeal({
   return withTransaction(db, () => {
     if (!subjectId) throw badRequest('申诉必须给 subjectId');
     if (!reason || !String(reason).trim()) throw badRequest('申诉必须写理由（空理由 = 无法复核）');
+    // ⛔ **E182 · F2（2026-10-28）：主体类型先过白名单**（fail-closed）。
+    //    未知类型 ⇒ 400 —— 绝不让它落进「既不是报名类也不是赛段结果类」的缝里。
+    //    ⚠️ 归一后**全程用 st**：分支、闸门、落库三处必须同一个值，
+    //       否则就会出现「按 team_result 判豁免、按别的值落库」这种分裂。
+    const st = normalizeAppealSubjectType(subjectType);
     // ⚠️ M0-2「限程序性错误」：理由类型白名单（fail-closed）。
     //    白名单为空（老配置 / 自定义规则集）⇒ 不限制，保持兼容。
-    const kind = appealReasonKindGate({ subjectType, reasonKind, rules });
+    const kind = appealReasonKindGate({ subjectType: st, reasonKind, rules });
 
     // ── 报名类申诉（DP-106）：独立的校验口径，见 fileRegistrationAppeal ──────
-    if (subjectType === 'registration') {
+    if (st === 'registration') {
       return fileRegistrationAppeal({ db, subjectId, filedBy, reason, reasonKind: kind, now, rules });
     }
 
@@ -210,7 +259,9 @@ export function fileAppeal({
     }
 
     const id = insertAppeal(db, {
-      subjectType, subjectId, filedBy, reason, reasonKind: kind, status: 'submitted', now,
+      // ⚠️ E182 · F2：落库用**归一后的 st**（不是原始入参）⇒ 表里的 subject_type
+      //    只可能是 'team_result' / 'registration' 两个值 ⇒ 裁决分支不会落进缝里。
+      subjectType: st, subjectId, filedBy, reason, reasonKind: kind, status: 'submitted', now,
     });
     // ⚠️ M0-2：SLA 截止时刻写进审计（提交时刻 + rules.compliance.appeal.slaHours）。
     const sla = appealSlaOf({ created_at: now }, rules, now);
@@ -220,7 +271,7 @@ export function fileAppeal({
       entity: 'appeal',
       entityId: id,
       detail: {
-        subjectType, subjectId, reason, stageId, teamId, tier,
+        subjectType: st, subjectId, reason, stageId, teamId, tier,
         reasonKind: kind, slaDueAt: sla.slaDueAt, slaHours: sla.slaHours,
       },
       now,

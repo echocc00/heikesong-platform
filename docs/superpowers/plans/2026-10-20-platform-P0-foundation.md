@@ -1998,7 +1998,7 @@ Expected: FAIL —— `Cannot find module '../src/config.js'`
 ```javascript
 {
   "id": "tiebreak",
-  "version": "2026-10-27",
+  "version": "2026-10-28",
   "conflictRef": "C-03",
   "source": "S7 §3.3 + S10 §0.4 + S10 §3.3（原文互相冲突，此处为裁决后的有序链）",
   "chain": [
@@ -2017,7 +2017,7 @@ Expected: FAIL —— `Cannot find module '../src/config.js'`
 ```javascript
 {
   "id": "ranks",
-  "version": "2026-10-27",
+  "version": "2026-10-28",
   "source": "S10 §2.2 段位表 + §2.3 降级与权益",
   "tiers": [
     { "key": "D", "name": "出题", "minMilestones": 0, "requiresBusinessSignoff": false },
@@ -2047,7 +2047,7 @@ Expected: FAIL —— `Cannot find module '../src/config.js'`
 ```javascript
 {
   "id": "behavior",
-  "version": "2026-10-27",
+  "version": "2026-10-28",
   "source": "S10 §3.1 计分明细 + §3.2 达标线 + §3.3 占比上限",
   "completionThreshold": 60,
   "maxWeightShare": 0.10,
@@ -2068,7 +2068,7 @@ Expected: FAIL —— `Cannot find module '../src/config.js'`
 ```javascript
 {
   "id": "visibility",
-  "version": "2026-10-27",
+  "version": "2026-10-28",
   "conflictRef": "C-02",
   "source": "S10 §0.3 分层公开 + §8 风险表",
   "rank": {
@@ -2115,7 +2115,7 @@ Expected: FAIL —— `Cannot find module '../src/config.js'`
 ```javascript
 {
   "id": "solvability",
-  "version": "2026-10-27",
+  "version": "2026-10-28",
   "source": "顶层文档 §3.2 六维可解性准入",
   "dimensions": [
     { "key": "problem_clarity", "label": "问题确定性", "weight": 0.30, "max": 3 },
@@ -2153,13 +2153,13 @@ Expected: FAIL —— `Cannot find module '../src/config.js'`
 ```javascript
 {
   "id": "milestones-default",
-  "version": "2026-10-27",
+  "version": "2026-10-28",
   "source": "S10 §4 商业里程碑 7 类 + §3.4 里程碑清单报名时固定｜R-PTS-11：下面这 7 类就是「L2 商业里程碑分」的完整类目（企业问题确认 / 真实数据接入 / 可演示原型 / 试点合同 / 业务迭代 N 轮 / 意向客户 M 家 / 确认收入 ¥X）｜R-PTS-12：里程碑与段位**共享「企业签字」这一个数据源**（countsTowardTier / signoffRequires），但**不共享任何一条规则** —— 里程碑表在这里，段位表在 rules/ranks.json，两边各自独立配置",
-  "note": "报名时随战队固定，赛程中不可自行新增（S10 §3.4 防拆单刷里程碑）",
+  "note": "报名时随战队固定，赛程中不可自行新增（S10 §3.4 防拆单刷里程碑）。⚠️ **E182 · F4（2026-10-28）**：原 `demo_ready` 的 `confirmedBy` 写的是 `judge`，**与实现矛盾**：里程碑的「达成」判定只有一条路径 —— `milestone_signoffs` 里有**未撤回**的一行（`src/services/tier.js` 的 `achieved = requires_signoff === 0 || 有未撤回签字`，`requires_signoff` 恒为 1）；而该表 `enterprise_id TEXT NOT NULL` ⇒ **结构上企业专用**，且 `hasActiveSignoff` 不区分签字人 ⇒ 评委的「确认」**根本没有落库路径**。⇒ 7 类里程碑的 `confirmedBy` 全部改为 `enterprise`（R-PTS-12：里程碑与段位共享「企业签字」这一个数据源）。⚠️ `confirmedBy` 此前**只被校验、从未被消费** —— 现在 `src/config.js` 加了一道机器闸：计分类里程碑的 `confirmedBy` 必须是 `enterprise`，否则拒绝启动（配置不许说谎）。",
   "items": [
     { "key": "problem_confirmed", "label": "企业问题确认", "confirmedBy": "enterprise", "countsTowardTier": true },
     { "key": "data_connected",    "label": "真实数据接入", "confirmedBy": "enterprise", "countsTowardTier": true },
-    { "key": "demo_ready",        "label": "可演示原型",   "confirmedBy": "judge",      "countsTowardTier": true },
+    { "key": "demo_ready",        "label": "可演示原型",   "confirmedBy": "enterprise", "countsTowardTier": true },
     { "key": "pilot_contract",    "label": "试点合同",     "confirmedBy": "enterprise", "countsTowardTier": true },
     { "key": "iterations",        "label": "业务迭代 N 轮","confirmedBy": "enterprise", "countsTowardTier": true },
     { "key": "intents",           "label": "意向客户 M 家","confirmedBy": "enterprise", "countsTowardTier": true },

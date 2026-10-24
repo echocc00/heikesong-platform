@@ -213,12 +213,23 @@ function publishDeadlines({ db, editionId = null, rules = null, now = null }) {
       return { ...base, state: 'no_roster', overdue: false, note: '赛段没有名册 ⇒ 不计入超期（但请确认这段是否真的不办）' };
     }
     if (!publishedAt) {
+      // ⛔ **E182 · F3（2026-10-28）：与「已发榜」分支同一把尺**。
+      //    修复前这一支 `overdue: true` 是**无条件**的 ⇒ 赛段结束 **1 小时**没发榜就报红，
+      //    而已发榜的同一时刻要 >72h 才算 late ⇒ **同一条 SLA 两种不对称判定**
+      //    ⇒ 试赛第一天就会误报一片红（而真超期的那一条反而淹没在噪声里）。
+      //    现在两支都按 `delayHours > publishDeadlineHours` 判。
+      //    ⚠️ **state 仍是 'never_published'**：它与 'late' 是**两件事**
+      //    （「一次都没发过」vs「发过但晚」）⇒ 报告里要能分开看。
+      const delayHours = round2((atMs - endsMs) / HOUR_MS);
+      const late = delayHours > publishDeadlineHours;
       return {
         ...base,
         state: 'never_published',
-        overdue: true,
-        delayHours: round2((atMs - endsMs) / HOUR_MS),
-        note: `赛段已结束 ${round2((atMs - endsMs) / HOUR_MS)} 小时，仍未发榜`,
+        overdue: late,
+        delayHours,
+        note: late
+          ? `赛段已结束 ${delayHours} 小时仍未发榜（时限 ${publishDeadlineHours} 小时，超期 ${round2(delayHours - publishDeadlineHours)} 小时）`
+          : `赛段已结束 ${delayHours} 小时，尚未到发榜时限（${publishDeadlineHours} 小时）`,
       };
     }
     const delayHours = round2((Date.parse(publishedAt) - endsMs) / HOUR_MS);
