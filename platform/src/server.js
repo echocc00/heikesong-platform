@@ -38,6 +38,8 @@ import { registerSignoffRoutes } from './http/routes/signoff.js';
 import { registerBehaviorRoutes } from './http/routes/behavior.js';
 import { registerAuditRoutes } from './http/routes/audit.js';
 import { registerAdminRoutes } from './http/routes/admin.js';
+// E181（2026-10-27）：S-7~S-10 业务就绪度端点（评审覆盖率 / 发榜时限）
+import { registerReadinessRoutes } from './http/routes/readiness.js';
 import { registerPublishRoutes } from './http/routes/publish.js';
 import { registerTiebreakRoutes } from './http/routes/tiebreak.js';
 import { registerStageRoutes } from './http/routes/stages.js';
@@ -236,6 +238,9 @@ export function createApp({ db, rules, webDir }) {
   registerAuditRoutes(router, { db, rules });
   // 管理端点（2026-10-24 评审补记）：登录限频的人工解锁兜底
   registerAdminRoutes(router, { db });
+  // E181（2026-10-27）：S-7~S-10 业务就绪度汇总（组委会用）
+  // ⚠️ 权限口径 `audit:read`（只有组委会持有）⇒ 内部运营信息不外泄。
+  registerReadinessRoutes(router, { db, rules });
 
   // ── P3 榜单与积分 ───────────────────────────────────────────
   // ⚠️ 路由优先级由 P0 的 router **逐段比较**决定：静态段胜参数段

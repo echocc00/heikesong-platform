@@ -5621,3 +5621,1653 @@ test('P1-4a install.sh 必须在迁移/种子之前停服（否则新闸会让�
    `dead-service-scan.mjs` / `plan-block-audit.mjs` ⇒ 退出码全 0，
    且 `plan-block-audit` 报 **C-RW = 0**。
 4. **变异检验**：每批的每条修法都要有**被杀死的变异**（存活 ⇒ 补判别性场景）。
+
+### 4.9 2026-10-27 E181 轮（S-8 评审覆盖率闸 + S-9 按时发榜闸 + A3 过滤键闸 + 预演数据）—— 新建文件登记
+
+本轮新建了以下文件。按本仓纪律「**新建文件必须登记进计划块，否则它的漂移查不出来**」，逐个登记如下：
+
+| 文件 | 为什么必须是**新文件** |
+|---|---|
+| `platform/src/services/readiness.js` | S-8（评审覆盖率汇总闸）与 S-9（超期未发榜告警）**必须自成一个服务**：① 两条闸的**口径**（应交格子怎么算、发榜时刻怎么取）与评审工作台、发榜流程**共用** `getReviewState` / `listSnapshotsByStage` ⇒ 放在既有服务里会与「工作台进度」「发榜」两套口径纠缠；② 两条闸要能被**预演脚本**与 **HTTP 端点**同时调用 ⇒ 不能只挂在某个路由的私有函数上；③ 它是**新增的聚合口径**，塞进 `services/review.js`（P2 owns）会把 P2 的文件撑成第二个「什么都管」的文件。 |
+| `platform/src/http/routes/readiness.js` | `GET /api/readiness` 是**组委会专用**的运营读口 ⇒ 权限口径（`audit:read`，只有组委会持有）与形状（按赛段聚合的业务指标）都与既有端点不同 ⇒ 独立成文件才能把「403 而不是 200+空集」这条 fail-closed 纪律写在**文件头**（空集会被读成「各项都达标」）。 |
+| `platform/src/db/repo/preview-data.js` | ⛔ 仓内纪律「**所有 SQL 字符串必须收在 platform/src/db/repo/ 下；handler / 脚本里禁止裸 SQL**」（设计文档 §7.2 + 评审编号 I-7，守卫见 `test/sql-boundary.test.js`）⇒ 预演数据要写库，INSERT 语句**只能**住在仓储层。⚠️ 它刻意**绕过业务服务的全部校验与副作用** ⇒ 因此**只能**被预演脚本调用 ⇒ 已登记进 `docs/tools/dead-service-scan.allow.json` 的「种子/运维脚本路径」一类（不塞进 allow 糊弄 ⇒ 理由写全）。 |
+| `platform/db/preview/preview-dataset.js` | 预演数据集（**纯数据**，不写库、不含 SQL）必须**独立于**生产种子数据：`scripts/seed.js` 灌的是「可用的最小演示数据」，而本轮要的是「把每个功能用到的数据摆出来、覆盖每个分支」⇒ 两者混在一起会互相污染。⚠️ 它的行**列名与生产表逐字一致** ⇒ 写错列名会被仓储层的 `PRAGMA table_info` 检查当场抓住。 |
+| `platform/scripts/preview-seed.js` | 建**临时库**（生产同款迁移 ⇒ 表结构一致）+ 灌预演数据 ⇒ 必须是**独立脚本**（不碰生产库 `platform/data/app.db`，脚本里有三道安全闸：目录写死成 `preview` / 目标目录有 `app.db` 就拒绝 / 默认重建）。 |
+| `platform/scripts/preview-report.js` | 「**人话**报告」是给**评审**看的 ⇒ 与机器读的结构化输出（`--json`）分开成脚本，避免把「给人看的措辞」写进 API 契约里。⚠️ 它读的是临时库 ⇒ 真实数据到位后**一个字都不用改**。 |
+| `platform/test/readiness.test.js` | S-8 / S-9 的判别性用例**自成一套口径断言**（应交格子数 = 席位数 × 队数 × 维度数、覆盖率百分比、超期小时数、not_applicable 的 null）⇒ 塞进既有测试文件会让「这条钉的是哪条口径」看不出来。 |
+| `platform/test/audit-filter.test.js` | A3（过滤键静默失效）的用例要**并排**钉住三端点的三份白名单（同一个键在另一个端点必须 400）⇒ 自成文件才能把「白名单互不相同」这条不变量写成一条用例。 |
+
+⚠️ 本轮**同时**改了 4 个既有文件（`src/http/routes/audit.js` → P4 owns、`src/server.js` → P0 owns、
+`src/config.js` → P0 owns、16 份 `rules/*.json` → 各自 owning 阶段）⇒ 它们的计划块**已用
+`docs/tools/plan-block-sync.mjs` 逐字同步回 owning 阶段**（C-RW 必须清零）。
+⚠️ 规则集又升了一版：`2026-10-26` → **`2026-10-27`**（16 份全改 ——
+本轮给 `rules/compliance.json` 加了 `readiness` 阈值段 ⇒ 版本必须全等，否则 `loadRules` 拒绝启动）。
+
+**Step 1: 创建 src/services/readiness.js**
+
+`platform/src/services/readiness.js`：
+
+```javascript
+// src/services/readiness.js — S-7~S-10 业务就绪度闸（E181，2026-10-27）
+//
+// 规则溯源：设计文档 §1.3.1「S-7~S-10：怎么量、今天有没有机器检查」
+//   · S-8 评审无漏评 —— 数据来源：`stage_reviews` 空缺 + 计算 trace 的 `normalization` 段
+//     ⇒ spec §1.3.1 原文：「⚠️ **部分**：`judge_pool_invalid` / `normalization_fallback`
+//       已在 trace 里**显式产出**（S-5），但**没有**「漏评覆盖率」的汇总闸」⇒ **待补**。
+//   · S-9 按时发榜 —— 数据来源：`leaderboard_snapshots.created_at` vs 赛段 `ends_at`
+//     ⇒ spec §1.3.1 原文：「⚠️ **部分**：发榜时刻已入库，但**没有**「超 72 小时」的告警」⇒ **待补**。
+//   · S-10 闭环时效与产出 —— 申诉 SLA 已由 rules/compliance.json 的 `appeal.slaHours` 驱动
+//     （M0-2 落地）；「完赛认定数 > 0」**需要真实赛事数据** ⇒ 本文件**不假装能算**。
+//
+// ⚠️ **本文件为什么从「真实表」读，而不是从「临时表」读**：
+//    E181 的做法是 —— 先用一份**预演数据集**（同样的表结构、装在临时库里）让功能可被评审；
+//    真实赛事数据到位后**直接灌进同一套表** ⇒ 本文件的代码**一行都不用改**。
+//    ⇒ ⛔ 本文件里**不许**出现任何「预演/演示专用」的分支（那会让预演数据与真实数据走两套口径）。
+//
+// ⚠️ **口径纪律（S-8 的「应交」怎么算）**：
+//    应交格子 = **有投票权席位数 × 赛段名册队数 × 评委席维度数**
+//    —— 判据取自 `services/review.js` 的 `getReviewState`（**不另起一套**）：
+//    ① 名册用 `resolveStageRoster`（赛段级优先、届期级兜底）—— 与外队进榜拦截同一口径；
+//    ② 席位排除 `observer`（R-JDG-11：观察员无投票权）；
+//    ③ 维度只算 `seat === 'judge'` 的（`enterprise` 维度走企业确认、`self` 维度走自评，
+//       **都不落在 `stage_reviews`** —— 写路径 `POST /api/stages/:id/reviews` 白名单同款）。
+//    ⇒ **复用 getReviewState 而不是重算一遍**，是为了让「闸里看到的覆盖率」与
+//      「评审工作台上显示的进度」**永远是同一个数**（同款纪律见 services/review.js:348
+//      「三样东西原先分散在三个地方，且三个口径会各自漂移」）。
+//
+// ⚠️ **fail-closed 的两处**：
+//    ① `expected === 0`（没有席位 / 没有名册 / 没有维度）⇒ 覆盖率**不可判定**，
+//       本文件返回 `status: 'not_applicable'` + `coveragePercent: null`，
+//       **绝不返回 100%**（那是把「没东西可评」说成「全都评了」）。
+//    ② `submitted > expected`（数据异常：写路径禁止非评委席维度进 `stage_reviews`）
+//       ⇒ 覆盖率封顶 100% 并显式给出 `overSubmitted: true` + `warnings`，**不静默吞掉**。
+import { getStage } from '../db/repo/stages.js';
+import { listStages } from '../db/repo/stages.js';
+import { listSnapshotsByStage } from '../db/repo/leaderboard.js';
+import { listTeamRows } from '../db/repo/teams.js';
+import { hasStageRoster, listStageTeamIds } from '../db/repo/stage-teams.js';
+import { getReviewState } from './review.js';
+import { AppError } from '../errors.js';
+
+const HOUR_MS = 3600 * 1000;
+
+/** 阈值全部来自 rules/compliance.json 的 `readiness` 段 —— 代码里**不硬编码**任何数字。 */
+function thresholdsOf(rules) {
+  const r = rules?.compliance?.readiness ?? {};
+  return {
+    minReviewCoveragePercent: Number(r.minReviewCoveragePercent ?? 90),
+    publishDeadlineHours: Number(r.publishDeadlineHours ?? 72),
+    minTeamsForScale: Number(r.minTeamsForScale ?? 4),
+  };
+}
+
+function round2(n) {
+  return Math.round(n * 100) / 100;
+}
+
+/**
+ * S-8：某赛段的评审覆盖率（漏评闸）。
+ *
+ * @param {object} db
+ * @param {string} stageId
+ * @param {object} [rules] 规则集（用于取维度全集与阈值）
+ * @returns {object} 覆盖率报告
+ */
+function reviewCoverage({ db, stageId, rules = null }) {
+  const stage = getStage(db, stageId);
+  if (!stage) throw new AppError(404, 'STAGE_NOT_FOUND', '赛段不存在');
+  const config = rules?.scoring?.[stage.scoring_config_key];
+  if (!config) {
+    throw new AppError(500, 'SCORING_CONFIG_MISSING', `赛段 ${stageId} 指向的权重表 ${stage.scoring_config_key} 不存在`);
+  }
+  const judgeDimensions = (config.dimensions ?? []).filter((d) => d.seat === 'judge').map((d) => d.key);
+  const { minReviewCoveragePercent } = thresholdsOf(rules);
+
+  // ⚠️ **「这段开打了没有」的前置判断**：名册（stage_team）没登记 ⇒ 这段还没开打。
+  //    ⇒ 此时**不给覆盖率结论**（not_applicable），而不是给一个基于届期兜底名册算出来的数。
+  //    ⛔ 为什么不用 `resolveStageRoster` 的届期兜底名册：
+  //       它回落到「本届全部队伍」⇒ 一个**根本没开的赛段**也会算出覆盖率
+  //       （4 队 × 4 席 × 5 维 = 80 格，没交 ⇒ 0%）⇒ 把「还没开始」说成「全部漏评」。
+  //    ⇒ 闸用**赛段级名册**（stage_team），与 S-9 的发榜时限判据**同一把尺**。
+  //    ✅ 口径一致性：名册登记过之后，`getReviewState` 内部用的 `resolveStageRoster`
+  //       也正是 stage_team ⇒ 闸里的数与评审工作台上的数**同一个**。
+  if (!hasStageRoster(db, stageId)) {
+    return {
+      stageId: stage.id,
+      stageKey: stage.key,
+      stageName: stage.name,
+      status: 'not_applicable',
+      statusNote: '赛段名册未登记 ⇒ 这段还没开打（不判定覆盖率）',
+      expected: null,
+      submitted: null,
+      coveragePercent: null,
+      thresholdPercent: minReviewCoveragePercent,
+      complete: false,
+      overSubmitted: false,
+      missingCount: null,
+      missing: [],
+      byDimension: {},
+      warnings: [],
+    };
+  }
+
+  // ⚠️ 复用 getReviewState 的**管理员口径**（isAdmin ⇒ 应交/已交/缺谁 全量）
+  const progress = getReviewState({
+    db,
+    stageId,
+    viewer: { userId: null, isAdmin: true },
+    dimensions: judgeDimensions,
+  });
+
+  const expected = progress.total;
+  const submitted = progress.submitted;
+  const warnings = [];
+  const overSubmitted = submitted > expected;
+  if (overSubmitted) {
+    warnings.push(
+      `已交格子数（${submitted}）大于应交格子数（${expected}）⇒ 数据异常：`
+      + 'stage_reviews 里出现了不该存在的维度评分（写路径本应挡住）',
+    );
+  }
+  if (expected === 0) {
+    // ⛔ fail-closed：没有应交格子 ⇒ **不可判定**，不是 100%
+    return {
+      stageId: stage.id,
+      stageKey: stage.key,
+      stageName: stage.name,
+      status: 'not_applicable',
+      statusNote: '没有应交格子（无投票权席位 / 无名册 / 无评委席维度）⇒ 覆盖率不可判定',
+      expected: 0,
+      submitted: 0,
+      coveragePercent: null,
+      thresholdPercent: minReviewCoveragePercent,
+      complete: false,
+      overSubmitted: false,
+      missingCount: 0,
+      missing: [],
+      byDimension: progress.dimensionProgress ?? {},
+      warnings,
+    };
+  }
+  const coveragePercent = round2(Math.min(submitted, expected) / expected * 100);
+  return {
+    stageId: stage.id,
+    stageKey: stage.key,
+    stageName: stage.name,
+    status: 'measurable',
+    statusNote: null,
+    expected,
+    submitted,
+    coveragePercent,
+    thresholdPercent: minReviewCoveragePercent,
+    complete: coveragePercent >= minReviewCoveragePercent,
+    overSubmitted,
+    missingCount: progress.missing.length,
+    // ⚠️ missing 的条数 = 席位数 × 队数 × 维度数 —— 大赛段可能上千条
+    //    ⇒ 列表**截断**并给出总数（完整清单走详情端点 / 预演报告脚本）。
+    missing: progress.missing.slice(0, 200),
+    byDimension: progress.dimensionProgress ?? {},
+    warnings,
+  };
+}
+
+/**
+ * S-9：赛段发榜时限（超期未发榜告警）。
+ *
+ * 判定口径：从赛段 `ends_at` 起算，到**第一条发榜快照**的 `created_at` 为止。
+ * ⚠️ 为什么取「第一条」：一次发榜会写 3 个 scope 的快照（rank/business/personal，
+ *    `services/leaderboard.js` 的 SCOPES），它们 `createdAt` 相同 ⇒ 取最早的一条即发榜时刻。
+ *
+ * @param {object} db
+ * @param {string|null} [editionId] 届期；不传则扫全部赛段
+ * @param {object} [rules]
+ * @param {string|null} [now] ISO 时刻（不传取当前时间）
+ */
+function publishDeadlines({ db, editionId = null, rules = null, now = null }) {
+  const { publishDeadlineHours } = thresholdsOf(rules);
+  const at = now ?? new Date().toISOString();
+  const atMs = Date.parse(at);
+  const stages = listStages(db, editionId ? { editionId } : {});
+
+  const rows = stages.map((stage) => {
+    const endsAt = stage.ends_at;
+    const endsMs = Date.parse(endsAt);
+    // ⚠️ **赛段级名册（stage_team）**，不是届期级兜底名册 —— 与 S-8 同一把尺。
+    //    理由见 reviewCoverage 的注释：没登记名册的赛段**还没开打** ⇒ 不该判它「超期没发榜」。
+    const roster = listStageTeamIds(db, stage.id);
+    const snapshots = listSnapshotsByStage(db, stage.id);
+    const publishedAt = snapshots.length ? snapshots[0].created_at : null;
+
+    const base = {
+      stageId: stage.id,
+      stageKey: stage.key,
+      stageName: stage.name,
+      endsAt,
+      publishedAt,
+      rosterSize: roster.length,
+      deadlineHours: publishDeadlineHours,
+      delayHours: null,
+      overdue: false,
+    };
+
+    if (!Number.isFinite(endsMs)) {
+      // ⛔ 赛段没有可解析的结束时间 ⇒ 不可判定（不假装它是「没超期」）
+      return { ...base, state: 'unknown_end', overdue: false, note: '赛段结束时间不可解析 ⇒ 不可判定' };
+    }
+    if (atMs < endsMs) {
+      return { ...base, state: 'not_due', overdue: false, note: '赛段尚未结束' };
+    }
+    if (!roster.length) {
+      // ⚠️ 没有名册的赛段**不计入超期**（还没建队 / 这段没真办）
+      //    ⇒ 但**照样列出来**（人能看到），并写明原因。
+      return { ...base, state: 'no_roster', overdue: false, note: '赛段没有名册 ⇒ 不计入超期（但请确认这段是否真的不办）' };
+    }
+    if (!publishedAt) {
+      return {
+        ...base,
+        state: 'never_published',
+        overdue: true,
+        delayHours: round2((atMs - endsMs) / HOUR_MS),
+        note: `赛段已结束 ${round2((atMs - endsMs) / HOUR_MS)} 小时，仍未发榜`,
+      };
+    }
+    const delayHours = round2((Date.parse(publishedAt) - endsMs) / HOUR_MS);
+    const late = delayHours > publishDeadlineHours;
+    return {
+      ...base,
+      state: late ? 'late' : 'published',
+      overdue: late,
+      delayHours,
+      note: late
+        ? `发榜比时限晚 ${round2(delayHours - publishDeadlineHours)} 小时（时限 ${publishDeadlineHours} 小时）`
+        : '按时发榜',
+    };
+  });
+
+  const overdue = rows.filter((r) => r.overdue);
+  return {
+    now: at,
+    deadlineHours: publishDeadlineHours,
+    stageCount: rows.length,
+    overdueCount: overdue.length,
+    overdueStageIds: overdue.map((r) => r.stageId),
+    stages: rows,
+  };
+}
+
+/**
+ * S-7~S-10 汇总：把能算的算出来，把**不能算的明说不能算**。
+ *
+ * ⛔ **不许在这里把「没数据」写成「达标」**：
+ *   · S-7 规模：队伍数可算（但「报名数」口径需真实赛事数据校准）；
+ *   · S-8 评审覆盖：可算（见 reviewCoverage）；
+ *   · S-9 按时发榜：可算（见 publishDeadlines）；
+ *   · S-10 闭环时效：申诉 SLA 部分可算（review-state 已有），「完赛认定数」**需要真实数据**。
+ */
+export function readinessSummary({ db, editionId = null, rules = null, now = null }) {
+  const at = now ?? new Date().toISOString();
+  const { minTeamsForScale } = thresholdsOf(rules);
+  const teams = editionId ? listTeamRows(db, { editionId }) : listTeamRows(db, {});
+  const coverage = editionId
+    ? listStages(db, { editionId }).map((s) => reviewCoverage({ db, stageId: s.id, rules }))
+    : listStages(db, {}).map((s) => reviewCoverage({ db, stageId: s.id, rules }));
+  const deadlines = publishDeadlines({ db, editionId, rules, now: at });
+
+  const measurable = coverage.filter((c) => c.status === 'measurable');
+  const worst = measurable.length
+    ? measurable.reduce((a, b) => (b.coveragePercent < a.coveragePercent ? b : a))
+    : null;
+
+  return {
+    now: at,
+    editionId: editionId ?? null,
+    s7: {
+      // 数据来源：teams 行数（spec §1.3.1「`teams` / `registrations` 行数」）
+      teamCount: teams.length,
+      thresholdTeams: minTeamsForScale,
+      met: teams.length >= minTeamsForScale,
+      note: '只数了**队伍数**；「报名数」口径（registrations 行数与去重规则）待真实赛事数据校准',
+    },
+    s8: {
+      stageCount: coverage.length,
+      measurableCount: measurable.length,
+      worstStageId: worst?.stageId ?? null,
+      worstCoveragePercent: worst?.coveragePercent ?? null,
+      met: measurable.length > 0 && measurable.every((c) => c.complete),
+      stages: coverage,
+    },
+    s9: {
+      stageCount: deadlines.stageCount,
+      overdueCount: deadlines.overdueCount,
+      overdueStageIds: deadlines.overdueStageIds,
+      met: deadlines.overdueCount === 0,
+      deadlineHours: deadlines.deadlineHours,
+      stages: deadlines.stages,
+    },
+    s10: {
+      // 申诉 SLA 已由 services/review-state.js 落地（M0-2）；这里只做**状态声明**
+      met: null,
+      note: '申诉 SLA 部分已落地（rules/compliance.json 的 appeal.slaHours）；'
+        + '「完赛认定数 > 0」与「按时发榜率 ≥ 90%」**需要真实赛事数据** ⇒ 本闸不判定',
+    },
+  };
+}
+```
+
+**Step 2: 创建 src/http/routes/readiness.js**
+
+`platform/src/http/routes/readiness.js`：
+
+```javascript
+// src/http/routes/readiness.js — S-7~S-10 业务就绪度端点（E181，2026-10-27）
+//
+// 规则溯源：设计文档 §1.3.1「S-7~S-10：怎么量、今天有没有机器检查」
+//   · S-7 规模达标       → teams / registrations 行数
+//   · S-8 评审无漏评     → stage_reviews 空缺 + 计算 trace 的 normalization 段
+//   · S-9 按时发榜       → leaderboard_snapshots.created_at vs 赛段 ends_at
+//   · S-10 闭环时效与产出 → appeals（SLA 字段已入库）+ milestone_signoffs + 行为分完赛认定
+//
+// ⛔ **权限口径**：`audit:read`（**只有组委会持有**，见 scripts/seed.js 的 ROLE_CAPABILITIES）
+//    —— 这份汇总里含「哪些赛段没发榜」「哪些格子没评分」这类**内部运营信息**。
+//    ⇒ 未登录 → 401；有登录但无能力点 → 403（**不是** 200 + 空集 ——
+//      空集会被误读成「都达标了」，那是本文件最危险的误读方向）。
+//
+// ⚠️ **为什么是独立端点而不是塞进 /api/audit/log**：
+//    ① 口径完全不同（一个是审计行，一个是**按赛段聚合的业务指标**）；
+//    ② 权限不同（审计日志是审计:read 起步，复核队列是 audit:write 才能裁决）；
+//    ③ 形状不同（聚合结构 vs 分页行）⇒ 混在一起会让前端拿到两套没法对齐的数组。
+//
+// ⛔ **可见性在 API 层过滤（白名单，fail-closed）**：本端点只吐**聚合数与 id**，
+//    **不吐**任何队伍的名称、手机号、分数明细（明细走各自的既有端点，那里才有可见性规则）。
+import { listEditions } from '../../db/repo/editions.js';
+import { can } from '../../auth/permissions.js';
+import { unauthenticated, forbidden, notFound } from '../../errors.js';
+import { readinessSummary } from '../../services/readiness.js';
+import { pickCurrentEdition } from './registration.js';
+
+function requireLogin(user) {
+  if (!user) throw unauthenticated();
+}
+
+export function registerReadinessRoutes(router, { db, rules }) {
+  router.add('GET', '/api/readiness', async ({ user, query }) => {
+    requireLogin(user);
+    // ⛔ 无 `audit:read` ⇒ 403（不是空集）：空集会被读成「各项都达标」。
+    if (!can(user, 'audit:read', null, db)) throw forbidden('无权查看业务就绪度汇总');
+
+    // 届期口径与注册端点一致：**当届** = 尚未结束的最早一届，都没有就退回最后一届。
+    // ⚠️ 允许显式传 `?editionId=` 查历史届期（组委会要复盘上一届时用）。
+    const editions = listEditions(db);
+    const edition = query?.editionId
+      ? editions.find((e) => e.id === query.editionId) ?? null
+      : pickCurrentEdition(editions);
+    if (query?.editionId && !edition) {
+      // 显式指定了不存在的届期 ⇒ 404（不静默退回「当届」—— 那会查错届期而不报错）
+      throw notFound(`届期不存在：${query.editionId}`);
+    }
+    return readinessSummary({
+      db,
+      editionId: edition?.id ?? null,
+      rules,
+      now: new Date().toISOString(),
+    });
+  });
+}
+```
+
+**Step 3: 创建 src/db/repo/preview-data.js**
+
+`platform/src/db/repo/preview-data.js`：
+
+```javascript
+// src/db/repo/preview-data.js — 预演数据集的**写入口**（E181，2026-10-27）
+//
+// ⚠️ **为什么这个文件存在**：仓内纪律「**所有 SQL 字符串必须收在 platform/src/db/repo/ 下；
+//    handler / 脚本里禁止裸 SQL**」（设计文档 §7.2 + 评审编号 I-7，
+//    见 test/sql-boundary.test.js 的守卫）。
+//    ⇒ 预演数据要写库，就得从仓储层出去 ⇒ 由本文件承担。
+//
+// ⚠️ **它做的是「按表插行」，不是「业务写入」**：
+//    预演数据的目的是**把每个功能用到的数据摆出来**，让功能可被评审；
+//    它刻意**绕过业务服务的全部校验与副作用**（不建冲突声明、不算分、不写审计…）。
+//    ⇒ ⛔ 因此它**只能被预演脚本调用**，不许被业务代码当通用写入口用
+//      （已登记进 docs/tools/dead-service-scan.allow.json 的「种子/运维脚本路径」一类）。
+//
+// ⚠️ **列名必须与生产表逐字一致**：本文件按 `PRAGMA table_info` 读真实列名，
+//    数据集里写错列名 ⇒ **立刻抛错**（插不进去）⇒ 「预演数据与生产表不同格式」当场暴露。
+/**
+ * 把一批行插进指定表（内部函数，不导出 —— 唯一的对外入口是 insertDataset）。
+ */
+function insertRows(db, table, rows) {
+  if (!Array.isArray(rows) || rows.length === 0) return 0;
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
+  if (!cols.length) throw new Error(`预演数据：表 ${table} 不存在（迁移没跑？）`);
+  for (const row of rows) {
+    for (const key of Object.keys(row)) {
+      if (!cols.includes(key)) {
+        throw new Error(
+          `预演数据：${table} 有列「${key}」，但生产表没有这一列 ⇒ 数据集与生产表不同格式`,
+        );
+      }
+    }
+  }
+  const stmt = db.prepare(
+    `INSERT INTO ${table} (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`,
+  );
+  for (const row of rows) {
+    stmt.run(...cols.map((c) => (row[c] === undefined ? null : row[c])));
+  }
+  return rows.length;
+}
+
+/**
+ * 按「表名 → 行数组」的映射批量插入（**顺序由调用方决定**：外键依赖在前）。
+ *
+ * @param {object} db
+ * @param {Record<string, object[]>} dataset
+ * @param {string[]} order 插入顺序（表名数组）
+ * @returns {Record<string, number>} 每张表插了多少行
+ */
+export function insertDataset(db, dataset, order) {
+  const counts = {};
+  for (const table of order) {
+    counts[table] = insertRows(db, table, dataset[table] ?? []);
+  }
+  return counts;
+}
+```
+
+**Step 4: 创建 db/preview/preview-dataset.js**
+
+`platform/db/preview/preview-dataset.js`：
+
+```javascript
+// platform/db/preview/preview-dataset.js — 预演数据集（E181，2026-10-27）
+//
+// ⚠️ **这是「临时表」的数据侧**：预演数据装在一个**临时库**里，
+//    库的 schema 由**生产同款迁移**建出来 ⇒ 表结构与生产**逐字一致**。
+//    ⇒ 真实赛事数据到位后，**直接灌进同一套表** ⇒ services/readiness.js 的代码**一行都不用改**。
+//    ⇒ ⛔ 本文件只提供**数据**；不许在这里出现任何「让闸更好通过」的特判。
+//
+// ⚠️ **为什么用相对日期而不是写死日期**：
+//    写死的日期会随时间流逝而失效（今天「超期」的赛段，明天就变成「未到期」）。
+//    ⇒ 所有时间都相对**锚点时刻**生成 ⇒ 无论什么时候跑预演，
+//      五个赛段分别落在五个**分支**上（下面「场景矩阵」那一段就是验收标准）。
+//
+// ⚠️ **列名与生产表逐字一致**：本文件每一行都直接对应一张生产表的一行，
+//    插入时按**表的名字**映射（见 scripts/preview-seed.js）⇒ 改列名会立刻插不进去（好事）。
+//
+// ── 场景矩阵（本文件的核心验收标准）────────────────────────────────
+//   赛段 s1 调研   名册4队 席位3评委+1企业+1观察员 评分满格   → S-8 100% 达标 ｜ S-9 按时发榜（+24h）
+//   赛段 s2 任务   同上但**故意漏 17 格**            → S-8 78.75% **不达标** ｜ S-9 超期发榜（+90h）
+//   赛段 s3 开发   评分满格但**从未发榜**             → S-8 100% 达标 ｜ S-9 **never_published**
+//   赛段 s4 路演   **没登记名册**（还没开打）        → S-8 **not_applicable** ｜ S-9 **no_roster**
+//   赛段 s5 落地   尚未结束                          → S-8 部分评分（不给结论的重点段）｜ S-9 **not_due**
+//
+// ⚠️ **观察员（observer）不进应交格子**（R-JDG-11：观察员无投票权）
+//    ⇒ s1 的应交 = 4 个有投票权席位 × 4 队 × 5 个评委席维度 = **80 格**。
+//    ⚠️ **企业席（enterprise）有投票权** ⇒ 它**要打分**，且同样只打评委席维度。
+//    ⚠️ **评委席维度**：初赛 5 个（track_fit / innovation / feasibility / completeness / collaboration）；
+//    `enterprise` 维度走企业确认、`self` 维度走自评，**都不落在 stage_reviews**。
+
+const HOUR = 3600 * 1000;
+const DAY = 24 * HOUR;
+
+const JUDGE_DIMS_INITIAL = ['track_fit', 'innovation', 'feasibility', 'completeness', 'collaboration'];
+const JUDGE_DIMS_FINAL = ['innovation', 'feasibility', 'completeness', 'collaboration'];
+
+const VOTING_SEATS = [
+  { userId: 'pv-judge-1', seat: 'judge' },
+  { userId: 'pv-judge-2', seat: 'judge' },
+  { userId: 'pv-judge-3', seat: 'judge' },
+  { userId: 'pv-ent-1', seat: 'enterprise' },
+];
+const OBSERVER = { userId: 'pv-obs-1', seat: 'observer' };
+
+const TEAMS = ['pv-team-1', 'pv-team-2', 'pv-team-3', 'pv-team-4'];
+const CAPTAINS = ['pv-cap-1', 'pv-cap-2', 'pv-cap-3', 'pv-cap-4'];
+
+/**
+ * s2 故意漏掉的 17 格（**刻意分组**，便于评审时看出「漏评长什么样」）：
+ *   · judge-3 完全没评 team-4            → 5 格
+ *   · judge-2 漏评 team-4 的 4 个维度      → 4 格
+ *   · ent-1   漏评 team-3 的 4 个维度      → 4 格
+ *   · judge-1 漏评 team-2 的 4 个维度      → 4 格
+ *   合计 17 格 ⇒ 覆盖率 = (80-17)/80 = 78.75% < 90% ⇒ **不达标**
+ */
+const S2_MISSING = new Set([
+  ...['track_fit', 'innovation', 'feasibility', 'completeness', 'collaboration']
+    .map((d) => `pv-judge-3|pv-team-4|${d}`),
+  ...['innovation', 'feasibility', 'completeness', 'collaboration']
+    .map((d) => `pv-judge-2|pv-team-4|${d}`),
+  ...['innovation', 'feasibility', 'completeness', 'collaboration']
+    .map((d) => `pv-ent-1|pv-team-3|${d}`),
+  ...['innovation', 'feasibility', 'completeness', 'collaboration']
+    .map((d) => `pv-judge-1|pv-team-2|${d}`),
+]);
+
+function iso(anchorMs, offsetMs) {
+  return new Date(anchorMs + offsetMs).toISOString();
+}
+
+/**
+ * 生成一份完整的预演数据集。
+ * @param {Date|string|number} [anchor] 锚点时刻（默认当前时间）
+ * @returns {object} 按**表名**分组的行数组（列名与生产表逐字一致）
+ */
+export function buildPreviewDataset(anchor = new Date()) {
+  const anchorMs = anchor instanceof Date ? anchor.getTime() : Date.parse(anchor);
+  const nowIso = iso(anchorMs, 0);
+
+  // ── editions ────────────────────────────────────────────────────
+  const editions = [{
+    id: 'pv-ed-1',
+    name: '预演届期 · 华东区 AI 商业黑客松',
+    city: '上海',
+    starts_at: iso(anchorMs, -30 * DAY),
+    ends_at: iso(anchorMs, 30 * DAY),
+    created_at: iso(anchorMs, -30 * DAY),
+  }];
+
+  // ── cities ──────────────────────────────────────────────────────
+  const cities = [{ id: 'pv-city-1', name: '上海', edition_id: 'pv-ed-1' }];
+
+  // ── users ───────────────────────────────────────────────────────
+  // ⚠️ phone 用**不可拨号的占位串**（不是 11 位数字）——
+  //    既不会撞真实号码，也不会被敏感值扫描误判成「疑似真实手机号」。
+  const mkUser = (id, name, extra = {}) => ({
+    id,
+    name,
+    phone: `pv-${id}`,
+    password_hash: 'preview-only-not-a-real-hash',
+    mba_status: 'other',
+    org: null,
+    is_superadmin: 0,
+    active: 1,
+    created_at: iso(anchorMs, -30 * DAY),
+    ...extra,
+  });
+  const users = [
+    mkUser('pv-admin-1', '预演组委会', { is_superadmin: 1, org: '组委会' }),
+    mkUser('pv-judge-1', '预演评委一', { org: '预演企业 A' }),
+    mkUser('pv-judge-2', '预演评委二', { org: '预演企业 B' }),
+    mkUser('pv-judge-3', '预演评委三', { org: '预演企业 C' }),
+    mkUser('pv-ent-1', '预演企业席', { org: '预演企业 D' }),
+    mkUser('pv-obs-1', '预演观察员', { org: '预演媒体' }),
+    ...CAPTAINS.map((id, i) => mkUser(id, `预演队长${i + 1}`, { mba_status: 'mba' })),
+  ];
+
+  // ── task_packages ───────────────────────────────────────────────
+  const taskPackages = CAPTAINS.map((capId, i) => ({
+    id: `pv-tp-${i + 1}`,
+    edition_id: 'pv-ed-1',
+    enterprise_id: null,
+    enterprise_name: `预演企业 ${String.fromCharCode(65 + i)}`,
+    title: `预演任务卡 ${i + 1}`,
+    pain_point: '预演痛点（占位）',
+    expected_delivery: '预演交付物（占位）',
+    acceptance_criteria: '预演验收标准（占位）',
+    grade: 'A',
+    status: 'approved',
+    solvability_score: 3,
+    solvability_grade: 'A',
+    commitment: null,
+    agreement: null,
+    is_free_brief: 0,
+    submitted_by: capId,
+    submitted_at: iso(anchorMs, -29 * DAY),
+    approved_by: 'pv-admin-1',
+    approved_at: iso(anchorMs, -29 * DAY),
+    meta_json: null,
+    deleted_at: null,
+  }));
+
+  // ── teams ───────────────────────────────────────────────────────
+  const teams = CAPTAINS.map((capId, i) => ({
+    id: TEAMS[i],
+    edition_id: 'pv-ed-1',
+    name: `预演战队 ${i + 1}`,
+    captain_id: capId,
+    task_package_id: `pv-tp-${i + 1}`,
+    tier: 'B',
+    status: 'active',
+    milestones_json: null,
+    created_at: iso(anchorMs, -28 * DAY),
+    deleted_at: null,
+  }));
+
+  // ── stages ──────────────────────────────────────────────────────
+  // ⛔ 赛段时间全部相对锚点（见文件头「为什么用相对日期」）
+  // ⚠️ `roster` 是**预演专用标记**（这段开没开打），**不进生产表** ⇒ 单独留在 specs 里，
+  //    不能混进 stages 行（stageReviews / stageJudges / stage_team 都要按它分支）。
+  const stageSpecs = [
+    {
+      id: 'pv-stg-s1', key: 's1', name: '调研', kind: 'initial',
+      starts_at: iso(anchorMs, -14 * DAY), ends_at: iso(anchorMs, -10 * DAY),
+      scoring_config_key: 'initial', roster: true,
+    },
+    {
+      id: 'pv-stg-s2', key: 's2', name: '任务', kind: 'initial',
+      starts_at: iso(anchorMs, -9 * DAY), ends_at: iso(anchorMs, -6 * DAY),
+      scoring_config_key: 'initial', roster: true,
+    },
+    {
+      id: 'pv-stg-s3', key: 's3', name: '开发', kind: 'initial',
+      starts_at: iso(anchorMs, -5 * DAY), ends_at: iso(anchorMs, -3 * DAY),
+      scoring_config_key: 'initial', roster: true,
+    },
+    {
+      id: 'pv-stg-s4', key: 's4', name: '路演', kind: 'final',
+      starts_at: iso(anchorMs, -2 * DAY), ends_at: iso(anchorMs, -1 * DAY),
+      scoring_config_key: 'final', roster: false,
+    },
+    {
+      id: 'pv-stg-s5', key: 's5', name: '落地', kind: 'final',
+      starts_at: iso(anchorMs, 1 * DAY), ends_at: iso(anchorMs, 10 * DAY),
+      scoring_config_key: 'final', roster: true,
+    },
+  ];
+  const stages = stageSpecs.map((s) => ({
+    id: s.id,
+    edition_id: 'pv-ed-1',
+    key: s.key,
+    name: s.name,
+    kind: s.kind,
+    starts_at: s.starts_at,
+    ends_at: s.ends_at,
+    freeze_at: null,
+    scoring_config_key: s.scoring_config_key,
+    status: 'open',
+  }));
+
+  // ── stage_judges / stage_team ───────────────────────────────────
+  const stageJudges = [];
+  const stageTeam = [];
+  for (const s of stageSpecs) {
+    if (!s.roster) continue; // s4：没登记名册 ⇒ 也没派评委（这段还没开打）
+    for (const seat of [...VOTING_SEATS, OBSERVER]) {
+      stageJudges.push({
+        stage_id: s.id,
+        user_id: seat.userId,
+        seat: seat.seat,
+        scope_type: 'edition',
+        scope_id: 'pv-ed-1',
+        assigned_at: iso(anchorMs, -15 * DAY),
+        conflict_declared_at: iso(anchorMs, -15 * DAY),
+        conflict_declaration_id: null,
+      });
+    }
+    for (const teamId of TEAMS) {
+      stageTeam.push({
+        id: `pv-st-${s.key}-${teamId}`,
+        stage_id: s.id,
+        team_id: teamId,
+        registered_at: iso(anchorMs, -15 * DAY),
+      });
+    }
+  }
+
+  // ── stage_reviews ───────────────────────────────────────────────
+  const stageReviews = [];
+  let revSeq = 0;
+  for (const s of stageSpecs) {
+    if (!s.roster) continue;
+    const dims = s.scoring_config_key === 'initial' ? JUDGE_DIMS_INITIAL : JUDGE_DIMS_FINAL;
+    // s5 尚未结束 ⇒ 只给部分评分（评审时能看到「未结束段落的部分数据」长什么样）
+    const partial = s.key === 's5';
+    for (const seat of VOTING_SEATS) {
+      for (const teamId of TEAMS) {
+        for (const dim of dims) {
+          const cellKey = `${seat.userId}|${teamId}|${dim}`;
+          if (s.key === 's2' && S2_MISSING.has(cellKey)) continue; // 故意漏评
+          if (partial && (dim === 'collaboration' || (seat.userId === 'pv-ent-1' && dim === 'feasibility'))) continue;
+          revSeq += 1;
+          stageReviews.push({
+            id: `pv-rev-${String(revSeq).padStart(4, '0')}`,
+            stage_id: s.id,
+            judge_id: seat.userId,
+            team_id: teamId,
+            dimension: dim,
+            raw_score: 60 + ((revSeq * 7) % 35),
+            submitted_at: iso(anchorMs, -12 * DAY),
+            request_id: null,
+            calibrated: 0,
+            deleted_at: null,
+          });
+        }
+      }
+    }
+  }
+
+  // ── leaderboard_snapshots（发榜时刻）────────────────────────────
+  // 一次发榜写 3 个 scope（services/leaderboard.js 的 SCOPES = rank/business/personal），
+  // 它们 created_at 相同 ⇒ 取最早的一条即发榜时刻。
+  const leaderboardSnapshots = [];
+  const snap = (stageId, atIso, seq) => {
+    for (const scope of ['rank', 'business', 'personal']) {
+      leaderboardSnapshots.push({
+        id: `pv-snap-${stageId}-${scope}`,
+        edition_id: 'pv-ed-1',
+        stage_id: stageId,
+        scope,
+        payload_json: JSON.stringify({ preview: true, scope }),
+        created_at: atIso,
+      });
+      seq += 1;
+    }
+    return seq;
+  };
+  // s1：结束 +24h 发榜 ⇒ 按时（时限 72h）
+  snap('pv-stg-s1', iso(anchorMs, -10 * DAY + 24 * HOUR), 0);
+  // s2：结束 +90h 发榜 ⇒ 超期（时限 72h）
+  snap('pv-stg-s2', iso(anchorMs, -6 * DAY + 90 * HOUR), 3);
+  // s3：**不发** ⇒ never_published
+  // s4 / s5：也不发
+
+  return {
+    editions,
+    cities,
+    users,
+    task_packages: taskPackages,
+    teams,
+    stages,
+    stage_judges: stageJudges,
+    stage_team: stageTeam,
+    stage_reviews: stageReviews,
+    leaderboard_snapshots: leaderboardSnapshots,
+    _meta: {
+      anchor: nowIso,
+      note: '预演数据集 —— 装在临时库里（生产同款迁移建的 schema）⇒ 真实数据可直接灌进同一套表',
+      expectedCells: { s1: 80, s2: 80, s3: 80, s5: 64 },
+    },
+  };
+}
+
+export const PREVIEW_SCENARIO = {
+  s1: '名册4队·席位4有投票权+1观察员·评分满格 ⇒ S-8 100% 达标；结束+24h发榜 ⇒ S-9 按时',
+  s2: '同 s1 但故意漏 17 格 ⇒ S-8 78.75% 不达标；结束+90h发榜 ⇒ S-9 超期',
+  s3: '评分满格但从未发榜 ⇒ S-8 达标；S-9 never_published',
+  s4: '没登记名册（还没开打）⇒ S-8 not_applicable；S-9 no_roster',
+  s5: '尚未结束 ⇒ S-9 not_due；S-8 只给了部分评分',
+};
+```
+
+**Step 5: 创建 scripts/preview-seed.js**
+
+`platform/scripts/preview-seed.js`：
+
+```javascript
+#!/usr/bin/env node
+// scripts/preview-seed.js — 建**临时库**并灌入预演数据集（E181，2026-10-27）
+//
+// ⚠️ **这是什么**：一个**临时的库**，schema 由**生产同款迁移**建出来，
+//    数据来自 `db/preview/preview-dataset.js`。
+//    ⇒ 表结构与生产**逐字一致** ⇒ 真实赛事数据到位后**直接灌进同一套表**，
+//      services/readiness.js 的代码**一行都不用改**。
+//    ⇒ 评审时用它看「功能行为是否符合预期」，**不是**用它冒充真实数据。
+//
+// ⛔ **安全闸**：本脚本**只**写 `<platform>/data/preview/preview.db`，
+//    **绝不**碰生产库（`platform/data/app.db`）——
+//    ① 目录名写死成 `preview` 子目录；
+//    ② 若目标目录里已经有 `app.db`（生产库同名）⇒ 拒绝执行；
+//    ③ 每次执行前**重建**（先删旧的 preview.db）⇒ 预演数据永远是最新的那一份。
+//
+// 用法：
+//   node scripts/preview-seed.js              # 用当前时间做锚点
+//   node scripts/preview-seed.js --anchor 2026-10-20T00:00:00Z
+//   node scripts/preview-seed.js --keep       # 不删旧库，直接灌（增量）
+import { existsSync, mkdirSync, rmSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+import { openDatabase } from '../src/db/sqlite.js';
+import { applyMigrations } from '../src/db/migrate.js';
+import { insertDataset } from '../src/db/repo/preview-data.js';
+import { buildPreviewDataset, PREVIEW_SCENARIO } from '../db/preview/preview-dataset.js';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const platformDir = join(here, '..');
+const previewDir = join(platformDir, 'data', 'preview');
+const dbFile = join(previewDir, 'preview.db');
+
+function parseArgs(argv) {
+  const out = { anchor: null, keep: false };
+  for (let i = 0; i < argv.length; i += 1) {
+    if (argv[i] === '--anchor') {
+      const v = argv[i + 1];
+      if (!v || v.startsWith('--')) {
+        console.error('[preview-seed] --anchor 后面必须是 ISO 时间');
+        process.exit(2);
+      }
+      out.anchor = v;
+      i += 1;
+    } else if (argv[i] === '--keep') {
+      out.keep = true;
+    } else {
+      console.error(`[preview-seed] 未知参数：${argv[i]}`);
+      console.error('[preview-seed] 用法：node scripts/preview-seed.js [--anchor <ISO>] [--keep]');
+      process.exit(2);
+    }
+  }
+  return out;
+}
+
+const args = parseArgs(process.argv.slice(2));
+
+// ⛔ 安全闸 ②：目标目录里若有名为 app.db 的东西 ⇒ 那是**生产库** ⇒ 拒绝。
+mkdirSync(previewDir, { recursive: true });
+if (existsSync(join(previewDir, 'app.db'))) {
+  console.error(`[preview-seed] 拒绝执行：${join(previewDir, 'app.db')} 存在（生产库同名）`);
+  process.exit(1);
+}
+// ⛔ 安全闸 ③：默认重建。
+if (!args.keep && existsSync(dbFile)) {
+  for (const suffix of ['', '-wal', '-shm']) {
+    if (existsSync(dbFile + suffix)) rmSync(dbFile + suffix);
+  }
+}
+
+const anchor = args.anchor ? new Date(args.anchor) : new Date();
+if (Number.isNaN(anchor.getTime())) {
+  console.error(`[preview-seed] 锚点时间不可解析：${args.anchor}`);
+  process.exit(2);
+}
+
+const { db, close } = openDatabase({ dataDir: previewDir, filename: 'preview.db' });
+try {
+  const migrated = applyMigrations(db, join(platformDir, 'db', 'migrations'));
+  const data = buildPreviewDataset(anchor);
+
+  // ⚠️ 插入顺序按**外键依赖**：父表先插。
+  //    ⛔ 真正的 INSERT 语句在**仓储层**（src/db/repo/preview-data.js）——
+  //    仓内纪律「SQL 字符串只许住在 src/db/repo/ 下」（test/sql-boundary.test.js 的守卫）。
+  const ORDER = [
+    'editions', 'cities', 'users', 'task_packages', 'teams',
+    'stages', 'stage_judges', 'stage_team', 'stage_reviews', 'leaderboard_snapshots',
+  ];
+  let counts = {};
+  db.exec('BEGIN');
+  try {
+    counts = insertDataset(db, data, ORDER);
+    db.exec('COMMIT');
+  } catch (err) {
+    db.exec('ROLLBACK');
+    throw err;
+  }
+
+  console.log(`[preview-seed] 临时库：${dbFile}`);
+  console.log(`[preview-seed] 迁移版本：${migrated.version}（生产同款迁移 ⇒ 表结构与生产一致）`);
+  console.log(`[preview-seed] 锚点时刻：${data._meta.anchor}`);
+  console.log('[preview-seed] 灌入行数：');
+  for (const t of ORDER) console.log(`    ${t.padEnd(24)} ${counts[t]}`);
+  console.log('[preview-seed] 场景矩阵（评审时对照这个看）：');
+  for (const [k, v] of Object.entries(PREVIEW_SCENARIO)) console.log(`    ${k}: ${v}`);
+  console.log('');
+  console.log('[preview-seed] 下一步：node scripts/preview-report.js');
+} finally {
+  close();
+}
+```
+
+**Step 6: 创建 scripts/preview-report.js**
+
+`platform/scripts/preview-report.js`：
+
+```javascript
+#!/usr/bin/env node
+// scripts/preview-report.js — 打印预演库的**人话报告**（E181，2026-10-27）
+//
+// ⚠️ **这个脚本是给人看的**：它把 S-7~S-10 的四个就绪度闸跑一遍，
+//    然后用**中文**把「哪些赛段达标、哪些没达标、为什么」讲清楚 ——
+//    目的是让**评审**能判断「功能行为是否符合预期」，而不是看一堆数字。
+//
+// ⚠️ **它读的是临时库**（`data/preview/preview.db`，由 preview-seed.js 建）：
+//    schema = 生产同款迁移；数据 = 预演数据集。
+//    ⇒ 真实赛事数据到位后，把同样的表灌满，这个脚本**一个字都不用改**。
+//
+// 用法：
+//   node scripts/preview-report.js
+//   node scripts/preview-report.js --json       # 机器读（结构化）
+import { existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+import { openDatabase } from '../src/db/sqlite.js';
+import { getDefaultRules } from '../src/config.js';
+import { readinessSummary } from '../src/services/readiness.js';
+import { PREVIEW_SCENARIO } from '../db/preview/preview-dataset.js';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const platformDir = join(here, '..');
+const dbFile = join(platformDir, 'data', 'preview', 'preview.db');
+
+const asJson = process.argv.includes('--json');
+
+if (!existsSync(dbFile)) {
+  console.error(`[preview-report] 临时库不存在：${dbFile}`);
+  console.error('[preview-report] 先跑：node scripts/preview-seed.js');
+  process.exit(2);
+}
+
+const rules = getDefaultRules();
+const { db, close } = openDatabase({ dataDir: join(platformDir, 'data', 'preview'), filename: 'preview.db' });
+try {
+  const now = new Date().toISOString();
+  const summary = readinessSummary({ db, editionId: 'pv-ed-1', rules, now });
+
+  if (asJson) {
+    console.log(JSON.stringify(summary, null, 2));
+    process.exit(0);
+  }
+
+  const yesNo = (v) => (v === true ? '✅ 达标' : v === false ? '❌ 未达标' : '⚪ 不可判定');
+  console.log('══════════════════════════════════════════════════════════════');
+  console.log('  S-7 ~ S-10 业务就绪度 · 预演报告');
+  console.log(`  临时库：${dbFile}`);
+  console.log(`  锚点时刻：${now}`);
+  console.log('══════════════════════════════════════════════════════════════');
+  console.log('');
+  console.log(`【S-7 规模达标】${yesNo(summary.s7.met)}`);
+  console.log(`   队伍数 ${summary.s7.teamCount} 支 / 门槛 ${summary.s7.thresholdTeams} 支`);
+  console.log(`   注：${summary.s7.note}`);
+  console.log('');
+
+  console.log(`【S-8 评审无漏评】${yesNo(summary.s8.met)}`);
+  console.log(`   赛段 ${summary.s8.stageCount} 个，其中可判定 ${summary.s8.measurableCount} 个`);
+  for (const s of summary.s8.stages) {
+    if (s.status === 'not_applicable') {
+      console.log(`   · ${s.stageKey} ${s.stageName}：⚪ 不可判定 —— ${s.statusNote}`);
+      continue;
+    }
+    const mark = s.complete ? '✅' : '❌';
+    console.log(`   · ${s.stageKey} ${s.stageName}：${mark} 覆盖率 ${s.coveragePercent}%`
+      + `（已交 ${s.submitted} / 应交 ${s.expected}，门槛 ${s.thresholdPercent}%）`
+      + (s.missingCount ? `，漏评 ${s.missingCount} 格` : ''));
+    if (s.overSubmitted) console.log('     ⚠️ ' + s.warnings.join(' / '));
+  }
+  console.log('');
+
+  console.log(`【S-9 按时发榜】${yesNo(summary.s9.met)}`);
+  console.log(`   时限 ${summary.s9.deadlineHours} 小时；超期 ${summary.s9.overdueCount} 个赛段`);
+  for (const s of summary.s9.stages) {
+    const mark = s.overdue ? '❌' : '✅';
+    const delay = s.delayHours === null ? '—' : `${s.delayHours}h`;
+    console.log(`   · ${s.stageKey} ${s.stageName}：${mark} 状态=${s.state} 延迟=${delay}`);
+    console.log(`     ${s.note}`);
+  }
+  console.log('');
+
+  console.log(`【S-10 闭环时效与产出】⚪ ${summary.s10.note}`);
+  console.log('');
+
+  console.log('── 场景矩阵对照（预演数据应当落在这五个分支上）──────────────');
+  for (const [k, v] of Object.entries(PREVIEW_SCENARIO)) console.log(`   ${k}: ${v}`);
+  console.log('');
+  console.log('⚠️ 这些是**预演数据**，不是真实赛事数据 —— 用途是评审功能行为是否符合预期。');
+  console.log('   真实数据到位后灌进同一套表（schema 不变）⇒ 闸的代码一行都不用改。');
+} finally {
+  close();
+}
+```
+
+**Step 7: 创建 test/readiness.test.js**
+
+`platform/test/readiness.test.js`：
+
+```javascript
+// platform/test/readiness.test.js —— S-8 评审覆盖率闸 + S-9 按时发榜闸（E181，2026-10-27）
+//
+// 规则溯源：
+//   - 设计文档 §1.3.1「S-7~S-10：怎么量、今天有没有机器检查」
+//     （spec 原文：S-8「⚠️ **部分** …但**没有**「漏评覆盖率」的汇总闸 ⇒ 待补」；
+//      S-9「⚠️ **部分**：发榜时刻已入库，但**没有**「超 72 小时」的告警 ⇒ 待补」）
+//   - 阈值来源：rules/compliance.json 的 `readiness` 段（**代码不硬编码数字**）
+//   - 三态状态码 → 设计文档 §7.3；可见性在 API 层过滤 → 设计文档 §6.6
+//
+// ⚠️ **判别性要求**（本仓纪律：用例必须能抓住「把修复去掉」）：
+//   每条用例都钉住**具体数字**（应交格子数 = 席位数 × 队数 × 维度数、覆盖率百分比、
+//   超期小时数），而不是钉「不是 undefined」那种糊弄断言。
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { openDatabase } from '../src/db/sqlite.js';
+import { applyMigrations } from '../src/db/migrate.js';
+import { loadRules, validateRules } from '../src/config.js';
+import { createApp } from '../src/server.js';
+import { createSession } from '../src/auth/session.js';
+import { createUser, getUserById, setSuperadmin } from '../src/db/repo/users.js';
+import { createEdition } from '../src/db/repo/editions.js';
+import { insertStage, assignStageJudge } from '../src/db/repo/stages.js';
+import { insertTeam } from '../src/db/repo/teams.js';
+import { registerStageTeams } from '../src/db/repo/stage-teams.js';
+import { insertReview } from '../src/db/repo/reviews.js';
+import { insertCapability, insertRoleCapability } from '../src/db/repo/capabilities.js';
+import { insertRole, insertUserRole } from '../src/db/repo/roles.js';
+import { readinessSummary } from '../src/services/readiness.js';
+import { callJson } from '../test-helpers/http-call.js';
+import { isolateTempDir } from '../test-helpers/tmp.js';
+
+isolateTempDir();
+
+const here = dirname(fileURLToPath(import.meta.url));
+const migrationsDir = join(here, '..', 'db', 'migrations');
+const rulesDir = join(here, '..', 'rules');
+const webDir = join(here, '..', 'web');
+const NOW = '2026-10-20T12:00:00.000Z';
+
+// 初赛评委席维度（rules/scoring-initial.json）—— ⛔ 不含 enterprise / self 维度
+// （那两个维度走企业确认与自评，**不落在 stage_reviews**）。
+const JUDGE_DIMS_INITIAL = ['track_fit', 'innovation', 'feasibility', 'completeness', 'collaboration'];
+
+function setup() {
+  const dataDir = mkdtempSync(join(tmpdir(), 'hks-ready-'));
+  const { db, close } = openDatabase({ dataDir });
+  applyMigrations(db, migrationsDir);
+  const { rules } = loadRules(rulesDir);
+  const app = createApp({ db, rules, webDir });
+  return { db, close, dataDir, app, rules };
+}
+
+/**
+ * 建一个「1 届 · 2 队 · 2 个评委席 + 1 个观察员」的骨架。
+ * ⚠️ 观察员**无投票权**（R-JDG-11）⇒ 不进应交格子。
+ */
+function seedStage(db, {
+  key = 's1', kind = 'initial', scoringConfigKey = 'initial',
+  endsAt = '2026-10-10', teamCount = 2, withRoster = true, withSeats = true,
+} = {}) {
+  const captain = createUser(db, { name: `队长${key}`, phone: `1390000${key.length}${key.charCodeAt(1)}`, password: 'pw' });
+  const judgeA = createUser(db, { name: `评委A${key}`, phone: `1391000${key.length}${key.charCodeAt(1)}`, password: 'pw' });
+  const judgeB = createUser(db, { name: `评委B${key}`, phone: `1392000${key.length}${key.charCodeAt(1)}`, password: 'pw' });
+  const observer = createUser(db, { name: `观察员${key}`, phone: `1393000${key.length}${key.charCodeAt(1)}`, password: 'pw' });
+
+  const edition = createEdition(db, {
+    name: `届${key}`, city: '上海', startsAt: '2026-10-01', endsAt: '2026-11-30', now: NOW,
+  });
+  const stage = insertStage(db, {
+    editionId: edition.id, key, name: `赛段${key}`, kind,
+    startsAt: '2026-10-01', endsAt, scoringConfigKey, status: 'open', now: NOW,
+  });
+  const teams = [];
+  for (let i = 0; i < teamCount; i += 1) {
+    teams.push(insertTeam(db, {
+      editionId: edition.id, name: `${key}队${i + 1}`, captainId: captain.id, status: 'active', now: NOW,
+    }));
+  }
+  if (withRoster) registerStageTeams(db, { stageId: stage.id, teamIds: teams.map((t) => t.id), now: NOW });
+  if (withSeats) {
+    assignStageJudge(db, { stageId: stage.id, userId: judgeA.id, seat: 'judge', now: NOW });
+    assignStageJudge(db, { stageId: stage.id, userId: judgeB.id, seat: 'judge', now: NOW });
+    assignStageJudge(db, { stageId: stage.id, userId: observer.id, seat: 'observer', now: NOW });
+  }
+  return { edition, stage, teams, judgeA, judgeB, observer, captain };
+}
+
+/** 给某赛段铺满评分（返回已插行数）。 */
+function fillReviews(db, stage, teams, judges, dims = JUDGE_DIMS_INITIAL, now = NOW) {
+  let n = 0;
+  for (const j of judges) {
+    for (const t of teams) {
+      for (const d of dims) {
+        insertReview(db, { stageId: stage.id, judgeId: j.id, teamId: t.id, dimension: d, rawScore: 80, now });
+        n += 1;
+      }
+    }
+  }
+  return n;
+}
+
+
+/** 走**公开 API**取某个赛段的覆盖率（⛔ 不直接调内部函数 —— 内部函数是模块私有的）。 */
+function coverageOf(db, stageId, rules, now = NOW) {
+  const sum = readinessSummary({ db, rules, now });
+  return sum.s8.stages.find((s) => s.stageId === stageId);
+}
+
+/** 走**公开 API**取某个赛段的发榜时限行。 */
+function deadlineOf(db, stageId, rules, now = NOW) {
+  const sum = readinessSummary({ db, rules, now });
+  return sum.s9.stages.find((s) => s.stageId === stageId);
+}
+
+// ── S-8 ──────────────────────────────────────────────────────────────
+
+test('S-8：评分铺满 ⇒ 覆盖率 100%，且**观察员不进应交格子**', () => {
+  const s = setup();
+  try {
+    const f = seedStage(s.db, { key: 's1', teamCount: 2 });
+    // 2 个评委席 × 2 队 × 5 个评委席维度 = 20 格
+    // ⚠️ 观察员**不算**（R-JDG-11：无投票权）⇒ 若误把它算进去，应交会变成 30
+    fillReviews(s.db, f.stage, f.teams, [f.judgeA, f.judgeB]);
+
+    const cov = coverageOf(s.db, f.stage.id, s.rules);
+    assert.equal(cov.status, 'measurable');
+    assert.equal(cov.expected, 20, '应交格子必须是 席位数(2) × 队数(2) × 评委席维度数(5)');
+    assert.equal(cov.submitted, 20);
+    assert.equal(cov.coveragePercent, 100);
+    assert.equal(cov.complete, true);
+    assert.equal(cov.missingCount, 0);
+  } finally {
+    s.close();
+  }
+});
+
+test('S-8：漏评 ⇒ 覆盖率按缺口算，低于门槛即**不达标**，且 missing 清单可用', () => {
+  const s = setup();
+  try {
+    const f = seedStage(s.db, { key: 's1', teamCount: 2 });
+    // 只铺 1 个评委 ⇒ 10 / 20 = 50% < 90%
+    fillReviews(s.db, f.stage, f.teams, [f.judgeA]);
+
+    const cov = coverageOf(s.db, f.stage.id, s.rules);
+    assert.equal(cov.expected, 20);
+    assert.equal(cov.submitted, 10);
+    assert.equal(cov.coveragePercent, 50);
+    assert.equal(cov.complete, false, '50% < 门槛 90% ⇒ 必须判不达标');
+    assert.equal(cov.missingCount, 10, '漏评 10 格');
+    assert.ok(cov.missing.length > 0, '必须给出漏评清单（评审要知道谁没交）');
+    assert.ok(cov.missing.every((m) => m.judgeId && m.teamId && m.dimension));
+  } finally {
+    s.close();
+  }
+});
+
+test('S-8：**名册未登记** ⇒ not_applicable（这段还没开打，不是「全部漏评」）', () => {
+  const s = setup();
+  try {
+    const f = seedStage(s.db, { key: 's4', teamCount: 2, withRoster: false });
+    const cov = coverageOf(s.db, f.stage.id, s.rules);
+    assert.equal(cov.status, 'not_applicable');
+    assert.equal(cov.coveragePercent, null, '⛔ 不可判定时绝不能返回 100%（那会把「没开打」说成「都交了」）');
+    assert.equal(cov.complete, false);
+    assert.ok(cov.statusNote && cov.statusNote.includes('名册'), '必须写明为什么不可判定');
+  } finally {
+    s.close();
+  }
+});
+
+test('S-8：**没有投票权席位** ⇒ 应交 0 格 ⇒ 不可判定（不得返回 100%）', () => {
+  const s = setup();
+  try {
+    const f = seedStage(s.db, { key: 's5', teamCount: 2, withSeats: false });
+    const cov = coverageOf(s.db, f.stage.id, s.rules);
+    assert.equal(cov.status, 'not_applicable');
+    assert.equal(cov.coveragePercent, null);
+    assert.equal(cov.expected, 0);
+  } finally {
+    s.close();
+  }
+});
+
+test('S-8：阈值来自 rules（改阈值 ⇒ 结论跟着变；代码里不硬编码）', () => {
+  const s = setup();
+  try {
+    const f = seedStage(s.db, { key: 's1', teamCount: 2 });
+    fillReviews(s.db, f.stage, f.teams, [f.judgeA]); // 10 / 20 = 50%
+
+    const cov = coverageOf(s.db, f.stage.id, s.rules);
+    assert.equal(cov.complete, false, '门槛 90% ⇒ 50% 不达标');
+    assert.equal(cov.thresholdPercent, 90);
+
+    // 把门槛降到 40% ⇒ 同样的数据应当判达标（证明阈值是配置驱动的）
+    const lax = structuredClone(s.rules);
+    lax.compliance.readiness.minReviewCoveragePercent = 40;
+    const cov2 = coverageOf(s.db, f.stage.id, lax);
+    assert.equal(cov2.complete, true, '门槛改成 40% ⇒ 50% 必须判达标');
+  } finally {
+    s.close();
+  }
+});
+
+// ── S-9 ──────────────────────────────────────────────────────────────
+
+function seedSnapshot(db, editionId, stageId, createdAt) {
+  for (const scope of ['rank', 'business', 'personal']) {
+    db.prepare(
+      'INSERT INTO leaderboard_snapshots (id, edition_id, stage_id, scope, payload_json, created_at) VALUES (?,?,?,?,?,?)',
+    ).run(`snap-${stageId}-${scope}`, editionId, stageId, scope, '{}', createdAt);
+  }
+}
+
+test('S-9：结束 +24h 发榜 ⇒ 按时（不超期）', () => {
+  const s = setup();
+  try {
+    const f = seedStage(s.db, { key: 's1', endsAt: '2026-10-10' });
+    seedSnapshot(s.db, f.edition.id, f.stage.id, '2026-10-11T00:00:00.000Z'); // 结束 +24h
+    const out = readinessSummary({ db: s.db, rules: s.rules, now: '2026-10-20T12:00:00.000Z' }).s9;
+    const row = out.stages.find((x) => x.stageId === f.stage.id);
+    assert.equal(row.state, 'published');
+    assert.equal(row.overdue, false);
+    assert.equal(row.delayHours, 24);
+    assert.equal(out.overdueCount, 0);
+  } finally {
+    s.close();
+  }
+});
+
+test('S-9：结束 +90h 发榜 ⇒ **超期**（时限 72h），且延迟小时数报得出来', () => {
+  const s = setup();
+  try {
+    const f = seedStage(s.db, { key: 's2', endsAt: '2026-10-10' });
+    seedSnapshot(s.db, f.edition.id, f.stage.id, '2026-10-13T18:00:00.000Z'); // 结束 +90h
+    const out = readinessSummary({ db: s.db, rules: s.rules, now: '2026-10-20T12:00:00.000Z' }).s9;
+    const row = out.stages.find((x) => x.stageId === f.stage.id);
+    assert.equal(row.state, 'late');
+    assert.equal(row.overdue, true);
+    assert.equal(row.delayHours, 90);
+    assert.equal(out.overdueCount, 1);
+    assert.ok(out.overdueStageIds.includes(f.stage.id));
+  } finally {
+    s.close();
+  }
+});
+
+test('S-9：结束 72h 仍**从未发榜** ⇒ 判 never_published 并计入超期', () => {
+  const s = setup();
+  try {
+    const f = seedStage(s.db, { key: 's3', endsAt: '2026-10-10' });
+    const out = readinessSummary({ db: s.db, rules: s.rules, now: '2026-10-13T12:00:00.000Z' }).s9;
+    const row = out.stages.find((x) => x.stageId === f.stage.id);
+    assert.equal(row.state, 'never_published');
+    assert.equal(row.overdue, true);
+    assert.equal(row.publishedAt, null);
+    assert.equal(row.delayHours, 84, '结束 10-10 00:00 → now 10-13 12:00 = 84 小时');
+  } finally {
+    s.close();
+  }
+});
+
+test('S-9：赛段**尚未结束** ⇒ not_due，不算超期', () => {
+  const s = setup();
+  try {
+    const f = seedStage(s.db, { key: 's5', endsAt: '2026-12-01' });
+    const out = readinessSummary({ db: s.db, rules: s.rules, now: '2026-10-20T12:00:00.000Z' }).s9;
+    const row = out.stages.find((x) => x.stageId === f.stage.id);
+    assert.equal(row.state, 'not_due');
+    assert.equal(row.overdue, false);
+  } finally {
+    s.close();
+  }
+});
+
+test('S-9：**名册未登记**（这段没开打）⇒ 不计入超期', () => {
+  const s = setup();
+  try {
+    const f = seedStage(s.db, { key: 's4', endsAt: '2026-10-10', withRoster: false });
+    const out = readinessSummary({ db: s.db, rules: s.rules, now: '2026-10-20T12:00:00.000Z' }).s9;
+    const row = out.stages.find((x) => x.stageId === f.stage.id);
+    assert.equal(row.state, 'no_roster');
+    assert.equal(row.overdue, false, '没开打的赛段不该被判「超期没发榜」');
+    assert.equal(out.overdueCount, 0);
+  } finally {
+    s.close();
+  }
+});
+
+test('S-9：同一赛段**发榜两次** ⇒ 判**首次**发榜时刻（重发不掩盖首发的按时性）', () => {
+  const s = setup();
+  try {
+    const f = seedStage(s.db, { key: 's1', endsAt: '2026-10-10' });
+    // 首发 +24h（按时）；重发 +100h（超期）
+    // ⚠️ 若闸取「最后一条快照」⇒ 会得出 100h ⇒ 误判超期 ⇒ 这条用例必须能抓住它。
+    seedSnapshot(s.db, f.edition.id, f.stage.id, '2026-10-11T00:00:00.000Z');
+    for (const scope of ['rank', 'business', 'personal']) {
+      s.db.prepare(
+        'INSERT INTO leaderboard_snapshots (id, edition_id, stage_id, scope, payload_json, created_at) VALUES (?,?,?,?,?,?)',
+      ).run(`snap2-${f.stage.id}-${scope}`, f.edition.id, f.stage.id, scope, '{}', '2026-10-14T04:00:00.000Z');
+    }
+    const row = deadlineOf(s.db, f.stage.id, s.rules, '2026-10-20T12:00:00.000Z');
+    assert.equal(row.publishedAt, '2026-10-11T00:00:00.000Z', '必须取**首次**发榜时刻');
+    assert.equal(row.delayHours, 24);
+    assert.equal(row.overdue, false, '首发按时 ⇒ 不得被后来的重发拖成超期');
+  } finally {
+    s.close();
+  }
+});
+
+test('S-9：时限来自 rules（改时限 ⇒ 超期判定跟着变）', () => {
+  const s = setup();
+  try {
+    const f = seedStage(s.db, { key: 's2', endsAt: '2026-10-10' });
+    seedSnapshot(s.db, f.edition.id, f.stage.id, '2026-10-12T00:00:00.000Z'); // 结束 +48h
+    const out = readinessSummary({ db: s.db, rules: s.rules, now: '2026-10-20T12:00:00.000Z' }).s9;
+    assert.equal(out.stages.find((x) => x.stageId === f.stage.id).overdue, false, '48h < 72h ⇒ 不超期');
+
+    const lax = structuredClone(s.rules);
+    lax.compliance.readiness.publishDeadlineHours = 24;
+    const out2 = readinessSummary({ db: s.db, rules: lax, now: '2026-10-20T12:00:00.000Z' }).s9;
+    assert.equal(out2.stages.find((x) => x.stageId === f.stage.id).overdue, true, '时限改成 24h ⇒ 48h 必须超期');
+  } finally {
+    s.close();
+  }
+});
+
+// ── 配置层机器闸 ──────────────────────────────────────────────────────
+
+test('配置闸：readiness 三个阈值非法 ⇒ validateRules 报错（拒绝启动）', () => {
+  const { rules } = loadRules(rulesDir);
+  const bad = structuredClone(rules);
+  bad.compliance.readiness.minReviewCoveragePercent = 0;
+  bad.compliance.readiness.publishDeadlineHours = -1;
+  bad.compliance.readiness.minTeamsForScale = 0;
+  const errs = validateRules(bad);
+  assert.ok(errs.some((e) => e.includes('minReviewCoveragePercent')), '覆盖率下限 0 必须报错');
+  assert.ok(errs.some((e) => e.includes('publishDeadlineHours')), '时限负数必须报错');
+  assert.ok(errs.some((e) => e.includes('minTeamsForScale')), '规模门槛 0 必须报错');
+});
+
+test('配置闸：覆盖率下限 > 100 也必须报错（否则闸永远红）', () => {
+  const { rules } = loadRules(rulesDir);
+  const bad = structuredClone(rules);
+  bad.compliance.readiness.minReviewCoveragePercent = 101;
+  assert.ok(validateRules(bad).some((e) => e.includes('minReviewCoveragePercent')));
+});
+
+// ── HTTP 端点 ────────────────────────────────────────────────────────
+
+function seedCommittee(db) {
+  const admin = createUser(db, { name: '组委会', phone: '13700000001', password: 'pw' });
+  setSuperadmin(db, admin.id);
+  const adminUser = getUserById(db, admin.id);
+  const plain = createUser(db, { name: '普通用户', phone: '13700000002', password: 'pw' });
+  insertCapability(db, 'audit:read', '读取审计与计算快照');
+  insertRole(db, 'admin', '组委会');
+  insertRoleCapability(db, 'admin', 'audit:read');
+  insertUserRole(db, plain.id, 'admin');
+  return { admin: adminUser, plain };
+}
+
+test('HTTP：GET /api/readiness 未登录 ⇒ 401', async () => {
+  const s = setup();
+  try {
+    const res = await callJson(s.app, 'GET', '/api/readiness');
+    assert.equal(res.status, 401);
+  } finally {
+    s.close();
+  }
+});
+
+test('HTTP：GET /api/readiness 登录但无 audit:read ⇒ 403（**不是** 200+空集）', async () => {
+  const s = setup();
+  try {
+    const outsider = createUser(s.db, { name: '路人', phone: '13700000003', password: 'pw' });
+    const token = createSession(s.db, outsider.id).token;
+    const res = await callJson(s.app, 'GET', '/api/readiness', { token });
+    // ⛔ 空集会被读成「各项都达标」⇒ 必须 403
+    assert.equal(res.status, 403);
+  } finally {
+    s.close();
+  }
+});
+
+test('HTTP：GET /api/readiness 组委会 ⇒ 200 且给出 S-7~S-10 四段结构', async () => {
+  const s = setup();
+  try {
+    const { admin } = seedCommittee(s.db);
+    const token = createSession(s.db, admin.id).token;
+    const res = await callJson(s.app, 'GET', '/api/readiness', { token });
+    assert.equal(res.status, 200);
+    const body = res.json;
+    for (const k of ['s7', 's8', 's9', 's10']) {
+      assert.ok(body[k], `返回体必须含 ${k} 段`);
+    }
+    assert.equal(typeof body.s7.teamCount, 'number');
+    assert.equal(typeof body.s9.overdueCount, 'number');
+    assert.equal(body.s10.met, null, 'S-10 需要真实赛事数据 ⇒ 不得假装判达标');
+  } finally {
+    s.close();
+  }
+});
+
+test('HTTP：GET /api/readiness?editionId=不存在 ⇒ 404（不静默退回「当届」）', async () => {
+  const s = setup();
+  try {
+    const { admin } = seedCommittee(s.db);
+    const token = createSession(s.db, admin.id).token;
+    const res = await callJson(s.app, 'GET', '/api/readiness?editionId=ed-not-exist', { token });
+    assert.equal(res.status, 404);
+  } finally {
+    s.close();
+  }
+});
+
+// ── 汇总 ─────────────────────────────────────────────────────────────
+
+test('汇总：S-8 有任何一个赛段不达标 ⇒ 整体不达标；S-9 超期数 > 0 ⇒ 不达标', () => {
+  const s = setup();
+  try {
+    const f1 = seedStage(s.db, { key: 's1', teamCount: 2 });
+    fillReviews(s.db, f1.stage, f1.teams, [f1.judgeA, f1.judgeB]); // 满覆盖
+    const f2 = seedStage(s.db, { key: 's2', teamCount: 2 });
+    fillReviews(s.db, f2.stage, f2.teams, [f2.judgeA]); // 半覆盖 ⇒ 50%
+
+    const sum = readinessSummary({ db: s.db, rules: s.rules, now: NOW });
+    assert.equal(sum.s8.met, false, '有一个赛段不达标 ⇒ 整体不达标');
+    assert.equal(sum.s8.worstCoveragePercent, 50, '最差赛段就是那个 50% 的');
+    assert.equal(sum.s8.worstStageId, f2.stage.id);
+    assert.equal(sum.s7.teamCount, 4, '两届各 2 队 ⇒ 共 4 支（seedStage 每建一个赛段建一届）');
+  } finally {
+    s.close();
+  }
+});
+```
+
+**Step 8: 创建 test/audit-filter.test.js**
+
+`platform/test/audit-filter.test.js`：
+
+```javascript
+// platform/test/audit-filter.test.js —— 审计/复核/申诉三端点的过滤键闸（E181 · A3，2026-10-27）
+//
+// 规则溯源：
+//   - 设计文档 §7.3 三态状态码（未登录 401 / 无权限 403 / 不满足 200+空集 / 单条 404）
+//   - 设计文档 §6.6「可见性在 API 层过滤」
+//   - 缺陷（E181 实测）：`pickFilter` 用**一份并集白名单**给三个端点用
+//     ⇒ `/api/audit/log?status=open` 被**接受**但仓储层不认识 status ⇒ **过滤被静默丢弃**
+//     ⇒ 调用方拿到**未筛选的全量**却以为自己筛过了。
+//
+// ⚠️ **判别性要求**：
+//   ① 「未知键 ⇒ 400」用例必须真的红在「400」这个数字上（不是「非 200」）；
+//   ② 「已知键 ⇒ 真的过滤」用例必须断言**返回行数变少**，否则把过滤实现抽掉也测不出来。
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { openDatabase } from '../src/db/sqlite.js';
+import { applyMigrations } from '../src/db/migrate.js';
+import { loadRules } from '../src/config.js';
+import { createApp } from '../src/server.js';
+import { createSession } from '../src/auth/session.js';
+import { createUser, getUserById, setSuperadmin } from '../src/db/repo/users.js';
+import { insertCapability, insertRoleCapability } from '../src/db/repo/capabilities.js';
+import { insertRole, insertUserRole } from '../src/db/repo/roles.js';
+import { insertAuditLogRow } from '../src/db/repo/audit-log.js';
+import { createFlag } from '../src/db/repo/flags.js';
+import { insertAppeal } from '../src/db/repo/appeals.js';
+import { callJson } from '../test-helpers/http-call.js';
+import { isolateTempDir } from '../test-helpers/tmp.js';
+
+isolateTempDir();
+
+const here = dirname(fileURLToPath(import.meta.url));
+const migrationsDir = join(here, '..', 'db', 'migrations');
+const rulesDir = join(here, '..', 'rules');
+const webDir = join(here, '..', 'web');
+const NOW = '2026-10-20T12:00:00.000Z';
+
+function setup() {
+  const dataDir = mkdtempSync(join(tmpdir(), 'hks-auditfilter-'));
+  const { db, close } = openDatabase({ dataDir });
+  applyMigrations(db, migrationsDir);
+  const { rules } = loadRules(rulesDir);
+  const app = createApp({ db, rules, webDir });
+  const admin = createUser(db, { name: '组委会', phone: '13800000001', password: 'pw' });
+  setSuperadmin(db, admin.id);
+  const adminUser = getUserById(db, admin.id);
+  insertCapability(db, 'audit:read', '读取审计与计算快照');
+  insertCapability(db, 'audit:write', '裁决复核项与申诉');
+  insertRole(db, 'admin', '组委会');
+  insertRoleCapability(db, 'admin', 'audit:read');
+  insertRoleCapability(db, 'admin', 'audit:write');
+  insertUserRole(db, adminUser.id, 'admin');
+  const token = createSession(db, adminUser.id).token;
+  return { db, close, dataDir, app, rules, admin: adminUser, token };
+}
+
+/** 造两条不同 action 的审计行。 */
+function seedAuditRows(db, actorId) {
+  insertAuditLogRow(db, {
+    actorId, action: 'leaderboard.publish', entity: 'stage', entityId: 'st1',
+    detailJson: '{}', createdAt: '2026-10-20T10:00:00.000Z',
+  });
+  insertAuditLogRow(db, {
+    actorId, action: 'flag.resolve', entity: 'flag', entityId: 'f1',
+    detailJson: '{}', createdAt: '2026-10-20T11:00:00.000Z',
+  });
+}
+
+test('/api/audit/log：未知过滤键 ⇒ 400（不再**静默丢弃**过滤条件）', async () => {
+  const s = setup();
+  try {
+    seedAuditRows(s.db, s.admin.id);
+    // ⛔ `status` 是**复核队列**的过滤键，审计日志端点**不支持** ⇒ 之前被静默忽略
+    const res = await callJson(s.app, 'GET', '/api/audit/log?status=open', { token: s.token });
+    assert.equal(res.status, 400, '未知过滤键必须 400，而不是返回未筛选的全量');
+    assert.ok(res.json?.error?.message?.includes('status'), '错误文案要点名是哪个参数');
+  } finally {
+    s.close();
+  }
+});
+
+test('/api/audit/log：拼错的参数名 ⇒ 400', async () => {
+  const s = setup();
+  try {
+    const res = await callJson(s.app, 'GET', '/api/audit/log?acton=leaderboard.publish', { token: s.token });
+    assert.equal(res.status, 400);
+  } finally {
+    s.close();
+  }
+});
+
+test('/api/audit/log：支持的过滤键 ⇒ 200 且**真的过滤**（行数变少）', async () => {
+  const s = setup();
+  try {
+    seedAuditRows(s.db, s.admin.id);
+    const all = await callJson(s.app, 'GET', '/api/audit/log', { token: s.token });
+    assert.equal(all.status, 200);
+    assert.equal(all.json.rows.length, 2, '先确认有两条');
+
+    const filtered = await callJson(s.app, 'GET', '/api/audit/log?action=flag.resolve', { token: s.token });
+    assert.equal(filtered.status, 200);
+    assert.equal(filtered.json.rows.length, 1, '按 action 过滤后必须只剩一条');
+    assert.equal(filtered.json.rows[0].action, 'flag.resolve');
+  } finally {
+    s.close();
+  }
+});
+
+test('/api/audit/log：`entity` 过滤键同样生效', async () => {
+  const s = setup();
+  try {
+    seedAuditRows(s.db, s.admin.id);
+    const res = await callJson(s.app, 'GET', '/api/audit/log?entity=stage', { token: s.token });
+    assert.equal(res.status, 200);
+    assert.equal(res.json.rows.length, 1);
+    assert.equal(res.json.rows[0].entity, 'stage');
+  } finally {
+    s.close();
+  }
+});
+
+test('/api/audit/log：非法分页参数（limit=abc）**仍然 200**（既有契约不破）', async () => {
+  const s = setup();
+  try {
+    seedAuditRows(s.db, s.admin.id);
+    // ⚠️ 这条是既有契约（test/audit-api.test.js 钉住「不得打成 500」）：
+    //    非法 limit/offset 是**静默忽略**，不是 400 —— 本次修复只治「过滤键静默失效」。
+    const res = await callJson(s.app, 'GET', '/api/audit/log?limit=abc&offset=xyz', { token: s.token });
+    assert.equal(res.status, 200);
+  } finally {
+    s.close();
+  }
+});
+
+test('/api/audit/flags：未知过滤键 ⇒ 400（entity 不属于复核队列）', async () => {
+  const s = setup();
+  try {
+    createFlag(s.db, { stageId: 'st1', kind: 'low_variance', detail: { judgeId: 'j1' } });
+    const res = await callJson(s.app, 'GET', '/api/audit/flags?entity=stage', { token: s.token });
+    assert.equal(res.status, 400);
+  } finally {
+    s.close();
+  }
+});
+
+test('/api/audit/flags：`kind` / `status` 过滤键 ⇒ 200 且**真的过滤**', async () => {
+  const s = setup();
+  try {
+    createFlag(s.db, { stageId: 'st1', kind: 'low_variance', detail: { judgeId: 'j1' } });
+    createFlag(s.db, { stageId: 'st1', kind: 'burst_submit', detail: { subjectId: 'j2' } });
+
+    const all = await callJson(s.app, 'GET', '/api/audit/flags', { token: s.token });
+    assert.equal(all.status, 200);
+    assert.equal(all.json.rows.length, 2, '先确认有两条');
+
+    const byKind = await callJson(s.app, 'GET', '/api/audit/flags?kind=low_variance', { token: s.token });
+    assert.equal(byKind.status, 200);
+    assert.equal(byKind.json.rows.length, 1, '按 kind 过滤后必须只剩一条');
+    assert.equal(byKind.json.rows[0].kind, 'low_variance');
+
+    const byStatus = await callJson(s.app, 'GET', '/api/audit/flags?status=open', { token: s.token });
+    assert.equal(byStatus.status, 200);
+    assert.ok(Array.isArray(byStatus.json.rows));
+  } finally {
+    s.close();
+  }
+});
+
+test('/api/appeals：未知过滤键 ⇒ 400（action 不属于申诉列表）', async () => {
+  const s = setup();
+  try {
+    insertAppeal(s.db, { subjectType: 'team_result', subjectId: 'st1:t1', filedBy: s.admin.id, reason: '算错了', now: NOW });
+    const res = await callJson(s.app, 'GET', '/api/appeals?action=leaderboard.publish', { token: s.token });
+    assert.equal(res.status, 400);
+  } finally {
+    s.close();
+  }
+});
+
+test('/api/appeals：`subjectType` 过滤键 ⇒ 200 且**真的过滤**', async () => {
+  const s = setup();
+  try {
+    insertAppeal(s.db, { subjectType: 'team_result', subjectId: 'st1:t1', filedBy: s.admin.id, reason: '算错了', now: NOW });
+    insertAppeal(s.db, { subjectType: 'registration', subjectId: 'r1', filedBy: s.admin.id, reason: '报名有问题', now: NOW });
+
+    const all = await callJson(s.app, 'GET', '/api/appeals', { token: s.token });
+    assert.equal(all.status, 200);
+    assert.equal(all.json.rows.length, 2, '先确认有两条');
+
+    const filtered = await callJson(s.app, 'GET', '/api/appeals?subjectType=registration', { token: s.token });
+    assert.equal(filtered.status, 200);
+    assert.equal(filtered.json.rows.length, 1, '按 subjectType 过滤后必须只剩一条');
+    assert.equal(filtered.json.rows[0].subjectType, 'registration');
+  } finally {
+    s.close();
+  }
+});
+
+test('三端点的白名单**互不相同**（同一个键在另一个端点必须 400）', async () => {
+  const s = setup();
+  try {
+    // action 只属于 audit/log；kind 只属于 flags；subjectType 只属于 appeals
+    assert.equal((await callJson(s.app, 'GET', '/api/audit/log?kind=x', { token: s.token })).status, 400);
+    assert.equal((await callJson(s.app, 'GET', '/api/audit/flags?action=x', { token: s.token })).status, 400);
+    assert.equal((await callJson(s.app, 'GET', '/api/appeals?kind=x', { token: s.token })).status, 400);
+  } finally {
+    s.close();
+  }
+});
+```

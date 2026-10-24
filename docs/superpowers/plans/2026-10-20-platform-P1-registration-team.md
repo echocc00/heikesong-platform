@@ -1123,7 +1123,7 @@ Expected: FAIL —— `Cannot find module '../src/domain/registration.js'`
 ```javascript
 {
   "id": "registration",
-  "version": "2026-10-26",
+  "version": "2026-10-27",
   "source": "SABC v1 §二 3 维画像筛选 + §六 待补 1 问卷字段设计",
   "scale": { "min": 1, "max": 5, "scoreMax": 100 },
   "dimensions": [
@@ -2159,7 +2159,7 @@ import { registerRegistrationRoutes } from './http/routes/registration.js';
 ```javascript
 {
   "id": "team-formation",
-  "version": "2026-10-26",
+  "version": "2026-10-27",
   "source": "任务书 §六 组队规则 + 顶层文档 §3.1",
   "teamSize": { "min": 2, "max": 5 },
   "captainMustBeMba": true,
@@ -2176,7 +2176,7 @@ import { registerRegistrationRoutes } from './http/routes/registration.js';
 ```javascript
 {
   "id": "schedule",
-  "version": "2026-10-26",
+  "version": "2026-10-27",
   "source": "任务书 2.0 §六 赛段表（R-STG-01）",
   "note": "日期为赛段相对日序（月-日）；落到具体日历日期由 edition.starts_at 偏移。",
   "stages": [
@@ -2206,7 +2206,7 @@ import { registerRegistrationRoutes } from './http/routes/registration.js';
 ```javascript
 {
   "id": "compliance",
-  "version": "2026-10-26",
+  "version": "2026-10-27",
   "source": "顶层文档 §3.1 S9（R-ENT-11 IP 与成果归属）+ §3.1 S15 与 §3.9（R-ENT-12 合规红线与同意记录）",
   "ipOwnership": {
     "team": "团队保留全部知识产权",
@@ -2214,11 +2214,26 @@ import { registerRegistrationRoutes } from './http/routes/registration.js';
     "enterprise": "企业享有成果优先对接洽谈权（不自动获得知识产权）"
   },
   "redLines": [
-    { "key": "no_data_export", "label": "数据出境：未经授权不得将参赛数据传出中国境内" },
-    { "key": "privacy_protection", "label": "隐私保护：涉及个人信息须取得授权并脱敏" },
-    { "key": "ai_generated_content", "label": "AI 生成内容：须标注来源与生成方式" },
-    { "key": "ip_no_infringement", "label": "知识产权：不得使用未授权的第三方成果" },
-    { "key": "identity_real", "label": "参赛者身份：报名信息须真实，冒名参赛取消资格" }
+    {
+      "key": "no_data_export",
+      "label": "数据出境：未经授权不得将参赛数据传出中国境内"
+    },
+    {
+      "key": "privacy_protection",
+      "label": "隐私保护：涉及个人信息须取得授权并脱敏"
+    },
+    {
+      "key": "ai_generated_content",
+      "label": "AI 生成内容：须标注来源与生成方式"
+    },
+    {
+      "key": "ip_no_infringement",
+      "label": "知识产权：不得使用未授权的第三方成果"
+    },
+    {
+      "key": "identity_real",
+      "label": "参赛者身份：报名信息须真实，冒名参赛取消资格"
+    }
   ],
   "consent": {
     "required": true,
@@ -2228,6 +2243,12 @@ import { registerRegistrationRoutes } from './http/routes/registration.js';
   "appeal": {
     "slaHours": 72,
     "slaNote": "M0-2（2026-10-26）：组委会应在 **72 小时**内裁决一条待处理的申诉（从提交时刻起算）⇒ 裁决队列按「剩余时间」排序、超期条目显式标注。⚠ 口径：SLA 是**对组委会的承诺**（不是对选手的）⇒ 超期**不自动改变裁决结果**，只在审计里留痕（逾期时长 + 是否逾期）。⚠ 72 小时的来源：这是本平台自定的**待组委会确认**口径（源文档未给时限）—— 改成别的值只需改这里，代码只读它。"
+  },
+  "readiness": {
+    "minReviewCoveragePercent": 90,
+    "publishDeadlineHours": 72,
+    "minTeamsForScale": 4,
+    "note": "A1 + A2（2026-10-27，E181）：S-7~S-10 四条**业务验收指标**的阈值（S-8 评审覆盖率下限 / S-9 发榜时限 / S-7 规模门槛）。⚠️ 三个数都是本平台**自定的待组委会确认**值（源文档未给）⇒ 与 C-01~C-07 同款：配置化、可一行改、且明确标注待确认。⚠️ 改这三个数**不需要改代码** —— services/readiness.js 只读这里。⚠️ S-8 的覆盖率口径 = **有投票权席位数 × 赛段名册队数 × 评委席维度数**（与评审工作台进度同尺，见 services/review.js getReviewState）；S-9 的时限从赛段 ends_at 起算到**第一条发榜快照**的 created_at。"
   }
 }
 ```

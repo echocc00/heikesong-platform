@@ -230,6 +230,11 @@
       "file": "src/db/repo/rate-limit.js",
       "name": "deleteRateLimitEventsOlderThan",
       "reason": "①种子/运维脚本路径：唯一调用方是 platform/scripts/prune.js（运维清理脚本），而 scripts/ 按本闸口径**不算产品路径**。限频计数事件表**只增不减**（每次登录失败 / 评分提交 / 申诉提交都写一行，窗口过了也不删）⇒ 需要一条批量清理的写口。⚠️ 删除判据是「updated_at 早于 now - retentionSeconds」，且 retentionSeconds 必须**严格大于任何规则的窗口**（本仓最宽的是 perHour = 1 小时，默认保留 24 小时）—— 删窗口内的行等于**绕过限频**，那才是真正的缺口。（有回归用例 test/ops-lifecycle.test.js 钉住这条不等式。）"
+    },
+    {
+      "file": "src/db/repo/preview-data.js",
+      "name": "insertDataset",
+      "reason": "①种子/运维脚本路径：唯一调用方是 platform/scripts/preview-seed.js（预演数据装载脚本），而 scripts/ 按本闸口径**不算产品路径**。⚠️ 它刻意**绕过业务服务的全部校验与副作用**（不建冲突声明、不算分、不写审计）⇒ 因此**只能**被预演脚本调用，**绝不能**被业务代码当通用写入口用。⚠️ 它之所以住在仓储层而不是脚本里：仓内纪律「所有 SQL 字符串必须收在 platform/src/db/repo/ 下；handler / 脚本里禁止裸 SQL」（设计文档 §7.2 + 评审编号 I-7，守卫见 test/sql-boundary.test.js）—— 预演数据要写库，INSERT 语句就只能住在仓储层。⚠️ 它**不在生产路径上**（不被 src/services/** 引用）⇒ 若将来它被业务代码引用，**必须重新评估**这条豁免（届时它要么该有生产调用方，要么该被删掉）。"
     }
   ]
 }

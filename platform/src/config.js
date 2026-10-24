@@ -679,6 +679,26 @@ export function validateRules(rules, expectedCount = null) {
       errors.push('compliance.appeal.slaHours 必须是正数（申诉裁决时限）');
     }
   }
+  // ⚠️ E181（2026-10-27）：S-7~S-10 的三个阈值（规模门槛 / 覆盖率下限 / 发榜时限）
+  //    必须落在合法区间 —— 这三个数直接决定「就绪度闸」判不判达标。
+  //    · 覆盖率下限在 (0, 100]：0 = 「没有格子也算达标」⇒ 闸形同虚设；
+  //      > 100 = 永远不可能达标 ⇒ 闸永远红。
+  //    · 时限与门槛必须 > 0（0 / 负数 = 「没有门槛」）。
+  if (rules.compliance?.readiness !== undefined) {
+    const rd = rules.compliance.readiness;
+    const pct = Number(rd.minReviewCoveragePercent);
+    if (!(Number.isFinite(pct) && pct > 0 && pct <= 100)) {
+      errors.push('compliance.readiness.minReviewCoveragePercent 必须在 (0, 100]（评审覆盖率下限）');
+    }
+    const deadline = Number(rd.publishDeadlineHours);
+    if (!(Number.isFinite(deadline) && deadline > 0)) {
+      errors.push('compliance.readiness.publishDeadlineHours 必须是正数（发榜时限）');
+    }
+    const teams = Number(rd.minTeamsForScale);
+    if (!(Number.isFinite(teams) && teams > 0)) {
+      errors.push('compliance.readiness.minTeamsForScale 必须是正数（规模门槛）');
+    }
+  }
 
   // ── 报名问卷（R-REG-11）──
   const q = rules.registration?.questions;

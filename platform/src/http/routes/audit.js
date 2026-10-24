@@ -14,7 +14,7 @@ import { listFlags, resolveFlag } from '../../services/anticheat.js';
 import { assertRateLimit } from '../../services/rate-limit.js';
 import { withIdempotency } from '../../services/idempotency.js';
 import { can } from '../../auth/permissions.js';
-import { unauthenticated, forbidden } from '../../errors.js';
+import { unauthenticated, forbidden, badRequest } from '../../errors.js';
 import { loadOptionalModule } from '../optional-module.js';
 import { fileURLToPath } from 'node:url';
 
@@ -61,19 +61,59 @@ function reviewStateUnavailable() {
   };
 }
 
-function pickFilter(query = {}) {
+// ⛔ E181（A3 · 2026-10-27）：过滤键**按端点精确到各自的仓储层**，且**未知键直接 400**。
+//
+// ⚠️ **修复前是什么样（静默失效，Low 级但会误导人）**：
+//    原来的 pickFilter 用**一份并集白名单**给三个端点用：
+//      ['action','entity','entityId','since','until','status','kind','stageId','subjectType','subjectId']
+//    而三个端点各自的仓储层支持的是**互不相同**的三组键：
+//      · queryAuditLog  （/api/audit/log）  → action, entity, entityId, since, until
+//      · listFlagRows   （/api/audit/flags） → status, kind, stageId
+//      · listAppealRows （/api/appeals）    → status, subjectType, subjectId
+//    ⇒ 例如 `GET /api/audit/log?status=open` 会**被接受**（白名单里有），
+//      但仓储层根本不认识 status ⇒ **过滤条件被静默丢弃** ⇒
+//      调用方拿到的是**未筛选的全量**，却以为自己筛过了。
+//      （`/api/audit/flags` 静默失效 6 个键、`/api/appeals` 静默失效 7 个键。）
+//    ⚠️ **不是越权**：多返回的是该 viewer 本来就有权看的数据（服务层先判能力点），
+//    但「以为筛了其实没筛」在裁决队列上会让人漏看/多看条目 —— 必须治。
+//
+// ⛔ **为什么是 400 而不是「静默忽略」**（fail-closed 纪律）：
+//    静默忽略 = 把「我传错了」变成「我以为筛了」⇒ 错误被藏起来。
+//    400 让调用方**当场知道**参数名写错了、或把别的端点的参数传过来了。
+const AUDIT_LOG_FILTER_KEYS = ['action', 'entity', 'entityId', 'since', 'until'];
+const FLAGS_FILTER_KEYS = ['status', 'kind', 'stageId'];
+const APPEALS_FILTER_KEYS = ['status', 'subjectType', 'subjectId'];
+// ⚠️ 分页键对三个端点都合法（各自的仓储层都收 limit/offset）。
+const PAGINATION_KEYS = ['limit', 'offset'];
+
+/**
+ * 按端点白名单挑过滤键；**未知键一律 400**。
+ * @param {object} query 请求查询参数
+ * @param {string[]} allowedKeys 该端点**精确**支持的过滤键
+ */
+function pickFilter(query = {}, allowedKeys = []) {
+  const q = query ?? {};
+  for (const key of Object.keys(q)) {
+    if (allowedKeys.includes(key) || PAGINATION_KEYS.includes(key)) continue;
+    throw badRequest(
+      `不支持的过滤参数：${key}（本接口只支持：${[...allowedKeys, ...PAGINATION_KEYS].join(' / ')}）`,
+    );
+  }
   const out = {};
-  for (const key of ['action', 'entity', 'entityId', 'since', 'until', 'status', 'kind', 'stageId', 'subjectType', 'subjectId']) {
-    if (query[key] !== undefined && query[key] !== '') out[key] = query[key];
+  for (const key of allowedKeys) {
+    if (q[key] !== undefined && q[key] !== '') out[key] = q[key];
   }
   // ⛔ limit / offset 必须是**有限正整数**：Number('abc') = NaN → 直接绑进 SQL
   //    会让 node:sqlite 抛 TypeError → 整个请求变 500（客户端一个 query 参数就能打挂接口）。
-  if (query.limit !== undefined) {
-    const limit = Number(query.limit);
+  //    ⚠️ 这里**保持既有的宽容语义**（非法值静默忽略，不用默认分页）——
+  //    那是既有契约（test/audit-api.test.js 有用例钉住「不得打成 500」），
+  //    **不在本次修复范围内**：本次只治「过滤键静默失效」这一类。
+  if (q.limit !== undefined) {
+    const limit = Number(q.limit);
     if (Number.isInteger(limit) && limit > 0) out.limit = limit;
   }
-  if (query.offset !== undefined) {
-    const offset = Number(query.offset);
+  if (q.offset !== undefined) {
+    const offset = Number(q.offset);
     if (Number.isInteger(offset) && offset >= 0) out.offset = offset;
   }
   return out;
@@ -106,12 +146,12 @@ export function registerAuditRoutes(router, { db, rules }) {
 
   router.add('GET', '/api/audit/log', async ({ user, query }) => {
     requireLogin(user);
-    return listAuditLog({ db, filter: pickFilter(query), viewer: user, rules, now: now() });
+    return listAuditLog({ db, filter: pickFilter(query, AUDIT_LOG_FILTER_KEYS), viewer: user, rules, now: now() });
   });
 
   router.add('GET', '/api/audit/flags', async ({ user, query }) => {
     requireLogin(user);
-    return listFlags({ db, filter: pickFilter(query), viewer: user });
+    return listFlags({ db, filter: pickFilter(query, FLAGS_FILTER_KEYS), viewer: user });
   });
 
   router.add('POST', '/api/audit/flags/:id/resolve', async ({ user, params, body }) => {
@@ -198,6 +238,6 @@ export function registerAuditRoutes(router, { db, rules }) {
     requireLogin(user);
     const reviewState = await loadReviewState();
     if (!reviewState) return reviewStateUnavailable();
-    return reviewState.listAppeals({ db, filter: pickFilter(query), viewer: user, rules, now: now() });
+    return reviewState.listAppeals({ db, filter: pickFilter(query, APPEALS_FILTER_KEYS), viewer: user, rules, now: now() });
   });
 }

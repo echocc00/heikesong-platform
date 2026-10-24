@@ -2666,7 +2666,7 @@ Expected: FAIL —— `Cannot find module '../src/services/rate-limit.js'`
 ```javascript
 {
   "id": "audit",
-  "version": "2026-10-26",
+  "version": "2026-10-27",
   "source": "设计文档 §11/§12 + 一页纸 §第 3 步 闸二 + 周报 2026-10-12~18 §4.2 教训 5",
   "note": "所有阈值都是待组委会确认的机制件，必须配置化（溯源表结论：60 条机制件不得硬编码）",
   "loginAttemptByIpNote": "登录限频的**来源维度**（2026-10-24 评审轮）。⚠️ 复核更正：评审说的「知道手机号的人可以把受害者锁在门外」**不成立** —— 限频判定只在口令校验**失败**的分支里 ⇒ **正确口令永远能登录**（这条不变量要保住）。真正的残余是**另一条**：限频判定发生在 scrypt **之后** ⇒ 被限流的请求**照样跑一遍 scrypt** ⇒ 限频挡不住 **CPU 打爆**。⇒ 本 profile 的作用 = 给「来源」加一道**前置只读预检**（判定在 scrypt 之前 ⇒ 被挡请求不跑 scrypt）+ 失败时消耗。⚠️ ⚠️⚠️ **sliding 必须比 loginAttempt 更紧（8 < 10）** —— 否则永远是**账号**配额先触顶，来源预检**根本不会触发** ⇒ CPU 保护落空（实测：IP=20 时第 11 次就由账号配额挡下，来源计数停在 10，预检永不生效）。⚠️ sliding 8 的含义：同一个出口 IP 在 60 秒内失败 8 次即被判定为攻击源 ⇒ **连正确口令一起挡**（fail-closed）。⚠️ 代价：共享出口 IP（同一办公室/校园网）的人**共享**这一个桶 ⇒ 阈值必须按「一个办公室的自然误输量」定（8 次/分钟 ⇒ 正常办公网远达不到，但连坐风险真实存在 ⇒ 这就是管理员**整体解除**应急出口存在的理由）。perHour 300 只挡**持续**喷洒，不影响正常办公网。",
@@ -7181,7 +7181,7 @@ import { listFlags, resolveFlag } from '../../services/anticheat.js';
 import { assertRateLimit } from '../../services/rate-limit.js';
 import { withIdempotency } from '../../services/idempotency.js';
 import { can } from '../../auth/permissions.js';
-import { unauthenticated, forbidden } from '../../errors.js';
+import { unauthenticated, forbidden, badRequest } from '../../errors.js';
 import { loadOptionalModule } from '../optional-module.js';
 import { fileURLToPath } from 'node:url';
 
@@ -7228,19 +7228,59 @@ function reviewStateUnavailable() {
   };
 }
 
-function pickFilter(query = {}) {
+// ⛔ E181（A3 · 2026-10-27）：过滤键**按端点精确到各自的仓储层**，且**未知键直接 400**。
+//
+// ⚠️ **修复前是什么样（静默失效，Low 级但会误导人）**：
+//    原来的 pickFilter 用**一份并集白名单**给三个端点用：
+//      ['action','entity','entityId','since','until','status','kind','stageId','subjectType','subjectId']
+//    而三个端点各自的仓储层支持的是**互不相同**的三组键：
+//      · queryAuditLog  （/api/audit/log）  → action, entity, entityId, since, until
+//      · listFlagRows   （/api/audit/flags） → status, kind, stageId
+//      · listAppealRows （/api/appeals）    → status, subjectType, subjectId
+//    ⇒ 例如 `GET /api/audit/log?status=open` 会**被接受**（白名单里有），
+//      但仓储层根本不认识 status ⇒ **过滤条件被静默丢弃** ⇒
+//      调用方拿到的是**未筛选的全量**，却以为自己筛过了。
+//      （`/api/audit/flags` 静默失效 6 个键、`/api/appeals` 静默失效 7 个键。）
+//    ⚠️ **不是越权**：多返回的是该 viewer 本来就有权看的数据（服务层先判能力点），
+//    但「以为筛了其实没筛」在裁决队列上会让人漏看/多看条目 —— 必须治。
+//
+// ⛔ **为什么是 400 而不是「静默忽略」**（fail-closed 纪律）：
+//    静默忽略 = 把「我传错了」变成「我以为筛了」⇒ 错误被藏起来。
+//    400 让调用方**当场知道**参数名写错了、或把别的端点的参数传过来了。
+const AUDIT_LOG_FILTER_KEYS = ['action', 'entity', 'entityId', 'since', 'until'];
+const FLAGS_FILTER_KEYS = ['status', 'kind', 'stageId'];
+const APPEALS_FILTER_KEYS = ['status', 'subjectType', 'subjectId'];
+// ⚠️ 分页键对三个端点都合法（各自的仓储层都收 limit/offset）。
+const PAGINATION_KEYS = ['limit', 'offset'];
+
+/**
+ * 按端点白名单挑过滤键；**未知键一律 400**。
+ * @param {object} query 请求查询参数
+ * @param {string[]} allowedKeys 该端点**精确**支持的过滤键
+ */
+function pickFilter(query = {}, allowedKeys = []) {
+  const q = query ?? {};
+  for (const key of Object.keys(q)) {
+    if (allowedKeys.includes(key) || PAGINATION_KEYS.includes(key)) continue;
+    throw badRequest(
+      `不支持的过滤参数：${key}（本接口只支持：${[...allowedKeys, ...PAGINATION_KEYS].join(' / ')}）`,
+    );
+  }
   const out = {};
-  for (const key of ['action', 'entity', 'entityId', 'since', 'until', 'status', 'kind', 'stageId', 'subjectType', 'subjectId']) {
-    if (query[key] !== undefined && query[key] !== '') out[key] = query[key];
+  for (const key of allowedKeys) {
+    if (q[key] !== undefined && q[key] !== '') out[key] = q[key];
   }
   // ⛔ limit / offset 必须是**有限正整数**：Number('abc') = NaN → 直接绑进 SQL
   //    会让 node:sqlite 抛 TypeError → 整个请求变 500（客户端一个 query 参数就能打挂接口）。
-  if (query.limit !== undefined) {
-    const limit = Number(query.limit);
+  //    ⚠️ 这里**保持既有的宽容语义**（非法值静默忽略，不用默认分页）——
+  //    那是既有契约（test/audit-api.test.js 有用例钉住「不得打成 500」），
+  //    **不在本次修复范围内**：本次只治「过滤键静默失效」这一类。
+  if (q.limit !== undefined) {
+    const limit = Number(q.limit);
     if (Number.isInteger(limit) && limit > 0) out.limit = limit;
   }
-  if (query.offset !== undefined) {
-    const offset = Number(query.offset);
+  if (q.offset !== undefined) {
+    const offset = Number(q.offset);
     if (Number.isInteger(offset) && offset >= 0) out.offset = offset;
   }
   return out;
@@ -7273,12 +7313,12 @@ export function registerAuditRoutes(router, { db, rules }) {
 
   router.add('GET', '/api/audit/log', async ({ user, query }) => {
     requireLogin(user);
-    return listAuditLog({ db, filter: pickFilter(query), viewer: user, rules, now: now() });
+    return listAuditLog({ db, filter: pickFilter(query, AUDIT_LOG_FILTER_KEYS), viewer: user, rules, now: now() });
   });
 
   router.add('GET', '/api/audit/flags', async ({ user, query }) => {
     requireLogin(user);
-    return listFlags({ db, filter: pickFilter(query), viewer: user });
+    return listFlags({ db, filter: pickFilter(query, FLAGS_FILTER_KEYS), viewer: user });
   });
 
   router.add('POST', '/api/audit/flags/:id/resolve', async ({ user, params, body }) => {
@@ -7316,6 +7356,8 @@ export function registerAuditRoutes(router, { db, rules }) {
         subjectId: body?.subjectId,
         filedBy: user.id,
         reason: body?.reason,
+        // ⚠️ M0-2：程序性错误类型（白名单在 rules/audit.json 的 appealReasonKinds）。
+        reasonKind: body?.reasonKind,
         now: now(),
         rules,
       });
@@ -7363,7 +7405,7 @@ export function registerAuditRoutes(router, { db, rules }) {
     requireLogin(user);
     const reviewState = await loadReviewState();
     if (!reviewState) return reviewStateUnavailable();
-    return reviewState.listAppeals({ db, filter: pickFilter(query), viewer: user });
+    return reviewState.listAppeals({ db, filter: pickFilter(query, APPEALS_FILTER_KEYS), viewer: user, rules, now: now() });
   });
 }
 ```
